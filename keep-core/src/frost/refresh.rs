@@ -152,8 +152,13 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
-    let new_group_pubkey = *new_packages[0].group_pubkey();
-    if new_group_pubkey != group_pubkey {
+    // Verify against the group key the refreshed shares actually reconstruct
+    // to (`new_pubkey_pkg.verifying_key()`), NOT the metadata we just rebuilt
+    // from the original `group_pubkey` (which would compare it to itself and
+    // never catch a key change). A refresh MUST preserve the group key; a
+    // mismatch means the operation produced a different key and must abort.
+    let refreshed_group_pubkey = super::dealer::extract_group_pubkey(&new_pubkey_pkg)?;
+    if refreshed_group_pubkey != group_pubkey {
         return Err(KeepError::Frost(
             "Group public key changed after refresh - aborting".into(),
         ));

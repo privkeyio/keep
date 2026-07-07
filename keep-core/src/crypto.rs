@@ -1045,10 +1045,25 @@ pub mod nip04 {
     type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
+    /// Emit a one-time deprecation warning: NIP-04 (unauthenticated AES-256-CBC)
+    /// is weak and should be replaced by NIP-44. Logged once per process to
+    /// flag lingering NIP-04 usage without spamming per call.
+    fn warn_deprecated_nip04() {
+        use std::sync::Once;
+        static WARN: Once = Once::new();
+        WARN.call_once(|| {
+            tracing::warn!(
+                "NIP-04 (AES-256-CBC) is deprecated and cryptographically weak \
+                 (unauthenticated encryption); prefer NIP-44"
+            );
+        });
+    }
+
     /// Encrypt plaintext using NIP-04 (AES-256-CBC) with a raw ECDH shared secret.
     ///
     /// Returns the encrypted payload in NIP-04 format: base64(ciphertext)?iv=base64(iv)
     pub fn encrypt(shared_secret: &[u8; 32], plaintext: &[u8]) -> Result<String> {
+        warn_deprecated_nip04();
         let iv: [u8; 16] = entropy::try_random_bytes()?;
 
         let cipher = Aes256CbcEnc::new(shared_secret.into(), &iv.into());
@@ -1062,6 +1077,7 @@ pub mod nip04 {
     ///
     /// Takes the encrypted payload in format: base64(ciphertext)?iv=base64(iv)
     pub fn decrypt(shared_secret: &[u8; 32], payload: &str) -> Result<Vec<u8>> {
+        warn_deprecated_nip04();
         let (ciphertext_b64, iv_b64) = payload
             .split_once("?iv=")
             .ok_or_else(|| CryptoError::decryption("Invalid NIP-04 format: missing ?iv="))?;
