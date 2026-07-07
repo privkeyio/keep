@@ -2000,66 +2000,8 @@ mod snapshot_decode_tests {
     /// and would instead return `Ok`, so `expect_err` kills it.
     #[test]
     fn aggregate_partial_psbts_rejects_input_below_threshold() {
-        use bitcoin::absolute::LockTime;
-        use bitcoin::opcodes::all::OP_CHECKSIG;
-        use bitcoin::secp256k1::{Keypair, Secp256k1};
-        use bitcoin::taproot::{LeafVersion, TaprootBuilder};
-        use bitcoin::transaction::Version;
-        use bitcoin::{
-            Amount, OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
-        };
-        use std::collections::BTreeMap;
-
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
-        let (xonly, _) = keypair.x_only_public_key();
-        // Single-leaf taproot tree: `<key> OP_CHECKSIG`.
-        let leaf_script = ScriptBuf::builder()
-            .push_x_only_key(&xonly)
-            .push_opcode(OP_CHECKSIG)
-            .into_script();
-        let internal_kp = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
-        let (internal, _) = internal_kp.x_only_public_key();
-        let spend_info = TaprootBuilder::new()
-            .add_leaf(0, leaf_script.clone())
-            .unwrap()
-            .finalize(&secp, internal)
-            .unwrap();
-        let control_block = spend_info
-            .control_block(&(leaf_script.clone(), LeafVersion::TapScript))
-            .unwrap();
-        let spk = ScriptBuf::new_p2tr_tweaked(spend_info.output_key());
-
-        let prev_txid: bitcoin::Txid =
-            "0000000000000000000000000000000000000000000000000000000000000001"
-                .parse()
-                .unwrap();
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: prev_txid,
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(40_000),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        };
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
-            value: Amount::from_sat(50_000),
-            script_pubkey: spk,
-        });
-        let mut tap_scripts = BTreeMap::new();
-        tap_scripts.insert(control_block, (leaf_script, LeafVersion::TapScript));
-        psbt.inputs[0].tap_scripts = tap_scripts;
-        let proposal = psbt.serialize();
+        let (proposal_psbt, _kp, _leaf, _prevout) = single_leaf_tapscript_psbt([7u8; 32]);
+        let proposal = proposal_psbt.serialize();
 
         // No tap_script_sigs => matching == 0, below threshold 1 => error.
         let err = super::aggregate_partial_psbts(&proposal, &std::collections::HashMap::new(), 1)
@@ -2189,9 +2131,10 @@ mod snapshot_decode_tests {
         let out = super::aggregate_partial_psbts(&proposal_psbt.serialize(), &map, 1)
             .expect("one valid tap_script_sig meets threshold 1");
         let decoded = Psbt::deserialize(&out).unwrap();
-        assert!(
-            decoded.inputs[0].tap_script_sigs.contains_key(&(xonly, leaf)),
-            "aggregated PSBT must carry the contributed signature"
+        assert_eq!(
+            decoded.inputs[0].tap_script_sigs.get(&(xonly, leaf)),
+            Some(&sig),
+            "aggregated PSBT must carry the contributed signature unchanged"
         );
     }
 
