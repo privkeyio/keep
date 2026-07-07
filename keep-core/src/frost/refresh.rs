@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
-use frost::keys::{KeyPackage, PublicKeyPackage};
+use frost::keys::{KeyPackage, PublicKeyPackage, VerifyingShare};
 use frost::rand_core::OsRng;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
@@ -148,15 +148,36 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
             ));
         }
 
+        // Real post-refresh verification: derive this share's public verifying
+        // share (g^{s_i}) from the refreshed *secret* share and require it to
+        // match the value published in `new_pubkey_pkg`. This is the check that
+        // proves the refresh produced correct shares; it catches a corrupted or
+        // mis-assigned secret before it is ever persisted. (frost-core preserves
+        // the group `verifying_key` verbatim across a refresh, so a group-key
+        // comparison alone cannot detect a bad refresh.)
+        let derived_vs = VerifyingShare::from(*new_kp.signing_share());
+        let published_vs = new_pubkey_pkg.verifying_shares().get(&id).ok_or_else(|| {
+            KeepError::Frost(format!(
+                "No verifying share for identifier {id:?} in refreshed pubkey package"
+            ))
+        })?;
+        if derived_vs != *published_vs {
+            return Err(KeepError::Frost(
+                "refreshed share does not match its published verifying share - aborting".into(),
+            ));
+        }
+
         let metadata = rebuild_metadata(share, threshold, total, group_pubkey, name.clone());
         new_packages.push(SharePackage::new(metadata, &new_kp, &new_pubkey_pkg)?);
     }
 
-    // Verify against the group key the refreshed shares actually reconstruct
-    // to (`new_pubkey_pkg.verifying_key()`), NOT the metadata we just rebuilt
-    // from the original `group_pubkey` (which would compare it to itself and
-    // never catch a key change). A refresh MUST preserve the group key; a
-    // mismatch means the operation produced a different key and must abort.
+    // Input-consistency guard: `new_pubkey_pkg.verifying_key()` is the group key
+    // frost-core carries forward unchanged across a refresh (only the verifying
+    // shares change), so this confirms the input share's stored `group_pubkey`
+    // agrees with its pubkey package. `SharePackage` stores the two independently
+    // and does not enforce that they match, so this can still fire on an
+    // inconsistent input. The per-share checks above are what verify the refresh
+    // itself.
     let refreshed_group_pubkey = super::dealer::extract_group_pubkey(&new_pubkey_pkg)?;
     if refreshed_group_pubkey != group_pubkey {
         return Err(KeepError::Frost(
@@ -229,6 +250,45 @@ mod tests {
             assert_eq!(share.metadata.threshold, 2);
             assert_eq!(share.metadata.total_shares, 3);
         }
+    }
+
+    /// The group-key guard must fire when a share's stored `group_pubkey`
+    /// metadata disagrees with its pubkey package. `SharePackage` keeps the two
+    /// independently, so an inconsistent input must abort rather than silently
+    /// emit shares under the wrong advertised key. Every metadata copy is
+    /// rewritten to the same bogus value so the earlier cross-share equality
+    /// check passes and execution reaches the group-key guard, which compares
+    /// against the untouched pubkey package.
+    #[test]
+    fn test_refresh_rejects_group_pubkey_metadata_mismatch() {
+        use crate::frost::share::SharePackage;
+
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("mismatch").unwrap();
+
+        let bogus = [0xABu8; 32];
+        let tampered: Vec<SharePackage> = shares
+            .iter()
+            .map(|s| {
+                let mut md = s.metadata.clone();
+                md.group_pubkey = bogus;
+                SharePackage::from_bytes(
+                    md,
+                    s.key_package_bytes().to_vec(),
+                    s.pubkey_package_bytes().to_vec(),
+                )
+            })
+            .collect();
+
+        let err = match refresh_shares(&tampered) {
+            Ok(_) => panic!("expected refresh to abort on group pubkey mismatch"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("Group public key changed after refresh"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
