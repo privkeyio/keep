@@ -47,6 +47,9 @@ pub struct ApprovalRequest {
     pub action: String,
     pub kind: Option<u16>,
     pub content_preview: Option<String>,
+    /// NIP-98 (kind 27235) HTTP-auth target (url, method) surfaced so the
+    /// operator can see what a bearer-credential sign request authorizes.
+    pub http_auth: Option<(Option<String>, Option<String>)>,
     pub response_tx: Sender<bool>,
 }
 
@@ -265,6 +268,20 @@ impl Tui {
             lines.push(Line::from(vec![
                 Span::styled("Kind: ", Style::default().fg(Color::Gray)),
                 Span::styled(kind.to_string(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+
+        if let Some((ref url, ref method)) = req.http_auth {
+            lines.push(Line::from(vec![
+                Span::styled("HTTP auth: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!(
+                        "{} {}",
+                        method.as_deref().unwrap_or("<no method>"),
+                        url.as_deref().unwrap_or("<no url>"),
+                    ),
+                    Style::default().fg(Color::Red),
+                ),
             ]));
         }
 

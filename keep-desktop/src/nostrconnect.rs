@@ -27,6 +27,7 @@ impl App {
             event_kind: None,
             event_content: request.url.clone(),
             requested_permissions: request.perms.clone(),
+            http_auth: None,
         };
         self.bunker_pending_approval = Some(display);
 

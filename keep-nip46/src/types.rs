@@ -22,6 +22,19 @@ pub struct LogEvent {
     pub detail: Option<String>,
 }
 
+/// The security-relevant target of a NIP-98 (kind 27235) HTTP-auth event: the
+/// `u` (URL) and `method` the signature will authenticate. NIP-98 content is
+/// empty, so without these the approval prompt cannot show what is being
+/// authorized and the user approves a blind bearer credential. Populated on
+/// `ApprovalRequest` only for kind-27235 sign requests; `None` otherwise. A
+/// field is `None` when the event omits that tag (a malformed request the UI
+/// should surface as "unspecified", not hide).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpAuthDetails {
+    pub url: Option<String>,
+    pub method: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub app_pubkey: PublicKey,
@@ -30,6 +43,10 @@ pub struct ApprovalRequest {
     pub event_kind: Option<Kind>,
     pub event_content: Option<String>,
     pub requested_permissions: Option<String>,
+    /// For NIP-98 (kind 27235) sign requests, the `u`/method the prompt must
+    /// show so the user is not approving a blind HTTP-auth token. `None` for
+    /// every other request.
+    pub http_auth: Option<HttpAuthDetails>,
 }
 
 /// How long an approval extends beyond the current request, captured from the

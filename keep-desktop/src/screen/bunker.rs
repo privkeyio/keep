@@ -67,6 +67,10 @@ pub struct PendingApprovalDisplay {
     pub event_kind: Option<u32>,
     pub event_content: Option<String>,
     pub requested_permissions: Option<String>,
+    /// NIP-98 (kind 27235) HTTP-auth target (url, method) surfaced so the user
+    /// can see what a bearer-credential sign request authorizes. `None` for
+    /// non-27235 requests.
+    pub http_auth: Option<(Option<String>, Option<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -794,6 +798,18 @@ impl State {
                 text(format!("Kind: {kind}"))
                     .size(theme::size::SMALL)
                     .color(theme::color::TEXT_MUTED),
+            );
+        }
+
+        if let Some((ref url, ref method)) = approval.http_auth {
+            details = details.push(
+                text(format!(
+                    "HTTP auth: {} {}",
+                    method.as_deref().unwrap_or("<no method>"),
+                    url.as_deref().unwrap_or("<no url>"),
+                ))
+                .size(theme::size::SMALL)
+                .color(theme::color::DANGER),
             );
         }
 

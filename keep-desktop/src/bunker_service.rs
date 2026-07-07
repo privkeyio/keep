@@ -85,6 +85,7 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
             event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
             event_content: request.event_content,
             requested_permissions: request.requested_permissions,
+            http_auth: request.http_auth.map(|d| (d.url, d.method)),
         };
         if self
             .tx

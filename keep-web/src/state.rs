@@ -288,5 +288,10 @@ pub enum Event {
         method: String,
         kind: Option<u16>,
         preview: Option<String>,
+        /// NIP-98 (kind 27235) HTTP-auth target the browser prompt must show so
+        /// the operator does not approve a blind bearer credential. Both `None`
+        /// for non-27235 requests.
+        http_auth_url: Option<String>,
+        http_auth_method: Option<String>,
     },
 }

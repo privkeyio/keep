@@ -20,9 +20,31 @@ use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
-    ApprovalRequest, ApprovalResult, RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH,
-    NIP98_MAX_REMEMBER_SECS,
+    ApprovalRequest, ApprovalResult, HttpAuthDetails, RememberDuration, ServerCallbacks,
+    NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
 };
+
+/// Extract the NIP-98 (kind 27235) HTTP-auth target from a sign request so the
+/// approval prompt can show the `u`/method the signature will authenticate.
+/// Returns `None` for every other kind. A 27235 event that omits `u` or
+/// `method` still returns `Some` with the missing field as `None`: the prompt
+/// must surface a malformed HTTP-auth request, not silently drop it.
+fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
+    if event.kind != NIP98_HTTP_AUTH {
+        return None;
+    }
+    let mut url = None;
+    let mut method = None;
+    for tag in event.tags.iter() {
+        let slice = tag.as_slice();
+        match slice.first().map(String::as_str) {
+            Some("u") if url.is_none() => url = slice.get(1).cloned(),
+            Some("method") if method.is_none() => method = slice.get(1).cloned(),
+            _ => {}
+        }
+    }
+    Some(HttpAuthDetails { url, method })
+}
 
 fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
     match remember.as_seconds() {
@@ -350,6 +372,7 @@ impl SignerHandler {
                     event_kind: None,
                     event_content: None,
                     requested_permissions: permissions.clone(),
+                    http_auth: None,
                 })
                 .await;
             if !result.approved {
@@ -441,6 +464,7 @@ impl SignerHandler {
                     event_kind: Some(kind),
                     event_content: Some(unsigned_event.content.clone()),
                     requested_permissions: None,
+                    http_auth: nip98_http_auth(&unsigned_event),
                 })
                 .await;
 
@@ -580,6 +604,7 @@ impl SignerHandler {
             event_kind: None,
             event_content: None,
             requested_permissions: None,
+            http_auth: None,
         };
         if self.request_approval(request).await.approved {
             Ok(())
@@ -882,11 +907,23 @@ mod tests {
     /// assert which operations triggered an interactive prompt. Approves all.
     struct RecordingCallbacks {
         methods: std::sync::Mutex<Vec<String>>,
+        http_auth: std::sync::Mutex<Option<HttpAuthDetails>>,
+    }
+    impl RecordingCallbacks {
+        fn new() -> Self {
+            Self {
+                methods: std::sync::Mutex::new(Vec::new()),
+                http_auth: std::sync::Mutex::new(None),
+            }
+        }
     }
     impl crate::types::ServerCallbacks for RecordingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
         fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
             self.methods.lock().unwrap().push(request.method);
+            if request.http_auth.is_some() {
+                *self.http_auth.lock().unwrap() = request.http_auth;
+            }
             ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str) {}
@@ -902,9 +939,7 @@ mod tests {
         let keyring = setup_keyring();
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        let cb = Arc::new(RecordingCallbacks {
-            methods: std::sync::Mutex::new(Vec::new()),
-        });
+        let cb = Arc::new(RecordingCallbacks::new());
         // Default connect_grant == Permission::DEFAULT (get_public_key only).
         let handler = SignerHandler::new(keyring, permissions, audit, Some(cb));
 
@@ -933,9 +968,7 @@ mod tests {
             .await
             .set_auto_approve_kinds(HashSet::from([NIP98_HTTP_AUTH]));
         let audit = Arc::new(Mutex::new(AuditLog::new(100)));
-        let cb = Arc::new(RecordingCallbacks {
-            methods: std::sync::Mutex::new(Vec::new()),
-        });
+        let cb = Arc::new(RecordingCallbacks::new());
         let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
             .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
 
@@ -959,6 +992,50 @@ mod tests {
             methods.iter().any(|m| m == "sign_event"),
             "kind 27235 MUST trigger a per-request approval prompt, saw: {methods:?}"
         );
+
+        // The prompt must carry the `u`/method so the user is not approving a
+        // blind HTTP-auth bearer credential (keep-qjx0).
+        let http_auth = cb.http_auth.lock().unwrap().clone();
+        assert_eq!(
+            http_auth,
+            Some(HttpAuthDetails {
+                url: Some("https://readstr.example/api/feed".into()),
+                method: Some("GET".into()),
+            }),
+            "kind 27235 approval must surface the NIP-98 url/method"
+        );
+    }
+
+    #[test]
+    fn nip98_http_auth_extracts_url_and_method() {
+        let signer_pk = Keys::generate().public_key();
+        let tags = vec![
+            Tag::parse(["u", "https://blossom.example/upload"]).unwrap(),
+            Tag::parse(["method", "PUT"]).unwrap(),
+        ];
+        let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "");
+        assert_eq!(
+            nip98_http_auth(&ev),
+            Some(HttpAuthDetails {
+                url: Some("https://blossom.example/upload".into()),
+                method: Some("PUT".into()),
+            })
+        );
+
+        // A malformed 27235 event (missing `u`) still surfaces as Some so the
+        // prompt can flag the omission rather than hide the request.
+        let bare = UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, vec![], "");
+        assert_eq!(
+            nip98_http_auth(&bare),
+            Some(HttpAuthDetails {
+                url: None,
+                method: None,
+            })
+        );
+
+        // Every other kind carries no HTTP-auth target.
+        let note = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "hi");
+        assert_eq!(nip98_http_auth(&note), None);
     }
 
     // #575: NIP-98 (kind 27235) is never auto-approved, not even per-app via
