@@ -1076,6 +1076,7 @@ mod tests {
             event_kind: None,
             event_content: None,
             requested_permissions: None,
+            http_auth: None,
         };
         app.notify_bunker_approval(&display);
     }

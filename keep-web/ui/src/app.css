@@ -829,6 +829,13 @@ ol.tasks li {
   gap: 0.5rem;
 }
 
+/* NIP-98 HTTP-auth target: security-critical, so it stands out in the prompt. */
+.http-auth {
+  color: var(--no);
+  font-weight: 600;
+  word-break: break-all;
+}
+
 /* Readiness pill + co-signer presence list. */
 .status-pill {
   font-size: 0.8rem;
