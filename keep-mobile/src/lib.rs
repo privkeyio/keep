@@ -445,6 +445,12 @@ pub struct KeepMobile {
     /// permission grants) so a relay edit and an engine grant/revoke write do
     /// not clobber each other's section.
     pub(crate) relay_config_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes the live-node lifecycle so the `(node, node_tasks)` pair is
+    /// always swapped atomically. `do_initialize` (install) and
+    /// `invalidate_live_node` (teardown) each hold this for their whole run, so
+    /// a concurrent FFI init racing a delete/rotate cannot interleave into a
+    /// node whose tasks were just aborted, or tasks pointing at a nulled node.
+    node_lifecycle_lock: Arc<std::sync::Mutex<()>>,
 }
 
 struct PendingRequest {
@@ -587,6 +593,7 @@ impl KeepMobile {
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
+            node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -889,6 +896,12 @@ impl KeepMobile {
     /// release their Arc clones, so the node drops and its share material
     /// zeroizes once the runtime finishes cancelling them.
     fn invalidate_live_node(&self) {
+        // Serialize teardown against a concurrent `do_initialize` so the
+        // (node, node_tasks) pair is swapped atomically. Held for the whole fn.
+        let _lifecycle = self
+            .node_lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for handle in self
             .node_tasks
             .lock()
@@ -2530,6 +2543,16 @@ impl KeepMobile {
         relays: Vec<String>,
         proxy: Option<std::net::SocketAddr>,
     ) -> Result<(), KeepMobileError> {
+        // Serialize install against a concurrent teardown (invalidate_live_node)
+        // so the (node, node_tasks) pair is swapped atomically. Held for the
+        // whole fn; neither path nests the other, so this cannot self-deadlock.
+        // The guard spans the relay I/O below (TLS pin verification, connect), so
+        // a concurrent teardown waits out the whole init; acceptable under the
+        // single-user mobile FFI model where init runs off the UI thread.
+        let _lifecycle = self
+            .node_lifecycle_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for relay in &relays {
             network::validate_relay_url(relay)?;
         }
