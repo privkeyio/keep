@@ -363,3 +363,107 @@ impl KfpNode {
         result
     }
 }
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use crate::node::PeerPolicy;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
+
+    // Not a valid compressed point: if a responder gate is (incorrectly)
+    // bypassed, the proceed path fails at `compute_partial_ecdh`, so asserting
+    // `Ok` on an ignore-gate still kills the predicate mutation.
+    const BAD_RECIPIENT: [u8; 33] = [0xFF; 33];
+
+    // Returns the relay guard alongside the node; callers must keep it alive so
+    // the node's client stays connected. The gate tests here all short-circuit
+    // before sending, but a future proceed/send test through this helper would
+    // fail confusingly if the relay were dropped early.
+    async fn test_node() -> (KfpNode, MockRelay) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("ecdh-gate-test").unwrap();
+        // First share -> FROST identifier 1.
+        let node = KfpNode::new(shares.remove(0), vec![relay]).await.unwrap();
+        (node, mock)
+    }
+
+    /// A request for a different group is silently ignored (returns Ok without
+    /// producing a share). Pins the group-membership early-return.
+    #[tokio::test]
+    async fn handle_ecdh_request_ignores_foreign_group() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let req = EcdhRequestPayload::new([1u8; 32], [0xAA; 32], BAD_RECIPIENT, vec![1]);
+        assert!(node.handle_ecdh_request(from, req).await.is_ok());
+    }
+
+    /// A request whose participant set excludes our own identifier is ignored.
+    #[tokio::test]
+    async fn handle_ecdh_request_ignores_non_participant() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![2, 3]);
+        assert!(node.handle_ecdh_request(from, req).await.is_ok());
+    }
+
+    /// A stale request (created_at outside the replay window) is rejected.
+    #[tokio::test]
+    async fn handle_ecdh_request_rejects_stale_replay() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload {
+            session_id: [1u8; 32],
+            group_pubkey: group,
+            recipient_pubkey: BAD_RECIPIENT,
+            participants: vec![1],
+            created_at: 1, // ancient -> outside the replay window
+        };
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    /// A far-future request (created_at beyond the skew bound) is rejected.
+    /// Pins the upper side of the replay window, distinct from the stale case.
+    #[tokio::test]
+    async fn handle_ecdh_request_rejects_future_skew() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload {
+            session_id: [1u8; 32],
+            group_pubkey: group,
+            recipient_pubkey: BAD_RECIPIENT,
+            participants: vec![1],
+            created_at: Timestamp::now().as_secs() + 3600, // beyond MAX_FUTURE_SKEW_SECS
+        };
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    /// A peer denied by policy cannot open an ECDH request. Fresh `created_at`
+    /// passes the replay gate so the policy gate is what trips.
+    #[tokio::test]
+    async fn handle_ecdh_request_rejects_denied_peer() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+}
