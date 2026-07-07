@@ -778,30 +778,28 @@ impl KfpNode {
         expected_fingerprints: &[String],
     ) -> Result<()> {
         let peers = self.peers.read();
-        for idx in expected_share_signers {
-            let Some(peer) = peers.get_peer(*idx) else {
-                continue;
-            };
-            for xpub in &peer.recovery_xpubs {
-                let fp_lc = xpub.fingerprint.to_ascii_lowercase();
-                if expected_fingerprints.contains(&fp_lc) {
-                    return Err(FrostNetError::Session(format!(
-                        "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        let resolved: Vec<(u16, Vec<String>)> = expected_share_signers
+            .iter()
+            .filter_map(|idx| {
+                peers.get_peer(*idx).map(|peer| {
+                    (
+                        *idx,
+                        peer.recovery_xpubs
+                            .iter()
+                            .map(|x| x.fingerprint.clone())
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
+        detect_dual_identity_signer(
+            resolved.iter().map(|(idx, fps)| (*idx, fps.as_slice())),
+            expected_fingerprints,
+        )
     }
 
     fn check_psbt_proposer_authorized(&self, share_index: u16) -> Result<()> {
-        let proposers = self.psbt_proposers.read();
-        if !proposers.is_empty() && !proposers.contains(&share_index) {
-            return Err(FrostNetError::Session(format!(
-                "Share {share_index} is not authorized to propose PSBTs"
-            )));
-        }
-        Ok(())
+        proposer_authorized(&self.psbt_proposers.read(), share_index)
     }
 
     fn verify_descriptor_hash_against_stored(&self, descriptor_hash: &[u8; 32]) -> Result<()> {
@@ -1550,6 +1548,42 @@ fn signer_id_sort_key(s: &SignerId) -> (u8, u16, String) {
         SignerId::Share(i) => (0u8, *i, String::new()),
         SignerId::Fingerprint(fp) => (1u8, 0u16, fp.clone()),
     }
+}
+
+/// Whether `share_index` may propose PSBTs given the configured proposer
+/// allowlist. An empty allowlist is open (any share may propose); a non-empty
+/// one restricts to its members. Pure so the allowlist boolean is directly
+/// testable.
+fn proposer_authorized(proposers: &HashSet<u16>, share_index: u16) -> Result<()> {
+    if !proposers.is_empty() && !proposers.contains(&share_index) {
+        return Err(FrostNetError::Session(format!(
+            "Share {share_index} is not authorized to propose PSBTs"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a peer that is counted as BOTH an expected share signer and an
+/// expected fingerprint signer, which would let one identity satisfy the
+/// threshold twice (Sybil toward quorum). `share_signers` supplies each
+/// expected share signer's recovery-xpub fingerprints; a match against
+/// `expected_fingerprints` (case-insensitive on the peer side, as stored) is
+/// rejected. Pure so the overlap logic is directly testable.
+fn detect_dual_identity_signer<'a>(
+    share_signers: impl IntoIterator<Item = (u16, &'a [String])>,
+    expected_fingerprints: &[String],
+) -> Result<()> {
+    for (idx, fingerprints) in share_signers {
+        for fp in fingerprints {
+            let fp_lc = fp.to_ascii_lowercase();
+            if expected_fingerprints.contains(&fp_lc) {
+                return Err(FrostNetError::Session(format!(
+                    "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reject a migration sweep whose fee is disproportionate to the funds moved,
@@ -2577,5 +2611,60 @@ mod sweep_validation_tests {
     fn input_value_overflow_rejected() {
         let err = check_sweep_fee([u64::MAX, 1], 0).unwrap_err();
         assert!(err.to_string().contains("overflow"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod proposer_and_identity_tests {
+    use super::{detect_dual_identity_signer, proposer_authorized};
+    use std::collections::HashSet;
+
+    #[test]
+    fn empty_allowlist_authorizes_any_proposer() {
+        let proposers: HashSet<u16> = HashSet::new();
+        assert!(proposer_authorized(&proposers, 7).is_ok());
+    }
+
+    #[test]
+    fn nonempty_allowlist_authorizes_only_members() {
+        let proposers: HashSet<u16> = HashSet::from([1, 2, 3]);
+        assert!(proposer_authorized(&proposers, 2).is_ok());
+        let err = proposer_authorized(&proposers, 4).unwrap_err();
+        assert!(err.to_string().contains("not authorized"), "{err}");
+    }
+
+    #[test]
+    fn dual_identity_overlap_rejected() {
+        // Share 1's peer carries fingerprint "abcd", which is also an expected
+        // fingerprint signer -> the same identity would count twice.
+        let fps = vec!["ABCD".to_string()];
+        let share_signers = vec![(1u16, fps.as_slice())];
+        let expected = vec!["abcd".to_string()];
+        let err = detect_dual_identity_signer(share_signers, &expected).unwrap_err();
+        assert!(err.to_string().contains("Dual-identity"), "{err}");
+    }
+
+    #[test]
+    fn dual_identity_match_is_case_insensitive_on_peer_side() {
+        // Peer fingerprint upper-case, expected lower-case: still overlaps.
+        let fps = vec!["DEADBEEF".to_string()];
+        let share_signers = vec![(2u16, fps.as_slice())];
+        let expected = vec!["deadbeef".to_string()];
+        assert!(detect_dual_identity_signer(share_signers, &expected).is_err());
+    }
+
+    #[test]
+    fn disjoint_share_and_fingerprint_signers_accepted() {
+        let fps = vec!["1111".to_string(), "2222".to_string()];
+        let share_signers = vec![(1u16, fps.as_slice())];
+        let expected = vec!["3333".to_string()];
+        assert!(detect_dual_identity_signer(share_signers, &expected).is_ok());
+    }
+
+    #[test]
+    fn no_share_signers_accepts() {
+        let share_signers: Vec<(u16, &[String])> = Vec::new();
+        let expected = vec!["abcd".to_string()];
+        assert!(detect_dual_identity_signer(share_signers, &expected).is_ok());
     }
 }
