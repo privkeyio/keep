@@ -655,14 +655,15 @@ pub(crate) enum FrostNetworkCommands {
         #[arg(
             long,
             help = "Hardware signer device path (e.g., /dev/ttyACM0). \
-                    Omit to run software DKG in-process; --path must then \
-                    point at the vault that stores the resulting share (#454)."
+                    Omit to run software DKG in-process, storing the resulting \
+                    share in the vault (#454)."
         )]
         hardware: Option<String>,
         #[arg(
             long,
-            help = "Vault path for software DKG. Required when --hardware is omitted; \
-                    the finalized share is stored here encrypted under the vault key."
+            help = "Vault path override for software DKG. Defaults to the global \
+                    --path / configured vault; the finalized share is stored here \
+                    encrypted under the vault key."
         )]
         path: Option<std::path::PathBuf>,
     },

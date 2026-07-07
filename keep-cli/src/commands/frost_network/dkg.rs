@@ -420,6 +420,15 @@ fn cmd_frost_network_dkg_software(
         SoftwareDkgSession::init(threshold as u16, participants as u16, our_index as u16)
             .map_err(|e| KeepError::FrostErr(FrostError::invalid_config(e.to_string())))?;
 
+    // `group` is stored as the share name at finalize; reject an out-of-bounds
+    // name now rather than after every network round only for the store to fail.
+    let group_name = group.trim();
+    if group_name.is_empty() || group_name.chars().count() > 64 {
+        return Err(KeepError::FrostErr(FrostError::invalid_config(
+            "group name must be 1..=64 characters".to_string(),
+        )));
+    }
+
     let spinner = out.spinner("Opening vault...");
     let mut keep = Keep::open(vault_path)?;
     let password = super::get_password("Enter password")?;
@@ -665,13 +674,12 @@ fn cmd_frost_network_dkg_software(
                 if recipient_idx_tag != Some(our_index as u16) {
                     continue;
                 }
-                let decrypted =
-                    match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
-                        // Plaintext carries the peer's secret signing share; scrub
-                        // it from the heap once this iteration drops it.
-                        Ok(d) => Zeroizing::new(d),
-                        Err(_) => continue,
-                    };
+                let decrypted = match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
+                    // Plaintext carries the peer's secret signing share; scrub
+                    // it from the heap once this iteration drops it.
+                    Ok(d) => Zeroizing::new(d),
+                    Err(_) => continue,
+                };
                 let wire: SoftwareRound2Wire = match serde_json::from_str(&decrypted) {
                     Ok(w) => w,
                     Err(_) => continue,
