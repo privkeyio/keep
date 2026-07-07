@@ -366,11 +366,14 @@ fn dispatch_frost_network(
             relay,
             hardware,
             path: dkg_path,
+            identity,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             // Software DKG needs a vault; honor an explicit --path override but
             // otherwise fall back to the globally resolved vault path like every
             // other frost command, instead of erroring on a missing --path.
+            // #674: identity authentication also loads an nsec from the vault,
+            // so BOTH hardware and software paths now require a vault.
             let vault_path = dkg_path.as_deref().or(Some(path));
             commands::frost_network::cmd_frost_network_dkg(
                 out,
@@ -381,6 +384,7 @@ fn dispatch_frost_network(
                 relay,
                 hardware.as_deref(),
                 vault_path,
+                identity.as_deref(),
             )
         }
         FrostNetworkCommands::Sign {
