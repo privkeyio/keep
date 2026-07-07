@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,9 +21,17 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type SpkiHash = [u8; 32];
 
+/// Upper bound on accepted pins per host. A handful covers current + staged
+/// backup keys (RFC 7469); anything larger is treated as corruption.
+pub const MAX_PINS_PER_HOST: usize = 8;
+
 #[derive(Clone, Debug, Default)]
 pub struct CertificatePinSet {
-    pins: HashMap<String, SpkiHash>,
+    /// One or more accepted SPKI hashes per hostname. Multiple pins let an
+    /// operator stage a backup pin (RFC 7469) before rotating a relay's
+    /// certificate, so both the current and next key verify during the
+    /// overlap instead of a rotation hard-failing every connection.
+    pins: HashMap<String, Vec<SpkiHash>>,
 }
 
 impl CertificatePinSet {
@@ -31,25 +39,107 @@ impl CertificatePinSet {
         Self::default()
     }
 
+    /// Add an accepted pin for `hostname`. Additive and de-duplicated: an
+    /// existing pin for the host is retained (so a rotation can pre-stage the
+    /// next key alongside the current one), and adding the same hash twice is
+    /// a no-op. Capped at `MAX_PINS_PER_HOST`; further pins for a full host are
+    /// ignored so the bounded invariant holds for every caller, not just loads.
     pub fn add_pin(&mut self, hostname: String, hash: SpkiHash) {
-        self.pins.insert(hostname, hash);
+        let entry = self.pins.entry(hostname).or_default();
+        if entry.len() < MAX_PINS_PER_HOST && !entry.contains(&hash) {
+            entry.push(hash);
+        }
     }
 
-    pub fn get_pin(&self, hostname: &str) -> Option<&SpkiHash> {
-        self.pins.get(hostname)
+    /// All accepted pins for `hostname` (empty slice if none).
+    pub fn get_pins(&self, hostname: &str) -> &[SpkiHash] {
+        self.pins.get(hostname).map_or(&[], Vec::as_slice)
     }
 
-    pub fn remove_pin(&mut self, hostname: &str) -> Option<SpkiHash> {
+    /// Whether `hostname` has at least one pin (used to gate TOFU).
+    pub fn is_pinned(&self, hostname: &str) -> bool {
+        self.pins.get(hostname).is_some_and(|v| !v.is_empty())
+    }
+
+    pub fn remove_pin(&mut self, hostname: &str) -> Option<Vec<SpkiHash>> {
         self.pins.remove(hostname)
     }
 
-    pub fn pins(&self) -> &HashMap<String, SpkiHash> {
+    pub fn pins(&self) -> &HashMap<String, Vec<SpkiHash>> {
         &self.pins
     }
 
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
     }
+
+    /// Serializable view of the pin set: host -> lowercase hex SPKI hashes.
+    /// Deterministic ordering via `BTreeMap` so persisted files are stable.
+    pub fn to_hex_map(&self) -> BTreeMap<String, Vec<String>> {
+        self.pins
+            .iter()
+            .map(|(host, hashes)| (host.clone(), hashes.iter().map(hex::encode).collect()))
+            .collect()
+    }
+
+    /// Parse a persisted cert-pin JSON object, accepting both the legacy
+    /// single-hash-per-host format and the current per-host list format.
+    ///
+    /// Returns the decoded pin set plus a list of `"host: reason"` strings for
+    /// entries that could not be decoded. Callers that want fail-closed loading
+    /// should reject when the malformed list is non-empty. Failing closed on an
+    /// empty pin list prevents an empty-array downgrade from silently clearing a
+    /// host's pins.
+    pub fn from_json_bytes(
+        bytes: &[u8],
+    ) -> std::result::Result<(Self, Vec<String>), serde_json::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum StoredPins {
+            Single(String),
+            Multiple(Vec<String>),
+        }
+        let map: HashMap<String, StoredPins> = serde_json::from_slice(bytes)?;
+        let mut set = Self::new();
+        let mut malformed = Vec::new();
+        for (hostname, stored) in map {
+            let hashes = match stored {
+                StoredPins::Single(s) => vec![s],
+                StoredPins::Multiple(v) => v,
+            };
+            for (i, hash_hex) in hashes.iter().enumerate() {
+                if i >= MAX_PINS_PER_HOST {
+                    malformed.push(format!("{hostname}: too many pins ({})", hashes.len()));
+                    break;
+                }
+                match hex::decode(hash_hex) {
+                    Ok(raw) => match <[u8; 32]>::try_from(raw) {
+                        Ok(hash) => set.add_pin(hostname.clone(), hash),
+                        Err(raw) => {
+                            malformed.push(format!("{hostname}: invalid length {}", raw.len()))
+                        }
+                    },
+                    Err(e) => malformed.push(format!("{hostname}: hex decode failed: {e}")),
+                }
+            }
+            if hashes.is_empty() {
+                malformed.push(format!("{hostname}: empty pin list"));
+            }
+        }
+        Ok((set, malformed))
+    }
+}
+
+/// Constant-time membership test: does `observed` equal any hash in `expected`?
+///
+/// Folds every comparison without short-circuiting so the match position does
+/// not leak through timing. Do not replace with `==` / `.iter().any()`.
+fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
+    let mut matched = subtle::Choice::from(0u8);
+    for pin in expected {
+        matched |= observed.ct_eq(pin);
+    }
+    bool::from(matched)
 }
 
 pub async fn verify_relay_certificate(
@@ -140,18 +230,21 @@ pub async fn verify_relay_certificate(
 
     let spki_hash = hash_spki(spki_bytes);
 
-    if let Some(expected) = pins.get_pin(&hostname) {
-        if spki_hash.ct_ne(expected).into() {
-            return Err(FrostNetError::CertificatePinMismatch {
-                hostname,
-                expected: "***".into(),
-                actual: hex::encode(spki_hash),
-            });
-        }
-        Ok((spki_hash, None))
-    } else {
-        Ok((spki_hash, Some((hostname, spki_hash))))
+    let expected = pins.get_pins(&hostname);
+    if expected.is_empty() {
+        // Trust-on-first-use: no pin yet, surface the observed hash to pin.
+        return Ok((spki_hash, Some((hostname, spki_hash))));
     }
+    // Accept if the observed hash matches ANY pinned key (current or a staged
+    // backup), using a constant-time fold that does not leak the match position.
+    if !pins_match(&spki_hash, expected) {
+        return Err(FrostNetError::CertificatePinMismatch {
+            hostname,
+            expected: "***".into(),
+            actual: hex::encode(spki_hash),
+        });
+    }
+    Ok((spki_hash, None))
 }
 
 fn hash_spki(spki_der: &[u8]) -> SpkiHash {
@@ -244,12 +337,129 @@ mod tests {
 
         let hash = [42u8; 32];
         pins.add_pin("relay.example.com".into(), hash);
-        assert_eq!(pins.get_pin("relay.example.com"), Some(&hash));
+        assert!(pins.is_pinned("relay.example.com"));
+        assert_eq!(pins.get_pins("relay.example.com"), &[hash]);
         assert!(!pins.is_empty());
 
         let removed = pins.remove_pin("relay.example.com");
-        assert_eq!(removed, Some(hash));
+        assert_eq!(removed, Some(vec![hash]));
         assert!(pins.is_empty());
+    }
+
+    #[test]
+    fn test_multi_pin_for_rotation() {
+        // A host can hold a current pin plus a staged backup; adding is
+        // additive and de-duplicated, and both are accepted.
+        let mut pins = CertificatePinSet::new();
+        let current = [1u8; 32];
+        let backup = [2u8; 32];
+        pins.add_pin("relay.example.com".into(), current);
+        pins.add_pin("relay.example.com".into(), backup);
+        pins.add_pin("relay.example.com".into(), current); // dedup, no-op
+        assert_eq!(pins.get_pins("relay.example.com"), &[current, backup]);
+        assert!(pins.get_pins("other.example.com").is_empty());
+        assert!(!pins.is_pinned("other.example.com"));
+    }
+
+    #[test]
+    fn test_add_pin_enforces_max_per_host() {
+        let mut pins = CertificatePinSet::new();
+        for i in 0..(MAX_PINS_PER_HOST as u8 + 3) {
+            pins.add_pin("relay.example.com".into(), [i; 32]);
+        }
+        assert_eq!(pins.get_pins("relay.example.com").len(), MAX_PINS_PER_HOST);
+    }
+
+    #[test]
+    fn test_pins_match_first_pin() {
+        let observed = [7u8; 32];
+        assert!(pins_match(&observed, &[[7u8; 32], [8u8; 32]]));
+    }
+
+    #[test]
+    fn test_pins_match_backup_pin() {
+        let observed = [8u8; 32];
+        assert!(pins_match(&observed, &[[7u8; 32], [8u8; 32]]));
+    }
+
+    #[test]
+    fn test_pins_match_rejects_unknown() {
+        let observed = [9u8; 32];
+        assert!(!pins_match(&observed, &[[7u8; 32], [8u8; 32]]));
+    }
+
+    #[test]
+    fn test_pins_match_empty_expected() {
+        assert!(!pins_match(&[7u8; 32], &[]));
+    }
+
+    #[test]
+    fn test_from_json_legacy_single_string() {
+        let hex = hex::encode([0x42u8; 32]);
+        let json = format!(r#"{{"relay.example.com":"{hex}"}}"#);
+        let (pins, malformed) = CertificatePinSet::from_json_bytes(json.as_bytes()).unwrap();
+        assert!(malformed.is_empty());
+        assert_eq!(pins.get_pins("relay.example.com"), &[[0x42u8; 32]]);
+    }
+
+    #[test]
+    fn test_from_json_list_format() {
+        let a = hex::encode([0x11u8; 32]);
+        let b = hex::encode([0x22u8; 32]);
+        let json = format!(r#"{{"relay.example.com":["{a}","{b}"]}}"#);
+        let (pins, malformed) = CertificatePinSet::from_json_bytes(json.as_bytes()).unwrap();
+        assert!(malformed.is_empty());
+        assert_eq!(
+            pins.get_pins("relay.example.com"),
+            &[[0x11u8; 32], [0x22u8; 32]]
+        );
+    }
+
+    #[test]
+    fn test_from_json_empty_array_is_malformed() {
+        let json = r#"{"relay.example.com":[]}"#;
+        let (pins, malformed) = CertificatePinSet::from_json_bytes(json.as_bytes()).unwrap();
+        assert!(!pins.is_pinned("relay.example.com"));
+        assert!(malformed.iter().any(|m| m.contains("empty pin list")));
+    }
+
+    #[test]
+    fn test_from_json_over_cap_is_malformed() {
+        let pins_hex: Vec<String> = (0..MAX_PINS_PER_HOST + 2)
+            .map(|i| hex::encode([i as u8; 32]))
+            .collect();
+        let json = serde_json::json!({ "relay.example.com": pins_hex }).to_string();
+        let (pins, malformed) = CertificatePinSet::from_json_bytes(json.as_bytes()).unwrap();
+        assert_eq!(pins.get_pins("relay.example.com").len(), MAX_PINS_PER_HOST);
+        assert!(malformed.iter().any(|m| m.contains("too many pins")));
+    }
+
+    #[test]
+    fn test_from_json_malformed_hex_and_length() {
+        let valid = hex::encode([0x42u8; 32]);
+        let json = format!(
+            r#"{{"bad.example.com":"nothex","short.example.com":"aabb","good.example.com":"{valid}"}}"#
+        );
+        let (pins, malformed) = CertificatePinSet::from_json_bytes(json.as_bytes()).unwrap();
+        assert_eq!(pins.get_pins("good.example.com"), &[[0x42u8; 32]]);
+        assert!(!pins.is_pinned("bad.example.com"));
+        assert!(!pins.is_pinned("short.example.com"));
+        assert!(malformed.iter().any(|m| m.contains("hex decode failed")));
+        assert!(malformed.iter().any(|m| m.contains("invalid length")));
+    }
+
+    #[test]
+    fn test_to_hex_map_roundtrip() {
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("relay.example.com".into(), [0x01u8; 32]);
+        pins.add_pin("relay.example.com".into(), [0x02u8; 32]);
+        let json = serde_json::to_vec(&pins.to_hex_map()).unwrap();
+        let (restored, malformed) = CertificatePinSet::from_json_bytes(&json).unwrap();
+        assert!(malformed.is_empty());
+        assert_eq!(
+            restored.get_pins("relay.example.com"),
+            &[[0x01u8; 32], [0x02u8; 32]]
+        );
     }
 
     #[test]

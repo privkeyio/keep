@@ -76,7 +76,7 @@ pub(crate) async fn verify_relay_certificates(
             let mut guard = certificate_pins
                 .lock()
                 .map_err(|_| ConnectionError::Other("Pin lock poisoned".to_string()))?;
-            if guard.get_pin(&hostname).is_none() {
+            if !guard.is_pinned(&hostname) {
                 guard.add_pin(hostname, hash);
             }
             let pins_snapshot = guard.clone();

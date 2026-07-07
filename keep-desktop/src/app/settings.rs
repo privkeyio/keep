@@ -234,7 +234,11 @@ impl App {
         let mut entries: Vec<(String, String)> = pins
             .pins()
             .iter()
-            .map(|(host, hash)| (host.clone(), hex::encode(hash)))
+            .flat_map(|(host, hashes)| {
+                hashes
+                    .iter()
+                    .map(move |hash| (host.clone(), hex::encode(hash)))
+            })
             .collect();
         entries.sort_unstable();
         entries
