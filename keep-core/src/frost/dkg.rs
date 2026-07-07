@@ -569,6 +569,114 @@ mod tests {
         assert!(SoftwareDkgSession::init(2, 3, 4).is_err());
     }
 
+    /// An n-of-n group (threshold == participants) completes DKG and its full
+    /// set of shares aggregates a valid signature.
+    #[test]
+    fn end_to_end_3_of_3_software_dkg() {
+        run_group(3, 3);
+    }
+
+    /// Two 2-of-2 sessions advanced through the round1 exchange and round2
+    /// emission, each in `AwaitingRound2` and holding the other's round2 wires.
+    /// `a`'s wires carry `sender_index == 1`, `b`'s carry `sender_index == 2`.
+    type Round2Wires = Vec<(u16, SoftwareRound2Wire)>;
+
+    fn advanced_2of2() -> (
+        SoftwareDkgSession,
+        SoftwareDkgSession,
+        Round2Wires,
+        Round2Wires,
+    ) {
+        let mut a = SoftwareDkgSession::init(2, 2, 1).unwrap();
+        let mut b = SoftwareDkgSession::init(2, 2, 2).unwrap();
+        let aw = a.round1().unwrap();
+        let bw = b.round1().unwrap();
+        a.round1_peer(&bw).unwrap();
+        b.round1_peer(&aw).unwrap();
+        let a2 = a.round2().unwrap();
+        let b2 = b.round2().unwrap();
+        (a, b, a2, b2)
+    }
+
+    /// Peer drop mid-round-2: a participant that never receives one peer's
+    /// round2 share must refuse to finalize rather than derive a key from an
+    /// incomplete set.
+    #[test]
+    fn finalize_refuses_when_a_peer_round2_share_is_missing() {
+        let mut sessions: Vec<SoftwareDkgSession> = (1..=3)
+            .map(|idx| SoftwareDkgSession::init(2, 3, idx).unwrap())
+            .collect();
+        let round1_wires: Vec<SoftwareRound1Wire> =
+            sessions.iter_mut().map(|s| s.round1().unwrap()).collect();
+        for (i, session) in sessions.iter_mut().enumerate() {
+            for (j, wire) in round1_wires.iter().enumerate() {
+                if i != j {
+                    session.round1_peer(wire).unwrap();
+                }
+            }
+        }
+        let per_session_round2: Vec<Vec<(u16, SoftwareRound2Wire)>> =
+            sessions.iter_mut().map(|s| s.round2().unwrap()).collect();
+
+        // Deliver to participant 1 only participant 2's share; participant 3's
+        // share is intentionally dropped.
+        for (recipient_index, wire) in &per_session_round2[1] {
+            if *recipient_index == 1 {
+                sessions[0].receive_share(wire).unwrap();
+            }
+        }
+
+        // `SoftwareDkgResult` holds key material and is intentionally not
+        // `Debug`, so match on the error directly rather than `expect_err`.
+        assert!(
+            matches!(sessions[0].finalize(), Err(KeepError::Frost(_))),
+            "a missing peer round2 share must refuse finalize"
+        );
+    }
+
+    /// A peer sending two round2 shares is refused; a late substitution could
+    /// otherwise bias the recipient's key material.
+    #[test]
+    fn duplicate_round2_share_refused() {
+        let (mut a, _b, _a2, b2) = advanced_2of2();
+        // b2 carries b's share destined for recipient 1 (a).
+        let (recipient, wire) = &b2[0];
+        assert_eq!(*recipient, 1);
+        a.receive_share(wire).unwrap();
+        let err = a
+            .receive_share(wire)
+            .expect_err("duplicate round2 share must be refused");
+        assert!(matches!(err, KeepError::Frost(_)));
+    }
+
+    /// A round2 share whose `sender_index` equals our own is refused, so a
+    /// participant cannot be tricked into mixing its own share back in.
+    #[test]
+    fn round2_share_echoing_our_index_refused() {
+        let (mut a, _b, a2, _b2) = advanced_2of2();
+        // a2 is a's own share (sender_index == 1) destined for recipient 2.
+        let (_recipient, own_wire) = &a2[0];
+        assert_eq!(own_wire.sender_index, 1);
+        let err = a
+            .receive_share(own_wire)
+            .expect_err("a self-echoed round2 share must be refused");
+        assert!(matches!(err, KeepError::Frost(_)));
+    }
+
+    /// `receive_share` before `round2` (wrong state) is refused without
+    /// corrupting session state.
+    #[test]
+    fn receive_share_out_of_order_refused() {
+        let (_a, _b, _a2, b2) = advanced_2of2();
+        let (_recipient, wire) = &b2[0];
+        // A fresh session is still in the initial state, not AwaitingRound2.
+        let mut fresh = SoftwareDkgSession::init(2, 2, 1).unwrap();
+        let err = fresh
+            .receive_share(wire)
+            .expect_err("receive_share before round2 must be refused");
+        assert!(matches!(err, KeepError::Frost(_)));
+    }
+
     #[test]
     fn identifier_round_trip() {
         for idx in [1u16, 2, 5, 42, 255, 300, 1000, 65535] {
