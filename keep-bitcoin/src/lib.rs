@@ -28,8 +28,7 @@ pub use chain_view::{
 };
 pub use descriptor::{
     descriptor_address, descriptor_address_at_index, descriptor_script_pubkey,
-    multipath_from_external, xpub_to_x_only,
-    DescriptorExport,
+    multipath_from_external, xpub_to_x_only, DescriptorExport,
 };
 pub use error::{BitcoinError, Result};
 pub use key_proof::{build_key_proof_psbt, sign_key_proof, verify_key_proof};

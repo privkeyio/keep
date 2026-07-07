@@ -427,8 +427,11 @@ mod tests {
                 ChildNumber::from_normal_idx(leaf).unwrap(),
             ]);
             let derived_change_xpub = xpub.derive_pub(&secp, &change_path).unwrap();
-            let change_pubkey_descriptor =
-                derived_change_xpub.public_key.x_only_public_key().0.serialize();
+            let change_pubkey_descriptor = derived_change_xpub
+                .public_key
+                .x_only_public_key()
+                .0
+                .serialize();
 
             assert_eq!(
                 change_pubkey_descriptor, change_pubkey_bip32_signing,
@@ -443,8 +446,7 @@ mod tests {
     #[test]
     fn frost_wallet_mainnet_descriptor_uses_coin_type_0() {
         let group = test_group_pubkey();
-        let export =
-            DescriptorExport::from_frost_wallet(&group, None, Network::Bitcoin).unwrap();
+        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Bitcoin).unwrap();
 
         let fingerprint = export.fingerprint;
         assert!(
