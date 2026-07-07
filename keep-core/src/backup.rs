@@ -236,7 +236,7 @@ pub fn create_backup_from_data(
     let mut json_bytes = serde_json::to_vec(&backup)
         .map_err(|e| KeepError::Other(format!("backup serialization failed: {e}")))?;
 
-    let salt: [u8; SALT_SIZE] = entropy::random_bytes();
+    let salt: [u8; SALT_SIZE] = entropy::try_random_bytes()?;
     let params = Argon2Params::DEFAULT;
     let key = crypto::derive_key(passphrase.as_bytes(), &salt, params)?;
     let encrypted = crypto::encrypt(&json_bytes, &key)?;
@@ -549,7 +549,7 @@ pub fn restore_backup(
         return Err(KeepError::AlreadyExists(target.display().to_string()));
     }
 
-    let rand_suffix: [u8; 8] = entropy::random_bytes();
+    let rand_suffix: [u8; 8] = entropy::try_random_bytes()?;
     let temp_name = format!(
         "{}.restore-{}",
         target

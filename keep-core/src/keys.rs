@@ -45,7 +45,7 @@ impl NostrKeypair {
     pub fn generate() -> Result<Self> {
         const MAX_RETRIES: usize = 64;
         for _ in 0..MAX_RETRIES {
-            let mut secret_bytes: [u8; 32] = crypto::random_bytes();
+            let mut secret_bytes: [u8; 32] = crypto::try_random_bytes()?;
             if let Ok(signing_key) = SigningKey::from_bytes(&secret_bytes) {
                 let verifying_key = signing_key.verifying_key();
                 return Ok(Self {
@@ -306,10 +306,10 @@ pub mod nip49 {
         }
         let password_nfkc = Zeroizing::new(password.nfkc().collect::<String>());
 
-        let salt: [u8; 16] = entropy::random_bytes();
+        let salt: [u8; 16] = entropy::try_random_bytes()?;
         let symmetric_key = derive_key(&password_nfkc, &salt, log_n)?;
 
-        let nonce: [u8; 24] = entropy::random_bytes();
+        let nonce: [u8; 24] = entropy::try_random_bytes()?;
         let key_security_byte: u8 = 0x01;
 
         let cipher = XChaCha20Poly1305::new_from_slice(symmetric_key.as_ref())

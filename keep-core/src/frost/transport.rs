@@ -54,7 +54,7 @@ impl ShareExport {
         ciphersuite: Ciphersuite,
         passphrase: &str,
     ) -> Result<Self> {
-        let salt: [u8; 32] = crypto::random_bytes();
+        let salt: [u8; 32] = crypto::try_random_bytes()?;
         let key = crypto::derive_key(passphrase.as_bytes(), &salt, crypto::Argon2Params::DEFAULT)?;
 
         let key_bytes = share.key_package_bytes().to_vec();
