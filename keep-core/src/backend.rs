@@ -168,6 +168,9 @@ impl RedbBackend {
             RELAY_CONFIGS_TABLE,
             CONFIG_TABLE,
             HEALTH_STATUS_TABLE,
+            // Carried through a file-format upgrade so the keep-state rollback-guard high-water-marks
+            // survive; otherwise they reset and the guard reverts to first-sync (TOFU) for every d-tag.
+            STATE_VERSIONS_TABLE,
         ];
 
         type TableEntries = Vec<(Vec<u8>, Vec<u8>)>;

@@ -92,6 +92,12 @@ pub fn parse_state_event(keys: &Keys, event: &Event) -> Result<Option<StateRecor
     if event.kind != Kind::Custom(KEEP_STATE_KIND) {
         return Ok(None);
     }
+    // Verify the id + signature here rather than trusting the relay pool to have done it: the entire
+    // rollback guard -- authorship AND the unforgeable created_at -- rests on the event being genuinely
+    // signed by the shared identity, so make this function sound on its own regardless of the caller.
+    if event.verify().is_err() {
+        return Ok(None);
+    }
     // Authenticate authorship against the shared cluster identity, not just the subscription filter:
     // relays are untrusted and can deliver events the filter should have excluded. Without this, a
     // tombstone signed by any keypair would be accepted and delete standby records (records are also

@@ -309,11 +309,13 @@ impl Storage {
         created_at: u64,
     ) -> Result<bool> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
-        if !self.accept_state_version(table, record_id, created_at)? {
+        let vkey = Self::state_version_key(table_name, &key);
+        if !self.state_version_is_newer(&vkey, created_at)? {
             return Ok(false);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         backend.put(table_name, &key, encrypted)?;
+        self.advance_state_version(&vkey, created_at)?;
         Ok(true)
     }
 
@@ -326,24 +328,36 @@ impl Storage {
         created_at: u64,
     ) -> Result<bool> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
-        if !self.accept_state_version(table, record_id, created_at)? {
+        let vkey = Self::state_version_key(table_name, &key);
+        if !self.state_version_is_newer(&vkey, created_at)? {
             return Ok(false);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         backend.delete(table_name, &key)?;
+        self.advance_state_version(&vkey, created_at)?;
         Ok(true)
     }
 
-    /// keep-state rollback guard. Returns `true` (and records the new high-water-mark) if `created_at`
-    /// is strictly newer than the highest previously applied for this record's d-tag; `false` if it is
-    /// stale or a replay and must be ignored. `created_at` lives in the SIGNED event, so a malicious
-    /// relay cannot forge a newer one, and persisting the mark keeps the guard across restarts.
-    fn accept_state_version(&self, table: &str, record_id: &str, created_at: u64) -> Result<bool> {
+    /// The rollback-guard high-water-mark key for a replicated record: the backend table name joined to
+    /// the DECODED record key bytes (not the hex string), so it can never diverge from the storage row
+    /// key for a non-canonically-encoded id. Table names are a fixed allowlist with no `:`, so the join
+    /// is unambiguous.
+    fn state_version_key(table_name: &str, key: &[u8]) -> Vec<u8> {
+        let mut vkey = Vec::with_capacity(table_name.len() + 1 + key.len());
+        vkey.extend_from_slice(table_name.as_bytes());
+        vkey.push(b':');
+        vkey.extend_from_slice(key);
+        vkey
+    }
+
+    /// keep-state rollback guard (read-only): `true` if `created_at` is strictly newer than the highest
+    /// previously applied for this d-tag, `false` if it is stale or a replay and must be ignored.
+    /// `created_at` lives in the SIGNED event, so a malicious relay cannot forge a newer one.
+    fn state_version_is_newer(&self, vkey: &[u8], created_at: u64) -> Result<bool> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         // Lazily ensure the table exists so a vault created before this guard migrates transparently.
         backend.create_table(STATE_VERSIONS_TABLE)?;
-        let vkey = format!("{table}:{record_id}").into_bytes();
-        if let Some(prev) = backend.get(STATE_VERSIONS_TABLE, &vkey)? {
+        if let Some(prev) = backend.get(STATE_VERSIONS_TABLE, vkey)? {
             let prev_ts = u64::from_be_bytes(prev.as_slice().try_into().map_err(|_| {
                 KeepError::Other("corrupt keep-state version high-water-mark".to_string())
             })?);
@@ -351,8 +365,16 @@ impl Storage {
                 return Ok(false);
             }
         }
-        backend.put(STATE_VERSIONS_TABLE, &vkey, &created_at.to_be_bytes())?;
         Ok(true)
+    }
+
+    /// Persist the high-water-mark. Called AFTER the data write, so a failed data write never advances
+    /// the mark and strands a version: the same event replayed later still applies (the guard tolerates
+    /// an idempotent re-apply) instead of being permanently rejected as stale.
+    fn advance_state_version(&self, vkey: &[u8], created_at: u64) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.put(STATE_VERSIONS_TABLE, vkey, &created_at.to_be_bytes())?;
+        Ok(())
     }
 
     /// Resolve a replicated `(table, record_id)` to its backend table and raw key: maps the logical

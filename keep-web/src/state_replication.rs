@@ -8,6 +8,13 @@
 //! reconstructs each record into its own storage, so a promoted standby serves the same keep secrets.
 //! Single-writer: the active publishes, the standby consumes; roles flip on promotion (the node is
 //! restarted with the new `KEEP_STATE_ROLE`).
+//!
+//! Rollback protection: each event carries the signed `created_at`, and the consumer keeps a persisted
+//! per-d-tag high-water-mark (keep-core `state_versions`), rejecting anything not strictly newer, so an
+//! untrusted relay cannot replay a stale record/tombstone to roll a synced standby back. Residual risks
+//! it does NOT cover (untrusted-relay + no-liveness model): a relay may still WITHHOLD a newer record or
+//! a tombstone (keeping a revoked key live), and on FIRST sync it may serve an arbitrarily old but
+//! validly-signed version (TOFU) -- detecting omission needs a signed cluster manifest/epoch (keep-0kzy).
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
