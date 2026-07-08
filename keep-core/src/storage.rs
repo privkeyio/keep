@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
 
 use crate::backend::{
-    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
-    RELAY_CONFIGS_TABLE, SHARES_TABLE,
+    AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
+    KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -298,24 +298,119 @@ impl Storage {
     /// the standby shares the vault key, so it later decrypts them like its own. Never notifies the
     /// publisher, so a consumed record is not echoed back to the relay. Rejects any table but the three
     /// replicated ones, so a hostile or buggy peer cannot write `shares` or node-local state.
+    /// `created_at` is the replicated event's signed timestamp; the record is applied only if it is
+    /// strictly newer than the highest already applied for this d-tag (rollback/replay guard). Returns
+    /// `true` if applied, `false` if ignored as stale.
     pub fn apply_replicated_record(
         &self,
         table: &str,
         record_id: &str,
         encrypted: &[u8],
-    ) -> Result<()> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        created_at: u64,
+    ) -> Result<bool> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
-        backend.put(table_name, &key, encrypted)?;
-        Ok(())
+        let vkey = Self::state_version_key(table_name, &key);
+        if !self.state_version_is_newer(&vkey, created_at)? {
+            return Ok(false);
+        }
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        // Write the data row and advance the high-water-mark in ONE atomic transaction: if these were
+        // two writes a crash between them would strand the mark BEHIND the data, and an untrusted relay
+        // could then replay an intermediate validly-signed version to roll the record back.
+        let ts = created_at.to_be_bytes();
+        backend.write_atomic(&[
+            AtomicOp {
+                table: table_name,
+                key: &key,
+                value: Some(encrypted),
+            },
+            AtomicOp {
+                table: STATE_VERSIONS_TABLE,
+                key: &vkey,
+                value: Some(&ts),
+            },
+        ])?;
+        Ok(true)
     }
 
-    /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher.
-    pub fn apply_replicated_delete(&self, table: &str, record_id: &str) -> Result<()> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+    /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher. Same rollback
+    /// guard as `apply_replicated_record`; returns `true` if applied, `false` if ignored as stale.
+    pub fn apply_replicated_delete(
+        &self,
+        table: &str,
+        record_id: &str,
+        created_at: u64,
+    ) -> Result<bool> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
-        backend.delete(table_name, &key)?;
-        Ok(())
+        let vkey = Self::state_version_key(table_name, &key);
+        if !self.state_version_is_newer(&vkey, created_at)? {
+            return Ok(false);
+        }
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        // Tombstone and mark advance in one atomic transaction; see `apply_replicated_record`.
+        let ts = created_at.to_be_bytes();
+        backend.write_atomic(&[
+            AtomicOp {
+                table: table_name,
+                key: &key,
+                value: None,
+            },
+            AtomicOp {
+                table: STATE_VERSIONS_TABLE,
+                key: &vkey,
+                value: Some(&ts),
+            },
+        ])?;
+        Ok(true)
+    }
+
+    /// The rollback-guard high-water-mark key for a replicated record: the backend table name joined to
+    /// the DECODED record key bytes (not the hex string), so it can never diverge from the storage row
+    /// key for a non-canonically-encoded id. Table names are a fixed allowlist with no `:`, so the join
+    /// is unambiguous.
+    fn state_version_key(table_name: &str, key: &[u8]) -> Vec<u8> {
+        let mut vkey = Vec::with_capacity(table_name.len() + 1 + key.len());
+        vkey.extend_from_slice(table_name.as_bytes());
+        vkey.push(b':');
+        vkey.extend_from_slice(key);
+        vkey
+    }
+
+    /// keep-state rollback guard (read-only): `true` if `created_at` is strictly newer than the highest
+    /// previously applied for this d-tag, `false` if it is stale or a replay and must be ignored.
+    /// `created_at` lives in the SIGNED event, so a malicious relay cannot forge a newer one.
+    fn state_version_is_newer(&self, vkey: &[u8], created_at: u64) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        // Lazily ensure the table exists so a vault created before this guard migrates transparently.
+        backend.create_table(STATE_VERSIONS_TABLE)?;
+        if let Some(prev) = backend.get(STATE_VERSIONS_TABLE, vkey)? {
+            let prev_ts = u64::from_be_bytes(prev.as_slice().try_into().map_err(|_| {
+                KeepError::Other("corrupt keep-state version high-water-mark".to_string())
+            })?);
+            if created_at <= prev_ts {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The highest keep-state high-water-mark persisted in this vault, or 0 if none. A promoted standby
+    /// (restarted as active) seeds its publisher's per-d-tag monotonic floor from this so a fresh publish
+    /// is strictly newer than every mark standbys already applied. Fails closed to 0 only on an empty or
+    /// absent table; a corrupt (non-8-byte) entry propagates a decode error, consistent with
+    /// `state_version_is_newer`.
+    pub fn max_state_version(&self) -> Result<u64> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        // The read path cannot create the table (redb read txns cannot), so ensure it exists first.
+        backend.create_table(STATE_VERSIONS_TABLE)?;
+        let mut max = 0u64;
+        for (_, v) in backend.list(STATE_VERSIONS_TABLE)? {
+            let ts = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
+                KeepError::Other("corrupt keep-state version high-water-mark".to_string())
+            })?);
+            max = max.max(ts);
+        }
+        Ok(max)
     }
 
     /// Resolve a replicated `(table, record_id)` to its backend table and raw key: maps the logical
@@ -416,6 +511,7 @@ impl Storage {
         backend.create_table(RELAY_CONFIGS_TABLE)?;
         backend.create_table(CONFIG_TABLE)?;
         backend.create_table(HEALTH_STATUS_TABLE)?;
+        backend.create_table(STATE_VERSIONS_TABLE)?;
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -1626,39 +1722,128 @@ mod tests {
 
         // Applying the replicated bytes reconstructs a loadable record (same vault key decrypts them).
         storage
-            .apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+            .apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
             .unwrap();
         assert_eq!(storage.load_key(&record.id).unwrap().name, "replicated");
 
         // A non-replicable table (shares / node-local / unknown) is refused, so a peer cannot write it.
         assert!(storage
-            .apply_replicated_record("shares", &hex::encode(record.id), &encrypted)
+            .apply_replicated_record("shares", &hex::encode(record.id), &encrypted, 1)
             .is_err());
         assert!(storage
-            .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted)
+            .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted, 1)
             .is_err());
 
         // A descriptor key of the wrong length is refused: the listing/lookup path fails closed on any
         // non-36-byte descriptor row, so accepting one would poison list_descriptors for the vault.
         assert!(storage
-            .apply_replicated_record("descriptors", &hex::encode([0u8; 20]), &encrypted)
+            .apply_replicated_record("descriptors", &hex::encode([0u8; 20]), &encrypted, 1)
             .is_err());
         assert!(storage
-            .apply_replicated_delete("descriptors", &hex::encode([0u8; 20]))
+            .apply_replicated_delete("descriptors", &hex::encode([0u8; 20]), 1)
             .is_err());
         // A correctly-sized 36-byte descriptor key is accepted.
         assert!(storage
-            .apply_replicated_record("descriptors", &hex::encode([0u8; 36]), &encrypted)
+            .apply_replicated_record("descriptors", &hex::encode([0u8; 36]), &encrypted, 1)
             .is_ok());
 
         // A replicated delete removes it, and never echoes to the publisher: the only recorded delete
         // is the earlier real delete_key, not this apply.
         let deletes_before = publisher.deletes.lock().unwrap().len();
         storage
-            .apply_replicated_delete("keys", &hex::encode(record.id))
+            .apply_replicated_delete("keys", &hex::encode(record.id), 2)
             .unwrap();
         assert!(storage.load_key(&record.id).is_err());
         assert_eq!(publisher.deletes.lock().unwrap().len(), deletes_before);
+    }
+
+    #[test]
+    fn replicated_apply_rejects_stale_created_at() {
+        // The rollback guard: an event not strictly newer than the highest applied for its d-tag is
+        // ignored, so an untrusted relay cannot replay a stale record/delete to roll a standby back.
+        // created_at is the SIGNED event timestamp and cannot be forged to look newer.
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "passwordX", Argon2Params::TESTING).unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+        let mk = |name: &str| {
+            KeyRecord::new(
+                [9u8; 32],
+                crate::keys::KeyType::Nostr,
+                name.into(),
+                vec![1, 2, 3],
+            )
+        };
+        storage.store_key(&mk("v1")).unwrap();
+        let enc_v1 = publisher.last_bytes.lock().unwrap().clone();
+        storage.store_key(&mk("v2")).unwrap();
+        let enc_v2 = publisher.last_bytes.lock().unwrap().clone();
+        let id = hex::encode([9u8; 32]);
+
+        // Apply v2 at created_at=100.
+        assert!(storage
+            .apply_replicated_record("keys", &id, &enc_v2, 100)
+            .unwrap());
+        assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
+
+        // An older replay is rejected and does NOT roll the record back to v1.
+        assert!(!storage
+            .apply_replicated_record("keys", &id, &enc_v1, 50)
+            .unwrap());
+        assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
+        // The SAME created_at is also rejected (idempotent, no rollback).
+        assert!(!storage
+            .apply_replicated_record("keys", &id, &enc_v1, 100)
+            .unwrap());
+        assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
+
+        // A strictly-newer delete IS applied, and a stale record cannot resurrect the deleted row.
+        assert!(storage.apply_replicated_delete("keys", &id, 200).unwrap());
+        assert!(storage.load_key(&[9u8; 32]).is_err());
+        assert!(!storage
+            .apply_replicated_record("keys", &id, &enc_v1, 150)
+            .unwrap());
+        assert!(storage.load_key(&[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn apply_replicated_record_fails_closed_on_corrupt_high_water_mark() {
+        // A non-8-byte high-water-mark cannot be decoded to a u64: the guard must propagate the decode
+        // error (fail closed) rather than silently treating it as first-sync and applying the event.
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "passwordX", Argon2Params::TESTING).unwrap();
+
+        let record = KeyRecord::new(
+            [3u8; 32],
+            crate::keys::KeyType::Nostr,
+            "corrupt".into(),
+            vec![1, 2, 3],
+        );
+        let id = hex::encode([3u8; 32]);
+        let vkey = Storage::state_version_key(KEYS_TABLE, &[3u8; 32]);
+        storage
+            .backend
+            .as_ref()
+            .unwrap()
+            .put(STATE_VERSIONS_TABLE, &vkey, &[1, 2, 3])
+            .unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+        storage.store_key(&record).unwrap();
+        let encrypted = publisher.last_bytes.lock().unwrap().clone();
+        storage.delete_key(&record.id).unwrap();
+
+        let err = storage
+            .apply_replicated_record("keys", &id, &encrypted, 100)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeepError::Other(m) if m == "corrupt keep-state version high-water-mark"),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1696,13 +1881,13 @@ mod tests {
         a.store_key(&record).unwrap();
         let encrypted = publisher.last_bytes.lock().unwrap().clone();
 
-        b.apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+        b.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
             .unwrap();
         assert_eq!(b.load_key(&record.id).unwrap().name, "shared");
 
         // Sanity: WITHOUT the shared key, a third vault cannot decrypt the same bytes.
         let c = Storage::create(&dir.path().join("c"), "passwordC", Argon2Params::TESTING).unwrap();
-        c.apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+        c.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
             .unwrap();
         assert!(c.load_key(&record.id).is_err());
     }

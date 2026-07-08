@@ -8,6 +8,19 @@
 //! reconstructs each record into its own storage, so a promoted standby serves the same keep secrets.
 //! Single-writer: the active publishes, the standby consumes; roles flip on promotion (the node is
 //! restarted with the new `KEEP_STATE_ROLE`).
+//!
+//! Rollback protection: each event carries the signed `created_at`, and the consumer keeps a persisted
+//! per-d-tag high-water-mark (keep-core `state_versions`), rejecting anything not strictly newer, so an
+//! untrusted relay cannot replay a stale record/tombstone to roll a synced standby back. Residual risks
+//! it does NOT cover (untrusted-relay + no-liveness model): a relay may still WITHHOLD a newer record or
+//! a tombstone (keeping a revoked key live), and on FIRST sync it may serve an arbitrarily old but
+//! validly-signed version (TOFU) -- detecting omission needs a signed cluster manifest/epoch.
+//!
+//! Operational requirement: the active node's wall clock must be monotonic and must not regress below
+//! any `created_at` it has already published, because each per-d-tag mark only advances, so a forward
+//! clock jump followed by a correction makes the consumer reject legitimate newer writes until wall-clock
+//! catches up. Seeding the publisher floor from stored marks covers a promoted standby, but not a live
+//! active whose own clock regresses.
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
@@ -94,21 +107,71 @@ pub async fn spawn(
     Ok(())
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Compute the strictly-monotonic per-d-tag `created_at` for the next publish. `last` is the in-memory
+/// per-d-tag high-water-mark, seeded at startup from the persisted floor (see `spawn_publisher`). A new
+/// slot starts at `floor`; each write returns `now` unless that is not strictly greater than the last
+/// timestamp, in which case it bumps to `last + 1` (`saturating_add` so it cannot overflow).
+fn next_ts(
+    last: &mut std::collections::HashMap<String, u64>,
+    dtag: &str,
+    floor: u64,
+    now: u64,
+) -> u64 {
+    let slot = last.entry(dtag.to_string()).or_insert(floor);
+    let ts = now.max(slot.saturating_add(1));
+    *slot = ts;
+    ts
+}
+
 async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
     keep.lock()
         .await
         .set_state_publisher(Arc::new(ChannelPublisher { tx }));
 
+    // Seed the per-d-tag monotonic floor from the highest mark this node has already persisted. On a
+    // promoted standby (restarted as active) whose stored marks were inflated above wall-clock
+    // (same-second bumps) or under inter-node clock skew, starting from 0 could publish a created_at
+    // <= a mark standbys already applied and be rejected; seeding guarantees the first publish for any
+    // d-tag is strictly greater than every previously-applied mark.
+    let floor = match keep.lock().await.max_state_version() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "keep-state: could not read persisted high-water floor, seeding from 0: {e}"
+            );
+            0
+        }
+    };
+
     tokio::spawn(async move {
+        // `last_ts` is an in-memory per-d-tag high-water-mark seeded from `floor` (the persisted mark).
+        // Within a run it guarantees strict per-d-tag monotonicity of created_at: a record and its
+        // immediate delete (or two rapid writes) must not collide on the same second, or the relay's
+        // created_at dedup could keep the wrong one and the standby's rollback guard would reject the
+        // newer as "not newer". Same-second writes bump to last+1; otherwise wall-clock is used.
+        let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         while let Some(change) = rx.recv().await {
+            let dtag = match &change {
+                Change::Record { table, id, .. } | Change::Delete { table, id } => {
+                    format!("{table}:{id}")
+                }
+            };
+            let ts = next_ts(&mut last_ts, &dtag, floor, now_secs());
             let event = match &change {
                 Change::Record {
                     table,
                     id,
                     encrypted,
-                } => state_record_event(&identity, table, id, encrypted),
-                Change::Delete { table, id } => state_tombstone_event(&identity, table, id),
+                } => state_record_event(&identity, table, id, encrypted, ts),
+                Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
             };
             match event {
                 Ok(ev) => {
@@ -159,13 +222,30 @@ async fn spawn_consumer(
                     Ok(Some(rec)) => {
                         let k = keep.lock().await;
                         let outcome = match rec.content {
-                            Some(bytes) => {
-                                k.apply_replicated_record(&rec.table, &rec.record_id, &bytes)
-                            }
-                            None => k.apply_replicated_delete(&rec.table, &rec.record_id),
+                            Some(bytes) => k.apply_replicated_record(
+                                &rec.table,
+                                &rec.record_id,
+                                &bytes,
+                                rec.created_at,
+                            ),
+                            None => k.apply_replicated_delete(
+                                &rec.table,
+                                &rec.record_id,
+                                rec.created_at,
+                            ),
                         };
-                        if let Err(e) = outcome {
-                            tracing::warn!(table = %rec.table, "keep-state apply failed: {e}");
+                        match outcome {
+                            Ok(true) => {}
+                            // Not strictly newer than what we already applied: a stale or replayed event
+                            // (rollback attempt from an untrusted relay). Ignore it, but record it.
+                            Ok(false) => tracing::warn!(
+                                table = %rec.table,
+                                created_at = rec.created_at,
+                                "keep-state: ignored stale/replayed event (rollback guard)"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(table = %rec.table, "keep-state apply failed: {e}")
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -183,6 +263,24 @@ mod tests {
     use keep_core::crypto::Argon2Params;
     use keep_core::{Keep, RelayConfig};
     use nostr_relay_builder::MockRelay;
+    use std::collections::HashMap;
+
+    #[test]
+    fn next_ts_is_strictly_monotonic_per_dtag() {
+        let mut last: HashMap<String, u64> = HashMap::new();
+
+        // (a) first write for a d-tag with floor 0 returns wall-clock.
+        assert_eq!(next_ts(&mut last, "keys:a", 0, 100), 100);
+        // (b) a second write in the same wall-clock second bumps to last+1.
+        assert_eq!(next_ts(&mut last, "keys:a", 0, 100), 101);
+        // (c) a later write with wall-clock advanced past the mark uses wall-clock.
+        assert_eq!(next_ts(&mut last, "keys:a", 0, 500), 500);
+        // (d) an independent d-tag has its own slot and does not interfere.
+        assert_eq!(next_ts(&mut last, "keys:b", 0, 100), 100);
+        assert_eq!(next_ts(&mut last, "keys:a", 0, 500), 501);
+        // (e) a seeded floor above wall-clock produces floor+1 (the promotion case).
+        assert_eq!(next_ts(&mut last, "keys:c", 1_000, 100), 1_001);
+    }
 
     // Full end-to-end: an ACTIVE keep-web node writes vault state, it flows through a live relay, and a
     // STANDBY node reconstructs it AND reads it back decrypted. The two vaults share the data key (the

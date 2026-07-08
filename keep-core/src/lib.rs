@@ -118,14 +118,28 @@ impl Keep {
         table: &str,
         record_id: &str,
         encrypted: &[u8],
-    ) -> Result<()> {
+        created_at: u64,
+    ) -> Result<bool> {
         self.storage
-            .apply_replicated_record(table, record_id, encrypted)
+            .apply_replicated_record(table, record_id, encrypted, created_at)
     }
 
-    /// Apply a replicated delete (tombstone) from a peer.
-    pub fn apply_replicated_delete(&self, table: &str, record_id: &str) -> Result<()> {
-        self.storage.apply_replicated_delete(table, record_id)
+    /// Apply a replicated delete (tombstone) from a peer. Returns `false` if ignored as stale.
+    pub fn apply_replicated_delete(
+        &self,
+        table: &str,
+        record_id: &str,
+        created_at: u64,
+    ) -> Result<bool> {
+        self.storage
+            .apply_replicated_delete(table, record_id, created_at)
+    }
+
+    /// The highest keep-state high-water-mark persisted in this vault (0 if none). A promoted standby
+    /// seeds its publisher's monotonic floor from this so a fresh publish is strictly newer than every
+    /// mark standbys already applied. See [`Storage::max_state_version`].
+    pub fn max_state_version(&self) -> Result<u64> {
+        self.storage.max_state_version()
     }
 
     /// Create a new Keep with the given password.
