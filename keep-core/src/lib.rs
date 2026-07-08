@@ -166,7 +166,7 @@ impl Keep {
         path: &Path,
         password: &str,
         params: Argon2Params,
-        data_key: [u8; 32],
+        data_key: [u8; crypto::KEY_SIZE],
     ) -> Result<Self> {
         let storage = Storage::create_with_shared_data_key(path, password, params, data_key)?;
         Ok(Self {
