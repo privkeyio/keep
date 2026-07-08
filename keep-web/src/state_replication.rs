@@ -94,6 +94,13 @@ pub async fn spawn(
     Ok(())
 }
 
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
     keep.lock()
@@ -101,14 +108,28 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         .set_state_publisher(Arc::new(ChannelPublisher { tx }));
 
     tokio::spawn(async move {
+        // Strictly-monotonic created_at per d-tag: a record and its immediate delete (or two rapid
+        // writes) must not collide on the same second, or the relay's created_at dedup could keep the
+        // wrong one and the standby's rollback guard would reject the newer as "not newer". Bump to
+        // last+1 when wall-clock has not advanced. In-memory is fine: on restart the first write to a
+        // d-tag reverts to wall-clock, which the relay + consumer already order correctly.
+        let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         while let Some(change) = rx.recv().await {
+            let dtag = match &change {
+                Change::Record { table, id, .. } | Change::Delete { table, id } => {
+                    format!("{table}:{id}")
+                }
+            };
+            let slot = last_ts.entry(dtag).or_insert(0);
+            let ts = now_secs().max(*slot + 1);
+            *slot = ts;
             let event = match &change {
                 Change::Record {
                     table,
                     id,
                     encrypted,
-                } => state_record_event(&identity, table, id, encrypted),
-                Change::Delete { table, id } => state_tombstone_event(&identity, table, id),
+                } => state_record_event(&identity, table, id, encrypted, ts),
+                Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
             };
             match event {
                 Ok(ev) => {
@@ -159,13 +180,30 @@ async fn spawn_consumer(
                     Ok(Some(rec)) => {
                         let k = keep.lock().await;
                         let outcome = match rec.content {
-                            Some(bytes) => {
-                                k.apply_replicated_record(&rec.table, &rec.record_id, &bytes)
-                            }
-                            None => k.apply_replicated_delete(&rec.table, &rec.record_id),
+                            Some(bytes) => k.apply_replicated_record(
+                                &rec.table,
+                                &rec.record_id,
+                                &bytes,
+                                rec.created_at,
+                            ),
+                            None => k.apply_replicated_delete(
+                                &rec.table,
+                                &rec.record_id,
+                                rec.created_at,
+                            ),
                         };
-                        if let Err(e) = outcome {
-                            tracing::warn!(table = %rec.table, "keep-state apply failed: {e}");
+                        match outcome {
+                            Ok(true) => {}
+                            // Not strictly newer than what we already applied: a stale or replayed event
+                            // (rollback attempt from an untrusted relay). Ignore it, but record it.
+                            Ok(false) => tracing::warn!(
+                                table = %rec.table,
+                                created_at = rec.created_at,
+                                "keep-state: ignored stale/replayed event (rollback guard)"
+                            ),
+                            Err(e) => {
+                                tracing::warn!(table = %rec.table, "keep-state apply failed: {e}")
+                            }
                         }
                     }
                     Ok(None) => {}

@@ -33,6 +33,7 @@ pub fn state_record_event(
     table: &str,
     record_id: &str,
     content: &[u8],
+    created_at: u64,
 ) -> Result<Event> {
     let ciphertext = nip44::encrypt(
         keys.secret_key(),
@@ -42,15 +43,24 @@ pub fn state_record_event(
     )
     .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
 
+    // `created_at` is caller-controlled (strictly monotonic per d-tag) so the relay's created_at-based
+    // addressable dedup always retains the latest write and the consumer's rollback guard never rejects
+    // a legitimate same-second update (e.g. a record and its immediate delete).
     EventBuilder::new(Kind::Custom(KEEP_STATE_KIND), ciphertext)
         .tag(Tag::identifier(d_tag(table, record_id)))
         .tag(Tag::custom(TagKind::custom("t"), [table.to_string()]))
+        .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(keys)
         .map_err(|e| FrostNetError::Nostr(e.to_string()))
 }
 
 /// Build a tombstone (delete) event for a record: same `d`-tag, empty content, a `deleted` marker tag.
-pub fn state_tombstone_event(keys: &Keys, table: &str, record_id: &str) -> Result<Event> {
+pub fn state_tombstone_event(
+    keys: &Keys,
+    table: &str,
+    record_id: &str,
+    created_at: u64,
+) -> Result<Event> {
     EventBuilder::new(Kind::Custom(KEEP_STATE_KIND), "")
         .tag(Tag::identifier(d_tag(table, record_id)))
         .tag(Tag::custom(TagKind::custom("t"), [table.to_string()]))
@@ -58,6 +68,7 @@ pub fn state_tombstone_event(keys: &Keys, table: &str, record_id: &str) -> Resul
             TagKind::custom("deleted"),
             Vec::<String>::new(),
         ))
+        .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(keys)
         .map_err(|e| FrostNetError::Nostr(e.to_string()))
 }
@@ -69,6 +80,9 @@ pub struct StateRecord {
     pub record_id: String,
     /// The decrypted record bytes, or `None` for a tombstone (delete).
     pub content: Option<Vec<u8>>,
+    /// The event's signed `created_at` (unix seconds). The consumer uses it as a per-d-tag
+    /// high-water-mark to reject stale/replayed events (rollback protection).
+    pub created_at: u64,
 }
 
 /// Parse + decrypt a keep-state event authored by the shared identity (`keys`). Returns `Ok(None)` if
@@ -114,6 +128,7 @@ pub fn parse_state_event(keys: &Keys, event: &Event) -> Result<Option<StateRecor
         table: table.to_string(),
         record_id: record_id.to_string(),
         content,
+        created_at: event.created_at.as_secs(),
     }))
 }
 
@@ -125,7 +140,7 @@ mod tests {
     fn record_event_round_trips() {
         let keys = Keys::generate();
         let content = b"vault-encrypted-record-bytes\x00\x01\x02";
-        let event = state_record_event(&keys, "keys", "abcd1234", content).unwrap();
+        let event = state_record_event(&keys, "keys", "abcd1234", content, 1000).unwrap();
 
         assert_eq!(event.kind, Kind::Custom(KEEP_STATE_KIND));
         assert_eq!(event.tags.identifier(), Some("keep:keys:abcd1234"));
@@ -134,12 +149,13 @@ mod tests {
         assert_eq!(parsed.table, "keys");
         assert_eq!(parsed.record_id, "abcd1234");
         assert_eq!(parsed.content.as_deref(), Some(content.as_slice()));
+        assert_eq!(parsed.created_at, 1000);
     }
 
     #[test]
     fn tombstone_has_no_content() {
         let keys = Keys::generate();
-        let event = state_tombstone_event(&keys, "descriptors", "deadbeef:3").unwrap();
+        let event = state_tombstone_event(&keys, "descriptors", "deadbeef:3", 1000).unwrap();
         let parsed = parse_state_event(&keys, &event).unwrap().unwrap();
         assert_eq!(parsed.table, "descriptors");
         // record_id keeps the remainder past the second ':', so a versioned id survives intact.
@@ -162,11 +178,11 @@ mod tests {
         // the subscription filter is relay-enforced and untrusted, so authorship is verified here.
         let ours = Keys::generate();
         let attacker = Keys::generate();
-        let forged = state_tombstone_event(&attacker, "keys", "abcd1234").unwrap();
+        let forged = state_tombstone_event(&attacker, "keys", "abcd1234", 1000).unwrap();
         assert_eq!(parse_state_event(&ours, &forged).unwrap(), None);
 
         // The same holds for a record event built under a foreign identity.
-        let forged_rec = state_record_event(&attacker, "keys", "abcd1234", b"x").unwrap();
+        let forged_rec = state_record_event(&attacker, "keys", "abcd1234", b"x", 1000).unwrap();
         assert_eq!(parse_state_event(&ours, &forged_rec).unwrap(), None);
     }
 
@@ -198,7 +214,7 @@ mod tests {
         let mut notifications = subscriber.notifications();
 
         let content = b"encrypted-record-bytes";
-        let event = state_record_event(&keys, "keys", "abc123", content).unwrap();
+        let event = state_record_event(&keys, "keys", "abc123", content, 1000).unwrap();
         publisher.send_event(&event).await.unwrap();
 
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
