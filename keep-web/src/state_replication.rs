@@ -114,6 +114,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How far ahead of wall-clock a published `created_at` may drift before we warn. Same-second bumps
+/// drift only ~1-2s; a much larger gap means the seeded floor is ahead of wall-clock (a clock
+/// regression), which a relay enforcing a NIP-11 `created_at_upper_limit` may reject.
+const MAX_FUTURE_DRIFT_SECS: u64 = 60;
+
 /// Compute the strictly-monotonic per-d-tag `created_at` for the next publish. `last` is the in-memory
 /// per-d-tag high-water-mark, seeded at startup from the persisted floor (see `spawn_publisher`). A new
 /// slot starts at `floor`; each write returns `now` unless that is not strictly greater than the last
@@ -164,7 +169,19 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                     format!("{table}:{id}")
                 }
             };
-            let ts = next_ts(&mut last_ts, &dtag, floor, now_secs());
+            let now = now_secs();
+            let ts = next_ts(&mut last_ts, &dtag, floor, now);
+            // A created_at far ahead of wall-clock (a floor seeded after a clock regression, or a long
+            // same-second burst) risks a strict relay rejecting it as too-far-future. Surface the drift
+            // so a rejection below is explainable.
+            if ts > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
+                tracing::warn!(
+                    dtag = %dtag,
+                    created_at = ts,
+                    now,
+                    "keep-state: created_at is far ahead of wall-clock; a relay enforcing a created_at_upper_limit may reject this event"
+                );
+            }
             let event = match &change {
                 Change::Record {
                     table,
@@ -174,11 +191,18 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                 Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
             };
             match event {
-                Ok(ev) => {
-                    if let Err(e) = client.send_event(&ev).await {
-                        tracing::warn!("keep-state publish failed: {e}");
-                    }
-                }
+                Ok(ev) => match client.send_event(&ev).await {
+                    // No relay accepted it -- rejected (e.g. NIP-01 "invalid: created_at too far off")
+                    // or unreachable. It did NOT replicate; log loudly instead of losing it silently.
+                    Ok(out) if out.success.is_empty() => tracing::error!(
+                        dtag = %dtag,
+                        created_at = ts,
+                        failed = ?out.failed,
+                        "keep-state publish accepted by NO relay; record did not replicate"
+                    ),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("keep-state publish failed: {e}"),
+                },
                 Err(e) => tracing::warn!("keep-state event build failed: {e}"),
             }
         }
