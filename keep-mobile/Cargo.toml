@@ -16,7 +16,7 @@ keep-frost-net = { path = "../keep-frost-net", default-features = false }
 keep-nip46 = { path = "../keep-nip46" }
 bitcoin = { version = "0.32", features = ["serde", "base64"] }
 frost-secp256k1-tr = { version = "3.0", default-features = false }
-uniffi = { version = "0.32", features = ["cli"] }
+uniffi = { version = "0.32" }
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["rt-multi-thread", "sync", "time"] }
 hex = "0.4"
@@ -40,6 +40,15 @@ tracing-android = "0.2"
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }
 
+[features]
+# The uniffi CLI (uniffi_bindgen + its askama templates) is only needed by the
+# uniffi-bindgen binary below, not by the runtime cdylib. Keeping it out of the
+# library build stops the non-deterministic bindgen/askama codegen from being
+# linked into libkeep_mobile.so, which is required for reproducible F-Droid
+# builds. Enable it only when building the binary (see required-features).
+cli = ["uniffi/cli"]
+
 [[bin]]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
