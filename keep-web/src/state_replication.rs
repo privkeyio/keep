@@ -70,6 +70,15 @@ pub async fn spawn(
     identity: Keys,
     role: &str,
 ) -> Result<(), String> {
+    // Validate role before connecting: an unrecognized value (e.g. a "stanby" typo) must NOT silently
+    // fall through to active, which would start a second publisher under the shared identity and cause
+    // split-brain last-write-wins updates.
+    if role != "active" && role != "standby" {
+        return Err(format!(
+            "invalid KEEP_STATE_ROLE {role:?}: expected \"active\" or \"standby\""
+        ));
+    }
+
     let client = Client::new(identity.clone());
     client
         .add_relay(&relay_url)
@@ -121,13 +130,19 @@ async fn spawn_consumer(
     let filter = Filter::new()
         .author(identity.public_key())
         .kind(Kind::Custom(KEEP_STATE_KIND));
+    // Take the notifications receiver BEFORE subscribing: the REQ returns the standby's backfill (the
+    // already-stored addressable records), and those can be broadcast before a receiver taken later
+    // exists, silently dropping vault state a starting standby needs.
+    let mut notifications = client.notifications();
     client
         .subscribe(filter, None)
         .await
         .map_err(|e| format!("state relay subscribe failed: {e}"))?;
 
     tokio::spawn(async move {
-        let mut notifications = client.notifications();
+        // Keep `client` owned by the task: its pool is ref-counted and shuts the relay down when the
+        // last handle drops, so letting it fall out of scope here would silently kill the subscription.
+        let _client = client;
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
                 match parse_state_event(&identity, &event) {

@@ -78,11 +78,18 @@ pub fn parse_state_event(keys: &Keys, event: &Event) -> Result<Option<StateRecor
     if event.kind != Kind::Custom(KEEP_STATE_KIND) {
         return Ok(None);
     }
+    // Authenticate authorship against the shared cluster identity, not just the subscription filter:
+    // relays are untrusted and can deliver events the filter should have excluded. Without this, a
+    // tombstone signed by any keypair would be accepted and delete standby records (records are also
+    // guarded by NIP-44 self-encryption, but tombstones carry no ciphertext to gate on).
+    if event.pubkey != keys.public_key() {
+        return Ok(None);
+    }
     let Some(d) = event.tags.identifier() else {
         return Ok(None);
     };
-    // d-tag: keep:<table>:<record-id>. record_id may itself contain ':' (e.g. a versioned descriptor),
-    // so split into exactly three parts and keep the remainder as the id.
+    // d-tag: keep:<table>:<record-id>. Production record_ids are hex, but splitn(3) keeps any ':' in
+    // the remainder with the id (see tombstone_has_no_content) so a colon-bearing id survives intact.
     let mut parts = d.splitn(3, ':');
     if parts.next() != Some("keep") {
         return Ok(None);
@@ -147,6 +154,20 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
         assert_eq!(parse_state_event(&keys, &foreign).unwrap(), None);
+    }
+
+    #[test]
+    fn foreign_author_is_rejected() {
+        // A well-formed keep-state tombstone signed by a DIFFERENT identity must not be accepted:
+        // the subscription filter is relay-enforced and untrusted, so authorship is verified here.
+        let ours = Keys::generate();
+        let attacker = Keys::generate();
+        let forged = state_tombstone_event(&attacker, "keys", "abcd1234").unwrap();
+        assert_eq!(parse_state_event(&ours, &forged).unwrap(), None);
+
+        // The same holds for a record event built under a foreign identity.
+        let forged_rec = state_record_event(&attacker, "keys", "abcd1234", b"x").unwrap();
+        assert_eq!(parse_state_event(&ours, &forged_rec).unwrap(), None);
     }
 
     // End-to-end over a real in-process relay, exercising the exact publish/subscribe/notification path
