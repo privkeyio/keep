@@ -729,7 +729,7 @@ impl Storage {
 
         let key = descriptor_storage_key(&descriptor.group_pubkey, descriptor.version);
         backend.put(DESCRIPTORS_TABLE, &key, &encrypted_bytes)?;
-        self.notify_record("descriptors", &hex::encode(&key), &encrypted_bytes);
+        self.notify_record("descriptors", &hex::encode(key), &encrypted_bytes);
         Ok(())
     }
 
@@ -938,7 +938,7 @@ impl Storage {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let key = descriptor_storage_key(group_pubkey, version);
         if backend.delete(DESCRIPTORS_TABLE, &key)? {
-            self.notify_delete("descriptors", &hex::encode(&key));
+            self.notify_delete("descriptors", &hex::encode(key));
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(format!(

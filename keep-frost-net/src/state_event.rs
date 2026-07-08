@@ -148,4 +148,52 @@ mod tests {
             .unwrap();
         assert_eq!(parse_state_event(&keys, &foreign).unwrap(), None);
     }
+
+    // End-to-end over a real in-process relay, exercising the exact publish/subscribe/notification path
+    // keep-web's replication uses: a publisher sends a state event, a subscriber filtered on the shared
+    // identity receives it and reconstructs the record.
+    #[tokio::test]
+    async fn state_event_round_trips_over_a_relay() {
+        use nostr_relay_builder::MockRelay;
+
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let keys = Keys::generate();
+
+        let publisher = Client::new(keys.clone());
+        publisher.add_relay(&url).await.unwrap();
+        publisher.connect().await;
+
+        let subscriber = Client::new(keys.clone());
+        subscriber.add_relay(&url).await.unwrap();
+        subscriber.connect().await;
+        let filter = Filter::new()
+            .author(keys.public_key())
+            .kind(Kind::Custom(KEEP_STATE_KIND));
+        subscriber.subscribe(filter, None).await.unwrap();
+        // Let the REQ register on the relay, and take the notifications receiver BEFORE publishing so
+        // the delivered event can't be broadcast before we are listening.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut notifications = subscriber.notifications();
+
+        let content = b"encrypted-record-bytes";
+        let event = state_record_event(&keys, "keys", "abc123", content).unwrap();
+        publisher.send_event(&event).await.unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(RelayPoolNotification::Event { event, .. }) = notifications.recv().await {
+                    if let Ok(Some(rec)) = parse_state_event(&keys, &event) {
+                        return rec;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("state event did not arrive over the relay");
+
+        assert_eq!(received.table, "keys");
+        assert_eq!(received.record_id, "abc123");
+        assert_eq!(received.content.as_deref(), Some(content.as_slice()));
+    }
 }
