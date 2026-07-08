@@ -92,6 +92,7 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
+pub use crate::storage::StatePublisher;
 use crate::storage::Storage;
 pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 
@@ -104,6 +105,29 @@ pub struct Keep {
 }
 
 impl Keep {
+    /// Install the keep-state replication sink on the underlying storage (keep-web wires this to a
+    /// publisher that ships each vault-state change to the state relay). See [`StatePublisher`].
+    pub fn set_state_publisher(&self, publisher: std::sync::Arc<dyn StatePublisher>) {
+        self.storage.set_state_publisher(publisher);
+    }
+
+    /// Apply a record replicated from a peer into storage (the standby consumer side). Delegates to
+    /// [`Storage::apply_replicated_record`]; never echoes back to the relay.
+    pub fn apply_replicated_record(
+        &self,
+        table: &str,
+        record_id: &str,
+        encrypted: &[u8],
+    ) -> Result<()> {
+        self.storage
+            .apply_replicated_record(table, record_id, encrypted)
+    }
+
+    /// Apply a replicated delete (tombstone) from a peer.
+    pub fn apply_replicated_delete(&self, table: &str, record_id: &str) -> Result<()> {
+        self.storage.apply_replicated_delete(table, record_id)
+    }
+
     /// Create a new Keep with the given password.
     ///
     /// # Example

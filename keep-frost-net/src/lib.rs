@@ -76,6 +76,7 @@ mod protocol;
 mod psbt_session;
 mod recovery_signers;
 mod session;
+mod state_event;
 mod structured_payload;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
@@ -155,6 +156,10 @@ pub use recovery_signers::{
 };
 pub use session::{
     derive_session_id, derive_session_id_salted, NetworkSession, SessionManager, SessionState,
+};
+pub use state_event::{
+    parse_state_event, state_record_event, state_tombstone_event, StateRecord, KEEP_STATE_KIND,
+    STATE_TABLES,
 };
 pub use structured_payload::{verify_structured_payload, BitcoinSighashPayload, NostrEventPayload};
 pub use tpm_policy::TpmAttestationPolicy;

@@ -4810,6 +4810,7 @@ dependencies = [
  "keep-core",
  "keep-frost-net",
  "keep-nip46",
+ "nostr-relay-builder",
  "nostr-sdk",
  "serde",
  "serde_json",
