@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod bunker;
 mod state;
+mod state_replication;
 mod ws;
 
 use std::collections::HashMap;
@@ -240,6 +241,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BunkerInfo::setup()
     };
     let keep = Arc::new(Mutex::new(keep));
+
+    // keep-state replication over the mesh relay (opt-in via KEEP_STATE_RELAY, e.g. the on-box wisp).
+    // The active publishes each vault-state write under a shared cluster identity; a standby consumes
+    // and reconstructs. The relay is a trusted local/mesh address, so it is validated with the
+    // allow-internal guard (a mesh IP is not public), and ws:// still needs KEEP_ALLOW_WS=1.
+    if let Ok(state_relay) = std::env::var("KEEP_STATE_RELAY") {
+        if !state_relay.trim().is_empty() {
+            keep_core::relay::validate_relay_url_allow_internal(&state_relay)
+                .map_err(|e| format!("KEEP_STATE_RELAY invalid: {e}"))?;
+            let identity = state_replication::load_state_identity()?;
+            let role = env_or("KEEP_STATE_ROLE", "active");
+            state_replication::spawn(keep.clone(), state_relay, identity, &role).await?;
+            tracing::info!(role = %role, "keep-state replication enabled");
+        }
+    }
+
     tracing::info!(mode = %bunker_info.mode, "started");
 
     let state = AppState {
