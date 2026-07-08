@@ -146,7 +146,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(k) => k,
         Err(keep_core::error::KeepError::NotFound(_)) => {
             tracing::info!(path = %vault_path.display(), "no vault found; creating");
-            Keep::create(&vault_path, &password)?
+            match std::env::var("KEEP_STORAGE_KEY") {
+                Ok(hex_key) if !hex_key.trim().is_empty() => {
+                    // Shared cluster data key (keep-state replication): every node creates its vault
+                    // with the SAME record-encryption key so a standby can decrypt the active's records.
+                    // Delivered out-of-band onto the encrypted volume, like the shared JWT key.
+                    let bytes: [u8; 32] = hex::decode(hex_key.trim())
+                        .map_err(|e| format!("KEEP_STORAGE_KEY is not hex: {e}"))?
+                        .try_into()
+                        .map_err(|_| {
+                            "KEEP_STORAGE_KEY must be 32 bytes (64 hex chars)".to_string()
+                        })?;
+                    Keep::create_with_shared_data_key(
+                        &vault_path,
+                        &password,
+                        keep_core::crypto::Argon2Params::DEFAULT,
+                        bytes,
+                    )?
+                }
+                _ => Keep::create(&vault_path, &password)?,
+            }
         }
         Err(e) => return Err(e.into()),
     };
