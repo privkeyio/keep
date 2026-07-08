@@ -159,6 +159,24 @@ impl Keep {
         })
     }
 
+    /// Like [`Self::create_with_params`] but seeds a shared record-encryption key, so every node in a
+    /// cluster shares one vault key (keep-state replication) and a standby decrypts what the active
+    /// shipped. Each node still wraps the key under its own password+salt.
+    pub fn create_with_shared_data_key(
+        path: &Path,
+        password: &str,
+        params: Argon2Params,
+        data_key: [u8; crypto::KEY_SIZE],
+    ) -> Result<Self> {
+        let storage = Storage::create_with_shared_data_key(path, password, params, data_key)?;
+        Ok(Self {
+            storage,
+            keyring: Keyring::new(),
+            audit: None,
+            signing_audit: None,
+        })
+    }
+
     /// Open an existing Keep.
     ///
     /// # Example

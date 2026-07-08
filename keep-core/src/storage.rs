@@ -351,7 +351,23 @@ impl Storage {
         let backend = RedbBackend::create(&db_path)?;
         #[cfg(unix)]
         let _ = chmod_secure(&db_path);
-        Self::create_inner(path, password, params, Box::new(backend))
+        Self::create_inner(path, password, params, Box::new(backend), None)
+    }
+
+    /// Create new storage whose data key is the caller-provided `data_key` rather than a fresh random
+    /// one, so every node in a cluster shares one vault key (keep-state replication).
+    pub fn create_with_shared_data_key(
+        path: &Path,
+        password: &str,
+        params: Argon2Params,
+        data_key: [u8; crypto::KEY_SIZE],
+    ) -> Result<Self> {
+        create_storage_dir(path)?;
+        let db_path = path.join("keep.db");
+        let backend = RedbBackend::create(&db_path)?;
+        #[cfg(unix)]
+        let _ = chmod_secure(&db_path);
+        Self::create_inner(path, password, params, Box::new(backend), Some(data_key))
     }
 
     /// Create new storage with a custom backend.
@@ -362,7 +378,7 @@ impl Storage {
         backend: Box<dyn StorageBackend>,
     ) -> Result<Self> {
         create_storage_dir(path)?;
-        Self::create_inner(path, password, params, backend)
+        Self::create_inner(path, password, params, backend, None)
     }
 
     fn create_inner(
@@ -370,11 +386,18 @@ impl Storage {
         password: &str,
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
+        shared_data_key: Option<[u8; crypto::KEY_SIZE]>,
     ) -> Result<Self> {
         validate_new_password(password)?;
 
         let mut header = Header::new(params)?;
-        let data_key = SecretKey::generate()?;
+        // The data key encrypts every record and is normally random per vault. A cluster can instead
+        // seed the SAME data key on every node (keep-state replication), so a standby decrypts records
+        // the active shipped: each node still wraps it under its OWN password+salt in its own header.
+        let data_key = match shared_data_key {
+            Some(k) => SecretKey::new(k)?,
+            None => SecretKey::generate()?,
+        };
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
         let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
 
@@ -1636,6 +1659,52 @@ mod tests {
             .unwrap();
         assert!(storage.load_key(&record.id).is_err());
         assert_eq!(publisher.deletes.lock().unwrap().len(), deletes_before);
+    }
+
+    #[test]
+    fn shared_data_key_cross_decrypts_across_vaults() {
+        // Two independent vaults with DIFFERENT passwords but the SAME seeded data key: a record
+        // encrypted by one must decrypt in the other. This is the cluster invariant keep-state
+        // replication relies on (the standby reads what the active shipped).
+        let shared: [u8; 32] = crypto::random_bytes();
+        let dir = tempdir().unwrap();
+
+        let a = Storage::create_with_shared_data_key(
+            &dir.path().join("a"),
+            "passwordA",
+            Argon2Params::TESTING,
+            shared,
+        )
+        .unwrap();
+        let b = Storage::create_with_shared_data_key(
+            &dir.path().join("b"),
+            "differentB",
+            Argon2Params::TESTING,
+            shared,
+        )
+        .unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        a.set_state_publisher(publisher.clone());
+
+        let record = KeyRecord::new(
+            crypto::random_bytes(),
+            crate::keys::KeyType::Nostr,
+            "shared".into(),
+            vec![1, 2, 3],
+        );
+        a.store_key(&record).unwrap();
+        let encrypted = publisher.last_bytes.lock().unwrap().clone();
+
+        b.apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+            .unwrap();
+        assert_eq!(b.load_key(&record.id).unwrap().name, "shared");
+
+        // Sanity: WITHOUT the shared key, a third vault cannot decrypt the same bytes.
+        let c = Storage::create(&dir.path().join("c"), "passwordC", Argon2Params::TESTING).unwrap();
+        c.apply_replicated_record("keys", &hex::encode(record.id), &encrypted)
+            .unwrap();
+        assert!(c.load_key(&record.id).is_err());
     }
 
     #[test]

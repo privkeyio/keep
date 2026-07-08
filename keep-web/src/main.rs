@@ -16,6 +16,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::{broadcast, Mutex};
 use tower_http::services::{ServeDir, ServeFile};
+use zeroize::Zeroizing;
 
 use keep_core::Keep;
 
@@ -60,6 +61,35 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
         }
     }
     Ok(std::fs::read_to_string(path)?.trim().to_string())
+}
+
+/// Resolve the optional shared cluster data key (keep-state replication). Reads via
+/// `secret_from` so `KEEP_STORAGE_KEY_FILE` is honored (keeps the raw key off the
+/// process environment, like the password and JWT key). Returns `None` when unset,
+/// `Err` when set but malformed so a misconfigured cluster node fails loudly instead
+/// of silently creating a non-replicable vault.
+fn shared_data_key_from_env() -> Result<Option<Zeroizing<[u8; 32]>>, Box<dyn std::error::Error>> {
+    let Some(hex_key) = secret_from("KEEP_STORAGE_KEY")? else {
+        return Ok(None);
+    };
+    Ok(Some(parse_shared_data_key(&hex_key)?))
+}
+
+/// Decode a 32-byte shared data key from hex. Rejects malformed hex, the wrong
+/// length, and an all-zero key so a misconfigured node fails loudly. The generic
+/// hex error avoids echoing the malformed key material back into logs.
+fn parse_shared_data_key(raw: &str) -> Result<Zeroizing<[u8; 32]>, Box<dyn std::error::Error>> {
+    let decoded =
+        Zeroizing::new(hex::decode(raw).map_err(|_| "KEEP_STORAGE_KEY is not valid hex")?);
+    if decoded.len() != 32 {
+        return Err("KEEP_STORAGE_KEY must be 32 bytes (64 hex chars)".into());
+    }
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(&decoded);
+    if key.iter().all(|&b| b == 0) {
+        return Err("KEEP_STORAGE_KEY must not be all zero".into());
+    }
+    Ok(key)
 }
 
 fn parse_relays(value: &str) -> Vec<String> {
@@ -146,7 +176,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(k) => k,
         Err(keep_core::error::KeepError::NotFound(_)) => {
             tracing::info!(path = %vault_path.display(), "no vault found; creating");
-            Keep::create(&vault_path, &password)?
+            match shared_data_key_from_env()? {
+                Some(key) => {
+                    tracing::info!(
+                        "creating vault with shared cluster data key (keep-state replication)"
+                    );
+                    Keep::create_with_shared_data_key(
+                        &vault_path,
+                        &password,
+                        keep_core::crypto::Argon2Params::DEFAULT,
+                        *key,
+                    )?
+                }
+                None => {
+                    tracing::info!(
+                        "KEEP_STORAGE_KEY not set; creating vault with a per-node random data key (non-replicable)"
+                    );
+                    Keep::create(&vault_path, &password)?
+                }
+            }
         }
         Err(e) => return Err(e.into()),
     };
@@ -378,5 +426,28 @@ mod tests {
         let a = *keep.frost_generate(2, 3, "a").unwrap()[0].group_pubkey();
         let npub = keep_core::keys::bytes_to_npub(&a);
         assert_eq!(resolve_group(&keep, Some(&npub)).unwrap().unwrap().0, a);
+    }
+
+    #[test]
+    fn parse_shared_data_key_valid() {
+        let hex_key = hex::encode([7u8; 32]);
+        let key = parse_shared_data_key(&hex_key).unwrap();
+        assert_eq!(*key, [7u8; 32]);
+    }
+
+    #[test]
+    fn parse_shared_data_key_bad_hex() {
+        assert!(parse_shared_data_key("zz").is_err());
+    }
+
+    #[test]
+    fn parse_shared_data_key_wrong_length() {
+        assert!(parse_shared_data_key(&hex::encode([1u8; 31])).is_err());
+        assert!(parse_shared_data_key(&hex::encode([1u8; 33])).is_err());
+    }
+
+    #[test]
+    fn parse_shared_data_key_all_zero() {
+        assert!(parse_shared_data_key(&hex::encode([0u8; 32])).is_err());
     }
 }
