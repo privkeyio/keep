@@ -305,9 +305,7 @@ impl Storage {
         encrypted: &[u8],
     ) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let table_name = Self::replicated_table(table)?;
-        let key = hex::decode(record_id)
-            .map_err(|e| KeepError::Other(format!("replicated record id not hex: {e}")))?;
+        let (table_name, key) = Self::replicated_key(table, record_id)?;
         backend.put(table_name, &key, encrypted)?;
         Ok(())
     }
@@ -315,11 +313,26 @@ impl Storage {
     /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher.
     pub fn apply_replicated_delete(&self, table: &str, record_id: &str) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let (table_name, key) = Self::replicated_key(table, record_id)?;
+        backend.delete(table_name, &key)?;
+        Ok(())
+    }
+
+    /// Resolve a replicated `(table, record_id)` to its backend table and raw key: maps the logical
+    /// table name and hex-decodes the id. Descriptor keys are fixed 36-byte `group||version`, and the
+    /// listing/lookup path fails closed on any other length, so a malformed descriptor key would poison
+    /// `list_descriptors` for the whole vault -- reject it here at the trust boundary.
+    fn replicated_key(table: &str, record_id: &str) -> Result<(&'static str, Vec<u8>)> {
         let table_name = Self::replicated_table(table)?;
         let key = hex::decode(record_id)
             .map_err(|e| KeepError::Other(format!("replicated record id not hex: {e}")))?;
-        backend.delete(table_name, &key)?;
-        Ok(())
+        if table_name == DESCRIPTORS_TABLE && key.len() != 36 {
+            return Err(KeepError::Other(format!(
+                "replicated descriptor key has length {} (expected 36)",
+                key.len()
+            )));
+        }
+        Ok((table_name, key))
     }
 
     /// Map a replicated logical table name (as it appears in the event `d`-tag) to its backend table.
@@ -1601,6 +1614,19 @@ mod tests {
         assert!(storage
             .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted)
             .is_err());
+
+        // A descriptor key of the wrong length is refused: the listing/lookup path fails closed on any
+        // non-36-byte descriptor row, so accepting one would poison list_descriptors for the vault.
+        assert!(storage
+            .apply_replicated_record("descriptors", &hex::encode([0u8; 20]), &encrypted)
+            .is_err());
+        assert!(storage
+            .apply_replicated_delete("descriptors", &hex::encode([0u8; 20]))
+            .is_err());
+        // A correctly-sized 36-byte descriptor key is accepted.
+        assert!(storage
+            .apply_replicated_record("descriptors", &hex::encode([0u8; 36]), &encrypted)
+            .is_ok());
 
         // A replicated delete removes it, and never echoes to the publisher: the only recorded delete
         // is the earlier real delete_key, not this apply.

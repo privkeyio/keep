@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use keep_core::{Keep, StatePublisher};
 use keep_frost_net::{
@@ -143,7 +143,17 @@ async fn spawn_consumer(
         // Keep `client` owned by the task: its pool is ref-counted and shuts the relay down when the
         // last handle drops, so letting it fall out of scope here would silently kill the subscription.
         let _client = client;
-        while let Ok(notification) = notifications.recv().await {
+        loop {
+            let notification = match notifications.recv().await {
+                Ok(n) => n,
+                // A lagged consumer has only missed already-replaced records; the relay still holds the
+                // latest per d-tag, so skip the gap and keep consuming rather than exiting for good.
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("keep-state consumer lagged, skipped {n} notifications");
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             if let RelayPoolNotification::Event { event, .. } = notification {
                 match parse_state_event(&identity, &event) {
                     Ok(Some(rec)) => {
