@@ -135,6 +135,13 @@ impl Keep {
             .apply_replicated_delete(table, record_id, created_at)
     }
 
+    /// The highest keep-state high-water-mark persisted in this vault (0 if none). A promoted standby
+    /// seeds its publisher's monotonic floor from this so a fresh publish is strictly newer than every
+    /// mark standbys already applied. See [`Storage::max_state_version`].
+    pub fn max_state_version(&self) -> Result<u64> {
+        self.storage.max_state_version()
+    }
+
     /// Create a new Keep with the given password.
     ///
     /// # Example

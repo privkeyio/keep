@@ -30,6 +30,17 @@ pub const HEALTH_STATUS_TABLE: &str = "key_health_status";
 /// event that is not strictly newer (replay/rollback protection).
 pub const STATE_VERSIONS_TABLE: &str = "state_versions";
 
+/// A single put-or-delete operation for [`StorageBackend::write_atomic`]. `value` `Some` is a put,
+/// `None` is a delete.
+pub struct AtomicOp<'a> {
+    /// Backend table the op targets.
+    pub table: &'a str,
+    /// Raw key bytes.
+    pub key: &'a [u8],
+    /// `Some(bytes)` to put, `None` to delete.
+    pub value: Option<&'a [u8]>,
+}
+
 /// Trait for pluggable storage backends.
 ///
 /// Implementations must be thread-safe (`Send + Sync`).
@@ -70,6 +81,22 @@ pub trait StorageBackend: Send + Sync {
     fn put_batch(&self, table: &str, entries: &[(&[u8], &[u8])]) -> Result<()> {
         for (key, value) in entries {
             self.put(table, key, value)?;
+        }
+        Ok(())
+    }
+
+    /// Apply several put/delete operations across tables. The default implementation applies each op
+    /// sequentially via `put`/`delete` and is NOT atomic; backends with transaction support should
+    /// override this so a crash mid-batch cannot leave the ops half-applied. Each op must target a
+    /// DISTINCT table.
+    fn write_atomic(&self, ops: &[AtomicOp<'_>]) -> Result<()> {
+        for op in ops {
+            match op.value {
+                Some(v) => self.put(op.table, op.key, v)?,
+                None => {
+                    self.delete(op.table, op.key)?;
+                }
+            }
         }
         Ok(())
     }
@@ -480,6 +507,25 @@ impl StorageBackend for RedbBackend {
             let mut tbl = wtxn.open_table(self.table_def(table)?)?;
             for key in keys {
                 tbl.remove(*key)?;
+            }
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    // Each op must target a distinct table: redb errors on opening the same table twice in one write
+    // txn. The only caller passes exactly [data_table, STATE_VERSIONS_TABLE], always distinct.
+    fn write_atomic(&self, ops: &[AtomicOp<'_>]) -> Result<()> {
+        let wtxn = self.db.begin_write()?;
+        for op in ops {
+            let mut tbl = wtxn.open_table(self.table_def(op.table)?)?;
+            match op.value {
+                Some(v) => {
+                    tbl.insert(op.key, v)?;
+                }
+                None => {
+                    tbl.remove(op.key)?;
+                }
             }
         }
         wtxn.commit()?;

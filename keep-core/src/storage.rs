@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
 
 use crate::backend::{
-    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
-    RELAY_CONFIGS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
+    AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
+    KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -314,8 +314,22 @@ impl Storage {
             return Ok(false);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        backend.put(table_name, &key, encrypted)?;
-        self.advance_state_version(&vkey, created_at)?;
+        // Write the data row and advance the high-water-mark in ONE atomic transaction: if these were
+        // two writes a crash between them would strand the mark BEHIND the data, and an untrusted relay
+        // could then replay an intermediate validly-signed version to roll the record back.
+        let ts = created_at.to_be_bytes();
+        backend.write_atomic(&[
+            AtomicOp {
+                table: table_name,
+                key: &key,
+                value: Some(encrypted),
+            },
+            AtomicOp {
+                table: STATE_VERSIONS_TABLE,
+                key: &vkey,
+                value: Some(&ts),
+            },
+        ])?;
         Ok(true)
     }
 
@@ -333,8 +347,20 @@ impl Storage {
             return Ok(false);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        backend.delete(table_name, &key)?;
-        self.advance_state_version(&vkey, created_at)?;
+        // Tombstone and mark advance in one atomic transaction; see `apply_replicated_record`.
+        let ts = created_at.to_be_bytes();
+        backend.write_atomic(&[
+            AtomicOp {
+                table: table_name,
+                key: &key,
+                value: None,
+            },
+            AtomicOp {
+                table: STATE_VERSIONS_TABLE,
+                key: &vkey,
+                value: Some(&ts),
+            },
+        ])?;
         Ok(true)
     }
 
@@ -368,13 +394,23 @@ impl Storage {
         Ok(true)
     }
 
-    /// Persist the high-water-mark. Called AFTER the data write, so a failed data write never advances
-    /// the mark and strands a version: the same event replayed later still applies (the guard tolerates
-    /// an idempotent re-apply) instead of being permanently rejected as stale.
-    fn advance_state_version(&self, vkey: &[u8], created_at: u64) -> Result<()> {
+    /// The highest keep-state high-water-mark persisted in this vault, or 0 if none. A promoted standby
+    /// (restarted as active) seeds its publisher's per-d-tag monotonic floor from this so a fresh publish
+    /// is strictly newer than every mark standbys already applied. Fails closed to 0 only on an empty or
+    /// absent table; a corrupt (non-8-byte) entry propagates a decode error, consistent with
+    /// `state_version_is_newer`.
+    pub fn max_state_version(&self) -> Result<u64> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        backend.put(STATE_VERSIONS_TABLE, vkey, &created_at.to_be_bytes())?;
-        Ok(())
+        // The read path cannot create the table (redb read txns cannot), so ensure it exists first.
+        backend.create_table(STATE_VERSIONS_TABLE)?;
+        let mut max = 0u64;
+        for (_, v) in backend.list(STATE_VERSIONS_TABLE)? {
+            let ts = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
+                KeepError::Other("corrupt keep-state version high-water-mark".to_string())
+            })?);
+            max = max.max(ts);
+        }
+        Ok(max)
     }
 
     /// Resolve a replicated `(table, record_id)` to its backend table and raw key: maps the logical
@@ -1770,6 +1806,44 @@ mod tests {
             .apply_replicated_record("keys", &id, &enc_v1, 150)
             .unwrap());
         assert!(storage.load_key(&[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn apply_replicated_record_fails_closed_on_corrupt_high_water_mark() {
+        // A non-8-byte high-water-mark cannot be decoded to a u64: the guard must propagate the decode
+        // error (fail closed) rather than silently treating it as first-sync and applying the event.
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "passwordX", Argon2Params::TESTING).unwrap();
+
+        let record = KeyRecord::new(
+            [3u8; 32],
+            crate::keys::KeyType::Nostr,
+            "corrupt".into(),
+            vec![1, 2, 3],
+        );
+        let id = hex::encode([3u8; 32]);
+        let vkey = Storage::state_version_key(KEYS_TABLE, &[3u8; 32]);
+        storage
+            .backend
+            .as_ref()
+            .unwrap()
+            .put(STATE_VERSIONS_TABLE, &vkey, &[1, 2, 3])
+            .unwrap();
+
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+        storage.store_key(&record).unwrap();
+        let encrypted = publisher.last_bytes.lock().unwrap().clone();
+        storage.delete_key(&record.id).unwrap();
+
+        let err = storage
+            .apply_replicated_record("keys", &id, &encrypted, 100)
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeepError::Other(m) if m == "corrupt keep-state version high-water-mark"),
+            "got {err:?}"
+        );
     }
 
     #[test]
