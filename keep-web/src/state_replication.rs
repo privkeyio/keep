@@ -205,10 +205,15 @@ mod tests {
             iterations: 1,
             parallelism: 1,
         };
-        let active = Keep::create_with_params(&path_a, "vaultpass", fast).unwrap();
+        // Create the active vault, then drop it so its redb handle releases the
+        // file lock before copying: Windows refuses to copy a file another
+        // handle holds open, unlike Unix. Reopen the active afterward.
+        Keep::create_with_params(&path_a, "vaultpass", fast).unwrap();
         std::fs::create_dir_all(&path_b).unwrap();
         std::fs::copy(path_a.join("keep.hdr"), path_b.join("keep.hdr")).unwrap();
         std::fs::copy(path_a.join("keep.db"), path_b.join("keep.db")).unwrap();
+        let mut active = Keep::open(&path_a).unwrap();
+        active.unlock("vaultpass").unwrap();
         let mut standby = Keep::open(&path_b).unwrap();
         standby.unlock("vaultpass").unwrap();
 
