@@ -58,6 +58,33 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    /// Build a holder's duress beacon: a normal KFP event signed by the holder's
+    /// dedicated duress-beacon `keys` (NOT the vault-derived identity, which
+    /// duress mode never unlocks). `nonce` must be freshly random. The cluster
+    /// authenticates it against the pinned beacon pubkey (see
+    /// [`verify_duress_beacon`]), so no proof-of-share is needed or possible.
+    ///
+    /// RELEASE GATE: this wire form is self-labeling (`t=duress_beacon` tag,
+    /// `type=duress_beacon` content, `g` group tag), so a relay-level adversary
+    /// can filter and silently drop the beacon. That is acceptable for this inert
+    /// primitive, but this MUST NOT reach a deployed path before the inc2
+    /// indistinguishability work (identify-by-pinned-pubkey, encrypted look-alike
+    /// content, constant cadence) lands.
+    pub fn duress_beacon(keys: &Keys, group_pubkey: &[u8; 32], nonce: &[u8; 32]) -> Result<Event> {
+        let payload = DuressBeaconPayload::new(*group_pubkey, *nonce);
+        let content = KfpMessage::DuressBeacon(payload).to_json()?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::custom(
+                TagKind::custom("g"),
+                [hex::encode(group_pubkey)],
+            ))
+            .tag(Tag::custom(TagKind::custom("t"), ["duress_beacon"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn sign_request(
         keys: &Keys,
         recipient: &PublicKey,
@@ -553,6 +580,55 @@ impl KfpEventBuilder {
     }
 }
 
+/// Verify an inbound event is an authentic, fresh duress beacon for `group_pubkey`,
+/// signed by the pinned beacon key. Returns the payload on success.
+///
+/// Authenticity IS the pinned signing key: the beacon carries no proof-of-share
+/// (duress mode never unlocks the vault), so it is trusted only when signed by
+/// the beacon pubkey the cluster pinned out of band for that holder. Also checks
+/// the Nostr signature, the decoded group, and `created_at` freshness. Nonce
+/// replay dedup is the caller's job (track seen nonces within the window); this
+/// only bounds the window.
+pub fn verify_duress_beacon(
+    event: &Event,
+    expected_beacon_pubkey: &PublicKey,
+    group_pubkey: &[u8; 32],
+    window_secs: u64,
+) -> Result<DuressBeaconPayload> {
+    if event.kind != Kind::Custom(KFP_EVENT_KIND) {
+        return Err(FrostNetError::Protocol("not a KFP event".into()));
+    }
+    if &event.pubkey != expected_beacon_pubkey {
+        return Err(FrostNetError::UntrustedPeer(
+            "duress beacon not signed by the pinned beacon key".into(),
+        ));
+    }
+    if event.verify().is_err() {
+        return Err(FrostNetError::UntrustedPeer(
+            "duress beacon signature invalid".into(),
+        ));
+    }
+    let payload = match KfpMessage::from_json(&event.content)? {
+        KfpMessage::DuressBeacon(p) => p,
+        _ => {
+            return Err(FrostNetError::Protocol(
+                "event is not a duress beacon".into(),
+            ))
+        }
+    };
+    if &payload.group_pubkey != group_pubkey {
+        return Err(FrostNetError::Protocol(
+            "duress beacon group mismatch".into(),
+        ));
+    }
+    if !payload.is_within_replay_window(window_secs) {
+        return Err(FrostNetError::ReplayDetected(
+            "duress beacon outside replay window".into(),
+        ));
+    }
+    Ok(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,5 +748,65 @@ mod tests {
             }
             _ => panic!("expected SignRequest"),
         }
+    }
+
+    #[test]
+    fn duress_beacon_roundtrips_and_verifies() {
+        let beacon_keys = Keys::generate();
+        let group = [7u8; 32];
+        let nonce = [9u8; 32];
+        let event = KfpEventBuilder::duress_beacon(&beacon_keys, &group, &nonce).unwrap();
+
+        assert_eq!(event.kind, Kind::Custom(KFP_EVENT_KIND));
+        let payload = verify_duress_beacon(&event, &beacon_keys.public_key(), &group, 300).unwrap();
+        assert_eq!(payload.group_pubkey, group);
+        assert_eq!(payload.nonce, nonce);
+    }
+
+    #[test]
+    fn duress_beacon_rejects_wrong_signer() {
+        // Signed by a different key than the pinned beacon key: authorship rejected.
+        // This is the load-bearing authenticity check (the beacon has no proof-of-share).
+        let beacon_keys = Keys::generate();
+        let attacker = Keys::generate();
+        let group = [7u8; 32];
+        let event = KfpEventBuilder::duress_beacon(&beacon_keys, &group, &[1u8; 32]).unwrap();
+        let err = verify_duress_beacon(&event, &attacker.public_key(), &group, 300).unwrap_err();
+        assert!(matches!(err, FrostNetError::UntrustedPeer(_)));
+    }
+
+    #[test]
+    fn duress_beacon_rejects_group_mismatch() {
+        let beacon_keys = Keys::generate();
+        let event = KfpEventBuilder::duress_beacon(&beacon_keys, &[1u8; 32], &[2u8; 32]).unwrap();
+        let err =
+            verify_duress_beacon(&event, &beacon_keys.public_key(), &[9u8; 32], 300).unwrap_err();
+        assert!(matches!(err, FrostNetError::Protocol(_)));
+    }
+
+    #[test]
+    fn duress_beacon_payload_freshness_window() {
+        let mut p = DuressBeaconPayload::new([0u8; 32], [0u8; 32]);
+        assert!(p.is_within_replay_window(300));
+        p.created_at = 1; // ancient
+        assert!(!p.is_within_replay_window(300));
+    }
+
+    #[test]
+    fn verify_duress_beacon_rejects_stale_end_to_end() {
+        // A beacon whose SIGNED payload created_at is far in the past is rejected
+        // by the verifier's freshness check (drives ReplayDetected through
+        // verify_duress_beacon, not just the payload helper).
+        let beacon_keys = Keys::generate();
+        let group = [7u8; 32];
+        let mut payload = DuressBeaconPayload::new(group, [1u8; 32]);
+        payload.created_at = 1; // ancient
+        let content = KfpMessage::DuressBeacon(payload).to_json().unwrap();
+        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .tag(Tag::custom(TagKind::custom("t"), ["duress_beacon"]))
+            .sign_with_keys(&beacon_keys)
+            .unwrap();
+        let err = verify_duress_beacon(&event, &beacon_keys.public_key(), &group, 300).unwrap_err();
+        assert!(matches!(err, FrostNetError::ReplayDetected(_)));
     }
 }

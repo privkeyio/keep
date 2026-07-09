@@ -132,6 +132,7 @@ pub enum KfpMessage {
     DescriptorNack(DescriptorNackPayload),
     DescriptorMigrate(DescriptorMigratePayload),
     XpubAnnounce(XpubAnnouncePayload),
+    DuressBeacon(DuressBeaconPayload),
     PsbtPropose(PsbtProposePayload),
     PsbtSign(PsbtSignPayload),
     PsbtFinalize(PsbtFinalizePayload),
@@ -168,6 +169,7 @@ impl KfpMessage {
             KfpMessage::DescriptorNack(_) => "descriptor_nack",
             KfpMessage::DescriptorMigrate(_) => "descriptor_migrate",
             KfpMessage::XpubAnnounce(_) => "xpub_announce",
+            KfpMessage::DuressBeacon(_) => "duress_beacon",
             KfpMessage::PsbtPropose(_) => "psbt_propose",
             KfpMessage::PsbtSign(_) => "psbt_sign",
             KfpMessage::PsbtFinalize(_) => "psbt_finalize",
@@ -226,6 +228,7 @@ impl KfpMessage {
             KfpMessage::DescriptorNack(p) => Some(&p.group_pubkey),
             KfpMessage::DescriptorMigrate(p) => Some(&p.group_pubkey),
             KfpMessage::XpubAnnounce(p) => Some(&p.group_pubkey),
+            KfpMessage::DuressBeacon(p) => Some(&p.group_pubkey),
             KfpMessage::PsbtPropose(p) => Some(&p.group_pubkey),
             KfpMessage::PsbtSign(p) => Some(&p.group_pubkey),
             KfpMessage::PsbtFinalize(p) => Some(&p.group_pubkey),
@@ -951,6 +954,40 @@ impl XpubAnnouncePayload {
             group_pubkey,
             share_index,
             recovery_xpubs,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+/// A holder's duress signal. Published when the holder is unlocked with its
+/// DURESS credential instead of the real vault password: the holder withholds
+/// its OPRF share (the box drops below threshold, fail-closed) and emits this.
+///
+/// It is signed (as a Nostr event) by the holder's dedicated duress-beacon key,
+/// whose public key the cluster pins out of band, NOT by the vault-derived
+/// identity (which duress mode never unlocks). Authenticity therefore comes from
+/// the pinned signing key, so a network attacker cannot forge one. The random
+/// `nonce` plus `created_at` bound replay: a captured beacon cannot be
+/// re-published as a fresh signal. It carries no secret and (beyond the group id
+/// every KFP event already tags) no sensitive data.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DuressBeaconPayload {
+    #[serde(with = "hex_bytes")]
+    pub group_pubkey: [u8; 32],
+    #[serde(with = "hex_bytes")]
+    pub nonce: [u8; 32],
+    pub created_at: u64,
+}
+
+impl DuressBeaconPayload {
+    pub fn new(group_pubkey: [u8; 32], nonce: [u8; 32]) -> Self {
+        Self {
+            group_pubkey,
+            nonce,
             created_at: Timestamp::now().as_secs(),
         }
     }

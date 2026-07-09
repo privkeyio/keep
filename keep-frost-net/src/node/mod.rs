@@ -2090,6 +2090,12 @@ impl KfpNode {
         // including `OprfEnrollAck`, is deliberately absent so it still requires a trusted peer
         // (defense in depth), matching `EcdhShare` / `SignatureShare` / `OprfEvalShare` /
         // `DescriptorAck`. Do NOT add `OprfEnrollAck` here: that would exempt it from the gate.
+        //
+        // `DuressBeacon` MUST be exempt: a duress beacon is signed by a dedicated duress-beacon
+        // key that never unlocks the vault and is by construction NOT a cluster peer, so the
+        // trusted-peer check would drop every authentic beacon before it reaches its arm. Its
+        // authenticity comes from `verify_duress_beacon` against the pinned beacon pubkey instead,
+        // which the arm (inc2) MUST call before acting -- the exemption grants NO trust on its own.
         if !matches!(
             msg,
             KfpMessage::Announce(_)
@@ -2097,6 +2103,7 @@ impl KfpNode {
                 | KfpMessage::EcdhRequest(_)
                 | KfpMessage::OprfEvalRequest(_)
                 | KfpMessage::OprfEnroll(_)
+                | KfpMessage::DuressBeacon(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -2191,6 +2198,13 @@ impl KfpNode {
             }
             KfpMessage::XpubAnnounce(payload) => {
                 self.handle_xpub_announce(event.pubkey, payload).await?;
+            }
+            KfpMessage::DuressBeacon(_) => {
+                // Reaches here WITHOUT the trusted-peer gate (the beacon key is not
+                // a peer; see the exemption above). inc1a ignores it. inc2 (sxb)
+                // MUST call `verify_duress_beacon` against this holder's PINNED
+                // beacon pubkey before acting -- reaching this arm grants no trust
+                // on its own -- then fail-closed freeze co-signing.
             }
             KfpMessage::PsbtPropose(payload) => {
                 self.handle_psbt_propose(event.pubkey, payload).await?;
