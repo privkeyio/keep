@@ -114,10 +114,43 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How far ahead of wall-clock a published `created_at` may drift before we warn. Same-second bumps
+/// drift only ~1-2s; a much larger gap means the seeded floor is ahead of wall-clock (a clock
+/// regression), which a relay enforcing a NIP-11 `created_at_upper_limit` may reject.
+const MAX_FUTURE_DRIFT_SECS: u64 = 60;
+
+/// How a relay pool responded to a publish. `RelayPool::send_event_to` returns `Ok(output)` even when
+/// every relay said no: a relay replying `OK: false` (including NIP-01 `invalid:` prefixes) lands in
+/// `failed`, leaving `success` empty. Classifying on the outer `Result` alone therefore reads a
+/// rejection as a success, which is the silent replication loss this exists to prevent.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    /// Every relay accepted the event.
+    Accepted,
+    /// At least one relay accepted, but others rejected it.
+    PartiallyRejected,
+    /// No relay accepted it: the record did NOT replicate.
+    NoRelayAccepted,
+}
+
+fn classify_send(out: &Output<EventId>) -> SendOutcome {
+    if out.success.is_empty() {
+        SendOutcome::NoRelayAccepted
+    } else if !out.failed.is_empty() {
+        SendOutcome::PartiallyRejected
+    } else {
+        SendOutcome::Accepted
+    }
+}
+
 /// Compute the strictly-monotonic per-d-tag `created_at` for the next publish. `last` is the in-memory
-/// per-d-tag high-water-mark, seeded at startup from the persisted floor (see `spawn_publisher`). A new
-/// slot starts at `floor`; each write returns `now` unless that is not strictly greater than the last
+/// per-d-tag high-water-mark. Each write returns `now` unless that is not strictly greater than the last
 /// timestamp, in which case it bumps to `last + 1` (`saturating_add` so it cannot overflow).
+///
+/// `floor` seeds a d-tag's slot ONLY the first time that d-tag is seen (see `spawn_publisher`, which
+/// reads the record's persisted mark lazily and passes a don't-care `0` once the slot is cached). Keep
+/// it that way: applying `floor` to an already-cached slot would let a stale `0` clamp `created_at` back
+/// to wall-clock and silently break the strict per-d-tag monotonicity the rollback guard depends on.
 fn next_ts(
     last: &mut std::collections::HashMap<String, u64>,
     dtag: &str,
@@ -136,35 +169,54 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         .await
         .set_state_publisher(Arc::new(ChannelPublisher { tx }));
 
-    // Seed the per-d-tag monotonic floor from the highest mark this node has already persisted. On a
-    // promoted standby (restarted as active) whose stored marks were inflated above wall-clock
-    // (same-second bumps) or under inter-node clock skew, starting from 0 could publish a created_at
-    // <= a mark standbys already applied and be rejected; seeding guarantees the first publish for any
-    // d-tag is strictly greater than every previously-applied mark.
-    let floor = match keep.lock().await.max_state_version() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                "keep-state: could not read persisted high-water floor, seeding from 0: {e}"
-            );
-            0
-        }
-    };
-
     tokio::spawn(async move {
-        // `last_ts` is an in-memory per-d-tag high-water-mark seeded from `floor` (the persisted mark).
-        // Within a run it guarantees strict per-d-tag monotonicity of created_at: a record and its
-        // immediate delete (or two rapid writes) must not collide on the same second, or the relay's
-        // created_at dedup could keep the wrong one and the standby's rollback guard would reject the
-        // newer as "not newer". Same-second writes bump to last+1; otherwise wall-clock is used.
+        // `last_ts` is an in-memory per-d-tag high-water-mark guaranteeing strict per-d-tag monotonicity
+        // of created_at within a run: a record and its immediate delete (or two rapid writes) must not
+        // collide on the same second, or the relay's created_at dedup could keep the wrong one and the
+        // standby's rollback guard would reject the newer as "not newer". Same-second writes bump to
+        // last+1. Each d-tag's floor is seeded on first sight from THAT record's OWN persisted mark (per
+        // record, not a global maximum), so a quiet record is not future-dated to the newest record's
+        // timestamp -- which is what a promoted standby, whose marks may be inflated above wall-clock,
+        // needs to stay strictly greater than what standbys already applied.
+        //
+        // The floor therefore covers only this record's own mark. A record this node never applied seeds
+        // from wall-clock, so if a peer holds a FUTURE-dated mark for it (this node was desynced while a
+        // prior active published it under a fast clock), that peer's rollback guard drops our publish as
+        // "not newer". Accepted deliberately: a global maximum would cover that case only by inflating
+        // every d-tag, which is the drift this seeding exists to remove, and the residual needs a real
+        // clock regression -- already an operational requirement above.
         let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         while let Some(change) = rx.recv().await {
-            let dtag = match &change {
-                Change::Record { table, id, .. } | Change::Delete { table, id } => {
-                    format!("{table}:{id}")
+            let (table, id) = match &change {
+                Change::Record { table, id, .. } | Change::Delete { table, id } => (table, id),
+            };
+            let dtag = format!("{table}:{id}");
+            let now = now_secs();
+            // Read this record's own persisted mark only on first sight (then cached in last_ts). A read
+            // error seeds 0 (wall-clock); the loud reject path below covers a rejected event.
+            let floor = if last_ts.contains_key(&dtag) {
+                0
+            } else {
+                match keep.lock().await.state_version(table, id) {
+                    Ok(v) => v.unwrap_or(0),
+                    Err(e) => {
+                        tracing::warn!(dtag = ?dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
+                        0
+                    }
                 }
             };
-            let ts = next_ts(&mut last_ts, &dtag, floor, now_secs());
+            let ts = next_ts(&mut last_ts, &dtag, floor, now);
+            // A created_at far ahead of wall-clock (a floor seeded after a clock regression, or a long
+            // same-second burst) risks a strict relay rejecting it as too-far-future. Surface the drift
+            // so a rejection below is explainable.
+            if ts > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
+                tracing::warn!(
+                    dtag = ?dtag,
+                    created_at = ts,
+                    now,
+                    "keep-state: created_at is far ahead of wall-clock; a relay enforcing a created_at_upper_limit may reject this event"
+                );
+            }
             let event = match &change {
                 Change::Record {
                     table,
@@ -174,11 +226,29 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                 Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
             };
             match event {
-                Ok(ev) => {
-                    if let Err(e) = client.send_event(&ev).await {
-                        tracing::warn!("keep-state publish failed: {e}");
-                    }
-                }
+                Ok(ev) => match client.send_event(&ev).await {
+                    Ok(out) => match classify_send(&out) {
+                        // Rejected (e.g. NIP-01 "invalid: event creation date is too far off from the
+                        // current time") or unreachable. It did NOT replicate; log loudly instead of
+                        // losing it silently.
+                        SendOutcome::NoRelayAccepted => tracing::error!(
+                            dtag = ?dtag,
+                            created_at = ts,
+                            failed = ?out.failed,
+                            "keep-state publish accepted by NO relay; record did not replicate"
+                        ),
+                        // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly
+                        // one relay, so this cannot fire), yet the reasons must never be discarded.
+                        SendOutcome::PartiallyRejected => tracing::warn!(
+                            dtag = ?dtag,
+                            created_at = ts,
+                            failed = ?out.failed,
+                            "keep-state publish rejected by some relays"
+                        ),
+                        SendOutcome::Accepted => {}
+                    },
+                    Err(e) => tracing::warn!("keep-state publish failed: {e}"),
+                },
                 Err(e) => tracing::warn!("keep-state event build failed: {e}"),
             }
         }
@@ -238,14 +308,20 @@ async fn spawn_consumer(
                             Ok(true) => {}
                             // Not strictly newer than what we already applied: a stale or replayed event
                             // (rollback attempt from an untrusted relay). Ignore it, but record it.
+                            // Debug-format the event-supplied table and record id: neither is charset-
+                            // constrained until `apply_*` checks the allowlist, so Display would let a
+                            // control character forge log lines.
                             Ok(false) => tracing::warn!(
-                                table = %rec.table,
+                                table = ?rec.table,
+                                record_id = ?rec.record_id,
                                 created_at = rec.created_at,
                                 "keep-state: ignored stale/replayed event (rollback guard)"
                             ),
-                            Err(e) => {
-                                tracing::warn!(table = %rec.table, "keep-state apply failed: {e}")
-                            }
+                            Err(e) => tracing::warn!(
+                                table = ?rec.table,
+                                record_id = ?rec.record_id,
+                                "keep-state apply failed: {e}"
+                            ),
                         }
                     }
                     Ok(None) => {}
@@ -265,6 +341,45 @@ mod tests {
     use nostr_relay_builder::MockRelay;
     use std::collections::HashMap;
 
+    // A relay that rejects an event (NIP-01 `OK: false`, e.g. an `invalid:` far-future `created_at`)
+    // still leaves `send_event` returning `Ok(output)` -- the rejection only shows up as an empty
+    // `success` set. Pin the classification, because reading `Ok(_)` as success is the silent
+    // replication loss this whole path exists to surface.
+    #[test]
+    fn a_send_no_relay_accepted_is_not_a_success() {
+        let out = |success: &[&str], failed: &[&str]| Output {
+            val: EventId::from_byte_array([0u8; 32]),
+            success: success
+                .iter()
+                .map(|u| RelayUrl::parse(u).unwrap())
+                .collect(),
+            failed: failed
+                .iter()
+                .map(|u| {
+                    (
+                        RelayUrl::parse(u).unwrap(),
+                        "invalid: event creation date is too far off from the current time".into(),
+                    )
+                })
+                .collect(),
+        };
+        let (a, b) = ("wss://a.example", "wss://b.example");
+
+        // Every relay rejected: the record did not replicate, even though the call returned `Ok`.
+        assert_eq!(
+            classify_send(&out(&[], &[a, b])),
+            SendOutcome::NoRelayAccepted
+        );
+        // No relay reachable at all: also did not replicate.
+        assert_eq!(classify_send(&out(&[], &[])), SendOutcome::NoRelayAccepted);
+        // Accepted somewhere, rejected elsewhere: replicated, but the reasons must not be discarded.
+        assert_eq!(
+            classify_send(&out(&[a], &[b])),
+            SendOutcome::PartiallyRejected
+        );
+        assert_eq!(classify_send(&out(&[a, b], &[])), SendOutcome::Accepted);
+    }
+
     #[test]
     fn next_ts_is_strictly_monotonic_per_dtag() {
         let mut last: HashMap<String, u64> = HashMap::new();
@@ -280,6 +395,26 @@ mod tests {
         assert_eq!(next_ts(&mut last, "keys:a", 0, 500), 501);
         // (e) a seeded floor above wall-clock produces floor+1 (the promotion case).
         assert_eq!(next_ts(&mut last, "keys:c", 1_000, 100), 1_001);
+    }
+
+    // The publisher warns when a computed created_at lands more than `MAX_FUTURE_DRIFT_SECS` ahead of
+    // wall-clock, because a relay enforcing a NIP-11 `created_at_upper_limit` may reject it. Pin both
+    // sides of that threshold: routine same-second bumps must not trip it, a seeded floor must.
+    #[test]
+    fn only_a_far_future_floor_trips_the_drift_threshold() {
+        let mut last: HashMap<String, u64> = HashMap::new();
+        let now = 1_000_000;
+
+        // A burst of same-second writes drifts one second per write, so it stays well inside the
+        // threshold -- the warning cannot false-positive on ordinary collision bumps.
+        for _ in 0..10 {
+            assert!(next_ts(&mut last, "keys:a", 0, now) <= now + MAX_FUTURE_DRIFT_SECS);
+        }
+
+        // A floor seeded above wall-clock (promoted standby, or a clock regression) pushes created_at
+        // past the threshold: exactly the case the warning exists to surface.
+        let ts = next_ts(&mut last, "keys:b", now + MAX_FUTURE_DRIFT_SECS, now);
+        assert!(ts > now + MAX_FUTURE_DRIFT_SECS);
     }
 
     // Full end-to-end: an ACTIVE keep-web node writes vault state, it flows through a live relay, and a
