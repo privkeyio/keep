@@ -66,6 +66,13 @@ pub struct Peer {
     pub status: PeerStatus,
     pub protocol_version: u8,
     pub attestation_status: AttestationStatus,
+    /// Last time this peer was admitted with `Verified` attestation. Stamped
+    /// only by a successful attested announce (via `with_attestation_status`),
+    /// never by a ping/pong or a re-announce that failed attestation, so unlike
+    /// `last_seen` it cannot be refreshed without producing fresh evidence. The
+    /// OPRF/enrollment oracle gates on this so a `Verified` verdict expires
+    /// instead of being honored indefinitely on credit.
+    pub last_attested: Option<Instant>,
     pub recovery_xpubs: Vec<AnnouncedXpub>,
 }
 
@@ -82,11 +89,15 @@ impl Peer {
             status: PeerStatus::Online,
             protocol_version: crate::KFP_VERSION,
             attestation_status: AttestationStatus::NotProvided,
+            last_attested: None,
             recovery_xpubs: Vec::new(),
         }
     }
 
     pub fn with_attestation_status(mut self, status: AttestationStatus) -> Self {
+        if matches!(status, AttestationStatus::Verified) {
+            self.last_attested = Some(Instant::now());
+        }
         self.attestation_status = status;
         self
     }
@@ -96,6 +107,23 @@ impl Peer {
             self.attestation_status,
             AttestationStatus::Verified | AttestationStatus::NotConfigured
         )
+    }
+
+    /// Whether this peer's attestation is `Verified` AND that verdict is still
+    /// fresh (its last attested announce was received within `window`). The OPRF
+    /// and enrollment oracles require this rather than a bare `Verified` so a
+    /// verdict ages out instead of being honored indefinitely on credit: an
+    /// attacker on un-attested hardware cannot forge a fresh Verified announce
+    /// (the AK is TPM-resident), so once the real box stops emitting valid
+    /// attested announces the verdict expires. Freshness is measured from
+    /// announce RECEIPT, so the honored lifetime after the box goes silent is
+    /// bounded by `window` PLUS the announce admission window
+    /// (`ANNOUNCE_MAX_AGE_SECS`), within which a captured announce could be
+    /// replayed to refresh the stamp; gating on the signed quote time instead
+    /// would remove that slack at the cost of wall-clock skew sensitivity.
+    pub fn is_attestation_fresh(&self, window: Duration) -> bool {
+        matches!(self.attestation_status, AttestationStatus::Verified)
+            && self.last_attested.is_some_and(|t| t.elapsed() < window)
     }
 
     pub fn with_name(mut self, name: &str) -> Self {
@@ -177,6 +205,13 @@ impl PeerManager {
                 // announce does not wipe the liveness signal the pre-round check
                 // relies on.
                 peer.last_pong = existing.last_pong;
+                // Keep the freshest attestation stamp: a Verified re-announce
+                // brings a newer `last_attested`; an announce that carried none
+                // must not wipe a prior verdict (its staleness is judged by the
+                // gate's window, not by presence).
+                if peer.last_attested.is_none() {
+                    peer.last_attested = existing.last_attested;
+                }
             }
             self.peers.insert(peer.share_index, peer);
         }
@@ -391,5 +426,57 @@ mod tests {
             parse_announce_interval(Some("99999".into())),
             Duration::from_secs(99999)
         );
+    }
+
+    #[test]
+    fn attestation_fresh_requires_verified_and_recent() {
+        let keys = Keys::generate();
+        let peer =
+            Peer::new(keys.public_key(), 2).with_attestation_status(AttestationStatus::Verified);
+        // A just-Verified peer is fresh within a normal window.
+        assert!(peer.last_attested.is_some());
+        assert!(peer.is_attestation_fresh(Duration::from_secs(60)));
+        // A zero window makes no verdict fresh (elapsed is never < 0); this
+        // stands in for a verdict that has aged past the offline window, at
+        // which point the oracle must refuse.
+        assert!(!peer.is_attestation_fresh(Duration::ZERO));
+    }
+
+    #[test]
+    fn attestation_fresh_false_for_unverified_or_unstamped() {
+        let keys = Keys::generate();
+        let w = Duration::from_secs(60);
+        // Never attested.
+        assert!(!Peer::new(keys.public_key(), 2).is_attestation_fresh(w));
+        // NotConfigured counts as "attested" for the permissive is_attested()
+        // path but must NOT satisfy the strict oracle gate; Failed never does.
+        assert!(!Peer::new(keys.public_key(), 2)
+            .with_attestation_status(AttestationStatus::NotConfigured)
+            .is_attestation_fresh(w));
+        assert!(!Peer::new(keys.public_key(), 2)
+            .with_attestation_status(AttestationStatus::Failed("x".into()))
+            .is_attestation_fresh(w));
+        // A Verified status with no stamp (defensive: unreachable via the
+        // builder) is never honored on credit.
+        let mut peer =
+            Peer::new(keys.public_key(), 2).with_attestation_status(AttestationStatus::Verified);
+        peer.last_attested = None;
+        assert!(!peer.is_attestation_fresh(w));
+    }
+
+    #[test]
+    fn re_announce_without_stamp_preserves_prior_attestation() {
+        // A Verified announce stamps last_attested; a later announce that
+        // carries no stamp must not wipe the prior verdict (its staleness is
+        // judged by the gate's window, not by presence).
+        let mut pm = PeerManager::new(1);
+        let keys = Keys::generate();
+        pm.add_peer(
+            Peer::new(keys.public_key(), 2).with_attestation_status(AttestationStatus::Verified),
+        );
+        let stamped = pm.get_peer(2).unwrap().last_attested;
+        assert!(stamped.is_some());
+        pm.add_peer(Peer::new(keys.public_key(), 2));
+        assert_eq!(pm.get_peer(2).unwrap().last_attested, stamped);
     }
 }

@@ -19,8 +19,6 @@ use crate::event::KfpEventBuilder;
 use crate::oprf_session::derive_oprf_session_id;
 use crate::protocol::*;
 
-use crate::peer::AttestationStatus;
-
 use super::{KfpNode, KfpNodeEvent};
 
 impl KfpNode {
@@ -88,9 +86,14 @@ impl KfpNode {
                         request.requester_share_index
                     ))
                 })?;
-            if !matches!(peer.attestation_status, AttestationStatus::Verified) {
+            // Require a Verified status that is still FRESH: an attested
+            // announce within the offline window. A bare `Verified` is sticky
+            // (a failing re-announce is rejected before it can downgrade the
+            // entry), so gating on freshness stops a stolen network identity
+            // replayed from un-attested hardware from trading on a stale verdict.
+            if !peer.is_attestation_fresh(peers.offline_threshold()) {
                 return Err(FrostNetError::UntrustedPeer(format!(
-                    "OPRF requester share {} attestation not Verified ({:?})",
+                    "OPRF requester share {} attestation not fresh-Verified ({:?})",
                     request.requester_share_index, peer.attestation_status
                 )));
             }
