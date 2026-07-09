@@ -347,6 +347,9 @@ fn dispatch_frost_network(
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_peers(out, path, &group, relay)
         }
+        FrostNetworkCommands::DuressProvision => {
+            commands::frost_network::cmd_frost_network_duress_provision(out)
+        }
         FrostNetworkCommands::AttestationProvision {
             group,
             relay,
