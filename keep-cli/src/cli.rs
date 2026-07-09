@@ -617,6 +617,10 @@ pub(crate) enum FrostNetworkCommands {
         #[arg(short, long)]
         relay: Option<String>,
     },
+    /// Provision a duress credential: derive and print the duress-beacon pubkey
+    /// (to pin with the cluster) and salt (to configure on `serve`). The
+    /// credential is never stored. Coercion resistance (inc1b).
+    DuressProvision,
     /// Author an attestation-config from observed announces (trust-on-first-use).
     AttestationProvision {
         #[arg(short, long, help = "FROST group npub")]

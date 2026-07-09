@@ -15,7 +15,7 @@ pub mod vault;
 pub mod wallet;
 
 use dialoguer::{theme::ColorfulTheme, Confirm, Password};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use tracing::debug;
 
 use keep_core::error::{KeepError, Result};
@@ -75,6 +75,41 @@ pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretSt
             )))
         })?;
     Ok(SecretString::from(pw))
+}
+
+/// Read a DURESS credential (coercion resistance). Prompt + confirm, or the
+/// `KEEP_DURESS_PASSWORD` env var , NEVER `KEEP_PASSWORD`, so an exported vault
+/// password cannot silently become the duress trigger (which would make every
+/// normal unlock fail closed). Refuses an empty/whitespace-only credential, and,
+/// when `KEEP_PASSWORD` is also set, refuses a credential equal to it.
+pub fn get_duress_credential(prompt: &str, confirm: &str) -> Result<SecretString> {
+    let cred = if let Some(pw) = password_from_env("KEEP_DURESS_PASSWORD") {
+        pw
+    } else {
+        let pw = Password::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .with_confirmation(confirm, "Credentials don't match")
+            .interact()
+            .map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "read password: {e}"
+                )))
+            })?;
+        SecretString::from(pw)
+    };
+    if cred.expose_secret().trim().is_empty() {
+        return Err(KeepError::invalid_input(
+            "duress credential must not be empty",
+        ));
+    }
+    if let Some(vault) = password_from_env("KEEP_PASSWORD") {
+        if cred.expose_secret() == vault.expose_secret() {
+            return Err(KeepError::invalid_input(
+                "duress credential must be DISTINCT from the vault password (KEEP_PASSWORD)",
+            ));
+        }
+    }
+    Ok(cred)
 }
 
 pub fn get_new_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretString> {
