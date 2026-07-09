@@ -400,19 +400,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extract_spki_matches_standard_spki_pin() {
-        // A P-256 self-signed cert (openssl). SPKI_PIN_HEX is openssl's INDEPENDENT SHA-256 of the DER
-        // SubjectPublicKeyInfo -- the standard SPKI pin -- so this proves x509-cert extraction yields the
-        // right bytes (byte-identical, for a DER cert, to the field as received on the wire).
+    // A P-256 self-signed cert (openssl), as raw DER. Shared by the extraction
+    // tests below.
+    fn valid_cert_der() -> Vec<u8> {
         use base64::Engine;
         const CERT_B64: &str = "MIIBfTCCASOgAwIBAgIUHTPZUgNrUaDV8WbwKjVdqApCNHIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJa2VlcC10ZXN0MB4XDTI2MDcwOTE2NDEzM1oXDTI2MDcxMDE2NDEzM1owFDESMBAGA1UEAwwJa2VlcC10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEu4Nc5266JcHihyRoqfVvBOX2YfSvZ0CcpeJb8EilRnjI7YMdV7tU4pQpaBJmTJ8Om1mQ1d+HmrCwaKYTxlwzQ6NTMFEwHQYDVR0OBBYEFHjQXcwFh3SfDQ63QlR2m/p3n87kMB8GA1UdIwQYMBaAFHjQXcwFh3SfDQ63QlR2m/p3n87kMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgX734WY/RX390XIofsLw7i+xRvyZF0rYRQq/GD75jW4oCIQCyz+TfYUL8/GDcGDC+pWG961UgUjp5rGG3UiCjepovyA==";
+        base64::engine::general_purpose::STANDARD
+            .decode(CERT_B64)
+            .unwrap()
+    }
+
+    #[test]
+    fn extract_spki_matches_standard_spki_pin() {
+        // SPKI_PIN_HEX is openssl's INDEPENDENT SHA-256 of the DER SubjectPublicKeyInfo -- the
+        // standard SPKI pin -- so this proves x509-cert extraction yields the right bytes
+        // (byte-identical, for a DER cert, to the field as received on the wire).
         const SPKI_PIN_HEX: &str =
             "3468fefa122e3f6ca0ce5eb07906e2f062a7d4cda0f5f32177094b329a5eb0e6";
-        let cert_der = base64::engine::general_purpose::STANDARD
-            .decode(CERT_B64)
-            .unwrap();
-        let spki = extract_spki_from_der(&cert_der).expect("valid cert should yield an SPKI");
+        let spki =
+            extract_spki_from_der(&valid_cert_der()).expect("valid cert should yield an SPKI");
         assert_eq!(hex::encode(hash_spki(&spki)), SPKI_PIN_HEX);
+    }
+
+    #[test]
+    fn extract_spki_fails_closed_on_malformed_der() {
+        // Garbage, empty, and truncated input must yield None so the caller fails
+        // closed (refuses the connection), never a wrong SPKI hashed into a pin.
+        assert!(extract_spki_from_der(b"not a certificate at all").is_none());
+        assert!(extract_spki_from_der(&[]).is_none());
+        let der = valid_cert_der();
+        assert!(
+            extract_spki_from_der(&der[..der.len() / 2]).is_none(),
+            "a truncated certificate must not parse"
+        );
+    }
+
+    #[test]
+    fn extract_spki_rejects_trailing_data() {
+        // The x509-cert decoder rejects bytes after the certificate, whereas the
+        // replaced positional walk sliced the SPKI element and silently ignored
+        // any trailing data. A cert with appended garbage must fail closed.
+        let mut der = valid_cert_der();
+        der.extend_from_slice(&[0xAA; 8]);
+        assert!(extract_spki_from_der(&der).is_none());
     }
 }
