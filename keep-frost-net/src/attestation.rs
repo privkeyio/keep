@@ -1,13 +1,16 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use sha2::{Digest, Sha256};
-#[cfg(not(feature = "nitro-attestation"))]
-use subtle::ConstantTimeEq;
 
 use crate::error::{FrostNetError, Result};
 use crate::protocol::EnclaveAttestation;
 
+// Only the Nitro document verifier checks an enclave attestation's timestamp;
+// the non-Nitro build fails closed before any timestamp check, so these are
+// gated to avoid dead-code warnings there.
+#[cfg(feature = "nitro-attestation")]
 pub const ATTESTATION_MAX_AGE_SECS: u64 = 300;
+#[cfg(feature = "nitro-attestation")]
 pub const ATTESTATION_MAX_FUTURE_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
@@ -108,19 +111,27 @@ pub fn verify_peer_attestation(
     Ok(())
 }
 
+/// Without the `nitro-attestation` feature there is no Nitro document verifier
+/// compiled in, so a peer's enclave attestation cannot be cryptographically
+/// verified. Fail closed: refuse it. The previous stub compared only the
+/// attacker-supplied PCR *claims* against the (public) expected values and
+/// returned `Ok`, which any forger could satisfy by echoing the expected PCRs.
+/// A node that cannot verify Nitro evidence must reject it, never admit it on
+/// trust.
 #[cfg(not(feature = "nitro-attestation"))]
 pub fn verify_peer_attestation(
-    attestation: &EnclaveAttestation,
-    expected_pcrs: &ExpectedPcrs,
+    _attestation: &EnclaveAttestation,
+    _expected_pcrs: &ExpectedPcrs,
     _group_pubkey: &[u8; 32],
 ) -> Result<()> {
-    verify_pcr(&attestation.pcr0, 0, &expected_pcrs.pcr0)?;
-    verify_pcr(&attestation.pcr1, 1, &expected_pcrs.pcr1)?;
-    verify_pcr(&attestation.pcr2, 2, &expected_pcrs.pcr2)?;
-    verify_attestation_timestamp_ms(attestation.timestamp)?;
-    Ok(())
+    Err(FrostNetError::Attestation(
+        "enclave (Nitro) attestation cannot be verified: this build lacks the \
+         nitro-attestation feature"
+            .into(),
+    ))
 }
 
+#[cfg(feature = "nitro-attestation")]
 pub(crate) fn verify_attestation_timestamp_ms(timestamp_ms: u64) -> Result<()> {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -144,25 +155,6 @@ pub(crate) fn verify_attestation_timestamp_ms(timestamp_ms: u64) -> Result<()> {
         )));
     }
 
-    Ok(())
-}
-
-#[cfg(not(feature = "nitro-attestation"))]
-fn verify_pcr(actual: &[u8], index: u32, expected: &[u8; 48]) -> Result<()> {
-    if actual.len() != 48 {
-        return Err(FrostNetError::PcrMismatch {
-            pcr: index,
-            expected: hex::encode(expected),
-            actual: format!("invalid length: {}", actual.len()),
-        });
-    }
-    if !bool::from(actual.ct_eq(expected)) {
-        return Err(FrostNetError::PcrMismatch {
-            pcr: index,
-            expected: hex::encode(expected),
-            actual: hex::encode(actual),
-        });
-    }
     Ok(())
 }
 
@@ -236,8 +228,12 @@ mod tests {
     mod non_nitro_tests {
         use super::*;
 
+        /// Without the nitro-attestation feature there is no document verifier,
+        /// so verify_peer_attestation fails closed for ANY input, including one
+        /// whose claimed PCRs and timestamp are otherwise valid, rather than the
+        /// old stub that returned Ok on a matching (forgeable) PCR claim.
         #[test]
-        fn test_verify_peer_attestation_success() {
+        fn verify_peer_attestation_fails_closed_without_nitro() {
             let attestation = EnclaveAttestation::new(
                 vec![],
                 vec![0u8; 48],
@@ -246,94 +242,14 @@ mod tests {
                 vec![],
                 current_timestamp_ms(),
             );
+            // PCRs and timestamp all "match"/are fresh; the old stub returned Ok.
             let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
-            let group_pubkey = [0u8; 32];
-            assert!(verify_peer_attestation(&attestation, &expected, &group_pubkey).is_ok());
-        }
-
-        #[test]
-        fn test_verify_peer_attestation_mismatch() {
-            let attestation = EnclaveAttestation::new(
-                vec![],
-                vec![0u8; 48],
-                vec![99u8; 48],
-                vec![2u8; 48],
-                vec![],
-                current_timestamp_ms(),
-            );
-            let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
-            let group_pubkey = [0u8; 32];
-            let result = verify_peer_attestation(&attestation, &expected, &group_pubkey);
-            assert!(result.is_err());
+            let result = verify_peer_attestation(&attestation, &expected, &[0u8; 32]);
             match result.unwrap_err() {
-                FrostNetError::PcrMismatch { pcr, .. } => assert_eq!(pcr, 1),
-                _ => panic!("Expected PcrMismatch error"),
-            }
-        }
-
-        #[test]
-        fn test_verify_peer_attestation_invalid_length() {
-            let attestation = EnclaveAttestation::new(
-                vec![],
-                vec![0u8; 32],
-                vec![1u8; 48],
-                vec![2u8; 48],
-                vec![],
-                current_timestamp_ms(),
-            );
-            let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
-            let group_pubkey = [0u8; 32];
-            let result = verify_peer_attestation(&attestation, &expected, &group_pubkey);
-            assert!(result.is_err());
-            match result.unwrap_err() {
-                FrostNetError::PcrMismatch { pcr, actual, .. } => {
-                    assert_eq!(pcr, 0);
-                    assert!(actual.contains("invalid length"));
+                FrostNetError::Attestation(msg) => {
+                    assert!(msg.contains("nitro-attestation"))
                 }
-                _ => panic!("Expected PcrMismatch error"),
-            }
-        }
-
-        #[test]
-        fn test_verify_peer_attestation_timestamp_too_old() {
-            let old_timestamp = current_timestamp_ms() - (ATTESTATION_MAX_AGE_SECS + 60) * 1000;
-            let attestation = EnclaveAttestation::new(
-                vec![],
-                vec![0u8; 48],
-                vec![1u8; 48],
-                vec![2u8; 48],
-                vec![],
-                old_timestamp,
-            );
-            let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
-            let group_pubkey = [0u8; 32];
-            let result = verify_peer_attestation(&attestation, &expected, &group_pubkey);
-            assert!(result.is_err());
-            match result.unwrap_err() {
-                FrostNetError::Attestation(msg) => assert!(msg.contains("too old")),
-                e => panic!("Expected Attestation error, got {:?}", e),
-            }
-        }
-
-        #[test]
-        fn test_verify_peer_attestation_timestamp_in_future() {
-            let future_timestamp =
-                current_timestamp_ms() + (ATTESTATION_MAX_FUTURE_SECS + 60) * 1000;
-            let attestation = EnclaveAttestation::new(
-                vec![],
-                vec![0u8; 48],
-                vec![1u8; 48],
-                vec![2u8; 48],
-                vec![],
-                future_timestamp,
-            );
-            let expected = ExpectedPcrs::new([0u8; 48], [1u8; 48], [2u8; 48]);
-            let group_pubkey = [0u8; 32];
-            let result = verify_peer_attestation(&attestation, &expected, &group_pubkey);
-            assert!(result.is_err());
-            match result.unwrap_err() {
-                FrostNetError::Attestation(msg) => assert!(msg.contains("future")),
-                e => panic!("Expected Attestation error, got {:?}", e),
+                e => panic!("Expected fail-closed Attestation error, got {:?}", e),
             }
         }
     }
