@@ -176,7 +176,7 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
             // so a rejection below is explainable.
             if ts > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
                 tracing::warn!(
-                    dtag = %dtag,
+                    dtag = ?dtag,
                     created_at = ts,
                     now,
                     "keep-state: created_at is far ahead of wall-clock; a relay enforcing a created_at_upper_limit may reject this event"
@@ -195,10 +195,18 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                     // No relay accepted it -- rejected (e.g. NIP-01 "invalid: created_at too far off")
                     // or unreachable. It did NOT replicate; log loudly instead of losing it silently.
                     Ok(out) if out.success.is_empty() => tracing::error!(
-                        dtag = %dtag,
+                        dtag = ?dtag,
                         created_at = ts,
                         failed = ?out.failed,
                         "keep-state publish accepted by NO relay; record did not replicate"
+                    ),
+                    // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly one
+                    // relay, so this cannot fire), yet the reasons must never be silently discarded.
+                    Ok(out) if !out.failed.is_empty() => tracing::warn!(
+                        dtag = ?dtag,
+                        created_at = ts,
+                        failed = ?out.failed,
+                        "keep-state publish rejected by some relays"
                     ),
                     Ok(_) => {}
                     Err(e) => tracing::warn!("keep-state publish failed: {e}"),
@@ -304,6 +312,26 @@ mod tests {
         assert_eq!(next_ts(&mut last, "keys:a", 0, 500), 501);
         // (e) a seeded floor above wall-clock produces floor+1 (the promotion case).
         assert_eq!(next_ts(&mut last, "keys:c", 1_000, 100), 1_001);
+    }
+
+    // The publisher warns when a computed created_at lands more than `MAX_FUTURE_DRIFT_SECS` ahead of
+    // wall-clock, because a relay enforcing a NIP-11 `created_at_upper_limit` may reject it. Pin both
+    // sides of that threshold: routine same-second bumps must not trip it, a seeded floor must.
+    #[test]
+    fn only_a_far_future_floor_trips_the_drift_threshold() {
+        let mut last: HashMap<String, u64> = HashMap::new();
+        let now = 1_000_000;
+
+        // A burst of same-second writes drifts one second per write, so it stays well inside the
+        // threshold -- the warning cannot false-positive on ordinary collision bumps.
+        for _ in 0..10 {
+            assert!(next_ts(&mut last, "keys:a", 0, now) <= now + MAX_FUTURE_DRIFT_SECS);
+        }
+
+        // A floor seeded above wall-clock (promoted standby, or a clock regression) pushes created_at
+        // past the threshold: exactly the case the warning exists to surface.
+        let ts = next_ts(&mut last, "keys:b", now + MAX_FUTURE_DRIFT_SECS, now);
+        assert!(ts > now + MAX_FUTURE_DRIFT_SECS);
     }
 
     // Full end-to-end: an ACTIVE keep-web node writes vault state, it flows through a live relay, and a
