@@ -120,9 +120,13 @@ fn now_secs() -> u64 {
 const MAX_FUTURE_DRIFT_SECS: u64 = 60;
 
 /// Compute the strictly-monotonic per-d-tag `created_at` for the next publish. `last` is the in-memory
-/// per-d-tag high-water-mark, seeded at startup from the persisted floor (see `spawn_publisher`). A new
-/// slot starts at `floor`; each write returns `now` unless that is not strictly greater than the last
+/// per-d-tag high-water-mark. Each write returns `now` unless that is not strictly greater than the last
 /// timestamp, in which case it bumps to `last + 1` (`saturating_add` so it cannot overflow).
+///
+/// `floor` seeds a d-tag's slot ONLY the first time that d-tag is seen (see `spawn_publisher`, which
+/// reads the record's persisted mark lazily and passes a don't-care `0` once the slot is cached). Keep
+/// it that way: applying `floor` to an already-cached slot would let a stale `0` clamp `created_at` back
+/// to wall-clock and silently break the strict per-d-tag monotonicity the rollback guard depends on.
 fn next_ts(
     last: &mut std::collections::HashMap<String, u64>,
     dtag: &str,
@@ -150,6 +154,13 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         // record, not a global maximum), so a quiet record is not future-dated to the newest record's
         // timestamp -- which is what a promoted standby, whose marks may be inflated above wall-clock,
         // needs to stay strictly greater than what standbys already applied.
+        //
+        // The floor therefore covers only this record's own mark. A record this node never applied seeds
+        // from wall-clock, so if a peer holds a FUTURE-dated mark for it (this node was desynced while a
+        // prior active published it under a fast clock), that peer's rollback guard drops our publish as
+        // "not newer". Accepted deliberately: a global maximum would cover that case only by inflating
+        // every d-tag, which is the drift this seeding exists to remove, and the residual needs a real
+        // clock regression -- already an operational requirement above.
         let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         while let Some(change) = rx.recv().await {
             let (table, id) = match &change {
@@ -165,7 +176,7 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                 match keep.lock().await.state_version(table, id) {
                     Ok(v) => v.unwrap_or(0),
                     Err(e) => {
-                        tracing::warn!(dtag = %dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
+                        tracing::warn!(dtag = ?dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
                         0
                     }
                 }
