@@ -1706,6 +1706,15 @@ async fn test_ecdh_request_completes_with_one_cosigner() {
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let recipient_pubkey: [u8; 33] = recipient_secret.public_key(&secp).serialize();
 
+    // The ECDH oracle now requires the requester to be fresh-Verified (matching
+    // the OPRF/enroll oracles). These nodes run without an attestation policy,
+    // so mark the requester (share index 1) Verified on the responder, exactly
+    // as the OPRF round-trip test does. Let the post-discovery reciprocal
+    // announces flush first (a re-announce would reset the status); re-announces
+    // are then 20s apart, covering the sub-second request window.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    node2.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
     let request_result = timeout(
         Duration::from_secs(45),
         node1.request_ecdh(&recipient_pubkey),
