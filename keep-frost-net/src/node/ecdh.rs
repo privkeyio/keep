@@ -50,6 +50,27 @@ impl KfpNode {
             )));
         }
 
+        // Attestation gate, matching the OPRF/enroll oracles (the #621 ship-gate
+        // this responder was missing): a quorum of these partials combines to
+        // the group's ECDH shared secret with an attacker-chosen recipient, so
+        // answer only a requester whose measured boot is freshly Verified. A
+        // stolen network identity replayed from un-attested hardware must not
+        // extract group ECDH secrets, even though policy (`can_receive_from`)
+        // still lists its pubkey. Fresh-Verified (not a bare `Verified`) so a
+        // stale verdict is not honored on credit; see `is_attestation_fresh`.
+        {
+            let peers = self.peers.read();
+            let peer = peers.get_peer_by_pubkey(&from).ok_or_else(|| {
+                FrostNetError::UntrustedPeer(format!("ECDH requester {from} not announced"))
+            })?;
+            if !peer.is_attestation_fresh(peers.offline_threshold()) {
+                return Err(FrostNetError::UntrustedPeer(format!(
+                    "ECDH requester {from} attestation not fresh-Verified ({:?})",
+                    peer.attestation_status
+                )));
+            }
+        }
+
         info!(
             session_id = %hex::encode(request.session_id),
             "Received ECDH request"
@@ -493,6 +514,38 @@ mod gate_tests {
         assert!(matches!(
             node.handle_ecdh_complete(from, payload).await,
             Err(FrostNetError::Session(_))
+        ));
+    }
+
+    /// A requester that is not a known peer at all is refused: the ECDH oracle
+    /// exposes the group's shared secret, so an unannounced pubkey cannot invoke
+    /// it. Fresh `created_at` passes the replay gate so the attestation gate is
+    /// what trips.
+    #[tokio::test]
+    async fn handle_ecdh_request_rejects_unannounced_requester() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
+
+    /// A known but unattested (default `NotProvided`) requester is refused,
+    /// matching the OPRF/enroll oracles. Reaching the attestation gate proves
+    /// group/participant/replay/policy all passed first.
+    #[tokio::test]
+    async fn handle_ecdh_request_rejects_unattested_requester() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        node.test_inject_peer(crate::peer::Peer::new(from, 2));
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::UntrustedPeer(_))
         ));
     }
 }
