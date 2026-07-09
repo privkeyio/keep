@@ -21,7 +21,6 @@ use zeroize::Zeroizing;
 use crate::enroll_session::derive_oprf_enroll_session_id;
 use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
-use crate::peer::AttestationStatus;
 use crate::protocol::*;
 
 use super::{KfpNode, KfpNodeEvent, OprfShareSealAck};
@@ -277,9 +276,12 @@ impl KfpNode {
                     payload.dealer_index
                 ))
             })?;
-            if !matches!(peer.attestation_status, AttestationStatus::Verified) {
+            // Fresh Verified, like the eval oracle: a sticky verdict must not
+            // let a stolen network identity deal an enrollment share from
+            // un-attested hardware after the attested announce has gone stale.
+            if !peer.is_attestation_fresh(peers.offline_threshold()) {
                 return Err(FrostNetError::UntrustedPeer(format!(
-                    "OPRF enrollment dealer share {} attestation not Verified ({:?})",
+                    "OPRF enrollment dealer share {} attestation not fresh-Verified ({:?})",
                     payload.dealer_index, peer.attestation_status
                 )));
             }

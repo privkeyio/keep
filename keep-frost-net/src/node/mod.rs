@@ -1433,6 +1433,9 @@ impl KfpNode {
     #[cfg(any(test, feature = "testing"))]
     pub fn test_set_peer_attestation(&self, share_index: u16, status: AttestationStatus) {
         if let Some(peer) = self.peers.write().get_peer_mut(share_index) {
+            if matches!(status, AttestationStatus::Verified) {
+                peer.last_attested = Some(std::time::Instant::now());
+            }
             peer.attestation_status = status;
         }
     }
