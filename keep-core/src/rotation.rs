@@ -900,8 +900,14 @@ mod tests {
                 redb::TableDefinition::new(HEALTH_STATUS_TABLE);
             let db = redb::Database::open(path.join("keep.db")).unwrap();
             let wtxn = db.begin_write().unwrap();
-            wtxn.delete_table(config_def).unwrap();
-            wtxn.delete_table(health_def).unwrap();
+            assert!(
+                wtxn.delete_table(config_def).unwrap(),
+                "config table must exist before it can be dropped"
+            );
+            assert!(
+                wtxn.delete_table(health_def).unwrap(),
+                "key_health_status table must exist before it can be dropped"
+            );
             wtxn.commit().unwrap();
         }
 
