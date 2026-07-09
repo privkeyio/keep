@@ -141,35 +141,35 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         .await
         .set_state_publisher(Arc::new(ChannelPublisher { tx }));
 
-    // Seed the per-d-tag monotonic floor from the highest mark this node has already persisted. On a
-    // promoted standby (restarted as active) whose stored marks were inflated above wall-clock
-    // (same-second bumps) or under inter-node clock skew, starting from 0 could publish a created_at
-    // <= a mark standbys already applied and be rejected; seeding guarantees the first publish for any
-    // d-tag is strictly greater than every previously-applied mark.
-    let floor = match keep.lock().await.max_state_version() {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                "keep-state: could not read persisted high-water floor, seeding from 0: {e}"
-            );
-            0
-        }
-    };
-
     tokio::spawn(async move {
-        // `last_ts` is an in-memory per-d-tag high-water-mark seeded from `floor` (the persisted mark).
-        // Within a run it guarantees strict per-d-tag monotonicity of created_at: a record and its
-        // immediate delete (or two rapid writes) must not collide on the same second, or the relay's
-        // created_at dedup could keep the wrong one and the standby's rollback guard would reject the
-        // newer as "not newer". Same-second writes bump to last+1; otherwise wall-clock is used.
+        // `last_ts` is an in-memory per-d-tag high-water-mark guaranteeing strict per-d-tag monotonicity
+        // of created_at within a run: a record and its immediate delete (or two rapid writes) must not
+        // collide on the same second, or the relay's created_at dedup could keep the wrong one and the
+        // standby's rollback guard would reject the newer as "not newer". Same-second writes bump to
+        // last+1. Each d-tag's floor is seeded on first sight from THAT record's OWN persisted mark (per
+        // record, not a global maximum), so a quiet record is not future-dated to the newest record's
+        // timestamp -- which is what a promoted standby, whose marks may be inflated above wall-clock,
+        // needs to stay strictly greater than what standbys already applied.
         let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         while let Some(change) = rx.recv().await {
-            let dtag = match &change {
-                Change::Record { table, id, .. } | Change::Delete { table, id } => {
-                    format!("{table}:{id}")
+            let (table, id) = match &change {
+                Change::Record { table, id, .. } | Change::Delete { table, id } => (table, id),
+            };
+            let dtag = format!("{table}:{id}");
+            let now = now_secs();
+            // Read this record's own persisted mark only on first sight (then cached in last_ts). A read
+            // error seeds 0 (wall-clock); the loud reject path below covers a rejected event.
+            let floor = if last_ts.contains_key(&dtag) {
+                0
+            } else {
+                match keep.lock().await.state_version(table, id) {
+                    Ok(v) => v.unwrap_or(0),
+                    Err(e) => {
+                        tracing::warn!(dtag = %dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
+                        0
+                    }
                 }
             };
-            let now = now_secs();
             let ts = next_ts(&mut last_ts, &dtag, floor, now);
             // A created_at far ahead of wall-clock (a floor seeded after a clock regression, or a long
             // same-second burst) risks a strict relay rejecting it as too-far-future. Surface the drift

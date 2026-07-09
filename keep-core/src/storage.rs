@@ -394,23 +394,23 @@ impl Storage {
         Ok(true)
     }
 
-    /// The highest keep-state high-water-mark persisted in this vault, or 0 if none. A promoted standby
-    /// (restarted as active) seeds its publisher's per-d-tag monotonic floor from this so a fresh publish
-    /// is strictly newer than every mark standbys already applied. Fails closed to 0 only on an empty or
-    /// absent table; a corrupt (non-8-byte) entry propagates a decode error, consistent with
-    /// `state_version_is_newer`.
-    pub fn max_state_version(&self) -> Result<u64> {
+    /// The persisted keep-state high-water-mark for a single replicated record's d-tag, or `None` if it
+    /// has never been applied. A promoted standby seeds its publisher's monotonic floor PER RECORD from
+    /// this (not from a global maximum), so a quiet record is not future-dated to the newest record's
+    /// timestamp. Uses the same key derivation as the consumer's guard, so it reads exactly the mark that
+    /// guard wrote. A corrupt (non-8-byte) entry propagates a decode error.
+    pub fn state_version(&self, table: &str, record_id: &str) -> Result<Option<u64>> {
+        let (table_name, key) = Self::replicated_key(table, record_id)?;
+        let vkey = Self::state_version_key(table_name, &key);
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         // The read path cannot create the table (redb read txns cannot), so ensure it exists first.
         backend.create_table(STATE_VERSIONS_TABLE)?;
-        let mut max = 0u64;
-        for (_, v) in backend.list(STATE_VERSIONS_TABLE)? {
-            let ts = u64::from_be_bytes(v.as_slice().try_into().map_err(|_| {
-                KeepError::Other("corrupt keep-state version high-water-mark".to_string())
-            })?);
-            max = max.max(ts);
+        match backend.get(STATE_VERSIONS_TABLE, &vkey)? {
+            Some(v) => Ok(Some(u64::from_be_bytes(v.as_slice().try_into().map_err(
+                |_| KeepError::Other("corrupt keep-state version high-water-mark".to_string()),
+            )?))),
+            None => Ok(None),
         }
-        Ok(max)
     }
 
     /// Resolve a replicated `(table, record_id)` to its backend table and raw key: maps the logical
@@ -1806,6 +1806,39 @@ mod tests {
             .apply_replicated_record("keys", &id, &enc_v1, 150)
             .unwrap());
         assert!(storage.load_key(&[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn state_version_is_per_record_not_global() {
+        // The publisher seeds each d-tag's floor from its OWN mark, so verify the getter returns
+        // per-record marks: a quiet record is not inflated to a busier record's timestamp.
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "passwordP", Argon2Params::TESTING).unwrap();
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+        storage
+            .store_key(&KeyRecord::new(
+                [1u8; 32],
+                crate::keys::KeyType::Nostr,
+                "a".into(),
+                vec![1],
+            ))
+            .unwrap();
+        let enc = publisher.last_bytes.lock().unwrap().clone();
+        let a = hex::encode([1u8; 32]);
+        let b = hex::encode([2u8; 32]);
+
+        assert_eq!(storage.state_version("keys", &a).unwrap(), None);
+        storage
+            .apply_replicated_record("keys", &a, &enc, 100)
+            .unwrap();
+        storage
+            .apply_replicated_record("keys", &b, &enc, 500)
+            .unwrap();
+        // Record a's mark stays 100 even though b was applied at 500 (no global-max contamination).
+        assert_eq!(storage.state_version("keys", &a).unwrap(), Some(100));
+        assert_eq!(storage.state_version("keys", &b).unwrap(), Some(500));
     }
 
     #[test]
