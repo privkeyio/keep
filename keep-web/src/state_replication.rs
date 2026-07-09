@@ -119,6 +119,30 @@ fn now_secs() -> u64 {
 /// regression), which a relay enforcing a NIP-11 `created_at_upper_limit` may reject.
 const MAX_FUTURE_DRIFT_SECS: u64 = 60;
 
+/// How a relay pool responded to a publish. `RelayPool::send_event_to` returns `Ok(output)` even when
+/// every relay said no: a relay replying `OK: false` (including NIP-01 `invalid:` prefixes) lands in
+/// `failed`, leaving `success` empty. Classifying on the outer `Result` alone therefore reads a
+/// rejection as a success, which is the silent replication loss this exists to prevent.
+#[derive(Debug, PartialEq, Eq)]
+enum SendOutcome {
+    /// Every relay accepted the event.
+    Accepted,
+    /// At least one relay accepted, but others rejected it.
+    PartiallyRejected,
+    /// No relay accepted it: the record did NOT replicate.
+    NoRelayAccepted,
+}
+
+fn classify_send(out: &Output<EventId>) -> SendOutcome {
+    if out.success.is_empty() {
+        SendOutcome::NoRelayAccepted
+    } else if !out.failed.is_empty() {
+        SendOutcome::PartiallyRejected
+    } else {
+        SendOutcome::Accepted
+    }
+}
+
 /// Compute the strictly-monotonic per-d-tag `created_at` for the next publish. `last` is the in-memory
 /// per-d-tag high-water-mark. Each write returns `now` unless that is not strictly greater than the last
 /// timestamp, in which case it bumps to `last + 1` (`saturating_add` so it cannot overflow).
@@ -203,23 +227,26 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
             };
             match event {
                 Ok(ev) => match client.send_event(&ev).await {
-                    // No relay accepted it -- rejected (e.g. NIP-01 "invalid: created_at too far off")
-                    // or unreachable. It did NOT replicate; log loudly instead of losing it silently.
-                    Ok(out) if out.success.is_empty() => tracing::error!(
-                        dtag = ?dtag,
-                        created_at = ts,
-                        failed = ?out.failed,
-                        "keep-state publish accepted by NO relay; record did not replicate"
-                    ),
-                    // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly one
-                    // relay, so this cannot fire), yet the reasons must never be silently discarded.
-                    Ok(out) if !out.failed.is_empty() => tracing::warn!(
-                        dtag = ?dtag,
-                        created_at = ts,
-                        failed = ?out.failed,
-                        "keep-state publish rejected by some relays"
-                    ),
-                    Ok(_) => {}
+                    Ok(out) => match classify_send(&out) {
+                        // Rejected (e.g. NIP-01 "invalid: event creation date is too far off from the
+                        // current time") or unreachable. It did NOT replicate; log loudly instead of
+                        // losing it silently.
+                        SendOutcome::NoRelayAccepted => tracing::error!(
+                            dtag = ?dtag,
+                            created_at = ts,
+                            failed = ?out.failed,
+                            "keep-state publish accepted by NO relay; record did not replicate"
+                        ),
+                        // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly
+                        // one relay, so this cannot fire), yet the reasons must never be discarded.
+                        SendOutcome::PartiallyRejected => tracing::warn!(
+                            dtag = ?dtag,
+                            created_at = ts,
+                            failed = ?out.failed,
+                            "keep-state publish rejected by some relays"
+                        ),
+                        SendOutcome::Accepted => {}
+                    },
                     Err(e) => tracing::warn!("keep-state publish failed: {e}"),
                 },
                 Err(e) => tracing::warn!("keep-state event build failed: {e}"),
@@ -281,14 +308,20 @@ async fn spawn_consumer(
                             Ok(true) => {}
                             // Not strictly newer than what we already applied: a stale or replayed event
                             // (rollback attempt from an untrusted relay). Ignore it, but record it.
+                            // Debug-format the event-supplied table and record id: neither is charset-
+                            // constrained until `apply_*` checks the allowlist, so Display would let a
+                            // control character forge log lines.
                             Ok(false) => tracing::warn!(
-                                table = %rec.table,
+                                table = ?rec.table,
+                                record_id = ?rec.record_id,
                                 created_at = rec.created_at,
                                 "keep-state: ignored stale/replayed event (rollback guard)"
                             ),
-                            Err(e) => {
-                                tracing::warn!(table = %rec.table, "keep-state apply failed: {e}")
-                            }
+                            Err(e) => tracing::warn!(
+                                table = ?rec.table,
+                                record_id = ?rec.record_id,
+                                "keep-state apply failed: {e}"
+                            ),
                         }
                     }
                     Ok(None) => {}
@@ -307,6 +340,45 @@ mod tests {
     use keep_core::{Keep, RelayConfig};
     use nostr_relay_builder::MockRelay;
     use std::collections::HashMap;
+
+    // A relay that rejects an event (NIP-01 `OK: false`, e.g. an `invalid:` far-future `created_at`)
+    // still leaves `send_event` returning `Ok(output)` -- the rejection only shows up as an empty
+    // `success` set. Pin the classification, because reading `Ok(_)` as success is the silent
+    // replication loss this whole path exists to surface.
+    #[test]
+    fn a_send_no_relay_accepted_is_not_a_success() {
+        let out = |success: &[&str], failed: &[&str]| Output {
+            val: EventId::from_byte_array([0u8; 32]),
+            success: success
+                .iter()
+                .map(|u| RelayUrl::parse(u).unwrap())
+                .collect(),
+            failed: failed
+                .iter()
+                .map(|u| {
+                    (
+                        RelayUrl::parse(u).unwrap(),
+                        "invalid: event creation date is too far off from the current time".into(),
+                    )
+                })
+                .collect(),
+        };
+        let (a, b) = ("wss://a.example", "wss://b.example");
+
+        // Every relay rejected: the record did not replicate, even though the call returned `Ok`.
+        assert_eq!(
+            classify_send(&out(&[], &[a, b])),
+            SendOutcome::NoRelayAccepted
+        );
+        // No relay reachable at all: also did not replicate.
+        assert_eq!(classify_send(&out(&[], &[])), SendOutcome::NoRelayAccepted);
+        // Accepted somewhere, rejected elsewhere: replicated, but the reasons must not be discarded.
+        assert_eq!(
+            classify_send(&out(&[a], &[b])),
+            SendOutcome::PartiallyRejected
+        );
+        assert_eq!(classify_send(&out(&[a, b], &[])), SendOutcome::Accepted);
+    }
 
     #[test]
     fn next_ts_is_strictly_monotonic_per_dtag() {
