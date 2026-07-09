@@ -214,19 +214,30 @@ impl Tui {
                 } else {
                     Color::Red
                 };
+                // `app`/`action`/`detail` carry attacker-influenced strings (the
+                // client's declared app name, the requested method). Sanitize
+                // them like the approval prompt so a newline/bidi sequence cannot
+                // corrupt or spoof a log line. Per-column caps keep one entry from
+                // dominating the pane.
                 let mut spans = vec![
                     Span::styled(
                         format!("[{}] ", entry.timestamp),
                         Style::default().fg(Color::DarkGray),
                     ),
                     Span::styled(format!("{symbol} "), Style::default().fg(color)),
-                    Span::styled(&entry.app, Style::default().fg(Color::White)),
+                    Span::styled(
+                        sanitize_prompt_field(&entry.app, 32),
+                        Style::default().fg(Color::White),
+                    ),
                     Span::raw(" "),
-                    Span::styled(&entry.action, Style::default().fg(Color::Gray)),
+                    Span::styled(
+                        sanitize_prompt_field(&entry.action, 48),
+                        Style::default().fg(Color::Gray),
+                    ),
                 ];
                 if let Some(ref detail) = entry.detail {
                     spans.push(Span::styled(
-                        format!(" ({detail})"),
+                        format!(" ({})", sanitize_prompt_field(detail, 64)),
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
