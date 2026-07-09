@@ -30,7 +30,7 @@ fn env_or(key: &str, default: &str) -> String {
 /// keeps the secret off the process environment (which leaks via /proc,
 /// container inspection, and crash dumps). Warns if the file is group/world
 /// accessible.
-fn secret_from(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+pub(crate) fn secret_from(key: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
     if let Ok(path) = std::env::var(format!("{key}_FILE")) {
         let path = path.trim();
         if !path.is_empty() {

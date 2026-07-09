@@ -95,10 +95,17 @@ fn requeue(pending: &StdMutex<HashMap<String, Change>>, dtag: String, change: Ch
 
 /// Load the shared cluster identity from `KEEP_STATE_IDENTITY` (an `nsec1...` bech32 or a 64-char hex
 /// secret key). This key is a cluster secret distributed out-of-band to every node, like the shared
-/// Vaultwarden JWT key.
+/// Vaultwarden JWT key. Read via `secret_from` so `KEEP_STATE_IDENTITY_FILE` is honored, keeping the
+/// raw nsec off the process environment (which leaks via /proc/<pid>/environ, child inheritance, and
+/// core dumps), matching how the password, auth token, and storage key are already delivered.
 pub fn load_state_identity() -> Result<Keys, String> {
-    let raw = std::env::var("KEEP_STATE_IDENTITY")
-        .map_err(|_| "KEEP_STATE_RELAY is set but KEEP_STATE_IDENTITY is missing".to_string())?;
+    let raw = zeroize::Zeroizing::new(
+        crate::secret_from("KEEP_STATE_IDENTITY")
+            .map_err(|e| format!("reading KEEP_STATE_IDENTITY: {e}"))?
+            .ok_or_else(|| {
+                "KEEP_STATE_RELAY is set but KEEP_STATE_IDENTITY[_FILE] is missing".to_string()
+            })?,
+    );
     Keys::parse(raw.trim()).map_err(|e| format!("invalid KEEP_STATE_IDENTITY: {e}"))
 }
 
