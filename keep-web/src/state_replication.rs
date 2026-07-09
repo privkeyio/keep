@@ -24,10 +24,11 @@
 //! clock jump followed by a correction makes the consumer reject legitimate newer writes until wall-clock
 //! catches up. Seeding the publisher floor from stored marks covers a promoted standby, but not a live
 //! active whose own clock regresses.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use nostr_sdk::prelude::*;
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use keep_core::{Keep, ReplicatedApply, StatePublisher};
 use keep_frost_net::{
@@ -47,53 +48,49 @@ enum Change {
     },
 }
 
-/// Bound on the pending-publish queue. `on_*` run inside the storage write path and must never block,
-/// so they `try_send`; a full queue (the relay is lagging or down) drops with a loud warning rather than
-/// growing memory without bound. A later write to the same record resends its latest state (the events
-/// are addressable), so a drop lags a record rather than losing it permanently.
-const PUBLISH_QUEUE_CAP: usize = 8192;
-/// Attempts to publish one event before giving up, retrying only a transport error (relay unreachable),
-/// with exponential backoff (~1s, 2s, 4s), so a brief relay blip does not drop the update.
-const MAX_SEND_ATTEMPTS: u32 = 4;
+/// How long the publish task waits after a failed publish sweep before retrying the still-pending
+/// changes; it wakes early if a new write arrives. The pending set is coalesced per d-tag, so a
+/// sustained outage cannot grow it beyond one entry per record.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// [`StatePublisher`] that enqueues each write to the async publish task. `on_*` run inside the storage
-/// write path, so they only `try_send` on a bounded channel -- never block, never touch the relay.
+/// [`StatePublisher`] that records each write into a coalescing pending map keyed by d-tag and wakes the
+/// publish task. `on_*` run inside the storage write path, so they only take a brief lock -- never block,
+/// never touch the relay. Coalescing (the latest change per record wins) bounds the map by RECORD COUNT,
+/// not write rate, so a slow/down relay cannot grow it without bound; and a delete or a write-once record
+/// is HELD until it is sent rather than dropped (a dropped tombstone would keep a revoked key live).
 struct ChannelPublisher {
-    tx: mpsc::Sender<Change>,
+    pending: Arc<StdMutex<HashMap<String, Change>>>,
+    notify: Arc<Notify>,
 }
 
 impl StatePublisher for ChannelPublisher {
     fn on_record(&self, table: &str, record_id: &str, encrypted: &[u8]) {
-        if self
-            .tx
-            .try_send(Change::Record {
+        self.pending.lock().unwrap().insert(
+            format!("{table}:{record_id}"),
+            Change::Record {
                 table: table.to_string(),
                 id: record_id.to_string(),
                 encrypted: encrypted.to_vec(),
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                table = %table,
-                "keep-state: publish queue full/closed; dropped a record update (standby lags until the next write to it)"
-            );
-        }
+            },
+        );
+        self.notify.notify_one();
     }
     fn on_delete(&self, table: &str, record_id: &str) {
-        if self
-            .tx
-            .try_send(Change::Delete {
+        self.pending.lock().unwrap().insert(
+            format!("{table}:{record_id}"),
+            Change::Delete {
                 table: table.to_string(),
                 id: record_id.to_string(),
-            })
-            .is_err()
-        {
-            tracing::warn!(
-                table = %table,
-                "keep-state: publish queue full/closed; dropped a delete (standby lags until the next write to it)"
-            );
-        }
+            },
+        );
+        self.notify.notify_one();
     }
+}
+
+/// Re-queue a change that failed to publish, for the next retry sweep. Coalesces: if a NEWER change for
+/// the same d-tag arrived while we were sending, keep the newer one -- it supersedes this stale attempt.
+fn requeue(pending: &StdMutex<HashMap<String, Change>>, dtag: String, change: Change) {
+    pending.lock().unwrap().entry(dtag).or_insert(change);
 }
 
 /// Load the shared cluster identity from `KEEP_STATE_IDENTITY` (an `nsec1...` bech32 or a 64-char hex
@@ -194,10 +191,14 @@ fn next_ts(
 }
 
 async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys) {
-    let (tx, mut rx) = mpsc::channel::<Change>(PUBLISH_QUEUE_CAP);
+    let pending: Arc<StdMutex<HashMap<String, Change>>> = Arc::new(StdMutex::new(HashMap::new()));
+    let notify = Arc::new(Notify::new());
     keep.lock()
         .await
-        .set_state_publisher(Arc::new(ChannelPublisher { tx }));
+        .set_state_publisher(Arc::new(ChannelPublisher {
+            pending: pending.clone(),
+            notify: notify.clone(),
+        }));
 
     tokio::spawn(async move {
         // `last_ts` is an in-memory per-d-tag high-water-mark guaranteeing strict per-d-tag monotonicity
@@ -215,86 +216,93 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         // "not newer". Accepted deliberately: a global maximum would cover that case only by inflating
         // every d-tag, which is the drift this seeding exists to remove, and the residual needs a real
         // clock regression -- already an operational requirement above.
-        let mut last_ts: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-        while let Some(change) = rx.recv().await {
-            let (table, id) = match &change {
-                Change::Record { table, id, .. } | Change::Delete { table, id } => (table, id),
-            };
-            let dtag = format!("{table}:{id}");
-            let now = now_secs();
-            // Read this record's own persisted mark only on first sight (then cached in last_ts). A read
-            // error seeds 0 (wall-clock); the loud reject path below covers a rejected event.
-            let floor = if last_ts.contains_key(&dtag) {
-                0
-            } else {
-                match keep.lock().await.state_version(table, id) {
-                    Ok(v) => v.unwrap_or(0),
-                    Err(e) => {
-                        tracing::warn!(dtag = ?dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
-                        0
-                    }
-                }
-            };
-            let ts = next_ts(&mut last_ts, &dtag, floor, now);
-            // A created_at far ahead of wall-clock (a floor seeded after a clock regression, or a long
-            // same-second burst) risks a strict relay rejecting it as too-far-future. Surface the drift
-            // so a rejection below is explainable.
-            if ts > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
-                tracing::warn!(
-                    dtag = ?dtag,
-                    created_at = ts,
-                    now,
-                    "keep-state: created_at is far ahead of wall-clock; a relay enforcing a created_at_upper_limit may reject this event"
-                );
+        let mut last_ts: HashMap<String, u64> = HashMap::new();
+        loop {
+            // Drain the coalesced pending set (the latest change per d-tag). Empty -> wait to be woken.
+            let batch: Vec<(String, Change)> = { pending.lock().unwrap().drain().collect() };
+            if batch.is_empty() {
+                notify.notified().await;
+                continue;
             }
-            let event = match &change {
-                Change::Record {
-                    table,
-                    id,
-                    encrypted,
-                } => state_record_event(&identity, table, id, encrypted, ts),
-                Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
-            };
-            match event {
-                Ok(ev) => {
-                    // Retry only a transport error (relay unreachable) with exponential backoff, so a
-                    // brief relay blip does not drop the update. A relay-level rejection (NoRelayAccepted)
-                    // is NOT retried -- it would fail identically -- and is logged loudly below.
-                    let mut result = client.send_event(&ev).await;
-                    let mut attempt = 1u32;
-                    while result.is_err() && attempt < MAX_SEND_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1)))
-                            .await;
-                        result = client.send_event(&ev).await;
-                        attempt += 1;
+
+            let mut failed = false;
+            for (dtag, change) in batch {
+                let (table, id) = match &change {
+                    Change::Record { table, id, .. } | Change::Delete { table, id } => (table, id),
+                };
+                let now = now_secs();
+                // Read this record's own persisted mark only on first sight (then cached in last_ts).
+                let floor = if last_ts.contains_key(&dtag) {
+                    0
+                } else {
+                    match keep.lock().await.state_version(table, id) {
+                        Ok(v) => v.unwrap_or(0),
+                        Err(e) => {
+                            tracing::warn!(dtag = ?dtag, "keep-state: could not read persisted mark for d-tag, seeding from 0: {e}");
+                            0
+                        }
                     }
-                    match result {
+                };
+                let ts = next_ts(&mut last_ts, &dtag, floor, now);
+                if ts > now.saturating_add(MAX_FUTURE_DRIFT_SECS) {
+                    tracing::warn!(
+                        dtag = ?dtag,
+                        created_at = ts,
+                        now,
+                        "keep-state: created_at is far ahead of wall-clock; a relay enforcing a created_at_upper_limit may reject this event"
+                    );
+                }
+                let event = match &change {
+                    Change::Record {
+                        table,
+                        id,
+                        encrypted,
+                    } => state_record_event(&identity, table, id, encrypted, ts),
+                    Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
+                };
+                match event {
+                    Ok(ev) => match client.send_event(&ev).await {
                         Ok(out) => match classify_send(&out) {
-                            // Rejected (e.g. NIP-01 "invalid: event creation date is too far off from the
-                            // current time") or unreachable. It did NOT replicate; log loudly instead of
-                            // losing it silently.
-                            SendOutcome::NoRelayAccepted => tracing::error!(
-                                dtag = ?dtag,
-                                created_at = ts,
-                                failed = ?out.failed,
-                                "keep-state publish accepted by NO relay; record did not replicate"
-                            ),
-                            // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly
-                            // one relay, so this cannot fire), yet the reasons must never be discarded.
+                            SendOutcome::Accepted => {}
+                            // Replicated, but some relay said no; never discard the reasons.
                             SendOutcome::PartiallyRejected => tracing::warn!(
                                 dtag = ?dtag,
                                 created_at = ts,
                                 failed = ?out.failed,
                                 "keep-state publish rejected by some relays"
                             ),
-                            SendOutcome::Accepted => {}
+                            // No relay accepted it (unreachable, or rejected e.g. as future-dated). Keep it
+                            // pending and retry after a backoff; a re-publish recomputes a fresh created_at,
+                            // so a future-dating rejection self-heals as wall-clock advances.
+                            SendOutcome::NoRelayAccepted => {
+                                tracing::warn!(
+                                    dtag = ?dtag,
+                                    created_at = ts,
+                                    failed = ?out.failed,
+                                    "keep-state publish accepted by no relay; will retry"
+                                );
+                                requeue(&pending, dtag, change);
+                                failed = true;
+                            }
                         },
-                        Err(e) => tracing::warn!(
-                            "keep-state publish failed after {attempt} attempts: {e}"
-                        ),
+                        // Transport error (relay unreachable): keep it pending and retry.
+                        Err(e) => {
+                            tracing::warn!(dtag = ?dtag, "keep-state publish transport error; will retry: {e}");
+                            requeue(&pending, dtag, change);
+                            failed = true;
+                        }
+                    },
+                    // A build error won't fix on retry; drop it loudly rather than spin forever.
+                    Err(e) => {
+                        tracing::error!(dtag = ?dtag, "keep-state event build failed; dropped: {e}")
                     }
                 }
-                Err(e) => tracing::warn!("keep-state event build failed: {e}"),
+            }
+
+            if failed {
+                // Back off before the next sweep, waking early if a new write arrives. The pending set
+                // stays bounded by record count (coalesced) throughout a sustained outage.
+                let _ = tokio::time::timeout(RETRY_BACKOFF, notify.notified()).await;
             }
         }
     });
@@ -400,6 +408,54 @@ mod tests {
     use keep_core::{Keep, RelayConfig};
     use nostr_relay_builder::MockRelay;
     use std::collections::HashMap;
+
+    #[test]
+    fn pending_coalesces_latest_change_per_dtag() {
+        // A slow/down relay must not grow the queue by write RATE: repeated writes to one record collapse
+        // to a single pending entry, and a delete supersedes an earlier record write, so a tombstone is
+        // never lost behind a stale record.
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let p = ChannelPublisher {
+            pending: pending.clone(),
+            notify: Arc::new(Notify::new()),
+        };
+        p.on_record("keys", "aa", b"v1");
+        p.on_record("keys", "aa", b"v2");
+        p.on_delete("keys", "aa");
+        p.on_record("keys", "bb", b"x");
+        let map = pending.lock().unwrap();
+        assert_eq!(map.len(), 2); // aa + bb (coalesced), not four
+        assert!(matches!(map.get("keys:aa"), Some(Change::Delete { .. }))); // latest for aa is the delete
+        assert!(matches!(map.get("keys:bb"), Some(Change::Record { .. })));
+    }
+
+    #[test]
+    fn requeue_does_not_clobber_a_newer_pending_change() {
+        // A failed send re-queues what it tried, but if a NEWER write for that record arrived while it was
+        // in flight, the newer one must win -- else a re-queued stale record could resurrect a just-
+        // deleted key.
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        pending.lock().unwrap().insert(
+            "keys:aa".to_string(),
+            Change::Delete {
+                table: "keys".into(),
+                id: "aa".into(),
+            },
+        );
+        requeue(
+            &pending,
+            "keys:aa".to_string(),
+            Change::Record {
+                table: "keys".into(),
+                id: "aa".into(),
+                encrypted: b"stale".to_vec(),
+            },
+        );
+        assert!(matches!(
+            pending.lock().unwrap().get("keys:aa"),
+            Some(Change::Delete { .. })
+        ));
+    }
 
     // A relay that rejects an event (NIP-01 `OK: false`, e.g. an `invalid:` far-future `created_at`)
     // still leaves `send_event` returning `Ok(output)` -- the rejection only shows up as an empty
