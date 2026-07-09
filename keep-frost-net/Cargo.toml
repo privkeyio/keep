@@ -39,6 +39,9 @@ hex = "0.4"
 base64 = "0.22"
 rustls = "0.23"
 rustls-pki-types = "1"
+# Vetted ASN.1/X.509 parser for robust SubjectPublicKeyInfo extraction in cert pinning (replaces a
+# fragile hand-rolled positional DER walk). Already in the dependency tree transitively.
+x509-cert = "0.2"
 
 redb = "4"
 thiserror = "2.0"

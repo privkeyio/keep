@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use x509_cert::der::{Decode, Encode};
+use x509_cert::Certificate;
 
 use keep_core::relay::is_internal_ip;
 
@@ -228,7 +230,7 @@ pub async fn verify_relay_certificate(
         FrostNetError::Transport(format!("Failed to parse certificate from {hostname}"))
     })?;
 
-    let spki_hash = hash_spki(spki_bytes);
+    let spki_hash = hash_spki(&spki_bytes);
 
     let expected = pins.get_pins(&hostname);
     if expected.is_empty() {
@@ -251,79 +253,15 @@ fn hash_spki(spki_der: &[u8]) -> SpkiHash {
     Sha256::digest(spki_der).into()
 }
 
-fn extract_spki_from_der(cert_der: &[u8]) -> Option<&[u8]> {
-    let content = read_der_sequence(cert_der)?;
-    let tbs_content = read_der_sequence(content)?;
-
-    let mut pos = tbs_content;
-
-    if !pos.is_empty() && pos[0] == 0xA0 {
-        pos = skip_der_element(pos)?;
-    }
-
-    for _ in 0..5 {
-        pos = skip_der_element(pos)?;
-    }
-
-    let element_len = der_element_total_len(pos)?;
-    Some(&pos[..element_len])
-}
-
-fn read_der_sequence(data: &[u8]) -> Option<&[u8]> {
-    if data.is_empty() || data[0] != 0x30 {
-        return None;
-    }
-    let (content_start, content_len) = read_der_length(&data[1..])?;
-    let start = 1 + content_start;
-    if start + content_len > data.len() {
-        return None;
-    }
-    Some(&data[start..start + content_len])
-}
-
-fn skip_der_element(data: &[u8]) -> Option<&[u8]> {
-    let total = der_element_total_len(data)?;
-    Some(&data[total..])
-}
-
-fn der_element_total_len(data: &[u8]) -> Option<usize> {
-    if data.is_empty() {
-        return None;
-    }
-    let (content_start, content_len) = read_der_length(&data[1..])?;
-    let total = 1 + content_start + content_len;
-    if total > data.len() {
-        return None;
-    }
-    Some(total)
-}
-
-fn read_der_length(data: &[u8]) -> Option<(usize, usize)> {
-    if data.is_empty() {
-        return None;
-    }
-    let first = data[0];
-    if first < 0x80 {
-        return Some((1, first as usize));
-    }
-    if first == 0x80 {
-        return None;
-    }
-    let num_bytes = (first & 0x7F) as usize;
-    if num_bytes > 4 || num_bytes + 1 > data.len() {
-        return None;
-    }
-    let mut len = 0usize;
-    for i in 0..num_bytes {
-        len = len.checked_shl(8)?.checked_add(data[1 + i] as usize)?;
-    }
-    if num_bytes == 1 && len < 0x80 {
-        return None;
-    }
-    if num_bytes > 1 && data[1] == 0 {
-        return None;
-    }
-    Some((1 + num_bytes, len))
+/// Extract the DER-encoded SubjectPublicKeyInfo from an X.509 certificate, for SPKI pinning. Parses with
+/// the vetted `x509-cert` ASN.1 decoder rather than a positional field walk: the old hand-rolled parser
+/// assumed SPKI was always the 6th TBSCertificate element, so a valid cert with unusual optional fields
+/// (or a maliciously crafted one) could yield the wrong bytes and pin against the wrong key. Re-encoding
+/// the parsed SPKI to canonical DER also matches the standard SPKI-pin definition (a hash over the DER
+/// SubjectPublicKeyInfo); for the DER certs TLS delivers this is byte-identical to the field as received.
+fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
+    let cert = Certificate::from_der(cert_der).ok()?;
+    cert.tbs_certificate.subject_public_key_info.to_der().ok()
 }
 
 #[cfg(test)]
@@ -463,26 +401,18 @@ mod tests {
     }
 
     #[test]
-    fn test_der_length_short_form() {
-        assert_eq!(read_der_length(&[0x05]), Some((1, 5)));
-        assert_eq!(read_der_length(&[0x7F]), Some((1, 127)));
-    }
-
-    #[test]
-    fn test_der_length_long_form() {
-        assert_eq!(read_der_length(&[0x81, 0x80]), Some((2, 128)));
-        assert_eq!(read_der_length(&[0x82, 0x01, 0x00]), Some((3, 256)));
-    }
-
-    #[test]
-    fn test_der_length_invalid() {
-        assert_eq!(read_der_length(&[]), None);
-        assert_eq!(read_der_length(&[0x80]), None);
-    }
-
-    #[test]
-    fn test_der_length_rejects_non_canonical() {
-        assert_eq!(read_der_length(&[0x81, 0x05]), None);
-        assert_eq!(read_der_length(&[0x82, 0x00, 0x80]), None);
+    fn extract_spki_matches_standard_spki_pin() {
+        // A P-256 self-signed cert (openssl). SPKI_PIN_HEX is openssl's INDEPENDENT SHA-256 of the DER
+        // SubjectPublicKeyInfo -- the standard SPKI pin -- so this proves x509-cert extraction yields the
+        // right bytes (byte-identical, for a DER cert, to the field as received on the wire).
+        use base64::Engine;
+        const CERT_B64: &str = "MIIBfTCCASOgAwIBAgIUHTPZUgNrUaDV8WbwKjVdqApCNHIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJa2VlcC10ZXN0MB4XDTI2MDcwOTE2NDEzM1oXDTI2MDcxMDE2NDEzM1owFDESMBAGA1UEAwwJa2VlcC10ZXN0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEu4Nc5266JcHihyRoqfVvBOX2YfSvZ0CcpeJb8EilRnjI7YMdV7tU4pQpaBJmTJ8Om1mQ1d+HmrCwaKYTxlwzQ6NTMFEwHQYDVR0OBBYEFHjQXcwFh3SfDQ63QlR2m/p3n87kMB8GA1UdIwQYMBaAFHjQXcwFh3SfDQ63QlR2m/p3n87kMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDSAAwRQIgX734WY/RX390XIofsLw7i+xRvyZF0rYRQq/GD75jW4oCIQCyz+TfYUL8/GDcGDC+pWG961UgUjp5rGG3UiCjepovyA==";
+        const SPKI_PIN_HEX: &str =
+            "3468fefa122e3f6ca0ce5eb07906e2f062a7d4cda0f5f32177094b329a5eb0e6";
+        let cert_der = base64::engine::general_purpose::STANDARD
+            .decode(CERT_B64)
+            .unwrap();
+        let spki = extract_spki_from_der(&cert_der).expect("valid cert should yield an SPKI");
+        assert_eq!(hex::encode(hash_spki(&spki)), SPKI_PIN_HEX);
     }
 }
