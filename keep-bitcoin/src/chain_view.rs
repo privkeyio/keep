@@ -23,7 +23,7 @@
 //! shape of `REFUSED:` error the destination guard uses, so operators see
 //! the two defenses side by side.
 
-use bitcoin::{OutPoint, Psbt, ScriptBuf, TxOut};
+use bitcoin::{OutPoint, Psbt, TxOut};
 
 /// Read-only view resolving an outpoint's committed `(value, script_pubkey)`
 /// for #502 prevout validation.
@@ -323,7 +323,7 @@ impl ChainView for EsploraChainView {
             .map_err(|e| ChainViewError::Decode(format!("decode scriptpubkey hex: {e}")))?;
         Ok(TxOut {
             value: bitcoin::Amount::from_sat(vout.value),
-            script_pubkey: ScriptBuf::from_bytes(script_bytes),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(script_bytes),
         })
     }
 }
