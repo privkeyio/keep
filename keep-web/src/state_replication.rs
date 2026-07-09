@@ -47,25 +47,52 @@ enum Change {
     },
 }
 
-/// [`StatePublisher`] that enqueues each write to the async publish task. `on_*` run inside the
-/// storage write path, so they only send on an unbounded channel -- never block, never touch the relay.
+/// Bound on the pending-publish queue. `on_*` run inside the storage write path and must never block,
+/// so they `try_send`; a full queue (the relay is lagging or down) drops with a loud warning rather than
+/// growing memory without bound. A later write to the same record resends its latest state (the events
+/// are addressable), so a drop lags a record rather than losing it permanently.
+const PUBLISH_QUEUE_CAP: usize = 8192;
+/// Attempts to publish one event before giving up, retrying only a transport error (relay unreachable),
+/// with exponential backoff (~1s, 2s, 4s), so a brief relay blip does not drop the update.
+const MAX_SEND_ATTEMPTS: u32 = 4;
+
+/// [`StatePublisher`] that enqueues each write to the async publish task. `on_*` run inside the storage
+/// write path, so they only `try_send` on a bounded channel -- never block, never touch the relay.
 struct ChannelPublisher {
-    tx: mpsc::UnboundedSender<Change>,
+    tx: mpsc::Sender<Change>,
 }
 
 impl StatePublisher for ChannelPublisher {
     fn on_record(&self, table: &str, record_id: &str, encrypted: &[u8]) {
-        let _ = self.tx.send(Change::Record {
-            table: table.to_string(),
-            id: record_id.to_string(),
-            encrypted: encrypted.to_vec(),
-        });
+        if self
+            .tx
+            .try_send(Change::Record {
+                table: table.to_string(),
+                id: record_id.to_string(),
+                encrypted: encrypted.to_vec(),
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                table = %table,
+                "keep-state: publish queue full/closed; dropped a record update (standby lags until the next write to it)"
+            );
+        }
     }
     fn on_delete(&self, table: &str, record_id: &str) {
-        let _ = self.tx.send(Change::Delete {
-            table: table.to_string(),
-            id: record_id.to_string(),
-        });
+        if self
+            .tx
+            .try_send(Change::Delete {
+                table: table.to_string(),
+                id: record_id.to_string(),
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                table = %table,
+                "keep-state: publish queue full/closed; dropped a delete (standby lags until the next write to it)"
+            );
+        }
     }
 }
 
@@ -167,7 +194,7 @@ fn next_ts(
 }
 
 async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
+    let (tx, mut rx) = mpsc::channel::<Change>(PUBLISH_QUEUE_CAP);
     keep.lock()
         .await
         .set_state_publisher(Arc::new(ChannelPublisher { tx }));
@@ -229,29 +256,44 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                 Change::Delete { table, id } => state_tombstone_event(&identity, table, id, ts),
             };
             match event {
-                Ok(ev) => match client.send_event(&ev).await {
-                    Ok(out) => match classify_send(&out) {
-                        // Rejected (e.g. NIP-01 "invalid: event creation date is too far off from the
-                        // current time") or unreachable. It did NOT replicate; log loudly instead of
-                        // losing it silently.
-                        SendOutcome::NoRelayAccepted => tracing::error!(
-                            dtag = ?dtag,
-                            created_at = ts,
-                            failed = ?out.failed,
-                            "keep-state publish accepted by NO relay; record did not replicate"
+                Ok(ev) => {
+                    // Retry only a transport error (relay unreachable) with exponential backoff, so a
+                    // brief relay blip does not drop the update. A relay-level rejection (NoRelayAccepted)
+                    // is NOT retried -- it would fail identically -- and is logged loudly below.
+                    let mut result = client.send_event(&ev).await;
+                    let mut attempt = 1u32;
+                    while result.is_err() && attempt < MAX_SEND_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_secs(1 << (attempt - 1)))
+                            .await;
+                        result = client.send_event(&ev).await;
+                        attempt += 1;
+                    }
+                    match result {
+                        Ok(out) => match classify_send(&out) {
+                            // Rejected (e.g. NIP-01 "invalid: event creation date is too far off from the
+                            // current time") or unreachable. It did NOT replicate; log loudly instead of
+                            // losing it silently.
+                            SendOutcome::NoRelayAccepted => tracing::error!(
+                                dtag = ?dtag,
+                                created_at = ts,
+                                failed = ?out.failed,
+                                "keep-state publish accepted by NO relay; record did not replicate"
+                            ),
+                            // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly
+                            // one relay, so this cannot fire), yet the reasons must never be discarded.
+                            SendOutcome::PartiallyRejected => tracing::warn!(
+                                dtag = ?dtag,
+                                created_at = ts,
+                                failed = ?out.failed,
+                                "keep-state publish rejected by some relays"
+                            ),
+                            SendOutcome::Accepted => {}
+                        },
+                        Err(e) => tracing::warn!(
+                            "keep-state publish failed after {attempt} attempts: {e}"
                         ),
-                        // Replicated, but some relay still said no. Not loss today (`spawn` adds exactly
-                        // one relay, so this cannot fire), yet the reasons must never be discarded.
-                        SendOutcome::PartiallyRejected => tracing::warn!(
-                            dtag = ?dtag,
-                            created_at = ts,
-                            failed = ?out.failed,
-                            "keep-state publish rejected by some relays"
-                        ),
-                        SendOutcome::Accepted => {}
-                    },
-                    Err(e) => tracing::warn!("keep-state publish failed: {e}"),
-                },
+                    }
+                }
                 Err(e) => tracing::warn!("keep-state event build failed: {e}"),
             }
         }
