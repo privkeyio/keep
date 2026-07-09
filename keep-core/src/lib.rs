@@ -92,8 +92,8 @@ use crate::keyring::Keyring;
 use crate::keys::{KeyRecord, KeyType, NostrKeypair};
 pub use crate::relay::{PeerPolicyEntry, RelayConfig, GLOBAL_RELAY_KEY};
 pub use crate::storage::ProxyConfig;
-pub use crate::storage::StatePublisher;
 use crate::storage::Storage;
+pub use crate::storage::{ReplicatedApply, StatePublisher};
 pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 
 /// The main Keep type for encrypted key management.
@@ -119,20 +119,23 @@ impl Keep {
         record_id: &str,
         encrypted: &[u8],
         created_at: u64,
-    ) -> Result<bool> {
+        now: u64,
+    ) -> Result<ReplicatedApply> {
         self.storage
-            .apply_replicated_record(table, record_id, encrypted, created_at)
+            .apply_replicated_record(table, record_id, encrypted, created_at, now)
     }
 
-    /// Apply a replicated delete (tombstone) from a peer. Returns `false` if ignored as stale.
+    /// Apply a replicated delete (tombstone) from a peer. `now` is local wall-clock, used to reject an
+    /// implausibly future-dated event (see [`Storage::apply_replicated_delete`]).
     pub fn apply_replicated_delete(
         &self,
         table: &str,
         record_id: &str,
         created_at: u64,
-    ) -> Result<bool> {
+        now: u64,
+    ) -> Result<ReplicatedApply> {
         self.storage
-            .apply_replicated_delete(table, record_id, created_at)
+            .apply_replicated_delete(table, record_id, created_at, now)
     }
 
     /// The persisted rollback high-water-mark for one replicated record's d-tag (`None` if never
