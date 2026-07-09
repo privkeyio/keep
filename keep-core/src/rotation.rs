@@ -408,6 +408,11 @@ impl Storage {
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
         let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
+        // decrypt_opaque_rows lazily materializes any absent opaque table via a committed redb
+        // write. This is the sole live-DB mutation preceding the safety backup below; every other
+        // pre-backup step is read-only. It is safe: the create is idempotent, on a legacy vault
+        // lacking the table it at worst leaves an empty table, and the backup taken afterward
+        // captures that post-create state so a rollback stays consistent.
         let opaque_rows = self.decrypt_opaque_rows(&old_data_key)?;
 
         self.backend = None;
@@ -862,6 +867,99 @@ mod tests {
         assert_eq!(statuses[0].share_index, 3);
         assert_eq!(statuses[0].last_check_timestamp, 1_700_000_000);
         assert!(statuses[0].responsive);
+        assert_eq!(statuses[0].created_at, Some(1_699_000_000));
+    }
+
+    /// A vault created before the `config`/`key_health_status` tables existed has neither table.
+    /// `decrypt_opaque_rows` must lazily create each absent table (a redb read txn cannot), so
+    /// rotation succeeds instead of failing on a missing table. Simulate the legacy layout by
+    /// dropping both tables from the redb file, then rotate.
+    #[test]
+    fn rotate_data_key_lazily_creates_missing_opaque_tables() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-vault");
+
+        {
+            let storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+            let pubkey: [u8; 32] = crypto::random_bytes();
+            let secret: Vec<u8> = vec![1, 2, 3, 4];
+            let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "legacy".into(),
+                encrypted.to_bytes(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let config_def: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new(CONFIG_TABLE);
+            let health_def: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new(HEALTH_STATUS_TABLE);
+            let db = redb::Database::open(path.join("keep.db")).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            wtxn.delete_table(config_def).unwrap();
+            wtxn.delete_table(health_def).unwrap();
+            wtxn.commit().unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .rotate_data_key("oldpass1")
+            .expect("rotation must lazily create the absent opaque tables");
+
+        assert!(!storage.get_kill_switch().unwrap());
+        assert!(storage.list_health_statuses().unwrap().is_empty());
+        assert_eq!(storage.list_keys().unwrap().len(), 1);
+    }
+
+    /// A rotation that fails after the safety backup is taken must roll back to the OLD data key.
+    /// With `config`/`key_health_status` rows present, those rows must remain readable under the
+    /// old key afterward. The failure is forced through an existing seam: `write_header_atomically`
+    /// creates `keep.hdr.tmp`, so a directory occupying that path makes the header write fail
+    /// mid-rotation, after `reencrypt_database` has run and the backup has been captured.
+    #[test]
+    fn rotate_data_key_rollback_preserves_opaque_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollback-vault");
+        let group_pubkey: [u8; 32] = crypto::random_bytes();
+
+        let mut storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+        storage.set_kill_switch(true).unwrap();
+        storage
+            .set_proxy_config(&ProxyConfig {
+                enabled: true,
+                port: 9150,
+            })
+            .unwrap();
+        storage
+            .store_health_status(&KeyHealthStatus {
+                group_pubkey,
+                share_index: 3,
+                last_check_timestamp: 1_700_000_000,
+                responsive: true,
+                created_at: Some(1_699_000_000),
+            })
+            .unwrap();
+
+        // Occupy keep.hdr.tmp with a directory so the mid-rotation header write cannot create it.
+        fs::create_dir(path.join("keep.hdr.tmp")).unwrap();
+
+        let err = storage
+            .rotate_data_key("oldpass1")
+            .expect_err("header write must fail and force a rollback");
+        assert!(matches!(err, KeepError::Io(_)), "expected Io, got {err:?}");
+
+        assert!(storage.get_kill_switch().unwrap());
+        let proxy = storage.get_proxy_config().unwrap();
+        assert!(proxy.enabled);
+        assert_eq!(proxy.port, 9150);
+        let statuses = storage.list_health_statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].group_pubkey, group_pubkey);
+        assert_eq!(statuses[0].share_index, 3);
         assert_eq!(statuses[0].created_at, Some(1_699_000_000));
     }
 
