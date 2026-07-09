@@ -29,14 +29,22 @@ use crate::types::{
 /// real request; legitimate HTTP-auth targets are far shorter than this.
 const NIP98_DISPLAY_MAX: usize = 512;
 
-/// Neutralize a NIP-98 `u`/`method` value before it reaches any approval prompt.
-/// The tag is fully attacker-controlled, so strip the characters that let a
-/// signed URL read as a different (trusted) one: bidi overrides/isolates,
-/// zero-width and BOM code points, and every control character (a URL/method is
-/// single-line, so newlines and tabs are stripped too). Then truncate so an
-/// oversized tag cannot hide the rest of the prompt. Applied here at the single
-/// choke point so every surface (CLI/desktop/mobile/web) inherits it.
-fn sanitize_http_auth_field(value: String) -> String {
+/// Cap for the event-content preview shown in a sign-approval prompt. Longer
+/// than a URL/method since content is free-form, but still bounded so a huge
+/// content cannot push the approve/reject line off-screen.
+const CONTENT_PREVIEW_MAX: usize = 256;
+
+/// Neutralize an attacker-controlled string before it reaches an approval
+/// prompt. The value (a NIP-98 `u`/`method` tag, or the content of an event to
+/// be signed) is fully attacker-controlled, so strip the characters that let it
+/// read as different (trusted) text or inject extra lines: bidi
+/// overrides/isolates, zero-width and BOM code points, and every control
+/// character (newlines and tabs included). Then truncate to `max` so an
+/// oversized value cannot hide the rest of the prompt. Applied at this single
+/// choke point so every surface (CLI/desktop/mobile/web) inherits it; callers
+/// pass a per-surface `max` (a short cap for a URL/method, a longer one for a
+/// content preview).
+pub fn sanitize_prompt_field(value: &str, max: usize) -> String {
     let mut out: String = value
         .chars()
         .filter(|c| {
@@ -53,8 +61,8 @@ fn sanitize_http_auth_field(value: String) -> String {
             ) && !c.is_control()
         })
         .collect();
-    if out.chars().count() > NIP98_DISPLAY_MAX {
-        out = out.chars().take(NIP98_DISPLAY_MAX).collect::<String>() + "...";
+    if out.chars().count() > max {
+        out = out.chars().take(max).collect::<String>() + "...";
     }
     out
 }
@@ -64,7 +72,7 @@ fn sanitize_http_auth_field(value: String) -> String {
 /// Returns `None` for every other kind. A 27235 event that omits `u` or
 /// `method` still returns `Some` with the missing field as `None`: the prompt
 /// must surface a malformed HTTP-auth request, not silently drop it. The `u`
-/// and `method` values are sanitized (see [`sanitize_http_auth_field`]) since
+/// and `method` values are sanitized (see [`sanitize_prompt_field`]) since
 /// they are attacker-controlled and land directly in a signing-approval prompt.
 fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
     if event.kind != NIP98_HTTP_AUTH {
@@ -77,8 +85,7 @@ fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
     let sanitized = |slice: &[String]| {
         slice
             .get(1)
-            .cloned()
-            .map(sanitize_http_auth_field)
+            .map(|v| sanitize_prompt_field(v, NIP98_DISPLAY_MAX))
             .filter(|s| !s.is_empty())
     };
     for tag in event.tags.iter() {
@@ -508,7 +515,14 @@ impl SignerHandler {
                     app_name: self.get_app_name(&app_pubkey).await,
                     method: "sign_event".into(),
                     event_kind: Some(kind),
-                    event_content: Some(unsigned_event.content.clone()),
+                    // Sanitize the content preview like the NIP-98 fields: it is
+                    // attacker-controlled and lands in the same approval popup,
+                    // where an unstripped newline/bidi sequence could inject fake
+                    // lines or reorder text above the approve prompt.
+                    event_content: Some(sanitize_prompt_field(
+                        &unsigned_event.content,
+                        CONTENT_PREVIEW_MAX,
+                    )),
                     requested_permissions: None,
                     http_auth: nip98_http_auth(&unsigned_event),
                 })
@@ -1146,6 +1160,23 @@ mod tests {
             url.ends_with("..."),
             "truncated url must be marked: {url:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_prompt_field_strips_spoofing_and_caps_by_char_count() {
+        // Bidi/zero-width and every control char (newlines/tabs) are removed so
+        // an attacker cannot inject fake lines or reorder text in a prompt.
+        assert_eq!(
+            sanitize_prompt_field("a\u{202E}b\u{200B}c\n\td", 100),
+            "abcd"
+        );
+        // Truncation is by CHARACTER count (not bytes) and marked with an ellipsis;
+        // a multibyte input proves it is not a byte cap.
+        let out = sanitize_prompt_field(&"\u{00e9}".repeat(50), 10);
+        assert_eq!(out.chars().count(), 13); // 10 chars + "..."
+        assert!(out.ends_with("..."));
+        // Clean, under-cap input is unchanged.
+        assert_eq!(sanitize_prompt_field("GET", 16), "GET");
     }
 
     // #575: NIP-98 (kind 27235) is never auto-approved, not even per-app via

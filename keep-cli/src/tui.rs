@@ -9,6 +9,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
+use keep_nip46::handler::sanitize_prompt_field;
 use keep_nip46::types::HttpAuthDetails;
 use ratatui::{
     prelude::*,
@@ -273,16 +274,15 @@ impl Tui {
         }
 
         if let Some(ref auth) = req.http_auth {
+            // method/url are already bidi/control-sanitized at the keep-nip46
+            // choke point; re-apply the shared sanitizer here only to enforce the
+            // tighter per-surface display cap so a long value cannot push the
+            // rest of the prompt off-screen.
+            let method = sanitize_prompt_field(auth.method.as_deref().unwrap_or("<no method>"), 16);
+            let url = sanitize_prompt_field(auth.url.as_deref().unwrap_or("<no url>"), 120);
             lines.push(Line::from(vec![
                 Span::styled("HTTP auth: ", Style::default().fg(Color::Gray)),
-                Span::styled(
-                    format!(
-                        "{} {}",
-                        auth.method.as_deref().unwrap_or("<no method>"),
-                        auth.url.as_deref().unwrap_or("<no url>"),
-                    ),
-                    Style::default().fg(Color::Red),
-                ),
+                Span::styled(format!("{method} {url}"), Style::default().fg(Color::Red)),
             ]));
         }
 
