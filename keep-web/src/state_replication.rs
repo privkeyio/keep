@@ -13,7 +13,8 @@
 //! per-d-tag high-water-mark (keep-core `state_versions`), rejecting anything not strictly newer, so an
 //! untrusted relay cannot replay a stale record/tombstone to roll a synced standby back. The consumer
 //! also rejects an event dated implausibly far ahead of local wall-clock, so a holder of the cluster key
-//! cannot stamp a mark near `u64::MAX` and freeze a record forever. Residual risks
+//! cannot stamp a mark near `u64::MAX` and freeze a record forever; a bounded suppression (up to the
+//! ~300s future margin) remains but self-heals once wall-clock passes it. Residual risks
 //! it does NOT cover (untrusted-relay + no-liveness model): a relay may still WITHHOLD a newer record or
 //! a tombstone (keeping a revoked key live), and on FIRST sync it may serve an arbitrarily old but
 //! validly-signed version (TOFU) -- detecting omission needs a signed cluster manifest/epoch.
@@ -322,14 +323,17 @@ async fn spawn_consumer(
                                 created_at = rec.created_at,
                                 "keep-state: ignored stale/replayed event (rollback guard)"
                             ),
-                            // Implausibly future-dated: a poison attempt (requires the cluster key), which
-                            // would freeze this record's mark forever. Rejected loudly, mark untouched.
+                            // created_at beyond the future bound. Two causes: a cluster-key poison attempt
+                            // (would otherwise freeze this record's mark), OR THIS node's clock is far
+                            // behind its peers -- in which case every legitimate event is rejected until
+                            // the clock is corrected, so check NTP before assuming an attack. Loud either
+                            // way; mark untouched, so it self-heals once wall-clock passes created_at.
                             Ok(ReplicatedApply::RejectedFuture) => tracing::error!(
                                 table = ?rec.table,
                                 record_id = ?rec.record_id,
                                 created_at = rec.created_at,
                                 now,
-                                "keep-state: rejected implausibly future-dated event (poison guard)"
+                                "keep-state: rejected event past the future bound (cluster-key poison attempt, or this node's clock is behind its peers -- check NTP)"
                             ),
                             Err(e) => tracing::warn!(
                                 table = ?rec.table,
