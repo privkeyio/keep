@@ -487,7 +487,7 @@ impl Storage {
         path: &Path,
         password: &str,
         params: Argon2Params,
-        data_key: [u8; crypto::KEY_SIZE],
+        data_key: Zeroizing<[u8; crypto::KEY_SIZE]>,
     ) -> Result<Self> {
         create_storage_dir(path)?;
         let db_path = path.join("keep.db");
@@ -513,7 +513,7 @@ impl Storage {
         password: &str,
         params: Argon2Params,
         backend: Box<dyn StorageBackend>,
-        shared_data_key: Option<[u8; crypto::KEY_SIZE]>,
+        shared_data_key: Option<Zeroizing<[u8; crypto::KEY_SIZE]>>,
     ) -> Result<Self> {
         validate_new_password(password)?;
 
@@ -521,8 +521,10 @@ impl Storage {
         // The data key encrypts every record and is normally random per vault. A cluster can instead
         // seed the SAME data key on every node (keep-state replication), so a standby decrypts records
         // the active shipped: each node still wraps it under its OWN password+salt in its own header.
+        // `from_slice` stages the seed in its own zeroizing buffer (and `SecretKey::new` wipes its
+        // by-value copy), so no un-zeroized bare `[u8; 32]` of the raw key outlives this call.
         let data_key = match shared_data_key {
-            Some(k) => SecretKey::new(k)?,
+            Some(k) => SecretKey::from_slice(k.as_slice())?,
             None => SecretKey::generate()?,
         };
         let master_key = crypto::derive_key(password.as_bytes(), &header.salt, params)?;
@@ -1992,21 +1994,21 @@ mod tests {
         // Two independent vaults with DIFFERENT passwords but the SAME seeded data key: a record
         // encrypted by one must decrypt in the other. This is the cluster invariant keep-state
         // replication relies on (the standby reads what the active shipped).
-        let shared: [u8; 32] = crypto::random_bytes();
+        let shared: Zeroizing<[u8; 32]> = Zeroizing::new(crypto::random_bytes());
         let dir = tempdir().unwrap();
 
         let a = Storage::create_with_shared_data_key(
             &dir.path().join("a"),
             "passwordA",
             Argon2Params::TESTING,
-            shared,
+            shared.clone(),
         )
         .unwrap();
         let b = Storage::create_with_shared_data_key(
             &dir.path().join("b"),
             "differentB",
             Argon2Params::TESTING,
-            shared,
+            shared.clone(),
         )
         .unwrap();
 

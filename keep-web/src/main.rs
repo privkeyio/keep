@@ -69,7 +69,8 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
 /// `Err` when set but malformed so a misconfigured cluster node fails loudly instead
 /// of silently creating a non-replicable vault.
 fn shared_data_key_from_env() -> Result<Option<Zeroizing<[u8; 32]>>, Box<dyn std::error::Error>> {
-    let Some(hex_key) = secret_from("KEEP_STORAGE_KEY")? else {
+    // Zeroize our copy of the hex on drop; it decodes to the raw record-encryption key.
+    let Some(hex_key) = secret_from("KEEP_STORAGE_KEY")?.map(Zeroizing::new) else {
         return Ok(None);
     };
     Ok(Some(parse_shared_data_key(&hex_key)?))
@@ -185,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &vault_path,
                         &password,
                         keep_core::crypto::Argon2Params::DEFAULT,
-                        *key,
+                        key,
                     )?
                 }
                 None => {
