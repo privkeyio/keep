@@ -109,7 +109,7 @@ pub use enroll_session::{
     OprfEnrollSessionState,
 };
 pub use error::{FrostNetError, Result};
-pub use event::KfpEventBuilder;
+pub use event::{verify_duress_beacon, KfpEventBuilder};
 pub use node::{
     DescriptorLookupUnavailable, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent,
     NoOpHooks, OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
@@ -126,15 +126,15 @@ pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
-    DescriptorProposePayload, EcdhCompletePayload, EcdhRequestPayload, EcdhSharePayload,
-    EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage, NonceCommitmentPayload, NonceRef,
-    OprfEnrollAckPayload, OprfEnrollPayload, OprfEvalRequestPayload, OprfEvalSharePayload,
-    PingPayload, PolicyTier, PongPayload, PreExchangedCommitment, PsbtAbortPayload,
-    PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo, PsbtProposePayload, PsbtSignPayload,
-    RefreshCompletePayload, RefreshRequestPayload, RefreshRound1Payload, RefreshRound2Payload,
-    SignRequestPayload, SignatureCompletePayload, SignatureSharePayload, TpmQuoteEvidence,
-    WalletPolicy, XpubAnnouncePayload, DEFAULT_REPLAY_WINDOW_SECS,
-    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    DescriptorProposePayload, DuressBeaconPayload, EcdhCompletePayload, EcdhRequestPayload,
+    EcdhSharePayload, EnclaveAttestation, ErrorPayload, KeySlot, KfpMessage,
+    NonceCommitmentPayload, NonceRef, OprfEnrollAckPayload, OprfEnrollPayload,
+    OprfEvalRequestPayload, OprfEvalSharePayload, PingPayload, PolicyTier, PongPayload,
+    PreExchangedCommitment, PsbtAbortPayload, PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo,
+    PsbtProposePayload, PsbtSignPayload, RefreshCompletePayload, RefreshRequestPayload,
+    RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload,
+    SignatureSharePayload, TpmQuoteEvidence, WalletPolicy, XpubAnnouncePayload,
+    DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
     DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
     DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
     KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
