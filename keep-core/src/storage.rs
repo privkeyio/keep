@@ -212,6 +212,26 @@ pub trait StatePublisher: Send + Sync {
     fn on_delete(&self, table: &str, record_id: &str);
 }
 
+/// Maximum seconds a replicated event's `created_at` may exceed local wall-clock before it is rejected
+/// as a poison attempt. Must exceed the publisher's legitimate future drift (same-second bumps advance
+/// `created_at` ~1s each) plus genuine inter-node clock skew, and stay within the NIP-11
+/// `created_at_upper_limit` range. Without it, a validly-signed event (which requires the shared cluster
+/// key) with `created_at` near `u64::MAX` would freeze a record's high-water-mark forever -- dropping
+/// every later update AND its revocation tombstone, across restarts and identity rotation.
+const MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Outcome of applying a replicated keep-state event on the standby.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicatedApply {
+    /// Applied; the per-d-tag high-water-mark advanced.
+    Applied,
+    /// Ignored: not strictly newer than the mark already applied (a stale event or replay).
+    IgnoredStale,
+    /// Rejected: `created_at` is implausibly far in the future (a poison attempt requiring the cluster
+    /// key). The mark is NOT advanced, so a legitimate later event still applies.
+    RejectedFuture,
+}
+
 /// Encrypted persistent storage for keys and FROST shares.
 pub struct Storage {
     pub(crate) path: PathBuf,
@@ -307,11 +327,19 @@ impl Storage {
         record_id: &str,
         encrypted: &[u8],
         created_at: u64,
-    ) -> Result<bool> {
+        now: u64,
+    ) -> Result<ReplicatedApply> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
+        // Reject an implausibly future-dated event before it can advance the mark. `created_at` is
+        // signed (a relay cannot forge it), but a holder of the shared cluster key could otherwise stamp
+        // a mark near u64::MAX and permanently freeze this record; the mark is left untouched so a
+        // legitimate later event still applies.
+        if created_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+            return Ok(ReplicatedApply::RejectedFuture);
+        }
         let vkey = Self::state_version_key(table_name, &key);
         if !self.state_version_is_newer(&vkey, created_at)? {
-            return Ok(false);
+            return Ok(ReplicatedApply::IgnoredStale);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         // Write the data row and advance the high-water-mark in ONE atomic transaction: if these were
@@ -330,21 +358,25 @@ impl Storage {
                 value: Some(&ts),
             },
         ])?;
-        Ok(true)
+        Ok(ReplicatedApply::Applied)
     }
 
-    /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher. Same rollback
-    /// guard as `apply_replicated_record`; returns `true` if applied, `false` if ignored as stale.
+    /// Apply a replicated delete (tombstone) from a peer. Never notifies the publisher. Same rollback +
+    /// future-bound guards as `apply_replicated_record`.
     pub fn apply_replicated_delete(
         &self,
         table: &str,
         record_id: &str,
         created_at: u64,
-    ) -> Result<bool> {
+        now: u64,
+    ) -> Result<ReplicatedApply> {
         let (table_name, key) = Self::replicated_key(table, record_id)?;
+        if created_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+            return Ok(ReplicatedApply::RejectedFuture);
+        }
         let vkey = Self::state_version_key(table_name, &key);
         if !self.state_version_is_newer(&vkey, created_at)? {
-            return Ok(false);
+            return Ok(ReplicatedApply::IgnoredStale);
         }
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         // Tombstone and mark advance in one atomic transaction; see `apply_replicated_record`.
@@ -361,7 +393,7 @@ impl Storage {
                 value: Some(&ts),
             },
         ])?;
-        Ok(true)
+        Ok(ReplicatedApply::Applied)
     }
 
     /// The rollback-guard high-water-mark key for a replicated record: the backend table name joined to
@@ -1722,36 +1754,48 @@ mod tests {
 
         // Applying the replicated bytes reconstructs a loadable record (same vault key decrypts them).
         storage
-            .apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
+            .apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1, 1_000_000)
             .unwrap();
         assert_eq!(storage.load_key(&record.id).unwrap().name, "replicated");
 
         // A non-replicable table (shares / node-local / unknown) is refused, so a peer cannot write it.
         assert!(storage
-            .apply_replicated_record("shares", &hex::encode(record.id), &encrypted, 1)
+            .apply_replicated_record("shares", &hex::encode(record.id), &encrypted, 1, 1_000_000)
             .is_err());
         assert!(storage
-            .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted, 1)
+            .apply_replicated_record("bogus", &hex::encode(record.id), &encrypted, 1, 1_000_000)
             .is_err());
 
         // A descriptor key of the wrong length is refused: the listing/lookup path fails closed on any
         // non-36-byte descriptor row, so accepting one would poison list_descriptors for the vault.
         assert!(storage
-            .apply_replicated_record("descriptors", &hex::encode([0u8; 20]), &encrypted, 1)
+            .apply_replicated_record(
+                "descriptors",
+                &hex::encode([0u8; 20]),
+                &encrypted,
+                1,
+                1_000_000
+            )
             .is_err());
         assert!(storage
-            .apply_replicated_delete("descriptors", &hex::encode([0u8; 20]), 1)
+            .apply_replicated_delete("descriptors", &hex::encode([0u8; 20]), 1, 1_000_000)
             .is_err());
         // A correctly-sized 36-byte descriptor key is accepted.
         assert!(storage
-            .apply_replicated_record("descriptors", &hex::encode([0u8; 36]), &encrypted, 1)
+            .apply_replicated_record(
+                "descriptors",
+                &hex::encode([0u8; 36]),
+                &encrypted,
+                1,
+                1_000_000
+            )
             .is_ok());
 
         // A replicated delete removes it, and never echoes to the publisher: the only recorded delete
         // is the earlier real delete_key, not this apply.
         let deletes_before = publisher.deletes.lock().unwrap().len();
         storage
-            .apply_replicated_delete("keys", &hex::encode(record.id), 2)
+            .apply_replicated_delete("keys", &hex::encode(record.id), 2, 1_000_000)
             .unwrap();
         assert!(storage.load_key(&record.id).is_err());
         assert_eq!(publisher.deletes.lock().unwrap().len(), deletes_before);
@@ -1783,29 +1827,93 @@ mod tests {
         let id = hex::encode([9u8; 32]);
 
         // Apply v2 at created_at=100.
-        assert!(storage
-            .apply_replicated_record("keys", &id, &enc_v2, 100)
-            .unwrap());
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc_v2, 100, 1_000_000)
+                .unwrap(),
+            ReplicatedApply::Applied
+        );
         assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
 
         // An older replay is rejected and does NOT roll the record back to v1.
-        assert!(!storage
-            .apply_replicated_record("keys", &id, &enc_v1, 50)
-            .unwrap());
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc_v1, 50, 1_000_000)
+                .unwrap(),
+            ReplicatedApply::IgnoredStale
+        );
         assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
         // The SAME created_at is also rejected (idempotent, no rollback).
-        assert!(!storage
-            .apply_replicated_record("keys", &id, &enc_v1, 100)
-            .unwrap());
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc_v1, 100, 1_000_000)
+                .unwrap(),
+            ReplicatedApply::IgnoredStale
+        );
         assert_eq!(storage.load_key(&[9u8; 32]).unwrap().name, "v2");
 
         // A strictly-newer delete IS applied, and a stale record cannot resurrect the deleted row.
-        assert!(storage.apply_replicated_delete("keys", &id, 200).unwrap());
+        assert_eq!(
+            storage
+                .apply_replicated_delete("keys", &id, 200, 1_000_000)
+                .unwrap(),
+            ReplicatedApply::Applied
+        );
         assert!(storage.load_key(&[9u8; 32]).is_err());
-        assert!(!storage
-            .apply_replicated_record("keys", &id, &enc_v1, 150)
-            .unwrap());
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc_v1, 150, 1_000_000)
+                .unwrap(),
+            ReplicatedApply::IgnoredStale
+        );
         assert!(storage.load_key(&[9u8; 32]).is_err());
+    }
+
+    #[test]
+    fn replicated_apply_rejects_implausibly_future_created_at() {
+        // A validly-signed event (would require the cluster key) with created_at far in the future must
+        // be rejected and must NOT advance the mark, or it would freeze the record forever (GH #708).
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "passwordF", Argon2Params::TESTING).unwrap();
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+        storage
+            .store_key(&KeyRecord::new(
+                [3u8; 32],
+                crate::keys::KeyType::Nostr,
+                "x".into(),
+                vec![1],
+            ))
+            .unwrap();
+        let enc = publisher.last_bytes.lock().unwrap().clone();
+        let id = hex::encode([3u8; 32]);
+        let now = 1_000_000u64;
+
+        // Far-future (now + ~1 year) and u64::MAX are rejected without persisting a mark.
+        for future in [now + 31_536_000, u64::MAX] {
+            assert_eq!(
+                storage
+                    .apply_replicated_record("keys", &id, &enc, future, now)
+                    .unwrap(),
+                ReplicatedApply::RejectedFuture
+            );
+            assert_eq!(storage.state_version("keys", &id).unwrap(), None);
+        }
+        // The poison did not freeze the record: a legitimate near-now event still applies, and the
+        // boundary (now + margin) is accepted.
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc, now, now)
+                .unwrap(),
+            ReplicatedApply::Applied
+        );
+        assert_eq!(
+            storage
+                .apply_replicated_record("keys", &id, &enc, now + MAX_FUTURE_SKEW_SECS, now)
+                .unwrap(),
+            ReplicatedApply::Applied
+        );
     }
 
     #[test]
@@ -1831,10 +1939,10 @@ mod tests {
 
         assert_eq!(storage.state_version("keys", &a).unwrap(), None);
         storage
-            .apply_replicated_record("keys", &a, &enc, 100)
+            .apply_replicated_record("keys", &a, &enc, 100, 1_000_000)
             .unwrap();
         storage
-            .apply_replicated_record("keys", &b, &enc, 500)
+            .apply_replicated_record("keys", &b, &enc, 500, 1_000_000)
             .unwrap();
         // Record a's mark stays 100 even though b was applied at 500 (no global-max contamination).
         assert_eq!(storage.state_version("keys", &a).unwrap(), Some(100));
@@ -1871,7 +1979,7 @@ mod tests {
         storage.delete_key(&record.id).unwrap();
 
         let err = storage
-            .apply_replicated_record("keys", &id, &encrypted, 100)
+            .apply_replicated_record("keys", &id, &encrypted, 100, 1_000_000)
             .unwrap_err();
         assert!(
             matches!(&err, KeepError::Other(m) if m == "corrupt keep-state version high-water-mark"),
@@ -1914,13 +2022,13 @@ mod tests {
         a.store_key(&record).unwrap();
         let encrypted = publisher.last_bytes.lock().unwrap().clone();
 
-        b.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
+        b.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1, 1_000_000)
             .unwrap();
         assert_eq!(b.load_key(&record.id).unwrap().name, "shared");
 
         // Sanity: WITHOUT the shared key, a third vault cannot decrypt the same bytes.
         let c = Storage::create(&dir.path().join("c"), "passwordC", Argon2Params::TESTING).unwrap();
-        c.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1)
+        c.apply_replicated_record("keys", &hex::encode(record.id), &encrypted, 1, 1_000_000)
             .unwrap();
         assert!(c.load_key(&record.id).is_err());
     }

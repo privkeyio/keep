@@ -11,7 +11,9 @@
 //!
 //! Rollback protection: each event carries the signed `created_at`, and the consumer keeps a persisted
 //! per-d-tag high-water-mark (keep-core `state_versions`), rejecting anything not strictly newer, so an
-//! untrusted relay cannot replay a stale record/tombstone to roll a synced standby back. Residual risks
+//! untrusted relay cannot replay a stale record/tombstone to roll a synced standby back. The consumer
+//! also rejects an event dated implausibly far ahead of local wall-clock, so a holder of the cluster key
+//! cannot stamp a mark near `u64::MAX` and freeze a record forever. Residual risks
 //! it does NOT cover (untrusted-relay + no-liveness model): a relay may still WITHHOLD a newer record or
 //! a tombstone (keeping a revoked key live), and on FIRST sync it may serve an arbitrarily old but
 //! validly-signed version (TOFU) -- detecting omission needs a signed cluster manifest/epoch.
@@ -26,7 +28,7 @@ use std::sync::Arc;
 use nostr_sdk::prelude::*;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-use keep_core::{Keep, StatePublisher};
+use keep_core::{Keep, ReplicatedApply, StatePublisher};
 use keep_frost_net::{
     parse_state_event, state_record_event, state_tombstone_event, KEEP_STATE_KIND,
 };
@@ -291,31 +293,43 @@ async fn spawn_consumer(
                 match parse_state_event(&identity, &event) {
                     Ok(Some(rec)) => {
                         let k = keep.lock().await;
+                        let now = now_secs();
                         let outcome = match rec.content {
                             Some(bytes) => k.apply_replicated_record(
                                 &rec.table,
                                 &rec.record_id,
                                 &bytes,
                                 rec.created_at,
+                                now,
                             ),
                             None => k.apply_replicated_delete(
                                 &rec.table,
                                 &rec.record_id,
                                 rec.created_at,
+                                now,
                             ),
                         };
+                        // Debug-format the event-supplied table and record id: neither is charset-
+                        // constrained until `apply_*` checks the allowlist, so Display would let a
+                        // control character forge log lines.
                         match outcome {
-                            Ok(true) => {}
+                            Ok(ReplicatedApply::Applied) => {}
                             // Not strictly newer than what we already applied: a stale or replayed event
                             // (rollback attempt from an untrusted relay). Ignore it, but record it.
-                            // Debug-format the event-supplied table and record id: neither is charset-
-                            // constrained until `apply_*` checks the allowlist, so Display would let a
-                            // control character forge log lines.
-                            Ok(false) => tracing::warn!(
+                            Ok(ReplicatedApply::IgnoredStale) => tracing::warn!(
                                 table = ?rec.table,
                                 record_id = ?rec.record_id,
                                 created_at = rec.created_at,
                                 "keep-state: ignored stale/replayed event (rollback guard)"
+                            ),
+                            // Implausibly future-dated: a poison attempt (requires the cluster key), which
+                            // would freeze this record's mark forever. Rejected loudly, mark untouched.
+                            Ok(ReplicatedApply::RejectedFuture) => tracing::error!(
+                                table = ?rec.table,
+                                record_id = ?rec.record_id,
+                                created_at = rec.created_at,
+                                now,
+                                "keep-state: rejected implausibly future-dated event (poison guard)"
                             ),
                             Err(e) => tracing::warn!(
                                 table = ?rec.table,
