@@ -344,9 +344,11 @@ impl SecretKey {
         if slice.len() != KEY_SIZE {
             return Err(CryptoError::invalid_key("invalid key length").into());
         }
-        let mut bytes = [0u8; KEY_SIZE];
+        // Zeroize the staging buffer: `Self::new` wipes its own by-value copy, but this local would
+        // otherwise linger un-zeroized in the stack frame after the call.
+        let mut bytes = Zeroizing::new([0u8; KEY_SIZE]);
         bytes.copy_from_slice(slice);
-        Self::new(bytes)
+        Self::new(*bytes)
     }
 
     pub fn try_clone(&self) -> Result<Self> {

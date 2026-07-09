@@ -521,8 +521,8 @@ impl Storage {
         // The data key encrypts every record and is normally random per vault. A cluster can instead
         // seed the SAME data key on every node (keep-state replication), so a standby decrypts records
         // the active shipped: each node still wraps it under its OWN password+salt in its own header.
-        // `from_slice` reads the seed straight out of the zeroizing buffer, avoiding a bare `[u8; 32]`
-        // stack copy of the raw key that would outlive the seed.
+        // `from_slice` stages the seed in its own zeroizing buffer (and `SecretKey::new` wipes its
+        // by-value copy), so no un-zeroized bare `[u8; 32]` of the raw key outlives this call.
         let data_key = match shared_data_key {
             Some(k) => SecretKey::from_slice(k.as_slice())?,
             None => SecretKey::generate()?,
