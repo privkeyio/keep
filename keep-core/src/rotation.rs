@@ -12,7 +12,8 @@ use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    RedbBackend, StorageBackend, DESCRIPTORS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE,
+    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
+    RELAY_CONFIGS_TABLE, SHARES_TABLE,
 };
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
@@ -24,6 +25,19 @@ use crate::storage::{
     share_id, validate_new_password, Header, Storage,
 };
 use crate::wallet::WalletDescriptor;
+
+/// Tables whose values are opaque `EncryptedData` blobs sealed directly under the data key,
+/// with no typed collection path of their own. Rotation moves them verbatim: decrypt each row
+/// under the old key, re-encrypt under the new one. `STATE_VERSIONS_TABLE` is deliberately
+/// absent because it stores plaintext big-endian counters, not ciphertext.
+const OPAQUE_TABLES: [&str; 2] = [CONFIG_TABLE, HEALTH_STATUS_TABLE];
+
+/// One row of an [`OPAQUE_TABLES`] table, held decrypted across a rotation.
+struct OpaqueRow {
+    table: &'static str,
+    key: Vec<u8>,
+    plaintext: Zeroizing<Vec<u8>>,
+}
 
 fn secure_delete(path: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = fs::metadata(path) {
@@ -394,6 +408,12 @@ impl Storage {
 
         let decrypted_keys = self.decrypt_all_keys(&keys, &old_data_key)?;
         let decrypted_shares = self.decrypt_all_shares(&shares, &old_data_key)?;
+        // decrypt_opaque_rows lazily materializes any absent opaque table via a committed redb
+        // write. This is the sole live-DB mutation preceding the safety backup below; every other
+        // pre-backup step is read-only. It is safe: the create is idempotent, on a legacy vault
+        // lacking the table it at worst leaves an empty table, and the backup taken afterward
+        // captures that post-create state so a rollback stays consistent.
+        let opaque_rows = self.decrypt_opaque_rows(&old_data_key)?;
 
         self.backend = None;
 
@@ -427,6 +447,7 @@ impl Storage {
                 &decrypted_shares,
                 &descriptors,
                 &relay_configs,
+                &opaque_rows,
                 &new_data_key,
             )?;
 
@@ -441,6 +462,7 @@ impl Storage {
                 &decrypted_shares,
                 &descriptors,
                 &relay_configs,
+                &opaque_rows,
             )?;
 
             Ok(())
@@ -513,12 +535,34 @@ impl Storage {
             .collect()
     }
 
+    fn decrypt_opaque_rows(&self, data_key: &SecretKey) -> Result<Vec<OpaqueRow>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let mut rows = Vec::new();
+        for table in OPAQUE_TABLES {
+            // A vault created before this table existed has no such table, and a redb read txn
+            // cannot create one. Same lazy-create idiom as `Storage::state_version`.
+            backend.create_table(table)?;
+            for (key, encrypted_bytes) in backend.list(table)? {
+                let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+                let plaintext = crypto::decrypt(&encrypted, data_key)?;
+                rows.push(OpaqueRow {
+                    table,
+                    key,
+                    plaintext: plaintext.as_slice()?,
+                });
+            }
+        }
+        Ok(rows)
+    }
+
     fn reencrypt_database(
         &self,
         keys: &[(KeyRecord, Zeroizing<Vec<u8>>)],
         shares: &[(StoredShare, Zeroizing<Vec<u8>>)],
         descriptors: &[WalletDescriptor],
         relay_configs: &[RelayConfig],
+        opaque_rows: &[OpaqueRow],
         new_data_key: &SecretKey,
     ) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -565,6 +609,11 @@ impl Storage {
             )?;
         }
 
+        for row in opaque_rows {
+            let encrypted = crypto::encrypt(&row.plaintext, new_data_key)?;
+            backend.put(row.table, &row.key, &encrypted.to_bytes())?;
+        }
+
         Ok(())
     }
 
@@ -574,6 +623,7 @@ impl Storage {
         original_shares: &[(StoredShare, Zeroizing<Vec<u8>>)],
         original_descriptors: &[WalletDescriptor],
         original_relay_configs: &[RelayConfig],
+        original_opaque_rows: &[OpaqueRow],
     ) -> Result<()> {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -723,6 +773,39 @@ impl Storage {
             }
         }
 
+        for table in OPAQUE_TABLES {
+            let expected = original_opaque_rows
+                .iter()
+                .filter(|row| row.table == table)
+                .count();
+            let found = backend.list(table)?.len();
+            if found != expected {
+                return Err(KeepError::RotationFailed(format!(
+                    "{table} row count mismatch: expected {expected}, found {found}"
+                )));
+            }
+        }
+
+        for row in original_opaque_rows {
+            let encrypted_bytes = backend.get(row.table, &row.key)?.ok_or_else(|| {
+                KeepError::RotationFailed(format!(
+                    "{} row {} missing after rotation",
+                    row.table,
+                    hex::encode(&row.key)
+                ))
+            })?;
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            if !bool::from(decrypted_bytes.ct_eq(row.plaintext.as_slice())) {
+                return Err(KeepError::RotationFailed(format!(
+                    "{} row {} content mismatch after rotation",
+                    row.table,
+                    hex::encode(&row.key)
+                )));
+            }
+        }
+
         Ok(())
     }
 }
@@ -731,7 +814,160 @@ impl Storage {
 mod tests {
     use super::*;
     use crate::crypto::Argon2Params;
+    use crate::storage::ProxyConfig;
+    use crate::wallet::KeyHealthStatus;
     use tempfile::tempdir;
+
+    /// `rotate_data_key` must re-encrypt the `config` and `key_health_status` tables under the
+    /// new data key. It previously rewrote only keys/shares/descriptors/relay_configs, stranding
+    /// those rows under the old key and permanently breaking `get_kill_switch`, `get_proxy_config`,
+    /// `list_health_statuses`, and (via `get_kill_switch`) vault backup.
+    #[test]
+    fn rotate_data_key_reencrypts_config_and_health_status() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-rotate-opaque");
+        let group_pubkey: [u8; 32] = crypto::random_bytes();
+
+        {
+            let mut storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+            storage.set_kill_switch(true).unwrap();
+            storage
+                .set_proxy_config(&ProxyConfig {
+                    enabled: true,
+                    port: 9150,
+                })
+                .unwrap();
+            storage
+                .store_health_status(&KeyHealthStatus {
+                    group_pubkey,
+                    share_index: 3,
+                    last_check_timestamp: 1_700_000_000,
+                    responsive: true,
+                    created_at: Some(1_699_000_000),
+                })
+                .unwrap();
+
+            storage.rotate_data_key("oldpass1").unwrap();
+
+            assert!(storage.get_kill_switch().unwrap());
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("oldpass1").unwrap();
+
+        assert!(storage.get_kill_switch().unwrap());
+
+        let proxy = storage.get_proxy_config().unwrap();
+        assert!(proxy.enabled);
+        assert_eq!(proxy.port, 9150);
+
+        let statuses = storage.list_health_statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].group_pubkey, group_pubkey);
+        assert_eq!(statuses[0].share_index, 3);
+        assert_eq!(statuses[0].last_check_timestamp, 1_700_000_000);
+        assert!(statuses[0].responsive);
+        assert_eq!(statuses[0].created_at, Some(1_699_000_000));
+    }
+
+    /// A vault created before the `config`/`key_health_status` tables existed has neither table.
+    /// `decrypt_opaque_rows` must lazily create each absent table (a redb read txn cannot), so
+    /// rotation succeeds instead of failing on a missing table. Simulate the legacy layout by
+    /// dropping both tables from the redb file, then rotate.
+    #[test]
+    fn rotate_data_key_lazily_creates_missing_opaque_tables() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("legacy-vault");
+
+        {
+            let storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+            let pubkey: [u8; 32] = crypto::random_bytes();
+            let secret: Vec<u8> = vec![1, 2, 3, 4];
+            let encrypted = crypto::encrypt(&secret, storage.data_key().unwrap()).unwrap();
+            let record = KeyRecord::new(
+                pubkey,
+                crate::keys::KeyType::Nostr,
+                "legacy".into(),
+                encrypted.to_bytes(),
+            );
+            storage.store_key(&record).unwrap();
+        }
+
+        {
+            let config_def: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new(CONFIG_TABLE);
+            let health_def: redb::TableDefinition<&[u8], &[u8]> =
+                redb::TableDefinition::new(HEALTH_STATUS_TABLE);
+            let db = redb::Database::open(path.join("keep.db")).unwrap();
+            let wtxn = db.begin_write().unwrap();
+            assert!(
+                wtxn.delete_table(config_def).unwrap(),
+                "config table must exist before it can be dropped"
+            );
+            assert!(
+                wtxn.delete_table(health_def).unwrap(),
+                "key_health_status table must exist before it can be dropped"
+            );
+            wtxn.commit().unwrap();
+        }
+
+        let mut storage = Storage::open(&path).unwrap();
+        storage
+            .rotate_data_key("oldpass1")
+            .expect("rotation must lazily create the absent opaque tables");
+
+        assert!(!storage.get_kill_switch().unwrap());
+        assert!(storage.list_health_statuses().unwrap().is_empty());
+        assert_eq!(storage.list_keys().unwrap().len(), 1);
+    }
+
+    /// A rotation that fails after the safety backup is taken must roll back to the OLD data key.
+    /// With `config`/`key_health_status` rows present, those rows must remain readable under the
+    /// old key afterward. The failure is forced through an existing seam: `write_header_atomically`
+    /// creates `keep.hdr.tmp`, so a directory occupying that path makes the header write fail
+    /// mid-rotation, after `reencrypt_database` has run and the backup has been captured.
+    #[test]
+    fn rotate_data_key_rollback_preserves_opaque_rows() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rollback-vault");
+        let group_pubkey: [u8; 32] = crypto::random_bytes();
+
+        let mut storage = Storage::create(&path, "oldpass1", Argon2Params::TESTING).unwrap();
+        storage.set_kill_switch(true).unwrap();
+        storage
+            .set_proxy_config(&ProxyConfig {
+                enabled: true,
+                port: 9150,
+            })
+            .unwrap();
+        storage
+            .store_health_status(&KeyHealthStatus {
+                group_pubkey,
+                share_index: 3,
+                last_check_timestamp: 1_700_000_000,
+                responsive: true,
+                created_at: Some(1_699_000_000),
+            })
+            .unwrap();
+
+        // Occupy keep.hdr.tmp with a directory so the mid-rotation header write cannot create it.
+        fs::create_dir(path.join("keep.hdr.tmp")).unwrap();
+
+        let err = storage
+            .rotate_data_key("oldpass1")
+            .expect_err("header write must fail and force a rollback");
+        assert!(matches!(err, KeepError::Io(_)), "expected Io, got {err:?}");
+
+        assert!(storage.get_kill_switch().unwrap());
+        let proxy = storage.get_proxy_config().unwrap();
+        assert!(proxy.enabled);
+        assert_eq!(proxy.port, 9150);
+        let statuses = storage.list_health_statuses().unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].group_pubkey, group_pubkey);
+        assert_eq!(statuses[0].share_index, 3);
+        assert_eq!(statuses[0].created_at, Some(1_699_000_000));
+    }
 
     #[test]
     fn test_rotate_password() {
