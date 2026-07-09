@@ -117,6 +117,16 @@ fn parse_tpm_policy(text: &str) -> Result<TpmAttestationPolicy> {
             reference_pcrs.len()
         )));
     }
+    // A fully zeroed reference set is theater: every PCR unextended means no
+    // measured boot happened, so the policy would "verify" a completely
+    // unmeasured TPM. Mirror the Nitro all-zero PCR0 rejection. A mix of zero
+    // and non-zero slots is legitimate (unused PCRs read zero), so reject only
+    // when EVERY reference PCR is zero.
+    if reference_pcrs.iter().all(|d| d.iter().all(|&b| b == 0)) {
+        return Err(err(
+            "attestation `reference_pcrs` are all zeros (an unmeasured TPM); refusing to pin a policy that verifies nothing",
+        ));
+    }
 
     if cfg.peer.is_empty() {
         return Err(err(
@@ -572,7 +582,7 @@ mod tests {
     fn rejects_no_peers() {
         let cfg = r#"
             selection = "00000001000b03010000"
-            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            reference_pcrs = ["cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0"]
         "#;
         assert!(parse_tpm_policy(cfg).is_err());
     }
@@ -581,7 +591,7 @@ mod tests {
     fn rejects_bad_ak() {
         let cfg = r#"
             selection = "00000001000b03010000"
-            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            reference_pcrs = ["cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0"]
             [[peer]]
             index = 2
             ak = "0400"
@@ -595,7 +605,7 @@ mod tests {
         let cfg = format!(
             r#"
             selection = "{ONE_PCR_SELECTION}"
-            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            reference_pcrs = ["cf2b0db7514f320c315130275a960f6e6ed80744c754c687069d7a9f55d704f0"]
             [[peer]]
             index = 2
             ak = "04{}"
@@ -628,6 +638,25 @@ mod tests {
             ak = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb"
         "#;
         assert!(parse_tpm_policy(cfg).is_err());
+    }
+
+    #[test]
+    fn rejects_all_zero_reference_set() {
+        // A fully zeroed reference set (an unmeasured TPM) is refused even when
+        // count and peer are otherwise valid. A mix with a non-zero slot (the
+        // VALID fixture) is accepted, so this pins the all-zero-only case.
+        let cfg = r#"
+            selection = "00000001000b03010000"
+            reference_pcrs = ["0000000000000000000000000000000000000000000000000000000000000000"]
+            [[peer]]
+            index = 2
+            ak = "04f533789fb86ad512ca3e930df08cd16396d14c30c79c46a88839b574a3dfb3271b3db55b2abdc884e40898e95dfffd2c7e8554526d4e1f651779bab1f81300cb"
+        "#;
+        let e = parse_tpm_policy(cfg).unwrap_err().to_string();
+        assert!(
+            e.contains("all zeros"),
+            "expected all-zeros rejection, got: {e}"
+        );
     }
 
     #[test]
