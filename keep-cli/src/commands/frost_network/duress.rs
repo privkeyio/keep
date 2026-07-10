@@ -6,7 +6,8 @@
 //! fail closed and emit a signed duress beacon. This module derives the
 //! dedicated beacon keypair from that credential and provisions it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use keep_core::crypto::{derive_key, Argon2Params, SALT_SIZE};
 use keep_core::error::{KeepError, Result};
@@ -154,6 +155,143 @@ pub(crate) fn build_duress_event(beacon: &Keys, group_pubkey: &[u8; 32]) -> Resu
 /// staying resident, so a black-holed relay cannot hang the duress start.
 const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
 
+/// Default delay before a `duress-clear --initiate` may be executed: a generous
+/// window for out-of-band intervention (`--cancel`) if the clear was coerced.
+pub const DEFAULT_DURESS_CLEAR_DELAY_SECS: u64 = 24 * 60 * 60;
+
+/// A pending, delayed operator clear (Argent guardian-recovery pattern): the box
+/// stays frozen until `--execute` runs after `requested_at + delay_secs`, and any
+/// operator can `--cancel` during the window.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ClearPending {
+    requested_at: u64,
+    delay_secs: u64,
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The pending-clear marker lives beside the freeze state file.
+fn clear_marker_path(state_file: &Path) -> PathBuf {
+    let mut p = state_file.as_os_str().to_owned();
+    p.push(".clear-pending");
+    PathBuf::from(p)
+}
+
+/// `keep frost network duress-clear`: lift a sticky duress freeze via a distinct,
+/// delayed, cancelable operator action rather than a bare file delete, so a
+/// coerced clear can be intervened on before it takes effect. Actions:
+/// `initiate` (start the delay; box stays frozen), `cancel` (abort the window),
+/// `execute` (lift the freeze once the delay elapses). `serve` is unchanged; the
+/// marker is consulted only here.
+pub fn cmd_frost_network_duress_clear(
+    out: &Output,
+    state_file: &Path,
+    action: crate::cli::DuressClearAction,
+    delay_secs: u64,
+) -> Result<()> {
+    use crate::cli::DuressClearAction::*;
+    match action {
+        Initiate => {
+            clear_initiate(state_file, delay_secs)?;
+            out.warn(&format!(
+                "Duress clear INITIATED. The box stays FROZEN for {delay_secs}s, then run \
+                 `duress-clear ... execute`. Cancel any time with `duress-clear ... cancel`."
+            ));
+        }
+        Cancel => {
+            if clear_cancel(state_file)? {
+                out.info("Pending duress clear cancelled; the box remains frozen.");
+            } else {
+                out.info("No pending duress clear to cancel.");
+            }
+        }
+        Execute => {
+            clear_execute(state_file, now_secs())?;
+            out.info(
+                "Duress freeze CLEARED. Restart `serve` (or reboot) to resume normal operation.",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Arm a delayed clear. Requires an active freeze (refuse to arm against nothing)
+/// and records the request time + delay in the marker beside the state file.
+fn clear_initiate(state_file: &Path, delay_secs: u64) -> Result<()> {
+    if read_persisted_freeze(state_file)?.is_none() {
+        return Err(KeepError::invalid_input(format!(
+            "no duress freeze at {}: nothing to clear",
+            state_file.display()
+        )));
+    }
+    let pending = ClearPending {
+        requested_at: now_secs(),
+        delay_secs,
+    };
+    let bytes = serde_json::to_vec(&pending)
+        .map_err(|e| KeepError::runtime(format!("serialize clear marker: {e}")))?;
+    let marker = clear_marker_path(state_file);
+    std::fs::write(&marker, &bytes)
+        .map_err(|e| KeepError::runtime(format!("write {}: {e}", marker.display())))
+}
+
+/// Abort a pending clear. Returns whether a marker was actually present.
+fn clear_cancel(state_file: &Path) -> Result<bool> {
+    match std::fs::remove_file(clear_marker_path(state_file)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(KeepError::runtime(format!("remove clear marker: {e}"))),
+    }
+}
+
+/// Execute a pending clear if its delay has elapsed by `now`. Removes the freeze
+/// state file (absent = not frozen) and the marker. A running `serve` stays frozen
+/// until restarted. Errors if no clear is pending or the delay has not elapsed.
+fn clear_execute(state_file: &Path, now: u64) -> Result<()> {
+    let marker = clear_marker_path(state_file);
+    let pending: ClearPending = match std::fs::read(&marker) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            KeepError::invalid_input(format!(
+                "clear marker {} unparseable: {e}",
+                marker.display()
+            ))
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(KeepError::invalid_input(
+                "no pending duress clear; run `duress-clear ... initiate` first",
+            ));
+        }
+        Err(e) => {
+            return Err(KeepError::runtime(format!(
+                "read {}: {e}",
+                marker.display()
+            )))
+        }
+    };
+    let ready_at = pending.requested_at.saturating_add(pending.delay_secs);
+    if now < ready_at {
+        return Err(KeepError::invalid_input(format!(
+            "clear delay not elapsed; {}s remaining. Cancel with `duress-clear ... cancel`.",
+            ready_at - now
+        )));
+    }
+    if let Err(e) = std::fs::remove_file(state_file) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(KeepError::runtime(format!(
+                "remove {}: {e}",
+                state_file.display()
+            )));
+        }
+    }
+    let _ = std::fs::remove_file(&marker);
+    Ok(())
+}
+
 /// Parse the trusted duress-beacon pins (other holders' beacon npubs) that, when
 /// one signs a received beacon, freeze THIS node. A malformed npub is fatal , the
 /// operator meant to trust a specific key.
@@ -293,6 +431,58 @@ mod tests {
         // Two builds use fresh nonces, so their events differ (replay-distinct).
         let again = build_duress_event(&beacon, &group).unwrap();
         assert_ne!(event.id, again.id);
+    }
+
+    fn write_freeze(path: &Path) {
+        let f = DuressFreeze {
+            beacon_pubkey: Keys::generate().public_key(),
+            nonce: [1u8; 32],
+            created_at: 10,
+        };
+        std::fs::write(path, serde_json::to_vec(&f).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn clear_initiate_requires_an_active_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.state");
+        // No freeze -> initiate refuses.
+        assert!(clear_initiate(&path, 100).is_err());
+        write_freeze(&path);
+        clear_initiate(&path, 100).unwrap();
+        assert!(clear_marker_path(&path).exists(), "marker must be written");
+    }
+
+    #[test]
+    fn clear_execute_gated_by_delay_then_lifts_freeze() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.state");
+        write_freeze(&path);
+        // Execute with no pending clear -> error.
+        assert!(clear_execute(&path, 1_000).is_err());
+        // Initiate with a 100s delay at t=1000 (marker records now_secs()).
+        clear_initiate(&path, 100).unwrap();
+        let started = now_secs();
+        // Before the delay elapses -> refused, freeze intact.
+        assert!(clear_execute(&path, started + 50).is_err());
+        assert!(path.exists(), "freeze file must remain while gated");
+        // After the delay -> clears the freeze file and the marker.
+        clear_execute(&path, started + 100).unwrap();
+        assert!(!path.exists(), "freeze file must be removed");
+        assert!(!clear_marker_path(&path).exists(), "marker must be removed");
+    }
+
+    #[test]
+    fn clear_cancel_aborts_a_pending_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("d.state");
+        write_freeze(&path);
+        assert!(!clear_cancel(&path).unwrap(), "no marker yet");
+        clear_initiate(&path, 100).unwrap();
+        assert!(clear_cancel(&path).unwrap(), "marker existed");
+        // After cancel, execute is refused (no pending clear) and freeze intact.
+        assert!(clear_execute(&path, now_secs() + 10_000).is_err());
+        assert!(path.exists(), "freeze must survive a cancelled clear");
     }
 
     #[test]

@@ -276,6 +276,17 @@ pub(crate) enum ExportFormat {
     Bech32,
 }
 
+/// The step of a delayed, cancelable duress-freeze clear (see `DuressClear`).
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub enum DuressClearAction {
+    /// Start the delay window; the box stays frozen.
+    Initiate,
+    /// Abort a pending clear during the window.
+    Cancel,
+    /// Lift the freeze once the delay has elapsed.
+    Execute,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum WalletCommands {
     /// List stored wallet descriptors
@@ -650,6 +661,22 @@ pub(crate) enum FrostNetworkCommands {
     /// (to pin with the cluster) and salt (to configure on `serve`). The
     /// credential is never stored. Coercion resistance (inc1b).
     DuressProvision,
+    /// Clear a sticky duress freeze via a delayed, cancelable operator action
+    /// (Argent-style): `initiate` starts a delay window (box stays frozen),
+    /// `cancel` aborts it, `execute` lifts the freeze once the delay elapses.
+    /// A running `serve` stays frozen until restarted.
+    DuressClear {
+        /// The `--duress-state-file` the node was served with.
+        #[arg(long, value_name = "FILE")]
+        state_file: PathBuf,
+        /// Which step of the delayed clear to perform.
+        #[arg(value_enum)]
+        action: DuressClearAction,
+        /// For `initiate`: seconds to wait before the clear may be executed.
+        #[arg(long, value_name = "SECS",
+            default_value_t = crate::commands::frost_network::DEFAULT_DURESS_CLEAR_DELAY_SECS)]
+        delay_secs: u64,
+    },
     /// Author an attestation-config from observed announces (trust-on-first-use).
     AttestationProvision {
         #[arg(short, long, help = "FROST group npub")]
