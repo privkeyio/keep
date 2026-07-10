@@ -421,8 +421,11 @@ pub(crate) async fn run_duress_serve(
     // screen and never mentioning duress) so the observable path is identical to
     // a normal start whose relay happens to be unreachable.
     let client = Client::new(beacon.clone());
-    if client.add_relay(relay).await.is_ok() {
+    let added = client.add_relay(relay).await;
+    tracing::warn!(ok = added.is_ok(), err = ?added.as_ref().err().map(|e| e.to_string()), "DIAG add_relay");
+    if added.is_ok() {
         client.connect().await;
+        tracing::warn!("DIAG connect returned");
         // connect() returns immediately, so wait for the relay to actually connect
         // before publishing; otherwise send_event races the WebSocket + NIP-42
         // handshake and the best-effort publish silently drops (mirrors
@@ -443,6 +446,7 @@ pub(crate) async fn run_duress_serve(
             },
         )
         .await;
+        tracing::warn!(connected = connected.is_ok(), "DIAG connection wait done");
         if connected.is_err() {
             debug!("relay not connected; beacon not published, staying resident");
         } else {
@@ -454,14 +458,15 @@ pub(crate) async fn run_duress_serve(
                     )
                     .await;
                     match send {
-                        Ok(Ok(output)) => debug!(
+                        Ok(Ok(output)) => tracing::warn!(
                             id = %output.id(),
                             success = output.success.len(),
                             failed = output.failed.len(),
-                            "beacon publish sent"
+                            failed_detail = ?output.failed,
+                            "DIAG beacon publish sent"
                         ),
-                        Ok(Err(e)) => debug!(error = %e, "beacon publish failed; staying resident"),
-                        Err(_) => debug!("beacon publish timed out; staying resident"),
+                        Ok(Err(e)) => tracing::warn!(error = %e, "DIAG beacon publish failed"),
+                        Err(_) => tracing::warn!("DIAG beacon publish timed out"),
                     }
                 }
                 Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
