@@ -1477,6 +1477,18 @@ impl KfpNode {
             Some(pins) if !pins.is_empty() => pins,
             _ => return Ok(()),
         };
+        // Cheap size cap BEFORE the expensive unwrap. Our transport pubkey is
+        // deterministically derivable from the public group data, so anyone with the
+        // group npub can address `kind:1059` floods at us; each would otherwise force
+        // a full ECDH + NIP-44 decrypt + two Schnorr verifies in `extract_rumor` on
+        // the serial notification loop. A real beacon wraps a tiny rumor, so it is far
+        // under this bound; an oversized payload is rejected here for the cost of a
+        // length check. (Full unauthenticated-flood rate limiting is tracked
+        // separately: naive dropping could starve a legitimate beacon.)
+        const MAX_GIFT_WRAP_CONTENT: usize = MAX_MESSAGE_SIZE;
+        if event.content.len() > MAX_GIFT_WRAP_CONTENT {
+            return Ok(());
+        }
         // Unwrap with our keys (the wrap is addressed to us). `extract_rumor`
         // decrypts the gift wrap + seal and verifies both signatures, returning the
         // seal author (`sender`) and the inner rumor.

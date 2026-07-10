@@ -117,6 +117,15 @@ pub fn cmd_frost_network_serve(
                     "--group-total is required with --duress-beacon-pubkey/--duress-beacon-salt",
                 )
             })?;
+            // A zero total derives no recipients, so the beacon would broadcast to
+            // nobody , the coerced holder would look resident but silently alert no
+            // one (fail-open). Reject it here, before the prompt, with the rest of
+            // the fail-closed config checks.
+            if total == 0 {
+                return Err(KeepError::invalid_input(
+                    "--group-total must be at least 1 (the group's share count)",
+                ));
+            }
             let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
             Some((pubkey, salt, total))
         }

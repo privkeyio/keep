@@ -422,7 +422,15 @@ pub(crate) async fn run_duress_serve(
     // Best-effort alert. Any failure is swallowed (logged only at debug, never on
     // screen and never mentioning duress) so the observable path is identical to
     // a normal start whose relay happens to be unreachable.
-    let client = Client::new(beacon.clone());
+    //
+    // The transport client is signed by an EPHEMERAL key, NOT the beacon key: the
+    // relay auto-authenticates (NIP-42), so a beacon-keyed client would sign the
+    // AUTH with the stable, cluster-pinned beacon pubkey , handing a relay-level
+    // adversary exactly the fixed author the gift-wrap redesign removed (it could
+    // then correlate or silently drop the duress broadcast by that pubkey). The
+    // wraps authenticate via their own seal, not the client key, so a throwaway
+    // AUTH identity loses nothing.
+    let client = Client::new(Keys::generate());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
         // Broadcast the beacon (one NIP-59 gift wrap per group member) and
@@ -479,10 +487,13 @@ pub(crate) async fn run_duress_serve(
 }
 
 /// Build a fresh-nonce gift-wrapped beacon for every group member and publish each
-/// to `client`. Returns whether EVERY wrap was accepted by the relay (relay in
-/// `output.success`) , i.e. the relay is authenticated and delivering , so the
-/// caller can retry fast until the first fully-accepted broadcast. Never errors on
-/// a send failure (best-effort); only a build/entropy failure is an `Err`.
+/// to `client`. Returns whether AT LEAST ONE wrap was accepted by the relay (relay
+/// in `output.success`) , which proves NIP-42 auth completed and the relay is
+/// delivering, so the caller can stop fast-retrying. Keying the relax on "any
+/// accepted" (not "all") avoids spinning at the fast cadence forever , amplifying
+/// the relay-observable duress signature , when one specific recipient's wrap is
+/// persistently rejected (relay size/rate limit) while the rest deliver. Never
+/// errors on a send failure (best-effort); only a build/entropy failure is an `Err`.
 async fn broadcast_beacon(
     client: &Client,
     beacon: &Keys,
@@ -501,24 +512,25 @@ async fn broadcast_beacon(
     if wraps.is_empty() {
         return Ok(false);
     }
-    let mut all_ok = true;
+    let mut any_ok = false;
     for wrap in &wraps {
         let sent = tokio::time::timeout(
             std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
             client.send_event(wrap),
         )
         .await;
-        match sent {
-            Ok(Ok(output)) if !output.success.is_empty() => {}
-            _ => all_ok = false,
+        if let Ok(Ok(output)) = sent {
+            if !output.success.is_empty() {
+                any_ok = true;
+            }
         }
     }
     debug!(
         wraps = wraps.len(),
-        accepted = all_ok,
+        any_accepted = any_ok,
         "duress beacon broadcast"
     );
-    Ok(all_ok)
+    Ok(any_ok)
 }
 
 #[cfg(test)]
