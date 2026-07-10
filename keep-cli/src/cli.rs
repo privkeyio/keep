@@ -664,7 +664,10 @@ pub(crate) enum FrostNetworkCommands {
     /// Clear a sticky duress freeze via a delayed, cancelable operator action
     /// (Argent-style): `initiate` starts a delay window (box stays frozen),
     /// `cancel` aborts it, `execute` lifts the freeze once the delay elapses.
-    /// A running `serve` stays frozen until restarted.
+    /// A running `serve` stays frozen until restarted. The delay defends only the
+    /// CLI-confined coercion case; the real boundary is filesystem permissions,
+    /// the state directory MUST be root-owned and not operator-writable, since a
+    /// party with directory write can delete the freeze file directly.
     DuressClear {
         /// The `--duress-state-file` the node was served with.
         #[arg(long, value_name = "FILE")]
