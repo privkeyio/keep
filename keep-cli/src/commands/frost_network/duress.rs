@@ -428,67 +428,59 @@ pub(crate) async fn run_duress_serve(
     let client = Client::new(beacon.clone());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
-        // connect() returns immediately, so wait for the relay to actually connect
-        // before publishing; otherwise send_event races the WebSocket + NIP-42
-        // handshake and the best-effort publish silently drops (mirrors
-        // KfpNode::new). Stay resident on timeout , the box is already fail-closed.
-        let connected = tokio::time::timeout(
-            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
-            async {
-                loop {
-                    let relays = client.relays().await;
-                    if relays
-                        .values()
-                        .any(|r| matches!(r.status(), RelayStatus::Connected))
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            },
-        )
-        .await;
-        if connected.is_err() {
-            debug!("relay not connected; beacon not published, staying resident");
-        } else {
-            // Re-broadcast the beacon on an interval (fresh nonce each time), not
-            // once: a one-shot alert would miss any holder that is briefly offline,
-            // reconnecting, or slow to subscribe when it fires. Holders freeze on
-            // the first one they verify and short-circuit the rest, so the repeat
-            // is idempotent for them. This loop also keeps the process resident so
-            // the holder looks online but answers no evaluations (fail-closed).
-            //
-            // The first send may still race the relay's NIP-42 auth (the wait above
-            // is for `Connected`, not `Authenticated`); the interval retry covers a
-            // rejected first publish. RELEASE GATE: the fixed re-broadcast cadence
-            // is itself a relay-observable duress signature (distinct from the wire
-            // FORMAT gate); traffic-shape indistinguishability is part of that gate.
-            loop {
-                match build_duress_event(beacon, group_pubkey) {
-                    Ok(event) => {
-                        let send = tokio::time::timeout(
-                            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
-                            client.send_event(&event),
-                        )
-                        .await;
-                        match send {
-                            Ok(Ok(output)) => debug!(
-                                id = %output.id(),
-                                success = output.success.len(),
-                                failed = output.failed.len(),
-                                "beacon published"
-                            ),
-                            Ok(Err(e)) => debug!(error = %e, "beacon publish failed"),
-                            Err(_) => debug!("beacon publish timed out"),
-                        }
-                    }
-                    Err(e) => debug!(error = %e, "beacon build failed"),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    BEACON_REPUBLISH_INTERVAL_SECS,
-                ))
-                .await;
+        // Re-broadcast the beacon on an interval (fresh nonce each time), not once:
+        // a one-shot alert would miss any holder that is briefly offline,
+        // reconnecting, or slow to subscribe when it fires. Holders freeze on the
+        // first one they verify and short-circuit the rest, so the repeat is
+        // idempotent for them. This loop also keeps the process resident so the
+        // holder looks online but answers no evaluations (fail-closed).
+        //
+        // connect() returns immediately, so we RE-CHECK the connection each pass
+        // rather than gating on a single fixed window: on a slow or contended host
+        // the WebSocket + NIP-42 handshake can take longer than any one timeout,
+        // and a one-shot give-up would leave the box resident but silent (no holder
+        // ever freezes , a coerced holder on a slow box would fail to alert). We
+        // only build+send once a relay is Connected; otherwise poll briefly and
+        // retry, which also recovers if the connection later drops. The send itself
+        // may still race NIP-42 auth (Connected != Authenticated); the interval
+        // retry covers a rejected first publish. RELEASE GATE: the fixed cadence is
+        // itself a relay-observable duress signature (distinct from the wire FORMAT
+        // gate); traffic-shape indistinguishability is part of that gate.
+        loop {
+            let connected = client
+                .relays()
+                .await
+                .values()
+                .any(|r| matches!(r.status(), RelayStatus::Connected));
+            if !connected {
+                // Not connected yet (or dropped); check again shortly.
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+            match build_duress_event(beacon, group_pubkey) {
+                Ok(event) => {
+                    let send = tokio::time::timeout(
+                        std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+                        client.send_event(&event),
+                    )
+                    .await;
+                    match send {
+                        Ok(Ok(output)) => debug!(
+                            id = %output.id(),
+                            success = output.success.len(),
+                            failed = output.failed.len(),
+                            "beacon published"
+                        ),
+                        Ok(Err(e)) => debug!(error = %e, "beacon publish failed"),
+                        Err(_) => debug!("beacon publish timed out"),
+                    }
+                }
+                Err(e) => debug!(error = %e, "beacon build failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(
+                BEACON_REPUBLISH_INTERVAL_SECS,
+            ))
+            .await;
         }
     }
 
