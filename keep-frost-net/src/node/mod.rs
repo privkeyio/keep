@@ -1461,11 +1461,16 @@ impl KfpNode {
     /// stale) or is a replay, is a no-op , receipt alone grants no trust.
     /// In-memory only (inc2a); sticky persistence + operator clear are
     /// inc2b/inc2c.
-    fn handle_duress_beacon(&self, event: &Event) -> Result<()> {
-        // Already frozen: nothing more to do. Short-circuits BEFORE the signature
-        // verify, so a flood of beacon-key events (including the sender's own
-        // periodic re-broadcasts) cannot force repeated Schnorr checks once the
-        // holder is frozen. The freeze itself is the dedup.
+    /// Handle a received NIP-59 gift wrap (`kind:1059`): unwrap it with our node
+    /// keys and, if it carries a duress beacon sealed by a PINNED beacon pubkey,
+    /// freeze. Gift wraps that are not for us, not decryptable, or not a duress
+    /// beacon are ignored. This is the metadata-private beacon receive path: the
+    /// beacon has no fixed author or label on the wire, so we cannot filter for it
+    /// by author , every gift wrap to us is unwrapped and re-verified here.
+    async fn handle_gift_wrap(&self, event: &Event) -> Result<()> {
+        // Already frozen: nothing more to do. Short-circuits BEFORE the unwrap so a
+        // flood of gift wraps (including the sender's own re-broadcasts) cannot
+        // force repeated nip44 decrypts once frozen. The freeze itself is the dedup.
         if self.is_duress_frozen() {
             return Ok(());
         }
@@ -1473,9 +1478,17 @@ impl KfpNode {
             Some(pins) if !pins.is_empty() => pins,
             _ => return Ok(()),
         };
+        // Unwrap with our keys (the wrap is addressed to us). `extract_rumor`
+        // decrypts the gift wrap + seal and verifies both signatures, returning the
+        // seal author (`sender`) and the inner rumor.
+        let unwrapped = match nostr_sdk::nips::nip59::extract_rumor(&self.keys, event).await {
+            Ok(u) => u,
+            Err(_) => return Ok(()),
+        };
         let verified = pins.iter().find_map(|pin| {
-            crate::event::verify_duress_beacon(
-                event,
+            crate::event::verify_unwrapped_duress_beacon(
+                &unwrapped.sender,
+                &unwrapped.rumor,
                 pin,
                 &self.group_pubkey,
                 self.replay_window_secs,
@@ -2074,23 +2087,24 @@ impl KfpNode {
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
 
-        // Coercion resistance: a duress beacon is authored by a dedicated beacon
-        // key, NOT a group member, so the author-scoped filters above never
-        // deliver it. Subscribe to the pinned beacon pubkey(s) as well, still
-        // scoped to this group's `g` tag so it stays bounded and group-specific.
-        // `handle_duress_beacon` re-verifies every event, so this subscription
-        // grants no trust; without a pin there is nothing to receive.
-        if let Some(pins) = self.duress_beacon_pins.as_ref().filter(|p| !p.is_empty()) {
-            let duress_filter = Filter::new()
-                .kind(Kind::Custom(KFP_EVENT_KIND))
-                .authors(pins.clone())
-                .custom_tag(
-                    SingleLetterTag::lowercase(Alphabet::G),
-                    hex::encode(self.group_pubkey),
-                )
-                .since(since);
+        // Coercion resistance: a duress beacon arrives as a NIP-59 gift wrap
+        // authored by an EPHEMERAL key (not a fixed beacon key or group member), so
+        // it cannot be filtered by author. Subscribe to gift wraps addressed to us
+        // (`kind:1059`, `#p` = our pubkey), which look like ordinary private DMs on
+        // the wire; `handle_gift_wrap` unwraps + re-verifies each against the pinned
+        // beacon key, so this grants no trust. Only when a pin is configured (else
+        // nothing would be actioned). Gift wraps use randomized past timestamps, so
+        // no `.since()` , that would drop legitimately back-dated wraps.
+        if self
+            .duress_beacon_pins
+            .as_ref()
+            .is_some_and(|p| !p.is_empty())
+        {
+            let giftwrap_filter = Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(self.keys.public_key());
             self.client
-                .subscribe(duress_filter, None)
+                .subscribe(giftwrap_filter, None)
                 .await
                 .map_err(|e| FrostNetError::Transport(e.to_string()))?;
         }
@@ -2257,6 +2271,14 @@ impl KfpNode {
             return Ok(());
         }
 
+        // A duress beacon arrives metadata-privately as a NIP-59 gift wrap
+        // (kind:1059) authored by an ephemeral key, not as a KFP event, so it is
+        // routed here before the KFP parse. `handle_gift_wrap` unwraps + re-verifies
+        // it against the pinned beacon key.
+        if event.kind == Kind::GiftWrap {
+            return self.handle_gift_wrap(event).await;
+        }
+
         let msg_type = KfpEventBuilder::get_message_type(event);
         debug!(msg_type = ?msg_type, from = %event.pubkey, "Received event");
 
@@ -2274,11 +2296,10 @@ impl KfpNode {
         // (defense in depth), matching `EcdhShare` / `SignatureShare` / `OprfEvalShare` /
         // `DescriptorAck`. Do NOT add `OprfEnrollAck` here: that would exempt it from the gate.
         //
-        // `DuressBeacon` MUST be exempt: a duress beacon is signed by a dedicated duress-beacon
-        // key that never unlocks the vault and is by construction NOT a cluster peer, so the
-        // trusted-peer check would drop every authentic beacon before it reaches its arm. Its
-        // authenticity comes from `verify_duress_beacon` against the pinned beacon pubkey instead,
-        // which the arm (inc2) MUST call before acting -- the exemption grants NO trust on its own.
+        // A duress beacon no longer arrives as a top-level KFP event , it is a NIP-59
+        // gift wrap handled by `handle_gift_wrap` above , so `DuressBeacon` is NOT
+        // exempt here: a plaintext top-level `DuressBeacon` (legacy/spoofed) is
+        // rejected by the trusted-peer gate like any other non-request message.
         if !matches!(
             msg,
             KfpMessage::Announce(_)
@@ -2286,7 +2307,6 @@ impl KfpNode {
                 | KfpMessage::EcdhRequest(_)
                 | KfpMessage::OprfEvalRequest(_)
                 | KfpMessage::OprfEnroll(_)
-                | KfpMessage::DuressBeacon(_)
         ) && !self.peers.read().is_trusted_peer(&event.pubkey)
         {
             debug!(from = %event.pubkey, "Rejecting message from untrusted peer");
@@ -2383,12 +2403,10 @@ impl KfpNode {
                 self.handle_xpub_announce(event.pubkey, payload).await?;
             }
             KfpMessage::DuressBeacon(_) => {
-                // Reaches here WITHOUT the trusted-peer gate (the beacon key is not
-                // a peer; see the exemption above). `handle_duress_beacon`
-                // self-gates via `verify_duress_beacon` against this holder's
-                // PINNED beacon pubkey , reaching this arm grants no trust on its
-                // own , then fail-closed freezes OPRF evaluations.
-                self.handle_duress_beacon(event)?;
+                // A real duress beacon arrives as a NIP-59 gift wrap (handled in
+                // `handle_gift_wrap`), never as a top-level KFP event. A plaintext
+                // top-level one is legacy/spoofed and only reaches here from a
+                // trusted peer (the gate above); ignore it , beacons must be wrapped.
             }
             KfpMessage::PsbtPropose(payload) => {
                 self.handle_psbt_propose(event.pubkey, payload).await?;

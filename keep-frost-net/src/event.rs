@@ -62,26 +62,29 @@ impl KfpEventBuilder {
     /// dedicated duress-beacon `keys` (NOT the vault-derived identity, which
     /// duress mode never unlocks). `nonce` must be freshly random. The cluster
     /// authenticates it against the pinned beacon pubkey (see
-    /// [`verify_duress_beacon`]), so no proof-of-share is needed or possible.
+    /// [`verify_unwrapped_duress_beacon`]), so no proof-of-share is needed.
     ///
-    /// RELEASE GATE: this wire form is self-labeling (`t=duress_beacon` tag,
-    /// `type=duress_beacon` content, `g` group tag), so a relay-level adversary
-    /// can filter and silently drop the beacon. That is acceptable for this inert
-    /// primitive, but this MUST NOT reach a deployed path before the inc2
-    /// indistinguishability work (identify-by-pinned-pubkey, encrypted look-alike
-    /// content, constant cadence) lands.
-    pub fn duress_beacon(keys: &Keys, group_pubkey: &[u8; 32], nonce: &[u8; 32]) -> Result<Event> {
+    /// Metadata-private wire form (NIP-59 gift wrap): the `DuressBeaconPayload` is
+    /// placed in an unsigned rumor authored by the beacon key, sealed by the beacon
+    /// key (authenticity), then gift-wrapped to `recipient` (a group member's
+    /// transport pubkey) with an EPHEMERAL key and a randomized timestamp. To a
+    /// relay it is an ordinary `kind:1059` gift wrap , indistinguishable from a
+    /// private DM, with no duress label, group, nonce, or beacon-key identity
+    /// visible on the wire, and no fixed author to filter on. Broadcast is one wrap
+    /// per group member (the caller wraps to each). Freshness is enforced on the
+    /// payload's own `created_at`, independent of the wrap's tweaked timestamp.
+    pub async fn duress_beacon(
+        beacon_keys: &Keys,
+        group_pubkey: &[u8; 32],
+        nonce: &[u8; 32],
+        recipient: &PublicKey,
+    ) -> Result<Event> {
         let payload = DuressBeaconPayload::new(*group_pubkey, *nonce);
         let content = KfpMessage::DuressBeacon(payload).to_json()?;
-
-        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
-            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
-            .tag(Tag::custom(
-                TagKind::custom("g"),
-                [hex::encode(group_pubkey)],
-            ))
-            .tag(Tag::custom(TagKind::custom("t"), ["duress_beacon"]))
-            .sign_with_keys(keys)
+        let rumor =
+            EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content).build(beacon_keys.public_key());
+        EventBuilder::gift_wrap(beacon_keys, recipient, rumor, [])
+            .await
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
@@ -589,30 +592,32 @@ impl KfpEventBuilder {
 /// the Nostr signature, the decoded group, and `created_at` freshness. Nonce
 /// replay dedup is the caller's job (track seen nonces within the window); this
 /// only bounds the window.
-pub fn verify_duress_beacon(
-    event: &Event,
+/// Verify a duress beacon UNWRAPPED from a NIP-59 gift wrap (via
+/// [`nostr_sdk::nips::nip59::extract_rumor`], which already decrypts and verifies
+/// the gift-wrap + seal signatures). `sender` is the seal author; `rumor` the
+/// inner payload event. Checks the seal author is the pinned beacon pubkey, the
+/// rumor is a `DuressBeacon` for `group_pubkey`, and it is fresh. Replay dedup is
+/// the caller's job; this only bounds the window.
+pub fn verify_unwrapped_duress_beacon(
+    sender: &PublicKey,
+    rumor: &UnsignedEvent,
     expected_beacon_pubkey: &PublicKey,
     group_pubkey: &[u8; 32],
     window_secs: u64,
 ) -> Result<DuressBeaconPayload> {
-    if event.kind != Kind::Custom(KFP_EVENT_KIND) {
-        return Err(FrostNetError::Protocol("not a KFP event".into()));
-    }
-    if &event.pubkey != expected_beacon_pubkey {
+    if sender != expected_beacon_pubkey {
         return Err(FrostNetError::UntrustedPeer(
-            "duress beacon not signed by the pinned beacon key".into(),
+            "duress beacon not sealed by the pinned beacon key".into(),
         ));
     }
-    if event.verify().is_err() {
-        return Err(FrostNetError::UntrustedPeer(
-            "duress beacon signature invalid".into(),
-        ));
+    if rumor.kind != Kind::Custom(KFP_EVENT_KIND) {
+        return Err(FrostNetError::Protocol("not a KFP rumor".into()));
     }
-    let payload = match KfpMessage::from_json(&event.content)? {
+    let payload = match KfpMessage::from_json(&rumor.content)? {
         KfpMessage::DuressBeacon(p) => p,
         _ => {
             return Err(FrostNetError::Protocol(
-                "event is not a duress beacon".into(),
+                "rumor is not a duress beacon".into(),
             ))
         }
     };
