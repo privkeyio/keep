@@ -634,7 +634,9 @@ pub(crate) enum FrostNetworkCommands {
         /// reboot. On a freeze the state is written here; at startup an existing
         /// file re-freezes the node before it serves, so a restart cannot silently
         /// resume answering. Only an out-of-band operator clear (removing/clearing
-        /// this file) lifts the freeze.
+        /// this file) lifts the freeze. MUST be passed on every start: omitting it
+        /// on a later start resumes un-frozen. Place it in a root-owned,
+        /// non-writable directory so a non-owner cannot delete the marker.
         #[arg(long, value_name = "FILE")]
         duress_state_file: Option<PathBuf>,
     },

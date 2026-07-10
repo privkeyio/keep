@@ -113,8 +113,19 @@ pub fn cmd_frost_network_serve(
     // Trusted beacon pins + any persisted sticky freeze, resolved up front so a
     // bad pin or a corrupt state file fails the node before it prompts or serves.
     let duress_pins = duress::parse_beacon_pins(duress_beacon_pins)?;
+    if !duress_pins.is_empty() && duress_state_file.is_none() {
+        out.warn(
+            "--duress-beacon-pin set without --duress-state-file: a duress freeze will NOT survive \
+             a restart (non-durable). Set --duress-state-file to make it sticky.",
+        );
+    }
+    // Probe the state path up front (fail closed if a freeze could not be
+    // persisted) before reading any freeze it already holds.
     let persisted_freeze = match duress_state_file {
-        Some(p) => duress::read_persisted_freeze(p)?,
+        Some(p) => {
+            probe_duress_state(out, p)?;
+            duress::read_persisted_freeze(p)?
+        }
         None => None,
     };
 
@@ -221,13 +232,11 @@ pub fn cmd_frost_network_serve(
         }
         if let Some(state_path) = duress_state_path.clone() {
             node.set_duress_persister(Arc::new(move |freeze| {
-                match serde_json::to_vec(freeze) {
-                    Ok(bytes) => {
-                        if let Err(e) = write_secret_file(&state_path, &bytes) {
-                            error!(error = %e, path = %state_path.display(), "failed to persist duress freeze");
-                        }
-                    }
-                    Err(e) => error!(error = %e, "failed to serialize duress freeze"),
+                // Synchronous fsync so the freeze is durable BEFORE the alert
+                // broadcasts; the in-memory freeze is already set, so on failure
+                // the box stays frozen this run and only loses durability (logged).
+                if let Err(e) = persist_freeze(&state_path, freeze) {
+                    error!(error = %e, path = %state_path.display(), "failed to persist duress freeze");
                 }
             }));
         }
@@ -1251,6 +1260,59 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Serialize and durably write a duress freeze to `path` (atomic temp + fsync +
+/// rename via [`write_secret_file`]). Split out so the persist round-trip and its
+/// error path are unit-testable.
+fn persist_freeze(path: &Path, freeze: &keep_frost_net::DuressFreeze) -> Result<()> {
+    let bytes = serde_json::to_vec(freeze)
+        .map_err(|e| KeepError::Runtime(format!("serialize duress freeze: {e}")))?;
+    write_secret_file(path, &bytes)
+}
+
+/// Validate a `--duress-state-file` at startup so a misconfigured path fails the
+/// node UP FRONT rather than silently at freeze time (when durability matters
+/// most). Writes, fsyncs, and removes a probe sibling to confirm the path is
+/// writable; a failure is fatal. Also WARNS if the containing directory is group/
+/// world-writable without the sticky bit, since removing a file needs only
+/// directory write, so a non-owner could `unlink` the freeze marker and silently
+/// unfreeze on the next boot. The appliance MUST place this in a root-owned,
+/// non-writable directory.
+fn probe_duress_state(out: &Output, path: &Path) -> Result<()> {
+    let mut probe = path.as_os_str().to_owned();
+    probe.push(".probe");
+    let probe = std::path::PathBuf::from(probe);
+    write_secret_file(&probe, b"probe").map_err(|e| {
+        KeepError::invalid_input(format!(
+            "--duress-state-file {} is not writable ({e}); refusing to start because a duress \
+             freeze could not be made durable",
+            path.display()
+        ))
+    })?;
+    let _ = std::fs::remove_file(&probe);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if let Ok(md) = std::fs::metadata(dir) {
+            let mode = md.mode();
+            // group/world write with no sticky bit lets a non-owner unlink the file.
+            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+                out.warn(&format!(
+                    "duress state directory {} is group/world-writable without the sticky bit: a \
+                     non-owner could delete the freeze marker and silently unfreeze on reboot. \
+                     Place --duress-state-file in a root-owned, non-writable directory.",
+                    dir.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reconstruct a LUKS key from a threshold-OPRF quorum and write the 32 raw key
 /// bytes to STDOUT (and nothing else), so a boot gate can pipe it to
 /// `cryptsetup open --key-file -`. All human/progress output goes to STDERR via
@@ -1605,6 +1667,33 @@ mod tests {
         assert!(!auto_approve_conflicts(true, false));
         assert!(!auto_approve_conflicts(false, true));
         assert!(!auto_approve_conflicts(false, false));
+    }
+
+    fn sample_freeze() -> keep_frost_net::DuressFreeze {
+        keep_frost_net::DuressFreeze {
+            beacon_pubkey: nostr_sdk::Keys::generate().public_key(),
+            nonce: [7u8; 32],
+            created_at: 42,
+        }
+    }
+
+    #[test]
+    fn persist_freeze_roundtrips_through_the_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duress.state");
+        let f = sample_freeze();
+        persist_freeze(&path, &f).unwrap();
+        let back = duress::read_persisted_freeze(&path).unwrap().unwrap();
+        assert_eq!(back.created_at, 42);
+        assert_eq!(back.nonce, [7u8; 32]);
+        assert_eq!(back.beacon_pubkey, f.beacon_pubkey);
+    }
+
+    #[test]
+    fn persist_freeze_errors_when_the_directory_is_unwritable() {
+        // A parent directory that does not exist cannot be written atomically.
+        let path = Path::new("/keep-nonexistent-dir-xyz-77/duress.state");
+        assert!(persist_freeze(path, &sample_freeze()).is_err());
     }
 
     #[test]
