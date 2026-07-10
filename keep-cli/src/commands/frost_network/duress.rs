@@ -10,6 +10,8 @@ use keep_core::crypto::{derive_key, Argon2Params, SALT_SIZE};
 use keep_core::error::{KeepError, Result};
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
+use subtle::ConstantTimeEq;
+use tracing::debug;
 
 use crate::commands::get_duress_credential;
 use crate::output::Output;
@@ -78,22 +80,29 @@ pub fn cmd_frost_network_duress_provision(out: &Output) -> Result<()> {
     out.newline();
     out.info(
         "Register the beacon pubkey with the cluster (like an attestation AK pin) and set both \
-         values on `serve`. Do NOT store the duress credential anywhere.",
+         values on `serve`. Treat the pinned pubkey as PROTECTED, not merely pinned: anyone who \
+         learns it can grind the credential offline. Do NOT store the duress credential anywhere.",
     );
     Ok(())
 }
 
-/// Constant-time equality of two x-only pubkeys, so duress detection does not
-/// leak (via timing) whether the entered password matched the pinned beacon key.
-/// The dominating cost is the Argon2 re-derivation (which runs for every serve
-/// regardless), so the paths are timing-indistinguishable.
+/// Constant-time equality of two x-only pubkeys (via the workspace's `subtle`,
+/// the same primitive used for CT comparisons elsewhere in the tree), so duress
+/// detection does not leak by timing whether the entered password matched the
+/// pinned beacon key.
 fn ct_pubkey_eq(a: &PublicKey, b: &PublicKey) -> bool {
-    let (a, b) = (a.to_bytes(), b.to_bytes());
-    let mut diff = 0u8;
-    for i in 0..a.len() {
-        diff |= a[i] ^ b[i];
-    }
-    diff == 0
+    a.to_bytes().ct_eq(&b.to_bytes()).into()
+}
+
+/// Spend the same KDF cost a genuine vault unlock would (the vault's own Argon2
+/// params) and discard the result, so a duress start is wall-clock-
+/// indistinguishable from a real unlock. The vault is NEVER unlocked here; this
+/// only reproduces the missing second derivation that `keep.unlock` performs on
+/// the normal path (the duress path returns before it). The derived key is held
+/// in `keep_core`'s mlocked, drop-zeroized box.
+pub(crate) fn equalize_unlock_cost(params: Argon2Params, salt: &[u8; SALT_SIZE]) -> Result<()> {
+    let _ = derive_key(b"duress-unlock-cost-equalizer", salt, params)?;
+    Ok(())
 }
 
 /// If `password` is the duress credential, return the beacon `Keys`; otherwise
@@ -129,19 +138,37 @@ pub(crate) fn parse_duress_config(
     Ok((pubkey, salt))
 }
 
+/// Build a single signed duress beacon event for `group_pubkey` with a fresh
+/// random nonce. Split from the transport so the beacon's construction is unit-
+/// testable without a live relay.
+pub(crate) fn build_duress_event(beacon: &Keys, group_pubkey: &[u8; 32]) -> Result<Event> {
+    let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+    keep_frost_net::KfpEventBuilder::duress_beacon(beacon, group_pubkey, &nonce)
+        .map_err(|e| KeepError::runtime(format!("build beacon: {e}")))
+}
+
+/// How long to wait for the best-effort beacon publish before giving up and
+/// staying resident, so a black-holed relay cannot hang the duress start.
+const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
+
 /// The duress serve path: fail CLOSED (never unlock the vault or load the OPRF
 /// share, so this holder answers no evaluations and the box drops below
-/// threshold) and publish ONE signed duress beacon, then stay resident so the
-/// holder looks online but simply never answers. Reached only when the entered
-/// password derived the pinned beacon key.
+/// threshold), best-effort publish ONE signed duress beacon, then stay resident
+/// so the holder looks online but simply never answers. Reached only when the
+/// entered password derived the pinned beacon key.
+///
+/// Beacon delivery is BEST-EFFORT and must never change observable behavior: a
+/// coercer can black-hole the network, so a failed connect/publish neither aborts
+/// nor prints anything (least of all the word "duress"). The box stays resident
+/// and fail-closed regardless , the vault is already never unlocked.
 ///
 /// The screen mirrors a normal serve start using data knowable without the vault
 /// (group, relay). The `Share`/`Threshold`/`Attestation` lines a normal serve
-/// derives from the unlocked share are the DOCUMENTED residual: full byte-level
-/// output and on-wire indistinguishability is a follow-up (deep-research open
-/// question, tracked with the inc2 wire-format release gate). The load-bearing
-/// coercion property is that the box stays locked , this fail-closed path plus the
-/// inc2 sticky freeze , invariant to which password was entered.
+/// derives from the unlocked share, and full on-wire indistinguishability of the
+/// beacon, are the DOCUMENTED residuals (tracked with the inc2 wire-format
+/// release gate). The load-bearing coercion property is that the box stays locked
+/// , this fail-closed path plus the inc2 sticky freeze , invariant to which
+/// password was entered.
 pub(crate) async fn run_duress_serve(
     out: &Output,
     beacon: &Keys,
@@ -154,23 +181,28 @@ pub(crate) async fn run_duress_serve(
     out.field("Group", &group_npub);
     out.field("Relay", relay);
     out.newline();
-
-    let client = Client::new(beacon.clone());
-    client
-        .add_relay(relay)
-        .await
-        .map_err(|e| KeepError::runtime(format!("add relay: {e}")))?;
-    client.connect().await;
-
-    let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
-    let event = keep_frost_net::KfpEventBuilder::duress_beacon(beacon, group_pubkey, &nonce)
-        .map_err(|e| KeepError::runtime(format!("build duress beacon: {e}")))?;
-    client
-        .send_event(&event)
-        .await
-        .map_err(|e| KeepError::runtime(format!("publish duress beacon: {e}")))?;
-
     out.info("Starting FROST coordination node...");
+
+    // Best-effort alert. Any failure is swallowed (logged only at debug, never on
+    // screen and never mentioning duress) so the observable path is identical to
+    // a normal start whose relay happens to be unreachable.
+    let client = Client::new(beacon.clone());
+    if client.add_relay(relay).await.is_ok() {
+        client.connect().await;
+        match build_duress_event(beacon, group_pubkey) {
+            Ok(event) => {
+                let send = tokio::time::timeout(
+                    std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+                    client.send_event(&event),
+                )
+                .await;
+                if let Ok(Err(e)) = send {
+                    debug!(error = %e, "beacon publish failed; staying resident");
+                }
+            }
+            Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
+        }
+    }
 
     // Stay resident so the holder appears online but answers no evaluation
     // requests (fail-closed). Nothing here is duress-specific on screen.
@@ -208,6 +240,20 @@ mod tests {
         let c = derive_beacon_key("y", &salt, P).unwrap().public_key();
         assert!(ct_pubkey_eq(&a, &b));
         assert!(!ct_pubkey_eq(&a, &c));
+    }
+
+    #[test]
+    fn build_duress_event_produces_a_verifiable_beacon() {
+        let salt = [1u8; SALT_SIZE];
+        let beacon = derive_beacon_key("the-duress-word", &salt, P).unwrap();
+        let group = [42u8; 32];
+        let event = build_duress_event(&beacon, &group).unwrap();
+        // The beacon verifies against the beacon pubkey and the expected group.
+        keep_frost_net::verify_duress_beacon(&event, &beacon.public_key(), &group, 3600)
+            .expect("freshly built beacon must verify");
+        // Two builds use fresh nonces, so their events differ (replay-distinct).
+        let again = build_duress_event(&beacon, &group).unwrap();
+        assert_ne!(event.id, again.id);
     }
 
     #[test]

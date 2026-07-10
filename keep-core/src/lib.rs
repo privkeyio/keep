@@ -275,6 +275,12 @@ impl Keep {
         self.storage.is_unlocked()
     }
 
+    /// The vault's Argon2id parameters (from the header, readable before unlock).
+    /// Non-secret; used to reproduce an unlock's KDF cost without unlocking.
+    pub fn argon2_params(&self) -> crate::crypto::Argon2Params {
+        self.storage.argon2_params()
+    }
+
     /// Generate a new Nostr keypair and store it.
     ///
     /// # Example
