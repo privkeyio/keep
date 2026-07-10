@@ -980,14 +980,22 @@ impl std::fmt::Debug for KfpNodeEvent {
 pub(crate) type SeenDescriptorMigrates = RwLock<HashMap<([u8; 32], [u8; 32]), u64>>;
 
 /// State recorded when a verified duress beacon freezes this holder. Carries the
-/// beacon identity and nonce so a persistence layer (inc2b) can make the freeze
-/// sticky across reboot and an operator clear (inc2c) can audit what it lifted.
-#[derive(Clone, Debug)]
+/// beacon identity and nonce so a persistence layer can make the freeze sticky
+/// across reboot and an operator clear (inc2c) can audit what it lifted. Serde-
+/// serializable so `serve` can persist it to a state file and restore it on boot.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct DuressFreeze {
     pub beacon_pubkey: PublicKey,
     pub nonce: [u8; 32],
     pub created_at: u64,
 }
+
+/// Injected sink that durably records a duress freeze the moment it happens, so a
+/// restart cannot silently resume serving. Called synchronously inside the beacon
+/// handler (right after the freeze is set) rather than off the event bus, so the
+/// persist cannot be lost to broadcast lag. Must be best-effort and non-panicking;
+/// implementations log their own failures.
+pub type DuressPersister = Arc<dyn Fn(&DuressFreeze) + Send + Sync>;
 
 pub struct KfpNode {
     pub(crate) keys: Keys,
@@ -1049,6 +1057,9 @@ pub struct KfpNode {
     /// only in inc2a; sticky persistence across reboot + the operator clear are
     /// inc2b/inc2c.
     duress_freeze: RwLock<Option<DuressFreeze>>,
+    /// Optional durable sink for the freeze (see [`DuressPersister`]). `None`
+    /// means the freeze is in-memory only (lost on restart).
+    duress_persister: Option<DuressPersister>,
     /// Producer side: when set, every announce carries a fresh TPM quote bound to
     /// it. `None` means this node attaches no TPM attestation to its announces.
     announce_attestor: Option<Arc<dyn AnnounceAttestor>>,
@@ -1318,6 +1329,7 @@ impl KfpNode {
             tpm_attestation_policy: None,
             duress_beacon_pins: None,
             duress_freeze: RwLock::new(None),
+            duress_persister: None,
             announce_attestor: None,
             announce_task: std::sync::Mutex::new(None),
             seen_xpub_announces: RwLock::new(HashSet::new()),
@@ -1411,6 +1423,27 @@ impl KfpNode {
         self.duress_beacon_pins = Some(pins);
     }
 
+    /// Install a durable sink that records the freeze the moment a beacon fires,
+    /// making the freeze survive a restart. See [`DuressPersister`].
+    pub fn set_duress_persister(&mut self, persister: DuressPersister) {
+        self.duress_persister = Some(persister);
+    }
+
+    /// Restore a freeze persisted by a previous run (called at boot BEFORE
+    /// serving). Fails closed: the holder starts frozen and refuses co-signing
+    /// and OPRF evals until an out-of-band operator clear. Does NOT re-invoke the
+    /// persister (the state is already durable) and is a no-op if already frozen.
+    pub fn restore_duress_freeze(&self, freeze: DuressFreeze) {
+        let mut guard = self.duress_freeze.write();
+        if guard.is_none() {
+            warn!(
+                beacon = %freeze.beacon_pubkey,
+                "Restored persisted DURESS freeze: refusing co-signing and OPRF evaluations until operator clear"
+            );
+            *guard = Some(freeze);
+        }
+    }
+
     /// Whether this holder is currently duress-frozen (refusing OPRF evals).
     pub fn is_duress_frozen(&self) -> bool {
         self.duress_freeze.read().is_some()
@@ -1457,11 +1490,17 @@ impl KfpNode {
         // Freeze. The frozen short-circuit above makes this the first beacon we
         // act on (serial event handling, no concurrent writer), so a plain set is
         // correct; a re-broadcast is dropped by that short-circuit, not here.
-        *self.duress_freeze.write() = Some(DuressFreeze {
+        let freeze = DuressFreeze {
             beacon_pubkey,
             nonce: payload.nonce,
             created_at: payload.created_at,
-        });
+        };
+        *self.duress_freeze.write() = Some(freeze.clone());
+        // Durably record the freeze (if configured) BEFORE alerting, so a crash
+        // between freeze and alert still leaves the box frozen on the next boot.
+        if let Some(persister) = &self.duress_persister {
+            persister(&freeze);
+        }
         warn!(
             beacon = %beacon_pubkey,
             "DURESS BEACON verified: freezing co-signing and OPRF evaluations (fail-closed)"
@@ -2843,6 +2882,40 @@ mod tests {
             [1u8; 32],
             "freeze must remain the first beacon"
         );
+    }
+
+    #[tokio::test]
+    async fn duress_persister_invoked_on_freeze() {
+        let mut node = duress_test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+        let captured = Arc::new(RwLock::new(None));
+        let sink = captured.clone();
+        node.set_duress_persister(Arc::new(move |f: &DuressFreeze| {
+            *sink.write() = Some(f.clone());
+        }));
+
+        let ev = KfpEventBuilder::duress_beacon(&beacon, &group, &[4u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+
+        let got = captured.read().clone().expect("persister must be invoked");
+        assert_eq!(got.beacon_pubkey, beacon.public_key());
+        assert_eq!(got.nonce, [4u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn restore_duress_freeze_starts_frozen() {
+        let node = duress_test_node().await;
+        assert!(!node.is_duress_frozen());
+        let beacon = Keys::generate();
+        node.restore_duress_freeze(DuressFreeze {
+            beacon_pubkey: beacon.public_key(),
+            nonce: [1u8; 32],
+            created_at: 123,
+        });
+        assert!(node.is_duress_frozen(), "restore must fail closed (frozen)");
+        assert_eq!(node.duress_freeze().unwrap().created_at, 123);
     }
 
     #[tokio::test]

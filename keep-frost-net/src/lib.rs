@@ -111,10 +111,11 @@ pub use enroll_session::{
 pub use error::{FrostNetError, Result};
 pub use event::{verify_duress_beacon, KfpEventBuilder};
 pub use node::{
-    DescriptorLookupUnavailable, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent,
-    NoOpHooks, OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
-    RefuseRawAndRequireStructuredHooks, RefuseRawSignatureHooks, RequireStructuredPayloadHooks,
-    ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
+    DescriptorLookupUnavailable, DuressFreeze, DuressPersister, HealthCheckResult,
+    KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck, PeerPolicy,
+    PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawAndRequireStructuredHooks,
+    RefuseRawSignatureHooks, RequireStructuredPayloadHooks, ServeHooks, SessionInfo, SigningHooks,
+    SuccessorLookup,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
