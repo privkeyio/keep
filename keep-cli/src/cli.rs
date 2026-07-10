@@ -633,6 +633,13 @@ pub(crate) enum FrostNetworkCommands {
         /// --duress-beacon-pubkey.
         #[arg(long, value_name = "HEX", requires = "duress_beacon_pubkey")]
         duress_beacon_salt: Option<String>,
+        /// Coercion resistance: the group's total share count (e.g. 3 for a 2-of-3).
+        /// The duress beacon is gift-wrapped (NIP-59, metadata-private) to every
+        /// group member, so the emitter needs the member count up front , a coerced
+        /// holder never unlocks the vault to read it. Public group data (not a
+        /// secret); required with --duress-beacon-pubkey.
+        #[arg(long, value_name = "N", requires = "duress_beacon_pubkey")]
+        duress_group_total: Option<u16>,
         /// Coercion resistance: a group holder's duress-beacon npub to TRUST.
         /// Repeatable. Receiving a verified beacon signed by any pinned key freezes
         /// this node: it refuses co-signing and OPRF evaluations (fail-closed) until

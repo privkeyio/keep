@@ -109,7 +109,7 @@ pub use enroll_session::{
     OprfEnrollSessionState,
 };
 pub use error::{FrostNetError, Result};
-pub use event::{verify_duress_beacon, KfpEventBuilder};
+pub use event::{verify_unwrapped_duress_beacon, KfpEventBuilder};
 pub use node::{
     DescriptorLookupUnavailable, DuressFreeze, DuressPersister, HealthCheckResult,
     KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck, PeerPolicy,

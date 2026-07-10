@@ -2559,14 +2559,21 @@ async fn test_duress_frozen_holder_refuses_oprf_eval() {
         .expect("holder");
     holder.set_oprf_key_share(oprf[1]);
 
-    // Pin a beacon key and freeze the holder with a valid beacon for its group.
+    // Pin a beacon key and freeze the holder with a valid beacon for its group,
+    // gift-wrapped to the holder's own transport key (the real receive path).
     let beacon = nostr_sdk::Keys::generate();
     holder.set_duress_beacon_pins(vec![beacon.public_key()]);
-    let ev =
-        keep_frost_net::KfpEventBuilder::duress_beacon(&beacon, holder.group_pubkey(), &[5u8; 32])
-            .expect("beacon");
+    let ev = keep_frost_net::KfpEventBuilder::duress_beacon(
+        &beacon,
+        holder.group_pubkey(),
+        &[5u8; 32],
+        &holder.test_transport_pubkey(),
+    )
+    .await
+    .expect("beacon");
     holder
-        .test_handle_duress_beacon(&ev)
+        .test_handle_gift_wrap(&ev)
+        .await
         .expect("handle beacon");
     assert!(holder.is_duress_frozen(), "holder must be frozen");
 

@@ -142,15 +142,6 @@ pub(crate) fn parse_duress_config(
     Ok((pubkey, salt))
 }
 
-/// Build a single signed duress beacon event for `group_pubkey` with a fresh
-/// random nonce. Split from the transport so the beacon's construction is unit-
-/// testable without a live relay.
-pub(crate) fn build_duress_event(beacon: &Keys, group_pubkey: &[u8; 32]) -> Result<Event> {
-    let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
-    keep_frost_net::KfpEventBuilder::duress_beacon(beacon, group_pubkey, &nonce)
-        .map_err(|e| KeepError::runtime(format!("build beacon: {e}")))
-}
-
 /// How long to wait for the best-effort beacon publish before giving up and
 /// staying resident, so a black-holed relay cannot hang the duress start.
 const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
@@ -159,6 +150,11 @@ const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
 /// a fresh nonce) on this cadence so a holder that was offline, reconnecting, or
 /// slow to subscribe when the first one fired still receives one and freezes.
 const BEACON_REPUBLISH_INTERVAL_SECS: u64 = 30;
+
+/// Fast retry interval used until the FIRST fully-accepted broadcast, so the beacon
+/// delivers within seconds once the relay's NIP-42 auth completes (rather than
+/// waiting a full re-broadcast interval on the initial auth race).
+const BEACON_INITIAL_RETRY_SECS: u64 = 2;
 
 /// Default delay before a `duress-clear --initiate` may be executed: a generous
 /// window for out-of-band intervention (`--cancel`) if the clear was coerced.
@@ -412,6 +408,7 @@ pub(crate) async fn run_duress_serve(
     out: &Output,
     beacon: &Keys,
     group_pubkey: &[u8; 32],
+    total_shares: u16,
     relay: &str,
 ) -> Result<()> {
     let group_npub = keep_core::keys::bytes_to_npub(group_pubkey);
@@ -425,27 +422,33 @@ pub(crate) async fn run_duress_serve(
     // Best-effort alert. Any failure is swallowed (logged only at debug, never on
     // screen and never mentioning duress) so the observable path is identical to
     // a normal start whose relay happens to be unreachable.
-    let client = Client::new(beacon.clone());
+    //
+    // The transport client is signed by an EPHEMERAL key, NOT the beacon key: the
+    // relay auto-authenticates (NIP-42), so a beacon-keyed client would sign the
+    // AUTH with the stable, cluster-pinned beacon pubkey , handing a relay-level
+    // adversary exactly the fixed author the gift-wrap redesign removed (it could
+    // then correlate or silently drop the duress broadcast by that pubkey). The
+    // wraps authenticate via their own seal, not the client key, so a throwaway
+    // AUTH identity loses nothing.
+    let client = Client::new(Keys::generate());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
-        // Re-broadcast the beacon on an interval (fresh nonce each time), not once:
-        // a one-shot alert would miss any holder that is briefly offline,
-        // reconnecting, or slow to subscribe when it fires. Holders freeze on the
-        // first one they verify and short-circuit the rest, so the repeat is
-        // idempotent for them. This loop also keeps the process resident so the
-        // holder looks online but answers no evaluations (fail-closed).
+        // Broadcast the beacon (one NIP-59 gift wrap per group member) and
+        // re-broadcast on an interval with a fresh nonce, not once: a one-shot
+        // alert would miss any holder briefly offline, reconnecting, or slow to
+        // subscribe. Holders freeze on the first wrap they verify and short-circuit
+        // the rest, so repeats are idempotent. The loop keeps the process resident
+        // (fail-closed: never unlocks, never answers evals).
         //
-        // connect() returns immediately, so we RE-CHECK the connection each pass
-        // rather than gating on a single fixed window: on a slow or contended host
-        // the WebSocket + NIP-42 handshake can take longer than any one timeout,
-        // and a one-shot give-up would leave the box resident but silent (no holder
-        // ever freezes , a coerced holder on a slow box would fail to alert). We
-        // only build+send once a relay is Connected; otherwise poll briefly and
-        // retry, which also recovers if the connection later drops. The send itself
-        // may still race NIP-42 auth (Connected != Authenticated); the interval
-        // retry covers a rejected first publish. RELEASE GATE: the fixed cadence is
-        // itself a relay-observable duress signature (distinct from the wire FORMAT
-        // gate); traffic-shape indistinguishability is part of that gate.
+        // Delivery is `Output`-driven: connect() returns immediately and a send can
+        // race the relay's NIP-42 auth (which completes shortly after connect but
+        // isn't exposed as a status), so we RETRY FAST until a broadcast is actually
+        // ACCEPTED (the relay appears in `output.success`) , covering the auth race
+        // and any connection settling , then relax to the re-broadcast cadence. A
+        // one-shot give-up would leave a coerced holder on a slow box silent.
+        // RELEASE GATE: the re-broadcast cadence is a relay-observable duress
+        // signature; traffic-shape indistinguishability is part of the gate.
+        let mut delivered = false;
         loop {
             let connected = client
                 .relays()
@@ -453,34 +456,26 @@ pub(crate) async fn run_duress_serve(
                 .values()
                 .any(|r| matches!(r.status(), RelayStatus::Connected));
             if !connected {
-                // Not connected yet (or dropped); check again shortly.
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
-            match build_duress_event(beacon, group_pubkey) {
-                Ok(event) => {
-                    let send = tokio::time::timeout(
-                        std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
-                        client.send_event(&event),
-                    )
-                    .await;
-                    match send {
-                        Ok(Ok(output)) => debug!(
-                            id = %output.id(),
-                            success = output.success.len(),
-                            failed = output.failed.len(),
-                            "beacon published"
-                        ),
-                        Ok(Err(e)) => debug!(error = %e, "beacon publish failed"),
-                        Err(_) => debug!("beacon publish timed out"),
+            let broadcast_ok =
+                match broadcast_beacon(&client, beacon, group_pubkey, total_shares).await {
+                    Ok(ok) => ok,
+                    Err(e) => {
+                        debug!(error = %e, "beacon broadcast build failed");
+                        false
                     }
-                }
-                Err(e) => debug!(error = %e, "beacon build failed"),
+                };
+            if broadcast_ok {
+                delivered = true;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(
-                BEACON_REPUBLISH_INTERVAL_SECS,
-            ))
-            .await;
+            let interval = if delivered {
+                BEACON_REPUBLISH_INTERVAL_SECS
+            } else {
+                BEACON_INITIAL_RETRY_SECS
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
     }
 
@@ -489,6 +484,53 @@ pub(crate) async fn run_duress_serve(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
+}
+
+/// Build a fresh-nonce gift-wrapped beacon for every group member and publish each
+/// to `client`. Returns whether AT LEAST ONE wrap was accepted by the relay (relay
+/// in `output.success`) , which proves NIP-42 auth completed and the relay is
+/// delivering, so the caller can stop fast-retrying. Keying the relax on "any
+/// accepted" (not "all") avoids spinning at the fast cadence forever , amplifying
+/// the relay-observable duress signature , when one specific recipient's wrap is
+/// persistently rejected (relay size/rate limit) while the rest deliver. Never
+/// errors on a send failure (best-effort); only a build/entropy failure is an `Err`.
+async fn broadcast_beacon(
+    client: &Client,
+    beacon: &Keys,
+    group_pubkey: &[u8; 32],
+    total_shares: u16,
+) -> Result<bool> {
+    let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+    let wraps = keep_frost_net::KfpEventBuilder::duress_beacon_broadcast(
+        beacon,
+        group_pubkey,
+        total_shares,
+        &nonce,
+    )
+    .await
+    .map_err(|e| KeepError::runtime(format!("build beacon: {e}")))?;
+    if wraps.is_empty() {
+        return Ok(false);
+    }
+    let mut any_ok = false;
+    for wrap in &wraps {
+        let sent = tokio::time::timeout(
+            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+            client.send_event(wrap),
+        )
+        .await;
+        if let Ok(Ok(output)) = sent {
+            if !output.success.is_empty() {
+                any_ok = true;
+            }
+        }
+    }
+    debug!(
+        wraps = wraps.len(),
+        any_accepted = any_ok,
+        "duress beacon broadcast"
+    );
+    Ok(any_ok)
 }
 
 #[cfg(test)]
@@ -520,20 +562,6 @@ mod tests {
         let c = derive_beacon_key("y", &salt, P).unwrap().public_key();
         assert!(ct_pubkey_eq(&a, &b));
         assert!(!ct_pubkey_eq(&a, &c));
-    }
-
-    #[test]
-    fn build_duress_event_produces_a_verifiable_beacon() {
-        let salt = [1u8; SALT_SIZE];
-        let beacon = derive_beacon_key("the-duress-word", &salt, P).unwrap();
-        let group = [42u8; 32];
-        let event = build_duress_event(&beacon, &group).unwrap();
-        // The beacon verifies against the beacon pubkey and the expected group.
-        keep_frost_net::verify_duress_beacon(&event, &beacon.public_key(), &group, 3600)
-            .expect("freshly built beacon must verify");
-        // Two builds use fresh nonces, so their events differ (replay-distinct).
-        let again = build_duress_event(&beacon, &group).unwrap();
-        assert_ne!(event.id, again.id);
     }
 
     fn write_freeze_nonce(path: &Path, nonce: [u8; 32]) {

@@ -326,6 +326,7 @@ fn dispatch_frost_network(
             tpm_tcti,
             duress_beacon_pubkey,
             duress_beacon_salt,
+            duress_group_total,
             duress_beacon_pins,
             duress_state_file,
         } => {
@@ -349,6 +350,7 @@ fn dispatch_frost_network(
                 duress_beacon_salt.as_deref(),
                 &duress_beacon_pins,
                 duress_state_file.as_deref(),
+                duress_group_total,
             )
         }
         FrostNetworkCommands::Peers { group, relay } => {

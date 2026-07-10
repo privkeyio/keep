@@ -20,7 +20,7 @@ keep-bitcoin = { path = "../keep-bitcoin" }
 keep-core = { path = "../keep-core", features = ["oprf"] }
 keep-enclave-host = { path = "../keep-enclave/host", optional = true }
 
-nostr-sdk = { version = "0.44", features = ["nip04", "nip44"] }
+nostr-sdk = { version = "0.44", features = ["nip04", "nip44", "nip59"] }
 frost-secp256k1-tr = "3.0"
 rand = "0.10"
 k256 = { version = "0.13.4", features = ["schnorr"] }
