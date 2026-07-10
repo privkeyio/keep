@@ -77,6 +77,11 @@ pub fn get_password_with_confirm(prompt: &str, confirm: &str) -> Result<SecretSt
     Ok(SecretString::from(pw))
 }
 
+/// Minimum length for a duress credential. A crude entropy proxy: because the
+/// pinned beacon pubkey is shared cluster-wide, a short credential is cheaply
+/// grindable offline even behind Argon2id.
+const MIN_DURESS_CREDENTIAL_LEN: usize = 12;
+
 /// Read a DURESS credential (coercion resistance). Prompt + confirm, or the
 /// `KEEP_DURESS_PASSWORD` env var , NEVER `KEEP_PASSWORD`, so an exported vault
 /// password cannot silently become the duress trigger (which would make every
@@ -97,10 +102,20 @@ pub fn get_duress_credential(prompt: &str, confirm: &str) -> Result<SecretString
             })?;
         SecretString::from(pw)
     };
-    if cred.expose_secret().trim().is_empty() {
+    let trimmed_len = cred.expose_secret().trim().chars().count();
+    if trimmed_len == 0 {
         return Err(KeepError::invalid_input(
             "duress credential must not be empty",
         ));
+    }
+    // The pinned beacon pubkey is shared cluster-wide, so the duress credential is
+    // offline-grindable if it leaks. Argon2id (HIGH) raises that cost, but a floor
+    // on length is a cheap defense against a trivially short, low-entropy choice.
+    if trimmed_len < MIN_DURESS_CREDENTIAL_LEN {
+        return Err(KeepError::invalid_input(format!(
+            "duress credential must be at least {MIN_DURESS_CREDENTIAL_LEN} characters \
+             (its pinned pubkey is shared with the cluster and offline-grindable)"
+        )));
     }
     if let Some(vault) = password_from_env("KEEP_PASSWORD") {
         if cred.expose_secret() == vault.expose_secret() {

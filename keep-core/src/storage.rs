@@ -712,6 +712,13 @@ impl Storage {
         self.data_key.is_some()
     }
 
+    /// The vault's Argon2id parameters (from the header, readable before unlock).
+    /// These are non-secret; callers use them to reproduce an unlock's KDF cost
+    /// (e.g. a timing equalizer) without unlocking the vault.
+    pub fn argon2_params(&self) -> Argon2Params {
+        self.header.argon2_params()
+    }
+
     /// The data encryption key, if unlocked.
     pub fn data_key(&self) -> Option<&SecretKey> {
         self.data_key.as_ref()

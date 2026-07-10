@@ -70,6 +70,8 @@ pub fn cmd_frost_network_serve(
     oprf_dealer: Option<u16>,
     oprf_auto_approve: bool,
     tpm_tcti: Option<&str>,
+    duress_beacon_pubkey: Option<&str>,
+    duress_beacon_salt: Option<&str>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
@@ -93,8 +95,42 @@ pub fn cmd_frost_network_serve(
     // `attestation-provision`). Built before unlocking so it fails fast.
     let attestor = attestation::optional_announce_attestor(out, tpm_tcti)?;
 
+    // Coercion resistance: resolve the duress-beacon config up front (fail closed
+    // on a partial or malformed config) so a misconfiguration surfaces BEFORE the
+    // operator is prompted for a password, never after. Both flags must be set
+    // together (clap also enforces this).
+    let duress_cfg = match (duress_beacon_pubkey, duress_beacon_salt) {
+        (Some(npub), Some(salt_hex)) => Some(duress::parse_duress_config(npub, salt_hex)?),
+        (None, None) => None,
+        _ => {
+            return Err(KeepError::invalid_input(
+                "--duress-beacon-pubkey and --duress-beacon-salt must be set together",
+            ));
+        }
+    };
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
+
+    // When a duress beacon is configured, re-derive its key from the entered
+    // password. On a match, take the fail-closed duress path , NEVER unlock the
+    // vault, NEVER load the OPRF share (so this holder answers no evaluations and
+    // the box drops below threshold), publish one signed beacon, and stay
+    // resident. To keep a coerced start wall-clock- and screen-indistinguishable
+    // from a genuine one, mirror the normal path's "Unlocking vault..." spinner
+    // and spend an equal-cost KDF (the vault's own params) before diverging.
+    if let Some((beacon_pubkey, salt)) = duress_cfg {
+        if let Some(beacon) = duress::match_duress(password.expose_secret(), &salt, &beacon_pubkey)?
+        {
+            let spinner = out.spinner("Unlocking vault...");
+            duress::equalize_unlock_cost(keep.argon2_params(), &salt)?;
+            spinner.finish();
+            let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+            let rt = tokio::runtime::Runtime::new()
+                .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+            return rt.block_on(duress::run_duress_serve(out, &beacon, &group_pubkey, relay));
+        }
+    }
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
