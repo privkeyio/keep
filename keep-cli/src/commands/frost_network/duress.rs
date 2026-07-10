@@ -423,18 +423,42 @@ pub(crate) async fn run_duress_serve(
     let client = Client::new(beacon.clone());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
-        match build_duress_event(beacon, group_pubkey) {
-            Ok(event) => {
-                let send = tokio::time::timeout(
-                    std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
-                    client.send_event(&event),
-                )
-                .await;
-                if let Ok(Err(e)) = send {
-                    debug!(error = %e, "beacon publish failed; staying resident");
+        // connect() returns immediately, so wait for the relay to actually connect
+        // before publishing; otherwise send_event races the WebSocket + NIP-42
+        // handshake and the best-effort publish silently drops (mirrors
+        // KfpNode::new). Stay resident on timeout , the box is already fail-closed.
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+            async {
+                loop {
+                    let relays = client.relays().await;
+                    if relays
+                        .values()
+                        .any(|r| matches!(r.status(), RelayStatus::Connected))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+            },
+        )
+        .await;
+        if connected.is_err() {
+            debug!("relay not connected; beacon not published, staying resident");
+        } else {
+            match build_duress_event(beacon, group_pubkey) {
+                Ok(event) => {
+                    let send = tokio::time::timeout(
+                        std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+                        client.send_event(&event),
+                    )
+                    .await;
+                    if let Ok(Err(e)) = send {
+                        debug!(error = %e, "beacon publish failed; staying resident");
+                    }
+                }
+                Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
             }
-            Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
         }
     }
 
