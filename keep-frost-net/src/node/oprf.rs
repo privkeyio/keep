@@ -36,6 +36,17 @@ impl KfpNode {
             return Ok(());
         }
 
+        // Fail closed under duress: a verified duress beacon freezes this holder,
+        // so it answers NO evaluations until an out-of-band operator clear
+        // (inc2c). This is the load-bearing coercion behavior , withholding the
+        // OPRF share drops the box below threshold.
+        if self.is_duress_frozen() {
+            debug!("Refusing OPRF eval request: holder is duress-frozen");
+            return Err(FrostNetError::PolicyViolation(
+                "holder is duress-frozen; OPRF evaluations refused".into(),
+            ));
+        }
+
         if !request
             .participants
             .contains(&self.share.metadata.identifier)
