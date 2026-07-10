@@ -1463,9 +1463,9 @@ impl KfpNode {
     /// inc2b/inc2c.
     fn handle_duress_beacon(&self, event: &Event) -> Result<()> {
         // Already frozen: nothing more to do. Short-circuits BEFORE the signature
-        // verify, so a flood of beacon-key events cannot force repeated Schnorr
-        // checks once the holder is frozen, and stops `seen_duress_nonces` from
-        // growing after the freeze.
+        // verify, so a flood of beacon-key events (including the sender's own
+        // periodic re-broadcasts) cannot force repeated Schnorr checks once the
+        // holder is frozen. The freeze itself is the dedup.
         if self.is_duress_frozen() {
             return Ok(());
         }
@@ -2073,6 +2073,27 @@ impl KfpNode {
             .subscribe(direct_filter, None)
             .await
             .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+
+        // Coercion resistance: a duress beacon is authored by a dedicated beacon
+        // key, NOT a group member, so the author-scoped filters above never
+        // deliver it. Subscribe to the pinned beacon pubkey(s) as well, still
+        // scoped to this group's `g` tag so it stays bounded and group-specific.
+        // `handle_duress_beacon` re-verifies every event, so this subscription
+        // grants no trust; without a pin there is nothing to receive.
+        if let Some(pins) = self.duress_beacon_pins.as_ref().filter(|p| !p.is_empty()) {
+            let duress_filter = Filter::new()
+                .kind(Kind::Custom(KFP_EVENT_KIND))
+                .authors(pins.clone())
+                .custom_tag(
+                    SingleLetterTag::lowercase(Alphabet::G),
+                    hex::encode(self.group_pubkey),
+                )
+                .since(since);
+            self.client
+                .subscribe(duress_filter, None)
+                .await
+                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        }
 
         let fetch_filter = Filter::new()
             .kind(Kind::Custom(KFP_EVENT_KIND))

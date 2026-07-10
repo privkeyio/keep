@@ -1680,6 +1680,10 @@ mod tests {
         }
     }
 
+    // `write_secret_file` fsyncs the containing directory (a Unix durability
+    // idiom) which errors on Windows; the duress state file, like the LUKS key and
+    // OPRF share it shares that writer with, is a Linux-appliance-only path.
+    #[cfg(unix)]
     #[test]
     fn persist_freeze_roundtrips_through_the_state_file() {
         let dir = tempfile::tempdir().unwrap();

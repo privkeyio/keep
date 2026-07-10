@@ -155,6 +155,11 @@ pub(crate) fn build_duress_event(beacon: &Keys, group_pubkey: &[u8; 32]) -> Resu
 /// staying resident, so a black-holed relay cannot hang the duress start.
 const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
 
+/// Interval between duress-beacon re-broadcasts. The beacon is re-published (with
+/// a fresh nonce) on this cadence so a holder that was offline, reconnecting, or
+/// slow to subscribe when the first one fired still receives one and freezes.
+const BEACON_REPUBLISH_INTERVAL_SECS: u64 = 30;
+
 /// Default delay before a `duress-clear --initiate` may be executed: a generous
 /// window for out-of-band intervention (`--cancel`) if the clear was coerced.
 pub const DEFAULT_DURESS_CLEAR_DELAY_SECS: u64 = 24 * 60 * 60;
@@ -423,23 +428,72 @@ pub(crate) async fn run_duress_serve(
     let client = Client::new(beacon.clone());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
-        match build_duress_event(beacon, group_pubkey) {
-            Ok(event) => {
-                let send = tokio::time::timeout(
-                    std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
-                    client.send_event(&event),
-                )
-                .await;
-                if let Ok(Err(e)) = send {
-                    debug!(error = %e, "beacon publish failed; staying resident");
+        // connect() returns immediately, so wait for the relay to actually connect
+        // before publishing; otherwise send_event races the WebSocket + NIP-42
+        // handshake and the best-effort publish silently drops (mirrors
+        // KfpNode::new). Stay resident on timeout , the box is already fail-closed.
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+            async {
+                loop {
+                    let relays = client.relays().await;
+                    if relays
+                        .values()
+                        .any(|r| matches!(r.status(), RelayStatus::Connected))
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+            },
+        )
+        .await;
+        if connected.is_err() {
+            debug!("relay not connected; beacon not published, staying resident");
+        } else {
+            // Re-broadcast the beacon on an interval (fresh nonce each time), not
+            // once: a one-shot alert would miss any holder that is briefly offline,
+            // reconnecting, or slow to subscribe when it fires. Holders freeze on
+            // the first one they verify and short-circuit the rest, so the repeat
+            // is idempotent for them. This loop also keeps the process resident so
+            // the holder looks online but answers no evaluations (fail-closed).
+            //
+            // The first send may still race the relay's NIP-42 auth (the wait above
+            // is for `Connected`, not `Authenticated`); the interval retry covers a
+            // rejected first publish. RELEASE GATE: the fixed re-broadcast cadence
+            // is itself a relay-observable duress signature (distinct from the wire
+            // FORMAT gate); traffic-shape indistinguishability is part of that gate.
+            loop {
+                match build_duress_event(beacon, group_pubkey) {
+                    Ok(event) => {
+                        let send = tokio::time::timeout(
+                            std::time::Duration::from_secs(BEACON_PUBLISH_TIMEOUT_SECS),
+                            client.send_event(&event),
+                        )
+                        .await;
+                        match send {
+                            Ok(Ok(output)) => debug!(
+                                id = %output.id(),
+                                success = output.success.len(),
+                                failed = output.failed.len(),
+                                "beacon published"
+                            ),
+                            Ok(Err(e)) => debug!(error = %e, "beacon publish failed"),
+                            Err(_) => debug!("beacon publish timed out"),
+                        }
+                    }
+                    Err(e) => debug!(error = %e, "beacon build failed"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    BEACON_REPUBLISH_INTERVAL_SECS,
+                ))
+                .await;
             }
-            Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
         }
     }
 
-    // Stay resident so the holder appears online but answers no evaluation
-    // requests (fail-closed). Nothing here is duress-specific on screen.
+    // Reached only when the relay could not be added/connected: stay resident so
+    // the holder appears online but answers no evaluation requests (fail-closed).
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
     }
