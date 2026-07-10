@@ -83,6 +83,73 @@ jobs:
       - run: cargo build --release
       - run: cargo test --workspace --lib --bins
 
+  android:
+    # keep-mobile is a workspace member, so the jobs above compile it for the host
+    # target only. Its `cfg(target_os = "android")` logging branch and the
+    # android-only tracing-android dependency are built by nothing here, and no
+    # other job runs uniffi-bindgen. Both would otherwise break first in the
+    # Android app repository, which pins this repo at a commit and so lags main.
+    #
+    # NDK, cargo-ndk, and Rust versions must stay in sync with that repository's
+    # build-rust.sh, which builds the shipped library from these same sources.
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft != true && github.event_name != 'schedule'
+    env:
+      NDK_VERSION: "29.0.14206865"
+      CARGO_NDK_VERSION: "4.1.2"
+      ANDROID_TARGET: aarch64-linux-android
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install dependencies
+        run: |
+          # GitHub-hosted runners preload third-party apt repos (Microsoft, Google)
+          # whose mirrors intermittently serve invalid InRelease files, which fails
+          # `apt-get update`. None of them provide the packages below, so drop them.
+          sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* /etc/apt/sources.list.d/*google*
+          sudo apt-get update
+          # aws-lc-sys (via rustls) compiles bundled C through the NDK's cmake
+          # toolchain, which only reliably supports the Ninja generator.
+          sudo apt-get install -y ninja-build
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v4
+      - name: Install Android NDK
+        run: sdkmanager --install "ndk;$NDK_VERSION"
+      # rust-toolchain.toml pins the channel, so the Android target has to be added
+      # to that exact toolchain rather than to whatever `stable` resolves to.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
+      - name: Cross-compile keep-mobile for Android
+        working-directory: keep-mobile
+        run: |
+          NDK_DIR="$ANDROID_HOME/ndk/$NDK_VERSION"
+          if [ ! -d "$NDK_DIR" ]; then
+            echo "pinned NDK $NDK_VERSION not found at $NDK_DIR" >&2
+            exit 1
+          fi
+          # Runners preinstall a different NDK and set ANDROID_NDK_ROOT, which
+          # cargo-ndk would silently prefer. Force every var it consults.
+          export ANDROID_NDK_HOME="$NDK_DIR" ANDROID_NDK_ROOT="$NDK_DIR" ANDROID_NDK="$NDK_DIR"
+          export CMAKE_GENERATOR=Ninja AWS_LC_SYS_CMAKE_BUILDER=1
+          cargo ndk -t "$ANDROID_TARGET" -P 33 -o "$RUNNER_TEMP/jniLibs" build --release --locked
+      - name: Generate Kotlin bindings
+        working-directory: keep-mobile
+        run: |
+          cargo run --locked --features cli --bin uniffi-bindgen generate \
+            --library "$RUNNER_TEMP/jniLibs/arm64-v8a/libkeep_mobile.so" \
+            --language kotlin --no-format --out-dir "$RUNNER_TEMP/kotlin"
+          test -f "$RUNNER_TEMP/kotlin/io/privkey/keep/uniffi/keep_mobile.kt"
+
   msrv:
     runs-on: ubuntu-latest
     steps:
