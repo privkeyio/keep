@@ -859,6 +859,15 @@ impl KfpNode {
         signer: SignerId,
         merged_psbt: Vec<u8>,
     ) -> Result<()> {
+        // Fail closed under duress: a verified duress beacon freezes co-signing,
+        // so a coerced holder does not contribute a PSBT signature toward a spend.
+        if self.is_duress_frozen() {
+            debug!("Refusing PSBT signature contribution: holder is duress-frozen");
+            return Err(FrostNetError::PolicyViolation(
+                "holder is duress-frozen; co-signing refused".into(),
+            ));
+        }
+
         let (share_index, fingerprint) = match &signer {
             SignerId::Share(i) => (Some(*i), None),
             SignerId::Fingerprint(fp) => (None, Some(fp.clone())),

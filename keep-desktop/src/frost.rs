@@ -808,6 +808,17 @@ pub(crate) async fn frost_event_listener(
                             new_version,
                         ));
                     }
+                    // A verified duress beacon froze this node: surface it
+                    // prominently (co-signing and OPRF evals are now refused).
+                    Ok(KfpNodeEvent::DuressFrozen { beacon_pubkey }) => {
+                        log!(
+                            EventLogType::Error,
+                            format!(
+                                "DURESS: co-signing frozen by beacon {}",
+                                truncate_peer_string(&beacon_pubkey.to_string())
+                            )
+                        );
+                    }
                     // Threshold-OPRF unlock events are not surfaced in the
                     // desktop UI yet (KeepNode appliance flow).
                     Ok(KfpNodeEvent::OprfEvalRequested { .. })

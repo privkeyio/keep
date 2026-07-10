@@ -2538,6 +2538,55 @@ async fn test_oprf_eval_declined_by_hook_sends_no_share() {
     );
 }
 
+/// Coercion resistance: a duress-frozen holder refuses OPRF evaluations
+/// outright. After a verified duress beacon freezes it, `handle_oprf_eval_request`
+/// fails closed for an otherwise-Verified, in-budget requester, so the box cannot
+/// reach quorum. This is the load-bearing inc2 behavior (holder withholds its
+/// share -> box drops below threshold).
+#[tokio::test]
+async fn test_duress_frozen_holder_refuses_oprf_eval() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-oprf-duress").unwrap();
+    let _ = shares.remove(0); // id 1 (box is synthetic)
+    let holder_share = shares.remove(0); // id 2 = holder
+
+    let oprf = split_oprf_key_2of3();
+    let mut holder = KfpNode::new(holder_share, vec![relay])
+        .await
+        .expect("holder");
+    holder.set_oprf_key_share(oprf[1]);
+
+    // Pin a beacon key and freeze the holder with a valid beacon for its group.
+    let beacon = nostr_sdk::Keys::generate();
+    holder.set_duress_beacon_pins(vec![beacon.public_key()]);
+    let ev =
+        keep_frost_net::KfpEventBuilder::duress_beacon(&beacon, holder.group_pubkey(), &[5u8; 32])
+            .expect("beacon");
+    holder
+        .test_handle_duress_beacon(&ev)
+        .expect("handle beacon");
+    assert!(holder.is_duress_frozen(), "holder must be frozen");
+
+    // A Verified, in-budget requester whose eval would otherwise be gated only by
+    // the approval hook is now refused BEFORE any of that, purely on the freeze.
+    let (box_pubkey, payload, _blinded) = make_oprf_request(&holder);
+    holder.test_inject_peer(
+        keep_frost_net::Peer::new(box_pubkey, 1)
+            .with_attestation_status(keep_frost_net::AttestationStatus::Verified),
+    );
+    let result = holder
+        .test_handle_oprf_eval_request(box_pubkey, payload)
+        .await;
+    let err = result.expect_err("a duress-frozen holder must refuse evals");
+    assert!(
+        err.to_string().contains("duress"),
+        "refusal must be the duress freeze, got: {err}"
+    );
+}
+
 /// Gate (attestation): a requester whose peer is NOT `Verified` (default
 /// `NotProvided`) is rejected with `UntrustedPeer` before any partial is
 /// produced, and the holder emits no `OprfEvalRequested`.

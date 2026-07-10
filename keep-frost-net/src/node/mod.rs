@@ -752,6 +752,13 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         reason: String,
     },
+    /// A verified duress beacon froze this holder: it now refuses OPRF
+    /// evaluations (fail-closed) until an out-of-band operator clear. In-memory
+    /// in inc2a; sticky persistence across reboot + the operator clear are
+    /// inc2b/inc2c.
+    DuressFrozen {
+        beacon_pubkey: PublicKey,
+    },
 }
 
 impl std::fmt::Debug for KfpNodeEvent {
@@ -961,12 +968,26 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .field("session_id", &hex::encode(session_id))
                 .field("reason", reason)
                 .finish(),
+            Self::DuressFrozen { beacon_pubkey } => f
+                .debug_struct("DuressFrozen")
+                .field("beacon_pubkey", beacon_pubkey)
+                .finish(),
         }
     }
 }
 
 /// Map key is `(session_id, new_descriptor_hash)`; value is `created_at`.
 pub(crate) type SeenDescriptorMigrates = RwLock<HashMap<([u8; 32], [u8; 32]), u64>>;
+
+/// State recorded when a verified duress beacon freezes this holder. Carries the
+/// beacon identity and nonce so a persistence layer (inc2b) can make the freeze
+/// sticky across reboot and an operator clear (inc2c) can audit what it lifted.
+#[derive(Clone, Debug)]
+pub struct DuressFreeze {
+    pub beacon_pubkey: PublicKey,
+    pub nonce: [u8; 32],
+    pub created_at: u64,
+}
 
 pub struct KfpNode {
     pub(crate) keys: Keys,
@@ -1016,6 +1037,18 @@ pub struct KfpNode {
     /// parallel to `expected_pcrs` for the Nitro path; `None` means TPM quotes
     /// are not configured and appraise to `NotConfigured`.
     tpm_attestation_policy: Option<TpmAttestationPolicy>,
+    /// Pinned duress-beacon pubkey(s) for this group. A received
+    /// `KfpMessage::DuressBeacon` is only actioned if `verify_duress_beacon`
+    /// succeeds against one of these. `None`/empty means duress beacons are not
+    /// configured and are ignored (reaching the arm grants no trust on its own).
+    duress_beacon_pins: Option<Vec<PublicKey>>,
+    /// Set once a valid, fresh duress beacon is verified: this holder is FROZEN
+    /// and refuses co-signing and OPRF evaluations (fail-closed). The freeze is
+    /// also the dedup , once set, `handle_duress_beacon` short-circuits, so a
+    /// re-broadcast neither re-alerts nor does redundant verify work. In-memory
+    /// only in inc2a; sticky persistence across reboot + the operator clear are
+    /// inc2b/inc2c.
+    duress_freeze: RwLock<Option<DuressFreeze>>,
     /// Producer side: when set, every announce carries a fresh TPM quote bound to
     /// it. `None` means this node attaches no TPM attestation to its announces.
     announce_attestor: Option<Arc<dyn AnnounceAttestor>>,
@@ -1283,6 +1316,8 @@ impl KfpNode {
             audit_log,
             expected_pcrs: None,
             tpm_attestation_policy: None,
+            duress_beacon_pins: None,
+            duress_freeze: RwLock::new(None),
             announce_attestor: None,
             announce_task: std::sync::Mutex::new(None),
             seen_xpub_announces: RwLock::new(HashSet::new()),
@@ -1362,6 +1397,86 @@ impl KfpNode {
 
     pub fn set_tpm_attestation_policy(&mut self, policy: TpmAttestationPolicy) {
         self.tpm_attestation_policy = Some(policy);
+    }
+
+    /// Pin the group's duress-beacon pubkey(s). A received duress beacon is only
+    /// actioned (freeze) if it verifies against one of these. Without a pin,
+    /// beacons are ignored.
+    pub fn with_duress_beacon_pins(mut self, pins: Vec<PublicKey>) -> Self {
+        self.duress_beacon_pins = Some(pins);
+        self
+    }
+
+    pub fn set_duress_beacon_pins(&mut self, pins: Vec<PublicKey>) {
+        self.duress_beacon_pins = Some(pins);
+    }
+
+    /// Whether this holder is currently duress-frozen (refusing OPRF evals).
+    pub fn is_duress_frozen(&self) -> bool {
+        self.duress_freeze.read().is_some()
+    }
+
+    /// The active duress freeze, if any (for alerting / persistence).
+    pub fn duress_freeze(&self) -> Option<DuressFreeze> {
+        self.duress_freeze.read().clone()
+    }
+
+    /// Verify a received duress beacon against this holder's pinned beacon
+    /// pubkey(s) and, on a valid + fresh + unseen beacon, FREEZE: refuse OPRF
+    /// evaluations and emit a `DuressFrozen` alert. Reaching this without a pin,
+    /// or with a beacon that fails verification (wrong signer, wrong group,
+    /// stale) or is a replay, is a no-op , receipt alone grants no trust.
+    /// In-memory only (inc2a); sticky persistence + operator clear are
+    /// inc2b/inc2c.
+    fn handle_duress_beacon(&self, event: &Event) -> Result<()> {
+        // Already frozen: nothing more to do. Short-circuits BEFORE the signature
+        // verify, so a flood of beacon-key events cannot force repeated Schnorr
+        // checks once the holder is frozen, and stops `seen_duress_nonces` from
+        // growing after the freeze.
+        if self.is_duress_frozen() {
+            return Ok(());
+        }
+        let pins = match self.duress_beacon_pins.as_deref() {
+            Some(pins) if !pins.is_empty() => pins,
+            _ => return Ok(()),
+        };
+        let verified = pins.iter().find_map(|pin| {
+            crate::event::verify_duress_beacon(
+                event,
+                pin,
+                &self.group_pubkey,
+                self.replay_window_secs,
+            )
+            .ok()
+            .map(|payload| (*pin, payload))
+        });
+        let (beacon_pubkey, payload) = match verified {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        // Freeze. The frozen short-circuit above makes this the first beacon we
+        // act on (serial event handling, no concurrent writer), so a plain set is
+        // correct; a re-broadcast is dropped by that short-circuit, not here.
+        *self.duress_freeze.write() = Some(DuressFreeze {
+            beacon_pubkey,
+            nonce: payload.nonce,
+            created_at: payload.created_at,
+        });
+        warn!(
+            beacon = %beacon_pubkey,
+            "DURESS BEACON verified: freezing co-signing and OPRF evaluations (fail-closed)"
+        );
+        if self
+            .event_tx
+            .send(KfpNodeEvent::DuressFrozen { beacon_pubkey })
+            .is_err()
+        {
+            // The freeze itself already holds (state set above); only the operator
+            // alert was dropped because no subscriber is listening. Surface it so a
+            // missing alert is at least visible in the logs.
+            warn!("DuressFrozen alert dropped: no active event subscriber");
+        }
+        Ok(())
     }
 
     /// Attach a TPM quote, produced by `attestor`, to every announce this node
@@ -1460,6 +1575,14 @@ impl KfpNode {
         request: OprfEvalRequestPayload,
     ) -> Result<()> {
         self.handle_oprf_eval_request(from, request).await
+    }
+
+    /// Test-only: drive the holder-side duress-beacon handler directly, so tests
+    /// can assert the freeze/no-freeze outcome without a relay round-trip.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
+    pub fn test_handle_duress_beacon(&self, event: &Event) -> Result<()> {
+        self.handle_duress_beacon(event)
     }
 
     /// Test-only: drive the holder-side OPRF enrollment handler directly. Lets the
@@ -2201,10 +2324,11 @@ impl KfpNode {
             }
             KfpMessage::DuressBeacon(_) => {
                 // Reaches here WITHOUT the trusted-peer gate (the beacon key is not
-                // a peer; see the exemption above). inc1a ignores it. inc2 (sxb)
-                // MUST call `verify_duress_beacon` against this holder's PINNED
-                // beacon pubkey before acting -- reaching this arm grants no trust
-                // on its own -- then fail-closed freeze co-signing.
+                // a peer; see the exemption above). `handle_duress_beacon`
+                // self-gates via `verify_duress_beacon` against this holder's
+                // PINNED beacon pubkey , reaching this arm grants no trust on its
+                // own , then fail-closed freezes OPRF evaluations.
+                self.handle_duress_beacon(event)?;
             }
             KfpMessage::PsbtPropose(payload) => {
                 self.handle_psbt_propose(event.pubkey, payload).await?;
@@ -2670,6 +2794,82 @@ mod tests {
 
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
+    }
+
+    async fn duress_test_node() -> KfpNode {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("duress-test").unwrap();
+        KfpNode::new(shares.remove(0), vec![relay_url])
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn duress_beacon_freezes_only_for_pinned_signer_and_dedups() {
+        let mut node = duress_test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        let wrong = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+
+        // A beacon from an unpinned key does NOT freeze (receipt grants no trust).
+        let ev_wrong = KfpEventBuilder::duress_beacon(&wrong, &group, &[1u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev_wrong).unwrap();
+        assert!(
+            !node.is_duress_frozen(),
+            "beacon from an unpinned key must not freeze"
+        );
+
+        // A beacon from the pinned key freezes and records its identity + nonce.
+        let ev = KfpEventBuilder::duress_beacon(&beacon, &group, &[1u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+        assert!(node.is_duress_frozen(), "pinned beacon must freeze");
+        let f = node.duress_freeze().unwrap();
+        assert_eq!(f.beacon_pubkey, beacon.public_key());
+        assert_eq!(f.nonce, [1u8; 32]);
+
+        // A later valid beacon (fresh nonce) keeps the FIRST freeze (idempotent,
+        // stable audit trail); re-handling the same event is a dedup no-op.
+        let ev2 = KfpEventBuilder::duress_beacon(&beacon, &group, &[2u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev2).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+        assert_eq!(
+            node.duress_freeze().unwrap().nonce,
+            [1u8; 32],
+            "freeze must remain the first beacon"
+        );
+    }
+
+    #[tokio::test]
+    async fn duress_beacon_ignored_when_no_pin_configured() {
+        let node = duress_test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        // No pin set: a well-formed beacon is ignored (not configured).
+        let ev = KfpEventBuilder::duress_beacon(&beacon, &group, &[9u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+        assert!(!node.is_duress_frozen());
+    }
+
+    #[tokio::test]
+    async fn duress_beacon_for_other_group_does_not_freeze() {
+        let mut node = duress_test_node().await;
+        let beacon = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+        // Correct signer, WRONG group , verify_duress_beacon rejects the group,
+        // so no freeze.
+        let other_group = [7u8; 32];
+        let ev = KfpEventBuilder::duress_beacon(&beacon, &other_group, &[3u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+        assert!(
+            !node.is_duress_frozen(),
+            "a beacon for a different group must not freeze this holder"
+        );
     }
 
     #[tokio::test]
