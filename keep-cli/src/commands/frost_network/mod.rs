@@ -77,6 +77,7 @@ pub fn cmd_frost_network_serve(
     duress_beacon_salt: Option<&str>,
     duress_beacon_pins: &[String],
     duress_state_file: Option<&Path>,
+    duress_group_total: Option<u16>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
@@ -105,7 +106,20 @@ pub fn cmd_frost_network_serve(
     // operator is prompted for a password, never after. Both flags must be set
     // together (clap also enforces this).
     let duress_cfg = match (duress_beacon_pubkey, duress_beacon_salt) {
-        (Some(npub), Some(salt_hex)) => Some(duress::parse_duress_config(npub, salt_hex)?),
+        (Some(npub), Some(salt_hex)) => {
+            // The beacon is gift-wrapped to every group member, so the emitter must
+            // know the member count up front (a coerced holder never unlocks the
+            // vault to read it). Require --group-total with the emit config; fail
+            // closed here, before the password prompt, so a misconfig never leaks by
+            // surfacing only after the operator has already typed the duress word.
+            let total = duress_group_total.ok_or_else(|| {
+                KeepError::invalid_input(
+                    "--group-total is required with --duress-beacon-pubkey/--duress-beacon-salt",
+                )
+            })?;
+            let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
+            Some((pubkey, salt, total))
+        }
         (None, None) => None,
         _ => {
             return Err(KeepError::invalid_input(
@@ -142,7 +156,7 @@ pub fn cmd_frost_network_serve(
     // resident. To keep a coerced start wall-clock- and screen-indistinguishable
     // from a genuine one, mirror the normal path's "Unlocking vault..." spinner
     // and spend an equal-cost KDF (the vault's own params) before diverging.
-    if let Some((beacon_pubkey, salt)) = duress_cfg {
+    if let Some((beacon_pubkey, salt, group_total)) = duress_cfg {
         if let Some(beacon) = duress::match_duress(password.expose_secret(), &salt, &beacon_pubkey)?
         {
             let spinner = out.spinner("Unlocking vault...");
@@ -151,7 +165,13 @@ pub fn cmd_frost_network_serve(
             let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
             let rt = tokio::runtime::Runtime::new()
                 .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
-            return rt.block_on(duress::run_duress_serve(out, &beacon, &group_pubkey, relay));
+            return rt.block_on(duress::run_duress_serve(
+                out,
+                &beacon,
+                &group_pubkey,
+                group_total,
+                relay,
+            ));
         }
     }
 

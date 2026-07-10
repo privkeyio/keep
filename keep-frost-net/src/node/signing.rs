@@ -1993,8 +1993,15 @@ mod gate_tests {
         let group = *node.group_pubkey();
         let beacon = Keys::generate();
         node.set_duress_beacon_pins(vec![beacon.public_key()]);
-        let ev = crate::event::KfpEventBuilder::duress_beacon(&beacon, &group, &[8u8; 32]).unwrap();
-        node.handle_duress_beacon(&ev).unwrap();
+        let ev = crate::event::KfpEventBuilder::duress_beacon(
+            &beacon,
+            &group,
+            &[8u8; 32],
+            &node.keys.public_key(),
+        )
+        .await
+        .unwrap();
+        node.handle_gift_wrap(&ev).await.unwrap();
         assert!(node.is_duress_frozen(), "node must be frozen");
 
         let from = Keys::generate().public_key();
