@@ -457,6 +457,12 @@ pub(crate) async fn run_duress_serve(
             // the first one they verify and short-circuit the rest, so the repeat
             // is idempotent for them. This loop also keeps the process resident so
             // the holder looks online but answers no evaluations (fail-closed).
+            //
+            // The first send may still race the relay's NIP-42 auth (the wait above
+            // is for `Connected`, not `Authenticated`); the interval retry covers a
+            // rejected first publish. RELEASE GATE: the fixed re-broadcast cadence
+            // is itself a relay-observable duress signature (distinct from the wire
+            // FORMAT gate); traffic-shape indistinguishability is part of that gate.
             loop {
                 match build_duress_event(beacon, group_pubkey) {
                     Ok(event) => {

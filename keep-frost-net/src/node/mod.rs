@@ -1463,9 +1463,9 @@ impl KfpNode {
     /// inc2b/inc2c.
     fn handle_duress_beacon(&self, event: &Event) -> Result<()> {
         // Already frozen: nothing more to do. Short-circuits BEFORE the signature
-        // verify, so a flood of beacon-key events cannot force repeated Schnorr
-        // checks once the holder is frozen, and stops `seen_duress_nonces` from
-        // growing after the freeze.
+        // verify, so a flood of beacon-key events (including the sender's own
+        // periodic re-broadcasts) cannot force repeated Schnorr checks once the
+        // holder is frozen. The freeze itself is the dedup.
         if self.is_duress_frozen() {
             return Ok(());
         }
