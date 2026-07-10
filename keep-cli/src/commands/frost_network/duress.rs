@@ -453,8 +453,15 @@ pub(crate) async fn run_duress_serve(
                         client.send_event(&event),
                     )
                     .await;
-                    if let Ok(Err(e)) = send {
-                        debug!(error = %e, "beacon publish failed; staying resident");
+                    match send {
+                        Ok(Ok(output)) => debug!(
+                            id = %output.id(),
+                            success = output.success.len(),
+                            failed = output.failed.len(),
+                            "beacon publish sent"
+                        ),
+                        Ok(Err(e)) => debug!(error = %e, "beacon publish failed; staying resident"),
+                        Err(_) => debug!("beacon publish timed out; staying resident"),
                     }
                 }
                 Err(e) => debug!(error = %e, "beacon build failed; staying resident"),
