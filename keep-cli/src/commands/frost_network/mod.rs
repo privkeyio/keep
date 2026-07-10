@@ -25,7 +25,10 @@ mod hardware;
 
 pub use attestation::cmd_frost_network_attestation_provision;
 pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
-pub use duress::cmd_frost_network_duress_provision;
+pub use duress::{
+    cmd_frost_network_duress_clear, cmd_frost_network_duress_provision,
+    DEFAULT_DURESS_CLEAR_DELAY_SECS,
+};
 pub use hardware::{cmd_frost_network_nonce_precommit, cmd_frost_network_sign_hardware};
 
 /// Fixed OPRF unlock input (the design's fixed label). Both provisioning and

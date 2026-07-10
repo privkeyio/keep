@@ -358,6 +358,16 @@ fn dispatch_frost_network(
         FrostNetworkCommands::DuressProvision => {
             commands::frost_network::cmd_frost_network_duress_provision(out)
         }
+        FrostNetworkCommands::DuressClear {
+            state_file,
+            action,
+            delay_secs,
+        } => commands::frost_network::cmd_frost_network_duress_clear(
+            out,
+            &state_file,
+            action,
+            delay_secs,
+        ),
         FrostNetworkCommands::AttestationProvision {
             group,
             relay,
