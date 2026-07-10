@@ -1042,15 +1042,13 @@ pub struct KfpNode {
     /// succeeds against one of these. `None`/empty means duress beacons are not
     /// configured and are ignored (reaching the arm grants no trust on its own).
     duress_beacon_pins: Option<Vec<PublicKey>>,
-    /// Set once a valid, fresh, unseen duress beacon is verified: this holder is
-    /// FROZEN and refuses OPRF evaluations (fail-closed). In-memory only in
-    /// inc2a; sticky persistence across reboot + the operator clear are
+    /// Set once a valid, fresh duress beacon is verified: this holder is FROZEN
+    /// and refuses co-signing and OPRF evaluations (fail-closed). The freeze is
+    /// also the dedup , once set, `handle_duress_beacon` short-circuits, so a
+    /// re-broadcast neither re-alerts nor does redundant verify work. In-memory
+    /// only in inc2a; sticky persistence across reboot + the operator clear are
     /// inc2b/inc2c.
     duress_freeze: RwLock<Option<DuressFreeze>>,
-    /// Nonce-dedup for duress beacons: `verify_duress_beacon` only bounds the
-    /// replay WINDOW, so this drops repeats (and same-beacon re-broadcasts)
-    /// within it. Keyed by the beacon nonce.
-    seen_duress_nonces: RwLock<HashSet<[u8; 32]>>,
     /// Producer side: when set, every announce carries a fresh TPM quote bound to
     /// it. `None` means this node attaches no TPM attestation to its announces.
     announce_attestor: Option<Arc<dyn AnnounceAttestor>>,
@@ -1320,7 +1318,6 @@ impl KfpNode {
             tpm_attestation_policy: None,
             duress_beacon_pins: None,
             duress_freeze: RwLock::new(None),
-            seen_duress_nonces: RwLock::new(HashSet::new()),
             announce_attestor: None,
             announce_task: std::sync::Mutex::new(None),
             seen_xpub_announces: RwLock::new(HashSet::new()),
@@ -1432,6 +1429,13 @@ impl KfpNode {
     /// In-memory only (inc2a); sticky persistence + operator clear are
     /// inc2b/inc2c.
     fn handle_duress_beacon(&self, event: &Event) -> Result<()> {
+        // Already frozen: nothing more to do. Short-circuits BEFORE the signature
+        // verify, so a flood of beacon-key events cannot force repeated Schnorr
+        // checks once the holder is frozen, and stops `seen_duress_nonces` from
+        // growing after the freeze.
+        if self.is_duress_frozen() {
+            return Ok(());
+        }
         let pins = match self.duress_beacon_pins.as_deref() {
             Some(pins) if !pins.is_empty() => pins,
             _ => return Ok(()),
@@ -1450,29 +1454,28 @@ impl KfpNode {
             Some(v) => v,
             None => return Ok(()),
         };
-        // Nonce-dedup: verify only bounds the replay window; drop repeats (and
-        // same-beacon re-broadcasts) within it.
-        if !self.seen_duress_nonces.write().insert(payload.nonce) {
-            return Ok(());
-        }
-        // Freeze , idempotent: keep the first freeze so its audit trail is stable.
-        {
-            let mut freeze = self.duress_freeze.write();
-            if freeze.is_none() {
-                *freeze = Some(DuressFreeze {
-                    beacon_pubkey,
-                    nonce: payload.nonce,
-                    created_at: payload.created_at,
-                });
-            }
-        }
+        // Freeze. The frozen short-circuit above makes this the first beacon we
+        // act on (serial event handling, no concurrent writer), so a plain set is
+        // correct; a re-broadcast is dropped by that short-circuit, not here.
+        *self.duress_freeze.write() = Some(DuressFreeze {
+            beacon_pubkey,
+            nonce: payload.nonce,
+            created_at: payload.created_at,
+        });
         warn!(
             beacon = %beacon_pubkey,
-            "DURESS BEACON verified: freezing OPRF evaluations (fail-closed)"
+            "DURESS BEACON verified: freezing co-signing and OPRF evaluations (fail-closed)"
         );
-        let _ = self
+        if self
             .event_tx
-            .send(KfpNodeEvent::DuressFrozen { beacon_pubkey });
+            .send(KfpNodeEvent::DuressFrozen { beacon_pubkey })
+            .is_err()
+        {
+            // The freeze itself already holds (state set above); only the operator
+            // alert was dropped because no subscriber is listening. Surface it so a
+            // missing alert is at least visible in the logs.
+            warn!("DuressFrozen alert dropped: no active event subscriber");
+        }
         Ok(())
     }
 

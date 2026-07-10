@@ -396,6 +396,15 @@ impl KfpNode {
             return Ok(());
         }
 
+        // Fail closed under duress: a verified duress beacon freezes co-signing
+        // too, so a coerced holder cannot be forced to co-sign a spend.
+        if self.is_duress_frozen() {
+            debug!("Rejecting sign request: holder is duress-frozen");
+            return Err(FrostNetError::PolicyViolation(
+                "holder is duress-frozen; co-signing refused".into(),
+            ));
+        }
+
         if !request
             .participants
             .contains(&self.share.metadata.identifier)
@@ -1972,6 +1981,28 @@ mod gate_tests {
         let group = *node.group_pubkey();
         let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![2, 3]);
         assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
+    /// A duress-frozen holder refuses to co-sign: a fresh sign request for its
+    /// own group is rejected with a `PolicyViolation`. The freeze check sits
+    /// before the participant/replay/policy gates, so it trips first (fail
+    /// closed) , a coerced holder cannot be forced to contribute a signature.
+    #[tokio::test]
+    async fn handle_sign_request_refused_when_duress_frozen() {
+        let (mut node, _relay) = test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+        let ev = crate::event::KfpEventBuilder::duress_beacon(&beacon, &group, &[8u8; 32]).unwrap();
+        node.handle_duress_beacon(&ev).unwrap();
+        assert!(node.is_duress_frozen(), "node must be frozen");
+
+        let from = Keys::generate().public_key();
+        let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.
