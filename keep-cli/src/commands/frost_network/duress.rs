@@ -83,6 +83,102 @@ pub fn cmd_frost_network_duress_provision(out: &Output) -> Result<()> {
     Ok(())
 }
 
+/// Constant-time equality of two x-only pubkeys, so duress detection does not
+/// leak (via timing) whether the entered password matched the pinned beacon key.
+/// The dominating cost is the Argon2 re-derivation (which runs for every serve
+/// regardless), so the paths are timing-indistinguishable.
+fn ct_pubkey_eq(a: &PublicKey, b: &PublicKey) -> bool {
+    let (a, b) = (a.to_bytes(), b.to_bytes());
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// If `password` is the duress credential, return the beacon `Keys`; otherwise
+/// `None`. Re-derives the beacon key from the entered password (same HIGH params
+/// as provisioning) and constant-time-compares its pubkey to the pinned
+/// `beacon_pubkey`. A single Argon2 derivation, run for EVERY serve unlock, so a
+/// normal password and the duress credential are indistinguishable by timing.
+pub(crate) fn match_duress(
+    password: &str,
+    salt: &[u8; SALT_SIZE],
+    beacon_pubkey: &PublicKey,
+) -> Result<Option<Keys>> {
+    let candidate = derive_beacon_key(password, salt, DURESS_BEACON_ARGON2)?;
+    if ct_pubkey_eq(&candidate.public_key(), beacon_pubkey) {
+        Ok(Some(candidate))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parse the serve-side duress config: the pinned beacon `npub` and the hex salt.
+pub(crate) fn parse_duress_config(
+    beacon_npub: &str,
+    salt_hex: &str,
+) -> Result<(PublicKey, [u8; SALT_SIZE])> {
+    let pubkey = PublicKey::from_bech32(beacon_npub.trim())
+        .map_err(|e| KeepError::invalid_input(format!("--duress-beacon-pubkey: {e}")))?;
+    let raw = hex::decode(salt_hex.trim())
+        .map_err(|e| KeepError::invalid_input(format!("--duress-beacon-salt not hex: {e}")))?;
+    let salt: [u8; SALT_SIZE] = raw.try_into().map_err(|_| {
+        KeepError::invalid_input("--duress-beacon-salt must be 32 bytes".to_string())
+    })?;
+    Ok((pubkey, salt))
+}
+
+/// The duress serve path: fail CLOSED (never unlock the vault or load the OPRF
+/// share, so this holder answers no evaluations and the box drops below
+/// threshold) and publish ONE signed duress beacon, then stay resident so the
+/// holder looks online but simply never answers. Reached only when the entered
+/// password derived the pinned beacon key.
+///
+/// The screen mirrors a normal serve start using data knowable without the vault
+/// (group, relay). The `Share`/`Threshold`/`Attestation` lines a normal serve
+/// derives from the unlocked share are the DOCUMENTED residual: full byte-level
+/// output and on-wire indistinguishability is a follow-up (deep-research open
+/// question, tracked with the inc2 wire-format release gate). The load-bearing
+/// coercion property is that the box stays locked , this fail-closed path plus the
+/// inc2 sticky freeze , invariant to which password was entered.
+pub(crate) async fn run_duress_serve(
+    out: &Output,
+    beacon: &Keys,
+    group_pubkey: &[u8; 32],
+    relay: &str,
+) -> Result<()> {
+    let group_npub = keep_core::keys::bytes_to_npub(group_pubkey);
+    out.newline();
+    out.header("FROST Network Node");
+    out.field("Group", &group_npub);
+    out.field("Relay", relay);
+    out.newline();
+
+    let client = Client::new(beacon.clone());
+    client
+        .add_relay(relay)
+        .await
+        .map_err(|e| KeepError::runtime(format!("add relay: {e}")))?;
+    client.connect().await;
+
+    let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+    let event = keep_frost_net::KfpEventBuilder::duress_beacon(beacon, group_pubkey, &nonce)
+        .map_err(|e| KeepError::runtime(format!("build duress beacon: {e}")))?;
+    client
+        .send_event(&event)
+        .await
+        .map_err(|e| KeepError::runtime(format!("publish duress beacon: {e}")))?;
+
+    out.info("Starting FROST coordination node...");
+
+    // Stay resident so the holder appears online but answers no evaluation
+    // requests (fail-closed). Nothing here is duress-specific on screen.
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +198,34 @@ mod tests {
         let a = derive_beacon_key("correct horse battery staple", &salt, P).unwrap();
         let b = derive_beacon_key("correct horse battery staple", &salt, P).unwrap();
         assert_eq!(a.public_key(), b.public_key());
+    }
+
+    #[test]
+    fn ct_pubkey_eq_matches_std_eq() {
+        let salt = [3u8; SALT_SIZE];
+        let a = derive_beacon_key("x", &salt, P).unwrap().public_key();
+        let b = derive_beacon_key("x", &salt, P).unwrap().public_key();
+        let c = derive_beacon_key("y", &salt, P).unwrap().public_key();
+        assert!(ct_pubkey_eq(&a, &b));
+        assert!(!ct_pubkey_eq(&a, &c));
+    }
+
+    #[test]
+    fn parse_duress_config_roundtrips_and_rejects_bad_input() {
+        let salt = [5u8; SALT_SIZE];
+        let npub = derive_beacon_key("dur", &salt, P)
+            .unwrap()
+            .public_key()
+            .to_bech32()
+            .unwrap();
+        let salt_hex = hex::encode(salt);
+        let (pk, parsed_salt) = parse_duress_config(&npub, &salt_hex).unwrap();
+        assert_eq!(parsed_salt, salt);
+        assert_eq!(pk.to_bech32().unwrap(), npub);
+        // A too-short salt is rejected (not silently zero-padded).
+        assert!(parse_duress_config(&npub, "00ff").is_err());
+        // A non-npub pubkey is rejected.
+        assert!(parse_duress_config("not-an-npub", &salt_hex).is_err());
     }
 
     #[test]

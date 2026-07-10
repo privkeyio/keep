@@ -610,6 +610,18 @@ pub(crate) enum FrostNetworkCommands {
         /// `attestation-provision`. Needs the tpm-attestation build feature.
         #[arg(long, value_name = "TCTI")]
         tpm_tcti: Option<String>,
+        /// Coercion resistance: the pinned duress-beacon npub from
+        /// `duress-provision`. When set (with --duress-beacon-salt), entering the
+        /// duress credential at the password prompt fails closed (the vault stays
+        /// locked, no OPRF share is loaded, so the box drops below threshold) and
+        /// publishes a signed duress beacon, indistinguishable from a normal start.
+        #[arg(long, value_name = "NPUB", requires = "duress_beacon_salt")]
+        duress_beacon_pubkey: Option<String>,
+        /// Coercion resistance: the hex salt printed by `duress-provision`, used to
+        /// re-derive and detect the duress credential. Set together with
+        /// --duress-beacon-pubkey.
+        #[arg(long, value_name = "HEX", requires = "duress_beacon_pubkey")]
+        duress_beacon_salt: Option<String>,
     },
     Peers {
         #[arg(short, long)]

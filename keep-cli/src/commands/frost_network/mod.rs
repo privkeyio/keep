@@ -70,6 +70,8 @@ pub fn cmd_frost_network_serve(
     oprf_dealer: Option<u16>,
     oprf_auto_approve: bool,
     tpm_tcti: Option<&str>,
+    duress_beacon_pubkey: Option<&str>,
+    duress_beacon_salt: Option<&str>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
@@ -95,6 +97,33 @@ pub fn cmd_frost_network_serve(
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
+
+    // Coercion resistance: when a duress beacon is configured, re-derive its key
+    // from the entered password. On a match, take the fail-closed duress path ,
+    // NEVER unlock the vault, NEVER load the OPRF share (so this holder answers no
+    // evaluations and the box drops below threshold), publish one signed beacon,
+    // and stay resident. The re-derivation runs on EVERY unlock, so a normal
+    // password and the duress credential are timing-indistinguishable. Both config
+    // values must be set together; a partial config fails closed.
+    match (duress_beacon_pubkey, duress_beacon_salt) {
+        (Some(npub), Some(salt_hex)) => {
+            let (beacon_pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
+            if let Some(beacon) =
+                duress::match_duress(password.expose_secret(), &salt, &beacon_pubkey)?
+            {
+                let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+                let rt = tokio::runtime::Runtime::new()
+                    .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+                return rt.block_on(duress::run_duress_serve(out, &beacon, &group_pubkey, relay));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(KeepError::invalid_input(
+                "--duress-beacon-pubkey and --duress-beacon-salt must be set together",
+            ));
+        }
+    }
 
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
