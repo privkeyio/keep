@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
-use tracing::debug;
+use tracing::{debug, error};
 use zeroize::Zeroize;
 
 use keep_core::error::{FrostError, KeepError, NetworkError, Result};
@@ -72,6 +72,8 @@ pub fn cmd_frost_network_serve(
     tpm_tcti: Option<&str>,
     duress_beacon_pubkey: Option<&str>,
     duress_beacon_salt: Option<&str>,
+    duress_beacon_pins: &[String],
+    duress_state_file: Option<&Path>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
@@ -107,6 +109,13 @@ pub fn cmd_frost_network_serve(
                 "--duress-beacon-pubkey and --duress-beacon-salt must be set together",
             ));
         }
+    };
+    // Trusted beacon pins + any persisted sticky freeze, resolved up front so a
+    // bad pin or a corrupt state file fails the node before it prompts or serves.
+    let duress_pins = duress::parse_beacon_pins(duress_beacon_pins)?;
+    let persisted_freeze = match duress_state_file {
+        Some(p) => duress::read_persisted_freeze(p)?,
+        None => None,
     };
 
     let mut keep = Keep::open(path)?;
@@ -176,6 +185,8 @@ pub fn cmd_frost_network_serve(
     };
     // Where an enrolled share is sealed, owned so the event loop can move it.
     let oprf_seal_path = oprf_share_file.map(|p| p.to_path_buf());
+    // Owned so the async event loop can move the persister closure that writes it.
+    let duress_state_path = duress_state_file.map(|p| p.to_path_buf());
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -199,6 +210,33 @@ pub fn cmd_frost_network_serve(
             );
         } else {
             out.field("Attestation", "DISABLED (--insecure-no-attestation)");
+        }
+        // Coercion resistance: trust the group's beacon pins so a verified beacon
+        // freezes this node, persist the freeze durably (so a restart stays
+        // frozen), and re-apply any freeze a previous run persisted before serving.
+        if !duress_pins.is_empty() {
+            let count = duress_pins.len();
+            node.set_duress_beacon_pins(duress_pins);
+            out.field("Duress beacons", &format!("{count} pinned"));
+        }
+        if let Some(state_path) = duress_state_path.clone() {
+            node.set_duress_persister(Arc::new(move |freeze| {
+                match serde_json::to_vec(freeze) {
+                    Ok(bytes) => {
+                        if let Err(e) = write_secret_file(&state_path, &bytes) {
+                            error!(error = %e, path = %state_path.display(), "failed to persist duress freeze");
+                        }
+                    }
+                    Err(e) => error!(error = %e, "failed to serialize duress freeze"),
+                }
+            }));
+        }
+        if let Some(freeze) = persisted_freeze {
+            node.restore_duress_freeze(freeze);
+            out.field(
+                "Duress",
+                "FROZEN (persisted; co-signing + OPRF refused until operator clear)",
+            );
         }
         if refuse_raw_sign || require_structured_sign || oprf_auto_approve {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {

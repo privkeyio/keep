@@ -622,6 +622,21 @@ pub(crate) enum FrostNetworkCommands {
         /// --duress-beacon-pubkey.
         #[arg(long, value_name = "HEX", requires = "duress_beacon_pubkey")]
         duress_beacon_salt: Option<String>,
+        /// Coercion resistance: a group holder's duress-beacon npub to TRUST.
+        /// Repeatable. Receiving a verified beacon signed by any pinned key freezes
+        /// this node: it refuses co-signing and OPRF evaluations (fail-closed) until
+        /// an out-of-band operator clear. These are OTHER holders' beacon pubkeys
+        /// (from their `duress-provision`), distinct from this node's own
+        /// --duress-beacon-pubkey trigger.
+        #[arg(long = "duress-beacon-pin", value_name = "NPUB")]
+        duress_beacon_pins: Vec<String>,
+        /// Coercion resistance: file that makes a duress freeze STICKY across
+        /// reboot. On a freeze the state is written here; at startup an existing
+        /// file re-freezes the node before it serves, so a restart cannot silently
+        /// resume answering. Only an out-of-band operator clear (removing/clearing
+        /// this file) lifts the freeze.
+        #[arg(long, value_name = "FILE")]
+        duress_state_file: Option<PathBuf>,
     },
     Peers {
         #[arg(short, long)]

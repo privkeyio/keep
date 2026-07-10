@@ -6,8 +6,11 @@
 //! fail closed and emit a signed duress beacon. This module derives the
 //! dedicated beacon keypair from that credential and provisions it.
 
+use std::path::Path;
+
 use keep_core::crypto::{derive_key, Argon2Params, SALT_SIZE};
 use keep_core::error::{KeepError, Result};
+use keep_frost_net::DuressFreeze;
 use nostr_sdk::prelude::*;
 use secrecy::ExposeSecret;
 use subtle::ConstantTimeEq;
@@ -151,6 +154,42 @@ pub(crate) fn build_duress_event(beacon: &Keys, group_pubkey: &[u8; 32]) -> Resu
 /// staying resident, so a black-holed relay cannot hang the duress start.
 const BEACON_PUBLISH_TIMEOUT_SECS: u64 = 10;
 
+/// Parse the trusted duress-beacon pins (other holders' beacon npubs) that, when
+/// one signs a received beacon, freeze THIS node. A malformed npub is fatal , the
+/// operator meant to trust a specific key.
+pub(crate) fn parse_beacon_pins(pins: &[String]) -> Result<Vec<PublicKey>> {
+    pins.iter()
+        .map(|p| {
+            PublicKey::from_bech32(p.trim())
+                .map_err(|e| KeepError::invalid_input(format!("--duress-beacon-pin {p}: {e}")))
+        })
+        .collect()
+}
+
+/// Read a persisted duress freeze at boot. `None` if the file is absent (normal:
+/// not frozen). An existing but unparseable file is FATAL, not silently ignored:
+/// a corrupt freeze marker must fail the node closed rather than let it resume
+/// answering, which is the whole point of the sticky freeze.
+pub(crate) fn read_persisted_freeze(path: &Path) -> Result<Option<DuressFreeze>> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let freeze = serde_json::from_slice(&bytes).map_err(|e| {
+                KeepError::invalid_input(format!(
+                    "duress state file {} is present but unparseable ({e}); \
+                     refusing to start un-frozen",
+                    path.display()
+                ))
+            })?;
+            Ok(Some(freeze))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(KeepError::runtime(format!(
+            "read duress state file {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// The duress serve path: fail CLOSED (never unlock the vault or load the OPRF
 /// share, so this holder answers no evaluations and the box drops below
 /// threshold), best-effort publish ONE signed duress beacon, then stay resident
@@ -254,6 +293,35 @@ mod tests {
         // Two builds use fresh nonces, so their events differ (replay-distinct).
         let again = build_duress_event(&beacon, &group).unwrap();
         assert_ne!(event.id, again.id);
+    }
+
+    #[test]
+    fn parse_beacon_pins_parses_and_rejects() {
+        let k = Keys::generate();
+        let npub = k.public_key().to_bech32().unwrap();
+        assert_eq!(parse_beacon_pins(&[npub]).unwrap(), vec![k.public_key()]);
+        assert!(parse_beacon_pins(&["not-an-npub".to_string()]).is_err());
+    }
+
+    #[test]
+    fn read_persisted_freeze_roundtrips_and_fails_closed_on_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duress.state");
+        // Absent -> None (not frozen).
+        assert!(read_persisted_freeze(&path).unwrap().is_none());
+        // A valid persisted freeze round-trips.
+        let f = DuressFreeze {
+            beacon_pubkey: Keys::generate().public_key(),
+            nonce: [3u8; 32],
+            created_at: 99,
+        };
+        std::fs::write(&path, serde_json::to_vec(&f).unwrap()).unwrap();
+        let got = read_persisted_freeze(&path).unwrap().unwrap();
+        assert_eq!(got.created_at, 99);
+        assert_eq!(got.nonce, [3u8; 32]);
+        // A present-but-corrupt file fails closed (Err), never silently un-frozen.
+        std::fs::write(&path, b"garbage").unwrap();
+        assert!(read_persisted_freeze(&path).is_err());
     }
 
     #[test]
