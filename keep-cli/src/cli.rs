@@ -709,6 +709,12 @@ pub(crate) enum FrostNetworkCommands {
             help = "Seconds to listen for announces (>= one announce interval)"
         )]
         wait: u64,
+        #[arg(
+            long = "expected-pcr",
+            value_name = "INDEX=HEX",
+            help = "Pin a known-good reference PCR value (e.g. 11=<64 hex> for measured-boot): a peer whose attested PCR at that index differs is REFUSED instead of trust-on-first-use pinned. Repeatable."
+        )]
+        expected_pcr: Vec<String>,
     },
     Dkg {
         #[arg(short, long, help = "Group name for the new keyset")]
