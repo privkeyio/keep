@@ -76,6 +76,68 @@ fn count_selected_pcrs(selection: &[u8]) -> Result<usize> {
     Ok(selected)
 }
 
+/// The PCR indices a `TPML_PCR_SELECTION` selects, in the same order the reference
+/// digests are listed (ascending PCR within each bank). Mirrors `count_selected_pcrs`
+/// but collects the indices. keep pins a single (SHA-256) bank, so an index appears
+/// once and maps 1:1 to its reference-digest position.
+fn selected_pcr_indices(selection: &[u8]) -> Result<Vec<u32>> {
+    let bad = || err("attestation `selection` is not a valid TPML_PCR_SELECTION");
+    let mut pos = 0usize;
+    let take = |pos: &mut usize, n: usize| -> Result<&[u8]> {
+        let end = pos.checked_add(n).ok_or_else(bad)?;
+        let slice = selection.get(*pos..end).ok_or_else(bad)?;
+        *pos = end;
+        Ok(slice)
+    };
+    let count = u32::from_be_bytes(take(&mut pos, 4)?.try_into().map_err(|_| bad())?);
+    let mut indices = Vec::new();
+    for _ in 0..count {
+        take(&mut pos, 2)?; // hash alg
+        let size = take(&mut pos, 1)?[0] as usize;
+        for (byte, &b) in take(&mut pos, size)?.iter().enumerate() {
+            for bit in 0..8u32 {
+                if b & (1 << bit) != 0 {
+                    indices.push((byte as u32) * 8 + bit);
+                }
+            }
+        }
+    }
+    if pos != selection.len() {
+        return Err(bad());
+    }
+    Ok(indices)
+}
+
+/// Parse repeatable `--expected-pcr INDEX=HEX` values (e.g. `11=<64 hex>`) into a
+/// map of PCR index to its known-good 32-byte SHA-256 reference. A malformed entry,
+/// non-32-byte digest, or duplicate index is a hard error , a bad reference must
+/// fail loudly, not silently weaken the pin.
+fn parse_expected_pcrs(args: &[String]) -> Result<std::collections::BTreeMap<u32, [u8; 32]>> {
+    let mut map = std::collections::BTreeMap::new();
+    for arg in args {
+        let (idx, hex_val) = arg.split_once('=').ok_or_else(|| {
+            err(format!(
+                "--expected-pcr must be INDEX=HEX (e.g. 11=<64 hex>), got: {arg}"
+            ))
+        })?;
+        let idx: u32 = idx
+            .trim()
+            .parse()
+            .map_err(|_| err(format!("--expected-pcr index is not a number: {idx}")))?;
+        let bytes = hex::decode(hex_val.trim())
+            .map_err(|_| err(format!("--expected-pcr {idx} value is not hex")))?;
+        let digest: [u8; 32] = bytes.try_into().map_err(|_| {
+            err(format!(
+                "--expected-pcr {idx} must be a 32-byte (64 hex) SHA-256 digest"
+            ))
+        })?;
+        if map.insert(idx, digest).is_some() {
+            return Err(err(format!("--expected-pcr {idx} given more than once")));
+        }
+    }
+    Ok(map)
+}
+
 /// Read and parse a TOML attestation policy file.
 pub fn load_tpm_policy(path: &Path) -> Result<TpmAttestationPolicy> {
     let text = std::fs::read_to_string(path)
@@ -279,6 +341,7 @@ fn capture_policy_from_announces(
     out: &Output,
     group_pubkey: &[u8; 32],
     events: &[nostr_sdk::Event],
+    expected: &std::collections::BTreeMap<u32, [u8; 32]>,
 ) -> Result<AttestationConfig> {
     use std::collections::btree_map::Entry;
     use std::collections::BTreeMap;
@@ -368,6 +431,42 @@ fn capture_policy_from_announces(
             ));
             continue;
         }
+
+        // Known-good reference check (closes the TOFU gap for measured-boot PCRs): when the operator
+        // supplied `--expected-pcr`, the peer's authenticated quote must report EXACTLY the reference
+        // value at each of those PCR indices, or it is refused , not pinned. This turns "trust whatever
+        // the first box reports" into "trust only a box whose kernel/initrd (PCR 11) match the shipped
+        // UKI." The AK stays TOFU (it is genuinely per-TPM), but the boot-state PCRs are pinned to a
+        // build-derived reference, so a box compromised at first attest cannot seed the policy.
+        if !expected.is_empty() {
+            let indices = selected_pcr_indices(&sel_bytes)?;
+            let mut refused = false;
+            for (&want_idx, want_val) in expected {
+                match indices.iter().position(|&i| i == want_idx) {
+                    Some(pos) if pcr_digests[pos] == *want_val => {}
+                    Some(_) => {
+                        out.warn(&format!(
+                            "peer {} PCR {want_idx} does not match the expected reference; refusing it",
+                            payload.share_index
+                        ));
+                        refused = true;
+                        break;
+                    }
+                    None => {
+                        out.warn(&format!(
+                            "peer {} does not attest PCR {want_idx} (not in its selection); refusing it",
+                            payload.share_index
+                        ));
+                        refused = true;
+                        break;
+                    }
+                }
+            }
+            if refused {
+                continue;
+            }
+        }
+
         let sel = hex::encode(&sel_bytes);
 
         // The first attested peer fixes the shared selection + reference PCRs; a
@@ -454,21 +553,34 @@ pub fn cmd_frost_network_attestation_provision(
     relay: &str,
     out_path: &Path,
     wait_secs: u64,
+    expected_pcr: &[String],
 ) -> Result<()> {
     use nostr_sdk::prelude::*;
 
     let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
     let wait = wait_secs.max(1);
+    let expected = parse_expected_pcrs(expected_pcr)?;
 
     out.newline();
     out.header("Attestation Policy Provisioning");
     out.field("Group", group_npub);
     out.field("Relay", relay);
     out.field("Output", &out_path.display().to_string());
-    out.warn(
-        "TRUST-ON-FIRST-USE: AK pins and reference PCRs are captured from observed announces \
-         WITHOUT verifying them. Run this only on a trusted network while your holders are online.",
-    );
+    if expected.is_empty() {
+        out.warn(
+            "TRUST-ON-FIRST-USE: AK pins and reference PCRs are captured from observed announces \
+             WITHOUT verifying them. Run this only on a trusted network while your holders are \
+             online. Pass --expected-pcr to pin a known-good reference (e.g. the measured-boot \
+             PCR 11) instead.",
+        );
+    } else {
+        let pins: Vec<String> = expected.keys().map(|i| i.to_string()).collect();
+        out.field("Expected PCRs (verified, not TOFU)", &pins.join(", "));
+        out.warn(
+            "AK pins are trust-on-first-use (genuinely per-TPM), but a peer whose attested PCRs at \
+             the --expected-pcr indices differ from the reference is REFUSED, not pinned.",
+        );
+    }
     out.newline();
 
     let rt =
@@ -519,7 +631,7 @@ pub fn cmd_frost_network_attestation_provision(
         }
         spinner.finish();
 
-        capture_policy_from_announces(out, &group_pubkey, &events)
+        capture_policy_from_announces(out, &group_pubkey, &events, &expected)
     })?;
 
     let pinned = config.peer.len();
@@ -844,7 +956,8 @@ mod tests {
         );
 
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &group, &[event]).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &[event], &Default::default())
+            .expect("capture");
         assert_eq!(config.selection, "00000001000b03951800");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 2);
@@ -861,7 +974,95 @@ mod tests {
     #[test]
     fn capture_errors_without_an_attested_announce() {
         let out = Output::new();
-        assert!(capture_policy_from_announces(&out, &[7u8; 32], &[]).is_err());
+        assert!(capture_policy_from_announces(&out, &[7u8; 32], &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn selected_pcr_indices_maps_the_default_selection() {
+        // SELECTION picks {0,2,4,7,11,12}; PCR 11 sits at reference/selection index 4,
+        // which is the position the --expected-pcr 11 gate compares against.
+        let sel = hex::decode(SELECTION).unwrap();
+        assert_eq!(
+            selected_pcr_indices(&sel).unwrap(),
+            vec![0, 2, 4, 7, 11, 12]
+        );
+    }
+
+    #[test]
+    fn parse_expected_pcrs_accepts_valid_and_rejects_bad() {
+        let good = "11=".to_string() + &"ab".repeat(32);
+        let m = parse_expected_pcrs(&[good]).unwrap();
+        assert_eq!(m[&11], [0xabu8; 32]);
+        assert!(parse_expected_pcrs(&["11".to_string()]).is_err()); // no '='
+        assert!(parse_expected_pcrs(&["x=".to_string() + &"ab".repeat(32)]).is_err()); // bad index
+        assert!(parse_expected_pcrs(&["11=zz".to_string()]).is_err()); // bad hex
+        assert!(parse_expected_pcrs(&["11=abab".to_string()]).is_err()); // not 32 bytes
+        assert!(parse_expected_pcrs(&[
+            "11=".to_string() + &"ab".repeat(32),
+            "11=".to_string() + &"cd".repeat(32),
+        ])
+        .is_err()); // duplicate index
+    }
+
+    #[test]
+    fn capture_pins_peer_whose_expected_pcr_matches() {
+        let group = [7u8; 32];
+        let pcrs = default_pcrs();
+        // PCR 11 is at selection index 4 in {0,2,4,7,11,12}.
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(11u32, hex_to_32(&pcrs[4]));
+        let event = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            pcrs,
+            signed_share(&group, 2, 1_700_000_000),
+        );
+        let out = Output::new();
+        let config = capture_policy_from_announces(&out, &group, &[event], &expected)
+            .expect("a peer matching the expected PCR 11 must be pinned");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.reference_pcrs[4], pcrs_pcr11_hex());
+    }
+
+    #[test]
+    fn capture_refuses_peer_whose_expected_pcr_differs() {
+        let group = [7u8; 32];
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(11u32, [0xABu8; 32]); // NOT the announced PCR 11
+        let event = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            signed_share(&group, 2, 1_700_000_000),
+        );
+        let out = Output::new();
+        // The only peer is refused on the reference mismatch, so there is nothing to pin.
+        assert!(capture_policy_from_announces(&out, &group, &[event], &expected).is_err());
+    }
+
+    #[test]
+    fn capture_refuses_peer_not_attesting_the_expected_pcr() {
+        let group = [7u8; 32];
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(99u32, [0xABu8; 32]); // PCR 99 is not in the peer's selection
+        let event = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            signed_share(&group, 2, 1_700_000_000),
+        );
+        let out = Output::new();
+        assert!(capture_policy_from_announces(&out, &group, &[event], &expected).is_err());
+    }
+
+    fn hex_to_32(s: &str) -> [u8; 32] {
+        hex::decode(s).unwrap().try_into().unwrap()
+    }
+    fn pcrs_pcr11_hex() -> String {
+        default_pcrs()[4].clone()
     }
 
     #[test]
@@ -877,7 +1078,9 @@ mod tests {
             ([2u8; 33], [0u8; 64]),
         );
         let out = Output::new();
-        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+        assert!(
+            capture_policy_from_announces(&out, &group, &[event], &Default::default()).is_err()
+        );
     }
 
     #[test]
@@ -892,7 +1095,9 @@ mod tests {
             signed_share(&other, 2, 1_700_000_000),
         );
         let out = Output::new();
-        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+        assert!(
+            capture_policy_from_announces(&out, &group, &[event], &Default::default()).is_err()
+        );
     }
 
     #[test]
@@ -919,7 +1124,8 @@ mod tests {
             ),
         ];
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &events, &Default::default())
+            .expect("capture");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 2);
     }
@@ -947,7 +1153,8 @@ mod tests {
             ),
         ];
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &events, &Default::default())
+            .expect("capture");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 2);
     }
@@ -970,7 +1177,9 @@ mod tests {
             signed_share(&group, 2, 1_700_000_000),
         );
         let out = Output::new();
-        assert!(capture_policy_from_announces(&out, &group, &[event]).is_err());
+        assert!(
+            capture_policy_from_announces(&out, &group, &[event], &Default::default()).is_err()
+        );
     }
 
     #[test]
@@ -1001,7 +1210,8 @@ mod tests {
             ),
         ];
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &events, &Default::default())
+            .expect("capture");
         assert_eq!(config.peer.len(), 1);
         assert_eq!(config.peer[0].index, 3);
     }
@@ -1028,7 +1238,8 @@ mod tests {
             ),
         ];
         let out = Output::new();
-        let config = capture_policy_from_announces(&out, &group, &events).expect("capture");
+        let config = capture_policy_from_announces(&out, &group, &events, &Default::default())
+            .expect("capture");
         assert_eq!(config.peer.len(), 1);
     }
 }
