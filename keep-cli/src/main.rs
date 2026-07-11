@@ -358,7 +358,7 @@ fn dispatch_frost_network(
             commands::frost_network::cmd_frost_network_peers(out, path, &group, relay)
         }
         FrostNetworkCommands::DuressProvision => {
-            commands::frost_network::cmd_frost_network_duress_provision(out)
+            commands::frost_network::cmd_frost_network_duress_provision(out, path)
         }
         FrostNetworkCommands::DuressClear {
             state_file,

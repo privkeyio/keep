@@ -261,6 +261,18 @@ impl Keep {
         self.storage.verify_password(password)
     }
 
+    /// Read-only pre-flight check of whether `password` is this vault's password,
+    /// WITHOUT touching the rate limiter, audit log, keyring, or unlock state.
+    /// `Ok(true)` = matches, `Ok(false)` = wrong password, `Err` = could not check.
+    /// Unlike [`Self::verify_password`] it does not record a rate-limit attempt and
+    /// is not blocked by an active backoff, so a pre-flight check cannot self-inflict
+    /// a lockout nor be silently skipped. Because it does not rate-limit, use it only
+    /// on local, operator-driven paths (e.g. the duress-provision anti-brick guard),
+    /// never as a remote or automated unlock oracle.
+    pub fn password_matches(&self, password: &str) -> Result<bool> {
+        self.storage.password_matches(password)
+    }
+
     /// Lock and clear all keys from memory.
     pub fn lock(&mut self) {
         self.audit_event(AuditEventType::VaultLock, |e| e);
