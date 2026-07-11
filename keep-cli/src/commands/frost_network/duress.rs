@@ -63,18 +63,21 @@ enum DuressVaultCheck {
     VaultUnavailable(String),
 }
 
-/// Test whether `candidate` is the vault password by attempting to unlock the vault
-/// at `path` with it. Split from the command so the anti-brick check is unit-testable
-/// without an interactive prompt.
+/// Test whether `candidate` is the vault password at `path`, via the read-only
+/// [`keep_core::Keep::password_matches`] pre-flight check (NOT an unlock): it does
+/// not touch the rate limiter, so this guard can neither self-inflict a lockout nor
+/// be silently skipped when the vault is in backoff. A candidate that could not be
+/// tested (crypto error, or the vault could not be opened) is reported as
+/// `VaultUnavailable` , the caller warns rather than treating "unknown" as "distinct"
+/// and letting the footgun through. Split out so the check is unit-testable.
 fn check_duress_vs_vault(path: &Path, candidate: &str) -> DuressVaultCheck {
-    match keep_core::Keep::open(path) {
-        Ok(mut keep) => {
-            if keep.unlock(candidate).is_ok() {
-                DuressVaultCheck::EqualsVaultPassword
-            } else {
-                DuressVaultCheck::Distinct
-            }
-        }
+    let keep = match keep_core::Keep::open(path) {
+        Ok(k) => k,
+        Err(e) => return DuressVaultCheck::VaultUnavailable(e.to_string()),
+    };
+    match keep.password_matches(candidate) {
+        Ok(true) => DuressVaultCheck::EqualsVaultPassword,
+        Ok(false) => DuressVaultCheck::Distinct,
         Err(e) => DuressVaultCheck::VaultUnavailable(e.to_string()),
     }
 }

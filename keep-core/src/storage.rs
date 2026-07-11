@@ -653,6 +653,38 @@ impl Storage {
         }
     }
 
+    /// Check whether `password` decrypts the vault header, WITHOUT touching the
+    /// rate limiter, the audit log, the keyring, or the unlock state. Returns
+    /// `Ok(true)` if it matches, `Ok(false)` if it is simply the wrong password,
+    /// and `Err` only if the check could not be performed (a crypto/KDF error).
+    ///
+    /// This is a read-only pre-flight primitive, NOT an unlock path. Unlike
+    /// [`Self::verify_password`] / [`Self::unlock`] it deliberately bypasses the
+    /// rate limiter: it neither consumes a real-unlock attempt (so a pre-flight
+    /// check cannot self-inflict a lockout) nor is defeated by an active backoff
+    /// (so it cannot be silently skipped when the vault is rate-limited). Because
+    /// it does not rate-limit, callers MUST keep it on a local, operator-driven
+    /// path (it needs the vault file already, same as an offline attacker) and
+    /// MUST NOT expose it as a remote or automated unlock oracle.
+    pub(crate) fn password_matches(&self, password: &str) -> Result<bool> {
+        validate_password_max_len(password)?;
+        let master_key = crypto::derive_key(
+            password.as_bytes(),
+            &self.header.salt,
+            self.header.argon2_params(),
+        )?;
+        let header_key = crypto::derive_subkey(&master_key, b"keep-header-key")?;
+        let encrypted = EncryptedData {
+            nonce: self.header.nonce,
+            ciphertext: self.header.encrypted_data_key.to_vec(),
+        };
+        match crypto::decrypt(&encrypted, &header_key) {
+            Ok(_) => Ok(true),
+            Err(KeepError::DecryptionFailed) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     fn unlock_inner(&mut self, password: &str) -> Result<()> {
         validate_password_max_len(password)?;
 
@@ -1922,6 +1954,32 @@ mod tests {
                 .apply_replicated_record("keys", &id, &enc, now + MAX_FUTURE_SKEW_SECS, now)
                 .unwrap(),
             ReplicatedApply::Applied
+        );
+    }
+
+    #[test]
+    fn password_matches_is_rate_limit_free() {
+        let dir = tempdir().unwrap();
+        let storage = Storage::create(
+            &dir.path().join("v"),
+            "rightpassword",
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+
+        // Correct classification: right password matches, wrong password does not.
+        assert!(storage.password_matches("rightpassword").unwrap());
+        assert!(!storage.password_matches("wrongpassword").unwrap());
+
+        // Hammer wrong passwords well past MAX_ATTEMPTS (5): password_matches must
+        // record no failures, so the rate limiter never trips. If it did, the real
+        // verify below would return RateLimited before decrypting.
+        for _ in 0..8 {
+            assert!(!storage.password_matches("nope").unwrap());
+        }
+        assert!(
+            storage.verify_password("rightpassword").is_ok(),
+            "password_matches must not touch the rate limiter (a pre-flight check cannot self-lock the vault)"
         );
     }
 
