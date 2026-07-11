@@ -53,13 +53,40 @@ pub(crate) fn derive_beacon_key(
     Ok(Keys::new(secret))
 }
 
+/// Outcome of testing a candidate duress credential against the vault at a path.
+enum DuressVaultCheck {
+    /// The candidate does NOT unlock the vault: safe, distinct from the vault password.
+    Distinct,
+    /// The candidate unlocks the vault, i.e. it IS the vault password (the brick footgun).
+    EqualsVaultPassword,
+    /// The vault could not be opened (e.g. it does not exist yet); check skipped.
+    VaultUnavailable(String),
+}
+
+/// Test whether `candidate` is the vault password by attempting to unlock the vault
+/// at `path` with it. Split from the command so the anti-brick check is unit-testable
+/// without an interactive prompt.
+fn check_duress_vs_vault(path: &Path, candidate: &str) -> DuressVaultCheck {
+    match keep_core::Keep::open(path) {
+        Ok(mut keep) => {
+            if keep.unlock(candidate).is_ok() {
+                DuressVaultCheck::EqualsVaultPassword
+            } else {
+                DuressVaultCheck::Distinct
+            }
+        }
+        Err(e) => DuressVaultCheck::VaultUnavailable(e.to_string()),
+    }
+}
+
 /// `keep frost network duress-provision`: interactively provision a duress
 /// credential and print the beacon pubkey (to pin with the cluster) plus the salt
-/// (to configure on `serve`). Purely local , it derives, prints, and forgets. The
-/// credential itself is NEVER stored (serve re-derives from the entered password
-/// and compares the pubkey), so a coercer inspecting config finds only a pubkey
-/// and a salt, not the duress trigger.
-pub fn cmd_frost_network_duress_provision(out: &Output) -> Result<()> {
+/// (to configure on `serve`). It derives, prints, and forgets; the credential is
+/// NEVER stored (serve re-derives from the entered password and compares the
+/// pubkey), so a coercer inspecting config finds only a pubkey and a salt, not the
+/// duress trigger. It does touch the vault at `path` once, read-only, to reject a
+/// duress credential equal to the vault password (see below).
+pub fn cmd_frost_network_duress_provision(out: &Output, path: &Path) -> Result<()> {
     out.header("Duress Provisioning");
     out.warn(
         "Choose a DURESS credential DISTINCT from your vault password. Entering it at `serve` \
@@ -68,6 +95,30 @@ pub fn cmd_frost_network_duress_provision(out: &Output) -> Result<()> {
          stored.",
     );
     let credential = get_duress_credential("Enter duress credential", "Confirm duress credential")?;
+
+    // Reject a duress credential that IS the vault password. At `serve`, match_duress
+    // runs before unlock, so if the two are equal every NORMAL unlock takes the
+    // fail-closed duress path and normal operation is permanently bricked. The
+    // KEEP_PASSWORD env case is caught in get_duress_credential; this catches the
+    // interactive case by testing the candidate against the ACTUAL vault (robust even
+    // when the vault password is complex). If the vault cannot be opened (e.g.
+    // provisioning before it exists), warn rather than silently allow the footgun.
+    match check_duress_vs_vault(path, credential.expose_secret()) {
+        DuressVaultCheck::EqualsVaultPassword => {
+            return Err(KeepError::invalid_input(
+                "duress credential must be DISTINCT from the vault password: it unlocks this \
+                 vault, so at `serve` every normal unlock would take the fail-closed duress \
+                 path and permanently brick normal operation",
+            ))
+        }
+        DuressVaultCheck::VaultUnavailable(e) => out.warn(&format!(
+            "could not open the vault at the configured path to verify the duress credential \
+             differs from the vault password ({e}); make sure it does, or a normal unlock will \
+             fail closed"
+        )),
+        DuressVaultCheck::Distinct => {}
+    }
+
     let salt: [u8; SALT_SIZE] = keep_core::entropy::try_random_bytes()?;
     let beacon = derive_beacon_key(credential.expose_secret(), &salt, DURESS_BEACON_ARGON2)?;
     let npub = beacon
@@ -552,6 +603,32 @@ mod tests {
         let a = derive_beacon_key("correct horse battery staple", &salt, P).unwrap();
         let b = derive_beacon_key("correct horse battery staple", &salt, P).unwrap();
         assert_eq!(a.public_key(), b.public_key());
+    }
+
+    #[test]
+    fn duress_provision_rejects_credential_equal_to_vault_password() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep::create requires a non-existent path (it creates the vault dir).
+        let vault = dir.path().join("vault");
+        let vault_pw = "the-real-vault-password";
+        // Fast params so the test is quick; unlock reads the stored params back.
+        keep_core::Keep::create_with_params(&vault, vault_pw, P).unwrap();
+
+        // The vault password IS detected , the brick footgun the guard blocks.
+        assert!(matches!(
+            check_duress_vs_vault(&vault, vault_pw),
+            DuressVaultCheck::EqualsVaultPassword
+        ));
+        // A distinct credential is allowed through.
+        assert!(matches!(
+            check_duress_vs_vault(&vault, "a-different-duress-credential"),
+            DuressVaultCheck::Distinct
+        ));
+        // A path with no vault skips the check (the caller warns) rather than hard-failing.
+        assert!(matches!(
+            check_duress_vs_vault(&dir.path().join("nope"), vault_pw),
+            DuressVaultCheck::VaultUnavailable(_)
+        ));
     }
 
     #[test]
