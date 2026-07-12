@@ -294,8 +294,9 @@ pub mod unlock {
     use voprf::{BlindedElement, OprfClient};
 
     /// Client state for one unlock attempt: the voprf blinding secret plus the unlock input,
-    /// both needed at [`Client::finalize_luks_key`]. The input is a fixed, low-entropy label, so
-    /// the eval oracle MUST be authenticated and rate-limited (see [`evaluate`]).
+    /// both needed at [`Client::finalize_luks_key`]. The input is a fixed label, so the eval oracle
+    /// MUST AUTHENTICATE its callers (that is what protects the key); rate-limiting it is DoS hygiene
+    /// only (see [`evaluate`]).
     pub struct Client {
         state: OprfClient<Secp256k1Sha256>,
         input: Vec<u8>,

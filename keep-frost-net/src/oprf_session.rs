@@ -290,11 +290,12 @@ impl Default for OprfUnlockSessionManager {
 /// SECURITY: this is DoS hygiene for the oracle, NOT the anti-grinding control. The
 /// OPRF-unlock input is FIXED, so obtaining the key needs exactly one evaluation per
 /// holder, not many -- a rate cap therefore cannot be what resists offline guessing.
-/// What actually gates the oracle is per-requester AUTHENTICATION: the fresh
-/// measured-boot attestation check and the duress freeze in the #621 gate chain,
-/// which only let a genuinely-booted, non-duressed box obtain any evaluation at all.
-/// This limiter bounds how much an already-authenticated requester can load the
-/// oracle, capping each at [`MAX_OPRF_EVALS_PER_WINDOW`] evaluations per
+/// What actually protects the key is the #621 gate chain: the per-requester
+/// fresh-measured-boot attestation check (the anti-theft control -- only a
+/// genuinely-booted box is admitted) plus the holder's own duress self-freeze (the
+/// anti-coercion control -- a duressed holder refuses ALL evaluations). This limiter
+/// bounds how much an already-authenticated requester can load the oracle, capping
+/// each at [`MAX_OPRF_EVALS_PER_WINDOW`] evaluations per
 /// [`OPRF_EVAL_WINDOW`]; beyond that the holder refuses with
 /// [`FrostNetError::RateLimited`].
 ///

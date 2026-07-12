@@ -2519,9 +2519,9 @@ impl KfpNode {
 
         let now = Timestamp::now().as_secs();
         // `payload.timestamp` is attacker-controlled and this runs BEFORE verify_proof, so use
-        // saturating arithmetic (matching within_replay_window): an unchecked add would wrap on a
-        // near-u64::MAX timestamp today and, under an `overflow-checks = true` release build, panic
-        // -- a remote pre-auth DoS on the discovery/boot gate.
+        // saturating arithmetic (as within_replay_window does for the same reason): an unchecked add
+        // would wrap on a near-u64::MAX timestamp today and, under an `overflow-checks = true` release
+        // build, panic -- a remote pre-auth DoS on the discovery/boot gate.
         if payload.timestamp.saturating_add(ANNOUNCE_MAX_AGE_SECS) < now {
             debug!(
                 timestamp = payload.timestamp,
