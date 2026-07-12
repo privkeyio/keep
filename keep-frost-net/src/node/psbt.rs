@@ -558,18 +558,26 @@ impl KfpNode {
 
         self.verify_descriptor_hash_against_stored(&payload.descriptor_hash)?;
 
-        self.reject_dual_identity_signers(
-            &payload.expected_signers,
-            &payload.expected_fingerprints,
-        )?;
+        // Canonicalize the wire-supplied fingerprints to lowercase once, mirroring
+        // the proposer path (propose_psbt) and the stored recovery fingerprints.
+        // detect_dual_identity_signer, the session signers set, and our own
+        // self-check below all expect lowercase; comparing against the raw wire
+        // values would let a proposer send uppercase fingerprints to sidestep the
+        // dual-identity (Sybil-toward-quorum) guard and desync the signer sets.
+        let expected_fingerprints: Vec<String> = payload
+            .expected_fingerprints
+            .iter()
+            .map(|fp| fp.to_ascii_lowercase())
+            .collect();
+
+        self.reject_dual_identity_signers(&payload.expected_signers, &expected_fingerprints)?;
 
         let signers: HashSet<SignerId> = payload
             .expected_signers
             .iter()
             .map(|idx| SignerId::Share(*idx))
             .chain(
-                payload
-                    .expected_fingerprints
+                expected_fingerprints
                     .iter()
                     .map(|fp| SignerId::Fingerprint(fp.clone())),
             )
@@ -630,8 +638,7 @@ impl KfpNode {
         let our_index = self.share.metadata.identifier;
         let our_fingerprints = self.own_recovery_fingerprints();
         let we_are_share_signer = payload.expected_signers.contains(&our_index);
-        let we_are_external_signer = payload
-            .expected_fingerprints
+        let we_are_external_signer = expected_fingerprints
             .iter()
             .any(|fp| our_fingerprints.contains(fp));
         if we_are_share_signer || we_are_external_signer {
@@ -1576,16 +1583,21 @@ fn proposer_authorized(proposers: &HashSet<u16>, share_index: u16) -> Result<()>
 /// expected fingerprint signer, which would let one identity satisfy the
 /// threshold twice (Sybil toward quorum). `share_signers` supplies each
 /// expected share signer's recovery-xpub fingerprints; a match against
-/// `expected_fingerprints` (case-insensitive on the peer side, as stored) is
-/// rejected. Pure so the overlap logic is directly testable.
+/// `expected_fingerprints` (compared case-insensitively) is rejected. Both sides
+/// are lowercased here so the guard holds even if a caller passes wire values
+/// that were not pre-normalized. Pure so the overlap logic is directly testable.
 fn detect_dual_identity_signer<'a>(
     share_signers: impl IntoIterator<Item = (u16, &'a [String])>,
     expected_fingerprints: &[String],
 ) -> Result<()> {
+    let expected_lc: Vec<String> = expected_fingerprints
+        .iter()
+        .map(|fp| fp.to_ascii_lowercase())
+        .collect();
     for (idx, fingerprints) in share_signers {
         for fp in fingerprints {
             let fp_lc = fp.to_ascii_lowercase();
-            if expected_fingerprints.contains(&fp_lc) {
+            if expected_lc.contains(&fp_lc) {
                 return Err(FrostNetError::Session(format!(
                     "Dual-identity signer rejected: share {idx} and fingerprint {fp_lc} resolve to the same peer"
                 )));
@@ -2659,6 +2671,19 @@ mod proposer_and_identity_tests {
         let fps = vec!["DEADBEEF".to_string()];
         let share_signers = vec![(2u16, fps.as_slice())];
         let expected = vec!["deadbeef".to_string()];
+        assert!(detect_dual_identity_signer(share_signers, &expected).is_err());
+    }
+
+    #[test]
+    fn dual_identity_match_is_case_insensitive_on_expected_side() {
+        // Expected (wire-supplied) fingerprint upper-case, peer lower-case: the
+        // overlap must still be caught. Before the responder normalized wire
+        // fingerprints and the guard lowercased its expected side, an uppercase
+        // wire value slipped past this check, letting one identity count as both
+        // a share signer and an external signer (dual-identity guard bypass).
+        let fps = vec!["deadbeef".to_string()];
+        let share_signers = vec![(2u16, fps.as_slice())];
+        let expected = vec!["DEADBEEF".to_string()];
         assert!(detect_dual_identity_signer(share_signers, &expected).is_err());
     }
 
