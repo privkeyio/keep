@@ -287,17 +287,25 @@ impl Default for OprfUnlockSessionManager {
 /// Per-requester sliding-window rate limiter for the holder-side OPRF evaluation
 /// oracle.
 ///
-/// SECURITY: the OPRF-unlock input is a fixed, low-entropy label, so the
-/// unlock's resistance to offline guessing depends on bounding how many
-/// evaluations any one identity can obtain (see
-/// `keep_core::oprf::threshold::partial_eval`). This caps each requester at
-/// [`MAX_OPRF_EVALS_PER_WINDOW`] evaluations per [`OPRF_EVAL_WINDOW`]; beyond
-/// that the holder refuses with [`FrostNetError::RateLimited`].
+/// SECURITY: this is DoS hygiene for the oracle, NOT the anti-grinding control. The
+/// OPRF-unlock input is FIXED, so obtaining the key needs exactly one evaluation per
+/// holder, not many -- a rate cap therefore cannot be what resists offline guessing.
+/// What actually gates the oracle is per-requester AUTHENTICATION: the fresh
+/// measured-boot attestation check and the duress freeze in the #621 gate chain,
+/// which only let a genuinely-booted, non-duressed box obtain any evaluation at all.
+/// This limiter bounds how much an already-authenticated requester can load the
+/// oracle, capping each at [`MAX_OPRF_EVALS_PER_WINDOW`] evaluations per
+/// [`OPRF_EVAL_WINDOW`]; beyond that the holder refuses with
+/// [`FrostNetError::RateLimited`].
 ///
-/// Memory ceiling: tracked identities are pruned lazily once their window
-/// empties, and the table is capped at [`MAX_TRACKED_REQUESTERS`]. If a
-/// finer-grained guarantee is ever needed (e.g. global eval budget), upgrade
-/// this to a token-bucket keyed by both identity and group.
+/// It is keyed on the requester's transport pubkey, i.e. a per-connection DoS bound,
+/// not a per-share budget: a genuine box that rotates its transport identity gets a
+/// fresh bucket. That is acceptable precisely because the anti-grinding guarantee does
+/// not rest on it; if a per-share budget is ever wanted, key on
+/// (group_pubkey, share_index) instead.
+///
+/// Memory ceiling: tracked identities are pruned lazily once their window empties, and
+/// the table is capped at [`MAX_TRACKED_REQUESTERS`].
 pub const MAX_OPRF_EVALS_PER_WINDOW: u32 = 8;
 pub const OPRF_EVAL_WINDOW: Duration = Duration::from_secs(60);
 const MAX_TRACKED_REQUESTERS: usize = 1024;

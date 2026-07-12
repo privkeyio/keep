@@ -1906,6 +1906,15 @@ impl KfpNode {
         threshold: usize,
         exclude: &[u16],
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+        // Defensive: every real group has threshold >= 2 (split_key rejects t < 2), but guard against
+        // a 0 threshold so the `threshold - 1` sample count below cannot underflow into a huge value
+        // and panic. Fail closed.
+        if threshold == 0 {
+            return Err(FrostNetError::InsufficientPeers {
+                needed: 0,
+                available: 0,
+            });
+        }
         let selected_peers: Vec<Peer> = {
             let peers = self.peers.read();
             let eligible_peers: Vec<_> = peers
@@ -2509,7 +2518,11 @@ impl KfpNode {
         }
 
         let now = Timestamp::now().as_secs();
-        if payload.timestamp + ANNOUNCE_MAX_AGE_SECS < now {
+        // `payload.timestamp` is attacker-controlled and this runs BEFORE verify_proof, so use
+        // saturating arithmetic (matching within_replay_window): an unchecked add would wrap on a
+        // near-u64::MAX timestamp today and, under an `overflow-checks = true` release build, panic
+        // -- a remote pre-auth DoS on the discovery/boot gate.
+        if payload.timestamp.saturating_add(ANNOUNCE_MAX_AGE_SECS) < now {
             debug!(
                 timestamp = payload.timestamp,
                 now, "Rejecting stale announcement"
@@ -2518,7 +2531,7 @@ impl KfpNode {
                 "Announcement timestamp too old".into(),
             ));
         }
-        if payload.timestamp > now + ANNOUNCE_MAX_FUTURE_SECS {
+        if payload.timestamp > now.saturating_add(ANNOUNCE_MAX_FUTURE_SECS) {
             debug!(
                 timestamp = payload.timestamp,
                 now, "Rejecting future-dated announcement"
