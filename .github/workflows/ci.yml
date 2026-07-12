@@ -218,6 +218,9 @@ jobs:
       - name: Fuzz FROST messages
         run: cargo +nightly fuzz run fuzz_frost_messages -- -max_total_time=30
         working-directory: fuzz
+      - name: Fuzz TPM quote parsing
+        run: cargo +nightly fuzz run fuzz_tpm_quote -- -max_total_time=30
+        working-directory: fuzz
       - name: Fuzz encrypted data
         run: cargo +nightly fuzz run fuzz_encrypted_data -- -max_total_time=30
         working-directory: fuzz
