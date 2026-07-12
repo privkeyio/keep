@@ -97,10 +97,13 @@ pub mod threshold {
     /// A share-holder's partial evaluation: `P_i = s_i * B`, carrying the same identifier so the
     /// combination knows its Lagrange index. The share `s_i` never leaves the holder.
     ///
-    /// SECURITY: the transport layer that exposes this evaluation oracle to clients MUST enforce
-    /// per-identity authentication and strict rate limiting. The OPRF-unlock's resistance to
-    /// low-entropy-input guessing depends on bounding the number of evaluations an attacker can
-    /// obtain; an unbounded or unauthenticated oracle reduces it to an offline brute force.
+    /// SECURITY: the transport exposing this oracle MUST AUTHENTICATE the caller before returning a
+    /// partial -- for keep, only a genuinely-booted (fresh measured-boot attestation) and non-duressed
+    /// box. That authentication is what protects the fixed unlock input: an unauthenticated oracle
+    /// hands the key to a stolen/reflashed box. Rate-limiting the authenticated caller is DoS hygiene,
+    /// not anti-grinding: the unlock input is FIXED, so a caller that passes authentication needs only
+    /// one evaluation per holder, and bounding evaluations adds no offline-guessing resistance for a
+    /// fixed input.
     pub fn partial_eval(
         share: &KeyShare,
         blinded: &BlindedElement<Secp256k1Sha256>,
@@ -291,8 +294,9 @@ pub mod unlock {
     use voprf::{BlindedElement, OprfClient};
 
     /// Client state for one unlock attempt: the voprf blinding secret plus the unlock input,
-    /// both needed at [`Client::finalize_luks_key`]. The input is a fixed, low-entropy label, so
-    /// the eval oracle MUST be authenticated and rate-limited (see [`evaluate`]).
+    /// both needed at [`Client::finalize_luks_key`]. The input is a fixed label, so the eval oracle
+    /// MUST AUTHENTICATE its callers (that is what protects the key); rate-limiting it is DoS hygiene
+    /// only (see [`evaluate`]).
     pub struct Client {
         state: OprfClient<Secp256k1Sha256>,
         input: Vec<u8>,
@@ -340,9 +344,10 @@ pub mod unlock {
     /// holder's key share, returning the partial evaluation as wire bytes. The share never leaves
     /// the holder.
     ///
-    /// SECURITY: the transport exposing this oracle MUST authenticate the caller and strictly
-    /// rate-limit it. Bounding evaluations is what keeps the fixed, low-entropy unlock input from
-    /// being brute-forced offline (see [`super::threshold::partial_eval`]).
+    /// SECURITY: the transport exposing this oracle MUST AUTHENTICATE the caller before returning a
+    /// partial -- that authentication (an attested, non-duressed requester), not a rate cap, is what
+    /// protects the fixed unlock input. Rate-limit the authenticated caller for DoS hygiene only (see
+    /// [`super::threshold::partial_eval`]).
     pub fn evaluate(
         share: &KeyShare,
         blinded: &[u8],

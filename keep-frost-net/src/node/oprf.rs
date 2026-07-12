@@ -135,8 +135,9 @@ impl KfpNode {
             }
         }
 
-        // Rate-limit the oracle per requester. Bounding evaluations is what keeps
-        // the fixed, low-entropy unlock input from being brute-forced offline.
+        // DoS-hygiene rate limit on the oracle. This is NOT the anti-grinding control (the fresh
+        // attestation gate just above is): the unlock input is fixed, so one eval per holder yields
+        // the key and a rate cap adds no offline-guessing resistance. See OprfEvalRateLimiter's doc.
         if !self.oprf_rate_limiter.write().check_and_record(from) {
             warn!(from = %from, "Rejecting OPRF eval request: rate limit exceeded");
             return Err(FrostNetError::RateLimited(format!(
