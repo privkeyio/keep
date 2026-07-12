@@ -19,7 +19,32 @@ use crate::event::KfpEventBuilder;
 use crate::oprf_session::derive_oprf_session_id;
 use crate::protocol::*;
 
+use super::signing::MAX_FAILOVER_ATTEMPTS;
 use super::{KfpNode, KfpNodeEvent};
+
+/// Failure of a single OPRF unlock round. `non_responders` carries the sampled
+/// holders that never deposited a partial (populated only on a timeout), so the
+/// failover loop can exclude them from the next round.
+struct OprfRoundError {
+    error: FrostNetError,
+    non_responders: Vec<u16>,
+}
+
+impl OprfRoundError {
+    /// A fatal round error with no failover hint (not a holder-silence timeout).
+    fn fatal(error: FrostNetError) -> Self {
+        Self {
+            error,
+            non_responders: Vec::new(),
+        }
+    }
+}
+
+impl From<FrostNetError> for OprfRoundError {
+    fn from(error: FrostNetError) -> Self {
+        Self::fatal(error)
+    }
+}
 
 impl KfpNode {
     /// Holder side: evaluate a box's blinded element with this node's dedicated
@@ -247,20 +272,110 @@ impl KfpNode {
     /// the FROST threshold to `finalize_luks_key`); a mismatch makes every
     /// finalize fail. The node with FROST identifier `i` must hold the OPRF share
     /// at vsss index `i`.
+    /// Threshold OPRF unlock with in-attempt holder failover.
+    ///
+    /// A single unlock samples `threshold-1` holders and waits one timeout for
+    /// their partials. On timeout with fewer than `threshold` partials, the
+    /// holders that never answered are excluded and a fresh round re-samples
+    /// from the remaining eligible holders, up to `MAX_FAILOVER_ATTEMPTS`. This
+    /// fails over to a live holder in seconds instead of failing the boot closed
+    /// when one holder is momentarily unreachable (the real target: a
+    /// geo-distributed holder on a flaky network). Mirrors the FROST signing
+    /// failover (`signing.rs`).
+    ///
+    /// Failover keys off a `Timeout` (silence) ONLY. A holder that answers but
+    /// rejects (duress-frozen, unattested, rate-limited, or approval-denied)
+    /// simply sends nothing, so it is indistinguishable from unreachable and is
+    /// correctly excluded. A holder whose partial reaches the box but fails to
+    /// combine surfaces as `Session`/`OprfUnlockFailed`, which is a real
+    /// cryptographic rejection and is surfaced to the caller unchanged (retrying
+    /// a different holder would combine to the same key, so it cannot help and
+    /// must not mask a misbehaving holder). Re-sampling never re-hits an excluded
+    /// holder, so no holder's per-requester rate limit or attestation gate is
+    /// bypassed; each round contacts each holder at most once for the same fixed
+    /// blinded input, so it is not a grinding vector.
     pub async fn request_oprf_unlock(
         &self,
         input: &[u8],
         volume_id: &str,
         epoch: u32,
     ) -> Result<Zeroizing<[u8; 32]>> {
-        let oprf_share = self.oprf_key_share.as_ref().ok_or_else(|| {
-            FrostNetError::Crypto("Node has no OPRF key share; cannot initiate unlock".into())
-        })?;
+        // Fail fast once if this node holds no OPRF share, before any round.
+        if self.oprf_key_share.is_none() {
+            return Err(FrostNetError::Crypto(
+                "Node has no OPRF key share; cannot initiate unlock".into(),
+            ));
+        }
+
+        let mut excluded: Vec<u16> = Vec::new();
+        for attempt in 0..MAX_FAILOVER_ATTEMPTS {
+            let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
+            match self
+                .oprf_unlock_round(input, volume_id, epoch, &excluded)
+                .await
+            {
+                Ok(key) => return Ok(key),
+                Err(OprfRoundError {
+                    error: FrostNetError::Timeout(_),
+                    non_responders,
+                }) if !last => {
+                    if non_responders.is_empty() {
+                        warn!(
+                            attempt,
+                            "OPRF unlock round timed out with no identifiable non-responders; re-sampling and retrying"
+                        );
+                    } else {
+                        warn!(
+                            excluded = ?non_responders,
+                            attempt,
+                            "OPRF unlock round timed out; excluding unresponsive holders and retrying"
+                        );
+                        excluded.extend(non_responders);
+                    }
+                }
+                Err(OprfRoundError {
+                    error: FrostNetError::InsufficientPeers { .. },
+                    ..
+                }) if !excluded.is_empty() => {
+                    // Failover exhausted the eligible holder set (each retry
+                    // excludes more until fewer than threshold remain). Surface
+                    // the aggregate timeout, not InsufficientPeers, which would
+                    // wrongly suggest the group was undersized.
+                    warn!(
+                        attempt,
+                        "OPRF failover exhausted the eligible holder set; surfacing aggregate timeout"
+                    );
+                    break;
+                }
+                Err(OprfRoundError { error, .. }) => return Err(error),
+            }
+        }
+        Err(FrostNetError::Timeout(
+            "OPRF unlock request timed out after failover".into(),
+        ))
+    }
+
+    /// One OPRF unlock round: sample (excluding `excluded`), blind, send, and
+    /// wait one timeout. On timeout, the returned `non_responders` are the
+    /// sampled holders that never deposited a partial, so the caller can exclude
+    /// them and fail over.
+    async fn oprf_unlock_round(
+        &self,
+        input: &[u8],
+        volume_id: &str,
+        epoch: u32,
+        excluded: &[u16],
+    ) -> std::result::Result<Zeroizing<[u8; 32]>, OprfRoundError> {
+        let oprf_share = self
+            .oprf_key_share
+            .as_ref()
+            .expect("caller checked oprf_key_share is present");
 
         let threshold = self.share.metadata.threshold;
 
-        let (participants, participant_peers) =
-            self.select_eligible_peers(threshold as usize, &[])?;
+        let (participants, participant_peers) = self
+            .select_eligible_peers(threshold as usize, excluded)
+            .map_err(OprfRoundError::fatal)?;
 
         let (client, blinded) = keep_core::oprf::unlock::blind(input)
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
@@ -325,7 +440,7 @@ impl KfpNode {
         .await;
         if let Err(e) = send_result {
             self.oprf_sessions.write().complete_session(&session_id);
-            return Err(e);
+            return Err(OprfRoundError::fatal(e));
         }
 
         // Single-participant (threshold=1) or quorum already met by our own
@@ -337,7 +452,7 @@ impl KfpNode {
                     Ok(key) => key,
                     Err(e) => {
                         oprf_sessions.complete_session(&session_id);
-                        return Err(e);
+                        return Err(OprfRoundError::fatal(e));
                     }
                 },
                 _ => None,
@@ -398,11 +513,42 @@ impl KfpNode {
                 "OPRF unlock request timed out".into(),
             )),
         };
-        // Tear down the session on any non-success exit so it does not linger
-        // until cleanup_expired reaps it (matches request_ecdh).
-        if result.is_err() {
-            self.oprf_sessions.write().complete_session(&session_id);
+        match result {
+            Ok(key) => Ok(key),
+            Err(error) => {
+                // On a timeout, identify the sampled holders that never
+                // deposited a partial so the caller can exclude them and fail
+                // over to other eligible holders. Read responders BEFORE tearing
+                // the session down. A non-timeout error (a real cryptographic
+                // rejection or a transport fault) carries no non-responders, so
+                // the caller surfaces it unchanged.
+                let non_responders = if matches!(error, FrostNetError::Timeout(_)) {
+                    let sessions = self.oprf_sessions.read();
+                    match sessions.get_session(&session_id) {
+                        Some(s) => {
+                            let responded: std::collections::HashSet<u16> =
+                                s.responders().into_iter().collect();
+                            participants
+                                .iter()
+                                .copied()
+                                .filter(|p| {
+                                    *p != self.share.metadata.identifier && !responded.contains(p)
+                                })
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                // Tear the session down on any non-success exit so it does not
+                // linger until cleanup_expired reaps it (matches request_ecdh).
+                self.oprf_sessions.write().complete_session(&session_id);
+                Err(OprfRoundError {
+                    error,
+                    non_responders,
+                })
+            }
         }
-        result
     }
 }

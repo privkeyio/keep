@@ -2443,6 +2443,136 @@ async fn test_oprf_unlock_completes_with_one_holder() {
     );
 }
 
+/// Failover: in a 2-of-3, one holder is persistently silent (its default
+/// approval hook DENIES, so it clears attestation + rate limit but returns no
+/// partial, which is indistinguishable from unreachable from the box's side).
+/// The box samples `threshold-1 = 1` holder at random; when it lands on the
+/// silent one it must exclude it and re-sample the live holder WITHIN the same
+/// unlock, instead of failing the boot closed. This is the geo-distributed
+/// flaky-holder case. A short session timeout keeps each failover round quick.
+///
+/// With failover, every iteration derives a key (immediate when the live holder
+/// is sampled, else after one failover round), so this test is deterministically
+/// green. A regression that drops failover fails any iteration that samples the
+/// silent holder, i.e. with probability `1 - 0.5^6` across the loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_oprf_unlock_fails_over_when_one_holder_silent() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let config = ThresholdConfig::two_of_three();
+    let dealer = TrustedDealer::new(config);
+    let (mut shares, _pkg) = dealer.generate("test-oprf-failover").unwrap();
+    let share1 = shares.remove(0); // FROST id 1 = box
+    let share2 = shares.remove(0); // FROST id 2 = silent holder
+    let share3 = shares.remove(0); // FROST id 3 = live holder
+
+    let oprf = split_oprf_key_2of3();
+
+    // Short session timeout so a failover round costs ~3s, not the 30s default.
+    let short = Some(Duration::from_secs(3));
+    let mut node1 = KfpNode::with_nonce_store(share1, vec![relay.clone()], None, None, short)
+        .await
+        .expect("box node");
+    node1.set_oprf_key_share(oprf[0]);
+    // node2 keeps the DEFAULT approval hook, which DENIES: it clears every prior
+    // gate but returns no partial, so from the box it is silent.
+    let mut node2 = KfpNode::with_nonce_store(share2, vec![relay.clone()], None, None, short)
+        .await
+        .expect("silent holder node");
+    node2.set_oprf_key_share(oprf[1]);
+    let mut node3 = KfpNode::with_nonce_store(share3, vec![relay], None, None, short)
+        .await
+        .expect("live holder node");
+    node3.set_oprf_key_share(oprf[2]);
+    node3.set_hooks(Arc::new(ApproveOprfHooks));
+
+    let mut rx1 = node1.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let shutdown3 = node3.take_shutdown_handle();
+
+    let node1 = Arc::new(node1);
+    let node2 = Arc::new(node2);
+    let node3 = Arc::new(node3);
+    let node1_run = Arc::clone(&node1);
+    let node2_run = Arc::clone(&node2);
+    let node3_run = Arc::clone(&node3);
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1_run.run().await;
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2_run.run().await;
+    });
+    let node3_handle = tokio::spawn(async move {
+        let _ = node3_run.run().await;
+    });
+
+    // The box must discover BOTH holders so either can be sampled.
+    let mut discovered = 0u32;
+    let discovery = timeout(Duration::from_secs(45), async {
+        while discovered < 2 {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx1.recv().await {
+                discovered += 1;
+            }
+        }
+    })
+    .await;
+    if discovery.is_err() {
+        graceful_shutdown(shutdown1, node1_handle).await;
+        graceful_shutdown(shutdown2, node2_handle).await;
+        graceful_shutdown(shutdown3, node3_handle).await;
+        panic!("Peer discovery timed out: box discovered {discovered}/2 holders");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut first_key: Option<[u8; 32]> = None;
+    for i in 0..6 {
+        // Re-assert the box as Verified on both holders before each unlock; a
+        // periodic re-announce can otherwise reset attestation between rounds.
+        node2.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+        node3.test_set_peer_attestation(1, keep_frost_net::AttestationStatus::Verified);
+
+        let key = match timeout(
+            Duration::from_secs(30),
+            node1.request_oprf_unlock(OPRF_INPUT, "vault0", 1),
+        )
+        .await
+        {
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => {
+                graceful_shutdown(shutdown1, node1_handle).await;
+                graceful_shutdown(shutdown2, node2_handle).await;
+                graceful_shutdown(shutdown3, node3_handle).await;
+                panic!(
+                    "unlock iteration {i} failed (a failover regression fails closed here): {e}"
+                );
+            }
+            Err(_) => {
+                graceful_shutdown(shutdown1, node1_handle).await;
+                graceful_shutdown(shutdown2, node2_handle).await;
+                graceful_shutdown(shutdown3, node3_handle).await;
+                panic!("unlock iteration {i} timed out");
+            }
+        };
+        assert_eq!(key.len(), 32, "iteration {i}: LUKS key must be 32 bytes");
+        let bytes: [u8; 32] = *key;
+        match first_key {
+            None => first_key = Some(bytes),
+            Some(k0) => assert_eq!(
+                k0, bytes,
+                "iteration {i}: every unlock must derive the same key regardless of which holder answered"
+            ),
+        }
+    }
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    graceful_shutdown(shutdown3, node3_handle).await;
+}
+
 /// Build a well-formed OPRF eval request for `holder` from a synthetic box at
 /// FROST share index 1, returning the box pubkey, the request payload (with a
 /// real blinded element), and the raw blinded bytes for box-side partials.

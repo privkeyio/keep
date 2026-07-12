@@ -157,6 +157,13 @@ impl OprfUnlockSession {
         self.partials.len() >= self.threshold
     }
 
+    /// Share indices that have deposited a partial into this session so far.
+    /// Used by the unlock requester to identify non-responding holders on a
+    /// timeout, so it can exclude them and fail over to other eligible holders.
+    pub fn responders(&self) -> Vec<u16> {
+        self.partials.keys().copied().collect()
+    }
+
     /// Derive the LUKS key once a quorum of partials is present. Below quorum
     /// returns `Ok(None)`; a finalize failure marks the session `Failed` and
     /// surfaces the error.
