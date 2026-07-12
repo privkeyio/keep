@@ -34,6 +34,14 @@ const NIP98_DISPLAY_MAX: usize = 512;
 /// content cannot push the approve/reject line off-screen.
 const CONTENT_PREVIEW_MAX: usize = 256;
 
+/// Cap for the client-declared app name shown in an approval prompt. App names
+/// are short labels; a longer one is truncated so it cannot bury the prompt.
+const APP_NAME_DISPLAY_MAX: usize = 64;
+
+/// Cap for the NIP-46 method shown in an approval prompt. Method names are short
+/// identifiers (`sign_event`, `nip44_encrypt`, ...), so this is generous.
+const METHOD_DISPLAY_MAX: usize = 32;
+
 /// Neutralize an attacker-controlled string before it reaches an approval
 /// prompt. The value (a NIP-98 `u`/`method` tag, or the content of an event to
 /// be signed) is fully attacker-controlled, so strip the characters that let it
@@ -920,7 +928,15 @@ impl SignerHandler {
             .unwrap_or_else(|| pubkey.to_hex()[..8].to_string())
     }
 
-    async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+    async fn request_approval(&self, mut request: ApprovalRequest) -> ApprovalResult {
+        // Sanitize the client-declared app name and method at this single choke point, which every
+        // approval path funnels through before any surface callback. Without this, an app name or
+        // method carrying bidi overrides (U+202E) or control characters would render raw in the
+        // approval prompt an operator approves from (keep-cli TUI, keep-web, mobile, desktop) and
+        // could spoof or corrupt it. The content preview and NIP-98 url/method are already sanitized
+        // where they are built; this closes the same gap for app_name and method on every surface.
+        request.app_name = sanitize_prompt_field(&request.app_name, APP_NAME_DISPLAY_MAX);
+        request.method = sanitize_prompt_field(&request.method, METHOD_DISPLAY_MAX);
         if let Some(ref callbacks) = self.callbacks {
             return callbacks.request_approval(request);
         }
@@ -967,12 +983,14 @@ mod tests {
     /// assert which operations triggered an interactive prompt. Approves all.
     struct RecordingCallbacks {
         methods: std::sync::Mutex<Vec<String>>,
+        app_names: std::sync::Mutex<Vec<String>>,
         http_auth: std::sync::Mutex<Option<HttpAuthDetails>>,
     }
     impl RecordingCallbacks {
         fn new() -> Self {
             Self {
                 methods: std::sync::Mutex::new(Vec::new()),
+                app_names: std::sync::Mutex::new(Vec::new()),
                 http_auth: std::sync::Mutex::new(None),
             }
         }
@@ -980,6 +998,7 @@ mod tests {
     impl crate::types::ServerCallbacks for RecordingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
         fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            self.app_names.lock().unwrap().push(request.app_name);
             self.methods.lock().unwrap().push(request.method);
             if request.http_auth.is_some() {
                 *self.http_auth.lock().unwrap() = request.http_auth;
@@ -987,6 +1006,42 @@ mod tests {
             ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    }
+
+    #[tokio::test]
+    async fn request_approval_sanitizes_app_name_and_method() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RecordingCallbacks::new());
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()));
+
+        // A hostile app name/method carrying a bidi override and control chars must be neutralized
+        // before it reaches the surface callback that renders the approval prompt.
+        let request = ApprovalRequest {
+            app_pubkey: Keys::generate().public_key(),
+            app_name: "Ev\u{202E}il\nApp".to_string(),
+            method: "sign_event\u{202E}\n".to_string(),
+            event_kind: None,
+            event_content: None,
+            requested_permissions: None,
+            http_auth: None,
+        };
+        handler.request_approval(request).await;
+
+        let app = cb.app_names.lock().unwrap().last().cloned().unwrap();
+        let method = cb.methods.lock().unwrap().last().cloned().unwrap();
+        assert!(
+            !app.contains('\u{202E}') && !app.contains('\n'),
+            "app_name must be sanitized: {app:?}"
+        );
+        assert!(
+            !method.contains('\u{202E}') && !method.contains('\n'),
+            "method must be sanitized: {method:?}"
+        );
+        // The legitimate text survives, only the spoofing code points are stripped.
+        assert_eq!(app, "EvilApp");
+        assert_eq!(method, "sign_event");
     }
 
     // Reproduces the readstr / nostr-tools failure: a client that connects
