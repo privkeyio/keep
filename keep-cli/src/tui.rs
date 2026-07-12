@@ -119,8 +119,12 @@ impl Tui {
 
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
-        stdout().execute(EnterAlternateScreen)?;
+        // Mark the alt screen active BEFORE entering it: a signal in the tiny window
+        // before EnterAlternateScreen then still restores the terminal (an escape
+        // emitted a hair early on a real TUI terminal is harmless), rather than
+        // leaving it stuck in the alt screen.
         ALT_SCREEN_ACTIVE.store(true, Ordering::SeqCst);
+        stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
         while !self.should_quit {
