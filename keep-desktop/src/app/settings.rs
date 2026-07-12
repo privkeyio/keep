@@ -8,6 +8,13 @@ use crate::screen::Screen;
 
 use super::{friendly_err, lock_keep, save_cert_pins, save_settings, App, ToastKind};
 
+/// Shown when an in-app pin edit cannot be persisted. The usual cause is a
+/// corrupt on-disk store, which `save_cert_pins` refuses to overwrite so a
+/// silently-dropped host is not downgraded to trust-on-first-use.
+const CERT_PIN_WRITE_BLOCKED: &str =
+    "Could not update pins. The certificate pin store may be corrupt; resolve or delete \
+     cert-pins.json, then retry.";
+
 impl App {
     pub(crate) fn handle_settings_message_new(
         &mut self,
@@ -124,18 +131,17 @@ impl App {
                 return self.handle_kill_switch_deactivate(password);
             }
             Event::CertPinClear(hostname) => {
-                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
+                let saved = if let Ok(mut pins) = self.certificate_pins.lock() {
                     pins.remove_pin(&hostname);
-                    save_cert_pins(&self.keep_path, &pins);
-                    true
+                    save_cert_pins(&self.keep_path, &pins)
                 } else {
                     false
                 };
-                if ok {
+                if saved {
                     self.sync_cert_pins_to_screen();
                     self.set_toast(format!("Cleared pin for {hostname}"), ToastKind::Success);
                 } else {
-                    self.set_toast("Failed to clear pin".into(), ToastKind::Error);
+                    self.set_toast(CERT_PIN_WRITE_BLOCKED.into(), ToastKind::Error);
                 }
                 return Task::none();
             }
@@ -155,21 +161,20 @@ impl App {
                 return self.handle_restore_submit(passphrase, vault_password);
             }
             Event::CertPinClearAll => {
-                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
+                let saved = if let Ok(mut pins) = self.certificate_pins.lock() {
                     *pins = keep_frost_net::CertificatePinSet::new();
-                    save_cert_pins(&self.keep_path, &pins);
-                    true
+                    save_cert_pins(&self.keep_path, &pins)
                 } else {
                     false
                 };
-                if ok {
+                if saved {
                     self.sync_cert_pins_to_screen();
                     if let Screen::Settings(s) = &mut self.screen {
                         s.clear_all_pins_done();
                     }
                     self.set_toast("Cleared all certificate pins".into(), ToastKind::Success);
                 } else {
-                    self.set_toast("Failed to clear pins".into(), ToastKind::Error);
+                    self.set_toast(CERT_PIN_WRITE_BLOCKED.into(), ToastKind::Error);
                 }
                 return Task::none();
             }
@@ -199,15 +204,15 @@ impl App {
                 let Some(mismatch) = self.pin_mismatch.as_ref() else {
                     return Task::none();
                 };
-                let ok = if let Ok(mut pins) = self.certificate_pins.lock() {
-                    pins.remove_pin(&mismatch.hostname);
-                    save_cert_pins(&self.keep_path, &pins);
-                    true
+                let hostname = mismatch.hostname.clone();
+                let saved = if let Ok(mut pins) = self.certificate_pins.lock() {
+                    pins.remove_pin(&hostname);
+                    save_cert_pins(&self.keep_path, &pins)
                 } else {
                     false
                 };
-                if !ok {
-                    self.set_toast("Failed to clear pin".into(), ToastKind::Error);
+                if !saved {
+                    self.set_toast(CERT_PIN_WRITE_BLOCKED.into(), ToastKind::Error);
                     return Task::none();
                 }
                 self.pin_mismatch = None;

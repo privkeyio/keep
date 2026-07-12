@@ -53,6 +53,21 @@ pub(crate) async fn verify_relay_certificates(
     keep_path: &std::path::Path,
 ) -> Result<(), crate::message::ConnectionError> {
     use crate::message::ConnectionError;
+    // Fail closed: refuse to connect when the on-disk pin store exists but is
+    // corrupt. Otherwise a corrupted entry for a previously-pinned host would
+    // have been silently dropped at load, and the loop below would re-pin
+    // (TOFU) whatever certificate is presented, which an on-path attacker can
+    // exploit to install their own pin. Re-checked from disk on every connect
+    // so fixing the file and reconnecting recovers without a restart. Mirrors
+    // keep-mobile, which returns Err from load_cert_pins on any malformed entry.
+    if let Some(reasons) = crate::app::cert_pin_store_corruption(keep_path) {
+        return Err(ConnectionError::Other(format!(
+            "Certificate pin store {} is corrupt ({}). Refusing to connect under \
+             weakened pinning; resolve or clear the file, then reconnect.",
+            crate::app::cert_pins_path(keep_path).display(),
+            reasons.join("; "),
+        )));
+    }
     for url in relay_urls.iter().filter(|u| u.starts_with("wss://")) {
         let pins_snapshot = certificate_pins
             .lock()
