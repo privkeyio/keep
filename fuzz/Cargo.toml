@@ -13,6 +13,13 @@ keep-frost-net = { path = "../keep-frost-net", default-features = false, feature
 libfuzzer-sys = "0.4"
 
 [[bin]]
+name = "fuzz_tpm_quote"
+path = "fuzz_targets/fuzz_tpm_quote.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_nsec"
 path = "fuzz_targets/fuzz_nsec.rs"
 test = false
