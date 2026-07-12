@@ -110,7 +110,7 @@ jobs:
           # aws-lc-sys (via rustls) compiles bundled C through the NDK's cmake
           # toolchain, which only reliably supports the Ninja generator.
           sudo apt-get install -y ninja-build
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
