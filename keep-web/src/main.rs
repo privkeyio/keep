@@ -93,6 +93,25 @@ fn parse_shared_data_key(raw: &str) -> Result<Zeroizing<[u8; 32]>, Box<dyn std::
     Ok(key)
 }
 
+/// Fail closed when a fresh vault is about to be created for a node that joins a keep-state
+/// replication cluster (`KEEP_STATE_RELAY` set) without the shared cluster data key. Such a vault
+/// would be created with a per-node RANDOM key and could never decrypt records replicated by its
+/// peers, so the node would silently consume cluster state it cannot read. Enforced only on create:
+/// an existing vault already has its data key baked in, so a restart without `KEEP_STORAGE_KEY` is
+/// fine.
+fn check_cluster_vault_key(has_shared_key: bool, joins_cluster: bool) -> Result<(), String> {
+    if joins_cluster && !has_shared_key {
+        return Err(
+            "KEEP_STATE_RELAY is set, so this node joins a keep-state replication cluster \
+             and needs the shared cluster data key to decrypt records replicated by its peers, but \
+             KEEP_STORAGE_KEY[_FILE] is not set. Set KEEP_STORAGE_KEY to the cluster's shared data \
+             key, or unset KEEP_STATE_RELAY to run this node standalone."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 fn parse_relays(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -171,13 +190,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let password = secret_from("KEEP_PASSWORD")?
         .ok_or("KEEP_PASSWORD or KEEP_PASSWORD_FILE must be set for headless unlock")?;
 
+    // Read once, before vault creation: whether this node joins a keep-state replication cluster.
+    // Reused below to actually wire replication.
+    let state_relay = std::env::var("KEEP_STATE_RELAY")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     // First-run provisioning: create the vault if this is a fresh install
     // (e.g. first StartOS boot) rather than crashing.
     let mut keep = match Keep::open(&vault_path) {
         Ok(k) => k,
         Err(keep_core::error::KeepError::NotFound(_)) => {
             tracing::info!(path = %vault_path.display(), "no vault found; creating");
-            match shared_data_key_from_env()? {
+            let shared_key = shared_data_key_from_env()?;
+            // Fail closed before creating a random-key vault a cluster node could never read from.
+            check_cluster_vault_key(shared_key.is_some(), state_relay.is_some())?;
+            match shared_key {
                 Some(key) => {
                     tracing::info!(
                         "creating vault with shared cluster data key (keep-state replication)"
@@ -295,15 +324,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The active publishes each vault-state write under a shared cluster identity; a standby consumes
     // and reconstructs. The relay is a trusted local/mesh address, so it is validated with the
     // allow-internal guard (a mesh IP is not public), and ws:// still needs KEEP_ALLOW_WS=1.
-    if let Ok(state_relay) = std::env::var("KEEP_STATE_RELAY") {
-        if !state_relay.trim().is_empty() {
-            keep_core::relay::validate_relay_url_allow_internal(&state_relay)
-                .map_err(|e| format!("KEEP_STATE_RELAY invalid: {e}"))?;
-            let identity = state_replication::load_state_identity()?;
-            let role = env_or("KEEP_STATE_ROLE", "active");
-            state_replication::spawn(keep.clone(), state_relay, identity, &role).await?;
-            tracing::info!(role = %role, "keep-state replication enabled");
-        }
+    if let Some(state_relay) = state_relay {
+        keep_core::relay::validate_relay_url_allow_internal(&state_relay)
+            .map_err(|e| format!("KEEP_STATE_RELAY invalid: {e}"))?;
+        let identity = state_replication::load_state_identity()?;
+        let role = env_or("KEEP_STATE_ROLE", "active");
+        state_replication::spawn(keep.clone(), state_relay, identity, &role).await?;
+        tracing::info!(role = %role, "keep-state replication enabled");
     }
 
     tracing::info!(mode = %bunker_info.mode, "started");
@@ -376,6 +403,24 @@ mod tests {
         let mut keep = Keep::create(&dir.join("vault"), "password").unwrap();
         keep.unlock("password").unwrap();
         keep
+    }
+
+    #[test]
+    fn cluster_node_without_shared_key_fails_closed() {
+        // Joins a cluster but has no shared key: must refuse rather than create a random-key vault.
+        assert!(check_cluster_vault_key(false, true).is_err());
+    }
+
+    #[test]
+    fn cluster_node_with_shared_key_is_ok() {
+        assert!(check_cluster_vault_key(true, true).is_ok());
+    }
+
+    #[test]
+    fn standalone_node_needs_no_shared_key() {
+        // Not joining a cluster: a per-node random key is fine, with or without a shared key.
+        assert!(check_cluster_vault_key(false, false).is_ok());
+        assert!(check_cluster_vault_key(true, false).is_ok());
     }
 
     #[test]
