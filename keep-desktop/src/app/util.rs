@@ -185,23 +185,58 @@ pub(crate) fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::Cer
 /// `Err` on any malformed entry.
 pub(crate) fn cert_pin_store_corruption(keep_path: &std::path::Path) -> Option<Vec<String>> {
     let path = cert_pins_path(keep_path);
-    // Absent file is a legitimate first-run state, not corruption.
-    let contents = std::fs::read_to_string(&path).ok()?;
-    match keep_frost_net::CertificatePinSet::from_json_bytes(contents.as_bytes()) {
+    // Read raw bytes (like keep-mobile) so non-UTF-8 content surfaces as a
+    // parse error below rather than a read failure, and so from_json_bytes
+    // sees exactly what was stored.
+    let contents = match std::fs::read(&path) {
+        Ok(contents) => contents,
+        // Absent file is a legitimate first-run state, not corruption.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // Any other read error (permissions, I/O) must fail closed rather than
+        // read as "no pins" and wave the connect through under TOFU. Mirrors
+        // keep-mobile, which only maps StorageNotFound to Ok(None).
+        Err(e) => return Some(vec![format!("unreadable: {e}")]),
+    };
+    match keep_frost_net::CertificatePinSet::from_json_bytes(&contents) {
         Ok((_, malformed)) if malformed.is_empty() => None,
         Ok((_, malformed)) => Some(malformed),
         Err(e) => Some(vec![format!("parse error: {e}")]),
     }
 }
 
+/// Persist `pins` to `cert-pins.json`. Returns `true` when the file was written.
+///
+/// Refuses (returns `false`) when the on-disk store is currently corrupt. The
+/// in-memory `pins` was built by [`load_cert_pins`], which silently drops
+/// malformed entries, so overwriting a corrupt file with it would erase the
+/// invisible corrupt entry and downgrade that host to trust-on-first-use on the
+/// next connect, reopening the very window the connect-time gate closes. While
+/// the store is corrupt the only safe resolutions are fixing or deleting the
+/// file by hand.
 pub(crate) fn save_cert_pins(
     keep_path: &std::path::Path,
     pins: &keep_frost_net::CertificatePinSet,
-) {
+) -> bool {
+    if let Some(reasons) = cert_pin_store_corruption(keep_path) {
+        tracing::warn!(
+            "Refusing to overwrite corrupt certificate pin store ({}); \
+             resolve or delete the file to reset",
+            reasons.join(", ")
+        );
+        return false;
+    }
     let path = cert_pins_path(keep_path);
-    if let Ok(json) = serde_json::to_string_pretty(&pins.to_hex_map()) {
-        if let Err(e) = write_private(&path, &json) {
-            tracing::error!("Failed to save certificate pins: {e}");
+    match serde_json::to_string_pretty(&pins.to_hex_map()) {
+        Ok(json) => match write_private(&path, &json) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("Failed to save certificate pins: {e}");
+                false
+            }
+        },
+        Err(e) => {
+            tracing::error!("Failed to serialize certificate pins: {e}");
+            false
         }
     }
 }
@@ -256,7 +291,10 @@ mod tests {
     fn corruption_none_for_valid_store() {
         let dir = tempfile::tempdir().unwrap();
         let hash = "aa".repeat(32);
-        write_store(dir.path(), &format!(r#"{{"relay.example.com":["{hash}"]}}"#));
+        write_store(
+            dir.path(),
+            &format!(r#"{{"relay.example.com":["{hash}"]}}"#),
+        );
         assert!(cert_pin_store_corruption(dir.path()).is_none());
         // And the valid pin still loads (parity: healthy files unaffected).
         assert!(load_cert_pins(dir.path()).is_pinned("relay.example.com"));
@@ -279,5 +317,53 @@ mod tests {
         write_store(dir.path(), "{ this is not json");
         let reasons = cert_pin_store_corruption(dir.path()).expect("bad json => corrupt");
         assert!(reasons.iter().any(|r| r.contains("parse error")));
+    }
+
+    #[test]
+    fn corruption_some_when_store_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the store path yields a non-NotFound read error, which
+        // must fail closed rather than read as "no pins" (open TOFU fallback).
+        std::fs::create_dir(cert_pins_path(dir.path())).unwrap();
+        let reasons = cert_pin_store_corruption(dir.path()).expect("unreadable => corrupt");
+        assert!(reasons.iter().any(|r| r.contains("unreadable")));
+    }
+
+    #[test]
+    fn save_refused_when_store_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = r#"{"relay.example.com":"nothex"}"#;
+        write_store(dir.path(), corrupt);
+
+        // A degraded in-memory set (the corrupt host dropped at load) must not
+        // be persisted over the corrupt file, which would erase the corrupt
+        // entry and silently re-enable TOFU for that host.
+        let mut pins = keep_frost_net::CertificatePinSet::new();
+        pins.add_pin("other.example.com".into(), [1u8; 32]);
+        assert!(
+            !save_cert_pins(dir.path(), &pins),
+            "must refuse to overwrite"
+        );
+
+        // The on-disk file is left untouched, so the connect-time gate still fires.
+        let on_disk = std::fs::read_to_string(cert_pins_path(dir.path())).unwrap();
+        assert_eq!(on_disk, corrupt);
+        assert!(cert_pin_store_corruption(dir.path()).is_some());
+    }
+
+    #[test]
+    fn save_succeeds_when_store_absent_or_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pins = keep_frost_net::CertificatePinSet::new();
+        pins.add_pin("relay.example.com".into(), [2u8; 32]);
+
+        // Absent file: first pin persists.
+        assert!(save_cert_pins(dir.path(), &pins));
+        assert!(load_cert_pins(dir.path()).is_pinned("relay.example.com"));
+
+        // Healthy file: a further save still succeeds.
+        pins.add_pin("relay2.example.com".into(), [3u8; 32]);
+        assert!(save_cert_pins(dir.path(), &pins));
+        assert!(load_cert_pins(dir.path()).is_pinned("relay2.example.com"));
     }
 }
