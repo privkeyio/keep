@@ -1523,10 +1523,11 @@ impl KfpNode {
         // Durably record the freeze (if configured) BEFORE alerting, so a crash
         // between freeze and alert still leaves the box frozen on the next boot.
         // The persister does blocking fsyncs; run it on the blocking pool and
-        // await it, so a slow or hung disk stalls only this task (already frozen
-        // in memory) and a blocking thread, not this async runtime worker and the
-        // whole serial notification loop, while still ordering the durable write
-        // before the alert.
+        // await it. This gift-wrap handler still waits for the write (the freeze
+        // is already set in memory, so that is fine), but the blocking I/O now
+        // stalls a blocking-pool thread instead of the Tokio worker, so a slow or
+        // hung disk no longer freezes the runtime worker and the other tasks it
+        // drives. Awaiting keeps the durable write ordered before the alert.
         if let Some(persister) = self.duress_persister.clone() {
             let freeze = freeze.clone();
             if let Err(e) = tokio::task::spawn_blocking(move || persister(&freeze)).await {
