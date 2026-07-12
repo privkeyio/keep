@@ -17,9 +17,9 @@ pub use config::Settings;
 pub(crate) use config::{load_settings, save_settings};
 pub use util::set_pending_nostrconnect;
 pub(crate) use util::{
-    collect_shares, default_bunker_relays, friendly_err, load_cert_pins, lock_keep, parse_hex_key,
-    save_cert_pins, take_pending_nostrconnect, to_display_entry, with_keep_blocking,
-    write_private_bytes,
+    cert_pin_store_corruption, cert_pins_path, collect_shares, default_bunker_relays, friendly_err,
+    load_cert_pins, lock_keep, parse_hex_key, save_cert_pins, take_pending_nostrconnect,
+    to_display_entry, with_keep_blocking, write_private_bytes,
 };
 
 use std::collections::{HashMap, VecDeque};

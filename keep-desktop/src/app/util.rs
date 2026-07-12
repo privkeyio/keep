@@ -170,6 +170,30 @@ pub(crate) fn load_cert_pins(keep_path: &std::path::Path) -> keep_frost_net::Cer
     }
 }
 
+/// Corruption status of the on-disk certificate-pin store.
+///
+/// Returns `None` when the file is absent (first run: no pins yet) or parses
+/// cleanly with no malformed entries. Returns `Some(reasons)` when the file
+/// exists but fails to parse, or parses with one or more malformed entries.
+///
+/// This is the fail-closed counterpart to [`load_cert_pins`], which drops
+/// malformed entries so valid pins still load. A corrupt store must not
+/// silently downgrade a previously-pinned host to trust-on-first-use: dropping
+/// a host's only (corrupted) entry would let `verify_relay_certificate` re-pin
+/// whatever certificate an on-path attacker presents. The connect path checks
+/// this and refuses, mirroring keep-mobile, whose `load_cert_pins` returns
+/// `Err` on any malformed entry.
+pub(crate) fn cert_pin_store_corruption(keep_path: &std::path::Path) -> Option<Vec<String>> {
+    let path = cert_pins_path(keep_path);
+    // Absent file is a legitimate first-run state, not corruption.
+    let contents = std::fs::read_to_string(&path).ok()?;
+    match keep_frost_net::CertificatePinSet::from_json_bytes(contents.as_bytes()) {
+        Ok((_, malformed)) if malformed.is_empty() => None,
+        Ok((_, malformed)) => Some(malformed),
+        Err(e) => Some(vec![format!("parse error: {e}")]),
+    }
+}
+
 pub(crate) fn save_cert_pins(
     keep_path: &std::path::Path,
     pins: &keep_frost_net::CertificatePinSet,
@@ -211,4 +235,49 @@ pub(crate) fn default_bunker_relays() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_store(dir: &std::path::Path, json: &str) {
+        std::fs::write(cert_pins_path(dir), json).unwrap();
+    }
+
+    #[test]
+    fn corruption_none_when_file_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        // First run: no cert-pins.json yet is not corruption.
+        assert!(cert_pin_store_corruption(dir.path()).is_none());
+    }
+
+    #[test]
+    fn corruption_none_for_valid_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "aa".repeat(32);
+        write_store(dir.path(), &format!(r#"{{"relay.example.com":["{hash}"]}}"#));
+        assert!(cert_pin_store_corruption(dir.path()).is_none());
+        // And the valid pin still loads (parity: healthy files unaffected).
+        assert!(load_cert_pins(dir.path()).is_pinned("relay.example.com"));
+    }
+
+    #[test]
+    fn corruption_some_for_malformed_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        // A previously-pinned host whose only entry no longer decodes to a hash.
+        write_store(dir.path(), r#"{"relay.example.com":"nothex"}"#);
+        let reasons = cert_pin_store_corruption(dir.path()).expect("malformed => corrupt");
+        assert!(reasons.iter().any(|r| r.contains("relay.example.com")));
+        // The host must not silently survive as an unpinned (TOFU) host.
+        assert!(!load_cert_pins(dir.path()).is_pinned("relay.example.com"));
+    }
+
+    #[test]
+    fn corruption_some_for_unparseable_json() {
+        let dir = tempfile::tempdir().unwrap();
+        write_store(dir.path(), "{ this is not json");
+        let reasons = cert_pin_store_corruption(dir.path()).expect("bad json => corrupt");
+        assert!(reasons.iter().any(|r| r.contains("parse error")));
+    }
 }
