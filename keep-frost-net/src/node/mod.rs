@@ -1522,8 +1522,16 @@ impl KfpNode {
         *self.duress_freeze.write() = Some(freeze.clone());
         // Durably record the freeze (if configured) BEFORE alerting, so a crash
         // between freeze and alert still leaves the box frozen on the next boot.
-        if let Some(persister) = &self.duress_persister {
-            persister(&freeze);
+        // The persister does blocking fsyncs; run it on the blocking pool and
+        // await it, so a slow or hung disk stalls only this task (already frozen
+        // in memory) and a blocking thread, not this async runtime worker and the
+        // whole serial notification loop, while still ordering the durable write
+        // before the alert.
+        if let Some(persister) = self.duress_persister.clone() {
+            let freeze = freeze.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || persister(&freeze)).await {
+                warn!(error = %e, "duress persister task panicked or was cancelled");
+            }
         }
         warn!(
             beacon = %beacon_pubkey,
