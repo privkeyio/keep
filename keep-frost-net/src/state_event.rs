@@ -22,12 +22,33 @@ pub const KEEP_STATE_KIND: u16 = 30078;
 /// so replicating it would clobber the standby's share (see the qmc design).
 pub const STATE_TABLES: [&str; 3] = ["keys", "descriptors", "relay_configs"];
 
+/// Tag key marking a record event's payload-encoding version. Absent on legacy
+/// events (published by <= v0.7.5), whose NIP-44 plaintext is `hex(content)`;
+/// present with [`STATE_ENC_VERSION`] on events whose plaintext is the raw
+/// record bytes. The hex wrapping doubled the plaintext and halved the usable
+/// 65535-byte NIP-44 budget, so records over ~32 KB failed to encrypt and were
+/// silently dropped; encrypting raw bytes restores the full budget.
+const STATE_ENC_VERSION_TAG: &str = "encv";
+/// Current payload-encoding version: NIP-44 over the raw record bytes.
+const STATE_ENC_VERSION: &str = "2";
+
 fn d_tag(table: &str, record_id: &str) -> String {
     format!("keep:{table}:{record_id}")
 }
 
-/// Build an addressable state-record event: `NIP-44(hex(content))` authored by `keys`, addressed by
-/// `keep:<table>:<record_id>`. `content` is the record's vault-encrypted redb bytes.
+/// Whether `event` carries the current raw payload-encoding tag (`encv=2`).
+/// Legacy events (<= v0.7.5) lack it and are decoded as hex-wrapped instead.
+fn has_raw_encoding(event: &Event) -> bool {
+    event.tags.iter().any(|t| {
+        t.kind() == TagKind::custom(STATE_ENC_VERSION_TAG)
+            && t.as_slice().get(1).map(String::as_str) == Some(STATE_ENC_VERSION)
+    })
+}
+
+/// Build an addressable state-record event: `NIP-44(content)` authored by `keys`, addressed by
+/// `keep:<table>:<record_id>` and tagged with the current [`STATE_ENC_VERSION`]. `content` is the
+/// record's vault-encrypted redb bytes, encrypted raw (NIP-44 accepts arbitrary bytes) so the full
+/// 65535-byte plaintext budget is available.
 pub fn state_record_event(
     keys: &Keys,
     table: &str,
@@ -38,7 +59,7 @@ pub fn state_record_event(
     let ciphertext = nip44::encrypt(
         keys.secret_key(),
         &keys.public_key(),
-        hex::encode(content),
+        content,
         nip44::Version::V2,
     )
     .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
@@ -49,6 +70,10 @@ pub fn state_record_event(
     EventBuilder::new(Kind::Custom(KEEP_STATE_KIND), ciphertext)
         .tag(Tag::identifier(d_tag(table, record_id)))
         .tag(Tag::custom(TagKind::custom("t"), [table.to_string()]))
+        .tag(Tag::custom(
+            TagKind::custom(STATE_ENC_VERSION_TAG),
+            [STATE_ENC_VERSION.to_string()],
+        ))
         .custom_created_at(Timestamp::from(created_at))
         .sign_with_keys(keys)
         .map_err(|e| FrostNetError::Nostr(e.to_string()))
@@ -124,7 +149,15 @@ pub fn parse_state_event(keys: &Keys, event: &Event) -> Result<Option<StateRecor
         .any(|t| t.kind() == TagKind::custom("deleted"));
     let content = if is_tombstone {
         None
+    } else if has_raw_encoding(event) {
+        // Current format: NIP-44 over the raw record bytes.
+        Some(
+            nip44::decrypt_to_bytes(keys.secret_key(), &keys.public_key(), &event.content)
+                .map_err(|e| FrostNetError::Crypto(e.to_string()))?,
+        )
     } else {
+        // Legacy format (published by <= v0.7.5, no encoding-version tag): the
+        // NIP-44 plaintext is hex(content), so decode the hex after decrypting.
         let hex_payload = nip44::decrypt(keys.secret_key(), &keys.public_key(), &event.content)
             .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
         Some(hex::decode(hex_payload.trim()).map_err(|e| FrostNetError::Crypto(e.to_string()))?)
@@ -156,6 +189,66 @@ mod tests {
         assert_eq!(parsed.record_id, "abcd1234");
         assert_eq!(parsed.content.as_deref(), Some(content.as_slice()));
         assert_eq!(parsed.created_at, 1000);
+    }
+
+    #[test]
+    fn new_record_event_is_tagged_raw_v2() {
+        let keys = Keys::generate();
+        let event = state_record_event(&keys, "keys", "abcd1234", b"x", 1000).unwrap();
+        assert!(has_raw_encoding(&event));
+    }
+
+    #[test]
+    fn large_record_round_trips() {
+        // ~50 KB of raw bytes: hex-wrapping (100 KB) would exceed the 65535-byte
+        // NIP-44 plaintext limit and drop the record; encrypting raw bytes fits.
+        let keys = Keys::generate();
+        let content = vec![0xABu8; 50_000];
+        let event = state_record_event(&keys, "descriptors", "big", &content, 1000).unwrap();
+        let parsed = parse_state_event(&keys, &event).unwrap().unwrap();
+        assert_eq!(parsed.content.as_deref(), Some(content.as_slice()));
+    }
+
+    /// A record over the halved hex budget could not even be built by the old
+    /// producer: it errored inside NIP-44 and was silently dropped.
+    #[test]
+    fn oversized_hex_record_could_not_be_built_before() {
+        let keys = Keys::generate();
+        let content = vec![0xABu8; 50_000];
+        let hex_wrapped = nip44::encrypt(
+            keys.secret_key(),
+            &keys.public_key(),
+            hex::encode(&content),
+            nip44::Version::V2,
+        );
+        assert!(
+            hex_wrapped.is_err(),
+            "hex-wrapped 50 KB must exceed the NIP-44 plaintext limit"
+        );
+    }
+
+    #[test]
+    fn legacy_hex_encoded_record_still_decodes() {
+        // Reproduce a pre-v0.7.6 event: NIP-44 over hex(content), no encv tag.
+        let keys = Keys::generate();
+        let content = b"vault-encrypted-record-bytes\x00\x01\x02";
+        let ciphertext = nip44::encrypt(
+            keys.secret_key(),
+            &keys.public_key(),
+            hex::encode(content),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let legacy = EventBuilder::new(Kind::Custom(KEEP_STATE_KIND), ciphertext)
+            .tag(Tag::identifier(d_tag("keys", "abcd1234")))
+            .tag(Tag::custom(TagKind::custom("t"), ["keys".to_string()]))
+            .custom_created_at(Timestamp::from(1000))
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(!has_raw_encoding(&legacy));
+        let parsed = parse_state_event(&keys, &legacy).unwrap().unwrap();
+        assert_eq!(parsed.content.as_deref(), Some(content.as_slice()));
     }
 
     #[test]
