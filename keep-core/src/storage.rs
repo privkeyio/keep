@@ -471,6 +471,26 @@ impl Storage {
             other => Err(KeepError::Other(format!("table {other} is not replicable"))),
         }
     }
+
+    /// Snapshot every replicable record currently in storage as `(logical table, hex record id, at-rest
+    /// encrypted bytes)` -- the same shape the [`StatePublisher`] hook emits for a live write. The
+    /// keep-state publisher replays this once at startup so records written BEFORE replication was wired
+    /// (which the write-time hook never observed) reach a fresh standby instead of being stranded.
+    ///
+    /// Reads the raw stored ciphertext (`hex(backend key)` is the record id, the stored value is the
+    /// encrypted blob), so it matches the hook byte-for-byte and needs neither decryption nor the data
+    /// key. The three logical tables mirror [`replicated_table`].
+    pub fn snapshot_replicable_records(&self) -> Result<Vec<(&'static str, String, Vec<u8>)>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let mut out = Vec::new();
+        for table in ["keys", "descriptors", "relay_configs"] {
+            let backend_table = Self::replicated_table(table)?;
+            for (key, encrypted) in backend.list(backend_table)? {
+                out.push((table, hex::encode(key), encrypted));
+            }
+        }
+        Ok(out)
+    }
     /// Create new storage with the given password.
     pub fn create(path: &Path, password: &str, params: Argon2Params) -> Result<Self> {
         create_storage_dir(path)?;
@@ -1955,6 +1975,41 @@ mod tests {
                 .unwrap(),
             ReplicatedApply::Applied
         );
+    }
+
+    #[test]
+    fn snapshot_replicable_records_matches_publisher_hook() {
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+        let publisher = std::sync::Arc::new(RecordingPublisher::default());
+        storage.set_state_publisher(publisher.clone());
+
+        let rec = KeyRecord::new(
+            [7u8; 32],
+            crate::keys::KeyType::Nostr,
+            "snap".into(),
+            vec![9, 8, 7],
+        );
+        storage.store_key(&rec).unwrap();
+
+        // The write-time hook and the startup snapshot must agree on (table, id, bytes) exactly, or a
+        // snapshot-published record would land under a different d-tag than the hook's and fail to
+        // supersede it on the standby.
+        let hook_id = hex::encode(rec.id);
+        let hook_bytes = publisher.last_bytes.lock().unwrap().clone();
+
+        let snap = storage.snapshot_replicable_records().unwrap();
+        let entry = snap
+            .iter()
+            .find(|(t, id, _)| *t == "keys" && *id == hook_id)
+            .expect("snapshot must include the stored key");
+        assert_eq!(
+            entry.2, hook_bytes,
+            "snapshot bytes must equal the hook's on_record bytes"
+        );
+        // Exactly one record was stored, so empty tables contribute no phantom rows.
+        assert_eq!(snap.len(), 1);
     }
 
     #[test]

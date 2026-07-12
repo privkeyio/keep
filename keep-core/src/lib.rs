@@ -144,6 +144,13 @@ impl Keep {
         self.storage.state_version(table, record_id)
     }
 
+    /// Snapshot all replicable records for the keep-state publisher to replay at startup, so records
+    /// written before the replication hook was installed still reach a fresh standby. See
+    /// [`Storage::snapshot_replicable_records`].
+    pub fn snapshot_replicable_records(&self) -> Result<Vec<(&'static str, String, Vec<u8>)>> {
+        self.storage.snapshot_replicable_records()
+    }
+
     /// Create a new Keep with the given password.
     ///
     /// # Example

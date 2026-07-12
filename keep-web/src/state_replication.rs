@@ -208,6 +208,33 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         }));
 
     tokio::spawn(async move {
+        // Seed the pending set with every record already in storage. The hook above only observes
+        // FUTURE writes, so records written before replication was wired would otherwise never be
+        // published, and a fresh standby would never receive them. `or_insert` never clobbers a write
+        // the hook captured between installing it and this snapshot (both read the same storage), and
+        // the per-d-tag coalescing keeps the map bounded by record count. Each seeded record is then
+        // published with a created_at seeded from its own persisted mark by the loop below.
+        match keep.lock().await.snapshot_replicable_records() {
+            Ok(records) => {
+                {
+                    let mut guard = pending.lock().unwrap();
+                    for (table, id, encrypted) in records {
+                        guard
+                            .entry(format!("{table}:{id}"))
+                            .or_insert(Change::Record {
+                                table: table.to_string(),
+                                id,
+                                encrypted,
+                            });
+                    }
+                }
+                notify.notify_one();
+            }
+            Err(e) => tracing::error!(
+                "keep-state: initial snapshot failed; a fresh standby may miss records written before replication started: {e}"
+            ),
+        }
+
         // `last_ts` is an in-memory per-d-tag high-water-mark guaranteeing strict per-d-tag monotonicity
         // of created_at within a run: a record and its immediate delete (or two rapid writes) must not
         // collide on the same second, or the relay's created_at dedup could keep the wrong one and the
