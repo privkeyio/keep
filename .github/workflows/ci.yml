@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: no job in this workflow writes to the repo, but every job runs
+# third-party actions (cargo-deny, setup-android, taiki-e/install-action, rust-cache).
+# Pin GITHUB_TOKEN to read-only so a compromised action cannot use whatever scope the
+# repository's ambient default grants (which can be write on push / same-repo PRs).
+permissions:
+  contents: read
+
 jobs:
   deny:
     runs-on: ubuntu-latest
