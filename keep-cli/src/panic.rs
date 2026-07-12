@@ -12,8 +12,9 @@ pub fn install() {
 }
 
 fn cleanup_terminal() {
-    let _ = crossterm::terminal::disable_raw_mode();
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+    // Emit LeaveAlternateScreen only if the TUI entered it, so a panic on a non-TUI
+    // command does not leak the escape onto that command's stdout (keep-node-95y).
+    crate::tui::restore_terminal();
 }
 
 fn log_panic(info: &PanicHookInfo<'_>) {
