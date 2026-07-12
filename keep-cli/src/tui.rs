@@ -15,6 +15,34 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// True only while the interactive TUI holds the alternate screen. The signal
+/// handler (`main`) and the panic handler (`panic`) consult this so they emit the
+/// LeaveAlternateScreen escape ONLY when the TUI actually entered it -- never on a
+/// non-TUI command like `frost network oprf-unlock`, whose stdout is contractually
+/// the 32-byte LUKS key and must carry no terminal control bytes (keep-node-95y).
+pub(crate) static ALT_SCREEN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Restore the terminal from a signal or panic handler. Always leaves raw mode (a
+/// no-op if it was never set; also recovers an interrupted `dialoguer` prompt), but
+/// leaves the alternate screen ONLY if the TUI entered it, so its escape never
+/// pollutes a command's stdout.
+pub(crate) fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let active = ALT_SCREEN_ACTIVE.swap(false, Ordering::SeqCst);
+    let _ = write_leave_alt_screen(&mut stdout(), active);
+}
+
+/// Write LeaveAlternateScreen to `w` iff the alternate screen was active. Split out
+/// from `restore_terminal` so the stdout-hygiene contract is unit-testable without a
+/// real terminal, a signal, or the global flag.
+fn write_leave_alt_screen<W: io::Write>(w: &mut W, active: bool) -> io::Result<()> {
+    if active {
+        w.execute(LeaveAlternateScreen)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub struct LogEntry {
@@ -91,6 +119,11 @@ impl Tui {
 
     pub fn run(&mut self) -> io::Result<()> {
         enable_raw_mode()?;
+        // Mark the alt screen active BEFORE entering it: a signal in the tiny window
+        // before EnterAlternateScreen then still restores the terminal (an escape
+        // emitted a hair early on a real TUI terminal is harmless), rather than
+        // leaving it stuck in the alt screen.
+        ALT_SCREEN_ACTIVE.store(true, Ordering::SeqCst);
         stdout().execute(EnterAlternateScreen)?;
         let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
@@ -101,6 +134,7 @@ impl Tui {
 
         disable_raw_mode()?;
         stdout().execute(LeaveAlternateScreen)?;
+        ALT_SCREEN_ACTIVE.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -348,4 +382,35 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod terminal_restore_tests {
+    use super::write_leave_alt_screen;
+
+    // A non-TUI command (e.g. `frost network oprf-unlock`) never entered the
+    // alternate screen, so a signal/panic exit must write NOTHING to the stream --
+    // stdout stays contractually the 32-byte LUKS key, with no control bytes
+    // (keep-node-95y).
+    #[test]
+    fn writes_nothing_when_alt_screen_inactive() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_leave_alt_screen(&mut buf, false).unwrap();
+        assert!(
+            buf.is_empty(),
+            "inactive alt-screen must emit no bytes, got {buf:?}"
+        );
+    }
+
+    // A real TUI session must still be restored on exit: the exact 8-byte
+    // LeaveAlternateScreen escape (ESC [ ? 1 0 4 9 l).
+    #[test]
+    fn emits_leave_alternate_screen_when_active() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_leave_alt_screen(&mut buf, true).unwrap();
+        assert_eq!(
+            buf, b"\x1b[?1049l",
+            "active alt-screen must emit LeaveAlternateScreen"
+        );
+    }
 }

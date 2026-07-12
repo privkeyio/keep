@@ -78,8 +78,11 @@ fn main() {
     keep_frost_net::install_default_crypto_provider();
 
     ctrlc::set_handler(|| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        // Restore raw mode, but emit LeaveAlternateScreen only if the TUI actually
+        // entered the alt screen -- otherwise this signal (incl. the SIGTERM the
+        // frost gate sends on a fail-closed oprf-unlock) would leak the escape onto
+        // a command's key-only stdout (keep-node-95y).
+        tui::restore_terminal();
         std::process::exit(130);
     })
     .ok();
