@@ -290,10 +290,12 @@ impl KfpNode {
     /// combine surfaces as `Session`/`OprfUnlockFailed`, which is a real
     /// cryptographic rejection and is surfaced to the caller unchanged (retrying
     /// a different holder would combine to the same key, so it cannot help and
-    /// must not mask a misbehaving holder). Re-sampling never re-hits an excluded
-    /// holder, so no holder's per-requester rate limit or attestation gate is
-    /// bypassed; each round contacts each holder at most once for the same fixed
-    /// blinded input, so it is not a grinding vector.
+    /// must not mask a misbehaving holder). Re-sampling never re-hits an
+    /// *excluded* (non-responding) holder; a holder that did respond may be
+    /// re-sampled in a later round, but the loop is capped at
+    /// `MAX_FAILOVER_ATTEMPTS` and every holder independently enforces its
+    /// per-requester rate limit and attestation gate on each eval, so failover
+    /// cannot drive a holder past its budget. Not a grinding vector.
     pub async fn request_oprf_unlock(
         &self,
         input: &[u8],
