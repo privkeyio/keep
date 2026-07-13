@@ -59,6 +59,7 @@ pub mod keyring;
 /// Key types and Nostr keypair operations.
 pub mod keys;
 pub mod migration;
+
 /// BIP-39 mnemonic generation and validation.
 pub mod mnemonic;
 /// NIP-06 key derivation from mnemonic seed phrase.
@@ -70,6 +71,8 @@ pub(crate) mod rate_limit;
 /// Relay configuration for FROST shares.
 pub mod relay;
 mod rotation;
+/// Arbitrary-secret records (passwords, API tokens, notes) stored in the vault.
+pub mod secret;
 /// Persistent encrypted storage backend.
 pub mod storage;
 /// Ephemeral time-limited secret vault.
@@ -473,6 +476,29 @@ impl Keep {
     /// List all stored key records.
     pub fn list_keys(&self) -> Result<Vec<KeyRecord>> {
         self.storage.list_keys()
+    }
+
+    /// Store (insert or overwrite by id) an arbitrary-secret record (password,
+    /// API token, note). The whole record, including its plaintext value and
+    /// title, is encrypted under the vault data key at rest. See
+    /// [`storage::Storage::store_secret`].
+    pub fn store_secret(&self, record: &crate::secret::SecretRecord) -> Result<()> {
+        self.storage.store_secret(record)
+    }
+
+    /// Load a secret record by its 32-byte id.
+    pub fn load_secret(&self, id: &[u8; 32]) -> Result<crate::secret::SecretRecord> {
+        self.storage.load_secret(id)
+    }
+
+    /// List all stored secret records.
+    pub fn list_secrets(&self) -> Result<Vec<crate::secret::SecretRecord>> {
+        self.storage.list_secrets()
+    }
+
+    /// Delete a secret record by its 32-byte id.
+    pub fn delete_secret(&self, id: &[u8; 32]) -> Result<()> {
+        self.storage.delete_secret(id)
     }
 
     /// Export a stored nsec key as NIP-49 ncryptsec.
