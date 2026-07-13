@@ -515,6 +515,13 @@ pub enum KeepError {
     Encryption(String),
     #[error("Database error: {0}")]
     Database(String),
+    /// The vault's redb file is already opened (exclusive lock) by another
+    /// process, typically a running `keep serve` daemon. Distinct from `Database`
+    /// so read-only CLI commands can detect it and route through the daemon's
+    /// inspect socket instead of failing (#533). The payload is a
+    /// ready-to-display hint.
+    #[error("{0}")]
+    VaultAlreadyOpen(String),
     #[error("Migration error: {0}")]
     Migration(String),
     #[error("Home directory not found")]

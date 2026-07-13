@@ -230,6 +230,19 @@ pub fn cmd_serve(
             ..Default::default()
         };
         rt.block_on(async {
+            // Serve a local inspect socket so read-only commands (`keep list`)
+            // can query this daemon instead of failing on the exclusive writer
+            // lock (#533). Owner-only; metadata only. Shares the same keyring.
+            let inspect_keyring = Arc::clone(&keyring);
+            let inspect_vault = path.to_path_buf();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::ipc::serve_inspect_socket(&inspect_vault, inspect_keyring).await
+                {
+                    tracing::warn!(error = %e, "inspect socket unavailable");
+                }
+            });
+
             let mut server = if let Some(frost) = frost_signer {
                 let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
                 Server::new_with_config(

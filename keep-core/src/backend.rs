@@ -451,12 +451,12 @@ pub(crate) fn open_database_with_retry(
 /// so this helper does not swallow real database failures.
 pub(crate) fn map_open_failure(path: &Path, e: redb::DatabaseError) -> KeepError {
     if matches!(&e, redb::DatabaseError::DatabaseAlreadyOpen) {
-        return KeepError::Database(format!(
+        return KeepError::VaultAlreadyOpen(format!(
             "vault at {} is already opened by another process. \
              A `keep serve` or `keep frost network serve` daemon typically holds the lock; \
              stop it (or wait for it to exit) and retry. \
-             A separate follow-up will let read-only commands (`list`, `audit list`, etc.) \
-             coexist with a running daemon; see #422 for details.",
+             Read-only commands like `list` route through the running daemon automatically \
+             (#533); see #422 for details.",
             path.display()
         ));
     }
@@ -703,8 +703,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            matches!(err, KeepError::Database(_)),
-            "expected Database from map_open_failure, got {err:?}"
+            matches!(err, KeepError::VaultAlreadyOpen(_)),
+            "expected VaultAlreadyOpen from map_open_failure, got {err:?}"
         );
         assert!(
             msg.contains("already opened by another process"),
