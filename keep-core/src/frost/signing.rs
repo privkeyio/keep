@@ -57,11 +57,12 @@ pub struct SigningSession {
 }
 
 impl SigningSession {
-    /// Create a new signing session.
-    pub fn new(message: Vec<u8>, threshold: u16) -> Self {
-        let session_id = Self::compute_session_id(&message);
+    /// Create a new signing session. Returns `Err` (rather than panicking) if the
+    /// CSPRNG health check fails, so a broken RNG cannot crash the caller.
+    pub fn new(message: Vec<u8>, threshold: u16) -> Result<Self> {
+        let session_id = Self::compute_session_id(&message)?;
 
-        Self {
+        Ok(Self {
             session_id,
             message,
             threshold,
@@ -70,19 +71,19 @@ impl SigningSession {
             signature_shares: BTreeMap::new(),
             our_nonces: None,
             signature: None,
-        }
+        })
     }
 
-    fn compute_session_id(message: &[u8]) -> [u8; 32] {
+    fn compute_session_id(message: &[u8]) -> Result<[u8; 32]> {
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-        let random: [u8; 16] = crypto::random_bytes();
+        let random: [u8; 16] = crypto::try_random_bytes()?;
 
         let mut preimage = Vec::with_capacity(message.len() + 24);
         preimage.extend_from_slice(message);
         preimage.extend_from_slice(&timestamp.to_le_bytes());
         preimage.extend_from_slice(&random);
 
-        crypto::blake2b_256(&preimage)
+        Ok(crypto::blake2b_256(&preimage))
     }
 
     /// The session ID.
@@ -324,8 +325,8 @@ mod tests {
         let kp0 = shares[0].key_package().unwrap();
         let kp1 = shares[1].key_package().unwrap();
 
-        let mut session0 = SigningSession::new(message.clone(), 2);
-        let mut session1 = SigningSession::new(message.clone(), 2);
+        let mut session0 = SigningSession::new(message.clone(), 2).unwrap();
+        let mut session1 = SigningSession::new(message.clone(), 2).unwrap();
         session1.session_id = session0.session_id;
 
         let commit0 = session0.generate_commitment(&kp0).unwrap();
@@ -363,7 +364,7 @@ mod tests {
         let message = b"test message".to_vec();
         let kp = shares[0].key_package().unwrap();
 
-        let mut session = SigningSession::new(message, 2);
+        let mut session = SigningSession::new(message, 2).unwrap();
         let _ = session.generate_commitment(&kp).unwrap();
 
         let result = session.generate_commitment(&kp);

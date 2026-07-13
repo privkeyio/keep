@@ -2177,7 +2177,7 @@ mod tests {
         let message = b"test".to_vec();
         let kp0 = shares[0].key_package().unwrap();
 
-        let mut session = SigningSession::new(message, 2);
+        let mut session = SigningSession::new(message, 2).unwrap();
         session.generate_commitment(&kp0).unwrap();
 
         assert_eq!(session.commitments_needed(), 1);

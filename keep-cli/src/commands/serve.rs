@@ -131,7 +131,7 @@ pub fn cmd_serve(
             let net_signer = NetworkFrostSigner::with_shared_node(group_pubkey, node);
             out.success("Connected to FROST network");
 
-            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+            let transport_key: [u8; 32] = keep_core::crypto::try_random_bytes()?;
 
             let mut server = Server::new_network_frost_with_config(
                 net_signer,
@@ -244,7 +244,7 @@ pub fn cmd_serve(
             });
 
             let mut server = if let Some(frost) = frost_signer {
-                let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+                let transport_key: [u8; 32] = keep_core::crypto::try_random_bytes()?;
                 Server::new_with_config(
                     Arc::new(Mutex::new(Keyring::new())),
                     Some(frost),
@@ -277,7 +277,7 @@ pub fn cmd_serve(
 
     let (bunker_url, npub, keyring_for_tui, transport_key_for_tui) = rt.block_on(async {
         if let Some(ref frost) = frost_signer {
-            let transport_key: [u8; 32] = keep_core::crypto::random_bytes();
+            let transport_key: [u8; 32] = keep_core::crypto::try_random_bytes()?;
             let server =
                 Server::new_frost(frost.clone(), transport_key, &[relay.to_string()], None).await?;
             Ok::<_, KeepError>((

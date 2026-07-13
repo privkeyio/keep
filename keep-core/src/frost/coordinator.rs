@@ -40,17 +40,18 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Create a new signing coordinator.
-    pub fn new(message: Vec<u8>, threshold: u16) -> Self {
-        Self {
-            session_id: crate::crypto::random_bytes(),
+    /// Create a new signing coordinator. Returns `Err` (rather than panicking) if
+    /// the CSPRNG health check fails.
+    pub fn new(message: Vec<u8>, threshold: u16) -> Result<Self> {
+        Ok(Self {
+            session_id: crate::crypto::try_random_bytes()?,
             message,
             threshold,
             commitments: BTreeMap::new(),
             signature_shares: BTreeMap::new(),
             our_identifier: None,
             our_nonces: None,
-        }
+        })
     }
 
     /// The session ID.
@@ -215,7 +216,7 @@ mod tests {
         let (shares, _) = dealer.generate("test").unwrap();
 
         let message = b"test message".to_vec();
-        let mut coord = Coordinator::new(message, 2);
+        let mut coord = Coordinator::new(message, 2).unwrap();
 
         let _msg1 = coord.add_local_share(&shares[0]).unwrap();
 
