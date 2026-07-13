@@ -351,6 +351,14 @@ fn capture_policy_from_announces(
     let mut peers: BTreeMap<u16, String> = BTreeMap::new();
 
     for event in events {
+        // Bound the relay-supplied content before parsing: `event.content` reaches
+        // us bounded only by relay limits, and an oversized frame cannot be a valid
+        // announce, so skip it up front rather than let `from_json` parse an
+        // arbitrarily large payload (memory/CPU DoS). Mirrors the MAX_MESSAGE_SIZE
+        // gate keep-frost-net applies before `from_json` on the runtime path.
+        if event.content.len() > keep_frost_net::MAX_MESSAGE_SIZE {
+            continue;
+        }
         let payload = match keep_frost_net::KfpMessage::from_json(&event.content) {
             Ok(keep_frost_net::KfpMessage::Announce(p)) => p,
             _ => continue,
@@ -975,6 +983,47 @@ mod tests {
     fn capture_errors_without_an_attested_announce() {
         let out = Output::new();
         assert!(capture_policy_from_announces(&out, &[7u8; 32], &[], &Default::default()).is_err());
+    }
+
+    #[test]
+    fn oversized_content_event_is_skipped() {
+        use keep_frost_net::KFP_EVENT_KIND;
+        use nostr_sdk::{EventBuilder, Keys, Kind};
+
+        let group = [7u8; 32];
+        // A frame larger than MAX_MESSAGE_SIZE cannot be a valid announce; it is
+        // skipped up front rather than parsed, so on its own it yields no policy...
+        let junk = EventBuilder::new(
+            Kind::Custom(KFP_EVENT_KIND),
+            "x".repeat(keep_frost_net::MAX_MESSAGE_SIZE + 1),
+        )
+        .sign_with_keys(&Keys::generate())
+        .unwrap();
+        let out = Output::new();
+        assert!(
+            capture_policy_from_announces(
+                &out,
+                &group,
+                std::slice::from_ref(&junk),
+                &Default::default()
+            )
+            .is_err(),
+            "an oversized junk event alone must yield no policy"
+        );
+
+        // ...and it must not block a valid announce that follows it in the list.
+        let valid = attested_event(
+            &group,
+            2,
+            1_700_000_000,
+            default_pcrs(),
+            signed_share(&group, 2, 1_700_000_000),
+        );
+        let config =
+            capture_policy_from_announces(&out, &group, &[junk, valid], &Default::default())
+                .expect("a valid announce after an oversized event must still be captured");
+        assert_eq!(config.peer.len(), 1);
+        assert_eq!(config.peer[0].index, 2);
     }
 
     #[test]
