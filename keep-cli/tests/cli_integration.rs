@@ -960,3 +960,201 @@ fn test_restore_rejects_tampered_backup() {
         "a tampered restore must not leave a vault"
     );
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 4: rotate-password / rotate-data-key / frost refresh
+// (security-critical vault mutations)
+// -----------------------------------------------------------------------------
+
+/// Read a named FROST group's pubkey directly from the vault (the display npub
+/// is truncated, so parse it in-process).
+fn frost_group_pubkey(vault: &Path, name: &str) -> [u8; 32] {
+    use keep_core::Keep;
+    let mut keep = Keep::open(vault).unwrap();
+    keep.unlock(TEST_PASSWORD).unwrap();
+    let shares = keep.frost_list_shares().unwrap();
+    shares
+        .iter()
+        .find(|s| s.metadata.name == name)
+        .unwrap_or_else(|| panic!("group {name} not found"))
+        .metadata
+        .group_pubkey
+}
+
+/// Assert `frost sign` output is a BIP-340 signature valid for `group_pubkey`
+/// over `digest`.
+fn assert_frost_sig_verifies(output: &Output, group_pubkey: &[u8; 32], digest: [u8; 32]) {
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+    let sig = extract_signature_hex(output);
+    let signature = schnorr::Signature::from_slice(&sig).expect("valid schnorr signature");
+    let msg = Message::from_digest(digest);
+    let xonly = XOnlyPublicKey::from_slice(group_pubkey).expect("group pubkey x-only");
+    let secp = Secp256k1::verification_only();
+    secp.verify_schnorr(&signature, &msg, &xonly)
+        .expect("`frost sign` output MUST verify against the group pubkey via BIP-340");
+}
+
+/// Rotating the vault password swaps the unlock credential: the new password
+/// unlocks and the old one no longer does.
+#[test]
+fn test_rotate_password_changes_unlock_credential() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("rot-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    // Old password from KEEP_PASSWORD, new from KEEP_NEW_PASSWORD (KEEP_YES
+    // auto-confirms the re-encryption prompt).
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .env("KEEP_NEW_PASSWORD", "newpass456789")
+        .args(["rotate-password"])
+        .run();
+    assert_success(&out);
+
+    // New password unlocks.
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .env("KEEP_PASSWORD", "newpass456789")
+            .args(["list"])
+            .run(),
+    );
+    // Old password no longer unlocks.
+    assert_failure(&KeepCmd::new(&bin).path(&vault).args(["list"]).run());
+}
+
+/// Rotating to an identical password is refused (a no-op rotation), and the
+/// original credential keeps working (no partial application).
+#[test]
+fn test_rotate_password_rejects_identical_password() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("rot-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .env("KEEP_NEW_PASSWORD", TEST_PASSWORD)
+        .args(["rotate-password"])
+        .run();
+    assert_failure(&out);
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["list"]).run());
+}
+
+/// Rotating the data key re-encrypts every stored key/share but must not change
+/// the FROST group key, and the group must still sign.
+#[test]
+fn test_rotate_data_key_preserves_frost_signing() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("rdk-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "frost",
+                "generate",
+                "--threshold",
+                "2",
+                "--shares",
+                "3",
+                "--name",
+                "grp",
+            ])
+            .run(),
+    );
+    let group_pubkey = frost_group_pubkey(&vault, "grp");
+
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["rotate-data-key"])
+            .run(),
+    );
+
+    assert_eq!(
+        frost_group_pubkey(&vault, "grp"),
+        group_pubkey,
+        "data-key rotation must not change the group key"
+    );
+    let digest: [u8; 32] = sha2::Sha256::digest(b"post-rotation signing payload").into();
+    let sign_out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "sign",
+            "--message",
+            &hex::encode(digest),
+            "--group",
+            "grp",
+        ])
+        .run();
+    assert_success(&sign_out);
+    assert_frost_sig_verifies(&sign_out, &group_pubkey, digest);
+}
+
+/// A proactive `frost refresh` issues new shares but preserves the group key,
+/// and the refreshed shares still reconstruct a valid signature.
+#[test]
+fn test_frost_refresh_preserves_group_signing() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("refresh-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "frost",
+                "generate",
+                "--threshold",
+                "2",
+                "--shares",
+                "3",
+                "--name",
+                "grp",
+            ])
+            .run(),
+    );
+    let group_pubkey = frost_group_pubkey(&vault, "grp");
+
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["frost", "refresh", "--group", "grp"])
+            .run(),
+    );
+    assert_eq!(
+        frost_group_pubkey(&vault, "grp"),
+        group_pubkey,
+        "refresh must preserve the group key"
+    );
+
+    let digest: [u8; 32] = sha2::Sha256::digest(b"post-refresh signing payload").into();
+    let sign_out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "sign",
+            "--message",
+            &hex::encode(digest),
+            "--group",
+            "grp",
+        ])
+        .run();
+    assert_success(&sign_out);
+    assert_frost_sig_verifies(&sign_out, &group_pubkey, digest);
+}
