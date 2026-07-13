@@ -9,7 +9,8 @@ use tracing::{debug, trace, warn};
 
 use crate::backend::{
     AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
-    KEYS_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
+    KEYS_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE, SHARES_TABLE,
+    STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -17,7 +18,7 @@ use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 use crate::relay::{self, RelayConfig};
-use crate::secret::SecretRecord;
+use crate::secret::{SecretRecord, ThresholdSeal};
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
@@ -567,6 +568,7 @@ impl Storage {
         backend.create_table(CONFIG_TABLE)?;
         backend.create_table(HEALTH_STATUS_TABLE)?;
         backend.create_table(SECRETS_TABLE)?;
+        backend.create_table(SECRET_SEALS_TABLE)?;
         backend.create_table(STATE_VERSIONS_TABLE)?;
 
         Ok(Self {
@@ -891,15 +893,79 @@ impl Storage {
         Ok(records)
     }
 
-    /// Delete a secret record by `id`. Errors if no such secret exists.
+    /// Store a secret whose VALUE is sealed behind a t-of-n OPRF quorum. The
+    /// record's `value` must already be the DEK-ciphertext produced by
+    /// [`crate::secret::seal_value`]; `seal` is its matching wrapped DEK + OPRF
+    /// params. The record (name/kind/DEK-ciphertext) and the seal are each
+    /// encrypted under the vault data key and written in ONE atomic transaction,
+    /// so a crash can never leave a sealed value without its wrapped DEK (which
+    /// would make the value permanently undecryptable). Like `store_secret`, it
+    /// never notifies the replication sink: secrets are not replicable.
+    pub fn store_sealed_secret(&self, record: &SecretRecord, seal: &ThresholdSeal) -> Result<()> {
+        debug!(id = %hex::encode(record.id), "storing sealed secret");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let rec_serialized = Zeroizing::new(bincode::serialize(record)?);
+        let rec_encrypted = crypto::encrypt(&rec_serialized, data_key)?.to_bytes();
+        let seal_serialized = Zeroizing::new(bincode::serialize(seal)?);
+        let seal_encrypted = crypto::encrypt(&seal_serialized, data_key)?.to_bytes();
+
+        backend.write_atomic(&[
+            AtomicOp {
+                table: SECRETS_TABLE,
+                key: &record.id,
+                value: Some(&rec_encrypted),
+            },
+            AtomicOp {
+                table: SECRET_SEALS_TABLE,
+                key: &record.id,
+                value: Some(&seal_encrypted),
+            },
+        ])?;
+        Ok(())
+    }
+
+    /// Load the [`ThresholdSeal`] for a secret `id`, or `None` when the secret is
+    /// not threshold-sealed (an ordinary plaintext-value secret). The presence of
+    /// a seal is what marks a secret as threshold-gated; its `value` is then the
+    /// DEK-ciphertext rather than plaintext.
+    pub fn load_secret_seal(&self, id: &[u8; 32]) -> Result<Option<ThresholdSeal>> {
+        trace!(id = %hex::encode(id), "loading secret seal");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let Some(encrypted_bytes) = backend.get(SECRET_SEALS_TABLE, id)? else {
+            return Ok(None);
+        };
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        Ok(Some(bincode_options().deserialize(&decrypted_bytes)?))
+    }
+
+    /// Delete a secret record by `id`, along with its threshold seal if it has
+    /// one, in a single atomic transaction. Errors if no such secret exists.
     pub fn delete_secret(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting secret");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.delete(SECRETS_TABLE, id)? {
-            Ok(())
-        } else {
-            Err(KeepError::NotFound(hex::encode(id)))
+        // The secret row must exist; the seal is optional, so gate on the record.
+        if backend.get(SECRETS_TABLE, id)?.is_none() {
+            return Err(KeepError::NotFound(hex::encode(id)));
         }
+        backend.write_atomic(&[
+            AtomicOp {
+                table: SECRETS_TABLE,
+                key: id,
+                value: None,
+            },
+            AtomicOp {
+                table: SECRET_SEALS_TABLE,
+                key: id,
+                value: None,
+            },
+        ])?;
+        Ok(())
     }
 
     /// The storage directory path.
@@ -1747,6 +1813,43 @@ mod tests {
         assert!(storage.list_secrets().unwrap().is_empty());
         // Deleting a missing secret errors rather than silently succeeding.
         assert!(storage.delete_secret(&id).is_err());
+    }
+
+    #[test]
+    fn sealed_secret_store_load_seal_and_delete_removes_both() {
+        use crate::secret::{seal_value, unseal_value, SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+
+        let mut rec = SecretRecord::new("api".into(), SecretKind::ApiToken, Vec::new()).unwrap();
+        let id = rec.id;
+        let (value_ct, seal) = seal_value(b"tok", &oprf_key, hex::encode(id), 2).unwrap();
+        rec.value = value_ct;
+        storage.store_sealed_secret(&rec, &seal).unwrap();
+
+        // A normal load returns the DEK-ciphertext (still gated); the seal loads
+        // and the value unseals under the OPRF key.
+        let loaded = storage.load_secret(&id).unwrap();
+        assert_ne!(loaded.value, b"tok", "stored value must be DEK-ciphertext");
+        let loaded_seal = storage
+            .load_secret_seal(&id)
+            .unwrap()
+            .expect("seal present");
+        assert_eq!(loaded_seal.epoch, 2);
+        let plaintext = unseal_value(&loaded.value, &loaded_seal, &oprf_key).unwrap();
+        assert_eq!(&plaintext[..], b"tok");
+
+        // A plain (unsealed) secret reports no seal.
+        let plain = SecretRecord::new("p".into(), SecretKind::Generic, b"v".to_vec()).unwrap();
+        storage.store_secret(&plain).unwrap();
+        assert!(storage.load_secret_seal(&plain.id).unwrap().is_none());
+
+        // Deleting a sealed secret drops its seal row atomically too.
+        storage.delete_secret(&id).unwrap();
+        assert!(storage.load_secret(&id).is_err());
+        assert!(storage.load_secret_seal(&id).unwrap().is_none());
     }
 
     #[test]

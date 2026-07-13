@@ -29,6 +29,10 @@ pub const HEALTH_STATUS_TABLE: &str = "key_health_status";
 /// Deliberately NOT a replicable table (see `Storage::replicated_table`): a
 /// password vault's metadata surface must not sync to public Nostr relays.
 pub const SECRETS_TABLE: &str = "secrets";
+/// Table name for threshold seals: maps a secret id to its `ThresholdSeal`
+/// (wrapped DEK + OPRF params), present only for secrets whose value is gated
+/// behind a t-of-n OPRF quorum. Like `SECRETS_TABLE`, NOT a replicable table.
+pub const SECRET_SEALS_TABLE: &str = "secret_seals";
 /// Table name for the keep-state replication high-water-mark: maps a `<table>:<record-id>` d-tag to
 /// the highest `created_at` (8-byte big-endian) applied for it, so the consumer rejects any replicated
 /// event that is not strictly newer (replay/rollback protection).
@@ -144,6 +148,7 @@ const CONFIG_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("co
 const HEALTH_STATUS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("key_health_status");
 const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secrets");
+const SECRET_SEALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secret_seals");
 const STATE_VERSIONS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("state_versions");
 
@@ -200,6 +205,11 @@ impl RedbBackend {
             RELAY_CONFIGS_TABLE,
             CONFIG_TABLE,
             HEALTH_STATUS_TABLE,
+            // Arbitrary-secret rows and their threshold seals must survive a file-format upgrade too;
+            // omitting them would silently drop the password/secret store (and leave any sealed value
+            // undecryptable if only one of the pair carried through). Missing tables are skipped below.
+            SECRETS_TABLE,
+            SECRET_SEALS_TABLE,
             // Carried through a file-format upgrade so the keep-state rollback-guard high-water-marks
             // survive; otherwise they reset and the guard reverts to first-sync (TOFU) for every d-tag.
             STATE_VERSIONS_TABLE,
@@ -374,6 +384,7 @@ impl RedbBackend {
             CONFIG_TABLE => Ok(CONFIG_TABLE_DEF),
             HEALTH_STATUS_TABLE => Ok(HEALTH_STATUS_TABLE_DEF),
             SECRETS_TABLE => Ok(SECRETS_TABLE_DEF),
+            SECRET_SEALS_TABLE => Ok(SECRET_SEALS_TABLE_DEF),
             STATE_VERSIONS_TABLE => Ok(STATE_VERSIONS_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
