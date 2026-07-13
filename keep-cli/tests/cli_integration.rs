@@ -1497,3 +1497,289 @@ fn test_migrate_status_fresh_vault_needs_no_migration() {
     assert!(output_contains(&out, "Needs migration"));
     assert!(output_contains(&out, "false"));
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 1: NIP-46 bunker end-to-end (keep's core promise)
+//
+// Launch a headless `keep serve` bunker as a subprocess against an in-process
+// mock relay, connect a real nostr client, request a signature over NIP-46, and
+// verify the returned event's BIP-340 signature. This drives the whole CLI serve
+// path end to end, not just the library.
+// -----------------------------------------------------------------------------
+
+/// A running `keep serve` child, killed on drop (headless serve never exits on
+/// its own).
+struct ServeChild {
+    child: std::process::Child,
+}
+
+impl Drop for ServeChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Spawn `keep serve --headless` against `relay`, scrape the `bunker://` URL it
+/// prints to stderr, and return the running child (killed on drop) plus the URL.
+/// A reader thread drains stderr so the pipe never stalls the child.
+fn spawn_bunker(bin: &Path, vault: &Path, relay: &str) -> (ServeChild, String) {
+    use std::io::{BufRead, BufReader};
+    let mut child = Command::new(bin)
+        .env("KEEP_PASSWORD", TEST_PASSWORD)
+        .env("KEEP_YES", "1")
+        .env("KEEP_ALLOW_WS", "1") // accept the loopback ws:// mock relay
+        .arg("--path")
+        .arg(vault)
+        .args(["serve", "--headless", "--relay", relay])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn keep serve");
+
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let mut sent = false;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // child exited / stderr closed
+                Ok(_) => {
+                    if !sent {
+                        if let Some(pos) = line.find("bunker://") {
+                            let _ = tx.send(line[pos..].trim().to_string());
+                            sent = true;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let url = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("keep serve must print a bunker:// URL within 15s");
+    (ServeChild { child }, url)
+}
+
+/// NIP-44-encrypt a `{id,method,params}` request and send it to the bunker as a
+/// `Kind::NostrConnect` event.
+async fn send_nip46(
+    client: &nostr_sdk::Client,
+    client_keys: &nostr_sdk::Keys,
+    server_pubkey: &nostr_sdk::PublicKey,
+    request: &serde_json::Value,
+) {
+    use nostr_sdk::prelude::*;
+    let json = request.to_string();
+    let encrypted = nip44::encrypt(
+        client_keys.secret_key(),
+        server_pubkey,
+        &json,
+        nip44::Version::V2,
+    )
+    .expect("nip44 encrypt");
+    let event = EventBuilder::new(Kind::NostrConnect, &encrypted)
+        .tag(Tag::public_key(*server_pubkey))
+        .sign_with_keys(client_keys)
+        .expect("sign nip46 request");
+    client.send_event(&event).await.expect("send_event");
+}
+
+/// Wait up to `timeout` for a decrypted NIP-46 response from the bunker whose
+/// JSON `id` matches `expected_id`. `notifications` must be created BEFORE the
+/// request is sent so a fast response cannot be dropped.
+async fn await_nip46(
+    notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>,
+    client_keys: &nostr_sdk::Keys,
+    server_pubkey: &nostr_sdk::PublicKey,
+    expected_id: &str,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    use nostr_sdk::prelude::*;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let event = match tokio::time::timeout(remaining, notifications.recv()).await {
+            Ok(Ok(RelayPoolNotification::Event { event, .. })) => event,
+            _ => continue,
+        };
+        if event.kind != Kind::NostrConnect || event.pubkey != *server_pubkey {
+            continue;
+        }
+        let decrypted = match nip44::decrypt(
+            client_keys.secret_key(),
+            server_pubkey,
+            event.content.as_str(),
+        ) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let json: serde_json::Value = match serde_json::from_str(&decrypted) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if json.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
+            continue;
+        }
+        return Some(json);
+    }
+}
+
+#[tokio::test]
+async fn test_serve_bunker_e2e_sign_verifies() {
+    use nostr_sdk::prelude::*;
+
+    let bin = match keep_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
+            return;
+        }
+    };
+
+    // Required once before any nostr/TLS client work.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("bunker-vault");
+
+    // A single-key vault: `keep serve` runs in single-key mode and signs with it.
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "signer"])
+            .run(),
+    );
+
+    let mock = nostr_relay_builder::MockRelay::run()
+        .await
+        .expect("mock relay start");
+    let relay_url = mock.url().await.to_string();
+
+    // Launch the headless bunker against the mock relay and read its bunker:// URL.
+    let (_serve, bunker_url) = spawn_bunker(&bin, &vault, &relay_url);
+    let parsed = url::Url::parse(&bunker_url).expect("bunker url parses");
+    let server_pubkey =
+        PublicKey::from_hex(parsed.host_str().expect("bunker host")).expect("server pubkey");
+    let secret = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "secret")
+        .map(|(_, v)| v.to_string())
+        .unwrap_or_default();
+
+    // The URL is printed before the bunker finishes subscribing on the relay.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let client_keys = Keys::generate();
+    let client = Client::new(client_keys.clone());
+    client.add_relay(&relay_url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .author(server_pubkey)
+                .pubkey(client_keys.public_key()),
+            None,
+        )
+        .await
+        .expect("subscribe to bunker responses");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut notifications = client.notifications();
+
+    // 1. connect -> ack
+    let connect_req = serde_json::json!({
+        "id": "req-connect",
+        "method": "connect",
+        "params": [server_pubkey.to_hex(), secret],
+    });
+    send_nip46(&client, &client_keys, &server_pubkey, &connect_req).await;
+    let ack = await_nip46(
+        &mut notifications,
+        &client_keys,
+        &server_pubkey,
+        "req-connect",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("connect must respond");
+    assert_eq!(
+        ack.get("result").and_then(|v| v.as_str()),
+        Some("ack"),
+        "connect must ack, got {ack}"
+    );
+
+    // 2. get_public_key -> the key the bunker will sign with
+    let gpk_req = serde_json::json!({"id": "req-gpk", "method": "get_public_key", "params": []});
+    send_nip46(&client, &client_keys, &server_pubkey, &gpk_req).await;
+    let gpk = await_nip46(
+        &mut notifications,
+        &client_keys,
+        &server_pubkey,
+        "req-gpk",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("get_public_key must respond");
+    let signer_hex = gpk
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("get_public_key result")
+        .to_string();
+
+    // 3. sign_event -> a signed kind-1 note that MUST verify
+    let request_content = "keep serve bunker e2e signing payload";
+    let unsigned = serde_json::json!({
+        "kind": 1,
+        "content": request_content,
+        "tags": [],
+        "created_at": Timestamp::now().as_secs(),
+    });
+    let sign_req = serde_json::json!({
+        "id": "req-sign",
+        "method": "sign_event",
+        "params": [serde_json::to_string(&unsigned).unwrap()],
+    });
+    send_nip46(&client, &client_keys, &server_pubkey, &sign_req).await;
+    let resp = await_nip46(
+        &mut notifications,
+        &client_keys,
+        &server_pubkey,
+        "req-sign",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("sign_event must respond");
+
+    let result_str = resp
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("sign_event response must include result");
+    let signed = Event::from_json(result_str).expect("result is a JSON-stringified signed event");
+
+    // verify() recomputes the id and checks the BIP-340 signature + pubkey binding.
+    signed.verify().expect("returned event MUST verify");
+    assert_eq!(
+        signed.content, request_content,
+        "content must match request"
+    );
+    assert_eq!(signed.kind, Kind::TextNote, "kind must match request");
+    assert_eq!(
+        signed.pubkey.to_hex(),
+        signer_hex,
+        "event must be signed under the bunker's signer key"
+    );
+
+    client.disconnect().await;
+    drop(mock); // keep the relay alive until the flow completes
+}

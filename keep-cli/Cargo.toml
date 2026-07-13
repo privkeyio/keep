@@ -89,3 +89,7 @@ tempfile = "3.27"
 sha2 = "0.10"
 hex = "0.4"
 k256 = { version = "0.13.4", features = ["schnorr"] }
+# End-to-end NIP-46 bunker test: an in-process mock relay + a nostr client
+# driving a live `keep serve` subprocess (see tests/cli_integration.rs).
+nostr-relay-builder = "0.44"
+rustls = { version = "0.23", features = ["ring"] }
