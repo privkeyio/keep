@@ -1362,6 +1362,36 @@ mod tests {
         assert!(require_roster_matches(&roster, &ident1, 2, 3, 42).is_err());
     }
 
+    /// #674: `DkgRoster::authenticates` is the single audited author-binding
+    /// gate all four intake paths (hardware/software x round1/round2) funnel
+    /// through, so cover its accept/reject branches directly.
+    #[test]
+    fn authenticates_binds_author_to_the_roster_pinned_index() {
+        let (_n1, pk1) = make_pubkey(1);
+        let (_n2, pk2) = make_pubkey(2);
+        let (_n3, pk3) = make_pubkey(3);
+        let mut by_index = BTreeMap::new();
+        by_index.insert(1, pk1);
+        by_index.insert(2, pk2);
+        let roster = DkgRoster {
+            threshold: 2,
+            participants: 2,
+            by_index,
+        };
+        let out = Output::new();
+
+        // The pinned pubkey for its own index is accepted.
+        assert!(roster.authenticates(1, &pk1, &out, "round 1 event"));
+        assert!(roster.authenticates(2, &pk2, &out, "round 2 share"));
+        // A roster member authoring for a DIFFERENT index is rejected: a relay
+        // writer cannot make participant 2's npub speak for index 1.
+        assert!(!roster.authenticates(1, &pk2, &out, "round 1 event"));
+        // A pubkey not on the roster at all is rejected.
+        assert!(!roster.authenticates(2, &pk3, &out, "round 2 share"));
+        // An index with no roster entry is rejected (unroster'd sender_index).
+        assert!(!roster.authenticates(9, &pk1, &out, "round 1 event"));
+    }
+
     /// #674: `frost_group_id` is the single source of truth shared by
     /// group-create and roster verification, so pin its exact bytes against an
     /// independent inline reference. If either caller drifts, this fails.
