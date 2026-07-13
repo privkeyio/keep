@@ -1783,3 +1783,66 @@ async fn test_serve_bunker_e2e_sign_verifies() {
     client.disconnect().await;
     drop(mock); // keep the relay alive until the flow completes
 }
+
+// -----------------------------------------------------------------------------
+// #533: read-only `keep list` coexists with a running daemon (inspect socket)
+// -----------------------------------------------------------------------------
+
+/// While `keep serve` holds redb's exclusive writer lock, `keep list` must still
+/// work by routing through the daemon's inspect socket, not fail on the lock.
+#[tokio::test]
+async fn test_list_coexists_with_running_daemon() {
+    let bin = match keep_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
+            return;
+        }
+    };
+
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("daemon-vault");
+
+    // Create a key BEFORE the daemon starts, so `list` has something to show.
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "daemonkey"])
+            .run(),
+    );
+
+    // Sanity: `list` works normally when no daemon holds the vault.
+    let before = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&before);
+    assert!(output_contains(&before, "daemonkey"));
+
+    // Start the daemon (holds the writer lock + serves the inspect socket).
+    let mock = nostr_relay_builder::MockRelay::run()
+        .await
+        .expect("mock relay start");
+    let relay = mock.url().await.to_string();
+    let (_serve, _bunker_url) = spawn_bunker(&bin, &vault, &relay);
+    // Let the inspect socket bind after the bunker URL is printed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // `list` now must route through the daemon (the direct open would fail on the
+    // exclusive lock).
+    let during = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&during);
+    assert!(
+        output_contains(&during, "daemonkey"),
+        "list must show the key via the daemon:\n{}",
+        String::from_utf8_lossy(&during.stderr)
+    );
+    assert!(
+        output_contains(&during, "via running daemon"),
+        "list must indicate it came from the daemon"
+    );
+
+    drop(mock);
+}

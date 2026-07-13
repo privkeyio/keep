@@ -396,6 +396,16 @@ pub fn cmd_list(out: &Output, path: &Path, hidden: bool) -> Result<()> {
 
     debug!("listing keys");
 
+    // #533: if a `keep serve` daemon holds redb's exclusive writer lock, it also
+    // serves a local inspect socket. Answer from it when present, which avoids the
+    // lock conflict (taken at unlock) and the password prompt entirely. A stale
+    // socket (dead daemon) fails the query, so fall through to a normal open.
+    if crate::ipc::inspect_socket_path(path).exists() {
+        if let Ok(keys) = crate::ipc::query_list(path) {
+            return render_daemon_keys(out, keys);
+        }
+    }
+
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
 
@@ -430,6 +440,33 @@ pub fn cmd_list(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     out.newline();
     out.info(&format!("{} key(s) total", keys.len()));
 
+    Ok(())
+}
+
+/// Render a key list obtained from a running daemon's inspect socket (#533),
+/// matching `cmd_list`'s table. The data came from the daemon's already-unlocked
+/// vault, so no local password prompt or unlock happens here.
+fn render_daemon_keys(out: &Output, keys: Vec<crate::ipc::KeyInfo>) -> Result<()> {
+    if keys.is_empty() {
+        out.newline();
+        out.info("No keys found. Use 'keep generate' to create one.");
+        return Ok(());
+    }
+    out.table_header(&[("NAME", 20), ("TYPE", 20), ("PUBKEY", 28)]);
+    for key in &keys {
+        let display_npub = if key.npub.len() > 24 {
+            format!("{}...", &key.npub[..24])
+        } else {
+            key.npub.clone()
+        };
+        out.table_row(&[
+            (&key.name, 20, false),
+            (&key.key_type, 20, false),
+            (&display_npub, 28, true),
+        ]);
+    }
+    out.newline();
+    out.info(&format!("{} key(s) total (via running daemon)", keys.len()));
     Ok(())
 }
 

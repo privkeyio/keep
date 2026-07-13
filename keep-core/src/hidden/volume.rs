@@ -1499,8 +1499,8 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            matches!(err, KeepError::Database(_)),
-            "expected Database from map_open_failure, got {err:?}"
+            matches!(err, KeepError::VaultAlreadyOpen(_)),
+            "expected VaultAlreadyOpen from map_open_failure, got {err:?}"
         );
         assert!(
             msg.contains("already opened by another process"),

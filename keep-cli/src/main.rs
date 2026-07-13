@@ -6,6 +6,7 @@
 mod cli;
 mod commands;
 mod config;
+mod ipc;
 mod output;
 mod panic;
 #[cfg(windows)]
