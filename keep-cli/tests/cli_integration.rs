@@ -721,3 +721,242 @@ fn test_wallet_propose_accepts_every_canonical_network() {
         );
     }
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 3: backup / restore round-trip (vault data-integrity safety net)
+//
+// With KEEP_PASSWORD set by the harness, both the vault unlock AND the backup
+// passphrase (and, on restore, the new vault password) are non-interactive, so
+// the whole round trip runs unattended. `restore` takes the backup file
+// positionally and a mandatory `--target` (a NEW path it refuses to overwrite).
+// -----------------------------------------------------------------------------
+
+/// A full-vault backup restored into a fresh path preserves every stored key.
+#[test]
+fn test_backup_restore_round_trip_preserves_keys() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("src-vault");
+    let backup = dir.path().join("vault.kbak");
+    let restored = dir.path().join("restored-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "alpha"])
+            .run(),
+    );
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "beta"])
+            .run(),
+    );
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["backup", "--output", backup.to_str().unwrap()])
+        .run();
+    assert_success(&out);
+    assert!(backup.exists(), "backup file must be written");
+
+    let out = KeepCmd::new(&bin)
+        .args([
+            "restore",
+            backup.to_str().unwrap(),
+            "--target",
+            restored.to_str().unwrap(),
+        ])
+        .run();
+    assert_success(&out);
+
+    let out = KeepCmd::new(&bin).path(&restored).args(["list"]).run();
+    assert_success(&out);
+    assert!(output_contains(&out, "alpha"));
+    assert!(output_contains(&out, "beta"));
+}
+
+/// A restored vault's FROST group still produces a valid BIP-340 signature,
+/// proving the key package (not just metadata) survived the round trip.
+#[test]
+fn test_backup_restore_preserves_frost_group_signing() {
+    use bitcoin::secp256k1::{schnorr, Message, Secp256k1, XOnlyPublicKey};
+    use keep_core::Keep;
+
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("src-vault");
+    let backup = dir.path().join("vault.kbak");
+    let restored = dir.path().join("restored-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "frost",
+                "generate",
+                "--threshold",
+                "2",
+                "--shares",
+                "3",
+                "--name",
+                "grp",
+            ])
+            .run(),
+    );
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["backup", "--output", backup.to_str().unwrap()])
+            .run(),
+    );
+    assert_success(
+        &KeepCmd::new(&bin)
+            .args([
+                "restore",
+                backup.to_str().unwrap(),
+                "--target",
+                restored.to_str().unwrap(),
+            ])
+            .run(),
+    );
+
+    // Read the group pubkey from the RESTORED vault (the display npub is truncated).
+    let group_pubkey: [u8; 32] = {
+        let mut keep = Keep::open(&restored).unwrap();
+        keep.unlock(TEST_PASSWORD).unwrap();
+        let shares = keep.frost_list_shares().unwrap();
+        shares
+            .iter()
+            .find(|s| s.metadata.name == "grp")
+            .expect("group must survive restore")
+            .metadata
+            .group_pubkey
+    };
+
+    let digest: [u8; 32] = sha2::Sha256::digest(b"restored group signing payload").into();
+    let msg_hex = hex::encode(digest);
+    let sign_out = KeepCmd::new(&bin)
+        .path(&restored)
+        .args(["frost", "sign", "--message", &msg_hex, "--group", "grp"])
+        .run();
+    assert_success(&sign_out);
+
+    let sig = extract_signature_hex(&sign_out);
+    let signature = schnorr::Signature::from_slice(&sig).expect("valid schnorr signature");
+    let msg = Message::from_digest(digest);
+    let xonly = XOnlyPublicKey::from_slice(&group_pubkey).expect("group pubkey x-only");
+    let secp = Secp256k1::verification_only();
+    secp.verify_schnorr(&signature, &msg, &xonly)
+        .expect("a restored FROST group's signature MUST verify against the group pubkey");
+}
+
+/// `restore` refuses to write over an existing path, so it can never clobber a
+/// live vault.
+#[test]
+fn test_restore_refuses_existing_target() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("src-vault");
+    let backup = dir.path().join("vault.kbak");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["backup", "--output", backup.to_str().unwrap()])
+            .run(),
+    );
+
+    // Target = the existing source vault: restore MUST refuse.
+    let out = KeepCmd::new(&bin)
+        .args([
+            "restore",
+            backup.to_str().unwrap(),
+            "--target",
+            vault.to_str().unwrap(),
+        ])
+        .run();
+    assert_failure(&out);
+}
+
+/// Restoring with the wrong backup passphrase fails cleanly and leaves no vault.
+#[test]
+fn test_restore_wrong_passphrase_fails() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("src-vault");
+    let backup = dir.path().join("vault.kbak");
+    let restored = dir.path().join("restored-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["backup", "--output", backup.to_str().unwrap()])
+            .run(),
+    );
+
+    // Restore reads the backup passphrase from KEEP_PASSWORD; override it with a
+    // wrong (but length-valid) value so failure is at decryption, not validation.
+    let out = KeepCmd::new(&bin)
+        .env("KEEP_PASSWORD", "wrongpassword123")
+        .args([
+            "restore",
+            backup.to_str().unwrap(),
+            "--target",
+            restored.to_str().unwrap(),
+        ])
+        .run();
+    assert_failure(&out);
+    assert!(
+        !restored.exists(),
+        "a failed restore must not leave a partial vault"
+    );
+}
+
+/// A single-byte tamper of the backup's AEAD tag is caught on restore.
+#[test]
+fn test_restore_rejects_tampered_backup() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("src-vault");
+    let backup = dir.path().join("vault.kbak");
+    let restored = dir.path().join("restored-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["backup", "--output", backup.to_str().unwrap()])
+            .run(),
+    );
+
+    // Flip the final byte (inside the AEAD tag) so authentication fails.
+    let mut bytes = std::fs::read(&backup).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&backup, &bytes).unwrap();
+
+    let out = KeepCmd::new(&bin)
+        .args([
+            "restore",
+            backup.to_str().unwrap(),
+            "--target",
+            restored.to_str().unwrap(),
+        ])
+        .run();
+    assert_failure(&out);
+    assert!(
+        !restored.exists(),
+        "a tampered restore must not leave a vault"
+    );
+}
