@@ -617,7 +617,7 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
             created_at: bs.created_at,
             updated_at: bs.updated_at,
         };
-        keep.store_secret(&record)?;
+        keep.restore_secret(&record)?;
     }
 
     keep.set_kill_switch(backup.config.kill_switch)?;
@@ -818,7 +818,8 @@ mod tests {
             "db password".into(),
             SecretKind::Password,
             b"s3cr3t".to_vec(),
-        );
+        )
+        .unwrap();
         let id = rec.id;
         let created = rec.created_at;
         keep.store_secret(&rec).unwrap();
@@ -844,6 +845,34 @@ mod tests {
         assert_eq!(loaded.value, b"s3cr3t");
         // Restore preserves the original id and timestamps, not fresh ones.
         assert_eq!(loaded.created_at, created);
+    }
+
+    #[test]
+    fn secret_create_and_delete_are_audited() {
+        use crate::audit::AuditEventType;
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let mut keep = create_test_keep(&dir.path().join("v"));
+        keep.unlock("test-password-123").unwrap();
+
+        let rec = SecretRecord::new("t".into(), SecretKind::Note, b"v".to_vec()).unwrap();
+        let id = rec.id;
+        keep.store_secret(&rec).unwrap();
+        keep.delete_secret(&id).unwrap();
+
+        let entries = keep.audit_read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.event_type, AuditEventType::SecretCreate)),
+            "store_secret must emit a SecretCreate audit event"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.event_type, AuditEventType::SecretDelete)),
+            "delete_secret must emit a SecretDelete audit event"
+        );
     }
 
     /// Pin that backup + restore preserves every stored row type — not just

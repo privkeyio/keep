@@ -1169,7 +1169,8 @@ mod tests {
         let id;
         {
             let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
-            let rec = SecretRecord::new("api".into(), SecretKind::ApiToken, b"tok-secret".to_vec());
+            let rec = SecretRecord::new("api".into(), SecretKind::ApiToken, b"tok-secret".to_vec())
+                .unwrap();
             id = rec.id;
             storage.store_secret(&rec).unwrap();
         }

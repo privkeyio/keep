@@ -311,6 +311,8 @@ struct AuditStats {
     password_rotate_fail: u32,
     data_key_rotate_ok: u32,
     data_key_rotate_fail: u32,
+    secret_create: u32,
+    secret_delete: u32,
 }
 
 impl AuditStats {
@@ -342,6 +344,8 @@ impl AuditStats {
             AuditEventType::PasswordRotateFailed => self.password_rotate_fail += 1,
             AuditEventType::DataKeyRotate => self.data_key_rotate_ok += 1,
             AuditEventType::DataKeyRotateFailed => self.data_key_rotate_fail += 1,
+            AuditEventType::SecretCreate => self.secret_create += 1,
+            AuditEventType::SecretDelete => self.secret_delete += 1,
         }
     }
 }
@@ -414,6 +418,10 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         "  Data-key rotations: {} ok / {} failed",
         stats.data_key_rotate_ok, stats.data_key_rotate_fail
     ));
+    out.info(&format!(
+        "  Secrets: {} created / {} deleted",
+        stats.secret_create, stats.secret_delete
+    ));
 
     Ok(())
 }
@@ -457,6 +465,8 @@ mod stats_tests {
         stats.record(AuditEventType::PasswordRotateFailed);
         stats.record(AuditEventType::DataKeyRotate);
         stats.record(AuditEventType::DataKeyRotateFailed);
+        stats.record(AuditEventType::SecretCreate);
+        stats.record(AuditEventType::SecretDelete);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -480,6 +490,8 @@ mod stats_tests {
         assert_eq!(stats.password_rotate_fail, 1);
         assert_eq!(stats.data_key_rotate_ok, 1);
         assert_eq!(stats.data_key_rotate_fail, 1);
+        assert_eq!(stats.secret_create, 1);
+        assert_eq!(stats.secret_delete, 1);
     }
 
     /// Closes the #526 gap surfaced by #441's testing pass: each of the

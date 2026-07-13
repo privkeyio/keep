@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::entropy;
+use crate::error::Result;
 
 /// Category of a stored secret. Additive: only APPEND new variants, so a record
 /// written by an older build keeps decoding under bincode's integer tag.
@@ -67,18 +68,19 @@ pub struct SecretRecord {
 
 impl SecretRecord {
     /// Create a new secret record with a fresh random id and `created_at ==
-    /// updated_at == now`.
-    pub fn new(name: String, kind: SecretKind, value: Vec<u8>) -> Self {
-        let id: [u8; 32] = entropy::random_bytes();
+    /// updated_at == now`. Returns `Err` (rather than panicking) if the CSPRNG
+    /// health check fails, so a broken RNG cannot crash the process here.
+    pub fn new(name: String, kind: SecretKind, value: Vec<u8>) -> Result<Self> {
+        let id: [u8; 32] = entropy::try_random_bytes()?;
         let now = chrono::Utc::now().timestamp();
-        Self {
+        Ok(Self {
             id,
             name,
             kind,
             value,
             created_at: now,
             updated_at: now,
-        }
+        })
     }
 }
 
@@ -103,8 +105,8 @@ mod tests {
 
     #[test]
     fn new_mints_a_random_id_and_equal_timestamps() {
-        let a = SecretRecord::new("x".into(), SecretKind::Password, b"v".to_vec());
-        let b = SecretRecord::new("x".into(), SecretKind::Password, b"v".to_vec());
+        let a = SecretRecord::new("x".into(), SecretKind::Password, b"v".to_vec()).unwrap();
+        let b = SecretRecord::new("x".into(), SecretKind::Password, b"v".to_vec()).unwrap();
         assert_ne!(a.id, b.id, "each secret gets a fresh random id");
         assert_eq!(a.created_at, a.updated_at);
     }
@@ -115,7 +117,8 @@ mod tests {
             "GitHub login".into(),
             SecretKind::Password,
             b"hunter2".to_vec(),
-        );
+        )
+        .unwrap();
         let s = format!("{rec:?}");
         assert!(!s.contains("GitHub login"), "name must be redacted: {s}");
         assert!(!s.contains("hunter2"), "value must be redacted: {s}");

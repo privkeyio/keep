@@ -1729,7 +1729,8 @@ mod tests {
             "GitHub login".into(),
             SecretKind::Password,
             b"hunter2".to_vec(),
-        );
+        )
+        .unwrap();
         let id = rec.id;
         storage.store_secret(&rec).unwrap();
 
@@ -1757,8 +1758,8 @@ mod tests {
 
         // The same title + value stored twice yields two rows: a secret has no
         // pubkey to derive a stable id from, so ids are random (see SecretRecord).
-        let a = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec());
-        let b = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec());
+        let a = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec()).unwrap();
+        let b = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec()).unwrap();
         assert_ne!(a.id, b.id);
         storage.store_secret(&a).unwrap();
         storage.store_secret(&b).unwrap();

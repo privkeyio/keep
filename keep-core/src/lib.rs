@@ -481,9 +481,13 @@ impl Keep {
     /// Store (insert or overwrite by id) an arbitrary-secret record (password,
     /// API token, note). The whole record, including its plaintext value and
     /// title, is encrypted under the vault data key at rest. See
-    /// [`storage::Storage::store_secret`].
-    pub fn store_secret(&self, record: &crate::secret::SecretRecord) -> Result<()> {
-        self.storage.store_secret(record)
+    /// [`storage::Storage::store_secret`]. Records a `SecretCreate` audit event
+    /// (tagged with the non-sensitive random id, never the name or value) so
+    /// secret mutations leave a forensic trail like every other sensitive op.
+    pub fn store_secret(&mut self, record: &crate::secret::SecretRecord) -> Result<()> {
+        self.storage.store_secret(record)?;
+        self.audit_event(AuditEventType::SecretCreate, |e| e.with_pubkey(&record.id));
+        Ok(())
     }
 
     /// Load a secret record by its 32-byte id.
@@ -496,9 +500,20 @@ impl Keep {
         self.storage.list_secrets()
     }
 
-    /// Delete a secret record by its 32-byte id.
-    pub fn delete_secret(&self, id: &[u8; 32]) -> Result<()> {
-        self.storage.delete_secret(id)
+    /// Delete a secret record by its 32-byte id. Records a `SecretDelete` audit
+    /// event tagged with the id.
+    pub fn delete_secret(&mut self, id: &[u8; 32]) -> Result<()> {
+        self.storage.delete_secret(id)?;
+        self.audit_event(AuditEventType::SecretDelete, |e| e.with_pubkey(id));
+        Ok(())
+    }
+
+    /// Restore a secret WITHOUT emitting an audit event, for the backup-restore
+    /// path only. Restore re-establishes the source vault's audit log verbatim
+    /// (see `VaultBackup::audit_entries`), so re-auditing each restored row would
+    /// double-count. Mirrors `restore_key_record`.
+    pub fn restore_secret(&self, record: &crate::secret::SecretRecord) -> Result<()> {
+        self.storage.store_secret(record)
     }
 
     /// Export a stored nsec key as NIP-49 ncryptsec.
