@@ -516,6 +516,73 @@ impl Keep {
         self.storage.store_secret(record)
     }
 
+    /// Store a secret whose value can only be revealed with a t-of-n OPRF quorum.
+    ///
+    /// `oprf_key` is the quorum-derived key ([`crate::oprf::derive_luks_key`]
+    /// output, obtained via the threshold-OPRF flow); `epoch` is its OPRF rotation
+    /// counter. The value is sealed under a fresh per-secret DEK wrapped by
+    /// `oprf_key`, so a single device that never assembles the quorum cannot
+    /// decrypt it even with the vault unlocked. The secret's name/kind stay
+    /// readable with the vault data key. Returns the minted record, whose random
+    /// id is the OPRF domain-separation label recorded in the seal. Records a
+    /// `SecretCreate` audit event tagged with the id.
+    pub fn store_sealed_secret(
+        &mut self,
+        name: String,
+        kind: crate::secret::SecretKind,
+        value: &[u8],
+        oprf_key: &crate::crypto::SecretKey,
+        epoch: u32,
+    ) -> Result<crate::secret::SecretRecord> {
+        let mut record = crate::secret::SecretRecord::new(name, kind, Vec::new())?;
+        let oprf_id = hex::encode(record.id);
+        let (value_ciphertext, seal) = crate::secret::seal_value(value, oprf_key, oprf_id, epoch)?;
+        record.value = value_ciphertext;
+        self.storage.store_sealed_secret(&record, &seal)?;
+        self.audit_event(AuditEventType::SecretCreate, |e| e.with_pubkey(&record.id));
+        Ok(record)
+    }
+
+    /// Load the threshold seal for a secret id, or `None` if the secret is an
+    /// ordinary plaintext-value secret. The seal carries the OPRF params
+    /// (`oprf_id`, `epoch`) the quorum needs to re-derive the unwrapping key.
+    pub fn load_secret_seal(&self, id: &[u8; 32]) -> Result<Option<crate::secret::ThresholdSeal>> {
+        self.storage.load_secret_seal(id)
+    }
+
+    /// Reveal a threshold-sealed secret's plaintext value given the OPRF-quorum
+    /// -derived key. Errors if the secret is not sealed, or if `oprf_key` is wrong
+    /// (a single-device caller that never assembled the quorum cannot derive it).
+    ///
+    /// Records a `SecretReveal` audit event (tagged with the id) only on a
+    /// successful unseal: revealing a quorum-gated plaintext is the most sensitive
+    /// read in the store, audited like `KeyExport`. A wrong-key attempt leaves no
+    /// entry (it never yields the value).
+    pub fn reveal_sealed_secret(
+        &mut self,
+        id: &[u8; 32],
+        oprf_key: &crate::crypto::SecretKey,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        let record = self.storage.load_secret(id)?;
+        let seal = self
+            .storage
+            .load_secret_seal(id)?
+            .ok_or_else(|| KeepError::invalid_input("secret is not threshold-sealed"))?;
+        let plaintext = crate::secret::unseal_value(&record.value, &seal, oprf_key)?;
+        self.audit_event(AuditEventType::SecretReveal, |e| e.with_pubkey(id));
+        Ok(plaintext)
+    }
+
+    /// Restore a threshold-sealed secret (record + seal) WITHOUT emitting an audit
+    /// event, for the backup-restore path only. Mirrors [`Self::restore_secret`].
+    pub fn restore_sealed_secret(
+        &self,
+        record: &crate::secret::SecretRecord,
+        seal: &crate::secret::ThresholdSeal,
+    ) -> Result<()> {
+        self.storage.store_sealed_secret(record, seal)
+    }
+
     /// Export a stored nsec key as NIP-49 ncryptsec.
     pub fn export_ncryptsec(&mut self, pubkey: &[u8; 32], password: &str) -> Result<String> {
         if !self.is_unlocked() {

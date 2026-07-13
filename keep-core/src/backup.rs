@@ -169,6 +169,27 @@ pub struct BackupSecret {
     /// Unix timestamp of the last update.
     #[zeroize(skip)]
     pub updated_at: i64,
+    /// Present only for a threshold-sealed secret: the wrapped DEK + OPRF params.
+    /// When present, `value` is the DEK-CIPHERTEXT (hex), not plaintext, and the
+    /// value stays gated behind the OPRF quorum after restore (the OPRF root is
+    /// never in a backup). `#[serde(default)]` so older backups decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<BackupSeal>,
+}
+
+/// Threshold seal carried in a backup: the wrapped DEK plus the OPRF params
+/// needed to re-derive the unwrapping key. Only ciphertext/params, never
+/// plaintext, so a backup never contains a threshold secret's value in the clear.
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct BackupSeal {
+    /// Hex-encoded wrapped DEK (the per-secret key encrypted under the OPRF key).
+    pub wrapped_dek: String,
+    /// OPRF domain-separation label (hex secret id).
+    #[zeroize(skip)]
+    pub oprf_id: String,
+    /// OPRF epoch (rotation counter for the derived key).
+    #[zeroize(skip)]
+    pub epoch: u32,
 }
 
 impl std::fmt::Debug for BackupSecret {
@@ -178,6 +199,7 @@ impl std::fmt::Debug for BackupSecret {
             .field("kind", &self.kind)
             .field("name", &"[REDACTED]")
             .field("value", &"[REDACTED]")
+            .field("sealed", &self.seal.is_some())
             .finish()
     }
 }
@@ -381,6 +403,14 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let secret_records = keep.list_secrets()?;
     let mut backup_secrets = Vec::with_capacity(secret_records.len());
     for record in &secret_records {
+        // For a threshold-sealed secret `record.value` is the DEK-ciphertext (not
+        // plaintext); the seal carries the wrapped DEK + OPRF params. Backing both
+        // up preserves the quorum gate without ever holding the plaintext.
+        let seal = keep.load_secret_seal(&record.id)?.map(|s| BackupSeal {
+            wrapped_dek: hex::encode(&s.wrapped_dek),
+            oprf_id: s.oprf_id.clone(),
+            epoch: s.epoch,
+        });
         backup_secrets.push(BackupSecret {
             id: hex::encode(record.id),
             name: record.name.clone(),
@@ -388,6 +418,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             value: hex::encode(&record.value),
             created_at: record.created_at,
             updated_at: record.updated_at,
+            seal,
         });
     }
 
@@ -617,7 +648,20 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
             created_at: bs.created_at,
             updated_at: bs.updated_at,
         };
-        keep.restore_secret(&record)?;
+        match &bs.seal {
+            // Threshold-sealed: `value` is the DEK-ciphertext; restore it with the
+            // seal so the value stays gated behind the OPRF quorum.
+            Some(bseal) => {
+                let seal = crate::secret::ThresholdSeal {
+                    wrapped_dek: hex::decode(&bseal.wrapped_dek)
+                        .map_err(|e| KeepError::Other(format!("hex decode wrapped dek: {e}")))?,
+                    oprf_id: bseal.oprf_id.clone(),
+                    epoch: bseal.epoch,
+                };
+                keep.restore_sealed_secret(&record, &seal)?;
+            }
+            None => keep.restore_secret(&record)?,
+        }
     }
 
     keep.set_kill_switch(backup.config.kill_switch)?;
@@ -845,6 +889,66 @@ mod tests {
         assert_eq!(loaded.value, b"s3cr3t");
         // Restore preserves the original id and timestamps, not fresh ones.
         assert_eq!(loaded.created_at, created);
+    }
+
+    /// A threshold-sealed secret MUST survive backup + restore with its value
+    /// still gated behind the OPRF quorum: the backup carries the DEK-ciphertext
+    /// and the wrapped DEK (never plaintext), so after restore the value only
+    /// unseals under the SAME OPRF key -- exactly as before the backup.
+    #[test]
+    fn backup_roundtrip_preserves_sealed_secrets() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let mut keep = create_test_keep(&src_path);
+        keep.unlock("test-password-123").unwrap();
+
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+        let record = keep
+            .store_sealed_secret(
+                "quorum note".into(),
+                crate::secret::SecretKind::Note,
+                b"only-with-a-quorum",
+                &oprf_key,
+                0,
+            )
+            .unwrap();
+        let id = record.id;
+
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+
+        // The plaintext must NOT appear anywhere in the encrypted-then-decoded
+        // backup path; but more strongly, the value in the backup is DEK-ciphertext.
+        let dst_path = dir.path().join("dst");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+
+        // Metadata survives and is readable without a quorum.
+        let loaded = restored.load_secret(&id).expect("sealed record survives");
+        assert_eq!(loaded.name, "quorum note");
+        assert_eq!(loaded.kind, crate::secret::SecretKind::Note);
+        assert_ne!(
+            loaded.value, b"only-with-a-quorum",
+            "value must stay sealed"
+        );
+
+        // The value only comes back with the OPRF key; a wrong key stays sealed.
+        let revealed = restored
+            .reveal_sealed_secret(&id, &oprf_key)
+            .expect("value unseals with the OPRF key after restore");
+        assert_eq!(&revealed[..], b"only-with-a-quorum");
+        let wrong = crypto::SecretKey::generate().unwrap();
+        assert!(
+            restored.reveal_sealed_secret(&id, &wrong).is_err(),
+            "single-device (wrong OPRF key) must fail after restore too"
+        );
     }
 
     #[test]

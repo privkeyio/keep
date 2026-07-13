@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::{
     RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
-    RELAY_CONFIGS_TABLE, SECRETS_TABLE, SHARES_TABLE,
+    RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE, SHARES_TABLE,
 };
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
@@ -34,7 +34,16 @@ use crate::wallet::WalletDescriptor;
 /// `SECRETS_TABLE` qualifies: each row is `crypto::encrypt(bincode(SecretRecord))`, a single
 /// blob under the data key with no inner per-field encryption (unlike `KeyRecord`, whose
 /// separately-encrypted secret is why keys are rotated on their own typed path, not here).
-const OPAQUE_TABLES: [&str; 3] = [CONFIG_TABLE, HEALTH_STATUS_TABLE, SECRETS_TABLE];
+///
+/// `SECRET_SEALS_TABLE` likewise: each row is `crypto::encrypt(bincode(ThresholdSeal))`. Rotation
+/// re-wraps only this outer data-key layer; the inner DEK-ciphertext value and the OPRF-wrapped DEK
+/// are opaque bytes carried through untouched, so no OPRF quorum is needed to rotate the data key.
+const OPAQUE_TABLES: [&str; 4] = [
+    CONFIG_TABLE,
+    HEALTH_STATUS_TABLE,
+    SECRETS_TABLE,
+    SECRET_SEALS_TABLE,
+];
 
 /// One row of an [`OPAQUE_TABLES`] table, held decrypted across a rotation.
 struct OpaqueRow {
@@ -1186,6 +1195,50 @@ mod tests {
         assert_eq!(loaded.value, b"tok-secret");
         assert_eq!(loaded.name, "api");
         assert_eq!(loaded.kind, SecretKind::ApiToken);
+    }
+
+    /// A threshold-sealed secret MUST survive a `rotate_data_key`: both the
+    /// record (`SECRETS_TABLE`) and its seal (`SECRET_SEALS_TABLE`) are registered
+    /// in `OPAQUE_TABLES`, so rotation re-wraps only the outer data-key layer and
+    /// the value still unseals under the SAME OPRF key afterward (no quorum needed
+    /// to rotate).
+    #[test]
+    fn rotate_data_key_preserves_sealed_secrets() {
+        use crate::secret::{seal_value, unseal_value, SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sealed-secrets-survive-rotation");
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+        let id;
+        {
+            let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
+            let mut rec =
+                SecretRecord::new("vault-key".into(), SecretKind::Generic, Vec::new()).unwrap();
+            id = rec.id;
+            let (value_ct, seal) =
+                seal_value(b"threshold-secret", &oprf_key, hex::encode(rec.id), 0).unwrap();
+            rec.value = value_ct;
+            storage.store_sealed_secret(&rec, &seal).unwrap();
+        }
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key("pass1234").unwrap();
+        }
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("pass1234").unwrap();
+        let loaded = storage
+            .load_secret(&id)
+            .expect("sealed record MUST survive a data-key rotation");
+        let seal = storage
+            .load_secret_seal(&id)
+            .expect("seal load ok")
+            .expect("seal MUST survive a data-key rotation");
+        let plaintext =
+            unseal_value(&loaded.value, &seal, &oprf_key).expect("unseal after rotation");
+        assert_eq!(
+            &plaintext[..],
+            b"threshold-secret",
+            "value must still unseal under the same OPRF key post-rotation"
+        );
     }
 
     /// `rotate_data_key` MUST reject a wrong password. Without the gate,

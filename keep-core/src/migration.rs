@@ -9,7 +9,7 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// The current schema version supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 6;
+pub const CURRENT_SCHEMA_VERSION: u32 = 7;
 
 /// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
@@ -120,6 +120,7 @@ fn migrate_v4_to_v5(db: &Database) -> Result<()> {
 }
 
 const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secrets");
+const SECRET_SEALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secret_seals");
 
 /// v5 → v6: introduce the `secrets` table for arbitrary-secret records
 /// (passwords, API tokens, notes). Creating the empty table is the whole
@@ -128,6 +129,16 @@ const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("s
 fn migrate_v5_to_v6(db: &Database) -> Result<()> {
     let wtxn = db.begin_write()?;
     wtxn.open_table(SECRETS_TABLE_DEF)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
+/// v6 → v7: introduce the `secret_seals` table for threshold seals (the wrapped
+/// DEK plus OPRF params) of secrets whose value is gated behind a t-of-n OPRF
+/// quorum. Creating the empty table is the whole migration; rows are untouched.
+fn migrate_v6_to_v7(db: &Database) -> Result<()> {
+    let wtxn = db.begin_write()?;
+    wtxn.open_table(SECRET_SEALS_TABLE_DEF)?;
     wtxn.commit()?;
     Ok(())
 }
@@ -158,6 +169,11 @@ fn get_migrations() -> Vec<Migration> {
             from_version: 5,
             to_version: 6,
             migrate: migrate_v5_to_v6,
+        },
+        Migration {
+            from_version: 6,
+            to_version: 7,
+            migrate: migrate_v6_to_v7,
         },
     ]
 }
