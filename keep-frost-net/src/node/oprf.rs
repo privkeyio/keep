@@ -358,6 +358,24 @@ impl KfpNode {
         ))
     }
 
+    /// Derive the quorum key that seals/unseals a threshold **secret**, by running
+    /// the OPRF unlock flow with the dedicated secrets input
+    /// ([`keep_core::oprf::SECRET_SEAL_INPUT`]) instead of the LUKS one. `oprf_id`
+    /// is the secret's id (its `ThresholdSeal.oprf_id`, used as the OPRF `volume_id`)
+    /// and `epoch` its rotation counter, so every secret derives a distinct key from
+    /// the SAME provisioned OPRF root the vault already uses for LUKS unlock, with no
+    /// per-secret provisioning. Requires a t-of-n quorum: a single device cannot
+    /// assemble the partials, so it cannot derive the key. The 32 bytes are the
+    /// `oprf_key` fed to `keep_core::secret::{seal_value, unseal_value}`.
+    pub async fn request_secret_seal_key(
+        &self,
+        oprf_id: &str,
+        epoch: u32,
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        self.request_oprf_unlock(keep_core::oprf::SECRET_SEAL_INPUT, oprf_id, epoch)
+            .await
+    }
+
     /// One OPRF unlock round: sample (excluding `excluded`), blind, send, and
     /// wait one timeout. On timeout, the returned `non_responders` are the
     /// sampled holders that never deposited a partial, so the caller can exclude

@@ -28,6 +28,17 @@ impl CipherSuite for Secp256k1Sha256 {
     type Hash = sha2_010::Sha256;
 }
 
+/// OPRF evaluation input for the threshold-sealed **secrets** store, distinct from
+/// the LUKS vault-unlock input. Feeding a different input to the SAME provisioned
+/// OPRF root yields a different OPRF output, so a secret's quorum-derived key can
+/// never collide with a LUKS volume key even though both reuse one root and the
+/// same `derive_luks_key` KDF. Per-secret separation is then layered on via the
+/// `volume_id` (the secret id) and `epoch`. Fixed like the LUKS input: the eval
+/// oracle authenticates callers (that is what protects it), so input entropy is
+/// not relied upon. MUST NOT change once it has sealed data (it would orphan every
+/// existing sealed value from its quorum).
+pub const SECRET_SEAL_INPUT: &[u8] = b"keep-secret-seal-v1";
+
 /// 2-of-3 (configurable t-of-n) threshold layer over the secp256k1 OPRF.
 ///
 /// The OPRF key is Shamir-shared across the share-holders (box / phone / replica). Each holder
@@ -699,6 +710,82 @@ mod tests {
                 "quorum {{{i},{j}}} must reproduce the provisioned LUKS key"
             );
         }
+    }
+
+    /// Derive a 32-byte key from `count` holder shares through the full quorum path
+    /// (blind -> per-holder evaluate -> combine -> derive), exactly as a networked
+    /// unlock does but in-process. `threshold` MUST be the `t` used at split.
+    fn quorum_derive(
+        shares: &[threshold::KeyShare],
+        count: usize,
+        input: &[u8],
+        volume_id: &str,
+        epoch: u32,
+        threshold: usize,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, crate::error::CryptoError> {
+        let (client, blinded) = unlock::blind(input)?;
+        let mut partials = Vec::with_capacity(count);
+        for share in shares.iter().take(count) {
+            partials.push(unlock::evaluate(share, &blinded)?.to_vec());
+        }
+        client.finalize_luks_key(&partials, threshold, volume_id, epoch)
+    }
+
+    /// End-to-end proof for threshold-sealed secrets (increment 2): a secret sealed
+    /// under the OPRF-quorum-derived key is revealable ONLY by re-deriving that key
+    /// through a t-of-n quorum, and a below-threshold set (single device) fails. This
+    /// exercises the real OPRF math + the `secret::seal` layer, without the network.
+    #[test]
+    fn secret_sealed_under_quorum_key_unseals_only_with_a_quorum() {
+        use crate::crypto::SecretKey;
+        use crate::secret::{seal_value, unseal_value};
+
+        let (t, n) = (2usize, 3usize);
+        // The seal's `oprf_id` is the secret id (hex); it is the OPRF `volume_id`.
+        let secret_id = hex::encode([7u8; 32]);
+        let epoch = 0u32;
+
+        // One provisioned OPRF root (reused across secrets) with the SECRETS input;
+        // shares are held by the quorum.
+        let (provisioned, shares) =
+            unlock::provision(SECRET_SEAL_INPUT, &secret_id, epoch, t, n).expect("provision");
+
+        // Seal a secret's value under the provisioned quorum key.
+        let key = SecretKey::from_slice(&provisioned[..]).expect("key");
+        let (ciphertext, seal) =
+            seal_value(b"only-with-a-quorum", &key, secret_id.clone(), epoch).expect("seal");
+
+        // Reveal: a quorum of `t` shares re-derives the SAME key and unseals.
+        let via_quorum =
+            quorum_derive(&shares, t, SECRET_SEAL_INPUT, &secret_id, epoch, t).expect("quorum");
+        assert_eq!(
+            &provisioned[..],
+            &via_quorum[..],
+            "a t-of-n quorum unlock must reproduce the provisioned seal key"
+        );
+        let key2 = SecretKey::from_slice(&via_quorum[..]).expect("key2");
+        assert_eq!(
+            &unseal_value(&ciphertext, &seal, &key2).expect("unseal")[..],
+            b"only-with-a-quorum"
+        );
+
+        // Below threshold (t-1 shares = a single device short of quorum): the partials
+        // cannot combine, so no key is derived and the value stays sealed.
+        assert!(
+            quorum_derive(&shares, t - 1, SECRET_SEAL_INPUT, &secret_id, epoch, t).is_err(),
+            "t-1 shares must fail to derive the key (single-device access fails)"
+        );
+
+        // A DIFFERENT secret id derives a DIFFERENT key from the same root/quorum
+        // (per-secret domain separation), so it cannot unseal this secret.
+        let other_id = hex::encode([8u8; 32]);
+        let other_key = quorum_derive(&shares, t, SECRET_SEAL_INPUT, &other_id, epoch, t)
+            .expect("other quorum");
+        assert_ne!(
+            &via_quorum[..],
+            &other_key[..],
+            "each secret id must derive a distinct key from the shared root"
+        );
     }
 
     /// A key share that is serialized then deserialized must behave identically to the original:
