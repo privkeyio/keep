@@ -37,6 +37,12 @@ impl CipherSuite for Secp256k1Sha256 {
 /// oracle authenticates callers (that is what protects it), so input entropy is
 /// not relied upon. MUST NOT change once it has sealed data (it would orphan every
 /// existing sealed value from its quorum).
+///
+/// Cross-domain separation from LUKS rests on this input occupying HKDF's IKM
+/// position in [`derive_luks_key`] (a different OPRF output for the same root), NOT
+/// on the HKDF `info` label, which stays `keep-node/luks/v1` for both domains. That
+/// is cryptographically sufficient on its own; also varying the `info` label per
+/// domain would be belt-and-suspenders, not a fix.
 pub const SECRET_SEAL_INPUT: &[u8] = b"keep-secret-seal-v1";
 
 /// 2-of-3 (configurable t-of-n) threshold layer over the secp256k1 OPRF.

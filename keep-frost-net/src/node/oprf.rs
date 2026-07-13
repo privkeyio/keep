@@ -367,6 +367,14 @@ impl KfpNode {
     /// per-secret provisioning. Requires a t-of-n quorum: a single device cannot
     /// assemble the partials, so it cannot derive the key. The 32 bytes are the
     /// `oprf_key` fed to `keep_core::secret::{seal_value, unseal_value}`.
+    ///
+    /// DESIGN PROPERTY: the OPRF eval is oblivious, so a holder's `approve_oprf_eval`
+    /// hook sees only `(requester_share_index, session_id)` -- it cannot tell a
+    /// secret-seal eval from a LUKS-unlock eval, nor which secret. Any authorized
+    /// quorum eval therefore grants derivation across both domains; an operator
+    /// cannot approve "this one secret only". Acceptable because both domains already
+    /// demand the identical quorum + fresh attestation, so this crosses no new
+    /// authority boundary.
     pub async fn request_secret_seal_key(
         &self,
         oprf_id: &str,
