@@ -13,7 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::{
     RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
-    RELAY_CONFIGS_TABLE, SHARES_TABLE,
+    RELAY_CONFIGS_TABLE, SECRETS_TABLE, SHARES_TABLE,
 };
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
@@ -30,7 +30,11 @@ use crate::wallet::WalletDescriptor;
 /// with no typed collection path of their own. Rotation moves them verbatim: decrypt each row
 /// under the old key, re-encrypt under the new one. `STATE_VERSIONS_TABLE` is deliberately
 /// absent because it stores plaintext big-endian counters, not ciphertext.
-const OPAQUE_TABLES: [&str; 2] = [CONFIG_TABLE, HEALTH_STATUS_TABLE];
+///
+/// `SECRETS_TABLE` qualifies: each row is `crypto::encrypt(bincode(SecretRecord))`, a single
+/// blob under the data key with no inner per-field encryption (unlike `KeyRecord`, whose
+/// separately-encrypted secret is why keys are rotated on their own typed path, not here).
+const OPAQUE_TABLES: [&str; 3] = [CONFIG_TABLE, HEALTH_STATUS_TABLE, SECRETS_TABLE];
 
 /// One row of an [`OPAQUE_TABLES`] table, held decrypted across a rotation.
 struct OpaqueRow {
@@ -1151,6 +1155,37 @@ mod tests {
             original_secret.as_slice(),
             "decrypted secret bytes MUST match the pre-rotation value"
         );
+    }
+
+    /// A `rotate_data_key` (new random data key, every row re-encrypted) MUST
+    /// carry `secrets` rows through: they are registered in `OPAQUE_TABLES`, so a
+    /// missed registration would leave them under the OLD key and fail to decrypt
+    /// here.
+    #[test]
+    fn rotate_data_key_preserves_secrets() {
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secrets-survive-rotation");
+        let id;
+        {
+            let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
+            let rec = SecretRecord::new("api".into(), SecretKind::ApiToken, b"tok-secret".to_vec())
+                .unwrap();
+            id = rec.id;
+            storage.store_secret(&rec).unwrap();
+        }
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key("pass1234").unwrap();
+        }
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("pass1234").unwrap();
+        let loaded = storage
+            .load_secret(&id)
+            .expect("secret MUST survive a data-key rotation");
+        assert_eq!(loaded.value, b"tok-secret");
+        assert_eq!(loaded.name, "api");
+        assert_eq!(loaded.kind, SecretKind::ApiToken);
     }
 
     /// `rotate_data_key` MUST reject a wrong password. Without the gate,

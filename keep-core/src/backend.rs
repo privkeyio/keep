@@ -25,6 +25,10 @@ pub const RELAY_CONFIGS_TABLE: &str = "relay_configs";
 pub const CONFIG_TABLE: &str = "config";
 /// Table name for key health status records.
 pub const HEALTH_STATUS_TABLE: &str = "key_health_status";
+/// Table name for arbitrary-secret records (passwords, API tokens, notes).
+/// Deliberately NOT a replicable table (see `Storage::replicated_table`): a
+/// password vault's metadata surface must not sync to public Nostr relays.
+pub const SECRETS_TABLE: &str = "secrets";
 /// Table name for the keep-state replication high-water-mark: maps a `<table>:<record-id>` d-tag to
 /// the highest `created_at` (8-byte big-endian) applied for it, so the consumer rejects any replicated
 /// event that is not strictly newer (replay/rollback protection).
@@ -139,6 +143,7 @@ const RELAY_CONFIGS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
 const CONFIG_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("config");
 const HEALTH_STATUS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("key_health_status");
+const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secrets");
 const STATE_VERSIONS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("state_versions");
 
@@ -368,6 +373,7 @@ impl RedbBackend {
             RELAY_CONFIGS_TABLE => Ok(RELAY_CONFIGS_TABLE_DEF),
             CONFIG_TABLE => Ok(CONFIG_TABLE_DEF),
             HEALTH_STATUS_TABLE => Ok(HEALTH_STATUS_TABLE_DEF),
+            SECRETS_TABLE => Ok(SECRETS_TABLE_DEF),
             STATE_VERSIONS_TABLE => Ok(STATE_VERSIONS_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }

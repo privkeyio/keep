@@ -87,6 +87,10 @@ pub enum AuditEventType {
     /// Data-key rotation attempted but rejected (wrong password or mid-
     /// rotation failure). Same locked-vault caveat as `PasswordRotateFailed`.
     DataKeyRotateFailed = 24,
+    /// Arbitrary secret (password, API token, note) created or overwritten.
+    SecretCreate = 25,
+    /// Arbitrary secret deleted.
+    SecretDelete = 26,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -117,6 +121,8 @@ impl std::fmt::Display for AuditEventType {
             Self::PasswordRotateFailed => write!(f, "password_rotate_failed"),
             Self::DataKeyRotate => write!(f, "data_key_rotate"),
             Self::DataKeyRotateFailed => write!(f, "data_key_rotate_failed"),
+            Self::SecretCreate => write!(f, "secret_create"),
+            Self::SecretDelete => write!(f, "secret_delete"),
         }
     }
 }

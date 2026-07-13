@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::audit::{AuditEntry, AuditLog};
 use crate::crypto::{self, Argon2Params, EncryptedData, NONCE_SIZE, SALT_SIZE};
@@ -15,6 +15,7 @@ use crate::error::{KeepError, Result};
 use crate::frost::StoredShare;
 use crate::keys::{KeyRecord, KeyType};
 use crate::relay::RelayConfig;
+use crate::secret::{SecretKind, SecretRecord};
 use crate::storage::ProxyConfig;
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 use crate::Keep;
@@ -55,6 +56,10 @@ struct VaultBackup {
     /// differ from the source but the timeline of events is preserved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     audit_entries: Vec<AuditEntry>,
+    /// Arbitrary secrets (passwords, API tokens, notes). `#[serde(default)]` so
+    /// a backup written before this field existed restores with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secrets: Vec<BackupSecret>,
 }
 
 /// A key entry in a backup file.
@@ -142,6 +147,41 @@ impl std::fmt::Debug for BackupShare {
     }
 }
 
+/// A secret entry (password, API token, note) in a backup file. Omitting these
+/// from backups would be silent data loss, so a full-vault backup includes them.
+/// The backup file is itself passphrase-encrypted; `name` and `value` are also
+/// scrubbed from memory on drop and never printed.
+#[derive(Serialize, Deserialize, Clone, Zeroize, ZeroizeOnDrop)]
+pub struct BackupSecret {
+    /// Hex-encoded 32-byte secret id (preserved so the restored row keeps its identity).
+    #[zeroize(skip)]
+    pub id: String,
+    /// Human-readable title.
+    pub name: String,
+    /// Secret kind string (e.g. "Password", "ApiToken").
+    #[zeroize(skip)]
+    pub kind: String,
+    /// Hex-encoded plaintext secret value.
+    pub value: String,
+    /// Unix timestamp when the secret was created.
+    #[zeroize(skip)]
+    pub created_at: i64,
+    /// Unix timestamp of the last update.
+    #[zeroize(skip)]
+    pub updated_at: i64,
+}
+
+impl std::fmt::Debug for BackupSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackupSecret")
+            .field("id", &self.id)
+            .field("kind", &self.kind)
+            .field("name", &"[REDACTED]")
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Summary information about a backup file.
 #[derive(Debug, Clone)]
 pub struct BackupInfo {
@@ -173,6 +213,8 @@ pub struct DecryptedBackup {
     pub config: BackupConfig,
     /// Decrypted audit entries from the source vault.
     pub audit_entries: Vec<AuditEntry>,
+    /// Arbitrary secrets (passwords, API tokens, notes).
+    pub secrets: Vec<BackupSecret>,
     /// ISO-8601 timestamp when the backup was created.
     pub created_at: String,
 }
@@ -181,6 +223,7 @@ impl Drop for DecryptedBackup {
     fn drop(&mut self) {
         self.keys.zeroize();
         self.shares.zeroize();
+        self.secrets.zeroize();
     }
 }
 
@@ -203,6 +246,27 @@ fn string_to_key_type(s: &str) -> Result<KeyType> {
     }
 }
 
+fn secret_kind_to_string(k: SecretKind) -> String {
+    match k {
+        SecretKind::Password => "Password".into(),
+        SecretKind::ApiToken => "ApiToken".into(),
+        SecretKind::Note => "Note".into(),
+        SecretKind::Generic => "Generic".into(),
+    }
+}
+
+fn string_to_secret_kind(s: &str) -> Result<SecretKind> {
+    match s {
+        "Password" => Ok(SecretKind::Password),
+        "ApiToken" => Ok(SecretKind::ApiToken),
+        "Note" => Ok(SecretKind::Note),
+        "Generic" => Ok(SecretKind::Generic),
+        other => Err(KeepError::InvalidInput(format!(
+            "unknown secret kind: {other}"
+        ))),
+    }
+}
+
 /// Create an encrypted backup from pre-gathered data.
 #[allow(clippy::too_many_arguments)]
 pub fn create_backup_from_data(
@@ -215,12 +279,8 @@ pub fn create_backup_from_data(
     audit_entries: Vec<AuditEntry>,
     passphrase: &str,
 ) -> Result<Vec<u8>> {
-    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
-        return Err(KeepError::InvalidInput(format!(
-            "passphrase must be at least {MIN_PASSPHRASE_LEN} characters"
-        )));
-    }
-
+    // External callers (e.g. keep-mobile) that do not hold a secret store back up
+    // no secrets. The full-vault `create_backup` path threads them in explicitly.
     let backup = VaultBackup {
         version: VERSION,
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -231,9 +291,22 @@ pub fn create_backup_from_data(
         health_statuses,
         config,
         audit_entries,
+        secrets: Vec::new(),
     };
+    encode_backup(&backup, passphrase)
+}
 
-    let mut json_bytes = serde_json::to_vec(&backup)
+/// Passphrase-check, serialize, Argon2-derive, and encrypt a [`VaultBackup`] into
+/// the on-disk backup format. Shared by [`create_backup_from_data`] and
+/// [`create_backup`] so the header/encryption layout stays in one place.
+fn encode_backup(backup: &VaultBackup, passphrase: &str) -> Result<Vec<u8>> {
+    if passphrase.chars().count() < MIN_PASSPHRASE_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "passphrase must be at least {MIN_PASSPHRASE_LEN} characters"
+        )));
+    }
+
+    let mut json_bytes = serde_json::to_vec(backup)
         .map_err(|e| KeepError::Other(format!("backup serialization failed: {e}")))?;
 
     let salt: [u8; SALT_SIZE] = entropy::try_random_bytes()?;
@@ -305,6 +378,19 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
         });
     }
 
+    let secret_records = keep.list_secrets()?;
+    let mut backup_secrets = Vec::with_capacity(secret_records.len());
+    for record in &secret_records {
+        backup_secrets.push(BackupSecret {
+            id: hex::encode(record.id),
+            name: record.name.clone(),
+            kind: secret_kind_to_string(record.kind),
+            value: hex::encode(&record.value),
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        });
+    }
+
     let descriptors = keep.list_all_wallet_descriptor_versions()?;
     let relay_configs = keep.list_relay_configs()?;
     let health_statuses = keep.list_health_statuses()?;
@@ -312,19 +398,22 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
     let proxy = keep.get_proxy_config()?;
     let audit_entries = keep.read_audit_entries()?;
 
-    create_backup_from_data(
-        backup_keys,
-        backup_shares,
-        descriptors,
+    let backup = VaultBackup {
+        version: VERSION,
+        created_at: chrono::Utc::now().to_rfc3339(),
+        keys: backup_keys,
+        shares: backup_shares,
+        wallet_descriptors: descriptors,
         relay_configs,
         health_statuses,
-        BackupConfig {
+        config: BackupConfig {
             kill_switch,
             proxy: if proxy.enabled { Some(proxy) } else { None },
         },
         audit_entries,
-        passphrase,
-    )
+        secrets: backup_secrets,
+    };
+    encode_backup(&backup, passphrase)
 }
 
 struct ParsedHeader {
@@ -434,6 +523,7 @@ pub fn decrypt_backup(data: &[u8], passphrase: &str) -> Result<DecryptedBackup> 
         health_statuses: vault.health_statuses,
         config: vault.config,
         audit_entries: vault.audit_entries,
+        secrets: vault.secrets,
         created_at: vault.created_at,
     })
 }
@@ -509,6 +599,25 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
 
     for h in &backup.health_statuses {
         keep.store_health_status(h)?;
+    }
+
+    for bs in &backup.secrets {
+        let id: [u8; 32] = decode_hex_32(&bs.id, "secret id")?;
+        let value = Zeroizing::new(
+            hex::decode(&bs.value)
+                .map_err(|e| KeepError::Other(format!("hex decode secret value: {e}")))?,
+        );
+        // Preserve the original id/timestamps so a restored secret keeps its
+        // identity; only `SecretRecord::new` mints a fresh id, which we bypass.
+        let record = SecretRecord {
+            id,
+            name: bs.name.clone(),
+            kind: string_to_secret_kind(&bs.kind)?,
+            value: value.to_vec(),
+            created_at: bs.created_at,
+            updated_at: bs.updated_at,
+        };
+        keep.restore_secret(&record)?;
     }
 
     keep.set_kill_switch(backup.config.kill_switch)?;
@@ -695,6 +804,75 @@ mod tests {
             assert_eq!(dst.pubkey, src.pubkey, "entry {i} pubkey");
             assert_eq!(dst.timestamp, src.timestamp, "entry {i} timestamp");
         }
+    }
+
+    #[test]
+    fn backup_roundtrip_preserves_secrets() {
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let mut keep = create_test_keep(&src_path);
+        keep.unlock("test-password-123").unwrap();
+
+        let rec = SecretRecord::new(
+            "db password".into(),
+            SecretKind::Password,
+            b"s3cr3t".to_vec(),
+        )
+        .unwrap();
+        let id = rec.id;
+        let created = rec.created_at;
+        keep.store_secret(&rec).unwrap();
+
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+
+        let dst_path = dir.path().join("dst");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+        let loaded = restored
+            .load_secret(&id)
+            .expect("secret MUST survive backup + restore");
+        assert_eq!(loaded.name, "db password");
+        assert_eq!(loaded.kind, SecretKind::Password);
+        assert_eq!(loaded.value, b"s3cr3t");
+        // Restore preserves the original id and timestamps, not fresh ones.
+        assert_eq!(loaded.created_at, created);
+    }
+
+    #[test]
+    fn secret_create_and_delete_are_audited() {
+        use crate::audit::AuditEventType;
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let mut keep = create_test_keep(&dir.path().join("v"));
+        keep.unlock("test-password-123").unwrap();
+
+        let rec = SecretRecord::new("t".into(), SecretKind::Note, b"v".to_vec()).unwrap();
+        let id = rec.id;
+        keep.store_secret(&rec).unwrap();
+        keep.delete_secret(&id).unwrap();
+
+        let entries = keep.audit_read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.event_type, AuditEventType::SecretCreate)),
+            "store_secret must emit a SecretCreate audit event"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.event_type, AuditEventType::SecretDelete)),
+            "delete_secret must emit a SecretDelete audit event"
+        );
     }
 
     /// Pin that backup + restore preserves every stored row type — not just

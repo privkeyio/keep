@@ -9,7 +9,7 @@ use tracing::{debug, trace, warn};
 
 use crate::backend::{
     AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
-    KEYS_TABLE, RELAY_CONFIGS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
+    KEYS_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -17,6 +17,7 @@ use crate::frost::StoredShare;
 use crate::keys::KeyRecord;
 use crate::rate_limit;
 use crate::relay::{self, RelayConfig};
+use crate::secret::SecretRecord;
 use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 
 use bincode::Options;
@@ -565,6 +566,7 @@ impl Storage {
         backend.create_table(RELAY_CONFIGS_TABLE)?;
         backend.create_table(CONFIG_TABLE)?;
         backend.create_table(HEALTH_STATUS_TABLE)?;
+        backend.create_table(SECRETS_TABLE)?;
         backend.create_table(STATE_VERSIONS_TABLE)?;
 
         Ok(Self {
@@ -836,6 +838,67 @@ impl Storage {
             Ok(())
         } else {
             Err(KeepError::KeyNotFound(hex::encode(id)))
+        }
+    }
+
+    /// Store (insert or overwrite) an arbitrary-secret record, keyed by its
+    /// random `id`. The whole record -- name, kind, AND plaintext value -- is
+    /// bincode-serialized then encrypted under the vault data key, so nothing is
+    /// on disk in the clear and the entry title is protected too. Unlike
+    /// `store_key` this never notifies the replication sink: secrets are not
+    /// replicable (see [`Self::replicated_table`]).
+    pub fn store_secret(&self, record: &SecretRecord) -> Result<()> {
+        debug!(id = %hex::encode(record.id), "storing secret");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let serialized = Zeroizing::new(bincode::serialize(record)?);
+        let encrypted = crypto::encrypt(&serialized, data_key)?;
+        backend.put(SECRETS_TABLE, &record.id, &encrypted.to_bytes())?;
+        Ok(())
+    }
+
+    /// Load a secret record by its 32-byte `id`.
+    pub fn load_secret(&self, id: &[u8; 32]) -> Result<SecretRecord> {
+        trace!(id = %hex::encode(id), "loading secret");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let encrypted_bytes = backend
+            .get(SECRETS_TABLE, id)?
+            .ok_or_else(|| KeepError::NotFound(hex::encode(id)))?;
+        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+        let decrypted = crypto::decrypt(&encrypted, data_key)?;
+        let decrypted_bytes = decrypted.as_slice()?;
+        Ok(bincode_options().deserialize(&decrypted_bytes)?)
+    }
+
+    /// List all stored secret records. O(n) full decrypt, matching `list_keys`;
+    /// fine for the modest counts a first-pass secret store holds.
+    pub fn list_secrets(&self) -> Result<Vec<SecretRecord>> {
+        trace!("listing secrets");
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+
+        let entries = backend.list(SECRETS_TABLE)?;
+        let mut records = Vec::with_capacity(entries.len());
+        for (_, encrypted_bytes) in entries {
+            let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
+            let decrypted = crypto::decrypt(&encrypted, data_key)?;
+            let decrypted_bytes = decrypted.as_slice()?;
+            records.push(bincode_options().deserialize(&decrypted_bytes)?);
+        }
+        Ok(records)
+    }
+
+    /// Delete a secret record by `id`. Errors if no such secret exists.
+    pub fn delete_secret(&self, id: &[u8; 32]) -> Result<()> {
+        debug!(id = %hex::encode(id), "deleting secret");
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.delete(SECRETS_TABLE, id)? {
+            Ok(())
+        } else {
+            Err(KeepError::NotFound(hex::encode(id)))
         }
     }
 
@@ -1653,6 +1716,61 @@ mod tests {
         let mut storage = Storage::open(&path).unwrap();
         let result = storage.unlock("wrongpass");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn secret_store_load_list_delete_round_trips() {
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+
+        let rec = SecretRecord::new(
+            "GitHub login".into(),
+            SecretKind::Password,
+            b"hunter2".to_vec(),
+        )
+        .unwrap();
+        let id = rec.id;
+        storage.store_secret(&rec).unwrap();
+
+        let loaded = storage.load_secret(&id).unwrap();
+        assert_eq!(loaded.id, id);
+        assert_eq!(loaded.name, "GitHub login");
+        assert_eq!(loaded.kind, SecretKind::Password);
+        assert_eq!(loaded.value, b"hunter2");
+
+        assert_eq!(storage.list_secrets().unwrap().len(), 1);
+
+        storage.delete_secret(&id).unwrap();
+        assert!(storage.load_secret(&id).is_err());
+        assert!(storage.list_secrets().unwrap().is_empty());
+        // Deleting a missing secret errors rather than silently succeeding.
+        assert!(storage.delete_secret(&id).is_err());
+    }
+
+    #[test]
+    fn secrets_get_distinct_random_ids() {
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+
+        // The same title + value stored twice yields two rows: a secret has no
+        // pubkey to derive a stable id from, so ids are random (see SecretRecord).
+        let a = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec()).unwrap();
+        let b = SecretRecord::new("dup".into(), SecretKind::Generic, b"same".to_vec()).unwrap();
+        assert_ne!(a.id, b.id);
+        storage.store_secret(&a).unwrap();
+        storage.store_secret(&b).unwrap();
+        assert_eq!(storage.list_secrets().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn secrets_table_is_not_replicable() {
+        // A password vault must never sync to public relays. `replicated_table`
+        // fails loudly for "secrets" rather than silently allowing it.
+        assert!(Storage::replicated_table("secrets").is_err());
     }
 
     #[test]

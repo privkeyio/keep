@@ -9,7 +9,7 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// The current schema version supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 5;
+pub const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 /// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
@@ -119,6 +119,19 @@ fn migrate_v4_to_v5(db: &Database) -> Result<()> {
     Ok(())
 }
 
+const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secrets");
+
+/// v5 → v6: introduce the `secrets` table for arbitrary-secret records
+/// (passwords, API tokens, notes). Creating the empty table is the whole
+/// migration; existing rows are untouched. Idempotent: opening a table that
+/// already exists is a no-op.
+fn migrate_v5_to_v6(db: &Database) -> Result<()> {
+    let wtxn = db.begin_write()?;
+    wtxn.open_table(SECRETS_TABLE_DEF)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
 fn get_migrations() -> Vec<Migration> {
     vec![
         Migration {
@@ -140,6 +153,11 @@ fn get_migrations() -> Vec<Migration> {
             from_version: 4,
             to_version: 5,
             migrate: migrate_v4_to_v5,
+        },
+        Migration {
+            from_version: 5,
+            to_version: 6,
+            migrate: migrate_v5_to_v6,
         },
     ]
 }
