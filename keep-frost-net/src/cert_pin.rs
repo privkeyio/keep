@@ -261,7 +261,10 @@ fn hash_spki(spki_der: &[u8]) -> SpkiHash {
 /// SubjectPublicKeyInfo); for the DER certs TLS delivers this is byte-identical to the field as received.
 fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
     let cert = Certificate::from_der(cert_der).ok()?;
-    cert.tbs_certificate.subject_public_key_info.to_der().ok()
+    cert.tbs_certificate()
+        .subject_public_key_info()
+        .to_der()
+        .ok()
 }
 
 #[cfg(test)]

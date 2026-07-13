@@ -182,11 +182,11 @@ impl AttestationVerifier {
 
         let issuer_pubkey = extract_p384_pubkey(&issuer_cert)?;
         let tbs_bytes = signing_cert
-            .tbs_certificate
+            .tbs_certificate()
             .to_der()
             .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
 
-        let cert_sig_bytes = signing_cert.signature.as_bytes().ok_or_else(|| {
+        let cert_sig_bytes = signing_cert.signature().as_bytes().ok_or_else(|| {
             EnclaveError::Certificate("Missing signature bytes on signing cert".into())
         })?;
 
@@ -213,12 +213,12 @@ impl AttestationVerifier {
 
             let issuer_pubkey = extract_p384_pubkey(issuer)?;
             let tbs_bytes = subject
-                .tbs_certificate
+                .tbs_certificate()
                 .to_der()
                 .map_err(|e| EnclaveError::Certificate(format!("DER encode failed: {e}")))?;
 
             let sig_bytes = subject
-                .signature
+                .signature()
                 .as_bytes()
                 .ok_or_else(|| EnclaveError::Certificate("Missing signature bytes".into()))?;
 
@@ -279,7 +279,7 @@ impl AttestationVerifier {
 }
 
 fn extract_p384_pubkey(cert: &Certificate) -> Result<VerifyingKey> {
-    let spki = &cert.tbs_certificate.subject_public_key_info;
+    let spki = cert.tbs_certificate().subject_public_key_info();
     let key_bytes = spki
         .subject_public_key
         .as_bytes()
@@ -295,7 +295,7 @@ fn verify_cert_validity(cert: &Certificate) -> Result<()> {
         .map_err(|_| EnclaveError::Certificate("System clock error".into()))?
         .as_secs();
 
-    let validity = &cert.tbs_certificate.validity;
+    let validity = cert.tbs_certificate().validity();
 
     let not_before = validity.not_before.to_unix_duration().as_secs();
     let not_after = validity.not_after.to_unix_duration().as_secs();
