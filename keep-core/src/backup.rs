@@ -979,6 +979,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sealed_secret_create_and_reveal_are_audited() {
+        use crate::audit::AuditEventType;
+        let dir = tempdir().unwrap();
+        let mut keep = create_test_keep(&dir.path().join("v"));
+        keep.unlock("test-password-123").unwrap();
+
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+        let rec = keep
+            .store_sealed_secret(
+                "t".into(),
+                crate::secret::SecretKind::Note,
+                b"quorum-only",
+                &oprf_key,
+                0,
+            )
+            .unwrap();
+
+        // A wrong-key reveal must NOT audit (it never yields the value).
+        let wrong = crypto::SecretKey::generate().unwrap();
+        assert!(keep.reveal_sealed_secret(&rec.id, &wrong).is_err());
+        // A successful reveal audits.
+        keep.reveal_sealed_secret(&rec.id, &oprf_key).unwrap();
+
+        let entries = keep.audit_read_all().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.event_type, AuditEventType::SecretCreate)),
+            "store_sealed_secret must emit a SecretCreate audit event"
+        );
+        let reveals = entries
+            .iter()
+            .filter(|e| matches!(e.event_type, AuditEventType::SecretReveal))
+            .count();
+        assert_eq!(
+            reveals, 1,
+            "exactly one SecretReveal (only the successful unseal), not the wrong-key attempt"
+        );
+    }
+
     /// Pin that backup + restore preserves every stored row type — not just
     /// keys (already covered by `test_backup_roundtrip`). #437's acceptance
     /// criterion is "verify in-place migration succeeds without data loss",
