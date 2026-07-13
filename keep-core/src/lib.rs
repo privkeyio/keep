@@ -553,8 +553,13 @@ impl Keep {
     /// Reveal a threshold-sealed secret's plaintext value given the OPRF-quorum
     /// -derived key. Errors if the secret is not sealed, or if `oprf_key` is wrong
     /// (a single-device caller that never assembled the quorum cannot derive it).
+    ///
+    /// Records a `SecretReveal` audit event (tagged with the id) only on a
+    /// successful unseal: revealing a quorum-gated plaintext is the most sensitive
+    /// read in the store, audited like `KeyExport`. A wrong-key attempt leaves no
+    /// entry (it never yields the value).
     pub fn reveal_sealed_secret(
-        &self,
+        &mut self,
         id: &[u8; 32],
         oprf_key: &crate::crypto::SecretKey,
     ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
@@ -563,7 +568,9 @@ impl Keep {
             .storage
             .load_secret_seal(id)?
             .ok_or_else(|| KeepError::invalid_input("secret is not threshold-sealed"))?;
-        crate::secret::unseal_value(&record.value, &seal, oprf_key)
+        let plaintext = crate::secret::unseal_value(&record.value, &seal, oprf_key)?;
+        self.audit_event(AuditEventType::SecretReveal, |e| e.with_pubkey(id));
+        Ok(plaintext)
     }
 
     /// Restore a threshold-sealed secret (record + seal) WITHOUT emitting an audit

@@ -122,11 +122,34 @@ impl std::fmt::Debug for ThresholdSeal {
     }
 }
 
+/// AAD binding the wrapped DEK to its secret id and OPRF epoch, so a wrapped DEK
+/// cannot be lifted onto a different secret or a tampered epoch: altering the
+/// stored `oprf_id`/`epoch` (which an attacker holding the vault data key could
+/// otherwise do to redirect the quorum query) makes the unwrap fail rather than
+/// silently succeed. Length-prefixed for injectivity, matching `derive_luks_key`.
+fn wrap_aad(oprf_id: &str, epoch: u32) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(23 + 8 + oprf_id.len() + 4);
+    aad.extend_from_slice(b"keep/secret-seal/dek/v1");
+    aad.extend_from_slice(&(oprf_id.len() as u64).to_be_bytes());
+    aad.extend_from_slice(oprf_id.as_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad
+}
+
+/// AAD binding the value ciphertext to its secret id, so a value blob cannot be
+/// swapped between secrets.
+fn value_aad(oprf_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(25 + oprf_id.len());
+    aad.extend_from_slice(b"keep/secret-seal/value/v1");
+    aad.extend_from_slice(oprf_id.as_bytes());
+    aad
+}
+
 /// Seal `plaintext` under a fresh per-secret DEK and wrap that DEK under
 /// `oprf_key` (the t-of-n OPRF-quorum-derived key). Returns the value ciphertext
 /// (to store as the record's `value`) and the matching [`ThresholdSeal`] (to
 /// store alongside). `oprf_id`/`epoch` are recorded in the seal so the quorum can
-/// later re-derive the same key.
+/// later re-derive the same key, and are bound into both ciphertexts as AAD.
 pub fn seal_value(
     plaintext: &[u8],
     oprf_key: &SecretKey,
@@ -134,11 +157,13 @@ pub fn seal_value(
     epoch: u32,
 ) -> Result<(Vec<u8>, ThresholdSeal)> {
     let dek = SecretKey::generate()?;
-    let value_ciphertext = crypto::encrypt(plaintext, &dek)?.to_bytes();
+    let value_ciphertext =
+        crypto::encrypt_with_aad(plaintext, &value_aad(&oprf_id), &dek)?.to_bytes();
     // Wrap the raw DEK bytes under the OPRF key. `decrypt` returns an mlocked,
     // zeroize-on-drop copy of the 32 DEK bytes.
     let dek_raw = dek.decrypt()?;
-    let wrapped_dek = crypto::encrypt(&dek_raw[..], oprf_key)?.to_bytes();
+    let wrapped_dek =
+        crypto::encrypt_with_aad(&dek_raw[..], &wrap_aad(&oprf_id, epoch), oprf_key)?.to_bytes();
     Ok((
         value_ciphertext,
         ThresholdSeal {
@@ -151,18 +176,21 @@ pub fn seal_value(
 
 /// Recover a sealed secret's plaintext from `value_ciphertext` given its
 /// [`ThresholdSeal`] and the OPRF-quorum-derived key. Fails if `oprf_key` is
-/// wrong: a single-device caller that never assembled the quorum cannot derive
-/// it, so the wrapped-DEK decryption fails and the value stays sealed.
+/// wrong (a single-device caller that never assembled the quorum cannot derive
+/// it) or if the seal's bound `oprf_id`/`epoch` were tampered with: either way
+/// the AEAD tag check fails and the value stays sealed.
 pub fn unseal_value(
     value_ciphertext: &[u8],
     seal: &ThresholdSeal,
     oprf_key: &SecretKey,
 ) -> Result<Zeroizing<Vec<u8>>> {
     let wrapped = EncryptedData::from_bytes(&seal.wrapped_dek)?;
-    let dek_bytes = crypto::decrypt(&wrapped, oprf_key)?.as_slice()?;
+    let dek_bytes =
+        crypto::decrypt_with_aad(&wrapped, &wrap_aad(&seal.oprf_id, seal.epoch), oprf_key)?
+            .as_slice()?;
     let dek = SecretKey::from_slice(&dek_bytes)?;
     let value = EncryptedData::from_bytes(value_ciphertext)?;
-    crypto::decrypt(&value, &dek)?.as_slice()
+    crypto::decrypt_with_aad(&value, &value_aad(&seal.oprf_id), &dek)?.as_slice()
 }
 
 impl std::fmt::Debug for SecretRecord {
@@ -214,6 +242,29 @@ mod tests {
         assert!(
             unseal_value(&ct, &seal, &wrong_key).is_err(),
             "unsealing with the wrong OPRF key must fail"
+        );
+    }
+
+    /// The seal's `oprf_id`/`epoch` are bound as AAD, so tampering with either
+    /// (an attacker with the vault data key redirecting the quorum query) makes
+    /// the unseal fail rather than silently proceed.
+    #[test]
+    fn unseal_fails_when_bound_oprf_params_are_tampered() {
+        let oprf_key = SecretKey::generate().unwrap();
+        let (ct, seal) = seal_value(b"v", &oprf_key, "abcd".into(), 0).unwrap();
+
+        let mut bad_epoch = seal.clone();
+        bad_epoch.epoch = 1;
+        assert!(
+            unseal_value(&ct, &bad_epoch, &oprf_key).is_err(),
+            "a tampered epoch must break the wrapped-DEK AAD"
+        );
+
+        let mut bad_id = seal.clone();
+        bad_id.oprf_id = "ffff".into();
+        assert!(
+            unseal_value(&ct, &bad_id, &oprf_key).is_err(),
+            "a tampered oprf_id must break the AAD"
         );
     }
 

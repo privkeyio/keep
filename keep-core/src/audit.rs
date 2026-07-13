@@ -91,6 +91,10 @@ pub enum AuditEventType {
     SecretCreate = 25,
     /// Arbitrary secret deleted.
     SecretDelete = 26,
+    /// Threshold-sealed secret value revealed via an OPRF quorum unseal. The most
+    /// sensitive read in the store (it hands out the plaintext), audited like
+    /// `KeyExport`.
+    SecretReveal = 27,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -123,6 +127,7 @@ impl std::fmt::Display for AuditEventType {
             Self::DataKeyRotateFailed => write!(f, "data_key_rotate_failed"),
             Self::SecretCreate => write!(f, "secret_create"),
             Self::SecretDelete => write!(f, "secret_delete"),
+            Self::SecretReveal => write!(f, "secret_reveal"),
         }
     }
 }
