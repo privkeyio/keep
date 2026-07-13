@@ -1377,7 +1377,7 @@ pub(crate) async fn run_oprf_request(
     out: &Output,
     share: keep_core::frost::SharePackage,
     relay: &str,
-    oprf_share: keep_core::oprf::threshold::KeyShare,
+    mut oprf_share: keep_core::oprf::threshold::KeyShare,
     attestor: Option<Arc<dyn keep_frost_net::AnnounceAttestor>>,
     input: &[u8],
     volume_id: &str,
@@ -1387,8 +1387,10 @@ pub(crate) async fn run_oprf_request(
         .await
         .map_err(|e| KeepError::Frost(e.to_string()))?;
     // Install the OPRF key share BEFORE running so this box can answer its own
-    // quorum's evaluate requests.
+    // quorum's evaluate requests. `set_oprf_key_share` takes a `Copy`, so wipe our
+    // transient parameter copy immediately after; the caller wipes its own.
     node.set_oprf_key_share(oprf_share);
+    oprf_share.zeroize();
     // If a TPM is configured, attach the fresh measured-boot quote source to every
     // announce so holders can verify this box before answering evals.
     attestation::set_optional_announce_attestor(out, &mut node, attestor);

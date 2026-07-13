@@ -346,6 +346,20 @@ pub(crate) struct OprfSecretArgs {
     pub tpm_tcti: Option<String>,
 }
 
+impl OprfSecretArgs {
+    /// Whether any OPRF connection option was supplied. Used to fail closed when
+    /// these are given to `secret add` WITHOUT `--threshold`, so a forgotten
+    /// `--threshold` cannot silently store a plaintext secret the operator
+    /// believes is quorum-gated.
+    pub fn any_present(&self) -> bool {
+        self.group.is_some()
+            || self.relay.is_some()
+            || self.share.is_some()
+            || self.share_file.is_some()
+            || self.tpm_tcti.is_some()
+    }
+}
+
 /// CLI mirror of [`keep_core::secret::SecretKind`].
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum SecretKindArg {
@@ -1190,6 +1204,35 @@ mod tests {
         assert_eq!(name, "vault-key");
         assert_eq!(oprf.group.as_deref(), Some("npub1group"));
         assert_eq!(oprf.share, Some(2));
+    }
+
+    #[test]
+    fn secret_add_oprf_args_without_threshold_are_detectable() {
+        // The handler fails closed on this combination; here we pin that the parse
+        // surfaces it (OPRF args present, threshold flag absent) so the guard fires.
+        let cli = Cli::try_parse_from([
+            "keep",
+            "secret",
+            "add",
+            "--name",
+            "x",
+            "--group",
+            "npub1group",
+        ])
+        .expect("parse secret add with oprf arg but no --threshold");
+        let Commands::Secret {
+            command: SecretCommands::Add {
+                threshold, oprf, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected secret add");
+        };
+        assert!(!threshold, "no --threshold flag");
+        assert!(
+            oprf.any_present(),
+            "OPRF args present -> handler must reject without --threshold"
+        );
     }
 
     #[test]

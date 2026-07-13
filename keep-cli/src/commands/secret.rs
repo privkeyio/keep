@@ -125,6 +125,17 @@ pub fn cmd_secret_add(
     refuse_hidden(path, hidden)?;
     validate_name(name)?;
 
+    // Fail closed: OPRF options without `--threshold` almost certainly means the
+    // operator intended a quorum-gated secret but forgot the flag. Storing it as
+    // plaintext silently would betray that intent, so refuse rather than guess.
+    if !threshold && oprf.any_present() {
+        return Err(KeepError::invalid_input(
+            "OPRF options (--group/--relay/--share/--share-file/--tpm-tcti) were given without \
+             --threshold. Add --threshold to seal this secret behind the quorum, or drop those \
+             options to store it as a plaintext secret.",
+        ));
+    }
+
     // Read the value off a hidden prompt or piped stdin, never argv.
     let value = read_secret_value("Secret value")?;
     if value.is_empty() {
