@@ -1349,6 +1349,131 @@ fn probe_duress_state(out: &Output, path: &Path) -> Result<()> {
 /// bytes to STDOUT (and nothing else), so a boot gate can pipe it to
 /// `cryptsetup open --key-file -`. All human/progress output goes to STDERR via
 /// `Output` (which is backed by `Term::stderr()`); the key is never logged.
+/// Read and deserialize this box's 64-byte OPRF key share (the TPM-unsealed
+/// secret). The raw file bytes live in a `Zeroizing` buffer wiped before return;
+/// the returned `KeyShare` is live key material the caller must zeroize.
+pub(crate) fn load_oprf_key_share(
+    share_file: &Path,
+) -> Result<keep_core::oprf::threshold::KeyShare> {
+    let mut share_bytes = zeroize::Zeroizing::new(
+        std::fs::read(share_file)
+            .map_err(|e| KeepError::Runtime(format!("read OPRF share file: {e}")))?,
+    );
+    let share = keep_core::oprf::threshold::deserialize_key_share(&share_bytes)
+        .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
+    share_bytes.zeroize();
+    Ok(share)
+}
+
+/// Run the threshold-OPRF quorum flow and return the derived 32-byte key: build a
+/// coordination node from `share`, install `oprf_share` so this box answers its own
+/// quorum, attach the optional TPM attestor, start the node, wait for peers, and
+/// request an evaluation for `(input, volume_id, epoch)`. Shared by LUKS unlock and
+/// the threshold-secrets store, which differ ONLY in `input`. `oprf_share` is copied
+/// into the node (`KeyShare` is `Copy`); the caller MUST wipe its own copy afterward
+/// on both paths (it is not `ZeroizeOnDrop`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_oprf_request(
+    out: &Output,
+    share: keep_core::frost::SharePackage,
+    relay: &str,
+    oprf_share: keep_core::oprf::threshold::KeyShare,
+    attestor: Option<Arc<dyn keep_frost_net::AnnounceAttestor>>,
+    input: &[u8],
+    volume_id: &str,
+    epoch: u32,
+) -> Result<zeroize::Zeroizing<[u8; 32]>> {
+    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+        .await
+        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    // Install the OPRF key share BEFORE running so this box can answer its own
+    // quorum's evaluate requests.
+    node.set_oprf_key_share(oprf_share);
+    // If a TPM is configured, attach the fresh measured-boot quote source to every
+    // announce so holders can verify this box before answering evals.
+    attestation::set_optional_announce_attestor(out, &mut node, attestor);
+
+    out.info("Starting FROST coordination node...");
+    let shutdown_tx = node.take_shutdown_handle();
+    let node = Arc::new(node);
+    let node_clone = node.clone();
+    let _run_guard = NodeRunGuard {
+        handle: tokio::spawn(async move {
+            let _ = node_clone.run().await;
+        }),
+        shutdown: shutdown_tx,
+    };
+
+    out.info("Discovering peers...");
+    for i in 0..12 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if node.online_peers() > 0 {
+            break;
+        }
+        if i < 11 {
+            out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
+        }
+    }
+    if node.online_peers() == 0 {
+        return Err(KeepError::Frost("No peers online after 24s.".into()));
+    }
+    out.success(&format!("Found {} online peer(s)", node.online_peers()));
+    out.info("Waiting for peers to discover us...");
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    node.request_oprf_unlock(input, volume_id, epoch)
+        .await
+        .map_err(|e| KeepError::Frost(e.to_string()))
+}
+
+/// Derive the OPRF-quorum key that seals/unseals a threshold **secret**, from an
+/// already-unlocked `keep` and the CLI's OPRF connection options. Resolves the
+/// FROST group/share, loads this box's OPRF share, runs the quorum for
+/// `(SECRET_SEAL_INPUT, oprf_id, epoch)`, and returns the key as a `SecretKey` for
+/// `keep.store_sealed_secret` / `reveal_sealed_secret`. Requires `--group` and
+/// `--share-file`; errors clearly if either is missing.
+pub(crate) fn derive_secret_seal_key(
+    out: &Output,
+    keep: &Keep,
+    oprf: &crate::cli::OprfSecretArgs,
+    default_relay: &str,
+    oprf_id: &str,
+    epoch: u32,
+) -> Result<keep_core::crypto::SecretKey> {
+    let group = oprf.group.as_deref().ok_or_else(|| {
+        KeepError::invalid_input("a threshold secret requires --group (the FROST group npub)")
+    })?;
+    let share_file = oprf.share_file.as_deref().ok_or_else(|| {
+        KeepError::invalid_input(
+            "a threshold secret requires --share-file (this box's 64-byte OPRF key share)",
+        )
+    })?;
+    let relay = oprf.relay.as_deref().unwrap_or(default_relay);
+    let group_pubkey = keep_core::keys::npub_to_bytes(group)?;
+    let share = match oprf.share {
+        Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+        None => keep.frost_get_share(&group_pubkey)?,
+    };
+    let attestor = attestation::optional_announce_attestor(out, oprf.tpm_tcti.as_deref())?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    let mut oprf_share = load_oprf_key_share(share_file)?;
+    let result = rt.block_on(run_oprf_request(
+        out,
+        share,
+        relay,
+        oprf_share,
+        attestor,
+        keep_core::oprf::SECRET_SEAL_INPUT,
+        oprf_id,
+        epoch,
+    ));
+    // `KeyShare` is `Copy`, not `ZeroizeOnDrop`: wipe our local copy on both paths.
+    oprf_share.zeroize();
+    let key = result?;
+    keep_core::crypto::SecretKey::from_slice(&key[..])
+}
+
 #[tracing::instrument(skip(out), fields(path = %path.display()))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_oprf_unlock(
@@ -1397,16 +1522,8 @@ pub fn cmd_frost_network_oprf_unlock(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     // Read this box's OPRF key share credential (64 raw bytes; the TPM-unsealed
-    // secret at boot). Held in a Zeroizing buffer so the raw bytes are wiped on
-    // drop; deserialize it, then explicitly wipe and drop the buffer.
-    let mut share_bytes = zeroize::Zeroizing::new(
-        std::fs::read(share_file)
-            .map_err(|e| KeepError::Runtime(format!("read OPRF share file: {e}")))?,
-    );
-    let mut oprf_share = keep_core::oprf::threshold::deserialize_key_share(&share_bytes)
-        .map_err(|e| KeepError::Frost(format!("invalid OPRF key share: {e}")))?;
-    share_bytes.zeroize();
-    drop(share_bytes);
+    // secret at boot). `KeyShare` is live key material wiped by hand below.
+    let mut oprf_share = load_oprf_key_share(share_file)?;
 
     out.newline();
     out.header("OPRF Unlock");
@@ -1427,53 +1544,19 @@ pub fn cmd_frost_network_oprf_unlock(
     out.field("Epoch", &epoch.to_string());
     out.newline();
 
-    let result = rt.block_on(async move {
-        let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
-        // Install the OPRF key share BEFORE running so this box can answer its
-        // own quorum's evaluate requests.
-        node.set_oprf_key_share(oprf_share);
-
-        // If a TPM is configured, attach the fresh measured-boot quote source to
-        // every announce so holders can verify this box before answering evals.
-        attestation::set_optional_announce_attestor(out, &mut node, attestor);
-
-        out.info("Starting FROST coordination node...");
-        let shutdown_tx = node.take_shutdown_handle();
-        let node = std::sync::Arc::new(node);
-        let node_clone = node.clone();
-        let _run_guard = NodeRunGuard {
-            handle: tokio::spawn(async move {
-                let _ = node_clone.run().await;
-            }),
-            shutdown: shutdown_tx,
-        };
-
-        out.info("Discovering peers...");
-        for i in 0..12 {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            if node.online_peers() > 0 {
-                break;
-            }
-            if i < 11 {
-                out.info(&format!("  Waiting for peers... ({}/12)", i + 1));
-            }
-        }
-        if node.online_peers() == 0 {
-            return Err(KeepError::Frost("No peers online after 24s.".into()));
-        }
-        out.success(&format!("Found {} online peer(s)", node.online_peers()));
-        out.info("Waiting for peers to discover us...");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-        node.request_oprf_unlock(OPRF_UNLOCK_INPUT, volume_id, epoch)
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))
-    });
+    let result = rt.block_on(run_oprf_request(
+        out,
+        share,
+        relay,
+        oprf_share,
+        attestor,
+        OPRF_UNLOCK_INPUT,
+        volume_id,
+        epoch,
+    ));
     // `KeyShare` is `Copy` + `Zeroize` but NOT `ZeroizeOnDrop`: the copy moved
-    // into the async block is gone with the node, but our local copy must be
-    // wiped by hand on both the Ok and Err paths.
+    // into the node is gone with it, but our local copy must be wiped by hand on
+    // both the Ok and Err paths.
     oprf_share.zeroize();
     let key = result?;
 

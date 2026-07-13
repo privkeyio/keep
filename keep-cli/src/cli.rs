@@ -294,12 +294,25 @@ pub(crate) enum SecretCommands {
         /// Category of secret.
         #[arg(short, long, value_enum, default_value = "generic")]
         kind: SecretKindArg,
+        /// Seal the value behind a t-of-n OPRF quorum: it can then be revealed
+        /// ONLY by assembling the quorum, not from this device alone. Requires
+        /// the OPRF connection options (at least --group and --share-file).
+        #[arg(long)]
+        threshold: bool,
+        /// OPRF key epoch for a `--threshold` secret (its rotation counter).
+        #[arg(long, default_value = "1")]
+        epoch: u32,
+        #[command(flatten)]
+        oprf: OprfSecretArgs,
     },
     /// Reveal a stored secret's value. Interactive-only (TTY-gated), like
-    /// `keep export`.
+    /// `keep export`. For a threshold-sealed secret, pass the OPRF connection
+    /// options so the value can be unsealed via the quorum.
     Get {
         /// Secret name, or its hex id (from `list`) to disambiguate duplicates.
         name: String,
+        #[command(flatten)]
+        oprf: OprfSecretArgs,
     },
     /// List stored secrets (name, kind, id) — never the values.
     List,
@@ -308,6 +321,29 @@ pub(crate) enum SecretCommands {
         /// Secret name, or its hex id (from `list`) to disambiguate duplicates.
         name: String,
     },
+}
+
+/// OPRF quorum connection options for threshold-sealed secrets, shared by
+/// `secret add --threshold` and `secret get`. All optional at the parser level;
+/// the handler enforces what a threshold operation actually needs (group +
+/// share-file) and leaves plain secrets untouched when none are given.
+#[derive(clap::Args)]
+pub(crate) struct OprfSecretArgs {
+    /// FROST group npub whose quorum gates the secret.
+    #[arg(long)]
+    pub group: Option<String>,
+    /// Coordination relay URL (defaults to the configured relay).
+    #[arg(long)]
+    pub relay: Option<String>,
+    /// Local FROST share index to use.
+    #[arg(long)]
+    pub share: Option<u16>,
+    /// Path to this box's 64-byte OPRF key share (TPM-unsealed at boot).
+    #[arg(long)]
+    pub share_file: Option<PathBuf>,
+    /// Attest to holders via the TPM at this TCTI (e.g. device:/dev/tpmrm0).
+    #[arg(long)]
+    pub tpm_tcti: Option<String>,
 }
 
 /// CLI mirror of [`keep_core::secret::SecretKind`].
@@ -1093,6 +1129,67 @@ mod tests {
             panic!("expected bitcoin sign command");
         };
         assert_eq!(psbt, "/tmp/unsigned.psbt");
+    }
+
+    #[test]
+    fn secret_add_threshold_parses_oprf_options() {
+        let cli = Cli::try_parse_from([
+            "keep",
+            "secret",
+            "add",
+            "--name",
+            "vault-key",
+            "--threshold",
+            "--group",
+            "npub1group",
+            "--share-file",
+            "/run/oprf.share",
+            "--epoch",
+            "2",
+        ])
+        .expect("parse secret add --threshold");
+        let Commands::Secret { command } = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommands::Add {
+            name,
+            threshold,
+            epoch,
+            oprf,
+            ..
+        } = command
+        else {
+            panic!("expected secret add");
+        };
+        assert_eq!(name, "vault-key");
+        assert!(threshold);
+        assert_eq!(epoch, 2);
+        assert_eq!(oprf.group.as_deref(), Some("npub1group"));
+        assert_eq!(oprf.share_file, Some(PathBuf::from("/run/oprf.share")));
+    }
+
+    #[test]
+    fn secret_get_parses_oprf_options() {
+        let cli = Cli::try_parse_from([
+            "keep",
+            "secret",
+            "get",
+            "vault-key",
+            "--group",
+            "npub1group",
+            "--share",
+            "2",
+        ])
+        .expect("parse secret get with oprf options");
+        let Commands::Secret { command } = cli.command else {
+            panic!("expected secret command");
+        };
+        let SecretCommands::Get { name, oprf } = command else {
+            panic!("expected secret get");
+        };
+        assert_eq!(name, "vault-key");
+        assert_eq!(oprf.group.as_deref(), Some("npub1group"));
+        assert_eq!(oprf.share, Some(2));
     }
 
     #[test]

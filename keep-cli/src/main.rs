@@ -126,12 +126,31 @@ fn run(out: &Output) -> Result<()> {
         Commands::RotatePassword => commands::vault::cmd_rotate_password(out, &path),
         Commands::RotateDataKey => commands::vault::cmd_rotate_data_key(out, &path),
         Commands::Secret { command } => match command {
-            SecretCommands::Add { name, kind } => {
-                commands::secret::cmd_secret_add(out, &path, &name, kind, hidden)
-            }
-            SecretCommands::Get { name } => {
-                commands::secret::cmd_secret_get(out, &path, &name, hidden)
-            }
+            SecretCommands::Add {
+                name,
+                kind,
+                threshold,
+                epoch,
+                oprf,
+            } => commands::secret::cmd_secret_add(
+                out,
+                &path,
+                &name,
+                kind,
+                hidden,
+                threshold,
+                epoch,
+                &oprf,
+                cfg.default_relay(),
+            ),
+            SecretCommands::Get { name, oprf } => commands::secret::cmd_secret_get(
+                out,
+                &path,
+                &name,
+                hidden,
+                &oprf,
+                cfg.default_relay(),
+            ),
             SecretCommands::List => commands::secret::cmd_secret_list(out, &path, hidden),
             SecretCommands::Rm { name } => {
                 commands::secret::cmd_secret_rm(out, &path, &name, hidden)
