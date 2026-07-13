@@ -33,10 +33,13 @@ use keep_core::keyring::Keyring;
 const SOCKET_NAME: &str = "keep.sock";
 /// Upper bound on a request/response line, a cheap guard against a runaway or
 /// hostile (same-user) peer streaming bytes without a newline.
+#[cfg(unix)]
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
 /// Drop a connection whose request does not arrive promptly (slowloris guard).
+#[cfg(unix)]
 const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Cap on concurrent in-flight connections, so a burst cannot pile up tasks/FDs.
+#[cfg(unix)]
 const MAX_CONNECTIONS: usize = 32;
 
 /// Path of the inspect socket for a vault.
@@ -44,6 +47,7 @@ pub(crate) fn inspect_socket_path(vault: &Path) -> PathBuf {
     vault.join(SOCKET_NAME)
 }
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize)]
 struct InspectRequest {
     cmd: String,
@@ -57,6 +61,7 @@ pub(crate) struct KeyInfo {
     pub npub: String,
 }
 
+#[cfg(unix)]
 #[derive(Serialize, Deserialize, Default)]
 struct InspectResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -67,6 +72,7 @@ struct InspectResponse {
 
 /// Snapshot the keyring's non-secret key metadata (name, kind, npub). Never
 /// touches secret material.
+#[cfg(unix)]
 fn list_keys(keyring: &Keyring) -> Vec<KeyInfo> {
     keyring
         .list()
@@ -81,6 +87,7 @@ fn list_keys(keyring: &Keyring) -> Vec<KeyInfo> {
 /// Serve the inspect socket for `vault`, answering read-only requests from the
 /// shared `keyring`, until the task is dropped/aborted. Binds `0600` and clears
 /// any stale socket first. Returns only on a bind error.
+#[cfg(unix)]
 pub(crate) async fn serve_inspect_socket(
     vault: &Path,
     keyring: Arc<Mutex<Keyring>>,
@@ -112,6 +119,7 @@ pub(crate) async fn serve_inspect_socket(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn handle_conn(
     mut stream: tokio::net::UnixStream,
     keyring: Arc<Mutex<Keyring>>,
@@ -160,6 +168,7 @@ async fn handle_conn(
 
 /// Ask a running daemon for its key list over the inspect socket. Used by
 /// `keep list` when `Keep::open` reports the vault is already open.
+#[cfg(unix)]
 pub(crate) fn query_list(vault: &Path) -> Result<Vec<KeyInfo>> {
     use std::io::{BufRead, BufReader, Write};
     use std::time::Duration;
@@ -198,7 +207,28 @@ pub(crate) fn query_list(vault: &Path) -> Result<Vec<KeyInfo>> {
     Ok(response.keys.unwrap_or_default())
 }
 
-#[cfg(test)]
+/// Non-Unix stub: the inspect socket is a Unix domain socket, so there is
+/// nothing to serve. The daemon still runs; read-only commands fall back to
+/// opening the vault directly.
+#[cfg(not(unix))]
+pub(crate) async fn serve_inspect_socket(
+    _vault: &Path,
+    _keyring: Arc<Mutex<Keyring>>,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Non-Unix stub: no inspect socket exists (see [`serve_inspect_socket`]), so
+/// there is no daemon to query. `inspect_socket_path(..).exists()` is always
+/// false here, so this is never reached in practice.
+#[cfg(not(unix))]
+pub(crate) fn query_list(_vault: &Path) -> Result<Vec<KeyInfo>> {
+    Err(KeepError::Runtime(
+        "the inspect socket is only available on Unix".into(),
+    ))
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use keep_core::keys::KeyType;
