@@ -518,25 +518,31 @@ impl Keep {
 
     /// Store a secret whose value can only be revealed with a t-of-n OPRF quorum.
     ///
+    /// Takes a caller-minted `record` (via [`crate::secret::SecretRecord::new`])
+    /// carrying the plaintext in `record.value`. The caller must mint the record
+    /// FIRST so it knows the id, then derive `oprf_key` from the quorum for that id
+    /// (`oprf_id = hex(record.id)`, `epoch`) BEFORE calling this: the seal records
+    /// `oprf_id`, and a reveal re-derives the key for the same id, so a key derived
+    /// for any other id would seal a value no quorum could ever reopen.
+    ///
     /// `oprf_key` is the quorum-derived key ([`crate::oprf::derive_luks_key`]
-    /// output, obtained via the threshold-OPRF flow); `epoch` is its OPRF rotation
-    /// counter. The value is sealed under a fresh per-secret DEK wrapped by
-    /// `oprf_key`, so a single device that never assembles the quorum cannot
-    /// decrypt it even with the vault unlocked. The secret's name/kind stay
-    /// readable with the vault data key. Returns the minted record, whose random
-    /// id is the OPRF domain-separation label recorded in the seal. Records a
-    /// `SecretCreate` audit event tagged with the id.
+    /// output); `epoch` its OPRF rotation counter. The value is sealed under a fresh
+    /// per-secret DEK wrapped by `oprf_key`, so a single device that never assembles
+    /// the quorum cannot decrypt it even with the vault unlocked. The record's
+    /// name/kind stay readable with the vault data key. Returns the stored record
+    /// (its `value` now the DEK-ciphertext). Records a `SecretCreate` audit event.
     pub fn store_sealed_secret(
         &mut self,
-        name: String,
-        kind: crate::secret::SecretKind,
-        value: &[u8],
+        mut record: crate::secret::SecretRecord,
         oprf_key: &crate::crypto::SecretKey,
         epoch: u32,
     ) -> Result<crate::secret::SecretRecord> {
-        let mut record = crate::secret::SecretRecord::new(name, kind, Vec::new())?;
         let oprf_id = hex::encode(record.id);
-        let (value_ciphertext, seal) = crate::secret::seal_value(value, oprf_key, oprf_id, epoch)?;
+        // Take the plaintext out of the record and seal it; `record.value` becomes
+        // the DEK-ciphertext. The lifted plaintext is zeroized when this scope ends.
+        let plaintext = zeroize::Zeroizing::new(std::mem::take(&mut record.value));
+        let (value_ciphertext, seal) =
+            crate::secret::seal_value(&plaintext, oprf_key, oprf_id, epoch)?;
         record.value = value_ciphertext;
         self.storage.store_sealed_secret(&record, &seal)?;
         self.audit_event(AuditEventType::SecretCreate, |e| e.with_pubkey(&record.id));

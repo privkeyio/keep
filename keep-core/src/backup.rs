@@ -903,15 +903,13 @@ mod tests {
         keep.unlock("test-password-123").unwrap();
 
         let oprf_key = crypto::SecretKey::generate().unwrap();
-        let record = keep
-            .store_sealed_secret(
-                "quorum note".into(),
-                crate::secret::SecretKind::Note,
-                b"only-with-a-quorum",
-                &oprf_key,
-                0,
-            )
-            .unwrap();
+        let to_seal = crate::secret::SecretRecord::new(
+            "quorum note".into(),
+            crate::secret::SecretKind::Note,
+            b"only-with-a-quorum".to_vec(),
+        )
+        .unwrap();
+        let record = keep.store_sealed_secret(to_seal, &oprf_key, 0).unwrap();
         let id = record.id;
 
         let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
@@ -987,15 +985,13 @@ mod tests {
         keep.unlock("test-password-123").unwrap();
 
         let oprf_key = crypto::SecretKey::generate().unwrap();
-        let rec = keep
-            .store_sealed_secret(
-                "t".into(),
-                crate::secret::SecretKind::Note,
-                b"quorum-only",
-                &oprf_key,
-                0,
-            )
-            .unwrap();
+        let record = crate::secret::SecretRecord::new(
+            "t".into(),
+            crate::secret::SecretKind::Note,
+            b"quorum-only".to_vec(),
+        )
+        .unwrap();
+        let rec = keep.store_sealed_secret(record, &oprf_key, 0).unwrap();
 
         // A wrong-key reveal must NOT audit (it never yields the value).
         let wrong = crypto::SecretKey::generate().unwrap();

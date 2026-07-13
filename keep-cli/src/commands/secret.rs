@@ -9,12 +9,14 @@ use std::path::Path;
 
 use secrecy::ExposeSecret;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use keep_core::error::{KeepError, Result};
 use keep_core::secret::SecretRecord;
 use keep_core::Keep;
 
-use crate::cli::SecretKindArg;
+use crate::cli::{OprfSecretArgs, SecretKindArg};
+use crate::commands::frost_network::derive_secret_seal_key;
 use crate::output::Output;
 
 use super::{
@@ -108,15 +110,31 @@ fn resolve_in<'a>(secrets: &'a [SecretRecord], handle: &str) -> Result<&'a Secre
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_secret_add(
     out: &Output,
     path: &Path,
     name: &str,
     kind: SecretKindArg,
     hidden: bool,
+    threshold: bool,
+    epoch: u32,
+    oprf: &OprfSecretArgs,
+    default_relay: &str,
 ) -> Result<()> {
     refuse_hidden(path, hidden)?;
     validate_name(name)?;
+
+    // Fail closed: OPRF options without `--threshold` almost certainly means the
+    // operator intended a quorum-gated secret but forgot the flag. Storing it as
+    // plaintext silently would betray that intent, so refuse rather than guess.
+    if !threshold && oprf.any_present() {
+        return Err(KeepError::invalid_input(
+            "OPRF options (--group/--relay/--share/--share-file/--tpm-tcti) were given without \
+             --threshold. Add --threshold to seal this secret behind the quorum, or drop those \
+             options to store it as a plaintext secret.",
+        ));
+    }
 
     // Read the value off a hidden prompt or piped stdin, never argv.
     let value = read_secret_value("Secret value")?;
@@ -126,6 +144,22 @@ pub fn cmd_secret_add(
 
     let mut keep = open_unlock(out, path)?;
     let kind_core: keep_core::secret::SecretKind = kind.into();
+
+    if threshold {
+        // Mint the record FIRST so the id (its OPRF label) is known, derive the
+        // quorum key for that exact id, then seal + store under it. Deriving for
+        // any other id would seal a value no quorum could reopen.
+        let record = SecretRecord::new(name.to_string(), kind_core, value.to_vec())?;
+        let oprf_id = hex::encode(record.id);
+        let oprf_key = derive_secret_seal_key(out, &keep, oprf, default_relay, &oprf_id, epoch)?;
+        keep.store_sealed_secret(record, &oprf_key, epoch)?;
+        out.success(&format!(
+            "Stored threshold-sealed secret '{name}' ({kind_core:?}); id {oprf_id}. \
+             Revealing it requires a t-of-n quorum."
+        ));
+        return Ok(());
+    }
+
     let record = SecretRecord::new(name.to_string(), kind_core, value.to_vec())?;
     keep.store_secret(&record)?;
 
@@ -138,24 +172,49 @@ pub fn cmd_secret_add(
     Ok(())
 }
 
-pub fn cmd_secret_get(out: &Output, path: &Path, handle: &str, hidden: bool) -> Result<()> {
+pub fn cmd_secret_get(
+    out: &Output,
+    path: &Path,
+    handle: &str,
+    hidden: bool,
+    oprf: &OprfSecretArgs,
+    default_relay: &str,
+) -> Result<()> {
     // Revealing a secret value is interactive-only by design, matching `export`:
     // fail fast before any password prompt or vault unlock.
     require_interactive_tty("keep secret get")?;
     refuse_hidden(path, hidden)?;
 
-    let keep = open_unlock(out, path)?;
+    let mut keep = open_unlock(out, path)?;
     let record = resolve_secret(&keep, handle)?;
+    let id = record.id;
+    // A threshold-sealed secret has a seal row; its value needs the quorum. A plain
+    // secret has none and its `value` is the plaintext.
+    let seal = keep.load_secret_seal(&id)?;
 
     out.secret_warning();
     out.newline();
-    if get_confirm("Display secret value?")? {
-        warn!(id = %hex::encode(record.id), "secret value revealed");
-        out.newline();
-        match std::str::from_utf8(&record.value) {
-            Ok(s) => out.info(s),
-            Err(_) => out.info(&format!("(binary; hex) {}", hex::encode(&record.value))),
+    if !get_confirm("Display secret value?")? {
+        return Ok(());
+    }
+
+    // Unseal via the quorum before logging the reveal, so a failed quorum does not
+    // leave a misleading "revealed" audit/log entry. `reveal_sealed_secret` emits
+    // the `SecretReveal` audit event only on success.
+    let revealed: Zeroizing<Vec<u8>> = match seal {
+        Some(seal) => {
+            let oprf_key =
+                derive_secret_seal_key(out, &keep, oprf, default_relay, &seal.oprf_id, seal.epoch)?;
+            keep.reveal_sealed_secret(&id, &oprf_key)?
         }
+        None => Zeroizing::new(record.value.clone()),
+    };
+
+    warn!(id = %hex::encode(id), "secret value revealed");
+    out.newline();
+    match std::str::from_utf8(&revealed) {
+        Ok(s) => out.info(s),
+        Err(_) => out.info(&format!("(binary; hex) {}", hex::encode(&revealed))),
     }
     Ok(())
 }
