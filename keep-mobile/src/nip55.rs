@@ -1018,6 +1018,24 @@ pub(crate) fn compute_nostr_event_id(
     Ok(hash.into())
 }
 
+/// The event kind that will actually be signed, read exactly as the signer
+/// reads it: a numeric `kind` bounded to `u16` (NIP-01 kinds are 0-65535).
+/// `None` for a missing, non-numeric, or out-of-range kind. This is the single
+/// source of truth for "what kind is this event"; the signing-decision layer
+/// derives its kind from the same event bytes via this function so the auto-sign
+/// classification cannot diverge from what is signed.
+pub(crate) fn signable_event_kind(event: &serde_json::Value) -> Option<u16> {
+    event["kind"].as_u64().and_then(|k| u16::try_from(k).ok())
+}
+
+/// Parse an event JSON string and return its signable kind, or `None` when the
+/// JSON is malformed or the kind is missing/out-of-range. Uses the same serde
+/// parse the signer uses, so duplicate-key and coercion handling match.
+pub(crate) fn signable_event_kind_from_json(event_json: &str) -> Option<u16> {
+    let event: serde_json::Value = serde_json::from_str(event_json).ok()?;
+    signable_event_kind(&event)
+}
+
 /// Build the `keep_frost_net::NostrEventPayload` structured wire format from
 /// the sign-event request's JSON body so the co-signers can recompute the
 /// event id (#529). Same canonical field extraction as
@@ -1036,10 +1054,7 @@ pub(crate) fn build_structured_nostr_payload(
     let created_at = event["created_at"]
         .as_u64()
         .ok_or(KeepMobileError::InvalidSession)?;
-    let kind = event["kind"]
-        .as_u64()
-        .and_then(|k| u16::try_from(k).ok())
-        .ok_or(KeepMobileError::InvalidSession)?;
+    let kind = signable_event_kind(event).ok_or(KeepMobileError::InvalidSession)?;
     let tags: Vec<Vec<String>> = event["tags"]
         .as_array()
         .ok_or(KeepMobileError::InvalidSession)?
@@ -1073,6 +1088,38 @@ pub(crate) fn build_structured_nostr_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signable_kind_reads_numeric_kind() {
+        assert_eq!(signable_event_kind_from_json(r#"{"kind":1}"#), Some(1));
+        assert_eq!(
+            signable_event_kind_from_json(r#"{"kind":22242}"#),
+            Some(22242)
+        );
+        assert_eq!(signable_event_kind_from_json(r#"{"kind":0}"#), Some(0));
+        assert_eq!(
+            signable_event_kind_from_json(r#"{"kind":65535}"#),
+            Some(65535)
+        );
+    }
+
+    #[test]
+    fn signable_kind_none_for_missing_or_invalid() {
+        assert_eq!(signable_event_kind_from_json(r#"{"tags":[]}"#), None);
+        assert_eq!(signable_event_kind_from_json(r#"{"kind":"1"}"#), None); // string, not number
+        assert_eq!(signable_event_kind_from_json(r#"{"kind":-1}"#), None);
+        assert_eq!(signable_event_kind_from_json(r#"{"kind":65536}"#), None); // > u16::MAX
+        assert_eq!(signable_event_kind_from_json("not json"), None);
+    }
+
+    #[test]
+    fn signable_kind_duplicate_key_is_last_wins() {
+        // serde takes the last value; the decision layer and the signer must agree.
+        assert_eq!(
+            signable_event_kind_from_json(r#"{"kind":1,"kind":22242}"#),
+            Some(22242)
+        );
+    }
 
     #[test]
     fn batch_results_success_carries_signature_and_result() {

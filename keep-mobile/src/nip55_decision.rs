@@ -24,7 +24,8 @@
 //! are handled by the caller before it invokes this function.
 
 use crate::nip55::{
-    nip55_extract_relay_host, nip55_relay_auth_gate, Nip55RelayAuthGate, Nip55RequestType,
+    nip55_extract_relay_host, nip55_relay_auth_gate, signable_event_kind_from_json,
+    Nip55RelayAuthGate, Nip55RequestType,
 };
 use crate::nip55_policy::{nip55_resolve_decision, Nip55PermissionDecision, Nip55StoredPermission};
 use crate::nip55_ratelimit::{nip55_check_velocity, Nip55VelocityResult};
@@ -60,9 +61,10 @@ pub struct Nip55DecisionInputs {
     pub is_locked: bool,
 
     pub request_type: Nip55RequestType,
-    /// Parsed event kind (`>= 0`), only for `SignEvent`.
-    pub event_kind: Option<u32>,
-    /// The raw event JSON, used to extract the NIP-42 relay host for kind 22242.
+    /// The raw event JSON for a `SignEvent`. The signed event kind is derived
+    /// from these bytes (never trusted from a separate field) so the auto-sign
+    /// classification is bound to what is actually signed. Unused for
+    /// non-`SignEvent` operations.
     pub event_json: String,
 
     /// Result of the coarse per-package front-door limiter (`false` fails closed).
@@ -207,10 +209,27 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         };
     }
 
+    // Derive the event kind from the bytes that will actually be signed, using
+    // the same parse as the signer. A SignEvent whose kind cannot be determined
+    // cannot be classified for sensitivity, so it fails closed rather than
+    // risking an auto-approve of a mislabeled sensitive event.
+    let event_kind: Option<u32> = if inputs.request_type == Nip55RequestType::SignEvent {
+        match signable_event_kind_from_json(&inputs.event_json) {
+            Some(kind) => Some(u32::from(kind)),
+            None => {
+                return Nip55Outcome::Reject {
+                    reason: "invalid_event_kind".to_string(),
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // The NIP-42 relay-auth gate is only meaningful for a kind-22242 SignEvent;
     // it is computed once and reused by the pre-policy gate and the grant lookup.
-    let is_relay_auth = inputs.request_type == Nip55RequestType::SignEvent
-        && inputs.event_kind == Some(KIND_NIP42_AUTH);
+    let is_relay_auth =
+        inputs.request_type == Nip55RequestType::SignEvent && event_kind == Some(KIND_NIP42_AUTH);
     let relay_gate: Option<Nip55RelayAuthGate> = if is_relay_auth {
         Some(if inputs.relay_whitelist_read_failed {
             Nip55RelayAuthGate::AutoReject
@@ -233,7 +252,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     let ctx = SigningRequestContext {
         operation: inputs.request_type.clone(),
         package_name: inputs.package_name.clone(),
-        event_kind: inputs.event_kind,
+        event_kind,
         has_signed_kind_before: inputs.has_signed_kind_before,
         app_age_ms: inputs.app_age_ms,
     };
@@ -296,15 +315,21 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         };
     }
 
+    // `event_kind` is bounded to u16 at derivation, so the i32 cast never wraps.
     let decision = nip55_resolve_decision(
         inputs.stored_exact_permission.clone(),
         inputs.stored_generic_permission.clone(),
-        inputs.event_kind.map(|k| k as i32),
+        event_kind.map(|k| k as i32),
         inputs.now_elapsed_ms,
         inputs.now_wall_ms,
     );
 
     // A whitelisted relay auto-signs, but an explicit per-app DENY still wins.
+    // `decision` is the per-kind (kind-22242) resolution: because 22242 is a
+    // sensitive kind, a kind-agnostic DENY row never falls back here (matching
+    // how the standing-permission storage resolves it), so a blanket DENY does
+    // not block a whitelisted relay. This reaches gate 7 only after the expiry
+    // and lookup checks above have already passed.
     if relay_gate == Some(Nip55RelayAuthGate::AutoAccept)
         && decision != Some(Nip55PermissionDecision::Deny)
     {
@@ -342,8 +367,7 @@ mod tests {
             signing_killed: false,
             is_locked: false,
             request_type: Nip55RequestType::SignEvent,
-            event_kind: Some(1),
-            event_json: "{}".to_string(),
+            event_json: r#"{"kind":1}"#.to_string(),
             front_door_within_limit: true,
             velocity_query_ok: true,
             velocity_hourly: 0,
@@ -512,7 +536,6 @@ mod tests {
     #[test]
     fn relay_not_whitelisted_rejects_before_policy() {
         let mut i = base();
-        i.event_kind = Some(KIND_NIP42_AUTH);
         i.event_json = relay_auth_event("relay.notallowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.is_opted_in = true;
@@ -527,7 +550,6 @@ mod tests {
     #[test]
     fn relay_whitelist_read_failure_rejects_for_auth_kind() {
         let mut i = base();
-        i.event_kind = Some(KIND_NIP42_AUTH);
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.relay_whitelist_read_failed = true;
@@ -540,11 +562,71 @@ mod tests {
     #[test]
     fn relay_gate_ignored_for_non_auth_kind() {
         // A non-22242 kind never consults the relay gate, even with a read
-        // failure and a non-empty whitelist.
+        // failure and a non-empty whitelist (base event_json is kind 1).
         let mut i = base();
-        i.event_kind = Some(1);
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.relay_whitelist_read_failed = true;
+        assert!(is_require_ui(&evaluate_nip55_request(i)));
+    }
+
+    // The relay-auth gate and the sensitive-kind gate key off the kind derived
+    // from event_json, not a caller claim: a duplicate `kind` key resolves (serde
+    // last-wins, matching the signer) to 22242 and is gated as relay-auth.
+    #[test]
+    fn derived_kind_drives_relay_auth_not_a_caller_claim() {
+        let mut i = base();
+        i.event_json = r#"{"kind":1,"tags":[["relay","wss://relay.notallowed.com"]],"kind":22242}"#
+            .to_string();
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i.is_opted_in = true;
+        i.policy_mode = PolicyMode::Auto;
+        i.opt_in_rate_check = Some(allowed());
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i)),
+            "deny_relay_whitelist"
+        );
+    }
+
+    // A SignEvent whose kind cannot be derived from the bytes fails closed.
+    #[test]
+    fn sign_event_missing_kind_rejects() {
+        let mut i = base();
+        i.event_json = r#"{"tags":[]}"#.to_string();
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i)),
+            "invalid_event_kind"
+        );
+    }
+
+    #[test]
+    fn sign_event_out_of_range_kind_rejects() {
+        let mut i = base();
+        i.event_json = r#"{"kind":70000}"#.to_string(); // > u16::MAX
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i)),
+            "invalid_event_kind"
+        );
+    }
+
+    #[test]
+    fn sign_event_malformed_json_rejects() {
+        let mut i = base();
+        i.event_json = "not json".to_string();
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i)),
+            "invalid_event_kind"
+        );
+    }
+
+    // Even opted-in under an Auto policy, a sensitive kind in the bytes escalates
+    // to the UI rather than auto-approving.
+    #[test]
+    fn sensitive_kind_in_bytes_blocks_auto_approve() {
+        let mut i = base();
+        i.event_json = r#"{"kind":4}"#.to_string();
+        i.is_opted_in = true;
+        i.policy_mode = PolicyMode::Auto;
+        i.opt_in_rate_check = Some(allowed());
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
@@ -572,7 +654,7 @@ mod tests {
         let mut i = base();
         i.is_opted_in = true;
         i.policy_mode = PolicyMode::Auto;
-        i.event_kind = Some(4); // sensitive (NIP-04 DM)
+        i.event_json = r#"{"kind":4}"#.to_string(); // sensitive (NIP-04 DM)
         i.opt_in_rate_check = Some(allowed());
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
@@ -659,7 +741,6 @@ mod tests {
     #[test]
     fn whitelisted_relay_auto_approves() {
         let mut i = base();
-        i.event_kind = Some(KIND_NIP42_AUTH);
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
@@ -668,18 +749,73 @@ mod tests {
     #[test]
     fn whitelisted_relay_deny_still_wins() {
         let mut i = base();
-        i.event_kind = Some(KIND_NIP42_AUTH);
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_exact_permission = Some(perm("deny"));
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny");
     }
 
+    // A whitelisted relay must not bypass the gate-7 fail-closed checks (expiry
+    // and lookup), which run before the AUTO_ACCEPT auto-sign.
+    fn whitelisted_relay_base() -> Nip55DecisionInputs {
+        let mut i = base();
+        i.event_json = relay_auth_event("relay.allowed.com");
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i
+    }
+
+    #[test]
+    fn whitelisted_relay_app_expiry_timeout_still_rejects() {
+        let mut i = whitelisted_relay_base();
+        i.app_expired = None;
+        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_timeout");
+    }
+
+    #[test]
+    fn whitelisted_relay_expired_app_still_rejects() {
+        let mut i = whitelisted_relay_base();
+        i.app_expired = Some(true);
+        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_expired");
+    }
+
+    #[test]
+    fn whitelisted_relay_lookup_timeout_still_rejects() {
+        let mut i = whitelisted_relay_base();
+        i.permission_lookup_ok = false;
+        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "lookup_timeout");
+    }
+
+    // Non-SignEvent operations: gate 6 always falls to UI, gate 7 still resolves.
+    #[test]
+    fn get_public_key_stored_allow_auto_approves() {
+        let mut i = base();
+        i.request_type = Nip55RequestType::GetPublicKey;
+        i.stored_exact_permission = Some(perm("allow"));
+        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    #[test]
+    fn encrypt_op_requires_ui_with_sensitive_operation_risk() {
+        let mut i = base();
+        i.request_type = Nip55RequestType::Nip44Encrypt;
+        i.is_opted_in = true;
+        i.policy_mode = PolicyMode::Auto;
+        i.opt_in_rate_check = Some(allowed());
+        match evaluate_nip55_request(i) {
+            Nip55Outcome::RequireUi { risk, .. } => {
+                assert!(risk
+                    .factors
+                    .contains(&crate::signing_policy::SigningRiskFactor::SensitiveOperation));
+            }
+            other => panic!("expected RequireUi, got {other:?}"),
+        }
+    }
+
     // RequireUi carries the risk-derived auth level.
     #[test]
     fn require_ui_sensitive_kind_escalates_auth() {
         let mut i = base();
-        i.event_kind = Some(4); // sensitive -> risk >= 40 -> Biometric
+        i.event_json = r#"{"kind":4}"#.to_string(); // sensitive -> risk >= 40 -> Biometric
         match evaluate_nip55_request(i) {
             Nip55Outcome::RequireUi {
                 required_auth,
