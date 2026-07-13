@@ -22,7 +22,7 @@ tracing = "0.1"
 
 sha2 = "0.10"
 p384 = { version = "0.13", features = ["ecdsa", "pem"] }
-x509-cert = { version = "0.2", features = ["pem", "builder"] }
+x509-cert = { version = "0.3", features = ["pem", "builder"] }
 const-oid = "0.10"
 k256 = { version = "0.13.4", features = ["schnorr"] }
 signature = "3.0"
