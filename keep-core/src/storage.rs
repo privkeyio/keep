@@ -856,7 +856,24 @@ impl Storage {
 
         let serialized = Zeroizing::new(bincode::serialize(record)?);
         let encrypted = crypto::encrypt(&serialized, data_key)?;
-        backend.put(SECRETS_TABLE, &record.id, &encrypted.to_bytes())?;
+        let encrypted_bytes = encrypted.to_bytes();
+        // A seal row is what marks a secret's `value` as DEK-ciphertext. Overwriting
+        // an id that was previously threshold-sealed via this plain path must clear
+        // that stale seal atomically, else the new plaintext `value` would be misread
+        // as ciphertext and `reveal_sealed_secret` would fail. Deleting an absent
+        // seal row (the common case) is a no-op.
+        backend.write_atomic(&[
+            AtomicOp {
+                table: SECRETS_TABLE,
+                key: &record.id,
+                value: Some(&encrypted_bytes),
+            },
+            AtomicOp {
+                table: SECRET_SEALS_TABLE,
+                key: &record.id,
+                value: None,
+            },
+        ])?;
         Ok(())
     }
 
@@ -903,6 +920,15 @@ impl Storage {
     /// never notifies the replication sink: secrets are not replicable.
     pub fn store_sealed_secret(&self, record: &SecretRecord, seal: &ThresholdSeal) -> Result<()> {
         debug!(id = %hex::encode(record.id), "storing sealed secret");
+        // The seal's OPRF label MUST be the record's own id: it is the quorum's
+        // domain-separation input and is bound as AAD. Rejecting a mismatch at this
+        // boundary (which also guards backup restore) prevents an identity-confused
+        // or unrecoverable sealed record from ever being persisted.
+        if seal.oprf_id != hex::encode(record.id) {
+            return Err(KeepError::invalid_input(
+                "threshold seal OPRF id does not match secret id",
+            ));
+        }
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
@@ -1850,6 +1876,54 @@ mod tests {
         storage.delete_secret(&id).unwrap();
         assert!(storage.load_secret(&id).is_err());
         assert!(storage.load_secret_seal(&id).unwrap().is_none());
+    }
+
+    #[test]
+    fn overwriting_a_sealed_id_via_plain_store_clears_the_stale_seal() {
+        use crate::secret::{seal_value, SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+
+        let mut rec = SecretRecord::new("s".into(), SecretKind::Generic, Vec::new()).unwrap();
+        let id = rec.id;
+        let (value_ct, seal) = seal_value(b"sealed", &oprf_key, hex::encode(id), 0).unwrap();
+        rec.value = value_ct;
+        storage.store_sealed_secret(&rec, &seal).unwrap();
+        assert!(storage.load_secret_seal(&id).unwrap().is_some());
+
+        // Overwrite the SAME id with a plain (unsealed) record: the stale seal must
+        // be gone so `value` is read as plaintext, not ciphertext.
+        let plain = SecretRecord {
+            id,
+            name: "s".into(),
+            kind: SecretKind::Generic,
+            value: b"now-plain".to_vec(),
+            created_at: 0,
+            updated_at: 0,
+        };
+        storage.store_secret(&plain).unwrap();
+        assert!(storage.load_secret_seal(&id).unwrap().is_none());
+        assert_eq!(storage.load_secret(&id).unwrap().value, b"now-plain");
+    }
+
+    #[test]
+    fn store_sealed_secret_rejects_mismatched_oprf_id() {
+        use crate::secret::{seal_value, SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+        let oprf_key = crypto::SecretKey::generate().unwrap();
+
+        let mut rec = SecretRecord::new("s".into(), SecretKind::Generic, Vec::new()).unwrap();
+        // Seal built for a DIFFERENT id than the record it is stored against.
+        let (value_ct, seal) = seal_value(b"v", &oprf_key, hex::encode([9u8; 32]), 0).unwrap();
+        rec.value = value_ct;
+        assert!(
+            storage.store_sealed_secret(&rec, &seal).is_err(),
+            "a seal whose oprf_id != record id must be rejected"
+        );
     }
 
     #[test]
