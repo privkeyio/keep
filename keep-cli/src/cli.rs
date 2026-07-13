@@ -72,6 +72,12 @@ pub(crate) enum Commands {
     RotatePassword,
     /// Rotate the vault data-encryption key (re-encrypts every secret)
     RotateDataKey,
+    /// Store, reveal, list, and remove arbitrary secrets (passwords, API
+    /// tokens, notes) in the vault
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommands,
+    },
     /// Start the NIP-46 bunker (and optional FROST network co-signer)
     Serve {
         #[arg(short, long)]
@@ -274,6 +280,54 @@ pub(crate) enum ConfigCommands {
 pub(crate) enum ExportFormat {
     Json,
     Bech32,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SecretCommands {
+    /// Store a secret. Its value is read from a hidden TTY prompt or piped
+    /// stdin, NEVER a command-line argument (which would leak to shell history
+    /// and the process list).
+    Add {
+        /// Human-readable title for the secret (e.g. "GitHub login").
+        #[arg(short, long)]
+        name: String,
+        /// Category of secret.
+        #[arg(short, long, value_enum, default_value = "generic")]
+        kind: SecretKindArg,
+    },
+    /// Reveal a stored secret's value. Interactive-only (TTY-gated), like
+    /// `keep export`.
+    Get {
+        /// Secret name, or its hex id (from `list`) to disambiguate duplicates.
+        name: String,
+    },
+    /// List stored secrets (name, kind, id) — never the values.
+    List,
+    /// Remove a secret by name or hex id.
+    Rm {
+        /// Secret name, or its hex id (from `list`) to disambiguate duplicates.
+        name: String,
+    },
+}
+
+/// CLI mirror of [`keep_core::secret::SecretKind`].
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum SecretKindArg {
+    Password,
+    ApiToken,
+    Note,
+    Generic,
+}
+
+impl From<SecretKindArg> for keep_core::secret::SecretKind {
+    fn from(k: SecretKindArg) -> Self {
+        match k {
+            SecretKindArg::Password => Self::Password,
+            SecretKindArg::ApiToken => Self::ApiToken,
+            SecretKindArg::Note => Self::Note,
+            SecretKindArg::Generic => Self::Generic,
+        }
+    }
 }
 
 /// The step of a delayed, cancelable duress-freeze clear (see `DuressClear`).

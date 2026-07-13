@@ -10,6 +10,7 @@ pub mod frost_hardware;
 pub mod frost_network;
 pub mod migrate;
 pub mod nip46;
+pub mod secret;
 pub mod serve;
 pub mod vault;
 pub mod wallet;
@@ -17,6 +18,7 @@ pub mod wallet;
 use dialoguer::{theme::ColorfulTheme, Confirm, Password};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::debug;
+use zeroize::Zeroizing;
 
 use keep_core::error::{KeepError, Result};
 
@@ -45,6 +47,33 @@ fn read_password(prompt: &str) -> Result<String> {
                 "read password: {e}"
             )))
         })
+}
+
+/// Read a secret VALUE without ever taking it from `argv` (which leaks to shell
+/// history and `ps`). Interactive stdin gets a hidden, no-echo prompt; a piped
+/// stdin is read in full (so binary or multi-line values work), with a single
+/// trailing newline stripped so `echo secret | keep secret add` stores `secret`,
+/// not `secret\n` (use the interactive prompt or a file for exact bytes).
+pub fn read_secret_value(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        let value = read_password(prompt)?;
+        Ok(Zeroizing::new(value.into_bytes()))
+    } else {
+        let mut buf = Zeroizing::new(Vec::new());
+        std::io::stdin().read_to_end(&mut buf).map_err(|e| {
+            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                "read secret value from stdin: {e}"
+            )))
+        })?;
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        Ok(buf)
+    }
 }
 
 pub fn get_password(prompt: &str) -> Result<SecretString> {
