@@ -1158,3 +1158,122 @@ fn test_frost_refresh_preserves_group_signing() {
     assert_success(&sign_out);
     assert_frost_sig_verifies(&sign_out, &group_pubkey, digest);
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 7: audit verify / stats / retention (tamper-evident audit log)
+// -----------------------------------------------------------------------------
+
+/// `audit verify` confirms the hash chain of a genuine, unmodified log.
+#[test]
+fn test_audit_verify_passes_on_intact_log() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "verified"));
+}
+
+/// `audit verify` MUST detect a post-hoc modification of the audit log: the
+/// tamper-evidence guarantee. Flipping a single byte breaks either an entry's
+/// AEAD tag or the hash chain, and the command exits non-zero.
+#[test]
+fn test_audit_verify_detects_tampering() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    // Verify passes before tampering.
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["audit", "verify"])
+            .run(),
+    );
+
+    // Flip a byte inside the encrypted, hash-chained log.
+    let log = vault.join("audit.log");
+    let mut bytes = std::fs::read(&log).expect("audit log must exist");
+    assert!(bytes.len() > 4, "audit log should have content");
+    let idx = bytes.len() / 2;
+    bytes[idx] ^= 0xff;
+    std::fs::write(&log, &bytes).unwrap();
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+}
+
+/// `audit stats` reports the count of each event type; two `generate`s show as
+/// two key generations.
+#[test]
+fn test_audit_stats_counts_key_generation() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    for name in ["k1", "k2"] {
+        assert_success(
+            &KeepCmd::new(&bin)
+                .path(&vault)
+                .args(["generate", "--name", name])
+                .run(),
+        );
+    }
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "stats"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Generated: 2"));
+}
+
+/// `audit retention --apply` is refused without a policy bound (it must never
+/// guess), and a bound without `--apply` reports a dry run rather than deleting.
+#[test]
+fn test_audit_retention_apply_requires_policy_bound() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    // --apply with no bound: refused.
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "retention", "--apply"])
+        .run();
+    assert_failure(&out);
+
+    // A bound without --apply: dry run, nothing deleted.
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "retention", "--max-entries", "5"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "NOT applied"));
+}
