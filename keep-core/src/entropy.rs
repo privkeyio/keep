@@ -212,7 +212,11 @@ pub fn try_random_bytes<const N: usize>() -> Result<[u8; N], EntropyHealthError>
 /// For larger requests, generates multiple 32-byte blocks with unique counters.
 ///
 /// # Panics
-/// Panics if the RNG health check fails (use `try_random_bytes` to handle errors).
+/// Panics if the RNG health check fails. **Production code MUST use
+/// [`try_random_bytes`] and propagate the error instead** — a CSPRNG failure is a
+/// fail-closed condition, not a crash. This panicking convenience is for tests,
+/// benchmarks, and non-fallible contexts only (#jrec: all production callers were
+/// migrated to `try_random_bytes`).
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     try_random_bytes().expect("RNG health check failed: constant or zero output detected")
 }
