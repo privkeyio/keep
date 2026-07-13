@@ -101,12 +101,16 @@ fn tweak_key_package(kp: &KeyPackage, tweak: &[u8; 32]) -> Result<KeyPackage> {
     let ss_bytes = Zeroizing::new(kp.signing_share().serialize());
     let ss_sk = bitcoin::secp256k1::SecretKey::from_slice(ss_bytes.as_slice())
         .map_err(|e| KeepError::Frost(format!("signing share is not a valid scalar: {e}")))?;
-    let tweaked_ss_bytes = Zeroizing::new(
-        ss_sk
-            .add_tweak(&scalar)
-            .map_err(|e| KeepError::Frost(format!("signing share + tweak invalid: {e}")))?
-            .secret_bytes(),
-    );
+    // `add_tweak` consumes `ss_sk` (transforming the raw share scalar in place),
+    // so the tweaked `SecretKey` is the only remaining live copy. secp256k1's
+    // `SecretKey` does NOT scrub on drop, and the raw share is recoverable from
+    // the tweaked scalar because the tweak is public, so scrub it explicitly once
+    // its bytes are captured in a Zeroizing buffer.
+    let mut tweaked_ss_sk = ss_sk
+        .add_tweak(&scalar)
+        .map_err(|e| KeepError::Frost(format!("signing share + tweak invalid: {e}")))?;
+    let tweaked_ss_bytes = Zeroizing::new(tweaked_ss_sk.secret_bytes());
+    tweaked_ss_sk.non_secure_erase();
     let tweaked_signing_share = SigningShare::deserialize(&*tweaked_ss_bytes)
         .map_err(|e| KeepError::Frost(format!("tweaked signing share deserialize: {e}")))?;
 
