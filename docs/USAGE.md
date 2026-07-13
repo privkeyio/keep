@@ -6,6 +6,7 @@
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
 - [Backup & Restore](#backup--restore)
+- [Secrets Store](#secrets-store)
 - [Remote Signing (NIP-46)](#remote-signing-nip-46)
 - [Bitcoin](#bitcoin)
 - [Threshold Signatures (FROST)](#threshold-signatures-frost)
@@ -90,6 +91,16 @@ Run `keep <command> --help` for the full flag list of any command.
 | `keep backup [--output <file>]` | Write a passphrase-encrypted vault backup |
 | `keep restore <file> --target <dir>` | Restore a backup into a **new** vault |
 
+**Secrets store** (see [Secrets Store](#secrets-store)):
+
+| Command | Description |
+|---------|-------------|
+| `keep secret add --name <n> [--kind <k>]` | Store a secret (value read from a hidden prompt or piped stdin, never argv) |
+| `keep secret add --name <n> --threshold --group <npub> --share-file <f>` | Store a secret sealed behind a t-of-n OPRF quorum |
+| `keep secret get <name>` | Reveal a secret (interactive TTY only); unseals via the quorum if threshold-sealed |
+| `keep secret list` | List secrets (name, kind, id) — never values |
+| `keep secret rm <name>` | Remove a secret |
+
 **Signing & coordination:**
 
 | Command | Description |
@@ -133,6 +144,60 @@ a restore can never clobber your live keys.
 For FROST shares specifically, use `keep frost export` / `keep frost import` (per-share,
 passphrase-encrypted) so shares can be moved or backed up independently. See
 [Threshold Signatures](#threshold-signatures-frost).
+
+---
+
+## Secrets Store
+
+An encrypted store for high-value, **key-adjacent** secrets that belong next to your
+keys: BIP39 passphrases, exchange API keys, hardware-wallet PINs, recovery codes. It
+is not a password manager — there is no clipboard, autofill, TOTP, or URL matching —
+just an encrypted place for the handful of secrets you already guard as carefully as
+your keys. Each record's name, kind, and value are encrypted under the vault data key
+at rest; values are never passed on the command line (read from a hidden prompt or
+piped stdin) and are scrubbed from memory on drop.
+
+```bash
+# Store a secret; the value is read from a hidden prompt (or piped stdin)
+keep secret add --name exchange-api --kind api-token
+
+# Pipe a value non-interactively (a single trailing newline is stripped)
+printf '%s' "$MY_SECRET" | keep secret add --name seed-passphrase --kind password
+
+# List (names/kinds/ids only, never values), reveal (interactive TTY only), remove
+keep secret list
+keep secret get exchange-api
+keep secret rm exchange-api
+```
+
+Kinds are labels only (`password`, `api-token`, `note`, `generic`). Secrets are
+included in `keep backup` and re-encrypted by `keep rotate-data-key` like every other
+record, and they never sync to relays.
+
+### Threshold-sealed secrets
+
+Seal a secret's **value** behind a *t-of-n* OPRF quorum so it can be revealed only by
+assembling the quorum, never from a single device — even one with the vault unlocked.
+The name and kind stay readable locally; only the value is quorum-gated. This reuses
+the same OPRF root and holders as
+[Threshold-OPRF Vault Unlock](#threshold-oprf-vault-unlock-advanced): provision the
+quorum once (`keep frost network oprf-provision`, with holders serving), then:
+
+```bash
+# Seal a new secret under the quorum (holders must be online and serving).
+# --group and --share-file are required.
+keep secret add --name cold-storage-passphrase --kind password --threshold \
+  --group npub1... --share-file box.share --tpm-tcti device:/dev/tpmrm0
+
+# Reveal it — runs the t-of-n quorum to unseal the value:
+keep secret get cold-storage-passphrase \
+  --group npub1... --share-file box.share --tpm-tcti device:/dev/tpmrm0
+```
+
+If you pass the OPRF options to `secret add` without `--threshold`, the command
+refuses rather than silently storing a plaintext secret you meant to seal. A threshold
+reveal fails closed if the quorum is unreachable: the value stays sealed and no reveal
+is recorded.
 
 ---
 
