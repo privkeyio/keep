@@ -1277,3 +1277,164 @@ fn test_audit_retention_apply_requires_policy_bound() {
     assert_success(&out);
     assert!(output_contains(&out, "NOT applied"));
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 5: bitcoin address / descriptor (BIP-86 Taproot derivation)
+// -----------------------------------------------------------------------------
+
+/// Extract the address printed on the `Index <index>:` line of `bitcoin address`
+/// output (`out.info` writes to stderr; check both streams).
+fn extract_address_at(output: &Output, index: u32) -> String {
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let needle = format!("Index {index}: ");
+    for line in combined.lines() {
+        if let Some(pos) = line.find(&needle) {
+            return line[pos + needle.len()..].trim().to_string();
+        }
+    }
+    panic!("no 'Index {index}:' line in output:\n{combined}");
+}
+
+/// `bitcoin address` derives a BIP-86 Taproot address whose HRP matches the
+/// requested network (mainnet -> bc1p, testnet -> tb1p).
+#[test]
+fn test_bitcoin_address_taproot_per_network() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("btc-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    let testnet = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["bitcoin", "address", "--key", "k", "--network", "testnet"])
+        .run();
+    assert_success(&testnet);
+    assert!(output_contains(&testnet, "tb1p"), "testnet taproot HRP");
+
+    let mainnet = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["bitcoin", "address", "--key", "k", "--network", "mainnet"])
+        .run();
+    assert_success(&mainnet);
+    assert!(output_contains(&mainnet, "bc1p"), "mainnet taproot HRP");
+}
+
+/// BIP-86 derivation is deterministic (same key+index -> same address) and each
+/// index yields a distinct address.
+#[test]
+fn test_bitcoin_address_is_deterministic_per_index() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("btc-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    let addr_cmd = |bin: &Path, vault: &Path| {
+        KeepCmd::new(bin)
+            .path(vault)
+            .args([
+                "bitcoin",
+                "address",
+                "--key",
+                "k",
+                "--count",
+                "3",
+                "--network",
+                "testnet",
+            ])
+            .run()
+    };
+
+    let first = addr_cmd(&bin, &vault);
+    let second = addr_cmd(&bin, &vault);
+    // Same index reproduces the same address across runs.
+    assert_eq!(
+        extract_address_at(&first, 0),
+        extract_address_at(&second, 0),
+        "BIP-86 derivation must be deterministic"
+    );
+    // Distinct indexes yield distinct addresses.
+    let a0 = extract_address_at(&first, 0);
+    let a1 = extract_address_at(&first, 1);
+    let a2 = extract_address_at(&first, 2);
+    assert_ne!(a0, a1);
+    assert_ne!(a1, a2);
+    assert_ne!(a0, a2);
+    assert!(a0.starts_with("tb1p"));
+}
+
+/// `bitcoin descriptor` exports a BIP-86 `tr(...)` output descriptor.
+#[test]
+fn test_bitcoin_descriptor_is_taproot() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("btc-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "bitcoin",
+            "descriptor",
+            "--key",
+            "k",
+            "--network",
+            "testnet",
+        ])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "tr("), "BIP-86 taproot descriptor");
+}
+
+/// An unrecognized `--network` is rejected.
+#[test]
+fn test_bitcoin_rejects_invalid_network() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("btc-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "bitcoin",
+            "address",
+            "--key",
+            "k",
+            "--network",
+            "notanetwork",
+        ])
+        .run();
+    assert_failure(&out);
+}
