@@ -12,6 +12,7 @@ mod nip46_ratelimit;
 mod nip55;
 mod nip55_audit;
 mod nip55_caller;
+mod nip55_decision;
 mod nip55_policy;
 mod nip55_ratelimit;
 mod persistence;
@@ -33,6 +34,9 @@ pub use nip46::{
     BunkerStatus, ParsedBunkerUrl,
 };
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
+pub use nip55_decision::{
+    evaluate_nip55_request, nip55_needs_biometric, Nip55DecisionInputs, Nip55Outcome,
+};
 pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use signing_policy::{

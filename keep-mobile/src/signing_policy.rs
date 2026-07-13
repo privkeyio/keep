@@ -56,7 +56,7 @@ pub enum SigningRiskFactor {
     FirstKind,
 }
 
-#[derive(uniffi::Record, Clone, Debug)]
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct SigningRiskAssessment {
     pub score: u32,
     pub factors: Vec<SigningRiskFactor>,
