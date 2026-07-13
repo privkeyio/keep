@@ -125,6 +125,18 @@ fn run(out: &Output) -> Result<()> {
         Commands::Delete { name } => commands::vault::cmd_delete(out, &path, &name, hidden),
         Commands::RotatePassword => commands::vault::cmd_rotate_password(out, &path),
         Commands::RotateDataKey => commands::vault::cmd_rotate_data_key(out, &path),
+        Commands::Secret { command } => match command {
+            SecretCommands::Add { name, kind } => {
+                commands::secret::cmd_secret_add(out, &path, &name, kind, hidden)
+            }
+            SecretCommands::Get { name } => {
+                commands::secret::cmd_secret_get(out, &path, &name, hidden)
+            }
+            SecretCommands::List => commands::secret::cmd_secret_list(out, &path, hidden),
+            SecretCommands::Rm { name } => {
+                commands::secret::cmd_secret_rm(out, &path, &name, hidden)
+            }
+        },
         Commands::Serve {
             relay,
             headless,
