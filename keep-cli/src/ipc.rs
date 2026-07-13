@@ -8,10 +8,17 @@
 //! to a per-vault Unix socket the daemon serves and get the (metadata-only)
 //! answer from the daemon's already-open, unlocked vault.
 //!
-//! Security: the socket is created mode `0600` inside the vault directory, so
-//! only processes running as the vault owner (who already holds the password)
-//! can connect. The daemon answers ONLY read-only, metadata-only requests and
-//! NEVER returns secret key material.
+//! Security: the socket is created mode `0600` inside the (0700, owner-only)
+//! vault directory, so only processes running as the vault owner can connect.
+//! The daemon answers ONLY read-only, metadata-only requests (key name, kind,
+//! npub) and NEVER returns secret key material.
+//!
+//! Trust model note: unlike a direct `keep list`, the socket path returns
+//! metadata WITHOUT the vault password. This lowers the bar for reading key
+//! names/npubs from "knows the password" to "is the same Unix user" while a
+//! daemon runs. That is acceptable because the daemon already holds the unlocked
+//! keyring in memory, which a same-user attacker can recover regardless; the
+//! socket exposes strictly less (metadata only, no secrets).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,8 +31,13 @@ use keep_core::keyring::Keyring;
 
 /// Filename of the per-vault inspect socket, inside the vault directory.
 const SOCKET_NAME: &str = "keep.sock";
-/// Upper bound on a request line, a cheap guard against a runaway/hostile peer.
+/// Upper bound on a request/response line, a cheap guard against a runaway or
+/// hostile (same-user) peer streaming bytes without a newline.
 const MAX_REQUEST_BYTES: u64 = 8 * 1024;
+/// Drop a connection whose request does not arrive promptly (slowloris guard).
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Cap on concurrent in-flight connections, so a burst cannot pile up tasks/FDs.
+const MAX_CONNECTIONS: usize = 32;
 
 /// Path of the inspect socket for a vault.
 pub(crate) fn inspect_socket_path(vault: &Path) -> PathBuf {
@@ -84,13 +96,20 @@ pub(crate) async fn serve_inspect_socket(
     // and chmod is not reachable by another user in practice.
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
 
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (stream, _addr) = listener.accept().await?;
+        // Backpressure: never hold more than MAX_CONNECTIONS handlers at once.
+        let Ok(permit) = Arc::clone(&limit).acquire_owned().await else {
+            break; // semaphore closed
+        };
         let keyring = Arc::clone(&keyring);
         tokio::spawn(async move {
             let _ = handle_conn(stream, keyring).await;
+            drop(permit);
         });
     }
+    Ok(())
 }
 
 async fn handle_conn(
@@ -102,7 +121,14 @@ async fn handle_conn(
     let (rd, mut wr) = stream.split();
     let mut reader = BufReader::new(rd).take(MAX_REQUEST_BYTES);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    // Bounded (MAX_REQUEST_BYTES via take) and time-bounded: a client that never
+    // sends a newline is dropped rather than parking the task.
+    if tokio::time::timeout(READ_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
 
     let response = match serde_json::from_str::<InspectRequest>(line.trim()) {
         Ok(req) if req.cmd == "list" => {
@@ -157,7 +183,9 @@ pub(crate) fn query_list(vault: &Path) -> Result<Vec<KeyInfo>> {
         .map_err(|e| KeepError::Runtime(format!("write to inspect socket: {e}")))?;
 
     let mut line = String::new();
-    BufReader::new(&stream)
+    // Bound the response too: a malicious (same-user) socket cannot grow this
+    // unboundedly. `set_read_timeout` above bounds a hang; `take` bounds volume.
+    BufReader::new(std::io::Read::take(&stream, MAX_REQUEST_BYTES))
         .read_line(&mut line)
         .map_err(|e| KeepError::Runtime(format!("read from inspect socket: {e}")))?;
     let response: InspectResponse = serde_json::from_str(line.trim())

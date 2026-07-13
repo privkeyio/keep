@@ -17,9 +17,10 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::AlreadyExists(_) | KeepError::NotFound(_) => "Resource error",
         KeepError::InvalidNetwork(_) => "Invalid network",
         KeepError::Encryption(_) | KeepError::CryptoErr(_) => "Cryptographic operation failed",
-        KeepError::Database(_) | KeepError::Migration(_) | KeepError::StorageErr(_) => {
-            "Storage error"
-        }
+        KeepError::Database(_)
+        | KeepError::VaultAlreadyOpen(_)
+        | KeepError::Migration(_)
+        | KeepError::StorageErr(_) => "Storage error",
         KeepError::HomeNotFound | KeepError::Config(_) => "Configuration error",
         KeepError::CapacityExceeded(_) => "Capacity exceeded",
         KeepError::PermissionDenied(_) => "Permission denied",
