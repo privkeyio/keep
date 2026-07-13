@@ -1438,3 +1438,62 @@ fn test_bitcoin_rejects_invalid_network() {
         .run();
     assert_failure(&out);
 }
+
+// -----------------------------------------------------------------------------
+// #434 Area 8: config (show/path/init) and migrate status
+// -----------------------------------------------------------------------------
+
+/// `config init` creates the config file, `path` prints its location, and `show`
+/// renders the summary. The config home is isolated via HOME + XDG_CONFIG_HOME so
+/// the test never touches the real user config; a second `init` refusing to
+/// overwrite proves the file was created (path-agnostic across platforms).
+#[test]
+fn test_config_init_path_and_show_isolated() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let cfg_home = dir.path().join("config");
+    let home = dir.path().join("home");
+
+    let cmd = |args: &[&str]| {
+        KeepCmd::new(&bin)
+            .env("XDG_CONFIG_HOME", cfg_home.to_str().unwrap())
+            .env("HOME", home.to_str().unwrap())
+            .args(args)
+            .run()
+    };
+
+    // path prints a config.toml location.
+    let out = cmd(&["config", "path"]);
+    assert_success(&out);
+    assert!(output_contains(&out, "config.toml"));
+
+    // init creates it; a second init detects it already exists (so it now does).
+    assert_success(&cmd(&["config", "init"]));
+    let again = cmd(&["config", "init"]);
+    assert_success(&again);
+    assert!(output_contains(&again, "already exists"));
+
+    // show renders the config summary.
+    let out = cmd(&["config", "show"]);
+    assert_success(&out);
+    assert!(output_contains(&out, "Config file"));
+}
+
+/// `migrate status` on a freshly created vault reports the current schema and no
+/// pending migration.
+#[test]
+fn test_migrate_status_fresh_vault_needs_no_migration() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("mig-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["migrate", "status"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Needs migration"));
+    assert!(output_contains(&out, "false"));
+}
