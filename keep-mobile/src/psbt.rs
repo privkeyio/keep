@@ -3,6 +3,7 @@
 
 use crate::error::KeepMobileError;
 use base64::Engine;
+use bitcoin::bip32::ChildNumber;
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::Psbt;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -38,6 +39,12 @@ pub struct PsbtInputSighash {
 pub struct PsbtParser {
     psbt: Psbt,
     network: Network,
+    /// The wallet's external (`.../0/*`) descriptor, when known. Change
+    /// detection derives the wallet's own change script from this and matches it
+    /// against an output's `script_pubkey`; without it, change detection fails
+    /// closed (no output is labeled change) because PSBT key-origin metadata is
+    /// attacker-controllable.
+    wallet_descriptor: Option<String>,
 }
 
 #[uniffi::export]
@@ -60,6 +67,7 @@ impl PsbtParser {
         Ok(Self {
             psbt,
             network: Network::Bitcoin,
+            wallet_descriptor: None,
         })
     }
 
@@ -74,6 +82,7 @@ impl PsbtParser {
         Ok(Self {
             psbt,
             network: Network::Bitcoin,
+            wallet_descriptor: None,
         })
     }
 
@@ -93,6 +102,23 @@ impl PsbtParser {
         Ok(Self {
             psbt: self.psbt.clone(),
             network,
+            wallet_descriptor: self.wallet_descriptor.clone(),
+        })
+    }
+
+    /// Attach the wallet's external descriptor so change detection can verify
+    /// that an output genuinely pays to the wallet's own change branch. The
+    /// descriptor is validated by deriving its change script at index 0.
+    pub fn with_wallet_descriptor(&self, descriptor: String) -> Result<Self, KeepMobileError> {
+        keep_bitcoin::change_script_at_index(&descriptor, self.network, 0).map_err(|e| {
+            KeepMobileError::PsbtError {
+                msg: format!("Invalid wallet descriptor: {e}"),
+            }
+        })?;
+        Ok(Self {
+            psbt: self.psbt.clone(),
+            network: self.network,
+            wallet_descriptor: Some(descriptor),
         })
     }
 
@@ -318,13 +344,47 @@ impl PsbtParser {
     }
 
     fn is_change_output(&self, index: usize) -> bool {
+        // Fail closed: without the wallet descriptor we cannot verify that an
+        // output pays to our own change branch. PSBT key-origin metadata is
+        // attacker-controllable, so an unverifiable output is never labeled
+        // change (it is shown as a normal payment for the user to scrutinize).
+        let Some(descriptor) = &self.wallet_descriptor else {
+            return false;
+        };
         let Some(output) = self.psbt.outputs.get(index) else {
             return false;
         };
+        let Some(txout) = self.psbt.unsigned_tx.output.get(index) else {
+            return false;
+        };
 
-        !output.bip32_derivation.is_empty()
-            || !output.tap_key_origins.is_empty()
-            || output.tap_internal_key.is_some()
+        // Use the PSBT metadata only as a hint for the derivation index; the
+        // authority is re-deriving our own change script and matching it against
+        // the consensus-committed script_pubkey.
+        let der_path = output
+            .bip32_derivation
+            .values()
+            .next()
+            .map(|(_, path)| path)
+            .or_else(|| {
+                output
+                    .tap_key_origins
+                    .values()
+                    .next()
+                    .map(|(_, (_, path))| path)
+            });
+        let Some(der_path) = der_path else {
+            return false;
+        };
+        let der_index = match der_path.into_iter().last() {
+            Some(ChildNumber::Normal { index }) => *index,
+            _ => return false,
+        };
+
+        match keep_bitcoin::change_script_at_index(descriptor, self.network, der_index) {
+            Ok(expected) => expected == txout.script_pubkey,
+            Err(_) => false,
+        }
     }
 
     fn get_taproot_sighash_type(&self, index: usize) -> Result<TapSighashType, KeepMobileError> {
@@ -378,7 +438,8 @@ mod tests {
     use bitcoin::script::ScriptBuf;
     use bitcoin::secp256k1::{Keypair, Secp256k1};
     use bitcoin::transaction::Version;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, Txid, Witness};
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, Txid, Witness, XOnlyPublicKey};
+    use std::str::FromStr;
 
     fn create_test_psbt() -> Psbt {
         let secp = Secp256k1::new();
@@ -495,6 +556,239 @@ mod tests {
         let parser = PsbtParser::from_bytes(bytes).unwrap();
         let result = parser.get_sighash_for_input(99);
         assert!(result.is_err());
+    }
+
+    // --- Change-output detection (keep-9yr): change must be verified against the
+    // wallet descriptor, not trusted from attacker-controllable PSBT metadata. ---
+
+    // A testnet BIP-86 external descriptor plus the wallet's own change (`/1/0`)
+    // key and script, derived from a fixed seed.
+    fn wallet_fixture() -> (String, XOnlyPublicKey, ScriptBuf) {
+        use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Testnet, &[7u8; 32]).unwrap();
+        let fp = master.fingerprint(&secp);
+        let acct_path = DerivationPath::from_str("m/86'/1'/0'").unwrap();
+        let acct_xpub = Xpub::from_priv(&secp, &master.derive_priv(&secp, &acct_path).unwrap());
+        let descriptor = format!("tr([{fp}/86'/1'/0']{acct_xpub}/0/*)");
+
+        let change_child = acct_xpub
+            .derive_pub(&secp, &DerivationPath::from_str("m/1/0").unwrap())
+            .unwrap();
+        let (change_xonly, _) = change_child.public_key.x_only_public_key();
+        let change_spk = keep_bitcoin::change_script_at_index(&descriptor, Network::Testnet, 0)
+            .expect("derive change script");
+        (descriptor, change_xonly, change_spk)
+    }
+
+    fn dummy_txin() -> TxIn {
+        TxIn {
+            previous_output: OutPoint {
+                txid: "0000000000000000000000000000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }
+    }
+
+    fn dummy_witness_utxo() -> TxOut {
+        TxOut {
+            value: Amount::from_sat(100000),
+            script_pubkey: ScriptBuf::new_p2tr(
+                &Secp256k1::new(),
+                Keypair::from_seckey_slice(&Secp256k1::new(), &[3u8; 32])
+                    .unwrap()
+                    .x_only_public_key()
+                    .0,
+                None,
+            ),
+        }
+    }
+
+    fn tag_change(psbt: &mut Psbt, out: usize, meta_key: XOnlyPublicKey, path: &str) {
+        use bitcoin::bip32::{DerivationPath, Fingerprint};
+        let path = DerivationPath::from_str(path).unwrap();
+        psbt.outputs[out].tap_key_origins.insert(
+            meta_key,
+            (vec![], (Fingerprint::from([1u8, 2, 3, 4]), path)),
+        );
+        psbt.outputs[out].tap_internal_key = Some(meta_key);
+    }
+
+    // A single-output PSBT paying `spk`, tagged with taproot key-origin metadata
+    // for `path` (the attacker's lever in the original bug).
+    fn psbt_with_output_at(spk: ScriptBuf, meta_key: XOnlyPublicKey, path: &str) -> Psbt {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![dummy_txin()],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: spk,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(dummy_witness_utxo());
+        tag_change(&mut psbt, 0, meta_key, path);
+        psbt
+    }
+
+    fn psbt_with_output(spk: ScriptBuf, meta_key: XOnlyPublicKey) -> Psbt {
+        psbt_with_output_at(spk, meta_key, "m/86'/1'/0'/1/0")
+    }
+
+    fn dummy_key() -> XOnlyPublicKey {
+        Keypair::from_seckey_slice(&Secp256k1::new(), &[5u8; 32])
+            .unwrap()
+            .x_only_public_key()
+            .0
+    }
+
+    fn parser_with_descriptor(psbt: Psbt, descriptor: String) -> PsbtParser {
+        PsbtParser::from_bytes(psbt.serialize())
+            .unwrap()
+            .set_network("testnet".to_string())
+            .unwrap()
+            .with_wallet_descriptor(descriptor)
+            .unwrap()
+    }
+
+    #[test]
+    fn genuine_change_is_detected_with_descriptor() {
+        let (descriptor, change_xonly, change_spk) = wallet_fixture();
+        let psbt = psbt_with_output(change_spk, change_xonly);
+        let parser = PsbtParser::from_bytes(psbt.serialize())
+            .unwrap()
+            .set_network("testnet".to_string())
+            .unwrap()
+            .with_wallet_descriptor(descriptor)
+            .unwrap();
+        assert!(parser.analyze().unwrap().outputs[0].is_change);
+    }
+
+    #[test]
+    fn forged_metadata_on_foreign_address_is_not_change() {
+        // The attack: a payment to an address the wallet does not own, decorated
+        // with taproot key-origin metadata so the old heuristic marked it change.
+        let (descriptor, _change_xonly, _change_spk) = wallet_fixture();
+        let secp = Secp256k1::new();
+        let attacker_key = Keypair::from_seckey_slice(&secp, &[9u8; 32])
+            .unwrap()
+            .x_only_public_key()
+            .0;
+        let attacker_spk = ScriptBuf::new_p2tr(&secp, attacker_key, None);
+        let psbt = psbt_with_output(attacker_spk, attacker_key);
+        let parser = PsbtParser::from_bytes(psbt.serialize())
+            .unwrap()
+            .set_network("testnet".to_string())
+            .unwrap()
+            .with_wallet_descriptor(descriptor)
+            .unwrap();
+        assert!(!parser.analyze().unwrap().outputs[0].is_change);
+    }
+
+    #[test]
+    fn change_fails_closed_without_descriptor() {
+        // Even a genuine change output is not labeled change when the parser has
+        // no wallet descriptor to verify against.
+        let (_descriptor, change_xonly, change_spk) = wallet_fixture();
+        let psbt = psbt_with_output(change_spk, change_xonly);
+        let parser = PsbtParser::from_bytes(psbt.serialize())
+            .unwrap()
+            .set_network("testnet".to_string())
+            .unwrap();
+        assert!(!parser.analyze().unwrap().outputs[0].is_change);
+    }
+
+    #[test]
+    fn with_wallet_descriptor_rejects_invalid_descriptor() {
+        let psbt = create_test_psbt();
+        let parser = PsbtParser::from_bytes(psbt.serialize()).unwrap();
+        assert!(parser
+            .with_wallet_descriptor("not a descriptor".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn genuine_change_detected_at_nonzero_index() {
+        // The index comes from the metadata path's last component; change must be
+        // re-derived at that same leaf, not only at 0.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let change5 =
+            keep_bitcoin::change_script_at_index(&descriptor, Network::Testnet, 5).unwrap();
+        let psbt = psbt_with_output_at(change5, dummy_key(), "m/86'/1'/0'/1/5");
+        assert!(
+            parser_with_descriptor(psbt, descriptor)
+                .analyze()
+                .unwrap()
+                .outputs[0]
+                .is_change
+        );
+    }
+
+    #[test]
+    fn receive_self_payment_is_not_change() {
+        // Paying our own receive (`/0/*`) address is a self-send, not change: the
+        // change branch (`/1/*`) script at that index must not match.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let receive3 = keep_bitcoin::descriptor_address_at_index(&descriptor, Network::Testnet, 3)
+            .unwrap()
+            .script_pubkey();
+        let psbt = psbt_with_output_at(receive3, dummy_key(), "m/86'/1'/0'/0/3");
+        assert!(
+            !parser_with_descriptor(psbt, descriptor)
+                .analyze()
+                .unwrap()
+                .outputs[0]
+                .is_change
+        );
+    }
+
+    #[test]
+    fn mixed_outputs_flag_only_genuine_change() {
+        // A two-output tx: one genuine change output and one external payment.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let change0 =
+            keep_bitcoin::change_script_at_index(&descriptor, Network::Testnet, 0).unwrap();
+        let secp = Secp256k1::new();
+        let external_spk = ScriptBuf::new_p2tr(
+            &secp,
+            Keypair::from_seckey_slice(&secp, &[9u8; 32])
+                .unwrap()
+                .x_only_public_key()
+                .0,
+            None,
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![dummy_txin()],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(40000),
+                    script_pubkey: external_spk,
+                },
+                TxOut {
+                    value: Amount::from_sat(50000),
+                    script_pubkey: change0,
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(dummy_witness_utxo());
+        // Both outputs carry change-looking metadata; only the real one matches.
+        tag_change(&mut psbt, 0, dummy_key(), "m/86'/1'/0'/1/0");
+        tag_change(&mut psbt, 1, dummy_key(), "m/86'/1'/0'/1/0");
+        let info = parser_with_descriptor(psbt, descriptor).analyze().unwrap();
+        assert!(
+            !info.outputs[0].is_change,
+            "external payment must not be change"
+        );
+        assert!(info.outputs[1].is_change, "genuine change must be change");
     }
 
     #[test]

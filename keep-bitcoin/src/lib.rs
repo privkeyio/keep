@@ -27,8 +27,8 @@ pub use chain_view::{
     validate_prevout_amounts_against_chain, ChainView, ChainViewError, KEEP_CHAIN_URL_ENV,
 };
 pub use descriptor::{
-    descriptor_address, descriptor_address_at_index, descriptor_script_pubkey,
-    multipath_from_external, xpub_to_x_only, DescriptorExport,
+    change_script_at_index, descriptor_address, descriptor_address_at_index,
+    descriptor_script_pubkey, multipath_from_external, xpub_to_x_only, DescriptorExport,
 };
 pub use error::{BitcoinError, Result};
 pub use key_proof::{build_key_proof_psbt, sign_key_proof, verify_key_proof};
