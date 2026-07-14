@@ -162,6 +162,20 @@ impl TryFrom<AuditEntry> for AuditEntryExport {
     }
 }
 
+/// Persistence backend for the append-only audit chain, implemented by foreign
+/// (mobile platform) code.
+///
+/// # Contract: `store_entry` must be non-blocking
+///
+/// [`AuditLog::log_event`] holds the chain's `last_hash` mutex across the call to
+/// [`store_entry`](Self::store_entry): the lock must span
+/// compute-previous-hash → store → advance-hash so two concurrent writers cannot
+/// chain onto the same previous hash and fork the log. Releasing the lock earlier
+/// is therefore not an option. As a result `store_entry` implementations MUST be
+/// non-blocking and fast: a single synchronous local write, with no unbounded
+/// I/O, no network, no user prompts/biometrics, and no re-entrancy back into this
+/// `AuditLog` (which would deadlock). A slow or hung `store_entry` stalls every
+/// concurrent audit write (a DoS). The read methods are not called under the lock.
 #[uniffi::export(with_foreign)]
 pub trait AuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
@@ -508,6 +522,12 @@ impl TryFrom<SigningAuditEntry> for SigningAuditEntryExport {
     }
 }
 
+/// Persistence backend for the signing audit chain (foreign-implemented). Like
+/// [`AuditStorage`], [`store_entry`](Self::store_entry) is called while
+/// [`SigningAuditLog::log_event`] holds the chain lock, so it MUST be non-blocking
+/// and fast (single synchronous local write; no unbounded I/O, network, prompts,
+/// or re-entrancy). A hung `store_entry` stalls every concurrent signing-audit
+/// write.
 #[uniffi::export(with_foreign)]
 pub trait SigningAuditStorage: Send + Sync {
     fn store_entry(&self, entry_json: String) -> Result<(), KeepMobileError>;
