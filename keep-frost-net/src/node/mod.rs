@@ -119,14 +119,16 @@ pub trait PersistedDescriptorLookup: Send + Sync {
     }
 
     /// Return the `policy_hash` of the persisted descriptor whose group +
-    /// canonical hash match, if any. Used at the PSBT-spend boundary to refuse
-    /// proposing a spend bound to a placeholder (all-zero) policy_hash, matching
-    /// the CLI spend guard. A descriptor imported before its policy is
-    /// coordinated carries `policy_hash == [0; 32]`, yet its canonical hash is
-    /// non-zero, so the plain all-zero-hash check cannot catch it. `None` (no
-    /// match, or no lookup configured) means "cannot confirm" and is not a
-    /// rejection; an unresolved hash is rejected downstream by responders'
-    /// descriptor_hash verification.
+    /// canonical hash match, if any. Used at both PSBT trust boundaries (the
+    /// proposer's `request_psbt_spend` and the responder's descriptor_hash
+    /// verification) to refuse a spend bound to a placeholder (all-zero)
+    /// policy_hash, matching the CLI spend guard. A descriptor imported before
+    /// its policy is coordinated carries `policy_hash == [0; 32]`, yet its
+    /// canonical hash is non-zero, so the plain all-zero-hash check cannot catch
+    /// it. `None` (no match, no lookup configured, or the vault temporarily
+    /// unreadable) means "cannot confirm" and is not a rejection: the per-caller
+    /// CLI/desktop spend paths keep their own fail-closed guard on the loaded
+    /// descriptor. This projection is defense-in-depth.
     fn policy_hash_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<[u8; 32]> {
         let _ = (group, hash);
         None
