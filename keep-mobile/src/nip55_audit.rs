@@ -208,13 +208,24 @@ pub fn nip55_verify_audit_chain(
     }
 }
 
-/// Authenticate the audit chain's tip: the total number of chained (non-legacy)
-/// entries and the last entry's hash. This MAC is persisted **separately** from
-/// the log (a keystore slot the log table cannot reach). The backward-link chain
-/// alone cannot detect deleting the newest rows (the remaining prefix stays
-/// perfectly linked) or wiping the whole log (an empty log verifies as valid);
-/// comparing the log's current `(count, last_hash)` against this independently
-/// stored MAC catches both.
+/// Domain tag prefixing the tip MAC content so, even sharing the per-app HMAC
+/// key with the per-entry chain hash, the two message types can never collide.
+const TIP_MAC_DOMAIN: &str = "nip55-audit-tip-v1";
+
+/// Authenticate the audit chain's tip: `count` is the number of **chained**
+/// (non-legacy, non-empty-hash) entries and `last_entry_hash` is the last such
+/// entry's hash (`None` for an empty/all-legacy log). This MAC is persisted
+/// **separately** from the log (a keystore slot the log table cannot reach). The
+/// backward-link chain alone cannot detect deleting the newest rows (the
+/// remaining prefix stays perfectly linked) or wiping the whole log (an empty
+/// log verifies as valid); comparing the log's current `(count, last_hash)`
+/// against this independently stored MAC catches both.
+///
+/// The caller must compute `count`/`last_entry_hash` over the same chained-entry
+/// set the verifier uses (see [`nip55_verify_audit_chain_with_tip`]), and must
+/// store this MAC confidentially and rollback-resistantly: this construction
+/// binds the current tip but has no epoch, so replaying an older leaked tip MAC
+/// alongside a log truncated to that earlier length would still validate.
 #[uniffi::export]
 pub fn nip55_audit_tip_mac(
     count: u64,
@@ -226,9 +237,15 @@ pub fn nip55_audit_tip_mac(
         "HMAC key not initialized - cannot compute audit tip MAC"
     );
     let hmac_key = zeroize::Zeroizing::new(hmac_key);
-    // Bind the count so tail-truncation (fewer entries) is detected even if the
-    // surviving last hash somehow matched; `|` cannot appear in a hex hash.
-    let content = format!("{}|{}", count, last_entry_hash.unwrap_or_default());
+    // Domain tag + count binding: `|` cannot appear in the decimal count or the
+    // hex hash, so the encoding is unambiguous and cannot collide with the
+    // 6-pipe per-entry content even under the shared key.
+    let content = format!(
+        "{}|{}|{}",
+        TIP_MAC_DOMAIN,
+        count,
+        last_entry_hash.unwrap_or_default()
+    );
     hex::encode(hmac_sha256(hmac_key.as_slice(), content.as_bytes()))
 }
 
