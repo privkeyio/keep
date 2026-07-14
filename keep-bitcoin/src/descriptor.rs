@@ -241,6 +241,29 @@ pub fn descriptor_address_at_index(
         .map_err(|e| BitcoinError::Descriptor(format!("address derivation failed: {e}")))
 }
 
+/// Derive the change (internal, `/1/*`) `script_pubkey` at `index` from a
+/// BIP-86 external descriptor (`.../0/*`), applying the same `/0/* -> /1/*`
+/// rewrite as [`DescriptorExport::internal_descriptor`].
+///
+/// This is the single source of truth for "does this output pay to the
+/// wallet's own change branch". Callers compare the returned script against a
+/// PSBT output's `script_pubkey` (which is consensus-committed) rather than
+/// trusting the attacker-suppliable key-origin metadata in a PSBT output, which
+/// otherwise lets a payment to an attacker's address masquerade as change.
+pub fn change_script_at_index(
+    external_descriptor: &str,
+    network: Network,
+    index: u32,
+) -> Result<bitcoin::ScriptBuf> {
+    let body = external_descriptor
+        .split('#')
+        .next()
+        .unwrap_or(external_descriptor);
+    let internal_body = keep_core::descriptor::rewrite_trailing_zero_to_one(body);
+    let (internal, _) = canonicalize_descriptor(&internal_body)?;
+    Ok(descriptor_address_at_index(&internal, network, index)?.script_pubkey())
+}
+
 /// Build the raw Base58Check-encoded xpub for a FROST group by combining its
 /// x-only pubkey (lifted to its +even secp256k1 point) with the deterministic
 /// chaincode from #487 PR1. Depth 0, no parent, child number 0: this is the
@@ -438,6 +461,29 @@ mod tests {
                 "leaf {leaf}: CHANGE-chain descriptor-derived key MUST equal FROST-signing child"
             );
         }
+    }
+
+    #[test]
+    fn change_script_at_index_uses_internal_branch() {
+        let group = test_group_pubkey();
+        let export = DescriptorExport::from_frost_wallet(&group, None, Network::Testnet).unwrap();
+        let external = export.external_descriptor();
+        let net = Network::Testnet;
+
+        let change0 = change_script_at_index(external, net, 0).unwrap();
+        // Change (`/1/0`) must differ from the external receive script (`/0/0`).
+        let recv0 = descriptor_address_at_index(external, net, 0)
+            .unwrap()
+            .script_pubkey();
+        assert_ne!(change0, recv0, "change /1/0 must differ from receive /0/0");
+        // And must equal the internal descriptor derived at the same index.
+        let internal = export.internal_descriptor().unwrap();
+        let internal0 = descriptor_address_at_index(&internal, net, 0)
+            .unwrap()
+            .script_pubkey();
+        assert_eq!(change0, internal0);
+        // Distinct indices produce distinct change scripts.
+        assert_ne!(change0, change_script_at_index(external, net, 1).unwrap());
     }
 
     /// #487 PR 4: the mainnet output users actually ship uses BIP-86
