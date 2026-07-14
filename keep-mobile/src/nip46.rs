@@ -188,6 +188,10 @@ pub struct BunkerHandler {
     bunker_url: std::sync::Mutex<Option<String>>,
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     handler: std::sync::Mutex<Option<Arc<SignerHandler>>>,
+    /// Serializes `do_start_bunker` against `rotate_bunker_credentials` so a
+    /// credential rotation cannot interleave with an in-flight start (which
+    /// would otherwise finish serving the pre-rotation keys).
+    start_rotate_lock: std::sync::Mutex<()>,
 }
 
 impl BunkerHandler {
@@ -210,6 +214,7 @@ impl BunkerHandler {
             bunker_url: std::sync::Mutex::new(None),
             shutdown_tx: std::sync::Mutex::new(None),
             handler: std::sync::Mutex::new(None),
+            start_rotate_lock: std::sync::Mutex::new(()),
         }
     }
 
@@ -280,6 +285,72 @@ impl BunkerHandler {
                 .runtime
                 .block_on(async { handler.revoke_all_clients().await });
         }
+    }
+
+    /// Rotate the bunker credentials: generate a fresh transport secret (new
+    /// bunker pubkey) and connect secret (new URL) and persist them, so any
+    /// previously distributed `bunker://` URL can no longer pair or sign — the
+    /// remedy for a leaked URL. Signals any running bunker to stop (dropping its
+    /// in-memory grants); the caller restarts it to obtain and publish the new
+    /// URL, and existing clients must re-pair.
+    ///
+    /// On `Err`, rotation did NOT happen and the previous (possibly leaked)
+    /// credential is still valid — callers must not report success.
+    pub fn rotate_bunker_credentials(&self) -> Result<(), KeepMobileError> {
+        // Serialize against `do_start_bunker`: without this a start already past
+        // its status CAS (but not yet holding `shutdown_tx`) would escape the
+        // `stop_bunker` below and finish serving the old keys, silently defeating
+        // the rotation. Holding this for the whole rotate guarantees no start is
+        // mid-flight: any concurrent start either completed (so `shutdown_tx` is
+        // set and `stop_bunker` signals it) or is blocked here and will read the
+        // freshly-persisted secrets when it proceeds.
+        let _start_guard =
+            self.start_rotate_lock
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "bunker start/rotate lock poisoned".into(),
+                })?;
+
+        // Signal the running bunker to stop so its old keys/URL and grants tear
+        // down; server shutdown completes asynchronously in its own task.
+        self.stop_bunker();
+
+        let _guard =
+            self.mobile
+                .bunker_config_lock
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "bunker config lock poisoned".into(),
+                })?;
+
+        let mut stored = crate::persistence::load_bunker_config(
+            &self.mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+        )?
+        .unwrap_or_default();
+
+        // Zeroize the decrypted plaintext secrets in `stored` on every exit path
+        // (the new secrets on success, the loaded old secrets on any error),
+        // since `StoredBunkerConfig` is not `ZeroizeOnDrop`.
+        let result = (|| {
+            let transport = Zeroizing::new(keep_core::crypto::try_random_bytes::<32>()?);
+            let connect = Zeroizing::new(keep_core::crypto::try_random_bytes::<16>()?);
+            stored.transport_secret = Some(hex::encode(&transport[..]));
+            stored.connect_secret = Some(hex::encode(&connect[..]));
+            crate::persistence::persist_bunker_config(
+                &self.mobile.storage,
+                crate::BUNKER_CONFIG_STORAGE_KEY,
+                &stored,
+            )
+        })();
+
+        if let Some(s) = stored.transport_secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = stored.connect_secret.as_mut() {
+            s.zeroize();
+        }
+        result
     }
 
     pub fn get_bunker_url(&self) -> Option<String> {
@@ -430,6 +501,16 @@ impl BunkerHandler {
         for relay in &relays {
             validate_relay_url(relay)?;
         }
+
+        // Held for the whole start so a concurrent `rotate_bunker_credentials`
+        // cannot slip between the status CAS and `shutdown_tx` being set and
+        // leave this start serving keys that rotation meant to revoke.
+        let _start_guard =
+            self.start_rotate_lock
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "bunker start/rotate lock poisoned".into(),
+                })?;
 
         if self
             .status
@@ -752,6 +833,28 @@ mod tests {
         let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*transport, *transport2);
         assert_eq!(*secret, *secret2);
+    }
+
+    // Rotating replaces both persisted secrets, so the derived bunker:// URL
+    // changes and any previously leaked URL can no longer pair.
+    #[test]
+    fn rotate_credentials_changes_transport_and_connect_secret() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+
+        let (transport1, secret1) = load_or_create_bunker_keys(&mobile).unwrap();
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        handler.rotate_bunker_credentials().unwrap();
+
+        let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
+        assert_ne!(*transport1, *transport2, "transport secret must rotate");
+        assert_ne!(
+            secret1.as_str(),
+            secret2.as_str(),
+            "connect secret must rotate"
+        );
+        assert_eq!(transport2.len(), 32);
     }
 
     // A persisted transport secret that is valid 32-byte hex but not a valid
