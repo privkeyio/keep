@@ -357,6 +357,8 @@ pub enum SigningRequestType {
     Nip44Decrypt = 6,
     Disconnect = 7,
     KillSwitch = 8,
+    ExportNcryptsec = 9,
+    ExportShare = 10,
 }
 
 impl std::fmt::Display for SigningRequestType {
@@ -371,6 +373,8 @@ impl std::fmt::Display for SigningRequestType {
             Self::Nip44Decrypt => write!(f, "nip44_decrypt"),
             Self::Disconnect => write!(f, "disconnect"),
             Self::KillSwitch => write!(f, "kill_switch"),
+            Self::ExportNcryptsec => write!(f, "export_ncryptsec"),
+            Self::ExportShare => write!(f, "export_share"),
         }
     }
 }
