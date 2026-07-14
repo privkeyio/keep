@@ -581,31 +581,22 @@ mod tests {
         (descriptor, change_xonly, change_spk)
     }
 
-    // A single-output PSBT paying `spk`, tagged with taproot key-origin metadata
-    // for change path `.../1/0` (the attacker's lever in the original bug).
-    fn psbt_with_output(spk: ScriptBuf, meta_key: XOnlyPublicKey) -> Psbt {
-        use bitcoin::bip32::{DerivationPath, Fingerprint};
-        let tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: "0000000000000000000000000000000000000000000000000000000000000001"
-                        .parse()
-                        .unwrap(),
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(50000),
-                script_pubkey: spk,
-            }],
-        };
-        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
-        psbt.inputs[0].witness_utxo = Some(TxOut {
+    fn dummy_txin() -> TxIn {
+        TxIn {
+            previous_output: OutPoint {
+                txid: "0000000000000000000000000000000000000000000000000000000000000001"
+                    .parse()
+                    .unwrap(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }
+    }
+
+    fn dummy_witness_utxo() -> TxOut {
+        TxOut {
             value: Amount::from_sat(100000),
             script_pubkey: ScriptBuf::new_p2tr(
                 &Secp256k1::new(),
@@ -615,14 +606,55 @@ mod tests {
                     .0,
                 None,
             ),
-        });
-        let path = DerivationPath::from_str("m/86'/1'/0'/1/0").unwrap();
-        psbt.outputs[0].tap_key_origins.insert(
+        }
+    }
+
+    fn tag_change(psbt: &mut Psbt, out: usize, meta_key: XOnlyPublicKey, path: &str) {
+        use bitcoin::bip32::{DerivationPath, Fingerprint};
+        let path = DerivationPath::from_str(path).unwrap();
+        psbt.outputs[out].tap_key_origins.insert(
             meta_key,
             (vec![], (Fingerprint::from([1u8, 2, 3, 4]), path)),
         );
-        psbt.outputs[0].tap_internal_key = Some(meta_key);
+        psbt.outputs[out].tap_internal_key = Some(meta_key);
+    }
+
+    // A single-output PSBT paying `spk`, tagged with taproot key-origin metadata
+    // for `path` (the attacker's lever in the original bug).
+    fn psbt_with_output_at(spk: ScriptBuf, meta_key: XOnlyPublicKey, path: &str) -> Psbt {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![dummy_txin()],
+            output: vec![TxOut {
+                value: Amount::from_sat(50000),
+                script_pubkey: spk,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(dummy_witness_utxo());
+        tag_change(&mut psbt, 0, meta_key, path);
         psbt
+    }
+
+    fn psbt_with_output(spk: ScriptBuf, meta_key: XOnlyPublicKey) -> Psbt {
+        psbt_with_output_at(spk, meta_key, "m/86'/1'/0'/1/0")
+    }
+
+    fn dummy_key() -> XOnlyPublicKey {
+        Keypair::from_seckey_slice(&Secp256k1::new(), &[5u8; 32])
+            .unwrap()
+            .x_only_public_key()
+            .0
+    }
+
+    fn parser_with_descriptor(psbt: Psbt, descriptor: String) -> PsbtParser {
+        PsbtParser::from_bytes(psbt.serialize())
+            .unwrap()
+            .set_network("testnet".to_string())
+            .unwrap()
+            .with_wallet_descriptor(descriptor)
+            .unwrap()
     }
 
     #[test]
@@ -679,6 +711,84 @@ mod tests {
         assert!(parser
             .with_wallet_descriptor("not a descriptor".to_string())
             .is_err());
+    }
+
+    #[test]
+    fn genuine_change_detected_at_nonzero_index() {
+        // The index comes from the metadata path's last component; change must be
+        // re-derived at that same leaf, not only at 0.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let change5 =
+            keep_bitcoin::change_script_at_index(&descriptor, Network::Testnet, 5).unwrap();
+        let psbt = psbt_with_output_at(change5, dummy_key(), "m/86'/1'/0'/1/5");
+        assert!(
+            parser_with_descriptor(psbt, descriptor)
+                .analyze()
+                .unwrap()
+                .outputs[0]
+                .is_change
+        );
+    }
+
+    #[test]
+    fn receive_self_payment_is_not_change() {
+        // Paying our own receive (`/0/*`) address is a self-send, not change: the
+        // change branch (`/1/*`) script at that index must not match.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let receive3 = keep_bitcoin::descriptor_address_at_index(&descriptor, Network::Testnet, 3)
+            .unwrap()
+            .script_pubkey();
+        let psbt = psbt_with_output_at(receive3, dummy_key(), "m/86'/1'/0'/0/3");
+        assert!(
+            !parser_with_descriptor(psbt, descriptor)
+                .analyze()
+                .unwrap()
+                .outputs[0]
+                .is_change
+        );
+    }
+
+    #[test]
+    fn mixed_outputs_flag_only_genuine_change() {
+        // A two-output tx: one genuine change output and one external payment.
+        let (descriptor, _k, _s) = wallet_fixture();
+        let change0 =
+            keep_bitcoin::change_script_at_index(&descriptor, Network::Testnet, 0).unwrap();
+        let secp = Secp256k1::new();
+        let external_spk = ScriptBuf::new_p2tr(
+            &secp,
+            Keypair::from_seckey_slice(&secp, &[9u8; 32])
+                .unwrap()
+                .x_only_public_key()
+                .0,
+            None,
+        );
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![dummy_txin()],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(40000),
+                    script_pubkey: external_spk,
+                },
+                TxOut {
+                    value: Amount::from_sat(50000),
+                    script_pubkey: change0,
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(dummy_witness_utxo());
+        // Both outputs carry change-looking metadata; only the real one matches.
+        tag_change(&mut psbt, 0, dummy_key(), "m/86'/1'/0'/1/0");
+        tag_change(&mut psbt, 1, dummy_key(), "m/86'/1'/0'/1/0");
+        let info = parser_with_descriptor(psbt, descriptor).analyze().unwrap();
+        assert!(
+            !info.outputs[0].is_change,
+            "external payment must not be change"
+        );
+        assert!(info.outputs[1].is_change, "genuine change must be change");
     }
 
     #[test]

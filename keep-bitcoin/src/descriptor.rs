@@ -255,6 +255,22 @@ pub fn change_script_at_index(
     network: Network,
     index: u32,
 ) -> Result<bitcoin::ScriptBuf> {
+    let parsed = parse_descriptor_body(external_descriptor)?;
+    if parsed.is_multipath() {
+        // BIP-389 multipath (`<0;1>`): the change branch is the second
+        // single-path descriptor. keep only builds/accepts external-first
+        // (`<0;1>`) order (see `multipath_from_external`).
+        let singles = parsed
+            .into_single_descriptors()
+            .map_err(|e| BitcoinError::Descriptor(format!("multipath descriptor: {e}")))?;
+        let change = singles.get(1).ok_or_else(|| {
+            BitcoinError::Descriptor("multipath descriptor missing change branch".into())
+        })?;
+        return Ok(change
+            .at_derivation_index(index)
+            .map_err(|e| BitcoinError::Descriptor(format!("definite descriptor: {e}")))?
+            .script_pubkey());
+    }
     let body = external_descriptor
         .split('#')
         .next()
@@ -484,6 +500,29 @@ mod tests {
         assert_eq!(change0, internal0);
         // Distinct indices produce distinct change scripts.
         assert_ne!(change0, change_script_at_index(external, net, 1).unwrap());
+
+        // A BIP-389 multipath (`<0;1>`) descriptor resolves the same change
+        // branch as the single-path external form.
+        let multipath = export.multipath_descriptor().unwrap();
+        assert_eq!(change0, change_script_at_index(&multipath, net, 0).unwrap());
+        assert_eq!(
+            change_script_at_index(external, net, 3).unwrap(),
+            change_script_at_index(&multipath, net, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn change_script_at_index_accepts_definite_descriptor() {
+        // A definite (non-ranged) taproot descriptor has no /0/* tail: it reuses
+        // one script, so change is index-independent. It must be accepted, not
+        // rejected, and never index-dependent.
+        let group = test_group_pubkey();
+        let xonly_hex: String = group.iter().map(|b| format!("{b:02x}")).collect();
+        let definite = format!("tr({xonly_hex})");
+        let net = Network::Testnet;
+        let s0 = change_script_at_index(&definite, net, 0).unwrap();
+        let s7 = change_script_at_index(&definite, net, 7).unwrap();
+        assert_eq!(s0, s7, "definite descriptor is index-independent");
     }
 
     /// #487 PR 4: the mainnet output users actually ship uses BIP-86
