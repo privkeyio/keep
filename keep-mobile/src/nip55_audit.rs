@@ -208,6 +208,87 @@ pub fn nip55_verify_audit_chain(
     }
 }
 
+/// Domain tag prefixing the tip MAC content so, even sharing the per-app HMAC
+/// key with the per-entry chain hash, the two message types can never collide.
+const TIP_MAC_DOMAIN: &str = "nip55-audit-tip-v1";
+
+/// Authenticate the audit chain's tip: `count` is the number of **chained**
+/// (non-legacy, non-empty-hash) entries and `last_entry_hash` is the last such
+/// entry's hash (`None` for an empty/all-legacy log). This MAC is persisted
+/// **separately** from the log (a keystore slot the log table cannot reach). The
+/// backward-link chain alone cannot detect deleting the newest rows (the
+/// remaining prefix stays perfectly linked) or wiping the whole log (an empty
+/// log verifies as valid); comparing the log's current `(count, last_hash)`
+/// against this independently stored MAC catches both.
+///
+/// The caller must compute `count`/`last_entry_hash` over the same chained-entry
+/// set the verifier uses (see [`nip55_verify_audit_chain_with_tip`]), and must
+/// store this MAC confidentially and rollback-resistantly: this construction
+/// binds the current tip but has no epoch, so replaying an older leaked tip MAC
+/// alongside a log truncated to that earlier length would still validate.
+#[uniffi::export]
+pub fn nip55_audit_tip_mac(
+    count: u64,
+    last_entry_hash: Option<String>,
+    hmac_key: Vec<u8>,
+) -> String {
+    assert!(
+        !hmac_key.is_empty(),
+        "HMAC key not initialized - cannot compute audit tip MAC"
+    );
+    let hmac_key = zeroize::Zeroizing::new(hmac_key);
+    // Domain tag + count binding: `|` cannot appear in the decimal count or the
+    // hex hash, so the encoding is unambiguous and cannot collide with the
+    // 6-pipe per-entry content even under the shared key.
+    let content = format!(
+        "{}|{}|{}",
+        TIP_MAC_DOMAIN,
+        count,
+        last_entry_hash.unwrap_or_default()
+    );
+    hex::encode(hmac_sha256(hmac_key.as_slice(), content.as_bytes()))
+}
+
+/// Verify the audit chain and its separately-stored tip record. Runs the same
+/// link/hash verification as [`nip55_verify_audit_chain`], then, when an
+/// `expected_tip_mac` is supplied, recomputes the tip MAC from the log's current
+/// chained-entry count and last hash and compares it constant-time. A mismatch
+/// means the newest rows were removed (tail truncation) or the log was wiped —
+/// reported as `Truncated`. `expected_tip_mac == None` means no tip record has
+/// been written yet (pre-adoption), so the tip check is skipped.
+#[uniffi::export]
+pub fn nip55_verify_audit_chain_with_tip(
+    entries: Vec<Nip55AuditEntry>,
+    hmac_key: Vec<u8>,
+    expected_tip_mac: Option<String>,
+) -> Nip55ChainStatus {
+    let base = nip55_verify_audit_chain(entries.clone(), hmac_key.clone());
+    // A link/hash failure is already conclusive; only add the tip check to an
+    // otherwise-intact chain.
+    match base {
+        Nip55ChainStatus::Valid | Nip55ChainStatus::PartiallyVerified { .. } => {}
+        other => return other,
+    }
+    let Some(expected) = expected_tip_mac else {
+        return base;
+    };
+
+    let chained: Vec<&Nip55AuditEntry> = entries
+        .iter()
+        .filter(|e| !e.entry_hash.is_empty())
+        .collect();
+    let count = chained.len() as u64;
+    let last_hash = chained.last().map(|e| e.entry_hash.clone());
+    let actual = nip55_audit_tip_mac(count, last_hash, hmac_key);
+    if ct_eq(&actual, &expected) {
+        base
+    } else {
+        Nip55ChainStatus::Truncated {
+            entry_id: chained.last().map(|e| e.id).unwrap_or(0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,6 +377,98 @@ mod tests {
         assert_eq!(
             nip55_verify_audit_chain(vec![], KEY.to_vec()),
             Nip55ChainStatus::Valid
+        );
+    }
+
+    fn chain(n: usize) -> Vec<Nip55AuditEntry> {
+        let mut out = Vec::new();
+        let mut prev: Option<String> = None;
+        for i in 0..n {
+            let e = entry(
+                i as i64 + 1,
+                prev.as_deref(),
+                "com.app",
+                Some(1),
+                "allow",
+                100 + i as i64,
+                false,
+            );
+            prev = Some(e.entry_hash.clone());
+            out.push(e);
+        }
+        out
+    }
+
+    fn tip_of(entries: &[Nip55AuditEntry]) -> String {
+        let chained: Vec<&Nip55AuditEntry> = entries
+            .iter()
+            .filter(|e| !e.entry_hash.is_empty())
+            .collect();
+        nip55_audit_tip_mac(
+            chained.len() as u64,
+            chained.last().map(|e| e.entry_hash.clone()),
+            KEY.to_vec(),
+        )
+    }
+
+    #[test]
+    fn tip_verifies_intact_chain() {
+        let c = chain(3);
+        let tip = tip_of(&c);
+        assert_eq!(
+            nip55_verify_audit_chain_with_tip(c, KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Valid
+        );
+    }
+
+    #[test]
+    fn tip_detects_tail_truncation() {
+        let full = chain(3);
+        let tip = tip_of(&full); // records 3 entries
+        let truncated: Vec<_> = full.into_iter().take(2).collect(); // delete the newest
+                                                                    // The link chain alone still says Valid (the bug); the tip catches it.
+        assert_eq!(
+            nip55_verify_audit_chain(truncated.clone(), KEY.to_vec()),
+            Nip55ChainStatus::Valid
+        );
+        assert!(matches!(
+            nip55_verify_audit_chain_with_tip(truncated, KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn tip_detects_full_deletion() {
+        let tip = tip_of(&chain(2));
+        // An empty log verifies as Valid on its own (the bug); the tip catches it.
+        assert_eq!(
+            nip55_verify_audit_chain(vec![], KEY.to_vec()),
+            Nip55ChainStatus::Valid
+        );
+        assert!(matches!(
+            nip55_verify_audit_chain_with_tip(vec![], KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Truncated { .. }
+        ));
+    }
+
+    #[test]
+    fn tip_none_skips_check() {
+        assert_eq!(
+            nip55_verify_audit_chain_with_tip(chain(2), KEY.to_vec(), None),
+            Nip55ChainStatus::Valid
+        );
+    }
+
+    #[test]
+    fn tip_mac_binds_count_and_last_hash() {
+        let h = Some("abcd".to_string());
+        assert_ne!(
+            nip55_audit_tip_mac(2, h.clone(), KEY.to_vec()),
+            nip55_audit_tip_mac(3, h.clone(), KEY.to_vec())
+        );
+        assert_ne!(
+            nip55_audit_tip_mac(2, h, KEY.to_vec()),
+            nip55_audit_tip_mac(2, Some("ffff".to_string()), KEY.to_vec())
         );
     }
 
