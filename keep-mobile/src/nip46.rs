@@ -282,6 +282,51 @@ impl BunkerHandler {
         }
     }
 
+    /// Rotate the bunker credentials: generate a fresh transport secret (new
+    /// bunker pubkey) and connect secret (new URL) and persist them, so any
+    /// previously distributed `bunker://` URL can no longer pair or sign — the
+    /// remedy for a leaked URL. The running bunker is stopped first (the old URL
+    /// stops serving immediately and in-memory grants drop); the caller restarts
+    /// it to obtain and publish the new URL, and existing clients must re-pair.
+    pub fn rotate_bunker_credentials(&self) -> Result<(), KeepMobileError> {
+        // Stop first so the old keys/URL stop serving before we replace them.
+        self.stop_bunker();
+
+        let _guard =
+            self.mobile
+                .bunker_config_lock
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "bunker config lock poisoned".into(),
+                })?;
+
+        let mut stored = crate::persistence::load_bunker_config(
+            &self.mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+        )?
+        .unwrap_or_default();
+
+        let transport = keep_core::crypto::try_random_bytes::<32>()?;
+        let connect = keep_core::crypto::try_random_bytes::<16>()?;
+        stored.transport_secret = Some(hex::encode(transport));
+        stored.connect_secret = Some(hex::encode(connect));
+
+        crate::persistence::persist_bunker_config(
+            &self.mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            &stored,
+        )?;
+
+        // Clear the plaintext hex copies before drop.
+        if let Some(s) = stored.transport_secret.as_mut() {
+            s.zeroize();
+        }
+        if let Some(s) = stored.connect_secret.as_mut() {
+            s.zeroize();
+        }
+        Ok(())
+    }
+
     pub fn get_bunker_url(&self) -> Option<String> {
         self.bunker_url
             .lock()
@@ -752,6 +797,28 @@ mod tests {
         let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*transport, *transport2);
         assert_eq!(*secret, *secret2);
+    }
+
+    // Rotating replaces both persisted secrets, so the derived bunker:// URL
+    // changes and any previously leaked URL can no longer pair.
+    #[test]
+    fn rotate_credentials_changes_transport_and_connect_secret() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+
+        let (transport1, secret1) = load_or_create_bunker_keys(&mobile).unwrap();
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        handler.rotate_bunker_credentials().unwrap();
+
+        let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
+        assert_ne!(*transport1, *transport2, "transport secret must rotate");
+        assert_ne!(
+            secret1.as_str(),
+            secret2.as_str(),
+            "connect secret must rotate"
+        );
+        assert_eq!(transport2.len(), 32);
     }
 
     // A persisted transport secret that is valid 32-byte hex but not a valid
