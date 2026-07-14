@@ -388,6 +388,12 @@ impl KfpNode {
             ));
         }
 
+        reject_placeholder_policy_spend(
+            &self.group_pubkey,
+            &descriptor_hash,
+            self.descriptor_lookup.as_deref(),
+        )?;
+
         let our_index = self.share.metadata.identifier;
         self.check_psbt_proposer_authorized(our_index)?;
         self.check_psbt_proposer_session_budget(&self.keys.public_key())?;
@@ -810,6 +816,17 @@ impl KfpNode {
     }
 
     fn verify_descriptor_hash_against_stored(&self, descriptor_hash: &[u8; 32]) -> Result<()> {
+        // Responder-side half of the placeholder-policy invariant: refuse to sign
+        // a spend keyed on a persisted descriptor whose policy_hash is the
+        // placeholder, so the guard enforced when proposing also holds at the
+        // boundary where this node actually signs. Fails open only when this
+        // node's own lookup cannot resolve the hash (see the guard's docs).
+        reject_placeholder_policy_spend(
+            &self.group_pubkey,
+            descriptor_hash,
+            self.descriptor_lookup.as_deref(),
+        )?;
+
         let (in_memory_match, saw_any_finalized) = {
             let sessions = self.descriptor_sessions.read();
             let mut saw_any_finalized = false;
@@ -821,6 +838,12 @@ impl KfpNode {
                 let Some(finalized) = session.descriptor() else {
                     continue;
                 };
+                // A finalized descriptor from a completed coordination carries a
+                // real policy_hash; treat a placeholder as no match so an
+                // uncoordinated policy can never validate a spend.
+                if finalized.policy_hash == [0u8; 32] {
+                    continue;
+                }
                 saw_any_finalized = true;
                 let expected = keep_core::wallet::canonical_descriptor_hash(
                     &finalized.external,
@@ -1708,6 +1731,40 @@ fn decide_descriptor_hash_verification(
     }
 }
 
+/// Refuse a spend bound to a descriptor whose `policy_hash` is the placeholder
+/// all-zero value. Enforced at both trust boundaries: the proposer side
+/// (`request_psbt_spend`) and the responder side
+/// (`verify_descriptor_hash_against_stored`), so the invariant holds regardless
+/// of who initiates the coordination.
+///
+/// A descriptor imported before its wallet policy is coordinated carries
+/// `policy_hash == [0; 32]`, yet its canonical `descriptor_hash` is non-zero, so
+/// the plain all-zero-hash check does not catch it, and a responder recomputes
+/// the identical hash (policy_hash is committed into it) and would otherwise
+/// accept. Binding a spend to such a descriptor would leave the coordination
+/// cryptographically tied to no policy.
+///
+/// Only fires when the descriptor positively resolves via *this node's* lookup
+/// to an all-zero policy_hash. A hash that does not resolve (no lookup, no
+/// match, or the vault temporarily unreadable) is not a rejection here; the
+/// per-caller CLI/desktop spend guards fail closed on their own loaded
+/// descriptor, and the opposite boundary applies the same check. Defense in
+/// depth, not the sole guard.
+fn reject_placeholder_policy_spend(
+    group: &[u8; 32],
+    descriptor_hash: &[u8; 32],
+    lookup: Option<&dyn super::PersistedDescriptorLookup>,
+) -> Result<()> {
+    if let Some(lookup) = lookup {
+        if lookup.policy_hash_for(group, descriptor_hash) == Some([0u8; 32]) {
+            return Err(FrostNetError::Session(
+                "descriptor has placeholder (all-zero) policy_hash; coordinate the wallet policy before spending".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod descriptor_lookup_tests {
     use super::*;
@@ -1779,6 +1836,53 @@ mod descriptor_lookup_tests {
         let result_no_lookup =
             decide_descriptor_hash_verification(false, true, &group, &hash, None);
         assert!(result_no_lookup.is_err());
+    }
+
+    struct PolicyMock {
+        policy_hash: Option<[u8; 32]>,
+    }
+
+    impl PersistedDescriptorLookup for PolicyMock {
+        fn find_by_hash(&self, _group: &[u8; 32], _hash: &[u8; 32]) -> bool {
+            self.policy_hash.is_some()
+        }
+        fn policy_hash_for(&self, _group: &[u8; 32], _hash: &[u8; 32]) -> Option<[u8; 32]> {
+            self.policy_hash
+        }
+        fn latest_version_for(
+            &self,
+            _group: &[u8; 32],
+        ) -> std::result::Result<Option<u32>, crate::node::DescriptorLookupUnavailable> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn placeholder_policy_hash_spend_is_rejected() {
+        let (group, hash) = fixture();
+        let lookup = PolicyMock {
+            policy_hash: Some([0u8; 32]),
+        };
+        assert!(reject_placeholder_policy_spend(&group, &hash, Some(&lookup)).is_err());
+    }
+
+    #[test]
+    fn coordinated_policy_hash_spend_is_allowed() {
+        let (group, hash) = fixture();
+        let lookup = PolicyMock {
+            policy_hash: Some([0xABu8; 32]),
+        };
+        assert!(reject_placeholder_policy_spend(&group, &hash, Some(&lookup)).is_ok());
+    }
+
+    #[test]
+    fn unresolved_or_absent_lookup_does_not_reject() {
+        let (group, hash) = fixture();
+        // No lookup configured: not our boundary to reject (responders verify).
+        assert!(reject_placeholder_policy_spend(&group, &hash, None).is_ok());
+        // Lookup present but the hash resolves to no descriptor.
+        let lookup = PolicyMock { policy_hash: None };
+        assert!(reject_placeholder_policy_spend(&group, &hash, Some(&lookup)).is_ok());
     }
 
     #[test]

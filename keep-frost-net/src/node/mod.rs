@@ -118,6 +118,22 @@ pub trait PersistedDescriptorLookup: Send + Sync {
         None
     }
 
+    /// Return the `policy_hash` of the persisted descriptor whose group +
+    /// canonical hash match, if any. Used at both PSBT trust boundaries (the
+    /// proposer's `request_psbt_spend` and the responder's descriptor_hash
+    /// verification) to refuse a spend bound to a placeholder (all-zero)
+    /// policy_hash, matching the CLI spend guard. A descriptor imported before
+    /// its policy is coordinated carries `policy_hash == [0; 32]`, yet its
+    /// canonical hash is non-zero, so the plain all-zero-hash check cannot catch
+    /// it. `None` (no match, no lookup configured, or the vault temporarily
+    /// unreadable) means "cannot confirm" and is not a rejection: the per-caller
+    /// CLI/desktop spend paths keep their own fail-closed guard on the loaded
+    /// descriptor. This projection is defense-in-depth.
+    fn policy_hash_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<[u8; 32]> {
+        let _ = (group, hash);
+        None
+    }
+
     /// Return the largest persisted descriptor version for the given group,
     /// `Ok(None)` if no descriptor exists, or `Err(DescriptorLookupUnavailable)`
     /// if the underlying store could not be queried (e.g. vault locked). Used
@@ -208,6 +224,10 @@ where
 
     fn external_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<String> {
         self.lookup(|d| Some(d.external_descriptor.clone()), group, hash)
+    }
+
+    fn policy_hash_for(&self, group: &[u8; 32], hash: &[u8; 32]) -> Option<[u8; 32]> {
+        self.lookup(|d| Some(d.policy_hash), group, hash)
     }
 
     fn latest_version_for(
