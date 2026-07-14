@@ -12,7 +12,7 @@ use keep_frost_net::{
 async fn test_cert_pin_trust_on_first_use() {
     install_default_crypto_provider();
     let pins = CertificatePinSet::new();
-    let result = verify_relay_certificate("wss://relay.damus.io", &pins).await;
+    let result = verify_relay_certificate("wss://relay.damus.io", &pins, false).await;
 
     let (hash, new_pin) = result.expect("Should connect and get certificate hash");
     assert_ne!(hash, [0u8; 32], "Hash should not be all zeros");
@@ -27,14 +27,14 @@ async fn test_cert_pin_trust_on_first_use() {
 async fn test_cert_pin_verification_passes() {
     install_default_crypto_provider();
     let pins = CertificatePinSet::new();
-    let (hash, _) = verify_relay_certificate("wss://relay.damus.io", &pins)
+    let (hash, _) = verify_relay_certificate("wss://relay.damus.io", &pins, false)
         .await
         .expect("First connection should succeed");
 
     let mut pins = CertificatePinSet::new();
     pins.add_pin("relay.damus.io".into(), hash);
 
-    let (verified_hash, new_pin) = verify_relay_certificate("wss://relay.damus.io", &pins)
+    let (verified_hash, new_pin) = verify_relay_certificate("wss://relay.damus.io", &pins, false)
         .await
         .expect("Pinned verification should pass");
 
@@ -52,7 +52,7 @@ async fn test_cert_pin_mismatch_rejects() {
     let mut pins = CertificatePinSet::new();
     pins.add_pin("relay.damus.io".into(), [0xAA; 32]);
 
-    let result = verify_relay_certificate("wss://relay.damus.io", &pins).await;
+    let result = verify_relay_certificate("wss://relay.damus.io", &pins, false).await;
     assert!(result.is_err(), "Should fail with wrong pin");
 
     let err_str = result.unwrap_err().to_string();
@@ -67,7 +67,7 @@ async fn test_cert_pin_mismatch_rejects() {
 async fn test_cert_pin_rejects_non_tls() {
     install_default_crypto_provider();
     let pins = CertificatePinSet::new();
-    let result = verify_relay_certificate("ws://relay.damus.io", &pins).await;
+    let result = verify_relay_certificate("ws://relay.damus.io", &pins, false).await;
     assert!(result.is_err(), "Should reject non-wss URL");
 }
 
@@ -77,11 +77,11 @@ async fn test_cert_pin_multiple_relays() {
     install_default_crypto_provider();
     let pins = CertificatePinSet::new();
 
-    let (hash1, _) = verify_relay_certificate("wss://relay.damus.io", &pins)
+    let (hash1, _) = verify_relay_certificate("wss://relay.damus.io", &pins, false)
         .await
         .expect("damus relay");
 
-    let (hash2, _) = verify_relay_certificate("wss://relay.primal.net", &pins)
+    let (hash2, _) = verify_relay_certificate("wss://relay.primal.net", &pins, false)
         .await
         .expect("primal relay");
 

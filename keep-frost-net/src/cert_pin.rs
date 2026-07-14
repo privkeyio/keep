@@ -144,9 +144,18 @@ fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
     bool::from(matched)
 }
 
+/// `require_pinned` is the deployment's strict-mode policy, supplied per call by
+/// the caller (from config) rather than stored on the pin set: strict is a
+/// policy, not pin data, so it can never be silently dropped by a pin-set
+/// reload. When true, a host with no pre-provisioned pin is REJECTED instead of
+/// trusted-on-first-use, closing the first-connection MitM window; when false,
+/// an un-pinned host is trusted-on-first-use (the observed hash is surfaced to
+/// pin). A high-assurance deployment provisions relay pins out-of-band and
+/// passes `true`, mirroring the opt-in strict attestation (`--expected-pcr`).
 pub async fn verify_relay_certificate(
     relay_url: &str,
     pins: &CertificatePinSet,
+    require_pinned: bool,
 ) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
     let url = url::Url::parse(relay_url)
         .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {e}")))?;
@@ -232,16 +241,42 @@ pub async fn verify_relay_certificate(
 
     let spki_hash = hash_spki(&spki_bytes);
 
-    let expected = pins.get_pins(&hostname);
+    evaluate_pin(
+        &hostname,
+        spki_hash,
+        pins.get_pins(&hostname),
+        require_pinned,
+    )
+}
+
+/// Decide the pin outcome for an observed SPKI hash: reject a mismatch, honor
+/// trust-on-first-use for an un-pinned host (unless `require_pinned` strict mode
+/// rejects it), or accept a match. Pure so the TOFU/strict/match logic is unit
+/// tested without a live TLS handshake.
+fn evaluate_pin(
+    hostname: &str,
+    spki_hash: SpkiHash,
+    expected: &[SpkiHash],
+    require_pinned: bool,
+) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
     if expected.is_empty() {
+        if require_pinned {
+            // Strict mode: refuse to trust an un-pre-provisioned host, closing
+            // the first-connection MitM window that plain TOFU leaves open.
+            return Err(FrostNetError::CertificatePinMismatch {
+                hostname: hostname.to_string(),
+                expected: "a pre-provisioned pin (strict cert pinning enabled)".into(),
+                actual: hex::encode(spki_hash),
+            });
+        }
         // Trust-on-first-use: no pin yet, surface the observed hash to pin.
-        return Ok((spki_hash, Some((hostname, spki_hash))));
+        return Ok((spki_hash, Some((hostname.to_string(), spki_hash))));
     }
     // Accept if the observed hash matches ANY pinned key (current or a staged
     // backup), using a constant-time fold that does not leak the match position.
     if !pins_match(&spki_hash, expected) {
         return Err(FrostNetError::CertificatePinMismatch {
-            hostname,
+            hostname: hostname.to_string(),
             expected: "***".into(),
             actual: hex::encode(spki_hash),
         });
@@ -270,6 +305,45 @@ fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- keep-y8v: opt-in strict mode closes the first-use TOFU MitM window ---
+
+    #[test]
+    fn tofu_default_pins_unknown_host_on_first_use() {
+        let host = "relay.example.com";
+        let observed = [7u8; 32];
+        // Non-strict (default): no pin yet -> surface the observed hash to pin (TOFU).
+        let (hash, to_pin) = evaluate_pin(host, observed, &[], false).unwrap();
+        assert_eq!(hash, observed);
+        assert_eq!(to_pin, Some((host.to_string(), observed)));
+    }
+
+    #[test]
+    fn strict_mode_rejects_unpinned_host() {
+        // Strict: an un-pre-provisioned host is rejected, not trusted-on-first-use.
+        let err = evaluate_pin("relay.example.com", [7u8; 32], &[], true).unwrap_err();
+        assert!(matches!(err, FrostNetError::CertificatePinMismatch { .. }));
+    }
+
+    #[test]
+    fn strict_mode_accepts_matching_provisioned_pin() {
+        let pin = [9u8; 32];
+        // Strict + the observed cert matches a provisioned pin -> accepted, no new pin.
+        let (hash, to_pin) = evaluate_pin("relay.example.com", pin, &[pin], true).unwrap();
+        assert_eq!(hash, pin);
+        assert_eq!(to_pin, None);
+    }
+
+    #[test]
+    fn mismatch_rejected_in_both_modes() {
+        let provisioned = [1u8; 32];
+        let observed = [2u8; 32];
+        for strict in [false, true] {
+            let err =
+                evaluate_pin("relay.example.com", observed, &[provisioned], strict).unwrap_err();
+            assert!(matches!(err, FrostNetError::CertificatePinMismatch { .. }));
+        }
+    }
 
     #[test]
     fn test_pin_set_operations() {
