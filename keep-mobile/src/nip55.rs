@@ -1036,6 +1036,17 @@ pub(crate) fn signable_event_kind_from_json(event_json: &str) -> Option<u16> {
     signable_event_kind(&event)
 }
 
+/// The signable event kind for a `sign_event` request body, exposed to the
+/// platform layer so it can key its decision inputs (velocity bucket, stored
+/// permission lookup, relay scope) by the SAME kind the signing decision derives
+/// internally. Using this instead of a platform-native JSON parser removes any
+/// parser-differential drift between the lookup key and the decision. `None` for
+/// a missing, non-numeric, or out-of-range (`> u16::MAX`) kind.
+#[uniffi::export]
+pub fn nip55_signable_event_kind(event_json: String) -> Option<u32> {
+    signable_event_kind_from_json(&event_json).map(u32::from)
+}
+
 /// Build the `keep_frost_net::NostrEventPayload` structured wire format from
 /// the sign-event request's JSON body so the co-signers can recompute the
 /// event id (#529). Same canonical field extraction as
@@ -1110,6 +1121,20 @@ mod tests {
         assert_eq!(signable_event_kind_from_json(r#"{"kind":-1}"#), None);
         assert_eq!(signable_event_kind_from_json(r#"{"kind":65536}"#), None); // > u16::MAX
         assert_eq!(signable_event_kind_from_json("not json"), None);
+    }
+
+    #[test]
+    fn exported_signable_kind_matches_internal() {
+        assert_eq!(
+            nip55_signable_event_kind(r#"{"kind":22242}"#.into()),
+            Some(22242)
+        );
+        assert_eq!(
+            nip55_signable_event_kind(r#"{"kind":1,"kind":4}"#.into()),
+            Some(4)
+        );
+        assert_eq!(nip55_signable_event_kind(r#"{"kind":65536}"#.into()), None);
+        assert_eq!(nip55_signable_event_kind("not json".into()), None);
     }
 
     #[test]
