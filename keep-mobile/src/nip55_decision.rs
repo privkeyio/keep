@@ -9,8 +9,8 @@
 //! DENY-wins rules across two files -- a divergence risk in security-critical
 //! signing. This module hoists that decision into Rust so both paths share one
 //! source of truth. It composes the existing policy primitives
-//! (`nip55_check_velocity`, `nip55_relay_auth_gate`, `evaluate_sign_policy`,
-//! `nip55_resolve_decision`, `assess_signing_risk`) in the exact gate order:
+//! (`nip55_relay_auth_gate`, `evaluate_sign_policy`, `nip55_resolve_decision`,
+//! `assess_signing_risk`) in the exact gate order:
 //!
 //!   caller-verified -> kill-switch -> lock -> front-door rate limit ->
 //!   velocity -> relay-auth whitelist -> sign policy -> app expiry ->
@@ -28,13 +28,23 @@ use crate::nip55::{
     Nip55RelayAuthGate, Nip55RequestType,
 };
 use crate::nip55_policy::{nip55_resolve_decision, Nip55PermissionDecision, Nip55StoredPermission};
-use crate::nip55_ratelimit::{nip55_check_velocity, Nip55VelocityResult};
 use crate::signing_policy::{
     assess_signing_risk, evaluate_sign_policy, AutoSignDecision, PolicyMode, SignPolicyEvaluation,
     SigningAuthLevel, SigningRequestContext, SigningRiskAssessment,
 };
 
 const KIND_NIP42_AUTH: u32 = 22242;
+
+/// Result of the caller's velocity check. The caller runs the check-and-record
+/// atomically (querying the window counts and recording the request in one
+/// transaction, so concurrent requests cannot race past the limit) and passes
+/// the outcome here. `TimedOut` and `Blocked` both fail closed.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum Nip55VelocityCheck {
+    Allowed,
+    Blocked,
+    TimedOut,
+}
 
 // When a caller is not opted in to auto-signing, the sign-policy gate is fed a
 // synthetic "allowed" rate-check so `evaluate_sign_policy` runs; the not-opted-in
@@ -70,13 +80,8 @@ pub struct Nip55DecisionInputs {
     /// Result of the coarse per-package front-door limiter (`false` fails closed).
     pub front_door_within_limit: bool,
 
-    /// Whether the velocity-log window counts were queried successfully; `false`
-    /// (a timeout) fails closed.
-    pub velocity_query_ok: bool,
-    /// Pre-insert velocity window counts.
-    pub velocity_hourly: u32,
-    pub velocity_daily: u32,
-    pub velocity_weekly: u32,
+    /// Outcome of the caller's atomic velocity check-and-record.
+    pub velocity_check: Nip55VelocityCheck,
 
     /// Pre-normalized relay-auth whitelist (empty defers to normal resolution).
     pub relay_whitelist: Vec<String>,
@@ -193,20 +198,20 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         };
     }
 
-    // Gate 4: request-count velocity (fail closed on a lookup timeout).
-    if !inputs.velocity_query_ok {
-        return Nip55Outcome::Reject {
-            reason: "deny_velocity_timeout".to_string(),
-        };
-    }
-    if let Nip55VelocityResult::Blocked { .. } = nip55_check_velocity(
-        inputs.velocity_hourly,
-        inputs.velocity_daily,
-        inputs.velocity_weekly,
-    ) {
-        return Nip55Outcome::Reject {
-            reason: "velocity_blocked".to_string(),
-        };
+    // Gate 4: request-count velocity. The caller's atomic check-and-record has
+    // already decided; a timeout or a block both fail closed.
+    match inputs.velocity_check {
+        Nip55VelocityCheck::TimedOut => {
+            return Nip55Outcome::Reject {
+                reason: "deny_velocity_timeout".to_string(),
+            }
+        }
+        Nip55VelocityCheck::Blocked => {
+            return Nip55Outcome::Reject {
+                reason: "velocity_blocked".to_string(),
+            }
+        }
+        Nip55VelocityCheck::Allowed => {}
     }
 
     // Derive the event kind from the bytes that will actually be signed, using
@@ -369,10 +374,7 @@ mod tests {
             request_type: Nip55RequestType::SignEvent,
             event_json: r#"{"kind":1}"#.to_string(),
             front_door_within_limit: true,
-            velocity_query_ok: true,
-            velocity_hourly: 0,
-            velocity_daily: 0,
-            velocity_weekly: 0,
+            velocity_check: Nip55VelocityCheck::Allowed,
             relay_whitelist: vec![],
             relay_whitelist_read_failed: false,
             policy_mode: PolicyMode::Manual,
@@ -500,7 +502,7 @@ mod tests {
     #[test]
     fn velocity_query_timeout_rejects() {
         let mut i = base();
-        i.velocity_query_ok = false;
+        i.velocity_check = Nip55VelocityCheck::TimedOut;
         assert_eq!(
             reject_reason(&evaluate_nip55_request(i)),
             "deny_velocity_timeout"
@@ -510,7 +512,7 @@ mod tests {
     #[test]
     fn velocity_blocked_rejects() {
         let mut i = base();
-        i.velocity_hourly = 1000;
+        i.velocity_check = Nip55VelocityCheck::Blocked;
         assert_eq!(
             reject_reason(&evaluate_nip55_request(i)),
             "velocity_blocked"
@@ -521,7 +523,7 @@ mod tests {
     fn front_door_precedes_velocity() {
         let mut i = base();
         i.front_door_within_limit = false;
-        i.velocity_query_ok = false;
+        i.velocity_check = Nip55VelocityCheck::TimedOut;
         assert_eq!(
             error_message(&evaluate_nip55_request(i)),
             "Too many requests, please try again later"

@@ -36,6 +36,7 @@ pub use nip46::{
 pub use nip55::{Nip55Handler, Nip55Request, Nip55RequestType, Nip55Response};
 pub use nip55_decision::{
     evaluate_nip55_request, nip55_needs_biometric, Nip55DecisionInputs, Nip55Outcome,
+    Nip55VelocityCheck,
 };
 pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
