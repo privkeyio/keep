@@ -22,7 +22,7 @@ fn setup() {
 async fn fetch_pin() -> SpkiHash {
     setup();
     let pins = CertificatePinSet::new();
-    let (hash, _) = verify_relay_certificate(TEST_RELAY, &pins)
+    let (hash, _) = verify_relay_certificate(TEST_RELAY, &pins, false)
         .await
         .expect("should connect");
     hash
@@ -40,7 +40,7 @@ fn roundtrip_pins(original: &CertificatePinSet) -> CertificatePinSet {
 async fn test_tofu_returns_new_pin() {
     setup();
     let pins = CertificatePinSet::new();
-    let (hash, new_pin) = verify_relay_certificate(TEST_RELAY, &pins)
+    let (hash, new_pin) = verify_relay_certificate(TEST_RELAY, &pins, false)
         .await
         .expect("TOFU connection should succeed");
 
@@ -61,7 +61,7 @@ async fn test_pin_persistence_reconnect() {
 
     let restored_pins = roundtrip_pins(&pins);
 
-    let (verified_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &restored_pins)
+    let (verified_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &restored_pins, false)
         .await
         .expect("reconnect with persisted pin should pass");
 
@@ -79,7 +79,7 @@ async fn test_mismatch_detection() {
     let wrong_hash = [0xBB; 32];
     pins.add_pin(TEST_HOSTNAME.into(), wrong_hash);
 
-    let err = verify_relay_certificate(TEST_RELAY, &pins)
+    let err = verify_relay_certificate(TEST_RELAY, &pins, false)
         .await
         .expect_err("should fail with wrong pin");
 
@@ -108,7 +108,7 @@ async fn test_clear_and_repin() {
     pins.remove_pin(TEST_HOSTNAME);
     assert!(!pins.is_pinned(TEST_HOSTNAME));
 
-    let (new_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &pins)
+    let (new_hash, new_pin) = verify_relay_certificate(TEST_RELAY, &pins, false)
         .await
         .expect("cleared pin should allow TOFU");
 
@@ -144,7 +144,7 @@ async fn test_lock_unlock_cycle() {
     let restored = roundtrip_pins(&pins);
     drop(pins);
 
-    let (verified, new_pin) = verify_relay_certificate(TEST_RELAY, &restored)
+    let (verified, new_pin) = verify_relay_certificate(TEST_RELAY, &restored, false)
         .await
         .expect("should verify after lock/unlock");
 

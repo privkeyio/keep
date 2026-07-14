@@ -2590,7 +2590,9 @@ impl KeepMobile {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
             let mut pins_changed = false;
             for relay in &relays {
-                match keep_frost_net::verify_relay_certificate(relay, &pins).await {
+                // require_pinned=false: trust-on-first-use. A strict-mode config
+                // toggle that passes true is tracked as a follow-up.
+                match keep_frost_net::verify_relay_certificate(relay, &pins, false).await {
                     Ok((_hash, new_pin)) => {
                         if let Some((hostname, hash)) = new_pin {
                             if !pins.is_pinned(&hostname) {

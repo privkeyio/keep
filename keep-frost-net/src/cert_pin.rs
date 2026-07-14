@@ -34,12 +34,6 @@ pub struct CertificatePinSet {
     /// certificate, so both the current and next key verify during the
     /// overlap instead of a rotation hard-failing every connection.
     pins: HashMap<String, Vec<SpkiHash>>,
-    /// Strict mode: when true, a host with no pre-provisioned pin is REJECTED
-    /// instead of trusted-on-first-use. Off by default (TOFU) so the common
-    /// path keeps working; a high-assurance deployment provisions relay pins
-    /// out-of-band and enables this to eliminate the first-connection MitM
-    /// window, mirroring the opt-in strict attestation (`--expected-pcr`).
-    require_pinned: bool,
 }
 
 impl CertificatePinSet {
@@ -67,17 +61,6 @@ impl CertificatePinSet {
     /// Whether `hostname` has at least one pin (used to gate TOFU).
     pub fn is_pinned(&self, hostname: &str) -> bool {
         self.pins.get(hostname).is_some_and(|v| !v.is_empty())
-    }
-
-    /// Enable/disable strict mode (reject an un-pre-pinned host instead of
-    /// trust-on-first-use). See [`Self::require_pinned`] field docs.
-    pub fn set_require_pinned(&mut self, require_pinned: bool) {
-        self.require_pinned = require_pinned;
-    }
-
-    /// Whether strict mode (no trust-on-first-use) is enabled.
-    pub fn require_pinned(&self) -> bool {
-        self.require_pinned
     }
 
     pub fn remove_pin(&mut self, hostname: &str) -> Option<Vec<SpkiHash>> {
@@ -161,9 +144,18 @@ fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
     bool::from(matched)
 }
 
+/// `require_pinned` is the deployment's strict-mode policy, supplied per call by
+/// the caller (from config) rather than stored on the pin set: strict is a
+/// policy, not pin data, so it can never be silently dropped by a pin-set
+/// reload. When true, a host with no pre-provisioned pin is REJECTED instead of
+/// trusted-on-first-use, closing the first-connection MitM window; when false,
+/// an un-pinned host is trusted-on-first-use (the observed hash is surfaced to
+/// pin). A high-assurance deployment provisions relay pins out-of-band and
+/// passes `true`, mirroring the opt-in strict attestation (`--expected-pcr`).
 pub async fn verify_relay_certificate(
     relay_url: &str,
     pins: &CertificatePinSet,
+    require_pinned: bool,
 ) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
     let url = url::Url::parse(relay_url)
         .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {e}")))?;
@@ -253,7 +245,7 @@ pub async fn verify_relay_certificate(
         &hostname,
         spki_hash,
         pins.get_pins(&hostname),
-        pins.require_pinned(),
+        require_pinned,
     )
 }
 
@@ -351,14 +343,6 @@ mod tests {
                 evaluate_pin("relay.example.com", observed, &[provisioned], strict).unwrap_err();
             assert!(matches!(err, FrostNetError::CertificatePinMismatch { .. }));
         }
-    }
-
-    #[test]
-    fn require_pinned_flag_round_trips() {
-        let mut pins = CertificatePinSet::new();
-        assert!(!pins.require_pinned());
-        pins.set_require_pinned(true);
-        assert!(pins.require_pinned());
     }
 
     #[test]

@@ -73,7 +73,9 @@ pub(crate) async fn verify_relay_certificates(
             .lock()
             .map_err(|_| ConnectionError::Other("Pin lock poisoned".to_string()))?
             .clone();
-        let (_hash, new_pin) = keep_frost_net::verify_relay_certificate(url, &pins_snapshot)
+        // require_pinned=false: trust-on-first-use. A strict-mode config toggle
+        // that passes true is tracked as a follow-up.
+        let (_hash, new_pin) = keep_frost_net::verify_relay_certificate(url, &pins_snapshot, false)
             .await
             .map_err(|e| match e {
                 keep_frost_net::FrostNetError::CertificatePinMismatch {
