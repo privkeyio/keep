@@ -265,6 +265,16 @@ pub struct CertificatePin {
 }
 
 #[derive(uniffi::Record)]
+pub struct CertPinRemovalResult {
+    /// Whether a pin was actually removed (false when the hash was not present).
+    pub pin_removed: bool,
+    /// Whether the host now has no pins left. The next connection will
+    /// trust-on-first-use and re-pin whatever cert is presented, so the UI should
+    /// require explicit confirmation before leaving a host unpinned.
+    pub host_now_unpinned: bool,
+}
+
+#[derive(uniffi::Record)]
 pub struct RelayConfigInfo {
     pub frost_relays: Vec<String>,
     pub profile_relays: Vec<String>,
@@ -1292,6 +1302,7 @@ impl KeepMobile {
         hostname: String,
         spki_hash: String,
     ) -> Result<(), KeepMobileError> {
+        let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
         pins.add_pin(hostname, hash);
@@ -1300,16 +1311,24 @@ impl KeepMobile {
 
     /// Remove a single SPKI pin from `hostname`, retiring a rotated-out key while
     /// keeping the host's remaining pins active (unlike `clear_certificate_pin`,
-    /// which unpins the whole host). A no-op if the pin is not present.
+    /// which unpins the whole host). Returns whether a pin was actually removed and
+    /// whether the host is now fully unpinned, so the caller can confirm before
+    /// leaving a host with no pins (which re-opens trust-on-first-use).
     pub fn remove_certificate_pin(
         &self,
         hostname: String,
         spki_hash: String,
-    ) -> Result<(), KeepMobileError> {
+    ) -> Result<CertPinRemovalResult, KeepMobileError> {
+        let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        pins.remove_specific_pin(&hostname, &hash);
-        persistence::persist_cert_pins(&self.storage, &pins)
+        let pin_removed = pins.remove_specific_pin(&hostname, &hash);
+        let host_now_unpinned = !pins.is_pinned(&hostname);
+        persistence::persist_cert_pins(&self.storage, &pins)?;
+        Ok(CertPinRemovalResult {
+            pin_removed,
+            host_now_unpinned,
+        })
     }
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
@@ -2420,6 +2439,18 @@ fn bytes_to_32(bytes: &[u8], label: &str) -> Result<[u8; 32], KeepMobileError> {
 /// Parse a hex-encoded SHA-256 SPKI pin (64 hex chars) into its 32 bytes.
 fn parse_spki_hash(spki_hash: &str) -> Result<[u8; 32], KeepMobileError> {
     bytes_to_32(&decode_hex(spki_hash, "SPKI hash")?, "SPKI hash")
+}
+
+/// Canonicalize an operator-supplied relay host to the exact key certificate pins
+/// are stored and verified under, rejecting input that cannot be parsed to a host
+/// (so a pin can never be stored under a scheme/port/case-variant that never
+/// matches at verification time).
+fn normalize_pin_host(hostname: &str) -> Result<String, KeepMobileError> {
+    keep_frost_net::normalize_pin_hostname(hostname).ok_or_else(|| {
+        KeepMobileError::InvalidRelayUrl {
+            msg: "invalid relay hostname for certificate pin".into(),
+        }
+    })
 }
 
 fn relay_config_key(group_pubkey: Option<&str>) -> String {

@@ -162,6 +162,24 @@ pub(crate) fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
     bool::from(matched)
 }
 
+/// Canonicalize a host to the exact key [`verify_relay_certificate`] pins under:
+/// `url::Url::host_str` for a `wss` URL (ASCII/IDNA-lowercased host with the
+/// scheme, port, path, and any trailing dot stripped). Accepts a bare host
+/// (`relay.example.com`) or a full `wss://`/`ws://` URL. Returns `None` when it
+/// cannot be parsed to a host. Pin staging and removal MUST route the operator's
+/// input through this, or a pin stored under a non-canonical host (`Relay.EXAMPLE`,
+/// `host:443`, `wss://host/`) silently never applies at verification time.
+pub fn normalize_pin_hostname(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let candidate = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("wss://{trimmed}")
+    };
+    let host = url::Url::parse(&candidate).ok()?.host_str()?.to_string();
+    (!host.is_empty()).then_some(host)
+}
+
 /// `require_pinned` is the deployment's strict-mode policy, supplied per call by
 /// the caller (from config) rather than stored on the pin set: strict is a
 /// policy, not pin data, so it can never be silently dropped by a pin-set
@@ -392,6 +410,33 @@ mod tests {
         assert_eq!(pins.get_pins("relay.example.com"), &[current, backup]);
         assert!(pins.get_pins("other.example.com").is_empty());
         assert!(!pins.is_pinned("other.example.com"));
+    }
+
+    #[test]
+    fn test_normalize_pin_hostname_matches_verify_key() {
+        // Bare host, case, port, scheme, path all canonicalize to url::Url::host_str.
+        assert_eq!(
+            normalize_pin_hostname("relay.example.com").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            normalize_pin_hostname("Relay.Example.COM").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            normalize_pin_hostname("relay.example.com:443").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            normalize_pin_hostname("wss://relay.example.com/").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(
+            normalize_pin_hostname("  relay.example.com  ").as_deref(),
+            Some("relay.example.com")
+        );
+        assert_eq!(normalize_pin_hostname(""), None);
+        assert_eq!(normalize_pin_hostname("wss://"), None);
     }
 
     #[test]
