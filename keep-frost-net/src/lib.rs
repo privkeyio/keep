@@ -71,6 +71,7 @@ mod nonce_pool;
 mod nonce_store;
 mod oprf_session;
 mod peer;
+mod pinning;
 pub mod proof;
 mod protocol;
 mod psbt_session;
@@ -92,6 +93,7 @@ pub use attestation::{
 };
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
+pub use pinning::{OnNewPin, PinningServerCertVerifier};
 pub use descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
     load_verified_wallet_policy, participant_indices, reconstruct_descriptor, DescriptorSession,
