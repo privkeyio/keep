@@ -3551,7 +3551,7 @@ impl KeepMobile {
             Some(k) => k,
             None => self.resolve_active_share()?,
         };
-        let data = self.storage.load_share_by_key(key)?;
+        let data = self.storage.load_share_by_key(key.clone())?;
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
@@ -3591,8 +3591,28 @@ impl KeepMobile {
                 msg: format!("Invalid pubkey package: {e}"),
             })?;
 
-        SharePackage::new(metadata, &key_package, &pubkey_package)
-            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
+        let share = SharePackage::new(metadata, &key_package, &pubkey_package)
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+
+        // Defense-in-depth against a compromised or buggy foreign SecureStorage:
+        // the share's group key read from its public-key package (not the
+        // separate, forgeable metadata field) MUST match the key it was requested
+        // under. This detects a store that returns a share for a *different*
+        // group, or a corrupted one, rather than loading it as the requested
+        // identity. A store that pairs the expected verifying key with junk key
+        // material still passes here but fails at signing; confidentiality and
+        // same-identity tamper-resistance rest on the platform secure storage.
+        let derived = share
+            .verified_group_pubkey()
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+        if !key.eq_ignore_ascii_case(&hex::encode(derived)) {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "stored share does not match its group key; the secure storage returned a \
+                      different or corrupted share"
+                    .into(),
+            });
+        }
+        Ok(share)
     }
 
     fn load_stored_share_info(&self, key: String) -> Option<StoredShareInfo> {
@@ -3857,6 +3877,41 @@ mod import_teardown_tests {
         assert_eq!(
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
+        );
+    }
+
+    #[test]
+    fn load_share_package_rejects_a_share_under_a_mismatched_key() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let key_bytes = Zeroizing::new(hex::decode("03".repeat(32)).unwrap());
+        let (key_package, pubkey_package, vk_bytes) =
+            KeepMobile::build_nsec_packages(&key_bytes).unwrap();
+        let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
+        let share = SharePackage::new(metadata.clone(), &key_package, &pubkey_package).unwrap();
+        let info = mobile.store_share_package(&share).unwrap();
+
+        // Loaded under its own (correct) key: accepted.
+        assert!(mobile.load_share_package().is_ok());
+
+        // Simulate a compromised/buggy store returning this share under a
+        // different key: the cryptographic identity no longer matches, so the
+        // load must fail closed rather than use the wrong share.
+        let raw = storage
+            .load_share_by_key(info.group_pubkey.clone())
+            .unwrap();
+        let wrong_key = "ff".repeat(32);
+        storage
+            .store_share_by_key(wrong_key.clone(), raw, (&metadata).into())
+            .unwrap();
+        storage.set_active_share_key(Some(wrong_key)).unwrap();
+
+        let result = mobile.load_share_package();
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("does not match its group key")),
+            "expected a group-key mismatch rejection"
         );
     }
 }
