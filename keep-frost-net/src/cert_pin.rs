@@ -67,6 +67,24 @@ impl CertificatePinSet {
         self.pins.remove(hostname)
     }
 
+    /// Remove a single `hash` from `hostname`, leaving the host's other pins in
+    /// place (unlike [`remove_pin`], which drops the whole host). If it was the
+    /// last pin, the host entry is dropped so [`is_pinned`] reports it unpinned.
+    /// Returns whether a pin was removed. Used to retire a rotated-out key while
+    /// keeping the current one active.
+    pub fn remove_specific_pin(&mut self, hostname: &str, hash: &SpkiHash) -> bool {
+        let Some(entry) = self.pins.get_mut(hostname) else {
+            return false;
+        };
+        let before = entry.len();
+        entry.retain(|h| h != hash);
+        let removed = entry.len() != before;
+        if entry.is_empty() {
+            self.pins.remove(hostname);
+        }
+        removed
+    }
+
     pub fn pins(&self) -> &HashMap<String, Vec<SpkiHash>> {
         &self.pins
     }
@@ -374,6 +392,29 @@ mod tests {
         assert_eq!(pins.get_pins("relay.example.com"), &[current, backup]);
         assert!(pins.get_pins("other.example.com").is_empty());
         assert!(!pins.is_pinned("other.example.com"));
+    }
+
+    #[test]
+    fn test_remove_specific_pin_retires_one_key() {
+        let mut pins = CertificatePinSet::new();
+        let current = [1u8; 32];
+        let backup = [2u8; 32];
+        pins.add_pin("relay.example.com".into(), current);
+        pins.add_pin("relay.example.com".into(), backup);
+
+        // Retire the rotated-out key; the host stays pinned on the remaining one.
+        assert!(pins.remove_specific_pin("relay.example.com", &current));
+        assert_eq!(pins.get_pins("relay.example.com"), &[backup]);
+        assert!(pins.is_pinned("relay.example.com"));
+
+        // Removing an absent pin is a no-op returning false.
+        assert!(!pins.remove_specific_pin("relay.example.com", &current));
+        assert!(!pins.remove_specific_pin("nohost.example.com", &backup));
+
+        // Removing the last pin drops the host so it reads as unpinned.
+        assert!(pins.remove_specific_pin("relay.example.com", &backup));
+        assert!(!pins.is_pinned("relay.example.com"));
+        assert!(pins.get_pins("relay.example.com").is_empty());
     }
 
     #[test]

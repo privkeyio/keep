@@ -1282,6 +1282,36 @@ impl KeepMobile {
         persistence::persist_cert_pins(&self.storage, &pins)
     }
 
+    /// Stage an additional accepted SPKI pin for `hostname` (RFC 7469 backup pin)
+    /// so the next relay key can be pre-pinned before rotation without a
+    /// hard-fail during the key overlap. Additive and de-duplicated, bounded per
+    /// host. Adding a trusted pin is a sensitive operator action; the caller MUST
+    /// gate it behind explicit user confirmation.
+    pub fn stage_certificate_pin(
+        &self,
+        hostname: String,
+        spki_hash: String,
+    ) -> Result<(), KeepMobileError> {
+        let hash = parse_spki_hash(&spki_hash)?;
+        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        pins.add_pin(hostname, hash);
+        persistence::persist_cert_pins(&self.storage, &pins)
+    }
+
+    /// Remove a single SPKI pin from `hostname`, retiring a rotated-out key while
+    /// keeping the host's remaining pins active (unlike `clear_certificate_pin`,
+    /// which unpins the whole host). A no-op if the pin is not present.
+    pub fn remove_certificate_pin(
+        &self,
+        hostname: String,
+        spki_hash: String,
+    ) -> Result<(), KeepMobileError> {
+        let hash = parse_spki_hash(&spki_hash)?;
+        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        pins.remove_specific_pin(&hostname, &hash);
+        persistence::persist_cert_pins(&self.storage, &pins)
+    }
+
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
         persistence::load_descriptors(&self.storage)
     }
@@ -2385,6 +2415,11 @@ fn bytes_to_32(bytes: &[u8], label: &str) -> Result<[u8; 32], KeepMobileError> {
     <[u8; 32]>::try_from(bytes).map_err(|_| KeepMobileError::BackupError {
         msg: format!("invalid {label} length: {} (expected 32)", bytes.len()),
     })
+}
+
+/// Parse a hex-encoded SHA-256 SPKI pin (64 hex chars) into its 32 bytes.
+fn parse_spki_hash(spki_hash: &str) -> Result<[u8; 32], KeepMobileError> {
+    bytes_to_32(&decode_hex(spki_hash, "SPKI hash")?, "SPKI hash")
 }
 
 fn relay_config_key(group_pubkey: Option<&str>) -> String {
