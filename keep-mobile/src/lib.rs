@@ -2500,6 +2500,17 @@ fn normalize_pin_host(hostname: &str) -> Result<String, KeepMobileError> {
     })
 }
 
+/// Whether `relay` is a `wss` URL whose host has no provisioned certificate pin.
+/// Uses the same host key as the verified-relay filter so strict mode skips
+/// exactly the relays that filter would exclude. Non-`wss` or unparseable relays
+/// are left to the normal verification path.
+fn wss_relay_lacks_pin(relay: &str, pins: &keep_frost_net::CertificatePinSet) -> bool {
+    match url::Url::parse(relay) {
+        Ok(u) if u.scheme() == "wss" => u.host_str().map(|h| !pins.is_pinned(h)).unwrap_or(true),
+        _ => false,
+    }
+}
+
 fn relay_config_key(group_pubkey: Option<&str>) -> String {
     match group_pubkey {
         Some(pk) => {
@@ -2709,8 +2720,9 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
-            // Opt-in strict pinning: when enabled, an un-pinned relay is rejected
-            // (fail-closed) rather than trusted-on-first-use. Disabled by default.
+            // Opt-in strict pinning: when enabled, an un-pinned relay is not
+            // trusted-on-first-use; it is skipped (see the per-relay handling
+            // below) rather than pinned. Disabled by default.
             let require_pinned =
                 persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
                     .unwrap_or_default()
@@ -2718,6 +2730,17 @@ impl KeepMobile {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
             let mut pins_changed = false;
             for relay in &relays {
+                // Strict mode: skip an un-pinned relay rather than aborting init
+                // for the whole set. It is excluded from `verified_relays` below,
+                // and the empty-set check there fails closed if none are pinned.
+                // A pinned relay presenting a mismatched cert stays a fatal MitM.
+                if require_pinned && wss_relay_lacks_pin(relay, &pins) {
+                    tracing::warn!(
+                        relay = %relay,
+                        "strict pinning: skipping relay with no provisioned pin"
+                    );
+                    continue;
+                }
                 match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned).await {
                     Ok((_hash, new_pin)) => {
                         if let Some((hostname, hash)) = new_pin {
@@ -3990,5 +4013,21 @@ mod cert_pin_ffi_tests {
         assert!(keep.get_strict_cert_pinning().unwrap());
         keep.set_strict_cert_pinning(false).unwrap();
         assert!(!keep.get_strict_cert_pinning().unwrap());
+    }
+
+    #[test]
+    fn wss_relay_lacks_pin_tracks_pin_state() {
+        let mut pins = keep_frost_net::CertificatePinSet::new();
+        // An un-pinned wss relay lacks a pin (skipped in strict mode).
+        assert!(super::wss_relay_lacks_pin("wss://relay.example.com", &pins));
+        // After staging its pin (same host key), it no longer lacks one.
+        pins.add_pin("relay.example.com".into(), [0xaa; 32]);
+        assert!(!super::wss_relay_lacks_pin(
+            "wss://relay.example.com",
+            &pins
+        ));
+        // Non-wss and unparseable relays are not treated as pin-skips.
+        assert!(!super::wss_relay_lacks_pin("ws://relay.example.com", &pins));
+        assert!(!super::wss_relay_lacks_pin("not a url", &pins));
     }
 }
