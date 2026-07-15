@@ -1801,6 +1801,13 @@ mod tests {
     #[test]
     fn persist_freeze_roundtrips_through_the_state_file() {
         let dir = tempfile::tempdir().unwrap();
+        // A real duress state dir is owner-only; tempdir honors the umask, which
+        // the read-side permission check now rejects if group/world-writable.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let path = dir.path().join("duress.state");
         let f = sample_freeze();
         persist_freeze(&path, &f).unwrap();

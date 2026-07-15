@@ -416,11 +416,59 @@ pub(crate) fn parse_beacon_pins(pins: &[String]) -> Result<Vec<PublicKey>> {
         .collect()
 }
 
+/// Fail closed if the directory holding the duress state file is writable by
+/// group or others. The sticky-freeze guarantee ("no file means not frozen")
+/// only holds when a non-owner cannot delete the file, which reduces to the
+/// directory's write permission. A group/world-writable state directory lets any
+/// local user delete a persisted freeze and silently resume serving, so refuse
+/// to trust its contents (an absent file could be a deleted freeze) rather than
+/// read it as "never frozen". Non-Unix targets rely on the platform ACLs; the
+/// duress serve boundary is documented for Unix.
+#[cfg(unix)]
+fn validate_state_dir_perms(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let meta = match std::fs::metadata(dir) {
+        Ok(m) => m,
+        // No directory yet means no persisted freeze can exist: nothing to guard.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(KeepError::runtime(format!(
+                "stat duress state directory {}: {e}",
+                dir.display()
+            )))
+        }
+    };
+    if meta.mode() & 0o022 != 0 {
+        return Err(KeepError::runtime(format!(
+            "duress state directory {} is group/world-writable (mode {:o}); a non-owner could \
+             delete a persisted freeze and silently resume serving. Restrict it (chmod go-w) and \
+             keep it root-owned.",
+            dir.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_state_dir_perms(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Read a persisted duress freeze at boot. `None` if the file is absent (normal:
 /// not frozen). An existing but unparseable file is FATAL, not silently ignored:
 /// a corrupt freeze marker must fail the node closed rather than let it resume
 /// answering, which is the whole point of the sticky freeze.
+///
+/// First validates the state directory's permissions ([`validate_state_dir_perms`]):
+/// a group/world-writable directory makes "absent" untrustworthy (a freeze could
+/// have been deleted by a non-owner), so it fails closed.
 pub(crate) fn read_persisted_freeze(path: &Path) -> Result<Option<DuressFreeze>> {
+    validate_state_dir_perms(path)?;
     match std::fs::read(path) {
         Ok(bytes) => {
             let freeze = serde_json::from_slice(&bytes).map_err(|e| {
@@ -600,6 +648,20 @@ mod tests {
         parallelism: 1,
     };
 
+    /// A tempdir with owner-only (0o700) permissions, as a real duress state
+    /// directory must be. `tempfile::tempdir()` honors the umask (often
+    /// group-writable), which `read_persisted_freeze`'s permission check rejects.
+    fn secure_state_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        dir
+    }
+
     #[test]
     fn derive_beacon_key_is_deterministic() {
         let salt = [7u8; SALT_SIZE];
@@ -661,7 +723,7 @@ mod tests {
 
     #[test]
     fn clear_initiate_requires_an_active_freeze() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("d.state");
         // No freeze -> initiate refuses.
         assert!(clear_initiate(&path, TEST_DELAY, 1000).is_err());
@@ -672,7 +734,7 @@ mod tests {
 
     #[test]
     fn clear_initiate_rejects_delay_below_the_floor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("d.state");
         write_freeze(&path);
         // 0 (or anything below the floor) is refused: the window cannot be nulled.
@@ -683,7 +745,7 @@ mod tests {
 
     #[test]
     fn clear_execute_gated_by_delay_then_lifts_freeze() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("d.state");
         write_freeze(&path);
         // Execute with no pending clear -> error.
@@ -702,7 +764,7 @@ mod tests {
 
     #[test]
     fn clear_execute_refuses_when_the_freeze_changed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("d.state");
         write_freeze_nonce(&path, [1u8; 32]);
         clear_initiate(&path, TEST_DELAY, 1000).unwrap();
@@ -719,7 +781,7 @@ mod tests {
 
     #[test]
     fn clear_cancel_aborts_a_pending_clear() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("d.state");
         write_freeze(&path);
         assert!(!clear_cancel(&path).unwrap(), "no marker yet");
@@ -740,7 +802,7 @@ mod tests {
 
     #[test]
     fn read_persisted_freeze_roundtrips_and_fails_closed_on_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = secure_state_tempdir();
         let path = dir.path().join("duress.state");
         // Absent -> None (not frozen).
         assert!(read_persisted_freeze(&path).unwrap().is_none());
@@ -757,6 +819,29 @@ mod tests {
         // A present-but-corrupt file fails closed (Err), never silently un-frozen.
         std::fs::write(&path, b"garbage").unwrap();
         assert!(read_persisted_freeze(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_persisted_freeze_rejects_group_or_world_writable_state_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duress.state");
+
+        // A group/world-writable state dir cannot be trusted: a non-owner could
+        // have deleted a freeze, so an absent file must not read as "not frozen".
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(read_persisted_freeze(&path).is_err());
+
+        // Restricting it restores the normal absent -> None behavior.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_persisted_freeze(&path).unwrap().is_none());
+
+        // A group-writable dir (not just world) is also rejected.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(read_persisted_freeze(&path).is_err());
+        // Restore before tempdir cleanup.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[test]
