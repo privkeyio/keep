@@ -150,6 +150,8 @@ pub fn cmd_nip46_grant(
         duration: parsed_duration,
         connected_at: now,
         timed_kind_grants: Vec::new(),
+        // An operator running the grant command is an explicit remember decision.
+        explicitly_remembered: Some(true),
     };
     let replaced = match existing {
         Some(idx) => {

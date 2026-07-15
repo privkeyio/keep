@@ -75,6 +75,15 @@ pub struct StoredBunkerPermission {
     /// are pruned when the bunker restores this client.
     #[serde(default)]
     pub timed_kind_grants: Vec<StoredTimedKindGrant>,
+    /// Whether the user made an explicit remember-decision for this app (picking
+    /// a `Forever` or timed duration on the approval prompt), as opposed to a
+    /// bare connection or a client-requested connect-time kind scope. Only
+    /// remembered apps are persisted and restored, so a merely-connected client
+    /// must re-present the connect secret after a restart. `None` marks a legacy
+    /// row written before this field existed; the bunker falls back to inspecting
+    /// the row's grants on restore.
+    #[serde(default)]
+    pub explicitly_remembered: Option<bool>,
 }
 
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
@@ -219,6 +228,7 @@ impl RelayConfig {
                 duration: bp.duration,
                 connected_at: bp.connected_at,
                 timed_kind_grants: bp.timed_kind_grants,
+                explicitly_remembered: bp.explicitly_remembered,
             });
         }
 
@@ -885,5 +895,32 @@ mod tests {
     fn rejects_mixed_case_trailing_dot() {
         assert!(validate_relay_url("wss://LocalHost./").is_err());
         assert!(validate_relay_url("wss://LOCALHOST./").is_err());
+    }
+
+    #[test]
+    fn stored_bunker_permission_legacy_json_defaults_remember_flag_to_none() {
+        // A row persisted before the flag existed omits `explicitly_remembered`;
+        // it must deserialize to None so the restore path treats it as legacy and
+        // falls back to inspecting the row's grants.
+        let legacy = r#"{
+            "pubkey_hex": "aa",
+            "name": "app",
+            "permissions": 3,
+            "auto_approve_kinds": [1],
+            "duration": "Forever",
+            "connected_at": 100
+        }"#;
+        let bp: StoredBunkerPermission = serde_json::from_str(legacy).unwrap();
+        assert_eq!(bp.explicitly_remembered, None);
+        assert!(bp.timed_kind_grants.is_empty());
+
+        // A current row round-trips the flag.
+        let current = StoredBunkerPermission {
+            explicitly_remembered: Some(true),
+            ..bp
+        };
+        let json = serde_json::to_string(&current).unwrap();
+        let back: StoredBunkerPermission = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.explicitly_remembered, Some(true));
     }
 }

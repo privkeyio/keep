@@ -836,6 +836,7 @@ impl SignerHandler {
         duration: PermissionDuration,
         connected_at: Timestamp,
         timed_kind_grants: HashMap<Kind, u64>,
+        explicitly_remembered: Option<bool>,
     ) {
         let mut pm = self.permissions.lock().await;
         pm.restore_persisted(
@@ -846,6 +847,7 @@ impl SignerHandler {
             duration,
             connected_at,
             timed_kind_grants,
+            explicitly_remembered,
         );
     }
 
