@@ -460,6 +460,10 @@ pub struct KeepMobile {
     /// permission grants) so a relay edit and an engine grant/revoke write do
     /// not clobber each other's section.
     pub(crate) relay_config_lock: Arc<std::sync::Mutex<()>>,
+    /// Serializes load-modify-persist of the certificate-pin store so concurrent
+    /// stage/remove/clear FFI calls and `do_initialize`'s trust-on-first-use
+    /// auto-pin cannot lose each other's update (last-writer-wins).
+    cert_pin_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes the live-node lifecycle so the `(node, node_tasks)` pair is
     /// always swapped atomically. `do_initialize` (install) and
     /// `invalidate_live_node` (teardown) each hold this for their whole run, so
@@ -615,6 +619,7 @@ impl KeepMobile {
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
+            cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             active_share_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -1282,11 +1287,19 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
+        let _guard = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.storage
             .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
+        let _guard = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
         pins.remove_pin(&hostname);
         persistence::persist_cert_pins(&self.storage, &pins)
@@ -1304,6 +1317,10 @@ impl KeepMobile {
     ) -> Result<(), KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
+        let _guard = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
         pins.add_pin(hostname, hash);
         persistence::persist_cert_pins(&self.storage, &pins)
@@ -1321,6 +1338,10 @@ impl KeepMobile {
     ) -> Result<CertPinRemovalResult, KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
+        let _guard = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
         let pin_removed = pins.remove_specific_pin(&hostname, &hash);
         let host_now_unpinned = !pins.is_pinned(&hostname);
@@ -2646,6 +2667,15 @@ impl KeepMobile {
             .node_lifecycle_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Held across the whole init (including the block_on below, on this stack
+        // frame rather than inside the future) so the trust-on-first-use auto-pin
+        // persist cannot lose an update to a concurrent stage/remove/clear FFI
+        // call. Lock order is node_lifecycle_lock -> cert_pin_lock; the FFI
+        // cert-pin methods take only cert_pin_lock, so there is no cycle.
+        let _cert_pins = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for relay in &relays {
             network::validate_relay_url(relay)?;
         }
@@ -3775,5 +3805,147 @@ mod import_teardown_tests {
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
         );
+    }
+}
+
+#[cfg(test)]
+mod cert_pin_ffi_tests {
+    use super::*;
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Default)]
+    struct MemStorage {
+        data: StdMutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl SecureStorage for MemStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            Err(KeepMobileError::StorageNotFound)
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            Vec::new()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            None
+        }
+        fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+    }
+
+    fn keep() -> KeepMobile {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        KeepMobile::new(storage).unwrap()
+    }
+
+    fn pins_for(keep: &KeepMobile, host: &str) -> usize {
+        keep.get_certificate_pins()
+            .unwrap()
+            .iter()
+            .filter(|p| p.hostname == host)
+            .count()
+    }
+
+    #[test]
+    fn stage_then_retire_roundtrips_and_reports_unpinned() {
+        let keep = keep();
+        let host = "relay.example.com";
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+
+        keep.stage_certificate_pin(host.into(), a.clone()).unwrap();
+        keep.stage_certificate_pin(host.into(), b.clone()).unwrap();
+        assert_eq!(pins_for(&keep, host), 2);
+
+        // Retiring one of two leaves the host pinned.
+        let first = keep.remove_certificate_pin(host.into(), a).unwrap();
+        assert!(first.pin_removed);
+        assert!(!first.host_now_unpinned);
+        assert_eq!(pins_for(&keep, host), 1);
+
+        // Retiring the last pin reports the host is now unpinned.
+        let last = keep.remove_certificate_pin(host.into(), b).unwrap();
+        assert!(last.pin_removed);
+        assert!(last.host_now_unpinned);
+        assert!(keep.get_certificate_pins().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_absent_pin_reports_not_removed_and_still_pinned() {
+        let keep = keep();
+        let host = "relay.example.com";
+        keep.stage_certificate_pin(host.into(), "a".repeat(64))
+            .unwrap();
+
+        let miss = keep
+            .remove_certificate_pin(host.into(), "c".repeat(64))
+            .unwrap();
+        assert!(!miss.pin_removed);
+        assert!(!miss.host_now_unpinned);
+        assert_eq!(pins_for(&keep, host), 1);
+    }
+
+    #[test]
+    fn stage_normalizes_hostname_to_verify_lookup_key() {
+        let keep = keep();
+        keep.stage_certificate_pin("WSS://Relay.Example.COM/".into(), "a".repeat(64))
+            .unwrap();
+        let pins = keep.get_certificate_pins().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].hostname, "relay.example.com");
+    }
+
+    #[test]
+    fn clear_removes_every_host() {
+        let keep = keep();
+        keep.stage_certificate_pin("relay.example.com".into(), "a".repeat(64))
+            .unwrap();
+        keep.stage_certificate_pin("other.example.com".into(), "b".repeat(64))
+            .unwrap();
+        keep.clear_certificate_pins().unwrap();
+        assert!(keep.get_certificate_pins().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_rejects_non_hex_hash() {
+        let keep = keep();
+        assert!(keep
+            .stage_certificate_pin("relay.example.com".into(), "not-a-hash".into())
+            .is_err());
     }
 }
