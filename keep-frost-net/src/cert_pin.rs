@@ -136,7 +136,7 @@ impl CertificatePinSet {
 ///
 /// Folds every comparison without short-circuiting so the match position does
 /// not leak through timing. Do not replace with `==` / `.iter().any()`.
-fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
+pub(crate) fn pins_match(observed: &SpkiHash, expected: &[SpkiHash]) -> bool {
     let mut matched = subtle::Choice::from(0u8);
     for pin in expected {
         matched |= observed.ct_eq(pin);
@@ -253,7 +253,7 @@ pub async fn verify_relay_certificate(
 /// trust-on-first-use for an un-pinned host (unless `require_pinned` strict mode
 /// rejects it), or accept a match. Pure so the TOFU/strict/match logic is unit
 /// tested without a live TLS handshake.
-fn evaluate_pin(
+pub(crate) fn evaluate_pin(
     hostname: &str,
     spki_hash: SpkiHash,
     expected: &[SpkiHash],
@@ -284,7 +284,7 @@ fn evaluate_pin(
     Ok((spki_hash, None))
 }
 
-fn hash_spki(spki_der: &[u8]) -> SpkiHash {
+pub(crate) fn hash_spki(spki_der: &[u8]) -> SpkiHash {
     Sha256::digest(spki_der).into()
 }
 
@@ -294,7 +294,7 @@ fn hash_spki(spki_der: &[u8]) -> SpkiHash {
 /// (or a maliciously crafted one) could yield the wrong bytes and pin against the wrong key. Re-encoding
 /// the parsed SPKI to canonical DER also matches the standard SPKI-pin definition (a hash over the DER
 /// SubjectPublicKeyInfo); for the DER certs TLS delivers this is byte-identical to the field as received.
-fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
     let cert = Certificate::from_der(cert_der).ok()?;
     cert.tbs_certificate()
         .subject_public_key_info()
