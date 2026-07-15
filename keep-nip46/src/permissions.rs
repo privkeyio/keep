@@ -152,6 +152,27 @@ impl AppPermission {
             .is_some_and(|expiry| now_unix_secs() < *expiry)
     }
 
+    /// Whether the user has made an explicit remember-decision for this app: a
+    /// Forever per-kind grant beyond the seeded `Reaction` default, or a live
+    /// non-NIP-98 timed per-kind grant. A bare connection, or only the default
+    /// `Reaction` (which is auto-approved globally regardless), does not count.
+    ///
+    /// Only such apps are persisted and restored, so a merely-connected client
+    /// must re-present the connect secret via a fresh `connect` after a bunker
+    /// restart instead of being silently re-authorized. This matches NIP-46's
+    /// single-connection `secret` and the remember-only persistence model used
+    /// by NIP-55 and reference signers.
+    pub fn has_explicit_remember_grant(&self) -> bool {
+        let now = now_unix_secs();
+        self.auto_approve_kinds
+            .iter()
+            .any(|k| *k != Kind::Reaction && *k != NIP98_HTTP_AUTH)
+            || self
+                .timed_kind_grants
+                .iter()
+                .any(|(k, expiry)| *k != NIP98_HTTP_AUTH && now < *expiry)
+    }
+
     fn prune_expired_kind_grants(&mut self) {
         let now = now_unix_secs();
         self.timed_kind_grants.retain(|_, expiry| now < *expiry);
@@ -430,7 +451,10 @@ impl PermissionManager {
         let now = now_unix_secs();
         self.apps
             .values()
-            .filter(|app| !matches!(app.duration, PermissionDuration::Session))
+            .filter(|app| {
+                !matches!(app.duration, PermissionDuration::Session)
+                    && app.has_explicit_remember_grant()
+            })
             .map(|app| StoredBunkerPermission {
                 pubkey_hex: app.pubkey.to_hex(),
                 name: app.name.clone(),
@@ -519,6 +543,15 @@ impl PermissionManager {
             .into_iter()
             .filter(|(kind, expiry)| *kind != NIP98_HTTP_AUTH && now < *expiry)
             .collect();
+        // Only restore apps the user explicitly chose to remember. A record with
+        // no remaining remember-grant (a bare connection, or a legacy row that
+        // over-captured every connected app) is dropped so the client must
+        // re-present the connect secret via a fresh `connect` rather than being
+        // silently re-authorized; this also migrates away pre-existing over-broad
+        // rows on the next load.
+        if !app.has_explicit_remember_grant() {
+            return false;
+        }
         self.insert(app);
         true
     }
@@ -1059,6 +1092,79 @@ mod tests {
             restored.needs_approval(&pubkey, Kind::Metadata),
             "an ungranted kind still prompts after restore"
         );
+    }
+
+    #[test]
+    fn stored_snapshot_omits_bare_connected_app() {
+        // A merely-connected app (secret accepted, SIGN_EVENT capability, but no
+        // remember-decision) must NOT be persisted, or it would be silently
+        // re-authorized on the next start without re-presenting the secret.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect_with_permissions(
+            pubkey,
+            "App".into(),
+            Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            HashSet::new(),
+        );
+        assert!(
+            pm.stored_snapshot().is_empty(),
+            "a connected app with no remember-grant is not persisted"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_reaction_only_is_treated_as_bare() {
+        // Reaction (kind 7) is the seeded default and is auto-approved globally,
+        // so an app carrying only Reaction is indistinguishable from a bare
+        // connection and must not be persisted.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+        assert!(pm.grant_kind_forever(&pubkey, Kind::Reaction));
+        assert!(
+            pm.stored_snapshot().is_empty(),
+            "a Reaction-only app is not persisted"
+        );
+    }
+
+    #[test]
+    fn stored_snapshot_keeps_forever_and_timed_remembers() {
+        let mut pm = PermissionManager::new();
+        let forever = Keys::generate().public_key();
+        let timed = Keys::generate().public_key();
+        let bare = Keys::generate().public_key();
+        pm.connect(forever, "Forever".into());
+        pm.connect(timed, "Timed".into());
+        pm.connect(bare, "Bare".into());
+        assert!(pm.grant_kind_forever(&forever, Kind::TextNote));
+        assert!(pm.grant_kind_for(&timed, Kind::TextNote, 3600));
+
+        let snapshot = pm.stored_snapshot();
+        assert_eq!(snapshot.len(), 2, "only the two remembered apps persist");
+        let hexes: HashSet<String> = snapshot.iter().map(|s| s.pubkey_hex.clone()).collect();
+        assert!(hexes.contains(&forever.to_hex()));
+        assert!(hexes.contains(&timed.to_hex()));
+        assert!(!hexes.contains(&bare.to_hex()));
+    }
+
+    #[test]
+    fn restore_persisted_drops_legacy_bare_row() {
+        // A legacy over-captured row (SIGN_EVENT, only the Reaction seed, no timed
+        // grant) is dropped on restore, migrating away the old broad persistence.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let restored = pm.restore_persisted(
+            pubkey,
+            "Bare".into(),
+            Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            HashSet::from([Kind::Reaction]),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            HashMap::new(),
+        );
+        assert!(!restored, "a bare legacy row is not restored");
+        assert!(pm.get_app(&pubkey).is_none());
     }
 
     #[test]
