@@ -690,7 +690,10 @@ impl App {
         let stored: Vec<StoredBunkerPermission> = bunker
             .clients
             .iter()
-            .filter(|c| c.duration != "Session")
+            // Persist only clients the user explicitly remembered; a bare
+            // connection or a client-supplied connect-time kind scope is not
+            // durable, so it must re-present the connect secret after a restart.
+            .filter(|c| c.duration != "Session" && c.explicitly_remembered)
             .map(|c| StoredBunkerPermission {
                 pubkey_hex: c.pubkey.clone(),
                 name: c.name.clone(),
@@ -709,11 +712,7 @@ impl App {
                     .iter()
                     .map(|&(kind, expires_at)| StoredTimedKindGrant { kind, expires_at })
                     .collect(),
-                // This desktop sync path does not carry the remember flag; leave
-                // it legacy (`None`) so the restore path falls back to inspecting
-                // the row's grants. Gating this write on an explicit remember is
-                // tracked separately.
-                explicitly_remembered: None,
+                explicitly_remembered: Some(c.explicitly_remembered),
             })
             .collect();
         self.update_relay_config(|config| config.bunker_permissions = stored);
@@ -793,6 +792,7 @@ impl App {
                                 .iter()
                                 .map(|(k, &expiry)| (k.as_u16(), expiry))
                                 .collect(),
+                            explicitly_remembered: app.explicitly_remembered,
                         }
                     })
                     .collect()
