@@ -1319,6 +1319,24 @@ mod tests {
     }
 
     #[test]
+    fn set_auto_approve_kinds_empty_preserves_timed_remember() {
+        // Clearing auto-approve kinds must not un-remember an app that still holds
+        // a live timed grant (a separate explicit remember decision).
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+        assert!(pm.grant_kind_for(&pubkey, Kind::TextNote, 3600));
+        assert!(pm.get_app(&pubkey).unwrap().explicitly_remembered);
+
+        pm.set_auto_approve_kinds_for_app(&pubkey, HashSet::new());
+        assert!(
+            pm.get_app(&pubkey).unwrap().explicitly_remembered,
+            "clearing auto-kinds must not drop a live timed remember"
+        );
+        assert_eq!(pm.stored_snapshot().len(), 1);
+    }
+
+    #[test]
     fn grant_kind_forever_enforces_max_auto_kinds_cap() {
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
