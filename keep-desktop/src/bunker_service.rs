@@ -709,6 +709,11 @@ impl App {
                     .iter()
                     .map(|&(kind, expires_at)| StoredTimedKindGrant { kind, expires_at })
                     .collect(),
+                // This desktop sync path does not carry the remember flag; leave
+                // it legacy (`None`) so the restore path falls back to inspecting
+                // the row's grants. Gating this write on an explicit remember is
+                // tracked separately.
+                explicitly_remembered: None,
             })
             .collect();
         self.update_relay_config(|config| config.bunker_permissions = stored);
@@ -735,6 +740,7 @@ impl App {
                     app.duration,
                     app.connected_at,
                     app.timed_kind_grants,
+                    app.explicitly_remembered,
                 )
                 .await;
         }

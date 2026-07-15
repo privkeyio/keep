@@ -63,6 +63,9 @@ pub struct PreGrantedApp {
     pub duration: PermissionDuration,
     pub connected_at: Timestamp,
     pub timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64>,
+    /// `None` for a legacy row predating the flag; the restore path then falls
+    /// back to inspecting the row's grants.
+    pub explicitly_remembered: Option<bool>,
 }
 
 impl PreGrantedApp {
@@ -117,6 +120,7 @@ impl PreGrantedApp {
             duration,
             connected_at: Timestamp::from_secs(stored.connected_at),
             timed_kind_grants,
+            explicitly_remembered: stored.explicitly_remembered,
         })
     }
 }
@@ -191,6 +195,7 @@ async fn apply_pre_grants(
             app.duration,
             app.connected_at,
             app.timed_kind_grants.clone(),
+            app.explicitly_remembered,
         );
     }
 }
@@ -876,6 +881,7 @@ mod tests {
             duration,
             connected_at,
             timed_kind_grants: Vec::new(),
+            explicitly_remembered: None,
         }
     }
 

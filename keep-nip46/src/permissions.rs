@@ -122,6 +122,14 @@ pub struct AppPermission {
     pub request_count: u64,
     #[serde(default = "default_duration")]
     pub duration: PermissionDuration,
+    /// Set true when the user makes an explicit remember-decision for this app
+    /// (`grant_kind_forever` / `grant_kind_for`), false for a bare connection or
+    /// a client-supplied connect-time kind scope. Distinguishes a real user
+    /// remember from a client's `sign_event:<kind>` connect request so only the
+    /// former is persisted/restored across a bunker restart. Rebuilt from the
+    /// persisted row on restore.
+    #[serde(default)]
+    pub explicitly_remembered: bool,
 }
 
 fn default_duration() -> PermissionDuration {
@@ -140,6 +148,7 @@ impl AppPermission {
             last_used: Timestamp::now(),
             request_count: 0,
             duration: PermissionDuration::Forever,
+            explicitly_remembered: false,
         }
     }
 
@@ -152,17 +161,19 @@ impl AppPermission {
             .is_some_and(|expiry| now_unix_secs() < *expiry)
     }
 
-    /// Whether the user has made an explicit remember-decision for this app: a
-    /// Forever per-kind grant beyond the seeded `Reaction` default, or a live
-    /// non-NIP-98 timed per-kind grant. A bare connection, or only the default
-    /// `Reaction` (which is auto-approved globally regardless), does not count.
+    /// Whether the app currently holds a live remember-grant: a Forever per-kind
+    /// grant beyond the seeded `Reaction` default, or an unexpired non-NIP-98
+    /// timed per-kind grant. A bare connection, or only the default `Reaction`
+    /// (auto-approved globally regardless), does not count.
     ///
-    /// Only such apps are persisted and restored, so a merely-connected client
+    /// This is the "still has something to remember" half of the persistence
+    /// gate; combined with [`AppPermission::explicitly_remembered`] (the "user
+    /// actually chose to remember, vs a client-supplied connect scope" half), it
+    /// decides whether the app is persisted/restored. A merely-connected client
     /// must re-present the connect secret via a fresh `connect` after a bunker
-    /// restart instead of being silently re-authorized. This matches NIP-46's
-    /// single-connection `secret` and the remember-only persistence model used
-    /// by NIP-55 and reference signers.
-    pub fn has_explicit_remember_grant(&self) -> bool {
+    /// restart instead of being silently re-authorized, matching NIP-46's
+    /// single-connection `secret` and the remember-only model of NIP-55.
+    pub fn has_live_remember_grant(&self) -> bool {
         let now = now_unix_secs();
         self.auto_approve_kinds
             .iter()
@@ -171,6 +182,12 @@ impl AppPermission {
                 .timed_kind_grants
                 .iter()
                 .any(|(k, expiry)| *k != NIP98_HTTP_AUTH && now < *expiry)
+    }
+
+    /// Whether this app should be persisted / restored: the user explicitly
+    /// remembered it AND it still holds a live remember-grant.
+    pub fn is_persistable_remember(&self) -> bool {
+        self.explicitly_remembered && self.has_live_remember_grant()
     }
 
     fn prune_expired_kind_grants(&mut self) {
@@ -369,6 +386,9 @@ impl PermissionManager {
             // A Forever grant supersedes any timed grant for the same kind.
             app.timed_kind_grants.remove(&kind);
             app.last_used = Timestamp::now();
+            // An explicit user remember-decision (vs a client-supplied connect
+            // kind scope); gates cross-restart persistence.
+            app.explicitly_remembered = true;
             return true;
         }
         false
@@ -419,6 +439,8 @@ impl PermissionManager {
             let expiry = now.saturating_add(secs);
             app.timed_kind_grants.insert(kind, expiry);
             app.last_used = Timestamp::now();
+            // An explicit user remember-decision; gates cross-restart persistence.
+            app.explicitly_remembered = true;
             return true;
         }
         false
@@ -453,7 +475,7 @@ impl PermissionManager {
             .values()
             .filter(|app| {
                 !matches!(app.duration, PermissionDuration::Session)
-                    && app.has_explicit_remember_grant()
+                    && app.is_persistable_remember()
             })
             .map(|app| StoredBunkerPermission {
                 pubkey_hex: app.pubkey.to_hex(),
@@ -475,6 +497,7 @@ impl PermissionManager {
                         expires_at: *expiry,
                     })
                     .collect(),
+                explicitly_remembered: Some(app.explicitly_remembered),
             })
             .collect()
     }
@@ -515,6 +538,7 @@ impl PermissionManager {
         duration: PermissionDuration,
         connected_at: Timestamp,
         timed_kind_grants: HashMap<Kind, u64>,
+        explicitly_remembered: Option<bool>,
     ) -> bool {
         match duration {
             PermissionDuration::Session => return false,
@@ -543,13 +567,18 @@ impl PermissionManager {
             .into_iter()
             .filter(|(kind, expiry)| *kind != NIP98_HTTP_AUTH && now < *expiry)
             .collect();
-        // Only restore apps the user explicitly chose to remember. A record with
-        // no remaining remember-grant (a bare connection, or a legacy row that
-        // over-captured every connected app) is dropped so the client must
-        // re-present the connect secret via a fresh `connect` rather than being
-        // silently re-authorized; this also migrates away pre-existing over-broad
-        // rows on the next load.
-        if !app.has_explicit_remember_grant() {
+        // Rebuild the remember flag. A legacy row (`None`) predates the flag, so
+        // fall back to whether it still carries a live grant, which preserves a
+        // genuine remembered app while dropping a legacy bare row. A current row
+        // is authoritative, so a client that only supplied a connect-time kind
+        // scope (persisted as `Some(false)`) is not resurrected.
+        app.explicitly_remembered =
+            explicitly_remembered.unwrap_or_else(|| app.has_live_remember_grant());
+        // Only restore apps the user explicitly chose to remember AND that still
+        // hold a live grant, so a merely-connected client must re-present the
+        // connect secret via a fresh `connect` rather than being silently
+        // re-authorized. Also migrates away pre-existing over-broad rows.
+        if !app.is_persistable_remember() {
             return false;
         }
         self.insert(app);
@@ -825,6 +854,7 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             grants,
+            None,
         );
         assert!(restored);
 
@@ -979,6 +1009,7 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             grants,
+            None,
         );
         assert!(restored);
 
@@ -1018,6 +1049,7 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             persisted,
+            None,
         );
 
         assert!(
@@ -1078,6 +1110,7 @@ mod tests {
             duration,
             Timestamp::from_secs(stored.connected_at),
             timed,
+            stored.explicitly_remembered,
         );
 
         assert!(
@@ -1162,6 +1195,7 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             HashMap::new(),
+            None,
         );
         assert!(!restored, "a bare legacy row is not restored");
         assert!(pm.get_app(&pubkey).is_none());
@@ -1183,6 +1217,7 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             grants,
+            None,
         );
         assert!(
             !restored,
@@ -1207,8 +1242,57 @@ mod tests {
             PermissionDuration::Forever,
             Timestamp::now(),
             grants,
+            None,
         );
         assert!(!restored, "a NIP-98-only legacy row is dropped on restore");
+        assert!(pm.get_app(&pubkey).is_none());
+    }
+
+    #[test]
+    fn stored_snapshot_omits_client_scoped_connect() {
+        // A client that requests a kind-scoped signing permission at connect
+        // (`sign_event:1` -> auto-approve kind 1) is silently approved for that
+        // kind this session, but must NOT self-qualify for cross-restart
+        // persistence: only an explicit user remember does.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect_with_permissions(
+            pubkey,
+            "App".into(),
+            Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            HashSet::from([Kind::Custom(1)]),
+        );
+        assert!(
+            !pm.needs_approval(&pubkey, Kind::Custom(1)),
+            "client scope is live"
+        );
+        assert!(
+            pm.stored_snapshot().is_empty(),
+            "a client-supplied connect kind scope is not persisted"
+        );
+        // Once the user explicitly remembers a kind, the app persists.
+        assert!(pm.grant_kind_forever(&pubkey, Kind::Custom(2)));
+        assert_eq!(pm.stored_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn restore_persisted_drops_row_marked_not_remembered() {
+        // A row authoritatively flagged not-remembered (`Some(false)`, e.g. a
+        // client connect scope persisted under an older path) is not restored,
+        // even though it carries a non-Reaction auto kind.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let restored = pm.restore_persisted(
+            pubkey,
+            "Client".into(),
+            Permission::SIGN_EVENT,
+            HashSet::from([Kind::Custom(1)]),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            HashMap::new(),
+            Some(false),
+        );
+        assert!(!restored, "a row marked not-remembered is not restored");
         assert!(pm.get_app(&pubkey).is_none());
     }
 

@@ -1063,6 +1063,7 @@ mod tests {
             duration: StoredPermissionDuration::Forever,
             connected_at: 1_700_000_000,
             timed_kind_grants: Vec::new(),
+            explicitly_remembered: None,
         });
         relay_cfg.auto_approve_kinds = vec![22242];
         keep.store_relay_config(&relay_cfg).unwrap();
