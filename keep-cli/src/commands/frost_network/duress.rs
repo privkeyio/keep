@@ -424,38 +424,45 @@ pub(crate) fn parse_beacon_pins(pins: &[String]) -> Result<Vec<PublicKey>> {
 /// to trust its contents (an absent file could be a deleted freeze) rather than
 /// read it as "never frozen". Non-Unix targets rely on the platform ACLs; the
 /// duress serve boundary is documented for Unix.
+/// The offending directory and its permission bits if the directory holding
+/// `path` is writable by a non-owner: group- or world-writable WITHOUT the
+/// sticky bit, which lets someone other than the file's owner unlink it. `None`
+/// when the directory is owner-safe, sticky (the sticky bit restricts unlink to
+/// the owner), or cannot be stat'd (a truly inaccessible dir surfaces on the
+/// read instead). Unix-only; other targets rely on the platform's ACLs.
+///
+/// Single source of truth for "insecure duress state directory", shared by this
+/// read-side fail-closed check and `probe_duress_state`'s boot-time warning so
+/// the two cannot drift (e.g. on the sticky-bit exemption).
 #[cfg(unix)]
-fn validate_state_dir_perms(path: &Path) -> Result<()> {
+pub(crate) fn state_dir_writable_by_non_owner(path: &Path) -> Option<(PathBuf, u32)> {
     use std::os::unix::fs::MetadataExt;
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let meta = match std::fs::metadata(dir) {
-        Ok(m) => m,
-        // No directory yet means no persisted freeze can exist: nothing to guard.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(KeepError::runtime(format!(
-                "stat duress state directory {}: {e}",
-                dir.display()
-            )))
-        }
-    };
-    if meta.mode() & 0o022 != 0 {
-        return Err(KeepError::runtime(format!(
-            "duress state directory {} is group/world-writable (mode {:o}); a non-owner could \
-             delete a persisted freeze and silently resume serving. Restrict it (chmod go-w) and \
-             keep it root-owned.",
-            dir.display(),
-            meta.mode() & 0o7777
-        )));
-    }
-    Ok(())
+    let mode = std::fs::metadata(dir).ok()?.mode();
+    (mode & 0o022 != 0 && mode & 0o1000 == 0).then(|| (dir.to_path_buf(), mode & 0o7777))
 }
 
 #[cfg(not(unix))]
-fn validate_state_dir_perms(_path: &Path) -> Result<()> {
+pub(crate) fn state_dir_writable_by_non_owner(_path: &Path) -> Option<(PathBuf, u32)> {
+    None
+}
+
+/// Fail closed if the duress state directory is writable by a non-owner, so a
+/// coercer cannot delete a persisted freeze and silently resume serving. The
+/// missing-directory and non-Unix cases pass through (no freeze can exist / rely
+/// on platform ACLs).
+fn validate_state_dir_perms(path: &Path) -> Result<()> {
+    if let Some((dir, mode)) = state_dir_writable_by_non_owner(path) {
+        return Err(KeepError::runtime(format!(
+            "duress state directory {} is group/world-writable without the sticky bit (mode \
+             {mode:o}); a non-owner could delete a persisted freeze and silently resume serving. \
+             Restrict it (chmod go-w) and keep it root-owned.",
+            dir.display()
+        )));
+    }
     Ok(())
 }
 
@@ -840,8 +847,23 @@ mod tests {
         // A group-writable dir (not just world) is also rejected.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
         assert!(read_persisted_freeze(&path).is_err());
+
+        // The sticky bit restricts unlink to the file's owner, so a sticky
+        // world-writable dir is accepted (and matches probe_duress_state).
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(read_persisted_freeze(&path).unwrap().is_none());
+
         // Restore before tempdir cleanup.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn read_persisted_freeze_allows_nonexistent_state_dir() {
+        // A missing directory means no freeze can exist yet: absent -> None, not
+        // a permission error.
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("no-such-subdir").join("duress.state");
+        assert!(read_persisted_freeze(&path).unwrap().is_none());
     }
 
     #[test]
