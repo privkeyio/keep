@@ -187,6 +187,16 @@ impl SharePackage {
     pub fn group_pubkey(&self) -> &[u8; 32] {
         &self.metadata.group_pubkey
     }
+
+    /// The group public key derived cryptographically from the public-key
+    /// package, as opposed to the `metadata.group_pubkey` field (which is plain
+    /// data and could be forged by whatever produced the package). Use this to
+    /// verify that a share loaded from an untrusted store actually belongs to the
+    /// expected group: a store that returns a different or corrupted share cannot
+    /// produce a public-key package whose verifying key matches the expected key.
+    pub fn verified_group_pubkey(&self) -> Result<[u8; 32]> {
+        super::dealer::extract_group_pubkey(&self.pubkey_package()?)
+    }
 }
 
 /// An encrypted share for persistent storage.
@@ -332,6 +342,28 @@ mod tests {
     const GOLDEN_PUBKEY_PACKAGE_LEGACY: &str = "00230f8ab3030000000000000000000000000000000000000000000000000000000000000001036800734597e8251af183d2ebe63d4e40e13aadb1fbc6a42b9355bf0e8687b9b9000000000000000000000000000000000000000000000000000000000000000203528367b7e2165da412e85b4dd5dc59f289ecbb2051d2e9f76ff3524b7ce10eab000000000000000000000000000000000000000000000000000000000000000303d408b25a61c86d4cd2c5d56a0e8d697ed81149852971469975dd36d64c5c215b03e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a88";
     const GOLDEN_KEY_PACKAGE_1: &str = "00230f8ab30000000000000000000000000000000000000000000000000000000000000001fb905abafb56780848f1404d19e7389ca53f838a52cd3d959ba015cbf1f30952036800734597e8251af183d2ebe63d4e40e13aadb1fbc6a42b9355bf0e8687b9b903e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a8802";
     const GOLDEN_KEY_PACKAGE_2: &str = "00230f8ab300000000000000000000000000000000000000000000000000000000000000020b9bd02ae54309f2459d2399a429b6675874a8a822566ec198cb218c2ddc8c2603528367b7e2165da412e85b4dd5dc59f289ecbb2051d2e9f76ff3524b7ce10eab03e29d92d6ce9b54080afc8e1b720092590a4a759224ef2dc8f99bbbdb13347a8802";
+
+    #[test]
+    fn verified_group_pubkey_derives_from_package_not_metadata() {
+        let real: [u8; 32] = hex::decode(GOLDEN_GROUP_PUBKEY)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let pubkey_bytes = hex::decode(GOLDEN_PUBKEY_PACKAGE_LEGACY).unwrap();
+        // Forge the metadata to claim a different group than the package really is.
+        let forged = [0xAAu8; 32];
+        let metadata = ShareMetadata::new(1, 2, 3, forged, "forged".into());
+        let share = SharePackage::from_bytes(
+            metadata,
+            hex::decode(GOLDEN_KEY_PACKAGE_1).unwrap(),
+            pubkey_bytes,
+        );
+        // The plain metadata field reflects the forgery...
+        assert_eq!(share.group_pubkey(), &forged);
+        // ...but the cryptographic identity is the real group key, so an untrusted
+        // store cannot pass off one share as another by rewriting the metadata.
+        assert_eq!(share.verified_group_pubkey().unwrap(), real);
+    }
 
     #[test]
     fn test_legacy_format_share_deserializes_and_signs() {
