@@ -3595,12 +3595,13 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
 
         // Defense-in-depth against a compromised or buggy foreign SecureStorage:
-        // the share's cryptographic group key (derived from the public-key
-        // package, not the forgeable metadata field) MUST match the key it was
-        // requested under. A store that returns a different or corrupted share is
-        // rejected here instead of being loaded as the requested identity. The
-        // store cannot forge a package whose verifying key matches `key` without
-        // an actual share for that group.
+        // the share's group key read from its public-key package (not the
+        // separate, forgeable metadata field) MUST match the key it was requested
+        // under. This detects a store that returns a share for a *different*
+        // group, or a corrupted one, rather than loading it as the requested
+        // identity. A store that pairs the expected verifying key with junk key
+        // material still passes here but fails at signing; confidentiality and
+        // same-identity tamper-resistance rest on the platform secure storage.
         let derived = share
             .verified_group_pubkey()
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
@@ -3907,7 +3908,11 @@ mod import_teardown_tests {
             .unwrap();
         storage.set_active_share_key(Some(wrong_key)).unwrap();
 
-        assert!(mobile.load_share_package().is_err());
+        let result = mobile.load_share_package();
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("does not match its group key")),
+            "expected a group-key mismatch rejection"
+        );
     }
 }
 

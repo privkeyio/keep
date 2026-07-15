@@ -188,12 +188,16 @@ impl SharePackage {
         &self.metadata.group_pubkey
     }
 
-    /// The group public key derived cryptographically from the public-key
-    /// package, as opposed to the `metadata.group_pubkey` field (which is plain
-    /// data and could be forged by whatever produced the package). Use this to
-    /// verify that a share loaded from an untrusted store actually belongs to the
-    /// expected group: a store that returns a different or corrupted share cannot
-    /// produce a public-key package whose verifying key matches the expected key.
+    /// The group public key read from the public-key package's verifying key,
+    /// as opposed to the separate `metadata.group_pubkey` field. Use this to
+    /// detect a share loaded from an untrusted store that belongs to a
+    /// *different* group (or is corrupted) than the key it was requested under.
+    ///
+    /// This compares the package's advertised verifying key, which is public
+    /// data and an independently-settable field, so it is NOT proof that the
+    /// share carries a valid secret for that group: a store could pair the
+    /// expected verifying key with junk key material. That case is caught later
+    /// at signing time (the partial signatures will not aggregate), not here.
     pub fn verified_group_pubkey(&self) -> Result<[u8; 32]> {
         super::dealer::extract_group_pubkey(&self.pubkey_package()?)
     }
