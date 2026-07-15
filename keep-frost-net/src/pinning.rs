@@ -10,10 +10,12 @@
 //!
 //! Pinning is layered strictly *on top of* standard validation, never in place
 //! of it: [`PinningServerCertVerifier::verify_server_cert`] first delegates to a
-//! `WebPkiServerVerifier` (full trust-anchor chain, validity window, hostname,
-//! revocation) and only then enforces the SPKI pin on the leaf that just
-//! passed. A cert that fails standard validation is rejected before the pin
-//! logic runs, so enabling pinning can only tighten trust, never loosen it.
+//! `WebPkiServerVerifier` (full trust-anchor chain, validity window, hostname)
+//! and only then enforces the SPKI pin on the leaf that just passed. A cert
+//! that fails standard validation is rejected before the pin logic runs, so
+//! enabling pinning can only tighten trust, never loosen it. (No CRL revocation
+//! is configured, matching a typical TLS client; any OCSP staple the peer sends
+//! is still passed through to the standard validator.)
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -86,6 +88,10 @@ impl PinningServerCertVerifier {
     /// the persistence hook fired); a mismatch or a strict-mode unpinned host is
     /// rejected with an application verification failure.
     fn enforce_pin(&self, hostname: &str, spki_hash: SpkiHash) -> Result<(), Error> {
+        // Recover a poisoned lock rather than panicking: a prior panic while the
+        // guard was held must not turn every later handshake into a panic (DoS).
+        // `add_pin` is the only write and is a single atomic push, so the set is
+        // never observed half-written.
         let mut pins = self.pins.lock().unwrap_or_else(|p| p.into_inner());
         let decision = {
             let expected = pins.get_pins(hostname);
@@ -121,7 +127,7 @@ impl ServerCertVerifier for PinningServerCertVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         // 1. Standard validation FIRST: trust-anchor chain, validity window,
-        //    hostname match, revocation. Never bypassed.
+        //    hostname match. Never bypassed.
         self.inner.verify_server_cert(
             end_entity,
             intermediates,
@@ -137,10 +143,16 @@ impl ServerCertVerifier for PinningServerCertVerifier {
         let spki_hash = cert_pin::hash_spki(&spki);
 
         // 3. Enforce the SPKI pin on the validated leaf, on the same TLS session
-        //    that will carry the data (no probe-vs-connect gap).
+        //    that will carry the data (no probe-vs-connect gap). The host key is
+        //    normalized to match how `verify_relay_certificate` keys pins via
+        //    `url::host_str()` (lowercased DNS labels, bracketed IPv6 literals),
+        //    so a pin provisioned or captured by either path resolves in both.
         let hostname = match server_name {
-            ServerName::DnsName(name) => name.as_ref().to_string(),
-            ServerName::IpAddress(ip) => std::net::IpAddr::from(*ip).to_string(),
+            ServerName::DnsName(name) => name.as_ref().to_ascii_lowercase(),
+            ServerName::IpAddress(ip) => match std::net::IpAddr::from(*ip) {
+                addr @ std::net::IpAddr::V6(_) => format!("[{addr}]"),
+                addr => addr.to_string(),
+            },
             // ServerName is #[non_exhaustive]; an unrecognized name kind cannot
             // be keyed to a pin, so fail closed rather than guess a host string.
             _ => {
@@ -262,9 +274,13 @@ mod tests {
         let der = cert_der();
         let end_entity = CertificateDer::from(der);
         let name = ServerName::try_from(host.to_string()).unwrap();
-        v.verify_server_cert(&end_entity, &[], &name, &[], UnixTime::since_unix_epoch(
-            std::time::Duration::from_secs(1_800_000_000),
-        ))
+        v.verify_server_cert(
+            &end_entity,
+            &[],
+            &name,
+            &[],
+            UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000)),
+        )
     }
 
     #[test]
@@ -334,5 +350,49 @@ mod tests {
         pins.add_pin("relay.example.com".into(), cert_spki_hash());
         let v = verifier(true, pins, true, None);
         assert!(run(&v, "relay.example.com").is_ok());
+    }
+
+    #[test]
+    fn fails_closed_when_validated_leaf_spki_is_unparseable() {
+        // A cert can pass the standard validator yet not parse under the SPKI
+        // extractor (different parsers). That path must fail closed, never pin
+        // a wrong/empty SPKI. Stub validator accepts; the leaf bytes are junk.
+        let v = verifier(true, CertificatePinSet::new(), false, None);
+        let end_entity = CertificateDer::from(b"not a certificate".to_vec());
+        let name = ServerName::try_from("relay.example.com").unwrap();
+        let err = v
+            .verify_server_cert(
+                &end_entity,
+                &[],
+                &name,
+                &[],
+                UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000)),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            Error::InvalidCertificate(CertificateError::BadEncoding)
+        ));
+    }
+
+    #[test]
+    fn dns_host_key_is_lowercased_to_match_url_keying() {
+        // A pin provisioned under the lowercased host must resolve even when the
+        // TLS ServerName carries mixed case, mirroring url::host_str() keying.
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("relay.example.com".into(), cert_spki_hash());
+        let v = verifier(true, pins, true, None); // strict: only a keyed pin passes
+        assert!(run(&v, "Relay.EXAMPLE.com").is_ok());
+    }
+
+    #[test]
+    fn ip_address_server_name_is_pinned_under_its_literal() {
+        // The IpAddress arm keys the pin under the address literal (IPv4 here).
+        let v = verifier(true, CertificatePinSet::new(), false, None);
+        assert!(run(&v, "127.0.0.1").is_ok());
+        assert_eq!(
+            v.pins.lock().unwrap().get_pins("127.0.0.1"),
+            &[cert_spki_hash()]
+        );
     }
 }

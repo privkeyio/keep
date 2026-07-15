@@ -93,7 +93,6 @@ pub use attestation::{
 };
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
-pub use pinning::{OnNewPin, PinningServerCertVerifier};
 pub use descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
     load_verified_wallet_policy, participant_indices, reconstruct_descriptor, DescriptorSession,
@@ -126,6 +125,7 @@ pub use oprf_session::{
     OprfUnlockSessionState, MAX_OPRF_EVALS_PER_WINDOW, OPRF_EVAL_WINDOW,
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
+pub use pinning::{OnNewPin, PinningServerCertVerifier};
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
