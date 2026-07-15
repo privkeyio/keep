@@ -254,6 +254,7 @@ const HEALTH_STATUS_KEY_PREFIX: &str = "__keep_health_";
 const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
 const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
 const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
+const STRICT_PIN_CONFIG_STORAGE_KEY: &str = "__keep_strict_pin_config_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
 const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -1900,6 +1901,31 @@ impl KeepMobile {
         persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)
     }
 
+    /// Whether strict certificate pinning is enabled. When true, connecting to a
+    /// relay that has no pre-provisioned pin is rejected (fail-closed) instead of
+    /// trusted-on-first-use, closing the first-connection MitM window that plain
+    /// TOFU leaves open. Opt-in and disabled by default: enable it only after
+    /// staging each relay's pin via `stage_certificate_pin`, or new connections
+    /// to un-pinned relays will fail until their pins are provisioned.
+    pub fn get_strict_cert_pinning(&self) -> Result<bool, KeepMobileError> {
+        Ok(
+            persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
+                .unwrap_or_default()
+                .enabled,
+        )
+    }
+
+    /// Enable or disable strict certificate pinning (see `get_strict_cert_pinning`).
+    /// Takes effect on the next connection.
+    pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
+        let config = persistence::StoredStrictPinConfig { enabled };
+        persistence::persist_strict_pin_config(
+            &self.storage,
+            STRICT_PIN_CONFIG_STORAGE_KEY,
+            &config,
+        )
+    }
+
     pub fn get_bunker_config(&self) -> Result<BunkerConfigInfo, KeepMobileError> {
         let stored = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?;
         let config = stored.unwrap_or_default();
@@ -2683,12 +2709,16 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
+            // Opt-in strict pinning: when enabled, an un-pinned relay is rejected
+            // (fail-closed) rather than trusted-on-first-use. Disabled by default.
+            let require_pinned =
+                persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
+                    .unwrap_or_default()
+                    .enabled;
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
             let mut pins_changed = false;
             for relay in &relays {
-                // require_pinned=false: trust-on-first-use. A strict-mode config
-                // toggle that passes true is tracked as a follow-up.
-                match keep_frost_net::verify_relay_certificate(relay, &pins, false).await {
+                match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned).await {
                     Ok((_hash, new_pin)) => {
                         if let Some((hostname, hash)) = new_pin {
                             if !pins.is_pinned(&hostname) {
@@ -3947,5 +3977,18 @@ mod cert_pin_ffi_tests {
         assert!(keep
             .stage_certificate_pin("relay.example.com".into(), "not-a-hash".into())
             .is_err());
+    }
+
+    #[test]
+    fn strict_cert_pinning_defaults_off_and_persists() {
+        let keep = keep();
+        assert!(
+            !keep.get_strict_cert_pinning().unwrap(),
+            "strict pinning is opt-in, off by default"
+        );
+        keep.set_strict_cert_pinning(true).unwrap();
+        assert!(keep.get_strict_cert_pinning().unwrap());
+        keep.set_strict_cert_pinning(false).unwrap();
+        assert!(!keep.get_strict_cert_pinning().unwrap());
     }
 }

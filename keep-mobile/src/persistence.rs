@@ -632,6 +632,47 @@ pub(crate) fn persist_proxy_config(
     storage.store_share_by_key(key.into(), data, storage_metadata("proxy_config"))
 }
 
+/// Opt-in strict certificate pinning. When enabled, a relay with no
+/// pre-provisioned pin is rejected at connect (fail-closed) instead of
+/// trusted-on-first-use, closing the first-connection MitM window. Defaults to
+/// disabled so existing deployments are not broken until the operator has staged
+/// each relay's pin.
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct StoredStrictPinConfig {
+    pub(crate) enabled: bool,
+}
+
+pub(crate) fn load_strict_pin_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<Option<StoredStrictPinConfig>, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let config: StoredStrictPinConfig =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize strict pin config: {e}"),
+                })?;
+            Ok(Some(config))
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => {
+            tracing::warn!("failed to load strict pin config: {e}");
+            Err(e)
+        }
+    }
+}
+
+pub(crate) fn persist_strict_pin_config(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    config: &StoredStrictPinConfig,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(config).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize strict pin config: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("strict_pin_config"))
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct StoredBunkerConfig {
     pub(crate) enabled: bool,
