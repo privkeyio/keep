@@ -1168,6 +1168,51 @@ mod tests {
     }
 
     #[test]
+    fn restore_persisted_drops_expired_timed_only_row() {
+        // A row whose only grant is a timed grant that expired while the bunker
+        // was down prunes to empty, leaving no remember, so it is dropped.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let mut grants = HashMap::new();
+        grants.insert(Kind::TextNote, 1); // expiry at epoch+1s: always in the past
+        let restored = pm.restore_persisted(
+            pubkey,
+            "Expired".into(),
+            Permission::SIGN_EVENT,
+            HashSet::new(),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            grants,
+        );
+        assert!(
+            !restored,
+            "an app whose only grant expired while down is dropped"
+        );
+        assert!(pm.get_app(&pubkey).is_none());
+    }
+
+    #[test]
+    fn restore_persisted_drops_nip98_only_row() {
+        // A legacy row whose only grants are NIP-98 (stripped on restore) leaves
+        // no remember and is dropped rather than silently re-authorized.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let mut grants = HashMap::new();
+        grants.insert(NIP98_HTTP_AUTH, now_unix_secs() + 3600);
+        let restored = pm.restore_persisted(
+            pubkey,
+            "Nip98".into(),
+            Permission::SIGN_EVENT,
+            HashSet::from([NIP98_HTTP_AUTH]),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            grants,
+        );
+        assert!(!restored, "a NIP-98-only legacy row is dropped on restore");
+        assert!(pm.get_app(&pubkey).is_none());
+    }
+
+    #[test]
     fn grant_kind_forever_enforces_max_auto_kinds_cap() {
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
