@@ -896,4 +896,31 @@ mod tests {
         assert!(validate_relay_url("wss://LocalHost./").is_err());
         assert!(validate_relay_url("wss://LOCALHOST./").is_err());
     }
+
+    #[test]
+    fn stored_bunker_permission_legacy_json_defaults_remember_flag_to_none() {
+        // A row persisted before the flag existed omits `explicitly_remembered`;
+        // it must deserialize to None so the restore path treats it as legacy and
+        // falls back to inspecting the row's grants.
+        let legacy = r#"{
+            "pubkey_hex": "aa",
+            "name": "app",
+            "permissions": 3,
+            "auto_approve_kinds": [1],
+            "duration": "Forever",
+            "connected_at": 100
+        }"#;
+        let bp: StoredBunkerPermission = serde_json::from_str(legacy).unwrap();
+        assert_eq!(bp.explicitly_remembered, None);
+        assert!(bp.timed_kind_grants.is_empty());
+
+        // A current row round-trips the flag.
+        let current = StoredBunkerPermission {
+            explicitly_remembered: Some(true),
+            ..bp
+        };
+        let json = serde_json::to_string(&current).unwrap();
+        let back: StoredBunkerPermission = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.explicitly_remembered, Some(true));
+    }
 }
