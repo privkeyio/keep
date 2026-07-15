@@ -1322,25 +1322,16 @@ fn probe_duress_state(out: &Output, path: &Path) -> Result<()> {
     })?;
     let _ = std::fs::remove_file(&probe);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let dir = match path.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
-        };
-        if let Ok(md) = std::fs::metadata(dir) {
-            let mode = md.mode();
-            // group/world write with no sticky bit lets a non-owner unlink the file.
-            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-                out.warn(&format!(
-                    "duress state directory {} is group/world-writable without the sticky bit: a \
-                     non-owner could delete the freeze marker and silently unfreeze on reboot. \
-                     Place --duress-state-file in a root-owned, non-writable directory.",
-                    dir.display()
-                ));
-            }
-        }
+    // Shares its definition of "insecure directory" with the read-side
+    // fail-closed check (`duress::validate_state_dir_perms`) so the boot-time
+    // warning and the hard failure cannot disagree (e.g. on the sticky bit).
+    if let Some((dir, _mode)) = duress::state_dir_writable_by_non_owner(path) {
+        out.warn(&format!(
+            "duress state directory {} is group/world-writable without the sticky bit: a \
+             non-owner could delete the freeze marker and silently unfreeze on reboot. \
+             Place --duress-state-file in a root-owned, non-writable directory.",
+            dir.display()
+        ));
     }
     Ok(())
 }
@@ -1801,6 +1792,13 @@ mod tests {
     #[test]
     fn persist_freeze_roundtrips_through_the_state_file() {
         let dir = tempfile::tempdir().unwrap();
+        // A real duress state dir is owner-only; tempdir honors the umask, which
+        // the read-side permission check now rejects if group/world-writable.
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let path = dir.path().join("duress.state");
         let f = sample_freeze();
         persist_freeze(&path, &f).unwrap();
