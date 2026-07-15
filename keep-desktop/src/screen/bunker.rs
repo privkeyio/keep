@@ -20,6 +20,10 @@ pub struct ConnectedClient {
     pub duration_seconds: Option<u64>,
     pub connected_at: u64,
     pub timed_kind_grants: Vec<(u16, u64)>,
+    /// Whether the user made an explicit remember-decision for this client, as
+    /// opposed to a bare connection or a client-supplied connect-time kind scope.
+    /// Only remembered clients are persisted to the vault.
+    pub explicitly_remembered: bool,
 }
 
 const PERM_FLAGS: &[(&str, u32)] = &[

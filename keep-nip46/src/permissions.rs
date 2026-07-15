@@ -595,6 +595,13 @@ impl PermissionManager {
         // #575: NIP-98 (kind 27235) is never auto-approved.
         kinds.remove(&NIP98_HTTP_AUTH);
         if let Some(app) = self.apps.get_mut(pubkey) {
+            // A user configuring auto-approve kinds is an explicit remember
+            // decision, so gate persistence keeps it (and does not false-drop it
+            // on restart). Clearing to empty leaves the flag untouched so a
+            // separate live timed grant still counts as remembered.
+            if !kinds.is_empty() {
+                app.explicitly_remembered = true;
+            }
             app.auto_approve_kinds = kinds;
             app.last_used = Timestamp::now();
         }
@@ -1294,6 +1301,39 @@ mod tests {
         );
         assert!(!restored, "a row marked not-remembered is not restored");
         assert!(pm.get_app(&pubkey).is_none());
+    }
+
+    #[test]
+    fn set_auto_approve_kinds_marks_app_remembered() {
+        // A user configuring auto-approve kinds is an explicit remember, so the
+        // app persists (and is not false-dropped by the gated persist path).
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+        assert!(!pm.get_app(&pubkey).unwrap().explicitly_remembered);
+        assert!(pm.stored_snapshot().is_empty());
+
+        pm.set_auto_approve_kinds_for_app(&pubkey, HashSet::from([Kind::TextNote]));
+        assert!(pm.get_app(&pubkey).unwrap().explicitly_remembered);
+        assert_eq!(pm.stored_snapshot().len(), 1);
+    }
+
+    #[test]
+    fn set_auto_approve_kinds_empty_preserves_timed_remember() {
+        // Clearing auto-approve kinds must not un-remember an app that still holds
+        // a live timed grant (a separate explicit remember decision).
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+        assert!(pm.grant_kind_for(&pubkey, Kind::TextNote, 3600));
+        assert!(pm.get_app(&pubkey).unwrap().explicitly_remembered);
+
+        pm.set_auto_approve_kinds_for_app(&pubkey, HashSet::new());
+        assert!(
+            pm.get_app(&pubkey).unwrap().explicitly_remembered,
+            "clearing auto-kinds must not drop a live timed remember"
+        );
+        assert_eq!(pm.stored_snapshot().len(), 1);
     }
 
     #[test]

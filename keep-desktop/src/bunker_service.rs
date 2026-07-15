@@ -687,35 +687,7 @@ impl App {
         let Some(ref bunker) = self.bunker else {
             return;
         };
-        let stored: Vec<StoredBunkerPermission> = bunker
-            .clients
-            .iter()
-            .filter(|c| c.duration != "Session")
-            .map(|c| StoredBunkerPermission {
-                pubkey_hex: c.pubkey.clone(),
-                name: c.name.clone(),
-                permissions: c.permissions,
-                auto_approve_kinds: c.auto_approve_kinds.clone(),
-                duration: match c.duration.as_str() {
-                    "Forever" => StoredPermissionDuration::Forever,
-                    _ => c
-                        .duration_seconds
-                        .map(StoredPermissionDuration::Seconds)
-                        .unwrap_or(StoredPermissionDuration::Session),
-                },
-                connected_at: c.connected_at,
-                timed_kind_grants: c
-                    .timed_kind_grants
-                    .iter()
-                    .map(|&(kind, expires_at)| StoredTimedKindGrant { kind, expires_at })
-                    .collect(),
-                // This desktop sync path does not carry the remember flag; leave
-                // it legacy (`None`) so the restore path falls back to inspecting
-                // the row's grants. Gating this write on an explicit remember is
-                // tracked separately.
-                explicitly_remembered: None,
-            })
-            .collect();
+        let stored = remembered_clients_to_stored(&bunker.clients);
         self.update_relay_config(|config| config.bunker_permissions = stored);
     }
 
@@ -793,11 +765,82 @@ impl App {
                                 .iter()
                                 .map(|(k, &expiry)| (k.as_u16(), expiry))
                                 .collect(),
+                            explicitly_remembered: app.explicitly_remembered,
                         }
                     })
                     .collect()
             },
             Message::BunkerClientsLoaded,
         )
+    }
+}
+
+/// Map the connected-client list to the vault's persisted bunker permissions,
+/// keeping only clients the user explicitly remembered. A bare connection or a
+/// client-supplied connect-time kind scope is not durable, so it must re-present
+/// the connect secret via a fresh `connect` after a restart. Pure so the persist
+/// gate can be tested independently of `App`.
+pub(crate) fn remembered_clients_to_stored(
+    clients: &[ConnectedClient],
+) -> Vec<StoredBunkerPermission> {
+    clients
+        .iter()
+        .filter(|c| c.duration != "Session" && c.explicitly_remembered)
+        .map(|c| StoredBunkerPermission {
+            pubkey_hex: c.pubkey.clone(),
+            name: c.name.clone(),
+            permissions: c.permissions,
+            auto_approve_kinds: c.auto_approve_kinds.clone(),
+            duration: match c.duration.as_str() {
+                "Forever" => StoredPermissionDuration::Forever,
+                _ => c
+                    .duration_seconds
+                    .map(StoredPermissionDuration::Seconds)
+                    .unwrap_or(StoredPermissionDuration::Session),
+            },
+            connected_at: c.connected_at,
+            timed_kind_grants: c
+                .timed_kind_grants
+                .iter()
+                .map(|&(kind, expires_at)| StoredTimedKindGrant { kind, expires_at })
+                .collect(),
+            explicitly_remembered: Some(c.explicitly_remembered),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(pubkey: &str, remembered: bool) -> ConnectedClient {
+        ConnectedClient {
+            pubkey: pubkey.to_string(),
+            name: "app".into(),
+            permissions: 3,
+            auto_approve_kinds: vec![1],
+            request_count: 0,
+            duration: "Forever".into(),
+            duration_seconds: None,
+            connected_at: 100,
+            timed_kind_grants: Vec::new(),
+            explicitly_remembered: remembered,
+        }
+    }
+
+    #[test]
+    fn only_remembered_clients_are_persisted() {
+        let clients = vec![client("aa", true), client("bb", false)];
+        let stored = remembered_clients_to_stored(&clients);
+        assert_eq!(stored.len(), 1, "the un-remembered client is dropped");
+        assert_eq!(stored[0].pubkey_hex, "aa");
+        assert_eq!(stored[0].explicitly_remembered, Some(true));
+    }
+
+    #[test]
+    fn session_clients_are_skipped_even_if_remembered() {
+        let mut c = client("aa", true);
+        c.duration = "Session".into();
+        assert!(remembered_clients_to_stored(&[c]).is_empty());
     }
 }
