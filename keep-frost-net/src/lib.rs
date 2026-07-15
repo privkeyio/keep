@@ -92,7 +92,7 @@ pub use attestation::{
     ExpectedPcrs,
 };
 pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
-pub use cert_pin::{verify_relay_certificate, CertificatePinSet, SpkiHash};
+pub use cert_pin::{normalize_pin_hostname, verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
     load_verified_wallet_policy, participant_indices, reconstruct_descriptor, DescriptorSession,
