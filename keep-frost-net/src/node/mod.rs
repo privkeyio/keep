@@ -2376,62 +2376,26 @@ impl KfpNode {
             return Err(FrostNetError::UntrustedPeer(event.pubkey.to_string()));
         }
 
+        self.dispatch_kfp_message(event, msg).await
+    }
+
+    /// Dispatch a decrypted, gate-cleared KFP message to its per-type handler.
+    async fn dispatch_kfp_message(&self, event: &Event, msg: KfpMessage) -> Result<()> {
+        let sender = event.pubkey;
         match msg {
-            KfpMessage::Announce(payload) => {
-                self.handle_announce(event.pubkey, payload).await?;
-            }
-            KfpMessage::SignRequest(payload) => {
-                self.handle_sign_request(event.pubkey, payload).await?;
-            }
-            KfpMessage::NonceCommitment(payload) => {
-                self.handle_nonce_commitment(event.pubkey, payload).await?;
-            }
-            KfpMessage::Commitment(payload) => {
-                self.handle_commitment(event.pubkey, payload).await?;
-            }
-            KfpMessage::SignatureShare(payload) => {
-                self.handle_signature_share(event.pubkey, payload).await?;
-            }
-            KfpMessage::SignatureComplete(payload) => {
-                self.handle_signature_complete(event.pubkey, payload)
-                    .await?;
-            }
-            KfpMessage::EcdhRequest(payload) => {
-                self.handle_ecdh_request(event.pubkey, payload).await?;
-            }
-            KfpMessage::EcdhShare(payload) => {
-                self.handle_ecdh_share(event.pubkey, payload).await?;
-            }
-            KfpMessage::EcdhComplete(payload) => {
-                self.handle_ecdh_complete(event.pubkey, payload).await?;
-            }
-            KfpMessage::OprfEvalRequest(payload) => {
-                self.handle_oprf_eval_request(event.pubkey, payload).await?;
-            }
-            KfpMessage::OprfEvalShare(payload) => {
-                self.handle_oprf_eval_share(event.pubkey, payload).await?;
-            }
-            KfpMessage::OprfEnroll(payload) => {
-                // Defense in depth: a share must arrive NIP-44 encrypted and directly addressed
-                // to us. decrypt_message treats a non-addressed event's content as plaintext, so
-                // require our `p` tag here; an addressed event that reached this point was
-                // necessarily decrypted (a forged plaintext payload would have failed decryption).
-                let addressed_to_us = event.tags.filter(TagKind::p()).any(|t| {
-                    matches!(
-                        t.as_standardized(),
-                        Some(TagStandard::PublicKey { public_key, .. })
-                            if public_key == &self.keys.public_key()
-                    )
-                });
-                if !addressed_to_us {
-                    debug!(from = %event.pubkey, "Rejecting OPRF enrollment: not directly addressed");
-                    return Ok(());
-                }
-                self.handle_oprf_enroll(event.pubkey, payload).await?;
-            }
-            KfpMessage::OprfEnrollAck(payload) => {
-                self.handle_oprf_enroll_ack(event.pubkey, payload).await?;
-            }
+            KfpMessage::Announce(p) => self.handle_announce(sender, p).await,
+            KfpMessage::SignRequest(p) => self.handle_sign_request(sender, p).await,
+            KfpMessage::NonceCommitment(p) => self.handle_nonce_commitment(sender, p).await,
+            KfpMessage::Commitment(p) => self.handle_commitment(sender, p).await,
+            KfpMessage::SignatureShare(p) => self.handle_signature_share(sender, p).await,
+            KfpMessage::SignatureComplete(p) => self.handle_signature_complete(sender, p).await,
+            KfpMessage::EcdhRequest(p) => self.handle_ecdh_request(sender, p).await,
+            KfpMessage::EcdhShare(p) => self.handle_ecdh_share(sender, p).await,
+            KfpMessage::EcdhComplete(p) => self.handle_ecdh_complete(sender, p).await,
+            KfpMessage::OprfEvalRequest(p) => self.handle_oprf_eval_request(sender, p).await,
+            KfpMessage::OprfEvalShare(p) => self.handle_oprf_eval_share(sender, p).await,
+            KfpMessage::OprfEnroll(p) => self.handle_oprf_enroll_if_addressed(event, p).await,
+            KfpMessage::OprfEnrollAck(p) => self.handle_oprf_enroll_ack(sender, p).await,
             KfpMessage::RefreshRequest(_)
             | KfpMessage::RefreshRound1(_)
             | KfpMessage::RefreshRound2(_)
@@ -2439,111 +2403,111 @@ impl KfpNode {
                 if let Some(sid) = msg.session_id() {
                     warn!(session_id = %hex::encode(sid), "Distributed refresh not yet implemented");
                 }
+                Ok(())
             }
-            KfpMessage::DescriptorPropose(payload) => {
-                self.handle_descriptor_propose(event.pubkey, payload)
-                    .await?;
+            KfpMessage::DescriptorPropose(p) => self.handle_descriptor_propose(sender, p).await,
+            KfpMessage::DescriptorContribute(p) => {
+                self.handle_descriptor_contribute(sender, p).await
             }
-            KfpMessage::DescriptorContribute(payload) => {
-                self.handle_descriptor_contribute(event.pubkey, payload)
-                    .await?;
-            }
-            KfpMessage::DescriptorFinalize(payload) => {
-                self.handle_descriptor_finalize(event.pubkey, payload)
-                    .await?;
-            }
-            KfpMessage::DescriptorAck(payload) => {
-                self.handle_descriptor_ack(event.pubkey, payload).await?;
-            }
-            KfpMessage::DescriptorNack(payload) => {
-                self.handle_descriptor_nack(event.pubkey, payload).await?;
-            }
-            KfpMessage::DescriptorMigrate(payload) => {
-                self.handle_descriptor_migrate(event.pubkey, payload)
-                    .await?;
-            }
-            KfpMessage::XpubAnnounce(payload) => {
-                self.handle_xpub_announce(event.pubkey, payload).await?;
-            }
-            KfpMessage::DuressBeacon(_) => {
-                // A real duress beacon arrives as a NIP-59 gift wrap (handled in
-                // `handle_gift_wrap`), never as a top-level KFP event. A plaintext
-                // top-level one is legacy/spoofed and only reaches here from a
-                // trusted peer (the gate above); ignore it , beacons must be wrapped.
-            }
-            KfpMessage::PsbtPropose(payload) => {
-                self.handle_psbt_propose(event.pubkey, payload).await?;
-            }
-            KfpMessage::PsbtSign(payload) => {
-                self.handle_psbt_sign(event.pubkey, payload).await?;
-            }
-            KfpMessage::PsbtFinalize(payload) => {
-                self.handle_psbt_finalize(event.pubkey, payload).await?;
-            }
-            KfpMessage::PsbtAbort(payload) => {
-                self.handle_psbt_abort(event.pubkey, payload).await?;
-            }
-            KfpMessage::Ping(payload) => {
-                self.handle_ping(event.pubkey, payload).await?;
-            }
-            KfpMessage::Pong(payload) => {
-                self.handle_pong(event.pubkey, payload).await?;
-            }
-            KfpMessage::Error(payload) => {
-                warn!(
-                    code = %payload.code,
-                    message = %payload.message,
-                    "Received error from peer"
-                );
-                // A session-scoped error from a participant means that peer
-                // cannot continue the session (e.g. it no longer holds a
-                // referenced pre-exchanged nonce). Surface it so an in-flight
-                // `request_signature` fails fast instead of waiting for timeout.
-                if let Some(session_id) = payload.session_id {
-                    // Resolve the offending peer's share index so the requester
-                    // can scope any pool cleanup to just that peer instead of
-                    // wiping every peer's pooled commitments.
-                    let offending_index = {
-                        let sessions = self.sessions.read();
-                        match sessions.get_session(&session_id) {
-                            Some(session) => {
-                                let peers = self.peers.read();
-                                session.participants().iter().copied().find(|&idx| {
-                                    peers
-                                        .get_peer(idx)
-                                        .map(|p| p.pubkey == event.pubkey)
-                                        .unwrap_or(false)
-                                })
-                            }
-                            None => None,
-                        }
-                    };
-                    // Recoverable pre-exchange misses (`stale_nonce` /
-                    // `incomplete_pre_exchange`) keep their fast-fail + pool-clear
-                    // handling in `request_signature`. Any other peer-reported
-                    // error is treated like an unresponsive peer there: the
-                    // offending index is excluded and the round fails over to
-                    // live co-signers instead of returning fatally, so a faulty
-                    // or malicious peer cannot reliably block signing. The index
-                    // is carried structurally; the human-readable string still
-                    // embeds it for logs and external consumers.
-                    let error = match offending_index {
-                        Some(idx) => {
-                            format!("Peer reported error: {} (peer {idx})", payload.code)
-                        }
-                        None => format!("Peer reported error: {}", payload.code),
-                    };
-                    let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
-                        session_id,
-                        error,
-                        code: payload.code.clone(),
-                        offending_index,
-                    });
-                }
+            KfpMessage::DescriptorFinalize(p) => self.handle_descriptor_finalize(sender, p).await,
+            KfpMessage::DescriptorAck(p) => self.handle_descriptor_ack(sender, p).await,
+            KfpMessage::DescriptorNack(p) => self.handle_descriptor_nack(sender, p).await,
+            KfpMessage::DescriptorMigrate(p) => self.handle_descriptor_migrate(sender, p).await,
+            KfpMessage::XpubAnnounce(p) => self.handle_xpub_announce(sender, p).await,
+            // A real duress beacon arrives as a NIP-59 gift wrap (handled in
+            // `handle_gift_wrap`), never as a top-level KFP event. A plaintext
+            // top-level one is legacy/spoofed and only reaches here from a trusted
+            // peer (the gate above); ignore it , beacons must be wrapped.
+            KfpMessage::DuressBeacon(_) => Ok(()),
+            KfpMessage::PsbtPropose(p) => self.handle_psbt_propose(sender, p).await,
+            KfpMessage::PsbtSign(p) => self.handle_psbt_sign(sender, p).await,
+            KfpMessage::PsbtFinalize(p) => self.handle_psbt_finalize(sender, p).await,
+            KfpMessage::PsbtAbort(p) => self.handle_psbt_abort(sender, p).await,
+            KfpMessage::Ping(p) => self.handle_ping(sender, p).await,
+            KfpMessage::Pong(p) => self.handle_pong(sender, p).await,
+            KfpMessage::Error(p) => {
+                self.handle_peer_error(sender, p);
+                Ok(())
             }
         }
+    }
 
-        Ok(())
+    /// OPRF enrollment shares must arrive NIP-44 encrypted and directly addressed
+    /// to us. `decrypt_message` treats a non-addressed event's content as plaintext,
+    /// so require our `p` tag here; an addressed event that reached this point was
+    /// necessarily decrypted (a forged plaintext payload would have failed decryption).
+    async fn handle_oprf_enroll_if_addressed(
+        &self,
+        event: &Event,
+        payload: OprfEnrollPayload,
+    ) -> Result<()> {
+        let addressed_to_us = event.tags.filter(TagKind::p()).any(|t| {
+            matches!(
+                t.as_standardized(),
+                Some(TagStandard::PublicKey { public_key, .. })
+                    if public_key == &self.keys.public_key()
+            )
+        });
+        if !addressed_to_us {
+            debug!(from = %event.pubkey, "Rejecting OPRF enrollment: not directly addressed");
+            return Ok(());
+        }
+        self.handle_oprf_enroll(event.pubkey, payload).await
+    }
+
+    /// Surface a session-scoped peer error so an in-flight `request_signature` fails
+    /// fast instead of waiting for timeout.
+    fn handle_peer_error(&self, sender: PublicKey, payload: ErrorPayload) {
+        warn!(
+            code = %payload.code,
+            message = %payload.message,
+            "Received error from peer"
+        );
+        // A session-scoped error from a participant means that peer
+        // cannot continue the session (e.g. it no longer holds a
+        // referenced pre-exchanged nonce). Surface it so an in-flight
+        // `request_signature` fails fast instead of waiting for timeout.
+        if let Some(session_id) = payload.session_id {
+            // Resolve the offending peer's share index so the requester
+            // can scope any pool cleanup to just that peer instead of
+            // wiping every peer's pooled commitments.
+            let offending_index = {
+                let sessions = self.sessions.read();
+                match sessions.get_session(&session_id) {
+                    Some(session) => {
+                        let peers = self.peers.read();
+                        session.participants().iter().copied().find(|&idx| {
+                            peers
+                                .get_peer(idx)
+                                .map(|p| p.pubkey == sender)
+                                .unwrap_or(false)
+                        })
+                    }
+                    None => None,
+                }
+            };
+            // Recoverable pre-exchange misses (`stale_nonce` /
+            // `incomplete_pre_exchange`) keep their fast-fail + pool-clear
+            // handling in `request_signature`. Any other peer-reported
+            // error is treated like an unresponsive peer there: the
+            // offending index is excluded and the round fails over to
+            // live co-signers instead of returning fatally, so a faulty
+            // or malicious peer cannot reliably block signing. The index
+            // is carried structurally; the human-readable string still
+            // embeds it for logs and external consumers.
+            let error = match offending_index {
+                Some(idx) => {
+                    format!("Peer reported error: {} (peer {idx})", payload.code)
+                }
+                None => format!("Peer reported error: {}", payload.code),
+            };
+            let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
+                session_id,
+                error,
+                code: payload.code.clone(),
+                offending_index,
+            });
+        }
     }
 
     async fn handle_announce(&self, pubkey: PublicKey, payload: AnnouncePayload) -> Result<()> {
