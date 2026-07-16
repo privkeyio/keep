@@ -666,11 +666,7 @@ mod tests {
         // ...and the next request through record_usage garbage-collects it.
         pm.record_usage(&pubkey);
         assert!(
-            pm.apps
-                .get(&pubkey)
-                .unwrap()
-                .timed_kind_grants
-                .is_empty(),
+            pm.apps.get(&pubkey).unwrap().timed_kind_grants.is_empty(),
             "expired timed grant must be garbage-collected on the request path"
         );
     }
