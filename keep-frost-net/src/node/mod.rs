@@ -541,7 +541,23 @@ impl SigningHooks for RefuseRawAndRequireStructuredHooks {
 /// admitted transport pubkey and is
 /// best-effort abuse control against a genuinely-admitted holder's accidental or
 /// naive over-querying, NOT a barrier against a compromised member (who is already
-/// inside the trust boundary). This flag lets an autonomous holder (e.g. a replica) answer
+/// inside the trust boundary).
+///
+/// RESIDUAL BRUTE-FORCE RISK: with auto-approve on, VERIFIED attestation is the
+/// SOLE human-free gate on evaluations. The per-requester rate limiter keys on
+/// the admitted transport pubkey, which an admitted peer can rotate to reset its
+/// bucket, so it does not bound the total number of evaluations. A single
+/// compromised-but-Verified holder can therefore obtain effectively unbounded
+/// evaluations of the fixed, low-entropy OPRF unlock input, which is exactly the
+/// oracle a brute-force / offline-dictionary attack on that input needs; the
+/// human-gated flow (auto-approve off) is what otherwise caps attempts. This is
+/// a deliberate trade-off for unattended holders, not a bug. Enable it ONLY where
+/// every Verified peer is fully trusted to hold the vault, and pin a strict PCR
+/// policy so attestation actually constrains WHO is admitted. An absolute
+/// per-input evaluation cap independent of requester identity would be a useful
+/// defense-in-depth here and is worth adding before relying on this at scale.
+///
+/// This flag lets an autonomous holder (e.g. a replica) answer
 /// verified requests unattended; leave it off for a holder that gates each evaluation
 /// behind a human (e.g. a phone).
 pub struct ServeHooks {
