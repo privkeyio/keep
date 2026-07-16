@@ -804,7 +804,14 @@ pub(crate) async fn dispatch_request(
                         .handle_nip04_decrypt(app_pubkey, peer, &request.params[1])
                         .await
                 }
-                _ => unreachable!(),
+                // The outer dispatch arm routes exactly the four methods above
+                // here, so this is unreachable today; fail closed instead of
+                // panicking so a future divergence between the two lists cannot
+                // let an attacker-supplied method string crash the signer.
+                other => {
+                    warn!(method = %other, "encryption dispatch received unrouted method");
+                    return Nip46Response::error(id, "Unsupported method");
+                }
             };
             match result {
                 Ok(data) => Nip46Response::ok(id, &data),
