@@ -531,11 +531,14 @@ impl SigningHooks for RefuseRawAndRequireStructuredHooks {
 /// is VERIFIED TPM attestation of the requester (AK pinning plus PCR correctness;
 /// `NotConfigured` is rejected, so the oracle fails closed) combined with this explicit
 /// opt-in. Safety rests primarily on WHO is answered, not on how many evals occur.
-/// Peer admission binds a claimed share index to the group's CANONICAL verifying
-/// share plus a proof of the member secret (see `handle_announce`), so an attacker
-/// who knows only the public `(group_pubkey, identifier)` cannot register as
-/// arbitrary member identities: only a real holder of member index N is admitted as
-/// N. The per-requester rate limiter keys on that admitted transport pubkey and is
+/// On a holder that carries the full public-key package, peer admission binds a
+/// claimed share index to the group's CANONICAL verifying share plus a proof of the
+/// member secret (see `handle_announce`), so an attacker who knows only the public
+/// `(group_pubkey, identifier)` cannot register as arbitrary member identities: only
+/// a real holder of member index N is admitted as N. (A holder whose share was
+/// imported carries only its own verifying share and falls back to the proof gate
+/// for indices it cannot validate.) The per-requester rate limiter keys on the
+/// admitted transport pubkey and is
 /// best-effort abuse control against a genuinely-admitted holder's accidental or
 /// naive over-querying, NOT a barrier against a compromised member (who is already
 /// inside the trust boundary). This flag lets an autonomous holder (e.g. a replica) answer
@@ -2585,11 +2588,17 @@ impl KfpNode {
         // the secret for whatever share it announced, not that the share is a real
         // member of THIS group: an attacker who knows the public group pubkey (and
         // hence the deterministically-derivable member transport key) could
-        // otherwise announce a self-generated share under a member index. The node
-        // holds the group's canonical public-key package, so a mismatch (or an
-        // index outside the group) is rejected fail-closed. Combined with the
-        // proof-of-secret above, only the real holder of member index N can be
-        // admitted as index N.
+        // otherwise announce a self-generated share under a member index. When the
+        // node holds the canonical share for the claimed index, a mismatch is
+        // rejected fail-closed; combined with the proof-of-secret above, only the
+        // real holder of member index N is admitted as N.
+        //
+        // A node whose share was imported through an encrypted export carries an
+        // INCOMPLETE public-key package (only its own verifying share). It cannot
+        // validate other members' shares it does not hold, so for an index it does
+        // not know it falls back to the proof-of-secret gate alone rather than
+        // rejecting the peer. Making exports carry the full verifying-share set so
+        // imported holders can enforce this too is tracked as a follow-up.
         {
             let pubkey_pkg = self.share.pubkey_package()?;
             let id =
@@ -2599,29 +2608,25 @@ impl KfpNode {
                         payload.share_index
                     ))
                 })?;
-            let canonical = pubkey_pkg.verifying_shares().get(&id).ok_or_else(|| {
-                FrostNetError::UntrustedPeer(format!(
-                    "Share index {} is not a member of this group",
-                    payload.share_index
-                ))
-            })?;
-            let canonical_bytes: [u8; 33] = canonical
-                .serialize()
-                .map_err(|e| {
-                    FrostNetError::Crypto(format!(
-                        "Failed to serialize canonical verifying share: {e}"
-                    ))
-                })?
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    FrostNetError::Crypto("Invalid canonical verifying share length".into())
-                })?;
-            if canonical_bytes != payload.verifying_share {
-                return Err(FrostNetError::UntrustedPeer(format!(
-                    "Announced verifying share for index {} does not match the group's canonical share",
-                    payload.share_index
-                )));
+            if let Some(canonical) = pubkey_pkg.verifying_shares().get(&id) {
+                let canonical_bytes: [u8; 33] = canonical
+                    .serialize()
+                    .map_err(|e| {
+                        FrostNetError::Crypto(format!(
+                            "Failed to serialize canonical verifying share: {e}"
+                        ))
+                    })?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| {
+                        FrostNetError::Crypto("Invalid canonical verifying share length".into())
+                    })?;
+                if canonical_bytes != payload.verifying_share {
+                    return Err(FrostNetError::UntrustedPeer(format!(
+                        "Announced verifying share for index {} does not match the group's canonical share",
+                        payload.share_index
+                    )));
+                }
             }
         }
 
