@@ -397,14 +397,16 @@ impl DescriptorSession {
             .as_ref()
             .ok_or_else(|| FrostNetError::Session("No finalized descriptor".into()))?;
 
-        let mut hasher = Sha256::new();
-        hasher.update((finalized.external.len() as u64).to_le_bytes());
-        hasher.update(finalized.external.as_bytes());
-        hasher.update((finalized.internal.len() as u64).to_le_bytes());
-        hasher.update(finalized.internal.as_bytes());
-        hasher.update(finalized.policy_hash);
-        keep_core::wallet::fold_descriptor_version_suffix(&mut hasher, self.policy.version);
-        let expected_hash: [u8; 32] = hasher.finalize().into();
+        // Shared with `WalletDescriptor::canonical_hash` and every other
+        // recompute site so the formula cannot drift; also rejects the invalid
+        // version==0 case that the old inline copy silently hashed.
+        let expected_hash = keep_core::wallet::canonical_descriptor_hash(
+            &finalized.external,
+            &finalized.internal,
+            &finalized.policy_hash,
+            self.policy.version,
+        )
+        .map_err(|e| FrostNetError::Session(format!("canonical descriptor hash: {e}")))?;
 
         if !bool::from(descriptor_hash.ct_eq(&expected_hash)) {
             return Err(FrostNetError::Session("Descriptor hash mismatch".into()));
