@@ -366,8 +366,12 @@ impl Nip46Client {
                 }
                 let decode_result = hex::decode(hex_str.trim());
                 hex_str.zeroize();
+                // Malformed hex (odd length, non-hex chars) is an untrusted-input
+                // validation failure, same class as the too-long / wrong-length
+                // checks around it; surface it as InvalidInput so callers can
+                // handle all three consistently, not as a StorageErr.
                 let decoded = decode_result.map_err(|e| {
-                    StorageError::invalid_format(format!("register_wallet hmac hex: {e}"))
+                    KeepError::InvalidInput(format!("register_wallet hmac hex: {e}"))
                 })?;
                 if decoded.len() != HMAC_SHA256_LEN {
                     return Err(KeepError::InvalidInput(format!(
