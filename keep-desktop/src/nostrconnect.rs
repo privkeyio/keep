@@ -87,9 +87,26 @@ impl App {
         let setup_arc = Arc::new(Mutex::new(None));
         self.bunker_pending_setup = Some(setup_arc.clone());
         let proxy = self.proxy_addr();
+        let cert_pins = self.certificate_pins.clone();
+        let keep_path = self.keep_path.clone();
+        let require_pinned = self.settings.strict_cert_pinning;
 
         Task::perform(
             async move {
+                // Enforce/establish SPKI pins before starting the bunker against
+                // these relays. The relay list comes from the (attacker-influenceable)
+                // nostrconnect request, so this fails closed on a corrupt pin store
+                // or a pin mismatch, and records TOFU pins otherwise, mirroring the
+                // interactive bunker-start path in bunker_service.rs.
+                crate::frost::verify_relay_certificates(
+                    &valid_relays,
+                    &cert_pins,
+                    &keep_path,
+                    require_pinned,
+                )
+                .await
+                .map_err(|e| format!("{e}"))?;
+
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
                     .map_err(|_| "Background task failed".to_string())??;
