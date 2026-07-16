@@ -322,7 +322,11 @@ pub mod nip49 {
             .encrypt(&XNonce::from(nonce), payload)
             .map_err(|_| CryptoError::encryption("NIP-49 encryption failed"))?;
 
-        let mut concat = Vec::with_capacity(91);
+        // Zeroize the assembled buffer on drop. It holds only the salt, nonce,
+        // and ciphertext (the plaintext key never enters it), but the salt and
+        // nonce are still worth clearing from memory. `with_capacity(91)` is the
+        // exact ncryptsec length, so no reallocation leaves an un-zeroed copy.
+        let mut concat = Zeroizing::new(Vec::with_capacity(91));
         concat.push(VERSION);
         concat.push(log_n);
         concat.extend_from_slice(&salt);
