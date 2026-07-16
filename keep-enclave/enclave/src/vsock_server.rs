@@ -3,7 +3,7 @@
 use crate::error::{EnclaveError, Result};
 use crate::kms::{EncryptedWallet, EnclaveKms};
 use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine, SigningContext};
-use crate::signer::EnclaveSigner;
+use crate::signer::{EnclaveSigner, PsbtAnalysis};
 use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -448,34 +448,10 @@ impl VsockServer {
             }
         };
 
-        for dest in &analysis.destinations {
-            if dest.is_change {
-                continue;
-            }
-            let addr = dest.address.as_deref();
-            let ctx = SigningContext {
-                key_id: &req.key_id,
-                amount_sats: Some(total_spend),
-                destination: addr,
-                event_kind: None,
-                timestamp,
-            };
-
-            match self.policy_engine.evaluate(&ctx) {
-                PolicyDecision::Allow => {}
-                PolicyDecision::Deny(reason) => {
-                    return EnclaveResponse::Error {
-                        code: ErrorCode::PolicyDenied,
-                        message: format!("Destination {:?} denied: {}", addr, reason),
-                    };
-                }
-                PolicyDecision::RequireApproval => {
-                    return EnclaveResponse::Error {
-                        code: ErrorCode::PolicyDenied,
-                        message: format!("Destination {:?} requires approval", addr),
-                    };
-                }
-            }
+        if let Some(denied) =
+            self.enforce_destination_policies(&analysis, &req.key_id, total_spend, timestamp)
+        {
+            return denied;
         }
 
         match self.signer.sign_psbt(&req.key_id, &req.psbt, network) {
@@ -491,6 +467,48 @@ impl VsockServer {
                 message: e.to_string(),
             },
         }
+    }
+
+    /// Evaluate the policy engine against each non-change destination. Returns the
+    /// error response to send back if any destination is denied or requires
+    /// approval, or `None` when every destination is allowed.
+    fn enforce_destination_policies(
+        &mut self,
+        analysis: &PsbtAnalysis,
+        key_id: &str,
+        total_spend: u64,
+        timestamp: u64,
+    ) -> Option<EnclaveResponse> {
+        for dest in &analysis.destinations {
+            if dest.is_change {
+                continue;
+            }
+            let addr = dest.address.as_deref();
+            let ctx = SigningContext {
+                key_id,
+                amount_sats: Some(total_spend),
+                destination: addr,
+                event_kind: None,
+                timestamp,
+            };
+
+            match self.policy_engine.evaluate(&ctx) {
+                PolicyDecision::Allow => {}
+                PolicyDecision::Deny(reason) => {
+                    return Some(EnclaveResponse::Error {
+                        code: ErrorCode::PolicyDenied,
+                        message: format!("Destination {:?} denied: {}", addr, reason),
+                    });
+                }
+                PolicyDecision::RequireApproval => {
+                    return Some(EnclaveResponse::Error {
+                        code: ErrorCode::PolicyDenied,
+                        message: format!("Destination {:?} requires approval", addr),
+                    });
+                }
+            }
+        }
+        None
     }
 
     fn handle_set_policy(&mut self, config: PolicyConfig) -> EnclaveResponse {
