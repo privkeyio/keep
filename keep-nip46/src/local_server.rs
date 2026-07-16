@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
@@ -168,6 +168,106 @@ async fn write_line(w: &mut OwnedWriteHalf, data: &[u8]) -> std::io::Result<()> 
     w.write_all(b"\n").await
 }
 
+/// Outcome of reading one newline-delimited request frame from a client.
+enum FrameOutcome {
+    /// A complete frame is in `buf`; `too_large` if it exceeded `max_size`.
+    Line { too_large: bool },
+    /// No data for `IDLE_TIMEOUT`.
+    IdleTimeout,
+    /// Clean EOF with nothing buffered.
+    Disconnected,
+    /// Underlying read error.
+    ReadError,
+}
+
+/// Read one `\n`-delimited frame into `buf` (cleared first), enforcing `max_size`.
+/// An oversize frame is drained to the next newline so the stream stays aligned;
+/// the caller rejects it via the `too_large` flag rather than buffering it.
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_size: usize,
+) -> FrameOutcome {
+    buf.clear();
+    let mut total = 0usize;
+    loop {
+        let fill = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
+        let available = match fill {
+            Err(_) => return FrameOutcome::IdleTimeout,
+            Ok(Ok([])) => {
+                if total == 0 {
+                    return FrameOutcome::Disconnected;
+                }
+                return FrameOutcome::Line { too_large: false };
+            }
+            Ok(Ok(b)) => b,
+            Ok(Err(_)) => return FrameOutcome::ReadError,
+        };
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return FrameOutcome::Line {
+                too_large: buf.len() > max_size,
+            };
+        }
+        let len = available.len();
+        total += len;
+        if total > max_size {
+            reader.consume(len);
+            loop {
+                let drain = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
+                let rest = match drain {
+                    Err(_) => break,
+                    Ok(Ok([])) => break,
+                    Ok(Ok(b)) => b,
+                    Ok(Err(_)) => break,
+                };
+                if let Some(pos) = rest.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    break;
+                }
+                let n = rest.len();
+                reader.consume(n);
+            }
+            return FrameOutcome::Line { too_large: true };
+        }
+        buf.extend_from_slice(available);
+        reader.consume(len);
+    }
+}
+
+/// Envelope-level validation of a parsed request. Returns the JSON error body to
+/// reply with when the request is malformed, or `None` when it is acceptable.
+fn validate_request_envelope(request: &crate::types::Nip46Request) -> Option<&'static [u8]> {
+    const MAX_NIP46_PARAMS: usize = 10;
+    if request.id.len() > 64
+        || !request
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Some(br#"{"id":"","error":"invalid request ID"}"#);
+    }
+    if request.params.len() > MAX_NIP46_PARAMS {
+        return Some(br#"{"id":"","error":"too many request params"}"#);
+    }
+    None
+}
+
+/// Parse and validate one raw request frame. On success returns the parsed
+/// request; otherwise returns the JSON error body to reply with (invalid UTF-8,
+/// invalid JSON, or a malformed envelope).
+fn parse_request(buf: &[u8]) -> std::result::Result<crate::types::Nip46Request, &'static [u8]> {
+    let line =
+        std::str::from_utf8(buf).map_err(|_| &br#"{"id":"","error":"invalid request"}"#[..])?;
+    let request: crate::types::Nip46Request =
+        serde_json::from_str(line).map_err(|_| &br#"{"id":"","error":"invalid JSON"}"#[..])?;
+    if let Some(err) = validate_request_envelope(&request) {
+        return Err(err);
+    }
+    Ok(request)
+}
+
 async fn handle_connection(
     stream: UnixStream,
     handler: Arc<SignerHandler>,
@@ -202,58 +302,22 @@ async fn handle_connection(
     let mut buf = Vec::with_capacity(1024);
 
     loop {
-        buf.clear();
-        let mut total = 0usize;
-        let too_large = loop {
-            let fill = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
-            let available = match fill {
-                Err(_) => {
-                    info!(client = %client_id, "idle timeout, disconnecting");
-                    handler.revoke_client(&app_pubkey).await;
-                    return Ok(());
-                }
-                Ok(Ok([])) => {
-                    if total == 0 {
-                        handler.revoke_client(&app_pubkey).await;
-                        info!(client = %client_id, "local client disconnected");
-                        return Ok(());
-                    }
-                    break false;
-                }
-                Ok(Ok(b)) => b,
-                Ok(Err(_)) => {
-                    handler.revoke_client(&app_pubkey).await;
-                    return Ok(());
-                }
-            };
-            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-                buf.extend_from_slice(&available[..pos]);
-                reader.consume(pos + 1);
-                break buf.len() > max_size;
+        let too_large = match read_frame(&mut reader, &mut buf, max_size).await {
+            FrameOutcome::IdleTimeout => {
+                info!(client = %client_id, "idle timeout, disconnecting");
+                handler.revoke_client(&app_pubkey).await;
+                return Ok(());
             }
-            let len = available.len();
-            total += len;
-            if total > max_size {
-                reader.consume(len);
-                loop {
-                    let drain = tokio::time::timeout(IDLE_TIMEOUT, reader.fill_buf()).await;
-                    let rest = match drain {
-                        Err(_) => break,
-                        Ok(Ok([])) => break,
-                        Ok(Ok(b)) => b,
-                        Ok(Err(_)) => break,
-                    };
-                    if let Some(pos) = rest.iter().position(|&b| b == b'\n') {
-                        reader.consume(pos + 1);
-                        break;
-                    }
-                    let n = rest.len();
-                    reader.consume(n);
-                }
-                break true;
+            FrameOutcome::Disconnected => {
+                handler.revoke_client(&app_pubkey).await;
+                info!(client = %client_id, "local client disconnected");
+                return Ok(());
             }
-            buf.extend_from_slice(available);
-            reader.consume(len);
+            FrameOutcome::ReadError => {
+                handler.revoke_client(&app_pubkey).await;
+                return Ok(());
+            }
+            FrameOutcome::Line { too_large } => too_large,
         };
         macro_rules! reply_or_disconnect {
             ($w:expr, $data:expr) => {
@@ -268,43 +332,13 @@ async fn handle_connection(
             reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"request too large"}"#);
             continue;
         }
-        let line = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => {
-                reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"invalid request"}"#);
-                continue;
-            }
-        };
-
-        let request: crate::types::Nip46Request = match serde_json::from_str(line) {
+        let request = match parse_request(&buf) {
             Ok(r) => r,
-            Err(_) => {
-                reply_or_disconnect!(&mut write_half, br#"{"id":"","error":"invalid JSON"}"#);
+            Err(err) => {
+                reply_or_disconnect!(&mut write_half, err);
                 continue;
             }
         };
-
-        if request.id.len() > 64
-            || !request
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        {
-            reply_or_disconnect!(
-                &mut write_half,
-                br#"{"id":"","error":"invalid request ID"}"#
-            );
-            continue;
-        }
-
-        const MAX_NIP46_PARAMS: usize = 10;
-        if request.params.len() > MAX_NIP46_PARAMS {
-            reply_or_disconnect!(
-                &mut write_half,
-                br#"{"id":"","error":"too many request params"}"#
-            );
-            continue;
-        }
 
         let method = request.method.clone();
         let response = dispatch_request(&handler, user_pubkey, app_pubkey, request, max_size).await;
@@ -325,5 +359,126 @@ async fn handle_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    // Feed `data` through a duplex stream (writer dropped to signal EOF) and read a
+    // single frame, returning the outcome and whatever was buffered.
+    async fn read_one(data: &[u8], max_size: usize) -> (FrameOutcome, Vec<u8>) {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        client.write_all(data).await.unwrap();
+        drop(client);
+        let mut reader = BufReader::new(server);
+        let mut buf = Vec::new();
+        let outcome = read_frame(&mut reader, &mut buf, max_size).await;
+        (outcome, buf)
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_line_without_the_newline() {
+        let (outcome, buf) = read_one(b"hello world\n", 1024).await;
+        assert!(matches!(outcome, FrameOutcome::Line { too_large: false }));
+        assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_frame_flags_oversize_line_terminated_by_newline() {
+        let (outcome, _) = read_one(b"abcdefghij\n", 4).await;
+        assert!(matches!(outcome, FrameOutcome::Line { too_large: true }));
+    }
+
+    #[tokio::test]
+    async fn read_frame_flags_oversize_line_with_no_newline_via_drain() {
+        let (outcome, _) = read_one(b"abcdefghij", 4).await;
+        assert!(matches!(outcome, FrameOutcome::Line { too_large: true }));
+    }
+
+    #[tokio::test]
+    async fn read_frame_reports_disconnect_on_immediate_eof() {
+        let (outcome, buf) = read_one(b"", 1024).await;
+        assert!(matches!(outcome, FrameOutcome::Disconnected));
+        assert!(buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_frame_treats_unterminated_data_as_a_line_on_eof() {
+        let (outcome, buf) = read_one(b"partial", 1024).await;
+        assert!(matches!(outcome, FrameOutcome::Line { too_large: false }));
+        assert_eq!(buf, b"partial");
+    }
+
+    fn req(id: &str, params: Vec<String>) -> crate::types::Nip46Request {
+        crate::types::Nip46Request {
+            id: id.to_string(),
+            method: "get_public_key".to_string(),
+            params,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_well_formed_envelope() {
+        assert!(validate_request_envelope(&req("abc-123", vec![])).is_none());
+    }
+
+    #[test]
+    fn validate_rejects_overlong_id() {
+        let id = "a".repeat(65);
+        assert_eq!(
+            validate_request_envelope(&req(&id, vec![])),
+            Some(&br#"{"id":"","error":"invalid request ID"}"#[..])
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_alphanumeric_id() {
+        assert_eq!(
+            validate_request_envelope(&req("bad id!", vec![])),
+            Some(&br#"{"id":"","error":"invalid request ID"}"#[..])
+        );
+    }
+
+    #[test]
+    fn validate_rejects_too_many_params() {
+        let params = vec!["x".to_string(); 11];
+        assert_eq!(
+            validate_request_envelope(&req("ok", params)),
+            Some(&br#"{"id":"","error":"too many request params"}"#[..])
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_invalid_utf8() {
+        assert_eq!(
+            parse_request(&[0xff, 0xfe]).unwrap_err(),
+            &br#"{"id":"","error":"invalid request"}"#[..]
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_invalid_json() {
+        assert_eq!(
+            parse_request(b"not json").unwrap_err(),
+            &br#"{"id":"","error":"invalid JSON"}"#[..]
+        );
+    }
+
+    #[test]
+    fn parse_request_rejects_malformed_envelope() {
+        let over = format!(r#"{{"id":"{}","method":"x"}}"#, "a".repeat(65));
+        assert_eq!(
+            parse_request(over.as_bytes()).unwrap_err(),
+            &br#"{"id":"","error":"invalid request ID"}"#[..]
+        );
+    }
+
+    #[test]
+    fn parse_request_accepts_a_valid_frame() {
+        let ok = parse_request(br#"{"id":"abc","method":"get_public_key","params":[]}"#);
+        assert!(ok.is_ok());
     }
 }
