@@ -950,6 +950,7 @@ mod tests {
             app.settings.start_minimized,
             false,
             Vec::new(),
+            app.settings.strict_cert_pinning,
         ));
     }
 
@@ -983,6 +984,29 @@ mod tests {
 
         assert!(app.window_visible);
         assert!(!app.settings.minimize_to_tray);
+    }
+
+    #[test]
+    fn strict_pinning_toggle_updates_settings_and_screen_and_defaults_off() {
+        use crate::screen::settings;
+        let s = default_settings();
+        assert!(
+            !s.strict_cert_pinning,
+            "strict pinning must be opt-in (default off)"
+        );
+        let mut app = App::test_new(s, false);
+        set_settings_screen(&mut app);
+
+        let _task = app.handle_settings_message_new(settings::Message::StrictPinningToggled(true));
+        assert!(app.settings.strict_cert_pinning);
+        if let Screen::Settings(scr) = &app.screen {
+            assert!(scr.strict_cert_pinning);
+        } else {
+            panic!("expected settings screen");
+        }
+
+        let _task = app.handle_settings_message_new(settings::Message::StrictPinningToggled(false));
+        assert!(!app.settings.strict_cert_pinning);
     }
 
     #[test]
@@ -1116,6 +1140,7 @@ mod tests {
             start_minimized: true,
             bunker_auto_start: false,
             local_signer_auto_start: false,
+            strict_cert_pinning: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         let parsed: Settings = serde_json::from_str(&json).unwrap();

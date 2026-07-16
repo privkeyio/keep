@@ -187,6 +187,7 @@ impl App {
             },
             certificate_pins: self.certificate_pins.clone(),
             keep_path: self.keep_path.clone(),
+            require_pinned: self.settings.strict_cert_pinning,
         }
     }
 
