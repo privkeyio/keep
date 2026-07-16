@@ -2750,7 +2750,12 @@ impl KeepMobile {
                             }
                         }
                     }
-                    Err(e @ keep_frost_net::FrostNetError::CertificatePinMismatch { .. }) => {
+                    Err(
+                        e @ (keep_frost_net::FrostNetError::CertificatePinMismatch { .. }
+                        | keep_frost_net::FrostNetError::CertificatePinMissing { .. }),
+                    ) => {
+                        // Fail closed on both a changed pin and, under strict
+                        // mode, an un-provisioned relay; do not silently skip.
                         return Err(e.into());
                     }
                     Err(e) => {

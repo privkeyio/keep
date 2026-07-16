@@ -739,9 +739,14 @@ impl SettingsScreen {
             self.strict_cert_pinning,
             Message::StrictPinningToggled(!self.strict_cert_pinning),
         );
+        let mode_caption = if self.strict_cert_pinning {
+            "Strict: relays with no recorded pin are rejected; provision pins first"
+        } else {
+            "Pins are set on first connection to each relay (TOFU)"
+        };
         let mut col = column![
             theme::label("TLS certificate pinning"),
-            theme::muted("Pins are set on first connection to each relay (TOFU)"),
+            theme::muted(mode_caption),
             row![
                 theme::muted("Strict pinning (reject relays with no recorded pin)"),
                 strict_btn

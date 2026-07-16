@@ -36,6 +36,12 @@ pub enum FrostNetError {
         actual: String,
     },
 
+    #[error(
+        "No certificate pin recorded for {hostname} and strict pinning is enabled; \
+         provision the relay's pin or disable strict pinning"
+    )]
+    CertificatePinMissing { hostname: String },
+
     #[error("Timeout: {0}")]
     Timeout(String),
 
