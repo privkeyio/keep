@@ -83,6 +83,27 @@ fn parse_pubkey(s: &str) -> Result<PublicKey> {
     })
 }
 
+/// Decide one peer's group-key confirmation against our own during the DKG
+/// equivocation check. `Ok(true)` when it matches and is a newly-counted peer,
+/// `Ok(false)` when that peer was already counted, and `Err` when the peer
+/// reports a DIFFERENT group key, which means the relay handed inconsistent
+/// round1 packages and the DKG must abort rather than persist a split keyset.
+/// Extracted so the equivocation decision is unit-testable without relay I/O.
+fn accept_group_key_confirmation(
+    ours: &str,
+    sender_index: u16,
+    theirs: &str,
+    already_confirmed: &mut HashSet<u16>,
+) -> Result<bool> {
+    if theirs.trim() != ours {
+        return Err(KeepError::FrostErr(FrostError::dkg(format!(
+            "participant {sender_index} derived a different group key than ours; aborting DKG \
+             (the relay may have equivocated round1 packages)"
+        ))));
+    }
+    Ok(already_confirmed.insert(sender_index))
+}
+
 /// Canonical group_id preimage, the single source of truth for the group
 /// identifier: `sha256("frost-group-id-v1" || name || [threshold] ||
 /// [participants] || each raw npub string in 1..=participants order)`.
@@ -1178,6 +1199,110 @@ fn cmd_frost_network_dkg_software(
             .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("finalize: {e}"))))?;
         spinner.finish();
 
+        // Equivocation check (keep-dcnq): round1 packages are broadcast through a
+        // single relay with no consistency round, so a malicious relay can hand
+        // DIFFERENT round1 sets to different participants, who then finalize
+        // DIFFERENT group keys with nothing in the base protocol to catch it.
+        // Before persisting, every participant broadcasts the group key it derived
+        // (an authenticated event the relay cannot forge) and requires all peers to
+        // report the SAME key. A divergence, or a peer that never confirms, aborts
+        // the DKG instead of storing an inconsistent keyset.
+        let our_group_hex = hex::encode(result.group_pubkey);
+        let confirm_event = EventBuilder::new(Kind::Custom(21107), &our_group_hex)
+            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
+            .tag(Tag::custom(
+                TagKind::custom("sender_index"),
+                vec![our_index.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("dkg_mode"),
+                vec!["software_v1".to_string()],
+            ))
+            .sign_with_keys(&keys)
+            .map_err(|e| {
+                KeepError::CryptoErr(CryptoError::invalid_signature(format!(
+                    "confirm event: {e}"
+                )))
+            })?;
+        client
+            .send_event(&confirm_event)
+            .await
+            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(format!("confirm: {e}"))))?;
+
+        out.newline();
+        out.info(&format!(
+            "Confirming the group key matches across {expected_peers} peers..."
+        ));
+        let confirm_filter = Filter::new()
+            .kind(Kind::Custom(21107))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
+        let start = std::time::Instant::now();
+        let mut confirmed_indices: HashSet<u16> = HashSet::new();
+        let mut seen_confirm: HashSet<EventId> = HashSet::new();
+        while (confirmed_indices.len() as u32) < expected_peers as u32 {
+            if start.elapsed() > timeout {
+                return Err(KeepError::NetworkErr(NetworkError::timeout(
+                    "waiting for peer group-key confirmations (possible relay equivocation)",
+                )));
+            }
+            let events = client
+                .fetch_events(confirm_filter.clone(), std::time::Duration::from_secs(5))
+                .await
+                .map_err(|e| {
+                    KeepError::NetworkErr(NetworkError::request(format!("fetch confirm: {e}")))
+                })?;
+            for ev in events.iter() {
+                if ev.pubkey == keys.public_key() {
+                    continue;
+                }
+                if !seen_confirm.insert(ev.id) {
+                    continue;
+                }
+                if seen_confirm.len() > MAX_DKG_EVENTS_SEEN {
+                    return Err(KeepError::NetworkErr(NetworkError::request(
+                        "too many distinct DKG confirm events; aborting to bound memory"
+                            .to_string(),
+                    )));
+                }
+                let is_software = ev.tags.iter().any(|t| {
+                    let slice = t.as_slice();
+                    slice.first().map(|s| s.as_str()) == Some("dkg_mode")
+                        && slice.get(1).map(|s| s.as_str()) == Some("software_v1")
+                });
+                if !is_software {
+                    continue;
+                }
+                let sender_idx = ev.tags.iter().find_map(|t| {
+                    let slice = t.as_slice();
+                    if slice.first().map(|s| s.as_str()) == Some("sender_index") {
+                        slice.get(1).and_then(|s| s.parse::<u16>().ok())
+                    } else {
+                        None
+                    }
+                });
+                let sender_idx = match sender_idx {
+                    Some(i) => i,
+                    None => continue,
+                };
+                if !roster.authenticates(sender_idx, &ev.pubkey, out, "group-key confirmation") {
+                    continue;
+                }
+                if accept_group_key_confirmation(
+                    &our_group_hex,
+                    sender_idx,
+                    &ev.content,
+                    &mut confirmed_indices,
+                )? {
+                    out.success(&format!(
+                        "Participant {sender_idx} confirmed the same group key"
+                    ));
+                }
+            }
+            if (confirmed_indices.len() as u32) < expected_peers as u32 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+
         let spinner = out.spinner("Storing share in vault...");
         keep.frost_store_dkg_share(&result, threshold as u16, participants as u16, group)?;
         spinner.finish();
@@ -1575,5 +1700,30 @@ mod tests {
         };
         assert!(roster.expected_pubkey(1).is_ok());
         assert!(roster.expected_pubkey(2).is_err());
+    }
+
+    #[test]
+    fn group_key_confirmation_accepts_matching_and_counts_each_peer_once() {
+        let ours = "aabb";
+        let mut seen = HashSet::new();
+        // A matching peer is counted once.
+        assert!(accept_group_key_confirmation(ours, 2, "aabb", &mut seen).unwrap());
+        // The same peer confirming again is not double-counted.
+        assert!(!accept_group_key_confirmation(ours, 2, "aabb", &mut seen).unwrap());
+        // A different peer is counted.
+        assert!(accept_group_key_confirmation(ours, 3, "aabb", &mut seen).unwrap());
+        assert_eq!(seen.len(), 2);
+        // Surrounding whitespace in the wire content does not cause a false abort.
+        assert!(accept_group_key_confirmation(ours, 4, "  aabb\n", &mut seen).unwrap());
+    }
+
+    #[test]
+    fn group_key_confirmation_aborts_on_divergent_key() {
+        let ours = "aabb";
+        let mut seen = HashSet::new();
+        // A peer that derived a different group key is an equivocation: abort.
+        assert!(accept_group_key_confirmation(ours, 2, "ccdd", &mut seen).is_err());
+        // The divergent peer is not counted as confirmed.
+        assert!(seen.is_empty());
     }
 }
