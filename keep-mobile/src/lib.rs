@@ -872,8 +872,15 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
 
-    pub fn export_ncryptsec(&self, password: String) -> Result<String, KeepMobileError> {
+    pub fn export_ncryptsec(&self, password: Vec<u8>) -> Result<String, KeepMobileError> {
+        // Accept the password as raw bytes so the caller (Kotlin) can pass a wipeable
+        // ByteArray instead of an immutable String that lingers on the JVM heap. The
+        // bytes are borrowed as UTF-8 in place; no owned String copy is made here.
         let password = Zeroizing::new(password);
+        let password =
+            std::str::from_utf8(&password).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "password must be valid UTF-8".into(),
+            })?;
         let share = self.load_share_package()?;
 
         if share.metadata.threshold != 1 || share.metadata.total_shares != 1 {
@@ -894,7 +901,7 @@ impl KeepMobile {
                 }
             })?);
 
-        keep_core::keys::nip49::encrypt(&secret, &password, Some(14))
+        keep_core::keys::nip49::encrypt(&secret, password, Some(14))
             .map_err(|e| KeepMobileError::EncryptionError { msg: e.to_string() })
     }
 
@@ -3917,6 +3924,55 @@ mod import_teardown_tests {
         assert!(
             matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("does not match its group key")),
             "expected a group-key mismatch rejection"
+        );
+    }
+
+    #[test]
+    fn export_ncryptsec_accepts_utf8_password_bytes() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let key_bytes = Zeroizing::new(hex::decode("03".repeat(32)).unwrap());
+        let (key_package, pubkey_package, vk_bytes) =
+            KeepMobile::build_nsec_packages(&key_bytes).unwrap();
+        let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
+        let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
+        mobile.store_share_package(&share).unwrap();
+        let expected_secret = key_package.signing_share().serialize();
+
+        let ncryptsec = mobile
+            .export_ncryptsec("correct horse battery".as_bytes().to_vec())
+            .unwrap();
+        assert!(ncryptsec.starts_with("ncryptsec1"));
+
+        // Round-trip: the password bytes must actually drive the encryption, so
+        // decrypting with the same password recovers the signing share, and a
+        // different password does not.
+        let recovered =
+            keep_core::keys::nip49::decrypt(&ncryptsec, "correct horse battery").unwrap();
+        assert_eq!(recovered.as_slice(), expected_secret.as_slice());
+        assert!(keep_core::keys::nip49::decrypt(&ncryptsec, "wrong password").is_err());
+    }
+
+    #[test]
+    fn export_ncryptsec_rejects_non_utf8_password_bytes() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let key_bytes = Zeroizing::new(hex::decode("03".repeat(32)).unwrap());
+        let (key_package, pubkey_package, vk_bytes) =
+            KeepMobile::build_nsec_packages(&key_bytes).unwrap();
+        let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
+        let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
+        mobile.store_share_package(&share).unwrap();
+
+        // 0xFF is never valid UTF-8: reject rather than silently mangle the password.
+        let result = mobile.export_ncryptsec(vec![0xff, 0xfe]);
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidInput { msg }) if msg.contains("UTF-8")),
+            "expected an InvalidInput UTF-8 rejection, got {result:?}"
         );
     }
 }

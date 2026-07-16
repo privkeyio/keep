@@ -287,7 +287,7 @@ interface KeepMobile {
     string export_share(string passphrase);
 
     [Throws=KeepMobileError]
-    string export_ncryptsec(string password);
+    string export_ncryptsec(sequence<u8> password);
 
     sequence<StoredShareInfo> list_shares();
 
