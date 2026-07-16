@@ -233,7 +233,13 @@ impl Nip46Client {
 
         match tokio::time::timeout(DEFAULT_REQUEST_TIMEOUT, setup).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                // Disconnect before propagating so the relay connections and the
+                // nostr-sdk background tasks they spawn are torn down instead of
+                // leaking (Drop does not disconnect), matching the timeout arm.
+                client.disconnect().await;
+                return Err(e);
+            }
             Err(_) => {
                 client.disconnect().await;
                 return Err(NetworkError::timeout(
