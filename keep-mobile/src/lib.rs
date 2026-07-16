@@ -877,9 +877,10 @@ impl KeepMobile {
         // ByteArray instead of an immutable String that lingers on the JVM heap. The
         // bytes are borrowed as UTF-8 in place; no owned String copy is made here.
         let password = Zeroizing::new(password);
-        let password = std::str::from_utf8(&password).map_err(|_| KeepMobileError::InvalidInput {
-            msg: "password must be valid UTF-8".into(),
-        })?;
+        let password =
+            std::str::from_utf8(&password).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "password must be valid UTF-8".into(),
+            })?;
         let share = self.load_share_package()?;
 
         if share.metadata.threshold != 1 || share.metadata.total_shares != 1 {
