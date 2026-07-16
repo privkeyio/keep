@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -572,330 +573,611 @@ pub(crate) async fn frost_event_listener(
     loop {
         tokio::select! {
             result = event_rx.recv() => {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-
-                macro_rules! log {
-                    ($ty:expr, $desc:expr) => {
-                        push_log(&frost_events, now_secs, $ty, $desc)
-                    };
-                }
-
-                match result {
-                    Ok(KfpNodeEvent::PeerDiscovered { share_index, ref name }) => {
-                        let label = name.as_deref().unwrap_or("Unknown");
-                        log!(EventLogType::PeerJoined, format!("Peer #{share_index} ({label}) joined"));
-                        let peers = build_peer_entries(&node);
-                        push_frost_event(&frost_events, FrostNodeMsg::PeerUpdate(peers));
-                    }
-                    Ok(KfpNodeEvent::PeerOffline { share_index }) => {
-                        log!(EventLogType::PeerLeft, format!("Peer #{share_index} went offline"));
-                        let peers = build_peer_entries(&node);
-                        push_frost_event(&frost_events, FrostNodeMsg::PeerUpdate(peers));
-                    }
-                    Ok(KfpNodeEvent::SigningStarted { session_id }) => {
-                        log!(EventLogType::SignRequest, format!("Signing started: {}", &hex::encode(session_id)[..8]));
-                    }
-                    Ok(KfpNodeEvent::SignatureComplete { session_id, .. }) => {
-                        log!(EventLogType::SignComplete, format!("Signature complete: {}", &hex::encode(session_id)[..8]));
-                        let id = hex::encode(session_id);
-                        if let Ok(mut guard) = pending_requests.lock() {
-                            guard.retain(|r| r.info.id != id);
-                        }
-                        push_frost_event(&frost_events, FrostNodeMsg::SignRequestRemoved(id));
-                    }
-                    Ok(KfpNodeEvent::SigningFailed { session_id, ref error, .. }) => {
-                        log!(EventLogType::SignFailed, format!("Signing failed: {}", truncate_peer_string(error)));
-                        let id = hex::encode(session_id);
-                        if let Ok(mut guard) = pending_requests.lock() {
-                            guard.retain(|r| r.info.id != id);
-                        }
-                        push_frost_event(&frost_events, FrostNodeMsg::SignRequestRemoved(id));
-                    }
-                    Ok(KfpNodeEvent::EcdhComplete { session_id, .. }) => {
-                        log!(EventLogType::EcdhComplete, format!("ECDH complete: {}", &hex::encode(session_id)[..8]));
-                    }
-                    Ok(KfpNodeEvent::EcdhFailed { session_id, ref error }) => {
-                        log!(EventLogType::EcdhFailed, format!("ECDH failed ({}): {}", &hex::encode(session_id)[..8], truncate_peer_string(error)));
-                    }
-                    Ok(KfpNodeEvent::DescriptorContributionNeeded {
-                        session_id,
-                        network,
-                        initiator_pubkey,
-                        ..
-                    }) => {
-                        log!(EventLogType::Descriptor, format!("Descriptor contribution needed ({network})"));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorContributionNeeded {
-                                session_id,
-                                network,
-                                initiator_pubkey,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorContributed {
-                        session_id,
-                        share_index,
-                    }) => {
-                        log!(EventLogType::Descriptor, format!("Peer #{share_index} contributed to descriptor"));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorContributed {
-                                session_id,
-                                share_index,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorReady { session_id }) => {
-                        log!(EventLogType::Descriptor, "Descriptor ready for finalization".to_string());
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorReady { session_id },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorComplete {
-                        session_id,
-                        external_descriptor,
-                        internal_descriptor,
-                        policy_hash,
-                        policy,
-                        ..
-                    }) => {
-                        log!(EventLogType::Descriptor, "Descriptor complete".to_string());
-                        let policy_value = match serde_json::to_value(&policy) {
-                            Ok(v) => Some(v),
-                            Err(e) => {
-                                tracing::error!(
-                                    error = %e,
-                                    session = %hex::encode(&session_id[..8]),
-                                    "failed to serialize WalletPolicy to JSON (recovery-tier verification will be unavailable for this descriptor)",
-                                );
-                                None
-                            }
-                        };
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorComplete {
-                                session_id,
-                                external_descriptor,
-                                internal_descriptor,
-                                policy_hash,
-                                policy: policy_value,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorAcked {
-                        session_id,
-                        share_index,
-                        ack_count,
-                        expected_acks,
-                    }) => {
-                        log!(EventLogType::Descriptor, format!("Descriptor ack from #{share_index} ({ack_count}/{expected_acks})"));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorAcked {
-                                session_id,
-                                share_index,
-                                ack_count,
-                                expected_acks,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorNacked {
-                        session_id,
-                        share_index,
-                        reason,
-                    }) => {
-                        log!(EventLogType::Error, format!("Descriptor nack from #{share_index}: {}", truncate_peer_string(&reason)));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorNacked {
-                                session_id,
-                                share_index,
-                                reason,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorFailed { session_id, error }) => {
-                        log!(EventLogType::Error, format!("Descriptor failed: {}", truncate_peer_string(&error)));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::DescriptorFailed { session_id, error },
-                        );
-                    }
-                    Ok(KfpNodeEvent::XpubAnnounced {
-                        share_index,
-                        recovery_xpubs,
-                    }) => {
-                        log!(EventLogType::Descriptor, format!("Peer #{share_index} announced {} xpub(s)", recovery_xpubs.len()));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::XpubAnnounced {
-                                share_index,
-                                recovery_xpubs,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::HealthCheckComplete {
-                        responsive,
-                        unresponsive,
-                        ..
-                    }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "Health check: {} responsive, {} unresponsive",
-                            responsive.len(),
-                            unresponsive.len()
-                        ));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::HealthCheckComplete {
-                                responsive,
-                                unresponsive,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorProposed { .. }) => {
-                        log!(EventLogType::Descriptor, "Descriptor proposed".to_string());
-                    }
-                    // TODO(WDC-PSBT): expose PSBT coordination to UI (#331)
-                    Ok(KfpNodeEvent::PsbtProposed { session_id, tier_index }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "PSBT proposed for tier {tier_index}: {}",
-                            &hex::encode(session_id)[..8]
-                        ));
-                    }
-                    Ok(KfpNodeEvent::PsbtSignatureNeeded { session_id, tier_index, initiator_pubkey }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "PSBT signature required for tier {tier_index} (session {})",
-                            &hex::encode(session_id)[..8]
-                        ));
-                        let snapshot = node.psbt_session_snapshot(&session_id);
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::PsbtSignatureNeeded {
-                                session_id,
-                                tier_index,
-                                initiator_pubkey,
-                                snapshot,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::PsbtSignatureReceived { session_id, signature_count, threshold, .. }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "PSBT signature received ({signature_count}/{threshold}): {}",
-                            &hex::encode(session_id)[..8]
-                        ));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::PsbtSignatureReceived {
-                                session_id,
-                                signature_count,
-                                threshold,
-                            },
-                        );
-                    }
-                    Ok(KfpNodeEvent::PsbtFinalized { session_id, txid }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "PSBT finalized: {}",
-                            &hex::encode(session_id)[..8]
-                        ));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::PsbtFinalized { session_id, txid },
-                        );
-                    }
-                    Ok(KfpNodeEvent::PsbtAborted { session_id, reason }) => {
-                        log!(EventLogType::Error, format!(
-                            "PSBT aborted ({}): {}",
-                            &hex::encode(session_id)[..8],
-                            truncate_peer_string(&reason)
-                        ));
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::PsbtAborted { session_id, reason },
-                        );
-                    }
-                    Ok(KfpNodeEvent::DescriptorMigrateReceived { session_id, new_version, .. }) => {
-                        log!(EventLogType::Descriptor, format!(
-                            "Descriptor migrate link ({}) v{}",
-                            &hex::encode(session_id)[..8],
-                            new_version,
-                        ));
-                    }
-                    // A verified duress beacon froze this node: surface it
-                    // prominently (co-signing and OPRF evals are now refused).
-                    Ok(KfpNodeEvent::DuressFrozen { beacon_pubkey }) => {
-                        log!(
-                            EventLogType::Error,
-                            format!(
-                                "DURESS: co-signing frozen by beacon {}",
-                                truncate_peer_string(&beacon_pubkey.to_string())
-                            )
-                        );
-                    }
-                    // Threshold-OPRF unlock events are not surfaced in the
-                    // desktop UI yet (KeepNode appliance flow).
-                    Ok(KfpNodeEvent::OprfEvalRequested { .. })
-                    | Ok(KfpNodeEvent::OprfUnlockComplete { .. })
-                    | Ok(KfpNodeEvent::OprfUnlockFailed { .. })
-                    | Ok(KfpNodeEvent::OprfShareReceived { .. })
-                    | Ok(KfpNodeEvent::OprfEnrollComplete { .. })
-                    | Ok(KfpNodeEvent::OprfEnrollFailed { .. }) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                if handle_node_event(result, &frost_events, &pending_requests, &node).is_break() {
+                    break;
                 }
             }
             result = request_rx.recv() => {
-                let Some((session, response_tx)) = result else {
-                    break;
-                };
-                let from_peer = session.requester;
-                let now = Instant::now();
-
-                if !check_rate_limit(
+                if handle_sign_request(
+                    result,
                     &mut global_request_times,
                     &mut peer_request_times,
+                    &frost_events,
                     &pending_requests,
-                    from_peer,
-                    now,
                     window,
-                ) {
-                    let _ = response_tx.try_send(false);
-                    continue;
-                }
-
-                let req = PendingSignRequest {
-                    id: hex::encode(session.session_id),
-                    message_preview: sanitize_message_preview(&session.message),
-                    from_peer,
-                    timestamp: std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                };
-
-                if let Ok(mut guard) = pending_requests.lock() {
-                    if guard.len() < MAX_PENDING_REQUESTS {
-                        global_request_times.push_back(now);
-                        peer_request_times.entry(from_peer).or_default().push_back(now);
-                        let entry = PendingRequestEntry {
-                            info: req.clone(),
-                            response_tx,
-                        };
-                        guard.push(entry);
-                        push_frost_event(
-                            &frost_events,
-                            FrostNodeMsg::NewSignRequest(req),
-                        );
-                    } else {
-                        let _ = response_tx.try_send(false);
-                    }
+                )
+                .is_break()
+                {
+                    break;
                 }
             }
         }
+    }
+}
+
+fn handle_sign_request(
+    result: Option<(SessionInfo, mpsc::Sender<bool>)>,
+    global_request_times: &mut VecDeque<Instant>,
+    peer_request_times: &mut HashMap<u16, VecDeque<Instant>>,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_requests: &Arc<Mutex<Vec<PendingRequestEntry>>>,
+    window: Duration,
+) -> ControlFlow<()> {
+    let Some((session, response_tx)) = result else {
+        return ControlFlow::Break(());
+    };
+    let from_peer = session.requester;
+    let now = Instant::now();
+
+    if !check_rate_limit(
+        global_request_times,
+        peer_request_times,
+        pending_requests,
+        from_peer,
+        now,
+        window,
+    ) {
+        let _ = response_tx.try_send(false);
+        return ControlFlow::Continue(());
+    }
+
+    let req = PendingSignRequest {
+        id: hex::encode(session.session_id),
+        message_preview: sanitize_message_preview(&session.message),
+        from_peer,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    if let Ok(mut guard) = pending_requests.lock() {
+        if guard.len() < MAX_PENDING_REQUESTS {
+            global_request_times.push_back(now);
+            peer_request_times
+                .entry(from_peer)
+                .or_default()
+                .push_back(now);
+            let entry = PendingRequestEntry {
+                info: req.clone(),
+                response_tx,
+            };
+            guard.push(entry);
+            push_frost_event(frost_events, FrostNodeMsg::NewSignRequest(req));
+        } else {
+            let _ = response_tx.try_send(false);
+        }
+    }
+
+    ControlFlow::Continue(())
+}
+
+fn handle_node_event(
+    result: Result<KfpNodeEvent, tokio::sync::broadcast::error::RecvError>,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_requests: &Arc<Mutex<Vec<PendingRequestEntry>>>,
+    node: &Arc<KfpNode>,
+) -> ControlFlow<()> {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let event = match result {
+        Err(RecvError::Lagged(_)) => return ControlFlow::Continue(()),
+        Err(RecvError::Closed) => return ControlFlow::Break(()),
+        Ok(event) => event,
+    };
+
+    match event {
+        ev @ (KfpNodeEvent::PeerDiscovered { .. }
+        | KfpNodeEvent::PeerOffline { .. }
+        | KfpNodeEvent::SigningStarted { .. }
+        | KfpNodeEvent::SignatureComplete { .. }
+        | KfpNodeEvent::SigningFailed { .. }
+        | KfpNodeEvent::EcdhComplete { .. }
+        | KfpNodeEvent::EcdhFailed { .. }) => {
+            handle_peer_signing_node_event(ev, now_secs, frost_events, pending_requests, node);
+        }
+        ev @ (KfpNodeEvent::DescriptorContributionNeeded { .. }
+        | KfpNodeEvent::DescriptorContributed { .. }
+        | KfpNodeEvent::DescriptorComplete { .. }) => {
+            handle_descriptor_node_event(ev, now_secs, frost_events);
+        }
+        ev @ (KfpNodeEvent::DescriptorReady { .. }
+        | KfpNodeEvent::DescriptorAcked { .. }
+        | KfpNodeEvent::DescriptorNacked { .. }
+        | KfpNodeEvent::DescriptorFailed { .. }
+        | KfpNodeEvent::DescriptorProposed { .. }) => {
+            handle_descriptor_status_node_event(ev, now_secs, frost_events);
+        }
+        ev @ (KfpNodeEvent::XpubAnnounced { .. }
+        | KfpNodeEvent::HealthCheckComplete { .. }
+        | KfpNodeEvent::DescriptorMigrateReceived { .. }) => {
+            handle_descriptor_health_node_event(ev, now_secs, frost_events);
+        }
+        ev @ (KfpNodeEvent::PsbtProposed { .. }
+        | KfpNodeEvent::PsbtSignatureNeeded { .. }
+        | KfpNodeEvent::PsbtSignatureReceived { .. }) => {
+            handle_psbt_node_event(ev, now_secs, frost_events, node);
+        }
+        ev @ (KfpNodeEvent::PsbtFinalized { .. } | KfpNodeEvent::PsbtAborted { .. }) => {
+            handle_psbt_status_node_event(ev, now_secs, frost_events);
+        }
+        // A verified duress beacon froze this node: surface it
+        // prominently (co-signing and OPRF evals are now refused).
+        KfpNodeEvent::DuressFrozen { beacon_pubkey } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!(
+                    "DURESS: co-signing frozen by beacon {}",
+                    truncate_peer_string(&beacon_pubkey.to_string())
+                ),
+            );
+        }
+        // Threshold-OPRF unlock events are not surfaced in the
+        // desktop UI yet (KeepNode appliance flow).
+        KfpNodeEvent::OprfEvalRequested { .. }
+        | KfpNodeEvent::OprfUnlockComplete { .. }
+        | KfpNodeEvent::OprfUnlockFailed { .. }
+        | KfpNodeEvent::OprfShareReceived { .. }
+        | KfpNodeEvent::OprfEnrollComplete { .. }
+        | KfpNodeEvent::OprfEnrollFailed { .. } => {}
+    }
+
+    ControlFlow::Continue(())
+}
+
+fn handle_peer_signing_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    pending_requests: &Arc<Mutex<Vec<PendingRequestEntry>>>,
+    node: &Arc<KfpNode>,
+) {
+    match event {
+        KfpNodeEvent::PeerDiscovered {
+            share_index,
+            ref name,
+        } => {
+            let label = name.as_deref().unwrap_or("Unknown");
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::PeerJoined,
+                format!("Peer #{share_index} ({label}) joined"),
+            );
+            let peers = build_peer_entries(node);
+            push_frost_event(frost_events, FrostNodeMsg::PeerUpdate(peers));
+        }
+        KfpNodeEvent::PeerOffline { share_index } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::PeerLeft,
+                format!("Peer #{share_index} went offline"),
+            );
+            let peers = build_peer_entries(node);
+            push_frost_event(frost_events, FrostNodeMsg::PeerUpdate(peers));
+        }
+        KfpNodeEvent::SigningStarted { session_id } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::SignRequest,
+                format!("Signing started: {}", &hex::encode(session_id)[..8]),
+            );
+        }
+        KfpNodeEvent::SignatureComplete { session_id, .. } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::SignComplete,
+                format!("Signature complete: {}", &hex::encode(session_id)[..8]),
+            );
+            let id = hex::encode(session_id);
+            if let Ok(mut guard) = pending_requests.lock() {
+                guard.retain(|r| r.info.id != id);
+            }
+            push_frost_event(frost_events, FrostNodeMsg::SignRequestRemoved(id));
+        }
+        KfpNodeEvent::SigningFailed {
+            session_id,
+            ref error,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::SignFailed,
+                format!("Signing failed: {}", truncate_peer_string(error)),
+            );
+            let id = hex::encode(session_id);
+            if let Ok(mut guard) = pending_requests.lock() {
+                guard.retain(|r| r.info.id != id);
+            }
+            push_frost_event(frost_events, FrostNodeMsg::SignRequestRemoved(id));
+        }
+        KfpNodeEvent::EcdhComplete { session_id, .. } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::EcdhComplete,
+                format!("ECDH complete: {}", &hex::encode(session_id)[..8]),
+            );
+        }
+        KfpNodeEvent::EcdhFailed {
+            session_id,
+            ref error,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::EcdhFailed,
+                format!(
+                    "ECDH failed ({}): {}",
+                    &hex::encode(session_id)[..8],
+                    truncate_peer_string(error)
+                ),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn handle_descriptor_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+) {
+    match event {
+        KfpNodeEvent::DescriptorContributionNeeded {
+            session_id,
+            network,
+            initiator_pubkey,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!("Descriptor contribution needed ({network})"),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorContributionNeeded {
+                    session_id,
+                    network,
+                    initiator_pubkey,
+                },
+            );
+        }
+        KfpNodeEvent::DescriptorContributed {
+            session_id,
+            share_index,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!("Peer #{share_index} contributed to descriptor"),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorContributed {
+                    session_id,
+                    share_index,
+                },
+            );
+        }
+        KfpNodeEvent::DescriptorComplete {
+            session_id,
+            external_descriptor,
+            internal_descriptor,
+            policy_hash,
+            policy,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                "Descriptor complete".to_string(),
+            );
+            let policy_value = match serde_json::to_value(&policy) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        session = %hex::encode(&session_id[..8]),
+                        "failed to serialize WalletPolicy to JSON (recovery-tier verification will be unavailable for this descriptor)",
+                    );
+                    None
+                }
+            };
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorComplete {
+                    session_id,
+                    external_descriptor,
+                    internal_descriptor,
+                    policy_hash,
+                    policy: policy_value,
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn handle_descriptor_status_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+) {
+    match event {
+        KfpNodeEvent::DescriptorReady { session_id } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                "Descriptor ready for finalization".to_string(),
+            );
+            push_frost_event(frost_events, FrostNodeMsg::DescriptorReady { session_id });
+        }
+        KfpNodeEvent::DescriptorAcked {
+            session_id,
+            share_index,
+            ack_count,
+            expected_acks,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!("Descriptor ack from #{share_index} ({ack_count}/{expected_acks})"),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorAcked {
+                    session_id,
+                    share_index,
+                    ack_count,
+                    expected_acks,
+                },
+            );
+        }
+        KfpNodeEvent::DescriptorNacked {
+            session_id,
+            share_index,
+            reason,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!(
+                    "Descriptor nack from #{share_index}: {}",
+                    truncate_peer_string(&reason)
+                ),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorNacked {
+                    session_id,
+                    share_index,
+                    reason,
+                },
+            );
+        }
+        KfpNodeEvent::DescriptorFailed { session_id, error } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!("Descriptor failed: {}", truncate_peer_string(&error)),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::DescriptorFailed { session_id, error },
+            );
+        }
+        KfpNodeEvent::DescriptorProposed { .. } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                "Descriptor proposed".to_string(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn handle_descriptor_health_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+) {
+    match event {
+        KfpNodeEvent::XpubAnnounced {
+            share_index,
+            recovery_xpubs,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "Peer #{share_index} announced {} xpub(s)",
+                    recovery_xpubs.len()
+                ),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::XpubAnnounced {
+                    share_index,
+                    recovery_xpubs,
+                },
+            );
+        }
+        KfpNodeEvent::HealthCheckComplete {
+            responsive,
+            unresponsive,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "Health check: {} responsive, {} unresponsive",
+                    responsive.len(),
+                    unresponsive.len()
+                ),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::HealthCheckComplete {
+                    responsive,
+                    unresponsive,
+                },
+            );
+        }
+        KfpNodeEvent::DescriptorMigrateReceived {
+            session_id,
+            new_version,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "Descriptor migrate link ({}) v{}",
+                    &hex::encode(session_id)[..8],
+                    new_version,
+                ),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn handle_psbt_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+    node: &Arc<KfpNode>,
+) {
+    match event {
+        // TODO(WDC-PSBT): expose PSBT coordination to UI (#331)
+        KfpNodeEvent::PsbtProposed {
+            session_id,
+            tier_index,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "PSBT proposed for tier {tier_index}: {}",
+                    &hex::encode(session_id)[..8]
+                ),
+            );
+        }
+        KfpNodeEvent::PsbtSignatureNeeded {
+            session_id,
+            tier_index,
+            initiator_pubkey,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "PSBT signature required for tier {tier_index} (session {})",
+                    &hex::encode(session_id)[..8]
+                ),
+            );
+            let snapshot = node.psbt_session_snapshot(&session_id);
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::PsbtSignatureNeeded {
+                    session_id,
+                    tier_index,
+                    initiator_pubkey,
+                    snapshot,
+                },
+            );
+        }
+        KfpNodeEvent::PsbtSignatureReceived {
+            session_id,
+            signature_count,
+            threshold,
+            ..
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!(
+                    "PSBT signature received ({signature_count}/{threshold}): {}",
+                    &hex::encode(session_id)[..8]
+                ),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::PsbtSignatureReceived {
+                    session_id,
+                    signature_count,
+                    threshold,
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
+fn handle_psbt_status_node_event(
+    event: KfpNodeEvent,
+    now_secs: u64,
+    frost_events: &Arc<Mutex<VecDeque<FrostNodeMsg>>>,
+) {
+    match event {
+        KfpNodeEvent::PsbtFinalized { session_id, txid } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Descriptor,
+                format!("PSBT finalized: {}", &hex::encode(session_id)[..8]),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::PsbtFinalized { session_id, txid },
+            );
+        }
+        KfpNodeEvent::PsbtAborted { session_id, reason } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!(
+                    "PSBT aborted ({}): {}",
+                    &hex::encode(session_id)[..8],
+                    truncate_peer_string(&reason)
+                ),
+            );
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::PsbtAborted { session_id, reason },
+            );
+        }
+        _ => {}
     }
 }
 
