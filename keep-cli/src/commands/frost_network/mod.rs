@@ -1777,12 +1777,17 @@ mod tests {
         assert!(!auto_approve_conflicts(false, false));
     }
 
+    #[cfg(unix)]
     fn temp_path_for(path: &Path) -> std::path::PathBuf {
         let mut s = path.as_os_str().to_owned();
         s.push(".tmp");
         std::path::PathBuf::from(s)
     }
 
+    // `write_secret_file` fsyncs the containing directory, which requires opening
+    // it as a file handle; that errors on Windows, so this appliance-only writer is
+    // exercised on Unix only (matching `write_secret_file_is_owner_only`).
+    #[cfg(unix)]
     #[test]
     fn write_secret_file_round_trips_and_leaves_no_temp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1814,6 +1819,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn write_secret_file_writes_empty_and_binary_payloads() {
         let dir = tempfile::tempdir().unwrap();
