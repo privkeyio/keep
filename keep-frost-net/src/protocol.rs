@@ -250,556 +250,633 @@ impl KfpMessage {
 
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
-            KfpMessage::Announce(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                if let Some(ref name) = p.name {
-                    if name.len() > MAX_NAME_LENGTH {
-                        return Err("Name exceeds maximum length");
-                    }
-                }
-                if p.capabilities.len() > MAX_CAPABILITIES {
-                    return Err("Too many capabilities");
-                }
-                for cap in &p.capabilities {
-                    if cap.len() > MAX_CAPABILITY_LENGTH {
-                        return Err("Capability string exceeds maximum length");
-                    }
-                }
-                if let Some(ref tpm) = p.tpm_attestation {
-                    if tpm.attest.is_empty() || tpm.attest.len() > MAX_TPM_ATTEST_SIZE {
-                        return Err("TPM attest exceeds maximum size");
-                    }
-                    if tpm.signature.len() != 64 {
-                        return Err("TPM signature must be 64 bytes");
-                    }
-                    if tpm.ak_sec1.len() != 65 || tpm.ak_sec1[0] != 0x04 {
-                        return Err("TPM AK must be a 65-byte uncompressed SEC1 point");
-                    }
-                    if tpm.pcr_values.is_empty() || tpm.pcr_values.len() > MAX_TPM_PCR_VALUES {
-                        return Err("TPM PCR value count out of range");
-                    }
-                    // Validate each PCR value's hex shape with the same fail-closed decoder the
-                    // appraisal uses, so the wire validator and verifier cannot diverge.
-                    crate::tpm_quote::decode_pcr_values(&tpm.pcr_values)?;
-                }
-            }
-            KfpMessage::SignRequest(p) => {
-                if p.message.len() > MAX_MESSAGE_SIZE {
-                    return Err("Message exceeds maximum size");
-                }
-                if p.message_type.len() > MAX_MESSAGE_TYPE_LENGTH {
-                    return Err("Message type exceeds maximum length");
-                }
-                if let Some(sp) = p.structured_payload.as_ref() {
-                    if sp.len() > MAX_STRUCTURED_PAYLOAD_SIZE {
-                        return Err("Structured payload exceeds maximum size");
-                    }
-                }
-                if p.derivation_path.len() > MAX_DERIVATION_PATH_DEPTH {
-                    return Err("Derivation path exceeds maximum depth");
-                }
-                if p.derivation_path
-                    .iter()
-                    .any(|&i| i >= BIP32_HARDENED_INDEX_START)
-                {
-                    return Err("Derivation path contains a hardened index; \
-                         only unhardened indexes are meaningful for FROST groups");
-                }
-                if p.participants.len() > MAX_PARTICIPANTS {
-                    return Err("Participants list exceeds maximum size");
-                }
-                if p.nonce_refs.len() > MAX_PARTICIPANTS {
-                    return Err("Nonce refs exceed maximum size");
-                }
-                if !p.nonce_refs.is_empty() {
-                    if p.nonce_refs.len() != p.participants.len() {
-                        return Err("Nonce refs must cover all participants");
-                    }
-                    let expected: HashSet<u16> = p.participants.iter().copied().collect();
-                    let mut seen_refs: HashSet<u16> = HashSet::new();
-                    // An all-zero `nonce_id` is the sentinel marking the
-                    // requester's own commitment (echo-only, never consumed).
-                    // Exactly one ref must carry it.
-                    let mut sentinel_refs = 0usize;
-                    for nref in &p.nonce_refs {
-                        if nref.commitment.len() > MAX_COMMITMENT_SIZE {
-                            return Err("Nonce ref commitment exceeds maximum size");
-                        }
-                        if !seen_refs.insert(nref.share_index) {
-                            return Err("Duplicate share_index in nonce_refs");
-                        }
-                        if !expected.contains(&nref.share_index) {
-                            return Err("Nonce ref share_index not in participants");
-                        }
-                        if nref.nonce_id == [0u8; 32] {
-                            sentinel_refs += 1;
-                        }
-                    }
-                    if seen_refs != expected {
-                        return Err("Nonce refs must match participant share indices");
-                    }
-                    if sentinel_refs != 1 {
-                        return Err("Nonce refs must contain exactly one sentinel");
-                    }
-                }
-            }
-            KfpMessage::NonceCommitment(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                if p.commitments.len() > MAX_NONCE_COMMITMENTS {
-                    return Err("Too many nonce commitments");
-                }
-                for c in &p.commitments {
-                    if c.commitment.len() > MAX_COMMITMENT_SIZE {
-                        return Err("Commitment exceeds maximum size");
-                    }
-                }
-            }
-            KfpMessage::Commitment(p) => {
-                if p.commitment.len() > MAX_COMMITMENT_SIZE {
-                    return Err("Commitment exceeds maximum size");
-                }
-            }
-            KfpMessage::SignatureShare(p) => {
-                if p.signature_share.len() > MAX_SIGNATURE_SHARE_SIZE {
-                    return Err("Signature share exceeds maximum size");
-                }
-            }
-            KfpMessage::Error(p) => {
-                if p.code.len() > MAX_ERROR_CODE_LENGTH {
-                    return Err("Error code exceeds maximum length");
-                }
-                if p.message.len() > MAX_ERROR_MESSAGE_LENGTH {
-                    return Err("Error message exceeds maximum length");
-                }
-            }
-            KfpMessage::EcdhRequest(p) => {
-                if p.participants.len() > MAX_PARTICIPANTS {
-                    return Err("Participants list exceeds maximum size");
-                }
-            }
-            KfpMessage::EcdhShare(p) => {
-                if p.partial_point.len() != 33 {
-                    return Err("Invalid partial point size");
-                }
-            }
-            KfpMessage::EcdhComplete(p) => {
-                if p.shared_secret.len() != 32 {
-                    return Err("Invalid shared secret size");
-                }
-            }
-            KfpMessage::OprfEvalRequest(p) => {
-                if p.participants.is_empty() {
-                    return Err("Participants list must not be empty");
-                }
-                if p.participants.len() > MAX_PARTICIPANTS {
-                    return Err("Participants list exceeds maximum size");
-                }
-                if p.requester_share_index == 0 {
-                    return Err("requester_share_index must be non-zero");
-                }
-            }
-            KfpMessage::OprfEvalShare(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                // Wire layout of an OPRF partial: 32-byte identifier scalar plus a
-                // 33-byte compressed point (see keep_core::oprf::threshold).
-                if p.partial.len() != OPRF_PARTIAL_LEN {
-                    return Err("Invalid OPRF partial size");
-                }
-            }
-            KfpMessage::OprfEnroll(p) => {
-                // The secret share is exactly the serialized key-share length.
-                if p.share.len() != keep_core::oprf::threshold::KEY_SHARE_LEN {
-                    return Err("Invalid OPRF key share size");
-                }
-                if p.dealer_index == 0 {
-                    return Err("dealer_index must be non-zero");
-                }
-                if p.target_index == 0 {
-                    return Err("target_index must be non-zero");
-                }
-                if p.threshold < 2 {
-                    return Err("threshold must be at least 2");
-                }
-                if p.threshold > p.total {
-                    return Err("threshold must not exceed total");
-                }
-                if p.total as usize > MAX_PARTICIPANTS {
-                    return Err("total exceeds maximum participants");
-                }
-            }
-            KfpMessage::OprfEnrollAck(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-            }
-            KfpMessage::RefreshRequest(p) => {
-                if p.participants.len() > MAX_PARTICIPANTS {
-                    return Err("Participants list exceeds maximum size");
-                }
-                if p.participants.len() < 2 {
-                    return Err("Refresh requires at least 2 participants");
-                }
-                if p.participants.contains(&0) {
-                    return Err("Participant index must be non-zero");
-                }
-                let unique: std::collections::HashSet<_> = p.participants.iter().collect();
-                if unique.len() != p.participants.len() {
-                    return Err("Duplicate participant indices");
-                }
-            }
-            KfpMessage::RefreshRound1(p) => {
-                if p.package.is_empty() {
-                    return Err("Package must not be empty");
-                }
-                if p.package.len() > MAX_MESSAGE_SIZE {
-                    return Err("Round1 package exceeds maximum size");
-                }
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-            }
-            KfpMessage::RefreshRound2(p) => {
-                if p.package.is_empty() {
-                    return Err("Package must not be empty");
-                }
-                if p.package.len() > MAX_MESSAGE_SIZE {
-                    return Err("Round2 package exceeds maximum size");
-                }
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                if p.target_index == 0 {
-                    return Err("target_index must be non-zero");
-                }
-                if p.share_index == p.target_index {
-                    return Err("share_index must differ from target_index");
-                }
-            }
-            KfpMessage::RefreshComplete(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-            }
-            KfpMessage::DescriptorPropose(p) => {
-                if let Some(t) = p.timeout_secs {
-                    if t == 0 {
-                        return Err("timeout_secs must be greater than zero");
-                    }
-                    if t > DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
-                        return Err("timeout_secs exceeds maximum allowed value");
-                    }
-                }
-                if !VALID_NETWORKS.contains(&p.network.as_str()) {
-                    return Err("Invalid network value");
-                }
-                if !is_valid_xpub(&p.initiator_xpub) {
-                    return Err("Invalid initiator xpub");
-                }
-                if !is_valid_fingerprint(&p.initiator_fingerprint) {
-                    return Err("Initiator fingerprint must be exactly 8 hex characters");
-                }
-                if p.policy.version == 0 {
-                    return Err("Policy version must be >= 1");
-                }
-                if p.policy.recovery_tiers.is_empty() {
-                    return Err("Policy must have at least one recovery tier");
-                }
-                if p.policy.recovery_tiers.len() > MAX_RECOVERY_TIERS {
-                    return Err("Too many recovery tiers");
-                }
-                for tier in &p.policy.recovery_tiers {
-                    if tier.key_slots.len() > MAX_KEYS_PER_TIER {
-                        return Err("Too many keys in tier");
-                    }
-                    if tier.threshold == 0 {
-                        return Err("Tier threshold must be non-zero");
-                    }
-                    if tier.timelock_months == 0 {
-                        return Err("Tier timelock must be non-zero");
-                    }
-                    if tier.threshold as usize > tier.key_slots.len() {
-                        return Err("Tier threshold exceeds number of key slots");
-                    }
-                    for slot in &tier.key_slots {
-                        match slot {
-                            KeySlot::Participant { share_index } => {
-                                if *share_index == 0 {
-                                    return Err("Participant share_index must be non-zero");
-                                }
-                            }
-                            KeySlot::External { xpub, fingerprint } => {
-                                if !is_valid_xpub(xpub) {
-                                    return Err("Invalid external xpub");
-                                }
-                                if !is_valid_fingerprint(fingerprint) {
-                                    return Err(
-                                        "External fingerprint must be exactly 8 hex characters",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            KfpMessage::DescriptorContribute(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                if !is_valid_xpub(&p.account_xpub) {
-                    return Err("Invalid account xpub");
-                }
-                if !is_valid_fingerprint(&p.fingerprint) {
-                    return Err("Fingerprint must be exactly 8 hex characters");
-                }
-            }
-            KfpMessage::DescriptorFinalize(p) => {
-                if p.external_descriptor.is_empty() {
-                    return Err("External descriptor cannot be empty");
-                }
-                if p.internal_descriptor.is_empty() {
-                    return Err("Internal descriptor cannot be empty");
-                }
-                if p.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
-                    return Err("External descriptor exceeds maximum length");
-                }
-                if p.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
-                    return Err("Internal descriptor exceeds maximum length");
-                }
-                if p.contributions.len() > MAX_PARTICIPANTS {
-                    return Err("Too many contributions in finalize payload");
-                }
-                for (&idx, contrib) in &p.contributions {
-                    if idx == 0 {
-                        return Err("Invalid contribution index");
-                    }
-                    if idx as usize > MAX_PARTICIPANTS {
-                        return Err("Contribution index exceeds maximum");
-                    }
-                    if !is_valid_xpub(&contrib.account_xpub) {
-                        return Err("Invalid contribution xpub");
-                    }
-                    if !is_valid_fingerprint(&contrib.fingerprint) {
-                        return Err("Contribution fingerprint must be exactly 8 hex characters");
-                    }
-                }
-            }
-            KfpMessage::DescriptorAck(p) => {
-                if p.key_proof_psbt.is_empty() {
-                    return Err("key_proof_psbt must not be empty");
-                }
-                if p.key_proof_psbt.len() > MAX_KEY_PROOF_PSBT_SIZE {
-                    return Err("key_proof_psbt exceeds maximum size");
-                }
-            }
-            KfpMessage::DescriptorNack(p) => {
-                if p.reason.is_empty() {
-                    return Err("Nack reason must not be empty");
-                }
-                if p.reason.len() > MAX_NACK_REASON_LENGTH {
-                    return Err("Nack reason exceeds maximum length");
-                }
-            }
-            KfpMessage::DescriptorMigrate(p) => {
-                p.validate()?;
-            }
-            KfpMessage::PsbtPropose(p) => {
-                if p.psbt.is_empty() {
-                    return Err("PSBT must not be empty");
-                }
-                if !p.psbt.starts_with(PSBT_MAGIC) {
-                    return Err("PSBT must start with the PSBT magic bytes");
-                }
-                if p.psbt.len() > MAX_PSBT_SIZE {
-                    return Err("PSBT exceeds maximum size");
-                }
-                if (p.tier_index as usize) >= MAX_RECOVERY_TIERS {
-                    return Err("tier_index exceeds maximum recovery tiers");
-                }
-                if let Some(t) = p.timeout_secs {
-                    if t == 0 {
-                        return Err("timeout_secs must be greater than zero");
-                    }
-                    if t > PSBT_SESSION_MAX_TIMEOUT_SECS {
-                        return Err("timeout_secs exceeds maximum allowed value");
-                    }
-                }
-                if p.expected_signers.is_empty() && p.expected_fingerprints.is_empty() {
-                    return Err("Must specify at least one expected signer");
-                }
-                if p.expected_signers.len() > MAX_PARTICIPANTS {
-                    return Err("Too many expected signers");
-                }
-                if p.expected_fingerprints.len() > MAX_PARTICIPANTS {
-                    return Err("Too many expected fingerprints");
-                }
-                if p.required_threshold == 0 {
-                    return Err("required_threshold must be non-zero");
-                }
-                let total_signers = p
-                    .expected_signers
-                    .len()
-                    .saturating_add(p.expected_fingerprints.len());
-                if p.required_threshold as usize > total_signers {
-                    return Err("required_threshold exceeds total expected signers");
-                }
-                let mut seen_shares: HashSet<u16> = HashSet::new();
-                for idx in &p.expected_signers {
-                    if *idx == 0 {
-                        return Err("expected_signers share index must be non-zero");
-                    }
-                    if !seen_shares.insert(*idx) {
-                        return Err("Duplicate share index in expected_signers");
-                    }
-                }
-                let mut seen_fps: HashSet<&String> = HashSet::new();
-                for fp in &p.expected_fingerprints {
-                    if !is_valid_fingerprint(fp) {
-                        return Err("expected_fingerprint must be exactly 8 hex characters");
-                    }
-                    if !seen_fps.insert(fp) {
-                        return Err("Duplicate fingerprint in expected_fingerprints");
-                    }
-                }
-                if p.inputs.len() > MAX_PSBT_INPUTS {
-                    return Err("Too many PSBT inputs");
-                }
-                if p.outputs.len() > MAX_PSBT_OUTPUTS {
-                    return Err("Too many PSBT outputs");
-                }
-                for input in &p.inputs {
-                    if let Some(addr) = &input.address {
-                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
-                            return Err("PSBT input address exceeds maximum length");
-                        }
-                    }
-                }
-                for output in &p.outputs {
-                    if let Some(addr) = &output.address {
-                        if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
-                            return Err("PSBT output address exceeds maximum length");
-                        }
-                    }
-                }
-            }
-            KfpMessage::PsbtSign(p) => {
-                if p.psbt.is_empty() {
-                    return Err("PSBT must not be empty");
-                }
-                if !p.psbt.starts_with(PSBT_MAGIC) {
-                    return Err("PSBT must start with the PSBT magic bytes");
-                }
-                if p.psbt.len() > MAX_PSBT_SIZE {
-                    return Err("PSBT exceeds maximum size");
-                }
-                if let Some(fp) = &p.signer_fingerprint {
-                    if !is_valid_fingerprint(fp) {
-                        return Err("signer_fingerprint must be exactly 8 hex characters");
-                    }
-                }
-                if p.signer_fingerprint.is_none() && p.signer_share_index.is_none() {
-                    return Err("PsbtSign must specify signer identity");
-                }
-                if p.signer_fingerprint.is_some() && p.signer_share_index.is_some() {
-                    return Err(
-                        "PsbtSign must not specify both signer_share_index and signer_fingerprint",
-                    );
-                }
-                if let Some(si) = p.signer_share_index {
-                    if si == 0 {
-                        return Err("signer_share_index must be non-zero");
-                    }
-                }
-            }
-            KfpMessage::PsbtFinalize(p) => {
-                if p.psbt.is_empty() {
-                    return Err("PSBT must not be empty");
-                }
-                if !p.psbt.starts_with(PSBT_MAGIC) {
-                    return Err("PSBT must start with the PSBT magic bytes");
-                }
-                if p.psbt.len() > MAX_PSBT_SIZE {
-                    return Err("PSBT exceeds maximum size");
-                }
-                if p.final_tx.is_some() != p.txid.is_some() {
-                    return Err("final_tx and txid must both be present or both absent");
-                }
-                if let Some(tx) = &p.final_tx {
-                    if tx.is_empty() {
-                        return Err("final_tx, if present, must not be empty");
-                    }
-                    if tx.len() > MAX_PSBT_SIZE {
-                        return Err("final_tx exceeds maximum size");
-                    }
-                }
-            }
-            KfpMessage::PsbtAbort(p) => {
-                if p.reason.is_empty() {
-                    return Err("Abort reason must not be empty");
-                }
-                if p.reason.len() > MAX_NACK_REASON_LENGTH {
-                    return Err("Abort reason exceeds maximum length");
-                }
-            }
-            KfpMessage::XpubAnnounce(p) => {
-                if p.share_index == 0 {
-                    return Err("share_index must be non-zero");
-                }
-                if p.recovery_xpubs.len() > MAX_RECOVERY_XPUBS {
-                    return Err("Too many recovery xpubs");
-                }
-                if p.recovery_xpubs.is_empty() {
-                    return Err("Recovery xpubs must not be empty");
-                }
-                let mut seen_xpubs = HashSet::with_capacity(p.recovery_xpubs.len());
-                for xpub in &p.recovery_xpubs {
-                    if xpub.xpub.len() < MIN_XPUB_LENGTH {
-                        return Err("Recovery xpub too short");
-                    }
-                    if xpub.xpub.len() > MAX_XPUB_LENGTH {
-                        return Err("Recovery xpub exceeds maximum length");
-                    }
-                    if !VALID_XPUB_PREFIXES
-                        .iter()
-                        .any(|pfx| xpub.xpub.starts_with(pfx))
-                    {
-                        return Err("Recovery xpub has invalid prefix");
-                    }
-                    if !seen_xpubs.insert(&xpub.xpub) {
-                        return Err("Duplicate recovery xpub");
-                    }
-                    // rust-bitcoin only parses standard BIP32 version bytes
-                    // (xpub/tpub); SLIP-132 Vpub/Upub keys are validated by
-                    // prefix+length above and accepted by the descriptor flow.
-                    if (xpub.xpub.starts_with("xpub") || xpub.xpub.starts_with("tpub"))
-                        && xpub.xpub.parse::<bitcoin::bip32::Xpub>().is_err()
-                    {
-                        return Err("Recovery xpub is not a valid extended public key");
-                    }
-                    if !is_valid_fingerprint(&xpub.fingerprint) {
-                        return Err(
-                            "Recovery fingerprint must be exactly 8 lowercase hex characters",
-                        );
-                    }
-                    if let Some(ref label) = xpub.label {
-                        if label.is_empty() {
-                            return Err("Recovery xpub label cannot be empty");
-                        }
-                        if label.len() > MAX_XPUB_LABEL_LENGTH {
-                            return Err("Recovery xpub label exceeds maximum length");
-                        }
-                    }
-                }
-            }
-            _ => {}
+            KfpMessage::Announce(p) => validate_announce(p),
+            KfpMessage::SignRequest(p) => validate_sign_request(p),
+            KfpMessage::NonceCommitment(p) => validate_nonce_commitment(p),
+            KfpMessage::Commitment(p) => validate_commitment(p),
+            KfpMessage::SignatureShare(p) => validate_signature_share(p),
+            KfpMessage::Error(p) => validate_error(p),
+            KfpMessage::EcdhRequest(p) => validate_ecdh_request(p),
+            KfpMessage::EcdhShare(p) => validate_ecdh_share(p),
+            KfpMessage::EcdhComplete(p) => validate_ecdh_complete(p),
+            KfpMessage::OprfEvalRequest(p) => validate_oprf_eval_request(p),
+            KfpMessage::OprfEvalShare(p) => validate_oprf_eval_share(p),
+            KfpMessage::OprfEnroll(p) => validate_oprf_enroll(p),
+            KfpMessage::OprfEnrollAck(p) => validate_oprf_enroll_ack(p),
+            KfpMessage::RefreshRequest(p) => validate_refresh_request(p),
+            KfpMessage::RefreshRound1(p) => validate_refresh_round1(p),
+            KfpMessage::RefreshRound2(p) => validate_refresh_round2(p),
+            KfpMessage::RefreshComplete(p) => validate_refresh_complete(p),
+            KfpMessage::DescriptorPropose(p) => validate_descriptor_propose(p),
+            KfpMessage::DescriptorContribute(p) => validate_descriptor_contribute(p),
+            KfpMessage::DescriptorFinalize(p) => validate_descriptor_finalize(p),
+            KfpMessage::DescriptorAck(p) => validate_descriptor_ack(p),
+            KfpMessage::DescriptorNack(p) => validate_descriptor_nack(p),
+            KfpMessage::DescriptorMigrate(p) => validate_descriptor_migrate(p),
+            KfpMessage::PsbtPropose(p) => validate_psbt_propose(p),
+            KfpMessage::PsbtSign(p) => validate_psbt_sign(p),
+            KfpMessage::PsbtFinalize(p) => validate_psbt_finalize(p),
+            KfpMessage::PsbtAbort(p) => validate_psbt_abort(p),
+            KfpMessage::XpubAnnounce(p) => validate_xpub_announce(p),
+            _ => Ok(()),
         }
-        Ok(())
     }
+}
+
+fn validate_announce(p: &AnnouncePayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    if let Some(ref name) = p.name {
+        if name.len() > MAX_NAME_LENGTH {
+            return Err("Name exceeds maximum length");
+        }
+    }
+    if p.capabilities.len() > MAX_CAPABILITIES {
+        return Err("Too many capabilities");
+    }
+    for cap in &p.capabilities {
+        if cap.len() > MAX_CAPABILITY_LENGTH {
+            return Err("Capability string exceeds maximum length");
+        }
+    }
+    if let Some(ref tpm) = p.tpm_attestation {
+        if tpm.attest.is_empty() || tpm.attest.len() > MAX_TPM_ATTEST_SIZE {
+            return Err("TPM attest exceeds maximum size");
+        }
+        if tpm.signature.len() != 64 {
+            return Err("TPM signature must be 64 bytes");
+        }
+        if tpm.ak_sec1.len() != 65 || tpm.ak_sec1[0] != 0x04 {
+            return Err("TPM AK must be a 65-byte uncompressed SEC1 point");
+        }
+        if tpm.pcr_values.is_empty() || tpm.pcr_values.len() > MAX_TPM_PCR_VALUES {
+            return Err("TPM PCR value count out of range");
+        }
+        // Validate each PCR value's hex shape with the same fail-closed decoder the
+        // appraisal uses, so the wire validator and verifier cannot diverge.
+        crate::tpm_quote::decode_pcr_values(&tpm.pcr_values)?;
+    }
+    Ok(())
+}
+
+fn validate_sign_request(p: &SignRequestPayload) -> Result<(), &'static str> {
+    if p.message.len() > MAX_MESSAGE_SIZE {
+        return Err("Message exceeds maximum size");
+    }
+    if p.message_type.len() > MAX_MESSAGE_TYPE_LENGTH {
+        return Err("Message type exceeds maximum length");
+    }
+    if let Some(sp) = p.structured_payload.as_ref() {
+        if sp.len() > MAX_STRUCTURED_PAYLOAD_SIZE {
+            return Err("Structured payload exceeds maximum size");
+        }
+    }
+    if p.derivation_path.len() > MAX_DERIVATION_PATH_DEPTH {
+        return Err("Derivation path exceeds maximum depth");
+    }
+    if p.derivation_path
+        .iter()
+        .any(|&i| i >= BIP32_HARDENED_INDEX_START)
+    {
+        return Err("Derivation path contains a hardened index; \
+                         only unhardened indexes are meaningful for FROST groups");
+    }
+    if p.participants.len() > MAX_PARTICIPANTS {
+        return Err("Participants list exceeds maximum size");
+    }
+    if p.nonce_refs.len() > MAX_PARTICIPANTS {
+        return Err("Nonce refs exceed maximum size");
+    }
+    if !p.nonce_refs.is_empty() {
+        if p.nonce_refs.len() != p.participants.len() {
+            return Err("Nonce refs must cover all participants");
+        }
+        let expected: HashSet<u16> = p.participants.iter().copied().collect();
+        let mut seen_refs: HashSet<u16> = HashSet::new();
+        // An all-zero `nonce_id` is the sentinel marking the
+        // requester's own commitment (echo-only, never consumed).
+        // Exactly one ref must carry it.
+        let mut sentinel_refs = 0usize;
+        for nref in &p.nonce_refs {
+            if nref.commitment.len() > MAX_COMMITMENT_SIZE {
+                return Err("Nonce ref commitment exceeds maximum size");
+            }
+            if !seen_refs.insert(nref.share_index) {
+                return Err("Duplicate share_index in nonce_refs");
+            }
+            if !expected.contains(&nref.share_index) {
+                return Err("Nonce ref share_index not in participants");
+            }
+            if nref.nonce_id == [0u8; 32] {
+                sentinel_refs += 1;
+            }
+        }
+        if seen_refs != expected {
+            return Err("Nonce refs must match participant share indices");
+        }
+        if sentinel_refs != 1 {
+            return Err("Nonce refs must contain exactly one sentinel");
+        }
+    }
+    Ok(())
+}
+
+fn validate_nonce_commitment(p: &NonceCommitmentPayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    if p.commitments.len() > MAX_NONCE_COMMITMENTS {
+        return Err("Too many nonce commitments");
+    }
+    for c in &p.commitments {
+        if c.commitment.len() > MAX_COMMITMENT_SIZE {
+            return Err("Commitment exceeds maximum size");
+        }
+    }
+    Ok(())
+}
+
+fn validate_commitment(p: &CommitmentPayload) -> Result<(), &'static str> {
+    if p.commitment.len() > MAX_COMMITMENT_SIZE {
+        return Err("Commitment exceeds maximum size");
+    }
+    Ok(())
+}
+
+fn validate_signature_share(p: &SignatureSharePayload) -> Result<(), &'static str> {
+    if p.signature_share.len() > MAX_SIGNATURE_SHARE_SIZE {
+        return Err("Signature share exceeds maximum size");
+    }
+    Ok(())
+}
+
+fn validate_error(p: &ErrorPayload) -> Result<(), &'static str> {
+    if p.code.len() > MAX_ERROR_CODE_LENGTH {
+        return Err("Error code exceeds maximum length");
+    }
+    if p.message.len() > MAX_ERROR_MESSAGE_LENGTH {
+        return Err("Error message exceeds maximum length");
+    }
+    Ok(())
+}
+
+fn validate_ecdh_request(p: &EcdhRequestPayload) -> Result<(), &'static str> {
+    if p.participants.len() > MAX_PARTICIPANTS {
+        return Err("Participants list exceeds maximum size");
+    }
+    Ok(())
+}
+
+fn validate_ecdh_share(p: &EcdhSharePayload) -> Result<(), &'static str> {
+    if p.partial_point.len() != 33 {
+        return Err("Invalid partial point size");
+    }
+    Ok(())
+}
+
+fn validate_ecdh_complete(p: &EcdhCompletePayload) -> Result<(), &'static str> {
+    if p.shared_secret.len() != 32 {
+        return Err("Invalid shared secret size");
+    }
+    Ok(())
+}
+
+fn validate_oprf_eval_request(p: &OprfEvalRequestPayload) -> Result<(), &'static str> {
+    if p.participants.is_empty() {
+        return Err("Participants list must not be empty");
+    }
+    if p.participants.len() > MAX_PARTICIPANTS {
+        return Err("Participants list exceeds maximum size");
+    }
+    if p.requester_share_index == 0 {
+        return Err("requester_share_index must be non-zero");
+    }
+    Ok(())
+}
+
+fn validate_oprf_eval_share(p: &OprfEvalSharePayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    // Wire layout of an OPRF partial: 32-byte identifier scalar plus a
+    // 33-byte compressed point (see keep_core::oprf::threshold).
+    if p.partial.len() != OPRF_PARTIAL_LEN {
+        return Err("Invalid OPRF partial size");
+    }
+    Ok(())
+}
+
+fn validate_oprf_enroll(p: &OprfEnrollPayload) -> Result<(), &'static str> {
+    // The secret share is exactly the serialized key-share length.
+    if p.share.len() != keep_core::oprf::threshold::KEY_SHARE_LEN {
+        return Err("Invalid OPRF key share size");
+    }
+    if p.dealer_index == 0 {
+        return Err("dealer_index must be non-zero");
+    }
+    if p.target_index == 0 {
+        return Err("target_index must be non-zero");
+    }
+    if p.threshold < 2 {
+        return Err("threshold must be at least 2");
+    }
+    if p.threshold > p.total {
+        return Err("threshold must not exceed total");
+    }
+    if p.total as usize > MAX_PARTICIPANTS {
+        return Err("total exceeds maximum participants");
+    }
+    Ok(())
+}
+
+fn validate_oprf_enroll_ack(p: &OprfEnrollAckPayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    Ok(())
+}
+
+fn validate_refresh_request(p: &RefreshRequestPayload) -> Result<(), &'static str> {
+    if p.participants.len() > MAX_PARTICIPANTS {
+        return Err("Participants list exceeds maximum size");
+    }
+    if p.participants.len() < 2 {
+        return Err("Refresh requires at least 2 participants");
+    }
+    if p.participants.contains(&0) {
+        return Err("Participant index must be non-zero");
+    }
+    let unique: std::collections::HashSet<_> = p.participants.iter().collect();
+    if unique.len() != p.participants.len() {
+        return Err("Duplicate participant indices");
+    }
+    Ok(())
+}
+
+fn validate_refresh_round1(p: &RefreshRound1Payload) -> Result<(), &'static str> {
+    if p.package.is_empty() {
+        return Err("Package must not be empty");
+    }
+    if p.package.len() > MAX_MESSAGE_SIZE {
+        return Err("Round1 package exceeds maximum size");
+    }
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    Ok(())
+}
+
+fn validate_refresh_round2(p: &RefreshRound2Payload) -> Result<(), &'static str> {
+    if p.package.is_empty() {
+        return Err("Package must not be empty");
+    }
+    if p.package.len() > MAX_MESSAGE_SIZE {
+        return Err("Round2 package exceeds maximum size");
+    }
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    if p.target_index == 0 {
+        return Err("target_index must be non-zero");
+    }
+    if p.share_index == p.target_index {
+        return Err("share_index must differ from target_index");
+    }
+    Ok(())
+}
+
+fn validate_refresh_complete(p: &RefreshCompletePayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    Ok(())
+}
+
+fn validate_descriptor_propose(p: &DescriptorProposePayload) -> Result<(), &'static str> {
+    if let Some(t) = p.timeout_secs {
+        if t == 0 {
+            return Err("timeout_secs must be greater than zero");
+        }
+        if t > DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS {
+            return Err("timeout_secs exceeds maximum allowed value");
+        }
+    }
+    if !VALID_NETWORKS.contains(&p.network.as_str()) {
+        return Err("Invalid network value");
+    }
+    if !is_valid_xpub(&p.initiator_xpub) {
+        return Err("Invalid initiator xpub");
+    }
+    if !is_valid_fingerprint(&p.initiator_fingerprint) {
+        return Err("Initiator fingerprint must be exactly 8 hex characters");
+    }
+    if p.policy.version == 0 {
+        return Err("Policy version must be >= 1");
+    }
+    if p.policy.recovery_tiers.is_empty() {
+        return Err("Policy must have at least one recovery tier");
+    }
+    if p.policy.recovery_tiers.len() > MAX_RECOVERY_TIERS {
+        return Err("Too many recovery tiers");
+    }
+    for tier in &p.policy.recovery_tiers {
+        if tier.key_slots.len() > MAX_KEYS_PER_TIER {
+            return Err("Too many keys in tier");
+        }
+        if tier.threshold == 0 {
+            return Err("Tier threshold must be non-zero");
+        }
+        if tier.timelock_months == 0 {
+            return Err("Tier timelock must be non-zero");
+        }
+        if tier.threshold as usize > tier.key_slots.len() {
+            return Err("Tier threshold exceeds number of key slots");
+        }
+        for slot in &tier.key_slots {
+            match slot {
+                KeySlot::Participant { share_index } => {
+                    if *share_index == 0 {
+                        return Err("Participant share_index must be non-zero");
+                    }
+                }
+                KeySlot::External { xpub, fingerprint } => {
+                    if !is_valid_xpub(xpub) {
+                        return Err("Invalid external xpub");
+                    }
+                    if !is_valid_fingerprint(fingerprint) {
+                        return Err("External fingerprint must be exactly 8 hex characters");
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_descriptor_contribute(p: &DescriptorContributePayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    if !is_valid_xpub(&p.account_xpub) {
+        return Err("Invalid account xpub");
+    }
+    if !is_valid_fingerprint(&p.fingerprint) {
+        return Err("Fingerprint must be exactly 8 hex characters");
+    }
+    Ok(())
+}
+
+fn validate_descriptor_finalize(p: &DescriptorFinalizePayload) -> Result<(), &'static str> {
+    if p.external_descriptor.is_empty() {
+        return Err("External descriptor cannot be empty");
+    }
+    if p.internal_descriptor.is_empty() {
+        return Err("Internal descriptor cannot be empty");
+    }
+    if p.external_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+        return Err("External descriptor exceeds maximum length");
+    }
+    if p.internal_descriptor.len() > MAX_DESCRIPTOR_LENGTH {
+        return Err("Internal descriptor exceeds maximum length");
+    }
+    if p.contributions.len() > MAX_PARTICIPANTS {
+        return Err("Too many contributions in finalize payload");
+    }
+    for (&idx, contrib) in &p.contributions {
+        if idx == 0 {
+            return Err("Invalid contribution index");
+        }
+        if idx as usize > MAX_PARTICIPANTS {
+            return Err("Contribution index exceeds maximum");
+        }
+        if !is_valid_xpub(&contrib.account_xpub) {
+            return Err("Invalid contribution xpub");
+        }
+        if !is_valid_fingerprint(&contrib.fingerprint) {
+            return Err("Contribution fingerprint must be exactly 8 hex characters");
+        }
+    }
+    Ok(())
+}
+
+fn validate_descriptor_ack(p: &DescriptorAckPayload) -> Result<(), &'static str> {
+    if p.key_proof_psbt.is_empty() {
+        return Err("key_proof_psbt must not be empty");
+    }
+    if p.key_proof_psbt.len() > MAX_KEY_PROOF_PSBT_SIZE {
+        return Err("key_proof_psbt exceeds maximum size");
+    }
+    Ok(())
+}
+
+fn validate_descriptor_nack(p: &DescriptorNackPayload) -> Result<(), &'static str> {
+    if p.reason.is_empty() {
+        return Err("Nack reason must not be empty");
+    }
+    if p.reason.len() > MAX_NACK_REASON_LENGTH {
+        return Err("Nack reason exceeds maximum length");
+    }
+    Ok(())
+}
+
+fn validate_descriptor_migrate(p: &DescriptorMigratePayload) -> Result<(), &'static str> {
+    p.validate()?;
+    Ok(())
+}
+
+fn validate_psbt_propose(p: &PsbtProposePayload) -> Result<(), &'static str> {
+    if p.psbt.is_empty() {
+        return Err("PSBT must not be empty");
+    }
+    if !p.psbt.starts_with(PSBT_MAGIC) {
+        return Err("PSBT must start with the PSBT magic bytes");
+    }
+    if p.psbt.len() > MAX_PSBT_SIZE {
+        return Err("PSBT exceeds maximum size");
+    }
+    if (p.tier_index as usize) >= MAX_RECOVERY_TIERS {
+        return Err("tier_index exceeds maximum recovery tiers");
+    }
+    if let Some(t) = p.timeout_secs {
+        if t == 0 {
+            return Err("timeout_secs must be greater than zero");
+        }
+        if t > PSBT_SESSION_MAX_TIMEOUT_SECS {
+            return Err("timeout_secs exceeds maximum allowed value");
+        }
+    }
+    if p.expected_signers.is_empty() && p.expected_fingerprints.is_empty() {
+        return Err("Must specify at least one expected signer");
+    }
+    if p.expected_signers.len() > MAX_PARTICIPANTS {
+        return Err("Too many expected signers");
+    }
+    if p.expected_fingerprints.len() > MAX_PARTICIPANTS {
+        return Err("Too many expected fingerprints");
+    }
+    if p.required_threshold == 0 {
+        return Err("required_threshold must be non-zero");
+    }
+    let total_signers = p
+        .expected_signers
+        .len()
+        .saturating_add(p.expected_fingerprints.len());
+    if p.required_threshold as usize > total_signers {
+        return Err("required_threshold exceeds total expected signers");
+    }
+    let mut seen_shares: HashSet<u16> = HashSet::new();
+    for idx in &p.expected_signers {
+        if *idx == 0 {
+            return Err("expected_signers share index must be non-zero");
+        }
+        if !seen_shares.insert(*idx) {
+            return Err("Duplicate share index in expected_signers");
+        }
+    }
+    let mut seen_fps: HashSet<&String> = HashSet::new();
+    for fp in &p.expected_fingerprints {
+        if !is_valid_fingerprint(fp) {
+            return Err("expected_fingerprint must be exactly 8 hex characters");
+        }
+        if !seen_fps.insert(fp) {
+            return Err("Duplicate fingerprint in expected_fingerprints");
+        }
+    }
+    if p.inputs.len() > MAX_PSBT_INPUTS {
+        return Err("Too many PSBT inputs");
+    }
+    if p.outputs.len() > MAX_PSBT_OUTPUTS {
+        return Err("Too many PSBT outputs");
+    }
+    for input in &p.inputs {
+        if let Some(addr) = &input.address {
+            if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                return Err("PSBT input address exceeds maximum length");
+            }
+        }
+    }
+    for output in &p.outputs {
+        if let Some(addr) = &output.address {
+            if addr.len() > MAX_PSBT_ADDRESS_LENGTH {
+                return Err("PSBT output address exceeds maximum length");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_psbt_sign(p: &PsbtSignPayload) -> Result<(), &'static str> {
+    if p.psbt.is_empty() {
+        return Err("PSBT must not be empty");
+    }
+    if !p.psbt.starts_with(PSBT_MAGIC) {
+        return Err("PSBT must start with the PSBT magic bytes");
+    }
+    if p.psbt.len() > MAX_PSBT_SIZE {
+        return Err("PSBT exceeds maximum size");
+    }
+    if let Some(fp) = &p.signer_fingerprint {
+        if !is_valid_fingerprint(fp) {
+            return Err("signer_fingerprint must be exactly 8 hex characters");
+        }
+    }
+    if p.signer_fingerprint.is_none() && p.signer_share_index.is_none() {
+        return Err("PsbtSign must specify signer identity");
+    }
+    if p.signer_fingerprint.is_some() && p.signer_share_index.is_some() {
+        return Err("PsbtSign must not specify both signer_share_index and signer_fingerprint");
+    }
+    if let Some(si) = p.signer_share_index {
+        if si == 0 {
+            return Err("signer_share_index must be non-zero");
+        }
+    }
+    Ok(())
+}
+
+fn validate_psbt_finalize(p: &PsbtFinalizePayload) -> Result<(), &'static str> {
+    if p.psbt.is_empty() {
+        return Err("PSBT must not be empty");
+    }
+    if !p.psbt.starts_with(PSBT_MAGIC) {
+        return Err("PSBT must start with the PSBT magic bytes");
+    }
+    if p.psbt.len() > MAX_PSBT_SIZE {
+        return Err("PSBT exceeds maximum size");
+    }
+    if p.final_tx.is_some() != p.txid.is_some() {
+        return Err("final_tx and txid must both be present or both absent");
+    }
+    if let Some(tx) = &p.final_tx {
+        if tx.is_empty() {
+            return Err("final_tx, if present, must not be empty");
+        }
+        if tx.len() > MAX_PSBT_SIZE {
+            return Err("final_tx exceeds maximum size");
+        }
+    }
+    Ok(())
+}
+
+fn validate_psbt_abort(p: &PsbtAbortPayload) -> Result<(), &'static str> {
+    if p.reason.is_empty() {
+        return Err("Abort reason must not be empty");
+    }
+    if p.reason.len() > MAX_NACK_REASON_LENGTH {
+        return Err("Abort reason exceeds maximum length");
+    }
+    Ok(())
+}
+
+fn validate_xpub_announce(p: &XpubAnnouncePayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
+    }
+    if p.recovery_xpubs.len() > MAX_RECOVERY_XPUBS {
+        return Err("Too many recovery xpubs");
+    }
+    if p.recovery_xpubs.is_empty() {
+        return Err("Recovery xpubs must not be empty");
+    }
+    let mut seen_xpubs = HashSet::with_capacity(p.recovery_xpubs.len());
+    for xpub in &p.recovery_xpubs {
+        if xpub.xpub.len() < MIN_XPUB_LENGTH {
+            return Err("Recovery xpub too short");
+        }
+        if xpub.xpub.len() > MAX_XPUB_LENGTH {
+            return Err("Recovery xpub exceeds maximum length");
+        }
+        if !VALID_XPUB_PREFIXES
+            .iter()
+            .any(|pfx| xpub.xpub.starts_with(pfx))
+        {
+            return Err("Recovery xpub has invalid prefix");
+        }
+        if !seen_xpubs.insert(&xpub.xpub) {
+            return Err("Duplicate recovery xpub");
+        }
+        // rust-bitcoin only parses standard BIP32 version bytes
+        // (xpub/tpub); SLIP-132 Vpub/Upub keys are validated by
+        // prefix+length above and accepted by the descriptor flow.
+        if (xpub.xpub.starts_with("xpub") || xpub.xpub.starts_with("tpub"))
+            && xpub.xpub.parse::<bitcoin::bip32::Xpub>().is_err()
+        {
+            return Err("Recovery xpub is not a valid extended public key");
+        }
+        if !is_valid_fingerprint(&xpub.fingerprint) {
+            return Err("Recovery fingerprint must be exactly 8 lowercase hex characters");
+        }
+        if let Some(ref label) = xpub.label {
+            if label.is_empty() {
+                return Err("Recovery xpub label cannot be empty");
+            }
+            if label.len() > MAX_XPUB_LABEL_LENGTH {
+                return Err("Recovery xpub label exceeds maximum length");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
