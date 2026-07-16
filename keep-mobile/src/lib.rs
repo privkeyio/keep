@@ -3938,11 +3938,20 @@ mod import_teardown_tests {
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
         let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
         mobile.store_share_package(&share).unwrap();
+        let expected_secret = key_package.signing_share().serialize();
 
         let ncryptsec = mobile
             .export_ncryptsec("correct horse battery".as_bytes().to_vec())
             .unwrap();
         assert!(ncryptsec.starts_with("ncryptsec1"));
+
+        // Round-trip: the password bytes must actually drive the encryption, so
+        // decrypting with the same password recovers the signing share, and a
+        // different password does not.
+        let recovered =
+            keep_core::keys::nip49::decrypt(&ncryptsec, "correct horse battery").unwrap();
+        assert_eq!(recovered.as_slice(), expected_secret.as_slice());
+        assert!(keep_core::keys::nip49::decrypt(&ncryptsec, "wrong password").is_err());
     }
 
     #[test]
