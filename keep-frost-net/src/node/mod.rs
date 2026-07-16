@@ -530,13 +530,18 @@ impl SigningHooks for RefuseRawAndRequireStructuredHooks {
 /// `approve_oprf_eval` requires. The real and ONLY security boundary for auto-approve
 /// is VERIFIED TPM attestation of the requester (AK pinning plus PCR correctness;
 /// `NotConfigured` is rejected, so the oracle fails closed) combined with this explicit
-/// opt-in. Safety rests on WHO is answered, not on how many evals occur. The
-/// per-requester rate limiter is NOT a meaningful barrier against a determined attacker:
-/// the requester transport pubkey it keys on is derived deterministically from the
-/// public `(group_pubkey, identifier)`, so an attacker who knows the public group key can
-/// rotate member identities to sidestep both the rate limiter and the share-index gate.
-/// The rate limiter is best-effort abuse control against accidental or naive
-/// over-querying only. This flag lets an autonomous holder (e.g. a replica) answer
+/// opt-in. Safety rests primarily on WHO is answered, not on how many evals occur.
+/// On a holder that carries the full public-key package, peer admission binds a
+/// claimed share index to the group's CANONICAL verifying share plus a proof of the
+/// member secret (see `handle_announce`), so an attacker who knows only the public
+/// `(group_pubkey, identifier)` cannot register as arbitrary member identities: only
+/// a real holder of member index N is admitted as N. (A holder whose share was
+/// imported carries only its own verifying share and falls back to the proof gate
+/// for indices it cannot validate.) The per-requester rate limiter keys on the
+/// admitted transport pubkey and is
+/// best-effort abuse control against a genuinely-admitted holder's accidental or
+/// naive over-querying, NOT a barrier against a compromised member (who is already
+/// inside the trust boundary). This flag lets an autonomous holder (e.g. a replica) answer
 /// verified requests unattended; leave it off for a holder that gates each evaluation
 /// behind a human (e.g. a phone).
 pub struct ServeHooks {
@@ -2578,6 +2583,53 @@ impl KfpNode {
             payload.timestamp,
         )?;
 
+        // Bind the announced verifying share to this group's canonical share for
+        // the claimed index. `verify_proof` above only proves the announcer holds
+        // the secret for whatever share it announced, not that the share is a real
+        // member of THIS group: an attacker who knows the public group pubkey (and
+        // hence the deterministically-derivable member transport key) could
+        // otherwise announce a self-generated share under a member index. When the
+        // node holds the canonical share for the claimed index, a mismatch is
+        // rejected fail-closed; combined with the proof-of-secret above, only the
+        // real holder of member index N is admitted as N.
+        //
+        // A node whose share was imported through an encrypted export carries an
+        // INCOMPLETE public-key package (only its own verifying share). It cannot
+        // validate other members' shares it does not hold, so for an index it does
+        // not know it falls back to the proof-of-secret gate alone rather than
+        // rejecting the peer. Making exports carry the full verifying-share set so
+        // imported holders can enforce this too is tracked as a follow-up.
+        {
+            let pubkey_pkg = self.share.pubkey_package()?;
+            let id =
+                frost_secp256k1_tr::Identifier::try_from(payload.share_index).map_err(|e| {
+                    FrostNetError::Protocol(format!(
+                        "Invalid share index {}: {e}",
+                        payload.share_index
+                    ))
+                })?;
+            if let Some(canonical) = pubkey_pkg.verifying_shares().get(&id) {
+                let canonical_bytes: [u8; 33] = canonical
+                    .serialize()
+                    .map_err(|e| {
+                        FrostNetError::Crypto(format!(
+                            "Failed to serialize canonical verifying share: {e}"
+                        ))
+                    })?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| {
+                        FrostNetError::Crypto("Invalid canonical verifying share length".into())
+                    })?;
+                if canonical_bytes != payload.verifying_share {
+                    return Err(FrostNetError::UntrustedPeer(format!(
+                        "Announced verifying share for index {} does not match the group's canonical share",
+                        payload.share_index
+                    )));
+                }
+            }
+        }
+
         // The attestation blobs sit outside `proof_signature`; their integrity rests on the
         // fail-closed admission below (AK pin plus nonce bound to the signed share_index/timestamp),
         // so unsigned or swapped evidence cannot be admitted.
@@ -2934,6 +2986,55 @@ mod tests {
 
         let node = result.unwrap();
         assert_eq!(node.share_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn handle_announce_rejects_non_canonical_verifying_share() {
+        use k256::schnorr::SigningKey;
+
+        let node = duress_test_node().await;
+
+        // A self-generated key. The announcer can prove it holds this key's
+        // secret (passing verify_proof), but the key is NOT the group's canonical
+        // share for the claimed member index, exactly the impersonation an
+        // attacker who only knows the public group pubkey could attempt.
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let mut signing_share = [0u8; 32];
+        signing_share.copy_from_slice(&signing_key.to_bytes());
+        let mut verifying_share = [0u8; 33];
+        verifying_share[0] = 0x02;
+        verifying_share[1..33].copy_from_slice(&signing_key.verifying_key().to_bytes());
+
+        let share_index = 2u16; // a real member index of the 2-of-3 group
+        let timestamp = Timestamp::now().as_secs();
+        let proof_signature = crate::proof::sign_proof(
+            &signing_share,
+            &node.group_pubkey,
+            share_index,
+            &verifying_share,
+            timestamp,
+        )
+        .unwrap();
+
+        let payload = AnnouncePayload {
+            version: KFP_VERSION,
+            group_pubkey: node.group_pubkey,
+            share_index,
+            verifying_share,
+            proof_signature,
+            timestamp,
+            capabilities: vec![],
+            name: None,
+            attestation: None,
+            tpm_attestation: None,
+        };
+
+        let from = Keys::generate().public_key();
+        let result = node.handle_announce(from, payload).await;
+        assert!(
+            matches!(&result, Err(FrostNetError::UntrustedPeer(msg)) if msg.contains("does not match the group's canonical share")),
+            "expected a canonical-share rejection, got {result:?}"
+        );
     }
 
     async fn duress_test_node() -> KfpNode {
