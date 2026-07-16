@@ -1777,6 +1777,56 @@ mod tests {
         assert!(!auto_approve_conflicts(false, false));
     }
 
+    fn temp_path_for(path: &Path) -> std::path::PathBuf {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".tmp");
+        std::path::PathBuf::from(s)
+    }
+
+    #[test]
+    fn write_secret_file_round_trips_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+
+        write_secret_file(&path, b"first-secret").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first-secret");
+        // The atomic temp is cleaned up after the rename.
+        assert!(!temp_path_for(&path).exists(), "temp file must not linger");
+
+        // Writing again atomically replaces the contents (rename over an existing
+        // target), so a rotated secret does not leave the old bytes behind.
+        write_secret_file(&path, b"second-secret").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-secret");
+        assert!(!temp_path_for(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_is_owner_only() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        write_secret_file(&path, b"key-material").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "secret key material must be written owner-only"
+        );
+    }
+
+    #[test]
+    fn write_secret_file_writes_empty_and_binary_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty");
+        write_secret_file(&empty, b"").unwrap();
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+
+        let bin = dir.path().join("bin");
+        let payload: Vec<u8> = (0..=255u8).collect();
+        write_secret_file(&bin, &payload).unwrap();
+        assert_eq!(std::fs::read(&bin).unwrap(), payload);
+    }
+
     fn sample_freeze() -> keep_frost_net::DuressFreeze {
         keep_frost_net::DuressFreeze {
             beacon_pubkey: nostr_sdk::Keys::generate().public_key(),
