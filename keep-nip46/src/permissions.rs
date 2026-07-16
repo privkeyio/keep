@@ -450,6 +450,12 @@ impl PermissionManager {
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.last_used = Timestamp::now();
             app.request_count += 1;
+            // GC the app's expired per-kind timed grants on its request path.
+            // `has_unexpired_timed_grant` / `needs_approval` only skip expired
+            // entries without removing them, so without this they linger until
+            // the app's next timed grant. Dropping an already-expired entry
+            // never changes an authorization decision.
+            app.prune_expired_kind_grants();
         }
     }
 
@@ -638,6 +644,31 @@ mod tests {
 
         pm.revoke(&pubkey);
         assert!(!pm.is_connected(&pubkey));
+    }
+
+    #[test]
+    fn record_usage_gcs_expired_timed_grants() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "App".into());
+
+        // Inject an already-expired timed grant directly (the write path always
+        // sets a future expiry, so simulate a grant whose window has passed).
+        let past = now_unix_secs().saturating_sub(100);
+        pm.apps
+            .get_mut(&pubkey)
+            .unwrap()
+            .timed_kind_grants
+            .insert(Kind::from(9999u16), past);
+
+        // The read path already treats it as expired...
+        assert!(pm.needs_approval(&pubkey, Kind::from(9999u16)));
+        // ...and the next request through record_usage garbage-collects it.
+        pm.record_usage(&pubkey);
+        assert!(
+            pm.apps.get(&pubkey).unwrap().timed_kind_grants.is_empty(),
+            "expired timed grant must be garbage-collected on the request path"
+        );
     }
 
     #[test]
