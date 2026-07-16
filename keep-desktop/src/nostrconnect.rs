@@ -98,14 +98,16 @@ impl App {
                 // nostrconnect request, so this fails closed on a corrupt pin store
                 // or a pin mismatch, and records TOFU pins otherwise, mirroring the
                 // interactive bunker-start path in bunker_service.rs.
+                // Propagate the `ConnectionError` unchanged (via `?`) so a
+                // `PinMismatch` keeps its structured variant and reaches the
+                // dedicated cert-failure UI, matching the interactive path.
                 crate::frost::verify_relay_certificates(
                     &valid_relays,
                     &cert_pins,
                     &keep_path,
                     require_pinned,
                 )
-                .await
-                .map_err(|e| format!("{e}"))?;
+                .await?;
 
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await
