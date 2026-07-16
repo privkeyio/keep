@@ -718,6 +718,12 @@ pub(crate) enum FrostNetworkCommands {
         /// to have VERIFIED attestation and is rate-limited; this is the explicit
         /// opt-in for an autonomous holder (e.g. a replica) that must answer
         /// attested requests unattended. Leave off to gate each eval behind a human.
+        /// RESIDUAL RISK: the rate limiter is best-effort (an admitted peer can
+        /// rotate transport identity to reset it), so attestation becomes the sole
+        /// human-free gate and a single compromised-but-Verified peer can obtain
+        /// effectively unbounded evaluations of the low-entropy unlock input,
+        /// removing brute-force protection. Enable ONLY where every Verified peer
+        /// is fully trusted, and pin strict PCRs.
         #[arg(long)]
         oprf_auto_approve: bool,
         /// Attach a TPM quote to this node's announces (e.g. device:/dev/tpmrm0)
