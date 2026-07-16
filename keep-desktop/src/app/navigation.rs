@@ -138,6 +138,7 @@ impl App {
                     self.settings.start_minimized,
                     self.has_tray,
                     self.cert_pin_display_entries(),
+                    self.settings.strict_cert_pinning,
                 ));
                 Task::none()
             }

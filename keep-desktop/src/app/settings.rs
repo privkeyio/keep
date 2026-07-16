@@ -124,6 +124,12 @@ impl App {
                     s.start_minimized = v;
                 }
             }
+            Event::StrictPinningToggled(v) => {
+                self.settings.strict_cert_pinning = v;
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.strict_cert_pinning = v;
+                }
+            }
             Event::KillSwitchActivate => {
                 return self.handle_kill_switch_activate();
             }

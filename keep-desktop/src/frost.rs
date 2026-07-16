@@ -52,6 +52,7 @@ pub(crate) async fn verify_relay_certificates(
     relay_urls: &[String],
     certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
     keep_path: &std::path::Path,
+    require_pinned: bool,
 ) -> Result<(), crate::message::ConnectionError> {
     use crate::message::ConnectionError;
     // Fail closed: refuse to connect when the on-disk pin store exists but is
@@ -74,22 +75,23 @@ pub(crate) async fn verify_relay_certificates(
             .lock()
             .map_err(|_| ConnectionError::Other("Pin lock poisoned".to_string()))?
             .clone();
-        // require_pinned=false: trust-on-first-use. A strict-mode config toggle
-        // that passes true is tracked as a follow-up.
-        let (_hash, new_pin) = keep_frost_net::verify_relay_certificate(url, &pins_snapshot, false)
-            .await
-            .map_err(|e| match e {
-                keep_frost_net::FrostNetError::CertificatePinMismatch {
-                    hostname,
-                    expected,
-                    actual,
-                } => ConnectionError::PinMismatch(crate::message::PinMismatchInfo {
-                    hostname,
-                    expected,
-                    actual,
-                }),
-                other => ConnectionError::Other(format!("{other}")),
-            })?;
+        // `require_pinned` comes from the strict-pinning setting: false is
+        // trust-on-first-use; true rejects any relay with no recorded pin.
+        let (_hash, new_pin) =
+            keep_frost_net::verify_relay_certificate(url, &pins_snapshot, require_pinned)
+                .await
+                .map_err(|e| match e {
+                    keep_frost_net::FrostNetError::CertificatePinMismatch {
+                        hostname,
+                        expected,
+                        actual,
+                    } => ConnectionError::PinMismatch(crate::message::PinMismatchInfo {
+                        hostname,
+                        expected,
+                        actual,
+                    }),
+                    other => ConnectionError::Other(format!("{other}")),
+                })?;
         if let Some((hostname, hash)) = new_pin {
             let mut guard = certificate_pins
                 .lock()
@@ -149,6 +151,9 @@ pub(crate) struct NetworkConfig {
     pub session_timeout: Option<Duration>,
     pub certificate_pins: Arc<Mutex<keep_frost_net::CertificatePinSet>>,
     pub keep_path: std::path::PathBuf,
+    /// Strict pinning policy: reject `wss://` relays with no recorded pin
+    /// instead of trusting on first use.
+    pub require_pinned: bool,
 }
 
 #[derive(Clone)]
@@ -299,7 +304,13 @@ pub(crate) async fn setup_frost_node(
     let nonce_store_path = keep_path.join("frost-nonces");
     keep_frost_net::install_default_crypto_provider();
 
-    verify_relay_certificates(&relay_urls, &net.certificate_pins, &net.keep_path).await?;
+    verify_relay_certificates(
+        &relay_urls,
+        &net.certificate_pins,
+        &net.keep_path,
+        net.require_pinned,
+    )
+    .await?;
 
     let nonce_store = keep_frost_net::FileNonceStore::new(&nonce_store_path)
         .map_err(|e| format!("Failed to create nonce store: {e}"))?;

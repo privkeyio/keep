@@ -20,6 +20,7 @@ pub enum Message {
     ProxyPortChanged(String),
     MinimizeToTrayToggled(bool),
     StartMinimizedToggled(bool),
+    StrictPinningToggled(bool),
     KillSwitchRequestConfirm,
     KillSwitchCancelConfirm,
     KillSwitchActivate,
@@ -58,6 +59,9 @@ impl fmt::Debug for Message {
             Self::StartMinimizedToggled(v) => {
                 f.debug_tuple("StartMinimizedToggled").field(v).finish()
             }
+            Self::StrictPinningToggled(v) => {
+                f.debug_tuple("StrictPinningToggled").field(v).finish()
+            }
             Self::KillSwitchRequestConfirm => f.write_str("KillSwitchRequestConfirm"),
             Self::KillSwitchCancelConfirm => f.write_str("KillSwitchCancelConfirm"),
             Self::KillSwitchActivate => f.write_str("KillSwitchActivate"),
@@ -92,6 +96,7 @@ pub enum Event {
     ProxyPortChanged(u16),
     MinimizeToTrayToggled(bool),
     StartMinimizedToggled(bool),
+    StrictPinningToggled(bool),
     KillSwitchActivate,
     KillSwitchDeactivate(Zeroizing<String>),
     CertPinClear(String),
@@ -133,6 +138,7 @@ pub struct SettingsScreen {
     pub start_minimized: bool,
     pub has_tray: bool,
     pub certificate_pins: Vec<(String, String)>,
+    pub strict_cert_pinning: bool,
     clear_all_pins_confirm: bool,
     backup_active: bool,
     backup_passphrase: Zeroizing<String>,
@@ -164,6 +170,7 @@ impl SettingsScreen {
         start_minimized: bool,
         has_tray: bool,
         certificate_pins: Vec<(String, String)>,
+        strict_cert_pinning: bool,
     ) -> Self {
         Self {
             auto_lock_secs,
@@ -181,6 +188,7 @@ impl SettingsScreen {
             start_minimized,
             has_tray,
             certificate_pins,
+            strict_cert_pinning,
             clear_all_pins_confirm: false,
             backup_active: false,
             backup_passphrase: Zeroizing::new(String::new()),
@@ -214,6 +222,7 @@ impl SettingsScreen {
             }
             Message::MinimizeToTrayToggled(v) => Some(Event::MinimizeToTrayToggled(v)),
             Message::StartMinimizedToggled(v) => Some(Event::StartMinimizedToggled(v)),
+            Message::StrictPinningToggled(v) => Some(Event::StrictPinningToggled(v)),
             Message::KillSwitchRequestConfirm => {
                 self.kill_switch_confirm = true;
                 None
@@ -726,9 +735,24 @@ impl SettingsScreen {
     }
 
     fn cert_pins_card(&self) -> Element<'_, Message> {
+        let strict_btn = toggle_button(
+            self.strict_cert_pinning,
+            Message::StrictPinningToggled(!self.strict_cert_pinning),
+        );
+        let mode_caption = if self.strict_cert_pinning {
+            "Strict: relays with no recorded pin are rejected; provision pins first"
+        } else {
+            "Pins are set on first connection to each relay (TOFU)"
+        };
         let mut col = column![
             theme::label("TLS certificate pinning"),
-            theme::muted("Pins are set on first connection to each relay (TOFU)"),
+            theme::muted(mode_caption),
+            row![
+                theme::muted("Strict pinning (reject relays with no recorded pin)"),
+                strict_btn
+            ]
+            .spacing(theme::space::SM)
+            .align_y(iced::Alignment::Center),
         ]
         .spacing(theme::space::SM);
 

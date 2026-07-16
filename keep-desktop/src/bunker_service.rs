@@ -455,12 +455,18 @@ impl App {
         let kill_switch = self.kill_switch.clone();
         let cert_pins = self.certificate_pins.clone();
         let keep_path = self.keep_path.clone();
+        let require_pinned = self.settings.strict_cert_pinning;
 
         Task::perform(
             async move {
                 use crate::message::ConnectionError;
-                crate::frost::verify_relay_certificates(&relay_urls, &cert_pins, &keep_path)
-                    .await?;
+                crate::frost::verify_relay_certificates(
+                    &relay_urls,
+                    &cert_pins,
+                    &keep_path,
+                    require_pinned,
+                )
+                .await?;
 
                 let keyring = tokio::task::spawn_blocking(move || extract_keyring(&keep_arc))
                     .await

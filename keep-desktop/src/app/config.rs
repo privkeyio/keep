@@ -22,6 +22,13 @@ pub struct Settings {
     pub bunker_auto_start: bool,
     #[serde(default)]
     pub local_signer_auto_start: bool,
+    /// Strict certificate pinning: when enabled, a `wss://` relay with no
+    /// pre-provisioned pin is rejected (fail-closed) instead of trusted on
+    /// first use, closing the first-connection MitM window plain TOFU leaves
+    /// open. Opt-in and off by default: enable only after every relay's pin
+    /// has been recorded, or new connections to un-pinned relays will fail.
+    #[serde(default)]
+    pub strict_cert_pinning: bool,
 }
 
 fn default_auto_lock_secs() -> u64 {
@@ -42,6 +49,7 @@ impl Default for Settings {
             start_minimized: false,
             bunker_auto_start: false,
             local_signer_auto_start: false,
+            strict_cert_pinning: false,
         }
     }
 }
@@ -186,5 +194,29 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
 
     if migrated {
         tracing::info!("Migrated relay/proxy config from JSON files to vault");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_without_strict_pinning_field_default_to_off() {
+        // A settings.json written before the field existed must keep parsing
+        // and must not silently enable strict mode.
+        let legacy = r#"{"auto_lock_secs":300,"clipboard_clear_secs":30}"#;
+        let s: Settings = serde_json::from_str(legacy).unwrap();
+        assert!(!s.strict_cert_pinning);
+    }
+
+    #[test]
+    fn strict_pinning_round_trips_through_serde() {
+        let mut s = Settings::default();
+        assert!(!s.strict_cert_pinning);
+        s.strict_cert_pinning = true;
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(back.strict_cert_pinning);
     }
 }

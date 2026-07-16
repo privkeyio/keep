@@ -298,11 +298,11 @@ pub(crate) fn evaluate_pin(
     if expected.is_empty() {
         if require_pinned {
             // Strict mode: refuse to trust an un-pre-provisioned host, closing
-            // the first-connection MitM window that plain TOFU leaves open.
-            return Err(FrostNetError::CertificatePinMismatch {
+            // the first-connection MitM window that plain TOFU leaves open. A
+            // distinct error (not a mismatch) lets callers tell "no pin yet,
+            // provision one" apart from "the pinned key changed".
+            return Err(FrostNetError::CertificatePinMissing {
                 hostname: hostname.to_string(),
-                expected: "a pre-provisioned pin (strict cert pinning enabled)".into(),
-                actual: hex::encode(spki_hash),
             });
         }
         // Trust-on-first-use: no pin yet, surface the observed hash to pin.
@@ -358,7 +358,7 @@ mod tests {
     fn strict_mode_rejects_unpinned_host() {
         // Strict: an un-pre-provisioned host is rejected, not trusted-on-first-use.
         let err = evaluate_pin("relay.example.com", [7u8; 32], &[], true).unwrap_err();
-        assert!(matches!(err, FrostNetError::CertificatePinMismatch { .. }));
+        assert!(matches!(err, FrostNetError::CertificatePinMissing { .. }));
     }
 
     #[test]
