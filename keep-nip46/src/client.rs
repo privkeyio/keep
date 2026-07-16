@@ -45,6 +45,54 @@ pub fn contains_control_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_control())
 }
 
+/// Validate the `register_wallet` arguments. Pure input validation with no
+/// network dependency, factored out so it can be unit-tested hermetically
+/// (without standing up a relay just to reach the checks).
+pub fn validate_register_wallet_args(name: &str, descriptor: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "wallet name must not be empty".into(),
+        ));
+    }
+    if name.len() > MAX_WALLET_NAME_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "wallet name exceeds {MAX_WALLET_NAME_LEN} bytes"
+        )));
+    }
+    if descriptor.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "descriptor must not be empty".into(),
+        ));
+    }
+    if descriptor.len() > MAX_DESCRIPTOR_LEN {
+        return Err(KeepError::InvalidInput(format!(
+            "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
+        )));
+    }
+    let body = descriptor.split('#').next().unwrap_or(descriptor);
+    let has_multipath = keep_core::descriptor::has_multipath_marker(body);
+    let has_single_path = keep_core::descriptor::has_single_path_tail(body);
+    if has_single_path {
+        let msg = if has_multipath {
+            "descriptor mixes multipath and single-path keys; normalize all keys to <0;1>"
+        } else {
+            "descriptor must be multipath (e.g. <0;1>) so the device can derive change"
+        };
+        return Err(KeepError::InvalidInput(msg.into()));
+    }
+    if body.contains("<1;0>") {
+        return Err(KeepError::InvalidInput(
+            "descriptor must use <0;1> multipath order; reorder before sending".into(),
+        ));
+    }
+    if !has_multipath && body.contains('*') {
+        return Err(KeepError::InvalidInput(
+            "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a free-form metadata string from a signer or operator: enforce
 /// `min_len..=max_len` byte length and reject control characters. `field` is
 /// used only for error messages.
@@ -297,47 +345,7 @@ impl Nip46Client {
         name: &str,
         descriptor: &str,
     ) -> Result<RegisterWalletResponse> {
-        if name.is_empty() {
-            return Err(KeepError::InvalidInput(
-                "wallet name must not be empty".into(),
-            ));
-        }
-        if name.len() > MAX_WALLET_NAME_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "wallet name exceeds {MAX_WALLET_NAME_LEN} bytes"
-            )));
-        }
-        if descriptor.is_empty() {
-            return Err(KeepError::InvalidInput(
-                "descriptor must not be empty".into(),
-            ));
-        }
-        if descriptor.len() > MAX_DESCRIPTOR_LEN {
-            return Err(KeepError::InvalidInput(format!(
-                "descriptor exceeds {MAX_DESCRIPTOR_LEN} bytes"
-            )));
-        }
-        let body = descriptor.split('#').next().unwrap_or(descriptor);
-        let has_multipath = keep_core::descriptor::has_multipath_marker(body);
-        let has_single_path = keep_core::descriptor::has_single_path_tail(body);
-        if has_single_path {
-            let msg = if has_multipath {
-                "descriptor mixes multipath and single-path keys; normalize all keys to <0;1>"
-            } else {
-                "descriptor must be multipath (e.g. <0;1>) so the device can derive change"
-            };
-            return Err(KeepError::InvalidInput(msg.into()));
-        }
-        if body.contains("<1;0>") {
-            return Err(KeepError::InvalidInput(
-                "descriptor must use <0;1> multipath order; reorder before sending".into(),
-            ));
-        }
-        if !has_multipath && body.contains('*') {
-            return Err(KeepError::InvalidInput(
-                "descriptor must be multipath (e.g. <0;1>) so the device can derive change".into(),
-            ));
-        }
+        validate_register_wallet_args(name, descriptor)?;
 
         let id = new_request_id();
         let mut response = self
@@ -689,6 +697,44 @@ fn append_json_string(buf: &mut Zeroizing<String>, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_register_wallet_args_accepts_multipath() {
+        assert!(validate_register_wallet_args("treasury", "tr([deadbeef]xpub6/<0;1>/*)").is_ok());
+    }
+
+    #[test]
+    fn validate_register_wallet_args_rejects_empty_name() {
+        let err = validate_register_wallet_args("", "tr(xpub/<0;1>/*)").unwrap_err();
+        assert!(err.to_string().contains("wallet name must not be empty"));
+    }
+
+    #[test]
+    fn validate_register_wallet_args_rejects_overlong_name() {
+        let long = "a".repeat(MAX_WALLET_NAME_LEN + 1);
+        let err = validate_register_wallet_args(&long, "tr(xpub/<0;1>/*)").unwrap_err();
+        assert!(err.to_string().contains("wallet name exceeds"));
+    }
+
+    #[test]
+    fn validate_register_wallet_args_rejects_empty_descriptor() {
+        let err = validate_register_wallet_args("ok", "").unwrap_err();
+        assert!(err.to_string().contains("descriptor must not be empty"));
+    }
+
+    #[test]
+    fn validate_register_wallet_args_rejects_single_path_descriptor() {
+        // A single-path `/0/*` tail (not multipath) is rejected so the device
+        // can derive the change chain.
+        let err = validate_register_wallet_args("ok", "tr(xpub/0/*)").unwrap_err();
+        assert!(err.to_string().contains("must be multipath"));
+    }
+
+    #[test]
+    fn validate_register_wallet_args_rejects_reversed_multipath_order() {
+        let err = validate_register_wallet_args("ok", "tr(xpub/<1;0>/*)").unwrap_err();
+        assert!(err.to_string().contains("<0;1> multipath order"));
+    }
 
     #[test]
     fn test_device_info_roundtrip_named_kind() {

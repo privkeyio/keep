@@ -220,25 +220,9 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
     signer_handle.abort();
 }
 
-#[tokio::test]
-async fn test_nip46_client_register_wallet_rejects_empty_name() {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
-
-    let mock_relay = MockRelay::run().await.expect("mock relay");
-    let relay_url = mock_relay.url().await.to_string();
-
-    let signer_keys = Keys::generate();
-    let client = Nip46Client::connect_with(signer_keys.public_key(), vec![relay_url], None)
-        .await
-        .expect("client connect");
-
-    let err = client
-        .register_wallet("", "tr(xpub.../<0;1>/*)")
-        .await
-        .unwrap_err();
-    assert!(err.to_string().contains("wallet name must not be empty"));
-
-    client.disconnect().await;
-}
+// Pure register_wallet argument validation (empty/overlong name, empty or
+// single-path descriptor, multipath order) is covered hermetically by the
+// `validate_register_wallet_args_*` unit tests in `client.rs`. Those need no
+// relay, so the former MockRelay-dependent empty-name integration test (which
+// could fail on a port conflict or a rustls-provider install race unrelated to
+// the validation under test) was removed as redundant and flaky.
