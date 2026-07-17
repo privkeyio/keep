@@ -709,16 +709,21 @@ impl KeepMobile {
         Ok((*mnemonic).clone())
     }
 
-    pub fn validate_mnemonic(&self, mut mnemonic: String) -> Result<(), KeepMobileError> {
-        let result = keep_core::mnemonic::validate_mnemonic(&mnemonic)
-            .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
-        mnemonic.zeroize();
-        result
+    pub fn validate_mnemonic(&self, mnemonic: Vec<u8>) -> Result<(), KeepMobileError> {
+        // Accept the mnemonic as wipeable bytes (a Kotlin ByteArray) rather than an
+        // immutable String that lingers on the JVM heap.
+        let mnemonic = Zeroizing::new(mnemonic);
+        let mnemonic =
+            std::str::from_utf8(&mnemonic).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "mnemonic must be valid UTF-8".into(),
+            })?;
+        keep_core::mnemonic::validate_mnemonic(mnemonic)
+            .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })
     }
 
     pub fn create_account_from_mnemonic(
         &self,
-        mnemonic: String,
+        mnemonic: Vec<u8>,
         passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
@@ -727,7 +732,7 @@ impl KeepMobile {
 
     pub fn create_account_from_mnemonic_with_index(
         &self,
-        mut mnemonic: String,
+        mnemonic: Vec<u8>,
         mut passphrase: String,
         name: String,
         account_index: u32,
@@ -739,16 +744,20 @@ impl KeepMobile {
             });
         }
 
-        let mnemonic_bytes = Zeroizing::new(mnemonic.as_bytes().to_vec());
-        let key = keep_core::nip06::derive_nostr_key(&mnemonic, &passphrase, account_index)
+        // The mnemonic arrives as wipeable bytes; borrow it as UTF-8 to derive the key
+        // and keep a zeroizing copy for storage. No plaintext mnemonic String is created.
+        let mnemonic = Zeroizing::new(mnemonic);
+        let mnemonic_str =
+            std::str::from_utf8(&mnemonic).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "mnemonic must be valid UTF-8".into(),
+            })?;
+        let mnemonic_bytes = Zeroizing::new(mnemonic.to_vec());
+        let key = keep_core::nip06::derive_nostr_key(mnemonic_str, &passphrase, account_index)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() });
-        mnemonic.zeroize();
         passphrase.zeroize();
         let key = key?;
-        let mut hex_key = hex::encode(*key);
-        let result = self.do_import_nsec(&hex_key, name, Some(mnemonic_bytes));
-        hex_key.zeroize();
-        result
+        let hex_key = Zeroizing::new(hex::encode(*key));
+        self.do_import_nsec(&hex_key, name, Some(mnemonic_bytes))
     }
 
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
@@ -3811,6 +3820,46 @@ mod import_teardown_tests {
         assert!(matches!(
             mobile.import_nsec(vec![0xff, 0xfe], "x".into()),
             Err(KeepMobileError::InvalidShare { .. })
+        ));
+    }
+
+    #[test]
+    fn validate_mnemonic_accepts_valid_bytes_and_rejects_garbage() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let mnemonic = mobile.generate_mnemonic(12).unwrap();
+        assert!(mobile.validate_mnemonic(mnemonic.into_bytes()).is_ok());
+
+        // Well-formed UTF-8 but not a valid BIP-39 phrase.
+        assert!(mobile
+            .validate_mnemonic(b"not a valid mnemonic phrase at all".to_vec())
+            .is_err());
+        // Non-UTF-8 bytes.
+        assert!(matches!(
+            mobile.validate_mnemonic(vec![0xff, 0xfe]),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+    }
+
+    #[test]
+    fn create_account_from_mnemonic_bytes_round_trips() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let mnemonic = mobile.generate_mnemonic(12).unwrap();
+        let info = mobile
+            .create_account_from_mnemonic(mnemonic.into_bytes(), String::new(), "acct".into())
+            .unwrap();
+        assert!(!info.group_pubkey.is_empty());
+        assert_eq!(
+            storage.get_active_share_key().as_deref(),
+            Some(info.group_pubkey.as_str())
+        );
+        // Non-UTF-8 mnemonic bytes fail closed.
+        assert!(matches!(
+            mobile.create_account_from_mnemonic(vec![0xff, 0xfe], String::new(), "x".into()),
+            Err(KeepMobileError::InvalidInput { .. })
         ));
     }
 
