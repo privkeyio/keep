@@ -23,7 +23,7 @@ use crate::handler::SignerHandler;
 use crate::permissions::PermissionManager;
 use crate::rate_limit::RateLimitConfig;
 use crate::server::dispatch_request;
-use crate::types::{LogEvent, ServerCallbacks};
+use crate::types::{ConnectAuthorization, LogEvent, ServerCallbacks};
 
 const MAX_CONNECTIONS: usize = 32;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -286,7 +286,9 @@ async fn handle_connection(
     }
 
     if let Some(ref cb) = callbacks {
-        cb.on_connect(&client_id, &client_id);
+        // Local IPC connections are gated by OS socket permissions, not a per-connect
+        // secret or approval prompt, so they are reported as AutoApproved.
+        cb.on_connect(&client_id, &client_id, ConnectAuthorization::AutoApproved);
     }
 
     let user_pubkey = match handler.our_pubkey().await {
@@ -341,7 +343,18 @@ async fn handle_connection(
         };
 
         let method = request.method.clone();
-        let response = dispatch_request(&handler, user_pubkey, app_pubkey, request, max_size).await;
+        // Local IPC authorizes on the socket-accept path above, not on a connect
+        // method through dispatch_request, so the connect authorization is ignored here.
+        let mut connect_auth = None;
+        let response = dispatch_request(
+            &handler,
+            user_pubkey,
+            app_pubkey,
+            request,
+            max_size,
+            &mut connect_auth,
+        )
+        .await;
 
         let success = response.error.is_none();
         if let Some(ref cb) = callbacks {

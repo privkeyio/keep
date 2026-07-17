@@ -117,10 +117,25 @@ impl From<bool> for ApprovalResult {
     }
 }
 
+/// Why a NIP-46 connect was authorized. Carried on `on_connect` so the consumer
+/// authorizes the client off an explicit assertion from the server, rather than
+/// inferring consent from the callback merely having fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectAuthorization {
+    /// The connect secret carried in the bunker URL matched the expected secret.
+    SecretMatched,
+    /// The user explicitly approved the connect via the approval prompt.
+    UserApproved,
+    /// The server was configured to auto-approve connects (no secret, no prompt).
+    /// Consumers that require explicit consent should NOT persist authorization
+    /// for this case.
+    AutoApproved,
+}
+
 pub trait ServerCallbacks: Send + Sync + 'static {
     fn on_log(&self, event: LogEvent);
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
-    fn on_connect(&self, _pubkey: &str, _name: &str) {}
+    fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
     /// Called after the in-memory permission grants change (a remember-grant is
     /// written or a client is revoked), passing a full snapshot of the current
     /// grants so the consumer can persist them durably. Default no-op: keep-web

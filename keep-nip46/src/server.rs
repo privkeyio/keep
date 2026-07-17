@@ -19,7 +19,9 @@ use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::handler::SignerHandler;
 use crate::permissions::{Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::RateLimitConfig;
-use crate::types::{LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks};
+use crate::types::{
+    ConnectAuthorization, LogEvent, Nip46Request, Nip46Response, PartialEvent, ServerCallbacks,
+};
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
 pub struct ServerConfig {
@@ -638,12 +640,14 @@ impl Server {
         debug!(method = %request.method, app_id, "NIP-46 request");
 
         let method = request.method.clone();
+        let mut connect_auth = None;
         let response = dispatch_request(
             handler,
             keys.public_key(),
             app_pubkey,
             request,
             max_event_json_size,
+            &mut connect_auth,
         )
         .await;
 
@@ -656,8 +660,10 @@ impl Server {
                 detail: response.error.clone(),
             });
 
-            if method == "connect" && success {
-                cb.on_connect(&app_pubkey.to_hex(), &format!("App {app_id}"));
+            // connect_auth is Some only when handle_connect authorized the connect,
+            // so on_connect fires with the explicit authorization reason.
+            if let Some(auth) = connect_auth {
+                cb.on_connect(&app_pubkey.to_hex(), &format!("App {app_id}"), auth);
             }
         }
 
@@ -692,6 +698,7 @@ pub(crate) async fn dispatch_request(
     app_pubkey: PublicKey,
     request: Nip46Request,
     max_event_json_size: usize,
+    connect_auth: &mut Option<ConnectAuthorization>,
 ) -> Nip46Response {
     let id = request.id.clone();
 
@@ -707,7 +714,10 @@ pub(crate) async fn dispatch_request(
                 .handle_connect(app_pubkey, our_pubkey, secret, permissions)
                 .await
             {
-                Ok(()) => Nip46Response::ok(id, "ack"),
+                Ok(auth) => {
+                    *connect_auth = Some(auth);
+                    Nip46Response::ok(id, "ack")
+                }
                 Err(e) => {
                     warn!(error = %e, "connect failed");
                     Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
