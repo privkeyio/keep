@@ -108,14 +108,6 @@ pub fn is_valid_nsec_format(nsec: String) -> bool {
 }
 
 #[uniffi::export]
-pub fn nsec_to_hex(nsec: String) -> Option<String> {
-    use nostr_sdk::prelude::{FromBech32, SecretKey};
-    SecretKey::from_bech32(&nsec)
-        .ok()
-        .map(|sk| sk.to_secret_hex())
-}
-
-#[uniffi::export]
 pub fn backup_min_passphrase_length() -> u32 {
     keep_core::backup::MIN_PASSPHRASE_LEN as u32
 }
@@ -695,20 +687,20 @@ impl KeepMobile {
         self.store_share_package(&share)
     }
 
-    pub fn import_nsec(
-        &self,
-        mut hex_key: String,
-        name: String,
-    ) -> Result<ShareInfo, KeepMobileError> {
-        if hex_key.len() != 64 {
-            hex_key.zeroize();
-            return Err(KeepMobileError::InvalidShare {
-                msg: "Key must be exactly 64 hex characters".into(),
-            });
-        }
-        let result = self.do_import_nsec(&hex_key, name, None);
-        hex_key.zeroize();
-        result
+    pub fn import_nsec(&self, nsec: Vec<u8>, name: String) -> Result<ShareInfo, KeepMobileError> {
+        use nostr_sdk::prelude::{FromBech32, SecretKey};
+        // Accept the nsec as wipeable bytes (a Kotlin ByteArray) rather than an
+        // immutable String, and decode it to the secret key here so the raw hex
+        // form is never handed back across the FFI to the caller.
+        let nsec = Zeroizing::new(nsec);
+        let nsec = std::str::from_utf8(&nsec).map_err(|_| KeepMobileError::InvalidShare {
+            msg: "nsec must be valid UTF-8".into(),
+        })?;
+        let secret = SecretKey::from_bech32(nsec).map_err(|_| KeepMobileError::InvalidShare {
+            msg: "invalid nsec".into(),
+        })?;
+        let hex_key = Zeroizing::new(secret.to_secret_hex());
+        self.do_import_nsec(&hex_key, name, None)
     }
 
     pub fn generate_mnemonic(&self, word_count: u32) -> Result<String, KeepMobileError> {
@@ -3789,8 +3781,13 @@ mod import_teardown_tests {
 
         seed_pending_request(&mobile);
 
+        use nostr_sdk::prelude::{SecretKey, ToBech32};
+        let nsec = SecretKey::from_slice(&[1u8; 32])
+            .unwrap()
+            .to_bech32()
+            .unwrap();
         let info = mobile
-            .import_nsec("01".repeat(32), "imported".into())
+            .import_nsec(nsec.into_bytes(), "imported".into())
             .unwrap();
 
         assert_pending_cleared(&mobile);
@@ -3798,6 +3795,23 @@ mod import_teardown_tests {
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
         );
+    }
+
+    #[test]
+    fn import_nsec_rejects_invalid_nsec_bytes() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        // Not a bech32 nsec at all.
+        assert!(matches!(
+            mobile.import_nsec(b"not-an-nsec".to_vec(), "x".into()),
+            Err(KeepMobileError::InvalidShare { .. })
+        ));
+        // Non-UTF-8 bytes are rejected before any bech32 parsing.
+        assert!(matches!(
+            mobile.import_nsec(vec![0xff, 0xfe], "x".into()),
+            Err(KeepMobileError::InvalidShare { .. })
+        ));
     }
 
     // A re-initialize that replaces a live node aborts the prior tasks and, like
