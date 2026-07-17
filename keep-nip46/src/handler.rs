@@ -20,8 +20,8 @@ use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
 use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
-    ApprovalRequest, ApprovalResult, HttpAuthDetails, RememberDuration, ServerCallbacks,
-    NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
+    ApprovalRequest, ApprovalResult, ConnectAuthorization, HttpAuthDetails, RememberDuration,
+    ServerCallbacks, NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
 };
 
 /// Max displayed length of a NIP-98 `u`/`method` value. A kilobyte-scale tag
@@ -397,13 +397,13 @@ impl SignerHandler {
         our_pubkey: Option<PublicKey>,
         secret: Option<String>,
         permissions: Option<String>,
-    ) -> Result<()> {
+    ) -> Result<ConnectAuthorization> {
         self.check_rate_limit(&app_pubkey).await?;
 
         let app_id = &app_pubkey.to_hex()[..8];
         let name = format!("App {app_id}");
 
-        if let Some(ref expected) = self.expected_secret {
+        let authorization = if let Some(ref expected) = self.expected_secret {
             let expected_hash = Sha256::digest(expected.as_bytes());
             let valid = match &secret {
                 Some(s) => {
@@ -420,6 +420,7 @@ impl SignerHandler {
                 );
                 return Err(KeepError::PermissionDenied("invalid secret".into()));
             }
+            ConnectAuthorization::SecretMatched
         } else if !self.auto_approve {
             // Connect-time approval ignores the remember-duration today: the
             // app-level lifetime is configured separately via the bunker's
@@ -439,7 +440,10 @@ impl SignerHandler {
             if !result.approved {
                 return Err(KeepError::UserRejected);
             }
-        }
+            ConnectAuthorization::UserApproved
+        } else {
+            ConnectAuthorization::AutoApproved
+        };
 
         if let Some(expected) = our_pubkey {
             // The client targets the transport (bunker URL) pubkey, which for a
@@ -479,7 +483,7 @@ impl SignerHandler {
             .log(AuditEntry::new(AuditAction::Connect, app_pubkey).with_app_name(&name));
 
         info!(app_id, "app connected");
-        Ok(())
+        Ok(authorization)
     }
 
     pub async fn handle_get_public_key(&self, app_pubkey: PublicKey) -> Result<PublicKey> {
@@ -1007,7 +1011,7 @@ mod tests {
             }
             ApprovalResult::approved_once()
         }
-        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
     }
 
     #[tokio::test]
@@ -1327,6 +1331,32 @@ mod tests {
 
         let pm = handler.permissions.lock().await;
         assert!(pm.is_connected(&app_pubkey));
+    }
+
+    #[tokio::test]
+    async fn handle_connect_reports_authorization_reason() {
+        // auto_approve mode: no secret, no prompt -> AutoApproved.
+        let handler = setup_handler();
+        let app = Keys::generate().public_key();
+        assert_eq!(
+            handler.handle_connect(app, None, None, None).await.unwrap(),
+            ConnectAuthorization::AutoApproved
+        );
+
+        // expected_secret mode with the correct secret -> SecretMatched.
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None)
+            .with_expected_secret("correct_secret_value".into());
+        let app = Keys::generate().public_key();
+        assert_eq!(
+            handler
+                .handle_connect(app, None, Some("correct_secret_value".into()), None)
+                .await
+                .unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
     }
 
     #[tokio::test]
@@ -1794,7 +1824,7 @@ mod tests {
                 remember: self.remember,
             }
         }
-        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
     }
 
     #[tokio::test]
@@ -1979,7 +2009,7 @@ mod tests {
                 remember: RememberDuration::Forever,
             }
         }
-        fn on_connect(&self, _pubkey: &str, _name: &str) {}
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
         fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
             self.snapshots.lock().unwrap().push(grants);
         }

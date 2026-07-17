@@ -81,7 +81,12 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         .into()
     }
 
-    fn on_connect(&self, client_id: &str, name: &str) {
+    fn on_connect(
+        &self,
+        client_id: &str,
+        name: &str,
+        _authorization: keep_nip46::types::ConnectAuthorization,
+    ) {
         let _ = self.tx.send(LocalSignerEvent::Connected {
             client_id: client_id.to_string(),
             name: name.to_string(),

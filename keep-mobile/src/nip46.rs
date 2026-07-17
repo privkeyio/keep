@@ -127,14 +127,36 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
     })
 }
 
+/// Why a NIP-46 connect was authorized, asserted by the signer core. The Kotlin
+/// consumer should persist a client as authorized only for an explicit-consent
+/// reason (`SecretMatched`/`UserApproved`), never for `AutoApproved`, so that
+/// authorization does not depend on the callback merely having fired.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectAuthorization {
+    SecretMatched,
+    UserApproved,
+    AutoApproved,
+}
+
+impl From<keep_nip46::types::ConnectAuthorization> for ConnectAuthorization {
+    fn from(a: keep_nip46::types::ConnectAuthorization) -> Self {
+        match a {
+            keep_nip46::types::ConnectAuthorization::SecretMatched => Self::SecretMatched,
+            keep_nip46::types::ConnectAuthorization::UserApproved => Self::UserApproved,
+            keep_nip46::types::ConnectAuthorization::AutoApproved => Self::AutoApproved,
+        }
+    }
+}
+
 #[uniffi::export(with_foreign)]
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
     fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
-    /// never as markup.
-    fn on_connect(&self, pubkey: String, name: String);
+    /// never as markup. `authorization` states why the core authorized the
+    /// connect; persist authorization only for explicit-consent reasons.
+    fn on_connect(&self, pubkey: String, name: String, authorization: ConnectAuthorization);
 }
 
 struct CallbackBridge {
@@ -169,9 +191,14 @@ impl ServerCallbacks for CallbackBridge {
             .into()
     }
 
-    fn on_connect(&self, pubkey: &str, name: &str) {
+    fn on_connect(
+        &self,
+        pubkey: &str,
+        name: &str,
+        authorization: keep_nip46::types::ConnectAuthorization,
+    ) {
         self.callbacks
-            .on_connect(pubkey.to_string(), name.to_string());
+            .on_connect(pubkey.to_string(), name.to_string(), authorization.into());
     }
 
     fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {

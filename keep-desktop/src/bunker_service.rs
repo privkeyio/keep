@@ -105,7 +105,12 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         .into()
     }
 
-    fn on_connect(&self, pubkey: &str, _name: &str) {
+    fn on_connect(
+        &self,
+        pubkey: &str,
+        _name: &str,
+        _authorization: keep_nip46::types::ConnectAuthorization,
+    ) {
         let _ = self.tx.send(BunkerEvent::Connected {
             pubkey: pubkey.to_string(),
         });
