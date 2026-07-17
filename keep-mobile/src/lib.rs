@@ -1052,7 +1052,7 @@ impl KeepMobile {
     }
 
     // Caller is responsible for re-authentication before calling this method
-    pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<String>, KeepMobileError> {
+    pub fn get_seed_words(&self, group_pubkey: String) -> Result<Option<Vec<u8>>, KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
 
         let data = self.storage.load_share_by_key(group_pubkey)?;
@@ -1062,10 +1062,12 @@ impl KeepMobile {
         stored
             .plaintext_mnemonic
             .map(|bytes| {
-                let s = std::str::from_utf8(&bytes).map_err(|_| KeepMobileError::StorageError {
+                // Validate UTF-8 (as before) but return the raw bytes so the caller holds a
+                // wipeable ByteArray instead of an immutable String on the JVM heap.
+                std::str::from_utf8(&bytes).map_err(|_| KeepMobileError::StorageError {
                     msg: "mnemonic contains invalid UTF-8".to_string(),
                 })?;
-                Ok(s.to_owned())
+                Ok(bytes.to_vec())
             })
             .transpose()
     }
@@ -3861,6 +3863,24 @@ mod import_teardown_tests {
             mobile.create_account_from_mnemonic(vec![0xff, 0xfe], String::new(), "x".into()),
             Err(KeepMobileError::InvalidInput { .. })
         ));
+    }
+
+    #[test]
+    fn get_seed_words_returns_stored_mnemonic_bytes() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        let mnemonic = mobile.generate_mnemonic(12).unwrap();
+        let expected = mnemonic.clone().into_bytes();
+        let info = mobile
+            .create_account_from_mnemonic(mnemonic.into_bytes(), String::new(), "acct".into())
+            .unwrap();
+
+        // The seed is returned as the raw stored bytes, matching what was imported.
+        assert_eq!(
+            mobile.get_seed_words(info.group_pubkey).unwrap(),
+            Some(expected)
+        );
     }
 
     // A re-initialize that replaces a live node aborts the prior tasks and, like
