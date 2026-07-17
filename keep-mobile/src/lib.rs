@@ -703,10 +703,13 @@ impl KeepMobile {
         self.do_import_nsec(&hex_key, name, None)
     }
 
-    pub fn generate_mnemonic(&self, word_count: u32) -> Result<String, KeepMobileError> {
+    pub fn generate_mnemonic(&self, word_count: u32) -> Result<Vec<u8>, KeepMobileError> {
+        // Return the generated phrase as bytes so the caller (Kotlin) can hold it in a
+        // wipeable ByteArray instead of an immutable String. The internal phrase is
+        // zeroized on drop; only the returned bytes leave the crate.
         let mnemonic = keep_core::mnemonic::generate_mnemonic(word_count)
             .map_err(|e| KeepMobileError::InvalidInput { msg: e.to_string() })?;
-        Ok((*mnemonic).clone())
+        Ok(mnemonic.as_bytes().to_vec())
     }
 
     pub fn validate_mnemonic(&self, mnemonic: Vec<u8>) -> Result<(), KeepMobileError> {
@@ -3831,7 +3834,7 @@ mod import_teardown_tests {
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
         let mnemonic = mobile.generate_mnemonic(12).unwrap();
-        assert!(mobile.validate_mnemonic(mnemonic.into_bytes()).is_ok());
+        assert!(mobile.validate_mnemonic(mnemonic).is_ok());
 
         // Well-formed UTF-8 but not a valid BIP-39 phrase.
         assert!(mobile
@@ -3851,7 +3854,7 @@ mod import_teardown_tests {
 
         let mnemonic = mobile.generate_mnemonic(12).unwrap();
         let info = mobile
-            .create_account_from_mnemonic(mnemonic.into_bytes(), String::new(), "acct".into())
+            .create_account_from_mnemonic(mnemonic, String::new(), "acct".into())
             .unwrap();
         assert!(!info.group_pubkey.is_empty());
         assert_eq!(
@@ -3871,9 +3874,9 @@ mod import_teardown_tests {
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
 
         let mnemonic = mobile.generate_mnemonic(12).unwrap();
-        let expected = mnemonic.clone().into_bytes();
+        let expected = mnemonic.clone();
         let info = mobile
-            .create_account_from_mnemonic(mnemonic.into_bytes(), String::new(), "acct".into())
+            .create_account_from_mnemonic(mnemonic, String::new(), "acct".into())
             .unwrap();
 
         // The seed is returned as the raw stored bytes, matching what was imported.
