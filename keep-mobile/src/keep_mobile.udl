@@ -256,7 +256,7 @@ interface KeepMobile {
     ShareInfo import_share(string data, string passphrase, string name);
 
     [Throws=KeepMobileError]
-    string generate_mnemonic(u32 word_count);
+    sequence<u8> generate_mnemonic(u32 word_count);
 
     [Throws=KeepMobileError]
     void validate_mnemonic(sequence<u8> mnemonic);
