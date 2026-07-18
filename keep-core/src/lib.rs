@@ -1805,6 +1805,42 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_snapshot_survives_lock() {
+        // cmd_wallet_spend (keep-1ij5) snapshots the descriptor set while unlocked, then
+        // locks the vault before the coordination wait so the master key is not resident.
+        // The snapshot is owned, non-secret metadata, so it must stay usable after lock.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let group_pubkey = [0x11u8; 32];
+        let descriptor = WalletDescriptor {
+            group_pubkey,
+            external_descriptor: format!("tr({})/0/*)", hex::encode(group_pubkey)),
+            internal_descriptor: format!("tr({})/1/*)", hex::encode(group_pubkey)),
+            network: "signet".into(),
+            created_at: 1_700_000_000,
+            device_registrations: Vec::new(),
+            policy_hash: [0x22; 32],
+            version: crate::wallet::INITIAL_DESCRIPTOR_VERSION,
+            previous_descriptor_hash: None,
+            policy: None,
+        };
+        keep.store_wallet_descriptor(&descriptor).unwrap();
+
+        // Snapshot while unlocked (as the spend path does), then lock.
+        let snapshot = keep.list_all_wallet_descriptor_versions().unwrap();
+        assert!(snapshot.iter().any(|d| d.group_pubkey == group_pubkey));
+
+        keep.lock();
+        assert!(!keep.is_unlocked());
+        // A live read now requires unlock, but the pre-lock snapshot the coordination
+        // wait relies on is unaffected.
+        assert!(keep.list_all_wallet_descriptor_versions().is_err());
+        assert!(snapshot.iter().any(|d| d.group_pubkey == group_pubkey));
+    }
+
+    #[test]
     fn rate_limit_trip_emits_audit_entry_on_next_unlock() {
         // The rate limiter trips after MAX_ATTEMPTS (5) failed unlocks. The
         // trip event must surface as a `RateLimitTripped` audit entry the

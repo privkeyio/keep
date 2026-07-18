@@ -1536,6 +1536,16 @@ pub fn cmd_wallet_spend(
         None => keep.frost_get_share(&group_pubkey)?,
     };
 
+    // Snapshot the (non-secret) descriptor set while unlocked, then lock the vault so the
+    // master key is zeroized before the coordination wait instead of lingering in memory
+    // for the whole session. Spend only READS descriptors and single-vault-open rules out
+    // a concurrent writer, so the snapshot is equivalent to the live lookup for the
+    // session's bounded lifetime. The FROST signing share stays resident in the node (it
+    // is needed for transport ECDH throughout, and is zeroized on drop). See keep-1ij5.
+    let descriptor_snapshot = std::sync::Arc::new(keep.list_all_wallet_descriptor_versions()?);
+    keep.lock();
+    drop(keep);
+
     out.newline();
     out.header("WDC Recovery Spend Proposal");
     out.field("Group", &hex::encode(group_pubkey));
@@ -1558,13 +1568,16 @@ pub fn cmd_wallet_spend(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
-    let keep = Arc::new(Mutex::new(keep));
-
     rt.block_on(async {
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new(
+            {
+                let snapshot = descriptor_snapshot.clone();
+                move || Some((*snapshot).clone())
+            },
+        )));
         let node = std::sync::Arc::new(node);
 
         node.announce()
