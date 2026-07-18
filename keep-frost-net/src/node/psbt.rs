@@ -1091,27 +1091,33 @@ impl KfpNode {
         final_tx: Option<(Vec<u8>, [u8; 32])>,
     ) -> Result<()> {
         let txid = final_tx.as_ref().map(|(_, id)| *id);
+        let self_pk = self.keys.public_key();
 
+        // Commit the local Finalized state atomically BEFORE broadcasting: check the
+        // initiator invariant and flip to Finalized under a single write lock, so a
+        // concurrent abort/remove_session cannot slip between the check and the commit
+        // and leave peers finalized while our session errored out. If the session is
+        // gone or in the wrong state we return here WITHOUT telling peers to finalize.
+        // `set_finalized` is synchronous (no await), so holding the guard is safe; the
+        // async broadcast happens after the guard is released.
         let (expected_signers, initiator) = {
-            let sessions = self.psbt_sessions.read();
+            let mut sessions = self.psbt_sessions.write();
             let session = sessions
-                .get_session(&session_id)
+                .get_session_mut(&session_id)
                 .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            (
-                session.expected_signers().clone(),
-                session.initiator().copied(),
-            )
+            let initiator = session.initiator().copied();
+            if initiator != Some(self_pk) {
+                return Err(FrostNetError::PolicyViolation(
+                    "Only the session initiator may finalize the PSBT".into(),
+                ));
+            }
+            let expected_signers = session.expected_signers().clone();
+            session.set_finalized(finalized_psbt.clone(), final_tx.clone())?;
+            (expected_signers, initiator)
         };
 
-        if initiator != Some(self.keys.public_key()) {
-            return Err(FrostNetError::PolicyViolation(
-                "Only the session initiator may finalize the PSBT".into(),
-            ));
-        }
-
-        let mut payload =
-            PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt.clone());
-        if let Some((tx, id)) = final_tx.clone() {
+        let mut payload = PsbtFinalizePayload::new(session_id, self.group_pubkey, finalized_psbt);
+        if let Some((tx, id)) = final_tx {
             payload = payload.with_final_tx(tx, id);
         }
         let msg = KfpMessage::PsbtFinalize(payload);
@@ -1138,8 +1144,7 @@ impl KfpNode {
                 .collect()
         };
 
-        // Broadcast before flipping local state so a broadcast failure doesn't
-        // leave peers in the dark while we believe the session is finalized.
+        // Local state is already committed; notifying peers is best-effort.
         let (_reached, broadcast_err) = self
             .broadcast_psbt_event_partial(&msg, &session_id, "psbt_finalize", &target_peers)
             .await;
@@ -1147,16 +1152,8 @@ impl KfpNode {
             warn!(
                 session_id = %hex::encode(session_id),
                 error = %e,
-                "finalize broadcast had failures; committing local state anyway so caller sees finalization",
+                "finalize broadcast had failures; local state already committed",
             );
-        }
-
-        {
-            let mut sessions = self.psbt_sessions.write();
-            let session = sessions
-                .get_session_mut(&session_id)
-                .ok_or_else(|| FrostNetError::Session("unknown PSBT session".into()))?;
-            session.set_finalized(finalized_psbt, final_tx)?;
         }
 
         let _ = self
