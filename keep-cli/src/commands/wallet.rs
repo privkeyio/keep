@@ -1337,6 +1337,14 @@ pub fn cmd_wallet_announce_keys(
         None => keep.frost_get_share(&group_pubkey)?,
     };
 
+    // Snapshot the (non-secret) descriptor set while unlocked, then lock the vault so the
+    // master key is zeroized before the coordination wait instead of lingering for the
+    // whole session. This command only READS descriptors during the wait (single-vault-open
+    // rules out a concurrent writer), so the snapshot is equivalent. See keep-1ij5 / keep-0tdx.
+    let descriptor_snapshot = std::sync::Arc::new(keep.list_all_wallet_descriptor_versions()?);
+    keep.lock();
+    drop(keep);
+
     out.newline();
     out.header("Announce Recovery Keys");
     out.field("Group", &hex::encode(group_pubkey));
@@ -1351,13 +1359,15 @@ pub fn cmd_wallet_announce_keys(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
-    let keep = Arc::new(Mutex::new(keep));
-
     rt.block_on(async {
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node =
+            node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new({
+                let snapshot = descriptor_snapshot.clone();
+                move || Some((*snapshot).clone())
+            })));
         let node = std::sync::Arc::new(node);
 
         node.announce()
@@ -1777,7 +1787,7 @@ fn parse_session_id(s: &str) -> Result<[u8; 32]> {
 #[allow(clippy::too_many_arguments)]
 async fn approve_psbt_session(
     out: &Output,
-    keep: Arc<Mutex<Keep>>,
+    descriptors: Arc<Vec<WalletDescriptor>>,
     node: Arc<keep_frost_net::KfpNode>,
     session_id: [u8; 32],
     group_pubkey: [u8; 32],
@@ -1809,20 +1819,15 @@ async fn approve_psbt_session(
     // the spend under the wrong policy/keys. All spend-side checks below
     // (policy, xpub, network, input bindings) derive from this descriptor.
     // Fail closed if no persisted version matches.
-    let descriptor = {
-        let guard = keep.lock().expect("keep mutex poisoned");
-        guard
-            .list_all_wallet_descriptor_versions()?
-            .into_iter()
-            .find(|d| {
-                d.group_pubkey == group_pubkey && d.canonical_hash() == session_descriptor_hash
-            })
-            .ok_or_else(|| {
-                KeepError::Frost(
-                    "no persisted descriptor matches the PSBT session descriptor_hash".into(),
-                )
-            })?
-    };
+    let descriptor = descriptors
+        .iter()
+        .find(|d| d.group_pubkey == group_pubkey && d.canonical_hash() == session_descriptor_hash)
+        .cloned()
+        .ok_or_else(|| {
+            KeepError::Frost(
+                "no persisted descriptor matches the PSBT session descriptor_hash".into(),
+            )
+        })?;
     let policy_json = descriptor.policy.clone().ok_or_else(|| {
         KeepError::InvalidInput(
             "persisted descriptor has no WalletPolicy; cannot derive recovery tier metadata".into(),
@@ -2053,6 +2058,13 @@ pub fn cmd_wallet_approve_psbt(
         None => keep.frost_get_share(&group_pubkey)?,
     };
 
+    // Snapshot the (non-secret) descriptor set while unlocked, then lock the vault so the
+    // master key is zeroized before the coordination wait. Approval only READS descriptors
+    // during the wait (signing runs via the NIP-46 bunker, not the vault). See keep-0tdx.
+    let descriptor_snapshot = std::sync::Arc::new(keep.list_all_wallet_descriptor_versions()?);
+    keep.lock();
+    drop(keep);
+
     out.newline();
     out.header("WDC Recovery Spend Approval");
     out.field("Group", &hex::encode(group_pubkey));
@@ -2070,8 +2082,6 @@ pub fn cmd_wallet_approve_psbt(
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
-    let keep = Arc::new(Mutex::new(keep));
-
     rt.block_on(async {
         let registry = Arc::new(keep_frost_net::InMemoryRecoverySignerRegistry::new());
         for (fp, uri) in &registry_entries {
@@ -2081,7 +2091,12 @@ pub fn cmd_wallet_approve_psbt(
         let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
             .await
             .map_err(|e| KeepError::Frost(e.to_string()))?;
-        let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
+        let node = node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new(
+            {
+                let snapshot = descriptor_snapshot.clone();
+                move || Some((*snapshot).clone())
+            },
+        )));
         let node = node.with_recovery_signer_registry(registry.clone());
         let node = Arc::new(node);
 
@@ -2143,7 +2158,7 @@ pub fn cmd_wallet_approve_psbt(
                     let bunker = registry_entries[idx].1.clone();
                     approve_psbt_session(
                         out,
-                        keep.clone(),
+                        descriptor_snapshot.clone(),
                         node.clone(),
                         session_id,
                         group_pubkey,
