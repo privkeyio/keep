@@ -1805,6 +1805,60 @@ mod tests {
     }
 
     #[test]
+    fn active_share_key_set_get_roundtrip_and_clear() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let keep = test_keep(&path);
+
+        assert_eq!(keep.get_active_share_key(), None, "absent by default");
+
+        // Set an uppercase pubkey -> stored normalized to lowercase.
+        let key = "AB".repeat(32);
+        keep.set_active_share_key(Some(&key)).unwrap();
+        assert_eq!(keep.get_active_share_key(), Some(key.to_ascii_lowercase()));
+
+        // Clear, then clearing again (absent file) is not an error.
+        keep.set_active_share_key(None).unwrap();
+        assert_eq!(keep.get_active_share_key(), None);
+        keep.set_active_share_key(None).unwrap();
+    }
+
+    #[test]
+    fn active_share_key_rejects_invalid_and_requires_unlock() {
+        let dir = tempdir().unwrap();
+        let keep = test_keep(&dir.path().join("keep"));
+
+        assert!(matches!(
+            keep.set_active_share_key(Some("nothex")),
+            Err(KeepError::InvalidInput(_))
+        ));
+        assert!(
+            matches!(
+                keep.set_active_share_key(Some(&"ab".repeat(31))),
+                Err(KeepError::InvalidInput(_))
+            ),
+            "62 hex chars is not a valid 32-byte pubkey"
+        );
+
+        let mut locked = test_keep(&dir.path().join("keep2"));
+        locked.lock();
+        assert!(matches!(
+            locked.set_active_share_key(Some(&"ab".repeat(32))),
+            Err(KeepError::Locked)
+        ));
+    }
+
+    #[test]
+    fn active_share_key_get_ignores_garbage_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let keep = test_keep(&path);
+        // A file whose content is not a valid hex pubkey is filtered out by get.
+        std::fs::write(path.join("active_share"), b"not-a-valid-pubkey").unwrap();
+        assert_eq!(keep.get_active_share_key(), None);
+    }
+
+    #[test]
     fn descriptor_snapshot_survives_lock() {
         // cmd_wallet_spend (keep-1ij5) snapshots the descriptor set while unlocked, then
         // locks the vault before the coordination wait so the master key is not resident.
