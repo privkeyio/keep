@@ -14,8 +14,13 @@ const SHARE_HRP: &str = "kshare";
 const MAX_FRAME_COUNT: usize = 100;
 const MAX_ASSEMBLED_SIZE: usize = 64 * 1024;
 
+/// AAD domain-separating the optional encrypted public-key-package envelope from
+/// the encrypted key package, so the two ciphertexts (same passphrase key) can
+/// never be confused or swapped.
+const PUBKEY_PACKAGE_AAD: &[u8] = b"keep-share-pubkey-package";
+
 /// An encrypted share export for backup and transfer.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ShareExport {
     /// Format version.
     pub version: u8,
@@ -40,6 +45,20 @@ pub struct ShareExport {
     /// `encrypted_share`, so it cannot be flipped without decryption failure.
     #[serde(default)]
     pub ciphersuite: Ciphersuite,
+    /// Encrypted full FROST public-key package (every participant's verifying
+    /// share), hex. Lets an imported holder enforce the canonical verifying-share
+    /// binding for co-signers instead of only its own share. Optional and
+    /// separately authenticated (own AAD + fresh nonce, same passphrase key):
+    /// absent in exports written before this field existed, stripped from the
+    /// size-limited [`Self::to_bech32`] form, and import falls back to a
+    /// single-entry package on absence, tampering, or mismatch. Secret recovery
+    /// never depends on it, and `version` stays `1` so older clients ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_pubkey_package: Option<String>,
+    /// Fresh nonce (hex) for [`Self::encrypted_pubkey_package`]; distinct from
+    /// `nonce` (never reuse a key+nonce pair).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pubkey_nonce: Option<String>,
 }
 
 impl ShareExport {
@@ -61,6 +80,14 @@ impl ShareExport {
 
         let encrypted = crypto::encrypt_with_aad(&key_bytes, ciphersuite.aad(), &key)?;
 
+        // Also carry the full public-key package. It is public data, but it is
+        // encrypted-and-authenticated (distinct AAD + its own fresh nonce, same
+        // key) so an importer can trust it as the canonical verifying-share map
+        // rather than only its own single entry. Never gates secret recovery, and
+        // is stripped from the size-limited bech32 form.
+        let encrypted_pubkey =
+            crypto::encrypt_with_aad(share.pubkey_package_bytes(), PUBKEY_PACKAGE_AAD, &key)?;
+
         Ok(Self {
             version: 1,
             threshold: share.metadata.threshold,
@@ -71,6 +98,8 @@ impl ShareExport {
             nonce: hex::encode(encrypted.nonce),
             salt: hex::encode(salt),
             ciphersuite,
+            encrypted_pubkey_package: Some(hex::encode(&encrypted_pubkey.ciphertext)),
+            pubkey_nonce: Some(hex::encode(encrypted_pubkey.nonce)),
         })
     }
 
@@ -132,10 +161,50 @@ impl ShareExport {
                     .map_err(|e| {
                         KeepError::Frost(format!("Failed to deserialize key package: {e}"))
                     })?;
-                let pubkey_package = derive_pubkey_package(&key_package)?;
+                // Prefer the exported full public-key package (enables the canonical
+                // verifying-share binding for co-signers). Fall back to a single-entry
+                // package on absence, decrypt/deserialize failure, or anchor mismatch;
+                // secret recovery is never gated on this optional field.
+                let pubkey_package = match self.recover_full_pubkey_package(&key, &key_package) {
+                    Some(pkg) => pkg,
+                    None => derive_pubkey_package(&key_package)?,
+                };
                 SharePackage::new(metadata, &key_package, &pubkey_package)
             }
             Ciphersuite::Ed25519 => import_ed25519_share(metadata, &key_bytes),
+        }
+    }
+
+    /// Decrypt and validate the optional exported full public-key package.
+    /// Returns `None` (caller falls back to a single-entry package) on absence,
+    /// hex/decrypt/deserialize failure, or if the recovered package does not
+    /// anchor to the AEAD-authenticated key package — so a tampered or mismatched
+    /// field can only degrade to the fallback, never inject a forged canonical
+    /// binding. Never errors; secret recovery does not depend on it.
+    fn recover_full_pubkey_package(
+        &self,
+        key: &crypto::SecretKey,
+        key_package: &frost_secp256k1_tr::keys::KeyPackage,
+    ) -> Option<frost_secp256k1_tr::keys::PublicKeyPackage> {
+        let ciphertext = hex::decode(self.encrypted_pubkey_package.as_ref()?).ok()?;
+        let nonce_bytes = hex::decode(self.pubkey_nonce.as_ref()?).ok()?;
+        if nonce_bytes.len() != 24 {
+            return None;
+        }
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&nonce_bytes);
+        let encrypted = crypto::EncryptedData { ciphertext, nonce };
+        let decrypted = crypto::decrypt_with_aad(&encrypted, PUBKEY_PACKAGE_AAD, key).ok()?;
+        let bytes = decrypted.as_slice().ok()?;
+        let pkg = frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&bytes).ok()?;
+        // Anchor to the authenticated key package: same group verifying key and a
+        // matching own-index verifying share. Otherwise reject and fall back.
+        if pkg.verifying_key() != key_package.verifying_key() {
+            return None;
+        }
+        match pkg.verifying_shares().get(key_package.identifier()) {
+            Some(vs) if vs == key_package.verifying_share() => Some(pkg),
+            _ => None,
         }
     }
 
@@ -170,8 +239,22 @@ impl ShareExport {
     }
 
     /// Encode as a bech32 string with `kshare` prefix.
+    ///
+    /// The optional full public-key package is **stripped** here: `Bech32m`'s
+    /// checksum bounds the payload (~639 bytes) and the package would overflow a
+    /// single string. It rides the JSON / animated-frame exports instead, and a
+    /// bech32 import simply falls back to the single-entry package. Secret
+    /// material is unaffected.
     pub fn to_bech32(&self) -> Result<String> {
-        let json = self.to_json()?;
+        let compact = if self.encrypted_pubkey_package.is_some() || self.pubkey_nonce.is_some() {
+            let mut c = self.clone();
+            c.encrypted_pubkey_package = None;
+            c.pubkey_nonce = None;
+            std::borrow::Cow::Owned(c)
+        } else {
+            std::borrow::Cow::Borrowed(self)
+        };
+        let json = compact.to_json()?;
         let hrp =
             Hrp::parse(SHARE_HRP).map_err(|e| KeepError::Frost(format!("Invalid HRP: {e}")))?;
         bech32::encode::<Bech32m>(hrp, json.as_bytes())
@@ -458,6 +541,84 @@ mod tests {
         let decoded = ShareExport::from_bech32(&encoded).unwrap();
         assert_eq!(decoded.identifier, export.identifier);
         assert_eq!(decoded.threshold, export.threshold);
+    }
+
+    #[test]
+    fn full_pubkey_package_survives_json_roundtrip() {
+        // A DKG holder's export carries the full verifying-share map; JSON transport
+        // keeps it, so an imported holder can bind co-signers, not just its own index.
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("test").unwrap();
+
+        let export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        assert!(export.encrypted_pubkey_package.is_some());
+
+        let imported = ShareExport::from_json(&export.to_json().unwrap())
+            .unwrap()
+            .to_share("pass", "imported")
+            .unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares().len(),
+            3,
+            "imported holder should carry the full 3-party verifying-share map"
+        );
+    }
+
+    #[test]
+    fn bech32_strips_package_and_import_falls_back() {
+        // The size-limited bech32 form omits the package; import falls back to a
+        // single-entry package but still recovers the secret unchanged.
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("test").unwrap();
+
+        let export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        let decoded = ShareExport::from_bech32(&export.to_bech32().unwrap()).unwrap();
+        assert!(decoded.encrypted_pubkey_package.is_none());
+
+        let imported = decoded.to_share("pass", "imported").unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares().len(),
+            1
+        );
+        assert_eq!(imported.metadata.identifier, shares[0].metadata.identifier);
+    }
+
+    #[test]
+    fn absent_pubkey_package_falls_back_to_single_entry() {
+        // A legacy (v1) export with the field absent imports via the single-entry
+        // fallback, unchanged.
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("test").unwrap();
+
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+
+        let imported = export.to_share("pass", "imported").unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn tampered_pubkey_package_falls_back_never_errors() {
+        // Flipping a byte of the authenticated package fails the MAC; import must
+        // fall back to single-entry (never panic, never yield the tampered map),
+        // and secret recovery still succeeds.
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("test").unwrap();
+
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        let mut ct = hex::decode(export.encrypted_pubkey_package.as_ref().unwrap()).unwrap();
+        ct[0] ^= 0xff;
+        export.encrypted_pubkey_package = Some(hex::encode(&ct));
+
+        let imported = export.to_share("pass", "imported").unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares().len(),
+            1
+        );
     }
 
     #[test]
