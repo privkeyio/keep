@@ -145,6 +145,14 @@ pub fn nip55_verify_audit_chain(
         .filter(|h| !h.is_empty())
         .collect();
 
+    // A legitimate log has at most a small run of leading empty-hash ("legacy") rows,
+    // from the pre-hash-chain migration (v0.1.0..v0.4.0 rows, the oldest, and time-pruned
+    // at 30 days). Bound that run so an attacker with audit-DB write access cannot prepend
+    // an unbounded number of unauthenticated leading rows to mask the genesis or downgrade
+    // the verdict. The bound is generous (no real early-adopter chain approaches it) so it
+    // never false-flags a legitimate legacy prefix; exceeding it is treated as tampering.
+    const MAX_LEADING_LEGACY: u32 = 1024;
+
     let mut in_legacy = true;
     let mut legacy_skipped: u32 = 0;
     let mut truncated = false;
@@ -154,6 +162,9 @@ pub fn nip55_verify_audit_chain(
         if in_legacy {
             if entry.entry_hash.is_empty() {
                 legacy_skipped += 1;
+                if legacy_skipped > MAX_LEADING_LEGACY {
+                    return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                }
                 continue;
             }
             in_legacy = false;
@@ -531,6 +542,81 @@ mod tests {
             Nip55ChainStatus::PartiallyVerified {
                 legacy_entries_skipped: 1
             }
+        );
+    }
+
+    fn legacy_entry(id: i64) -> Nip55AuditEntry {
+        Nip55AuditEntry {
+            id,
+            timestamp: id,
+            caller: "old".to_string(),
+            request_type: "SIGN_EVENT".to_string(),
+            event_kind: None,
+            decision: "allow".to_string(),
+            was_automatic: false,
+            previous_hash: None,
+            entry_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn leading_legacy_at_cap_still_partial() {
+        // Exactly MAX_LEADING_LEGACY (1024) legacy rows + a valid tail stays
+        // PartiallyVerified: a legitimate (if large) pre-hash-chain prefix is not flagged.
+        let mut entries: Vec<Nip55AuditEntry> = (1..=1024).map(legacy_entry).collect();
+        entries.push(entry(2000, None, "com.app", Some(1), "allow", 5000, false));
+        assert_eq!(
+            nip55_verify_audit_chain(entries, KEY.to_vec()),
+            Nip55ChainStatus::PartiallyVerified {
+                legacy_entries_skipped: 1024
+            }
+        );
+    }
+
+    #[test]
+    fn leading_legacy_over_cap_is_tampered() {
+        // One row past the cap trips before the tail is reached, so a prepended-blank-row
+        // downgrade/injection is bounded rather than unbounded.
+        let mut entries: Vec<Nip55AuditEntry> = (1..=1025).map(legacy_entry).collect();
+        entries.push(entry(2000, None, "com.app", Some(1), "allow", 5000, false));
+        assert_eq!(
+            nip55_verify_audit_chain(entries, KEY.to_vec()),
+            Nip55ChainStatus::Tampered { entry_id: 1025 }
+        );
+    }
+
+    #[test]
+    fn all_legacy_over_cap_is_tampered() {
+        // An all-empty-hash log past the cap is tampering, not Valid/PartiallyVerified.
+        let entries: Vec<Nip55AuditEntry> = (1..=1025).map(legacy_entry).collect();
+        assert_eq!(
+            nip55_verify_audit_chain(entries, KEY.to_vec()),
+            Nip55ChainStatus::Tampered { entry_id: 1025 }
+        );
+    }
+
+    #[test]
+    fn small_legacy_prefix_still_partial() {
+        // A small legacy-only log (early adopter, no post-upgrade activity) is unaffected.
+        let entries: Vec<Nip55AuditEntry> = (1..=10).map(legacy_entry).collect();
+        assert_eq!(
+            nip55_verify_audit_chain(entries, KEY.to_vec()),
+            Nip55ChainStatus::PartiallyVerified {
+                legacy_entries_skipped: 10
+            }
+        );
+    }
+
+    #[test]
+    fn tip_path_inherits_legacy_cap() {
+        // The tip-MAC entry point delegates to the base verifier, so a conclusive base
+        // Tampered (from the cap) short-circuits and is returned as-is.
+        let mut entries: Vec<Nip55AuditEntry> = (1..=1025).map(legacy_entry).collect();
+        entries.push(entry(2000, None, "com.app", Some(1), "allow", 5000, false));
+        let tip = tip_of(&entries);
+        assert_eq!(
+            nip55_verify_audit_chain_with_tip(entries, KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Tampered { entry_id: 1025 }
         );
     }
 
