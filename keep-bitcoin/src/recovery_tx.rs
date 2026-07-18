@@ -229,11 +229,9 @@ impl RecoveryTxBuilder {
                 psbt.inputs.len()
             )));
         }
-        let sk_bytes = Zeroizing::new(*secret_key);
-        let keypair = Keypair::from_seckey_slice(&self.secp, &*sk_bytes)
-            .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))?;
-        let (x_only, _) = keypair.x_only_public_key();
-
+        // Compute everything fallible BEFORE loading the secret key, so no early
+        // return (missing witness UTXO, sighash error, etc.) can leave secret
+        // material resident in memory.
         let prevouts: Vec<TxOut> = psbt
             .inputs
             .iter()
@@ -246,9 +244,8 @@ impl RecoveryTxBuilder {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
         let leaf_hash = tier.leaf_hash;
-
+        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
         let sighash = sighash_cache
             .taproot_script_spend_signature_hash(
                 0,
@@ -262,9 +259,28 @@ impl RecoveryTxBuilder {
             .map_err(|e| BitcoinError::Signing(e.to_string()))?;
 
         let aux_rand = crate::aux_rand()?;
+
+        let sk_bytes = Zeroizing::new(*secret_key);
+        let mut keypair = Keypair::from_seckey_slice(&self.secp, &*sk_bytes)
+            .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()))?;
+        let (x_only, _) = keypair.x_only_public_key();
+
+        // The signing key must belong to this tier. A non-member signature is dead
+        // weight (finalize only reads tier.keys), so reject it early rather than
+        // silently producing a PSBT that can never finalize. Erase the key first.
+        if !tier.keys.contains(&x_only) {
+            keypair.non_secure_erase();
+            return Err(BitcoinError::Recovery(format!(
+                "signing key is not a member of recovery tier {tier_index}"
+            )));
+        }
+
         let sig = self
             .secp
             .sign_schnorr_with_aux_rand(&msg, &keypair, &aux_rand);
+        // secp256k1's Keypair is not zeroize-on-drop; wipe its secret-key copy now
+        // rather than leaving it resident until the value drops.
+        keypair.non_secure_erase();
 
         psbt.inputs[0].tap_script_sigs.insert(
             (x_only, leaf_hash),
@@ -694,6 +710,50 @@ mod tests {
 
         let tx = builder.finalize_recovery(&mut psbt, 0).unwrap();
         assert!(!tx.input[0].witness.is_empty());
+    }
+
+    #[test]
+    fn sign_recovery_rejects_non_tier_key() {
+        let (_, pk1) = test_keypair_full(1);
+        let (_, pk2) = test_keypair_full(2);
+        let (sk_outsider, _) = test_keypair_full(9); // not a member of any tier
+        let secp = Secp256k1::new();
+
+        let config = RecoveryConfig {
+            primary: SpendingTier {
+                keys: vec![pk1],
+                threshold: 1,
+            },
+            recovery_tiers: vec![RecoveryTier {
+                keys: vec![pk2],
+                threshold: 1,
+                timelock_months: 6,
+            }],
+            network: Network::Testnet,
+        };
+        let output = config.build().unwrap();
+        let builder = RecoveryTxBuilder::new(output);
+
+        let utxo = OutPoint {
+            txid: bitcoin::Txid::all_zeros(),
+            vout: 0,
+        };
+        let xonly_pk1 = XOnlyPublicKey::from_slice(&pk1).unwrap();
+        let dest = ScriptBuf::new_p2tr(&secp, xonly_pk1, None);
+        let mut psbt = builder
+            .build_recovery_psbt(0, utxo, 100_000, &dest, 1_000)
+            .unwrap();
+
+        // Tier 0 is the recovery tier {pk2}; signing it with an outsider key must fail
+        // fast and insert nothing, rather than producing a PSBT that can never finalize.
+        let err = builder
+            .sign_recovery(&mut psbt, 0, &sk_outsider)
+            .unwrap_err();
+        assert!(
+            matches!(err, BitcoinError::Recovery(ref m) if m.contains("not a member")),
+            "expected tier-membership rejection, got {err:?}"
+        );
+        assert!(psbt.inputs[0].tap_script_sigs.is_empty());
     }
 
     #[test]
