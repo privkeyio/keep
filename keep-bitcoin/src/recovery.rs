@@ -12,6 +12,11 @@ const BLOCKS_PER_DAY: u32 = 144;
 const BLOCKS_PER_MONTH: u32 = BLOCKS_PER_DAY * 30;
 const MAX_KEYS_PER_TIER: usize = 20;
 const MAX_RECOVERY_TIERS: usize = 10;
+/// Maximum block-based relative timelock (`older(n)`) for a recovery tier. BIP-68
+/// encodes a block-height relative timelock in the low 16 bits of `nSequence`, so
+/// 0xFFFF (65535 blocks ≈ 455 days ≈ ~15 months at 10 min/block) is the protocol
+/// ceiling. A tier whose `timelock_months` exceeds this is rejected (see
+/// `build_tier_infos`), never silently truncated.
 const MAX_CSV_BLOCKS: u32 = 0xFFFF;
 
 // BIP-341 unspendable internal key (no known discrete log).
@@ -214,6 +219,14 @@ impl RecoveryConfig {
             .map_err(|e| BitcoinError::Recovery(format!("NUMS point: {e}")))
     }
 
+    /// Build the script-path spending tiers, in taproot-leaf order.
+    ///
+    /// Index mapping (historically confusing — match on [`TierInfo::name`] rather
+    /// than relying on position):
+    /// - A **multisig** primary (>1 key or threshold >1) occupies index 0 as
+    ///   `"primary"`. A single-key (1-of-1) primary is the taproot KEY path, not a
+    ///   script tier, so it is absent here and recovery tiers start at index 0.
+    /// - Recovery tiers follow in config order as `"recovery_1"`, `"recovery_2"`, …
     fn build_tier_infos(&self) -> Result<Vec<TierInfo>> {
         let mut tiers = Vec::new();
 
