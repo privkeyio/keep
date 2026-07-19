@@ -38,6 +38,13 @@ pub const SECRET_SEALS_TABLE: &str = "secret_seals";
 /// event that is not strictly newer (replay/rollback protection).
 pub const STATE_VERSIONS_TABLE: &str = "state_versions";
 
+/// Durable outbox of pending delete-tombstones for cross-node replication. Each
+/// entry (key `"<table>:<hex record id>"`) records that a replicable row was
+/// deleted so, if the process crashes before the delete is published, a fresh
+/// standby is not left with the revoked row still live. Cleared once the delete
+/// has been accepted by a relay.
+pub const PENDING_TOMBSTONES_TABLE: &str = "pending_tombstones";
+
 /// A single put-or-delete operation for [`StorageBackend::write_atomic`]. `value` `Some` is a put,
 /// `None` is a delete.
 pub struct AtomicOp<'a> {
@@ -95,8 +102,8 @@ pub trait StorageBackend: Send + Sync {
 
     /// Apply several put/delete operations across tables. The default implementation applies each op
     /// sequentially via `put`/`delete` and is NOT atomic; backends with transaction support should
-    /// override this so a crash mid-batch cannot leave the ops half-applied. Each op must target a
-    /// DISTINCT table.
+    /// override this so a crash mid-batch cannot leave the ops half-applied. Ops may target the same
+    /// table more than once; same-table ops are applied in the order given.
     fn write_atomic(&self, ops: &[AtomicOp<'_>]) -> Result<()> {
         for op in ops {
             match op.value {
@@ -151,6 +158,8 @@ const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("s
 const SECRET_SEALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secret_seals");
 const STATE_VERSIONS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("state_versions");
+const PENDING_TOMBSTONES_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("pending_tombstones");
 
 /// Redb-based storage backend (default).
 pub struct RedbBackend {
@@ -213,6 +222,9 @@ impl RedbBackend {
             // Carried through a file-format upgrade so the keep-state rollback-guard high-water-marks
             // survive; otherwise they reset and the guard reverts to first-sync (TOFU) for every d-tag.
             STATE_VERSIONS_TABLE,
+            // Undelivered delete-tombstones must survive a file-format upgrade too, or a revoked
+            // record could be resurrected on a standby that never saw the delete.
+            PENDING_TOMBSTONES_TABLE,
         ];
 
         type TableEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -386,6 +398,7 @@ impl RedbBackend {
             SECRETS_TABLE => Ok(SECRETS_TABLE_DEF),
             SECRET_SEALS_TABLE => Ok(SECRET_SEALS_TABLE_DEF),
             STATE_VERSIONS_TABLE => Ok(STATE_VERSIONS_TABLE_DEF),
+            PENDING_TOMBSTONES_TABLE => Ok(PENDING_TOMBSTONES_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),
         }
     }
@@ -534,14 +547,27 @@ impl StorageBackend for RedbBackend {
     // txn. The only caller passes exactly [data_table, STATE_VERSIONS_TABLE], always distinct.
     fn write_atomic(&self, ops: &[AtomicOp<'_>]) -> Result<()> {
         let wtxn = self.db.begin_write()?;
+        // Group ops by table so each table is opened exactly once: redb forbids
+        // holding two handles to the same table at once, and grouping lets a
+        // single call carry several ops for one table while keeping the whole
+        // batch in one transaction. Distinct tables are visited in first-seen
+        // order and each table's ops applied in their original order.
+        let mut tables: Vec<&str> = Vec::new();
         for op in ops {
-            let mut tbl = wtxn.open_table(self.table_def(op.table)?)?;
-            match op.value {
-                Some(v) => {
-                    tbl.insert(op.key, v)?;
-                }
-                None => {
-                    tbl.remove(op.key)?;
+            if !tables.contains(&op.table) {
+                tables.push(op.table);
+            }
+        }
+        for table in tables {
+            let mut tbl = wtxn.open_table(self.table_def(table)?)?;
+            for op in ops.iter().filter(|o| o.table == table) {
+                match op.value {
+                    Some(v) => {
+                        tbl.insert(op.key, v)?;
+                    }
+                    None => {
+                        tbl.remove(op.key)?;
+                    }
                 }
             }
         }
@@ -683,6 +709,53 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = RedbBackend::create(&dir.path().join("test.db")).unwrap();
         assert!(backend.create_table("unknown").is_err());
+    }
+
+    #[test]
+    fn write_atomic_applies_multiple_ops_to_the_same_table() {
+        let dir = tempdir().unwrap();
+        let backend = RedbBackend::create(&dir.path().join("test.db")).unwrap();
+        // A row a later op in the same batch will delete.
+        backend.put(KEYS_TABLE, b"gone", b"x").unwrap();
+        // One transaction carrying several ops for KEYS_TABLE (two puts and a
+        // delete) plus an op on a second table exercises the per-table grouping.
+        backend
+            .write_atomic(&[
+                AtomicOp {
+                    table: KEYS_TABLE,
+                    key: b"a",
+                    value: Some(b"1"),
+                },
+                AtomicOp {
+                    table: KEYS_TABLE,
+                    key: b"b",
+                    value: Some(b"2"),
+                },
+                AtomicOp {
+                    table: KEYS_TABLE,
+                    key: b"gone",
+                    value: None,
+                },
+                AtomicOp {
+                    table: STATE_VERSIONS_TABLE,
+                    key: b"v",
+                    value: Some(b"3"),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            backend.get(KEYS_TABLE, b"a").unwrap().as_deref(),
+            Some(&b"1"[..])
+        );
+        assert_eq!(
+            backend.get(KEYS_TABLE, b"b").unwrap().as_deref(),
+            Some(&b"2"[..])
+        );
+        assert_eq!(backend.get(KEYS_TABLE, b"gone").unwrap(), None);
+        assert_eq!(
+            backend.get(STATE_VERSIONS_TABLE, b"v").unwrap().as_deref(),
+            Some(&b"3"[..])
+        );
     }
 
     #[test]
