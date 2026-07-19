@@ -518,10 +518,15 @@ impl AgentClient {
                     continue;
                 };
                 if let Some(ref expected_id) = request_id {
-                    if let Ok(resp) = serde_json::from_str::<serde_json::Value>(&decrypted) {
-                        if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
-                            continue;
-                        }
+                    // Only accept a well-formed response whose id matches. An
+                    // unparseable payload is not our response, so keep waiting
+                    // rather than returning malformed content as valid (previously
+                    // a parse failure fell through to the return below).
+                    let Ok(resp) = serde_json::from_str::<serde_json::Value>(&decrypted) else {
+                        continue;
+                    };
+                    if resp.get("id").and_then(|v| v.as_str()) != Some(expected_id) {
+                        continue;
                     }
                 }
                 return Ok(decrypted);
