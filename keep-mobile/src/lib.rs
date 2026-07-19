@@ -2477,7 +2477,11 @@ fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
     use keep_core::error::{KeepError, NetworkError};
     match e {
         KeepError::InvalidInput(msg) => KeepMobileError::InvalidInput { msg },
+        KeepError::UserRejected => KeepMobileError::InvalidInput {
+            msg: "request rejected".into(),
+        },
         KeepError::RateLimited(_) => KeepMobileError::RateLimited,
+        KeepError::CapacityExceeded(_) => KeepMobileError::RateLimited,
         KeepError::NetworkErr(NetworkError::Timeout { .. }) => KeepMobileError::Timeout,
         KeepError::NetworkErr(e) => KeepMobileError::NetworkError { msg: e.to_string() },
         KeepError::StorageErr(e) => KeepMobileError::StorageError { msg: e.to_string() },
@@ -2820,15 +2824,18 @@ impl KeepMobile {
             {
                 let store_path =
                     std::path::PathBuf::from(path).join("descriptor-sessions.redb");
-                let store = keep_frost_net::FileDescriptorSessionStore::new(&store_path)
-                    .map_err(|e| KeepMobileError::StorageError {
-                        msg: format!(
-                            "Failed to create descriptor session store: {e}"
-                        ),
-                    })?;
-                node.with_descriptor_session_store(
-                    Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
-                )
+                match keep_frost_net::FileDescriptorSessionStore::new(&store_path) {
+                    Ok(store) => node.with_descriptor_session_store(
+                        Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "descriptor session store unavailable ({e}); \
+                             continuing with in-memory sessions"
+                        );
+                        node
+                    }
+                }
             } else {
                 node
             };

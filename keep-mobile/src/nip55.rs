@@ -740,7 +740,7 @@ impl Nip55Handler {
         let mut limits = self.rate_limits.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
 
-        self.evict_stale_entries(&mut limits, now);
+        Self::evict_stale_entries(&mut limits, now);
 
         let state = limits.entry(caller_id.to_string()).or_default();
 
@@ -779,7 +779,7 @@ impl Nip55Handler {
         }
     }
 
-    fn evict_stale_entries(&self, limits: &mut HashMap<String, RateLimitState>, now: Instant) {
+    fn evict_stale_entries(limits: &mut HashMap<String, RateLimitState>, now: Instant) {
         if limits.len() <= MAX_RATE_LIMIT_ENTRIES {
             return;
         }
@@ -792,6 +792,24 @@ impl Nip55Handler {
             let in_backoff = state.backoff_until.is_some_and(|b| now < b);
             recent || in_backoff
         });
+
+        // A flood of distinct, still-recent caller_ids survives the retain above
+        // and would grow the map without bound; enforce a hard cap by dropping the
+        // least-recently-active entries.
+        if limits.len() > MAX_RATE_LIMIT_ENTRIES {
+            let mut activity: Vec<(String, Instant)> = limits
+                .iter()
+                .map(|(id, state)| {
+                    let last = state.requests.iter().copied().max().unwrap_or(now);
+                    (id.clone(), last)
+                })
+                .collect();
+            activity.sort_by_key(|(_, last)| *last);
+            let excess = limits.len() - MAX_RATE_LIMIT_ENTRIES;
+            for (id, _) in activity.into_iter().take(excess) {
+                limits.remove(&id);
+            }
+        }
     }
 }
 
@@ -1486,6 +1504,27 @@ mod tests {
     // Amber's batch wire format puts the signature in BOTH `signature` and
     // `result` and never emits the assembled event; the per-request `event`
     // payload is only for the single-result intent path.
+    #[test]
+    fn evict_stale_entries_enforces_hard_cap_under_distinct_recent_flood() {
+        // A flood of distinct caller_ids that are all still "recent" (so the
+        // staleness retain keeps them) must not grow the map past the cap.
+        let now = Instant::now();
+        let mut limits: HashMap<String, RateLimitState> = HashMap::new();
+        for i in 0..(MAX_RATE_LIMIT_ENTRIES + 500) {
+            limits.insert(
+                format!("caller-{i}"),
+                RateLimitState {
+                    requests: vec![now],
+                    backoff_until: None,
+                    consecutive_failures: 0,
+                },
+            );
+        }
+        assert!(limits.len() > MAX_RATE_LIMIT_ENTRIES);
+        Nip55Handler::evict_stale_entries(&mut limits, now);
+        assert_eq!(limits.len(), MAX_RATE_LIMIT_ENTRIES);
+    }
+
     #[test]
     fn batch_results_sign_event_uses_signature_not_event() {
         let responses = vec![Nip55Response {
