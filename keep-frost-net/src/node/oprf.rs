@@ -692,4 +692,18 @@ mod tests {
             Err(FrostNetError::PolicyViolation(_))
         ));
     }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_share_rejects_unannounced_peer() {
+        // The share-ingestion handler binds the sender's pubkey to its claimed
+        // share index first, so a partial from an unannounced peer is rejected
+        // rather than fed into a session.
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let payload = OprfEvalSharePayload::new([1u8; 32], 2, vec![0u8; 32]);
+        assert!(matches!(
+            node.handle_oprf_eval_share(from, payload).await,
+            Err(FrostNetError::UntrustedPeer(_))
+        ));
+    }
 }
