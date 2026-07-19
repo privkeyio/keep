@@ -2706,6 +2706,89 @@ impl KeepMobile {
         }
     }
 
+    /// Verify each relay's TLS certificate against the stored pins (trust-on-
+    /// first-use, or strict when configured), persist any newly learned pins,
+    /// and return the subset that passed. Fails closed if none pass.
+    ///
+    /// The caller must hold `cert_pin_lock` across this call so the read-modify-
+    /// write of the persisted pin set cannot lose an update to a concurrent
+    /// stage/remove/clear FFI call.
+    async fn verify_and_pin_relays(
+        &self,
+        relays: &[String],
+    ) -> Result<Vec<String>, KeepMobileError> {
+        // Opt-in strict pinning: when enabled, an un-pinned relay is not
+        // trusted-on-first-use; it is skipped (see the per-relay handling
+        // below) rather than pinned. Disabled by default.
+        let require_pinned =
+            persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
+                .unwrap_or_default()
+                .enabled;
+        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        let mut pins_changed = false;
+        for relay in relays {
+            // Strict mode: skip an un-pinned relay rather than aborting for the
+            // whole set. It is excluded from `verified_relays` below, and the
+            // empty-set check there fails closed if none are pinned. A pinned
+            // relay presenting a mismatched cert stays a fatal MitM.
+            if require_pinned && wss_relay_lacks_pin(relay, &pins) {
+                tracing::warn!(
+                    relay = %relay,
+                    "strict pinning: skipping relay with no provisioned pin"
+                );
+                continue;
+            }
+            match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned).await {
+                Ok((_hash, new_pin)) => {
+                    if let Some((hostname, hash)) = new_pin {
+                        if !pins.is_pinned(&hostname) {
+                            pins.add_pin(hostname, hash);
+                            pins_changed = true;
+                        }
+                    }
+                }
+                Err(
+                    e @ (keep_frost_net::FrostNetError::CertificatePinMismatch { .. }
+                    | keep_frost_net::FrostNetError::CertificatePinMissing { .. }),
+                ) => {
+                    // Fail closed on both a changed pin and, under strict mode,
+                    // an un-provisioned relay; do not silently skip.
+                    return Err(e.into());
+                }
+                Err(e) => {
+                    tracing::warn!(relay = %relay, error = %e, "TLS certificate verification failed, skipping relay");
+                }
+            }
+        }
+        if pins_changed {
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+        }
+
+        let verified_relays: Vec<String> = relays
+            .iter()
+            .filter(|r| {
+                let url = match url::Url::parse(r) {
+                    Ok(u) => u,
+                    Err(_) => return false,
+                };
+                if url.scheme() != "wss" {
+                    return true;
+                }
+                url.host_str().map(|h| pins.is_pinned(h)).unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+
+        if verified_relays.is_empty() {
+            return Err(keep_frost_net::FrostNetError::Transport(
+                "No relays passed TLS certificate verification".into(),
+            )
+            .into());
+        }
+
+        Ok(verified_relays)
+    }
+
     fn do_initialize(
         &self,
         relays: Vec<String>,
@@ -2737,76 +2820,7 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
-            // Opt-in strict pinning: when enabled, an un-pinned relay is not
-            // trusted-on-first-use; it is skipped (see the per-relay handling
-            // below) rather than pinned. Disabled by default.
-            let require_pinned =
-                persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
-                    .unwrap_or_default()
-                    .enabled;
-            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-            let mut pins_changed = false;
-            for relay in &relays {
-                // Strict mode: skip an un-pinned relay rather than aborting init
-                // for the whole set. It is excluded from `verified_relays` below,
-                // and the empty-set check there fails closed if none are pinned.
-                // A pinned relay presenting a mismatched cert stays a fatal MitM.
-                if require_pinned && wss_relay_lacks_pin(relay, &pins) {
-                    tracing::warn!(
-                        relay = %relay,
-                        "strict pinning: skipping relay with no provisioned pin"
-                    );
-                    continue;
-                }
-                match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned).await {
-                    Ok((_hash, new_pin)) => {
-                        if let Some((hostname, hash)) = new_pin {
-                            if !pins.is_pinned(&hostname) {
-                                pins.add_pin(hostname, hash);
-                                pins_changed = true;
-                            }
-                        }
-                    }
-                    Err(
-                        e @ (keep_frost_net::FrostNetError::CertificatePinMismatch { .. }
-                        | keep_frost_net::FrostNetError::CertificatePinMissing { .. }),
-                    ) => {
-                        // Fail closed on both a changed pin and, under strict
-                        // mode, an un-provisioned relay; do not silently skip.
-                        return Err(e.into());
-                    }
-                    Err(e) => {
-                        tracing::warn!(relay = %relay, error = %e, "TLS certificate verification failed, skipping relay");
-                    }
-                }
-            }
-            if pins_changed {
-                persistence::persist_cert_pins(&self.storage, &pins)?;
-            }
-
-            let verified_relays: Vec<String> = relays
-                .iter()
-                .filter(|r| {
-                    let url = match url::Url::parse(r) {
-                        Ok(u) => u,
-                        Err(_) => return false,
-                    };
-                    if url.scheme() != "wss" {
-                        return true;
-                    }
-                    url.host_str()
-                        .map(|h| pins.is_pinned(h))
-                        .unwrap_or(false)
-                })
-                .cloned()
-                .collect();
-
-            if verified_relays.is_empty() {
-                return Err(keep_frost_net::FrostNetError::Transport(
-                    "No relays passed TLS certificate verification".into(),
-                )
-                .into());
-            }
+            let verified_relays = self.verify_and_pin_relays(&relays).await?;
 
             let node = match proxy {
                 Some(addr) => KfpNode::new_with_proxy(share, verified_relays, addr).await?,
@@ -2822,11 +2836,10 @@ impl KeepMobile {
                 })
                 .clone()
             {
-                let store_path =
-                    std::path::PathBuf::from(path).join("descriptor-sessions.redb");
+                let store_path = std::path::PathBuf::from(path).join("descriptor-sessions.redb");
                 match keep_frost_net::FileDescriptorSessionStore::new(&store_path) {
                     Ok(store) => node.with_descriptor_session_store(
-                        Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>,
+                        Arc::new(store) as Arc<dyn keep_frost_net::DescriptorSessionStore>
                     ),
                     Err(e) => {
                         tracing::warn!(
