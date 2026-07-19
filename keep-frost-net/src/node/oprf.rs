@@ -581,3 +581,115 @@ impl KfpNode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Single-node gate tests for the OPRF eval oracle: build a real node, call
+    //! the handler directly, no relay run loop.
+
+    use super::*;
+    use crate::node::PeerPolicy;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use nostr_relay_builder::MockRelay;
+
+    async fn test_node() -> (KfpNode, MockRelay) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("oprf-eval-gate-test").unwrap();
+        // First share -> FROST identifier 1.
+        (
+            KfpNode::new(shares.remove(0), vec![relay]).await.unwrap(),
+            mock,
+        )
+    }
+
+    fn oprf_share() -> keep_core::oprf::threshold::KeyShare {
+        use k256::elliptic_curve::rand_core::OsRng;
+        use k256::{elliptic_curve::Field, Scalar};
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        keep_core::oprf::threshold::split_key(&secret, 2, 3, rng)
+            .unwrap()
+            .remove(0)
+    }
+
+    // participants = [1] so the "addressed to us" membership gate passes and the
+    // request reaches the later replay/policy gates. requester_share_index 2 is
+    // only consulted after those gates.
+    fn eval_req(group: [u8; 32]) -> OprfEvalRequestPayload {
+        OprfEvalRequestPayload::new([1u8; 32], group, [0x02u8; 33], vec![1], 2)
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_request_ignores_foreign_group() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        // Foreign group short-circuits (Ok) before any later gate.
+        assert!(node
+            .handle_oprf_eval_request(from, eval_req([0xAAu8; 32]))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_request_ignores_non_participant() {
+        let (node, _relay) = test_node().await;
+        let from = Keys::generate().public_key();
+        let mut req = eval_req(*node.group_pubkey());
+        req.participants = vec![2, 3]; // excludes our identifier (1) -> ignored
+        assert!(node.handle_oprf_eval_request(from, req).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_request_refused_when_duress_frozen() {
+        let (mut node, _relay) = test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+        let ev =
+            KfpEventBuilder::duress_beacon(&beacon, &group, &[8u8; 32], &node.keys.public_key())
+                .await
+                .unwrap();
+        node.handle_gift_wrap(&ev).await.unwrap();
+        assert!(node.is_duress_frozen(), "node must be frozen");
+
+        // The duress gate sits before the participant/share/replay/policy gates,
+        // so it trips first (fail closed) even with no OPRF share configured.
+        let from = Keys::generate().public_key();
+        assert!(matches!(
+            node.handle_oprf_eval_request(from, eval_req(group)).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_request_rejects_stale_replay() {
+        let (mut node, _relay) = test_node().await;
+        node.set_oprf_key_share(oprf_share());
+        let from = Keys::generate().public_key();
+        let mut req = eval_req(*node.group_pubkey());
+        req.created_at = 1; // ancient -> outside the replay window
+        assert!(matches!(
+            node.handle_oprf_eval_request(from, req).await,
+            Err(FrostNetError::ReplayDetected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_oprf_eval_request_rejects_denied_peer() {
+        let (mut node, _relay) = test_node().await;
+        node.set_oprf_key_share(oprf_share());
+        let from = Keys::generate().public_key();
+        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        // Fresh created_at passes the replay gate; policy denial trips next.
+        let group = *node.group_pubkey();
+        assert!(matches!(
+            node.handle_oprf_eval_request(from, eval_req(group)).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+}
