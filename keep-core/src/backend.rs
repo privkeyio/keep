@@ -543,8 +543,9 @@ impl StorageBackend for RedbBackend {
         Ok(())
     }
 
-    // Each op must target a distinct table: redb errors on opening the same table twice in one write
-    // txn. The only caller passes exactly [data_table, STATE_VERSIONS_TABLE], always distinct.
+    // Ops are grouped by table so each table is opened exactly once (redb errors on opening the same
+    // table twice concurrently in one write txn); this lets a single batch carry several ops for the
+    // same table (e.g. deleting every descriptor version plus each version's tombstone) atomically.
     fn write_atomic(&self, ops: &[AtomicOp<'_>]) -> Result<()> {
         let wtxn = self.db.begin_write()?;
         // Group ops by table so each table is opened exactly once: redb forbids
