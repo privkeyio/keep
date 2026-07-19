@@ -1080,6 +1080,32 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn reconstruct_descriptor_rejects_invalid_network() {
+        let policy = WalletPolicy {
+            recovery_tiers: vec![],
+            version: 1,
+        };
+        let contributions = BTreeMap::new();
+        let result = reconstruct_descriptor(&[2u8; 32], &policy, &contributions, "notanetwork");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn reconstruct_descriptor_errors_on_missing_contribution() {
+        // test_policy references participants 1/2/3 but no xpubs are supplied,
+        // so reconstruction must fail on the first missing share rather than
+        // silently dropping the recovery tier.
+        let policy = test_policy();
+        let contributions = BTreeMap::new();
+        let result = reconstruct_descriptor(&[2u8; 32], &policy, &contributions, "signet");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("missing xpub contribution for share"),
+            "unexpected error: {err}"
+        );
+    }
+
     fn test_policy() -> WalletPolicy {
         WalletPolicy {
             recovery_tiers: vec![PolicyTier {
