@@ -20,6 +20,7 @@ mod policy;
 mod psbt;
 mod signing_policy;
 mod storage;
+mod storage_integrity;
 mod types;
 mod velocity;
 
