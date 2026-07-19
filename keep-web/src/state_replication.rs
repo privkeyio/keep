@@ -395,6 +395,49 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
     });
 }
 
+/// Minimum seconds between logged occurrences of the same rejection outcome, so
+/// an untrusted relay streaming stale, future-dated, or malformed events cannot
+/// flood the logs (drowning real signal and burning disk) with one line each.
+const REJECT_LOG_INTERVAL_SECS: u64 = 60;
+
+/// Per-outcome log throttle for replicated-event rejections. Fixed set of
+/// buckets (stale / future / apply-error), so it cannot itself grow under a
+/// distinct-record flood.
+#[derive(Default)]
+struct RejectLogThrottle {
+    stale: ThrottleBucket,
+    future: ThrottleBucket,
+    apply_error: ThrottleBucket,
+}
+
+#[derive(Default)]
+struct ThrottleBucket {
+    last_logged: Option<u64>,
+    suppressed: u64,
+}
+
+impl ThrottleBucket {
+    /// If this occurrence should be logged now, returns `Some(n)` where `n` is
+    /// how many occurrences were suppressed since the last logged one (0 on the
+    /// first). Returns `None` to suppress this occurrence. A non-monotonic clock
+    /// (now < last) is treated as within the interval (suppressed), never a
+    /// negative elapsed.
+    fn should_log(&mut self, now: u64, interval: u64) -> Option<u64> {
+        match self.last_logged {
+            Some(t) if now.saturating_sub(t) < interval => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                let suppressed = self.suppressed;
+                self.suppressed = 0;
+                self.last_logged = Some(now);
+                Some(suppressed)
+            }
+        }
+    }
+}
+
 async fn spawn_consumer(
     keep: Arc<Mutex<Keep>>,
     client: Client,
@@ -423,6 +466,10 @@ async fn spawn_consumer(
         // not count; only an actual `Applied` clears the run.
         const PERSISTENT_DIVERGENCE_THRESHOLD: u32 = 20;
         let mut consecutive_future_rejections: u32 = 0;
+        // Rate-limits the per-event rejection log lines so a hostile relay cannot
+        // flood the logs; the persistent-divergence escalation below is separate
+        // and always fires on its threshold.
+        let mut reject_log = RejectLogThrottle::default();
         loop {
             let notification = match notifications.recv().await {
                 Ok(n) => n,
@@ -461,25 +508,37 @@ async fn spawn_consumer(
                             Ok(ReplicatedApply::Applied) => consecutive_future_rejections = 0,
                             // Not strictly newer than what we already applied: a stale or replayed event
                             // (rollback attempt from an untrusted relay). Ignore it, but record it.
-                            Ok(ReplicatedApply::IgnoredStale) => tracing::warn!(
-                                table = ?rec.table,
-                                record_id = ?rec.record_id,
-                                created_at = rec.created_at,
-                                "keep-state: ignored stale/replayed event (rollback guard)"
-                            ),
+                            Ok(ReplicatedApply::IgnoredStale) => {
+                                if let Some(suppressed) =
+                                    reject_log.stale.should_log(now, REJECT_LOG_INTERVAL_SECS)
+                                {
+                                    tracing::warn!(
+                                        table = ?rec.table,
+                                        record_id = ?rec.record_id,
+                                        created_at = rec.created_at,
+                                        suppressed_since_last = suppressed,
+                                        "keep-state: ignored stale/replayed event (rollback guard)"
+                                    );
+                                }
+                            }
                             // created_at beyond the future bound. Two causes: a cluster-key poison attempt
                             // (would otherwise freeze this record's mark), OR THIS node's clock is far
                             // behind its peers -- in which case every legitimate event is rejected until
                             // the clock is corrected, so check NTP before assuming an attack. Loud either
                             // way; mark untouched, so it self-heals once wall-clock passes created_at.
                             Ok(ReplicatedApply::RejectedFuture) => {
-                                tracing::error!(
-                                    table = ?rec.table,
-                                    record_id = ?rec.record_id,
-                                    created_at = rec.created_at,
-                                    now,
-                                    "keep-state: rejected event past the future bound (cluster-key poison attempt, or this node's clock is behind its peers -- check NTP)"
-                                );
+                                if let Some(suppressed) =
+                                    reject_log.future.should_log(now, REJECT_LOG_INTERVAL_SECS)
+                                {
+                                    tracing::error!(
+                                        table = ?rec.table,
+                                        record_id = ?rec.record_id,
+                                        created_at = rec.created_at,
+                                        now,
+                                        suppressed_since_last = suppressed,
+                                        "keep-state: rejected event past the future bound (cluster-key poison attempt, or this node's clock is behind its peers -- check NTP)"
+                                    );
+                                }
                                 consecutive_future_rejections += 1;
                                 if consecutive_future_rejections % PERSISTENT_DIVERGENCE_THRESHOLD
                                     == 0
@@ -490,11 +549,19 @@ async fn spawn_consumer(
                                     );
                                 }
                             }
-                            Err(e) => tracing::warn!(
-                                table = ?rec.table,
-                                record_id = ?rec.record_id,
-                                "keep-state apply failed: {e}"
-                            ),
+                            Err(e) => {
+                                if let Some(suppressed) = reject_log
+                                    .apply_error
+                                    .should_log(now, REJECT_LOG_INTERVAL_SECS)
+                                {
+                                    tracing::warn!(
+                                        table = ?rec.table,
+                                        record_id = ?rec.record_id,
+                                        suppressed_since_last = suppressed,
+                                        "keep-state apply failed: {e}"
+                                    );
+                                }
+                            }
                         }
                     }
                     Ok(None) => {}
@@ -513,6 +580,34 @@ mod tests {
     use keep_core::{Keep, RelayConfig};
     use nostr_relay_builder::MockRelay;
     use std::collections::HashMap;
+
+    #[test]
+    fn reject_log_throttle_logs_first_then_rate_limits_reporting_suppressed() {
+        let mut b = ThrottleBucket::default();
+        // First occurrence logs immediately; nothing suppressed yet.
+        assert_eq!(b.should_log(1000, 60), Some(0));
+        // Within the interval: suppressed, counted.
+        assert_eq!(b.should_log(1010, 60), None);
+        assert_eq!(b.should_log(1030, 60), None);
+        // Interval elapsed: logs again and reports the 2 it suppressed.
+        assert_eq!(b.should_log(1061, 60), Some(2));
+        // Counter resets after a logged occurrence.
+        assert_eq!(b.should_log(1062, 60), None);
+        assert_eq!(b.should_log(1200, 60), Some(1));
+        // A clock that goes backwards never yields a negative elapsed: treated as
+        // within the interval (suppressed), not an immediate re-log.
+        assert_eq!(b.should_log(1100, 60), None);
+    }
+
+    #[test]
+    fn reject_log_throttle_buckets_are_independent() {
+        let mut t = RejectLogThrottle::default();
+        assert_eq!(t.stale.should_log(1000, 60), Some(0));
+        // A stale log does not consume the future bucket's first-log allowance.
+        assert_eq!(t.future.should_log(1000, 60), Some(0));
+        assert_eq!(t.apply_error.should_log(1000, 60), Some(0));
+        assert_eq!(t.stale.should_log(1005, 60), None);
+    }
 
     #[test]
     fn pending_coalesces_latest_change_per_dtag() {
