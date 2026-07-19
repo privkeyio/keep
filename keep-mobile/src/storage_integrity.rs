@@ -67,13 +67,16 @@ pub fn storage_entry_mac(mac_key: Vec<u8>, entry_key: String, value: Vec<u8>) ->
         "storage MAC key not initialized - cannot compute entry MAC"
     );
     let mac_key = zeroize::Zeroizing::new(mac_key);
-    let mut pre = Vec::with_capacity(ENTRY_MAC_DOMAIN.len() + 16 + entry_key.len() + value.len());
+    // `pre` holds a copy of `value` (which may be a plaintext share); wipe it.
+    let mut pre = zeroize::Zeroizing::new(Vec::with_capacity(
+        ENTRY_MAC_DOMAIN.len() + 16 + entry_key.len() + value.len(),
+    ));
     pre.extend_from_slice(ENTRY_MAC_DOMAIN);
     pre.extend_from_slice(&(entry_key.len() as u64).to_be_bytes());
     pre.extend_from_slice(entry_key.as_bytes());
     pre.extend_from_slice(&(value.len() as u64).to_be_bytes());
     pre.extend_from_slice(&value);
-    hmac_sha256(mac_key.as_slice(), &pre).to_vec()
+    hmac_sha256(mac_key.as_slice(), pre.as_slice()).to_vec()
 }
 
 /// Verify a per-entry MAC in constant time.
@@ -94,6 +97,14 @@ pub fn storage_verify_entry_mac(
 /// adding, or tampering with any entry changes the recomputed tip and fails
 /// [`storage_verify_tip_mac`], and a storage that strips per-entry MACs cannot
 /// silently downgrade to "no integrity" -- the tip still demands the full set.
+///
+/// The tip binds each entry's key and per-entry MAC, NOT its value directly, so
+/// the wired verifier MUST also verify every per-entry MAC against its value
+/// (via [`storage_verify_entry_mac`]); checking only the tip would miss a value
+/// swap that leaves the stored per-entry MAC in place. An absent tip (e.g. a
+/// wiped Keystore slot) must be treated as a failure once integrity has been
+/// initialized -- the empty-store state is `storage_tip_mac(key, [])` over
+/// `count = 0`, an authenticated value, not a "skip the check" sentinel.
 ///
 /// Panics on an empty `mac_key` (fail closed).
 #[uniffi::export]
