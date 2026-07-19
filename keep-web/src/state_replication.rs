@@ -24,7 +24,7 @@
 //! clock jump followed by a correction makes the consumer reject legitimate newer writes until wall-clock
 //! catches up. Seeding the publisher floor from stored marks covers a promoted standby, but not a live
 //! active whose own clock regresses.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use nostr_sdk::prelude::*;
@@ -214,26 +214,65 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
         // the hook captured between installing it and this snapshot (both read the same storage), and
         // the per-d-tag coalescing keeps the map bounded by record count. Each seeded record is then
         // published with a created_at seeded from its own persisted mark by the loop below.
-        match keep.lock().await.snapshot_replicable_records() {
-            Ok(records) => {
-                {
+        let mut record_dtags: HashSet<String> = HashSet::new();
+        // Hold the keep lock across BOTH the record snapshot and the tombstone
+        // read so `record_dtags` is a view consistent with the tombstone set: a
+        // delete takes the same mutex, so it cannot commit a fresh, legitimate
+        // tombstone between the two reads and then have it wrongly cleared as
+        // obsolete below. There is no `.await` inside the guard's scope.
+        {
+            let keep_guard = keep.lock().await;
+            match keep_guard.snapshot_replicable_records() {
+                Ok(records) => {
                     let mut guard = pending.lock().unwrap();
                     for (table, id, encrypted) in records {
-                        guard
-                            .entry(format!("{table}:{id}"))
-                            .or_insert(Change::Record {
-                                table: table.to_string(),
-                                id,
-                                encrypted,
-                            });
+                        let dtag = format!("{table}:{id}");
+                        record_dtags.insert(dtag.clone());
+                        guard.entry(dtag).or_insert(Change::Record {
+                            table: table.to_string(),
+                            id,
+                            encrypted,
+                        });
                     }
                 }
-                notify.notify_one();
+                Err(e) => tracing::error!(
+                    "keep-state: initial snapshot failed; a fresh standby may miss records written before replication started: {e}"
+                ),
             }
-            Err(e) => tracing::error!(
-                "keep-state: initial snapshot failed; a fresh standby may miss records written before replication started: {e}"
-            ),
+
+            // Seed undelivered delete-tombstones: a record removed locally but
+            // never published must still tombstone on standbys, or a revoked key
+            // stays live there. A tombstone whose record still exists (deleted
+            // then re-created before the delete published) is obsolete -- clear
+            // it rather than seed a delete that would resurrect-then-remove the
+            // live record. `or_insert` also yields to a record/delete the hook
+            // captured between install and this drain (same storage).
+            match keep_guard.pending_tombstones() {
+                Ok(tombstones) => {
+                    for (table, id) in tombstones {
+                        let dtag = format!("{table}:{id}");
+                        if record_dtags.contains(&dtag) {
+                            if let Err(e) = keep_guard.clear_pending_tombstone(&table, &id) {
+                                tracing::warn!(
+                                    dtag = %dtag,
+                                    "keep-state: could not clear obsolete delete-tombstone: {e}"
+                                );
+                            }
+                            continue;
+                        }
+                        pending
+                            .lock()
+                            .unwrap()
+                            .entry(dtag)
+                            .or_insert(Change::Delete { table, id });
+                    }
+                }
+                Err(e) => tracing::error!(
+                    "keep-state: pending-tombstone seed failed; a revoked record may stay live on a standby: {e}"
+                ),
+            }
         }
+        notify.notify_one();
 
         // `last_ts` is an in-memory per-d-tag high-water-mark guaranteeing strict per-d-tag monotonicity
         // of created_at within a run: a record and its immediate delete (or two rapid writes) must not
@@ -297,7 +336,21 @@ async fn spawn_publisher(keep: Arc<Mutex<Keep>>, client: Client, identity: Keys)
                 match event {
                     Ok(ev) => match client.send_event(&ev).await {
                         Ok(out) => match classify_send(&out) {
-                            SendOutcome::Accepted => {}
+                            SendOutcome::Accepted => {
+                                // A delete is now durably replicated; drop its
+                                // persisted tombstone so the outbox neither
+                                // re-publishes it on the next restart nor grows.
+                                if let Change::Delete { table, id } = &change {
+                                    if let Err(e) =
+                                        keep.lock().await.clear_pending_tombstone(table, id)
+                                    {
+                                        tracing::warn!(
+                                            dtag = ?dtag,
+                                            "keep-state: could not clear delivered delete-tombstone: {e}"
+                                        );
+                                    }
+                                }
+                            }
                             // Replicated, but some relay said no; never discard the reasons.
                             SendOutcome::PartiallyRejected => tracing::warn!(
                                 dtag = ?dtag,

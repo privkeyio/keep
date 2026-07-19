@@ -154,6 +154,20 @@ impl Keep {
         self.storage.snapshot_replicable_records()
     }
 
+    /// Every undelivered delete-tombstone as `(table, record_id)`, for the
+    /// keep-state publisher to seed as pending deletes at startup so a revoked
+    /// record removed but never published still reaches standbys. See
+    /// [`Storage::pending_tombstones`].
+    pub fn pending_tombstones(&self) -> Result<Vec<(String, String)>> {
+        self.storage.pending_tombstones()
+    }
+
+    /// Clear a delete-tombstone once its delete has been accepted by a relay.
+    /// See [`Storage::clear_pending_tombstone`].
+    pub fn clear_pending_tombstone(&self, table: &str, record_id: &str) -> Result<()> {
+        self.storage.clear_pending_tombstone(table, record_id)
+    }
+
     /// Create a new Keep with the given password.
     ///
     /// # Example

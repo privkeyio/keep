@@ -9,8 +9,8 @@ use tracing::{debug, trace, warn};
 
 use crate::backend::{
     AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
-    KEYS_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE, SHARES_TABLE,
-    STATE_VERSIONS_TABLE,
+    KEYS_TABLE, PENDING_TOMBSTONES_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE,
+    SHARES_TABLE, STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -24,6 +24,22 @@ use crate::wallet::{KeyHealthStatus, WalletDescriptor};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
+
+/// Marker value stored for a pending delete-tombstone. Only the entry KEY
+/// (`"<table>:<hex record id>"`) carries information; the delete is re-published
+/// with a fresh `created_at`, so no timestamp needs to persist here.
+const TOMBSTONE_MARKER: &[u8] = &[1u8];
+
+/// Split a pending-tombstone entry key (`"<table>:<hex record id>"`) back into
+/// `(table, record_id)`. Returns `None` for a malformed key.
+fn parse_tombstone_key(raw: &[u8]) -> Option<(String, String)> {
+    let s = std::str::from_utf8(raw).ok()?;
+    let (table, id) = s.split_once(':')?;
+    if table.is_empty() || id.is_empty() {
+        return None;
+    }
+    Some((table.to_string(), id.to_string()))
+}
 
 /// SOCKS5 proxy configuration stored in the vault.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -831,11 +847,68 @@ impl Storage {
         Ok(records)
     }
 
+    /// Atomically remove a replicable row AND persist a delete-tombstone intent,
+    /// so a crash after the row is gone but before the delete is replicated
+    /// cannot leave a revoked record live on a standby. `logical_table` is the
+    /// replication table name (`"keys"`/`"descriptors"`/`"relay_configs"`),
+    /// `backend_table` the physical redb table. Returns whether the row existed;
+    /// the caller emits `notify_delete` on `true`.
+    fn delete_replicable(
+        &self,
+        logical_table: &str,
+        backend_table: &str,
+        key: &[u8],
+    ) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.get(backend_table, key)?.is_none() {
+            return Ok(false);
+        }
+        let tombstone_key = format!("{logical_table}:{}", hex::encode(key));
+        // Row removal and tombstone persist commit together; the two ops target
+        // distinct tables as `write_atomic` requires.
+        backend.write_atomic(&[
+            AtomicOp {
+                table: backend_table,
+                key,
+                value: None,
+            },
+            AtomicOp {
+                table: PENDING_TOMBSTONES_TABLE,
+                key: tombstone_key.as_bytes(),
+                value: Some(TOMBSTONE_MARKER),
+            },
+        ])?;
+        Ok(true)
+    }
+
+    /// Every undelivered delete-tombstone, as `(logical_table, hex record id)`.
+    /// A fresh publisher seeds these as pending deletes so a revoked record that
+    /// was removed but never published still reaches standbys. Tolerates the
+    /// table not yet existing (no delete has ever been persisted).
+    pub fn pending_tombstones(&self) -> Result<Vec<(String, String)>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend.create_table(PENDING_TOMBSTONES_TABLE)?;
+        Ok(backend
+            .list(PENDING_TOMBSTONES_TABLE)?
+            .into_iter()
+            .filter_map(|(k, _)| parse_tombstone_key(&k))
+            .collect())
+    }
+
+    /// Clear a delete-tombstone once its delete has been accepted by a relay, so
+    /// the outbox does not grow without bound or re-publish an already-delivered
+    /// delete on the next restart.
+    pub fn clear_pending_tombstone(&self, logical_table: &str, record_id: &str) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let tombstone_key = format!("{logical_table}:{record_id}");
+        backend.delete(PENDING_TOMBSTONES_TABLE, tombstone_key.as_bytes())?;
+        Ok(())
+    }
+
     /// Delete a key record.
     pub fn delete_key(&self, id: &[u8; 32]) -> Result<()> {
         debug!(id = %hex::encode(id), "deleting key");
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.delete(KEYS_TABLE, id)? {
+        if self.delete_replicable("keys", KEYS_TABLE, id)? {
             self.notify_delete("keys", &hex::encode(id));
             Ok(())
         } else {
@@ -1284,9 +1357,10 @@ impl Storage {
     }
 
     /// Delete every stored version of the wallet descriptor for a group.
-    /// All version rows are removed via the backend's `delete_batch`; on
-    /// backends that implement it atomically (redb does) a crash mid-delete
-    /// cannot leave a partial set behind.
+    /// All version rows are removed, each with a persisted delete-tombstone, in
+    /// one atomic transaction; on backends that implement `write_atomic`
+    /// atomically (redb does) a crash mid-delete cannot leave a partial set
+    /// behind, nor a deleted version without its replication tombstone.
     pub fn delete_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
         debug!(group = %hex::encode(group_pubkey), "deleting wallet descriptor (all versions)");
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -1305,8 +1379,27 @@ impl Storage {
             )));
         }
 
-        let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
-        backend.delete_batch(DESCRIPTORS_TABLE, &refs)?;
+        // Remove every version row and persist a delete-tombstone for each in a
+        // single atomic transaction, so a crash cannot leave a revoked
+        // descriptor live on a standby that never observed the delete.
+        let tombstone_keys: Vec<String> = keys
+            .iter()
+            .map(|k| format!("descriptors:{}", hex::encode(k)))
+            .collect();
+        let mut ops: Vec<AtomicOp> = Vec::with_capacity(keys.len() * 2);
+        for (k, tk) in keys.iter().zip(&tombstone_keys) {
+            ops.push(AtomicOp {
+                table: DESCRIPTORS_TABLE,
+                key: k,
+                value: None,
+            });
+            ops.push(AtomicOp {
+                table: PENDING_TOMBSTONES_TABLE,
+                key: tk.as_bytes(),
+                value: Some(TOMBSTONE_MARKER),
+            });
+        }
+        backend.write_atomic(&ops)?;
         for k in &keys {
             self.notify_delete("descriptors", &hex::encode(k));
         }
@@ -1315,9 +1408,8 @@ impl Storage {
 
     /// Delete a single version of a wallet descriptor for a group.
     pub fn delete_descriptor_version(&self, group_pubkey: &[u8; 32], version: u32) -> Result<()> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         let key = descriptor_storage_key(group_pubkey, version);
-        if backend.delete(DESCRIPTORS_TABLE, &key)? {
+        if self.delete_replicable("descriptors", DESCRIPTORS_TABLE, &key)? {
             self.notify_delete("descriptors", &hex::encode(key));
             Ok(())
         } else {
@@ -1385,8 +1477,7 @@ impl Storage {
     /// Delete a relay configuration.
     pub fn delete_relay_config(&self, group_pubkey: &[u8; 32]) -> Result<()> {
         debug!(group = %hex::encode(group_pubkey), "deleting relay config");
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.delete(RELAY_CONFIGS_TABLE, group_pubkey)? {
+        if self.delete_replicable("relay_configs", RELAY_CONFIGS_TABLE, group_pubkey)? {
             self.notify_delete("relay_configs", &hex::encode(group_pubkey));
             Ok(())
         } else {
@@ -1976,6 +2067,53 @@ mod tests {
         storage.delete_key(&record.id).unwrap();
         let keys = storage.list_keys().unwrap();
         assert_eq!(keys.len(), 0);
+    }
+
+    #[test]
+    fn delete_key_persists_tombstone_across_reopen_until_cleared() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        let record = KeyRecord::new(
+            crypto::random_bytes(),
+            crate::keys::KeyType::Nostr,
+            "revoked".into(),
+            vec![1, 2, 3, 4],
+        );
+        let record_id = hex::encode(record.id);
+
+        {
+            let storage = Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+            storage.store_key(&record).unwrap();
+            // No delete yet -> no outbox entry.
+            assert!(storage.pending_tombstones().unwrap().is_empty());
+            storage.delete_key(&record.id).unwrap();
+            assert_eq!(
+                storage.pending_tombstones().unwrap(),
+                vec![("keys".to_string(), record_id.clone())]
+            );
+        }
+
+        // Simulate a crash/restart: the tombstone must survive so the delete
+        // still reaches a standby that never saw it.
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("password").unwrap();
+        assert_eq!(
+            storage.pending_tombstones().unwrap(),
+            vec![("keys".to_string(), record_id.clone())]
+        );
+
+        // Once the delete is acknowledged by a relay, clearing drops it for good.
+        storage.clear_pending_tombstone("keys", &record_id).unwrap();
+        assert!(storage.pending_tombstones().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_missing_key_writes_no_tombstone() {
+        let dir = tempdir().unwrap();
+        let storage =
+            Storage::create(&dir.path().join("v"), "password", Argon2Params::TESTING).unwrap();
+        assert!(storage.delete_key(&[9u8; 32]).is_err());
+        assert!(storage.pending_tombstones().unwrap().is_empty());
     }
 
     #[test]
