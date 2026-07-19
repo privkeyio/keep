@@ -18,6 +18,12 @@ const COOLING_OFF_PERIOD_MS: u64 = 15 * 60 * 1000;
 const HOUR_MS: u64 = 60 * 60 * 1000;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const RISK_ESCALATION_THRESHOLD: u32 = 40;
+/// The `Basic` policy's auto-approval ceiling: the `SigningAuthLevel::None` band
+/// (`assess_signing_risk` returns `None` below a score of 20). `Basic` therefore
+/// auto-approves only requests the risk model rates as needing no extra auth,
+/// making it a strict subset of `Auto` (which auto-approves up to
+/// `RISK_ESCALATION_THRESHOLD`).
+const BASIC_RISK_THRESHOLD: u32 = 20;
 
 const SENSITIVE_KINDS: &[u32] = &[
     0,     // Metadata (profile)
@@ -106,12 +112,12 @@ pub enum PolicyMode {
 /// (Manual=0, Basic=1, Auto=2), so migrating the client's stored value is a
 /// pure read-through.
 ///
-/// NOTE: `Basic` and `Auto` currently map to the SAME evaluation mode
-/// (`PolicyMode::Auto`), reproducing keep-android's present behavior where the
-/// two are indistinguishable at runtime (the only client branch collapses both
-/// to `PolicyMode::Auto`). Giving `Basic` a distinct curated-allow-set semantics
-/// is a separate product decision (#716) and is intentionally NOT implemented
-/// here; this type only hoists the SELECTION state into the core, behavior-neutral.
+/// `Basic` and `Auto` get distinct runtime behavior via
+/// [`evaluate_sign_policy_selection`], where `Basic` is a strictly stricter auto
+/// tier than `Auto` (#716). The legacy [`policy_mode`] bridge still collapses both
+/// onto [`PolicyMode::Auto`] for callers on the 2-value [`evaluate_sign_policy`]
+/// path; those callers see the previous behavior until they migrate to the
+/// selection-aware evaluator.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignPolicySelection {
     Manual,
@@ -138,8 +144,9 @@ impl SignPolicySelection {
         }
     }
 
-    /// Map the selection onto the evaluation mode. `Basic` and `Auto` both map
-    /// to `Auto` today (behavior-neutral hoist); see the type note.
+    /// Map the selection onto the legacy 2-value evaluation mode. `Basic` and
+    /// `Auto` both map to `Auto` here; the selection-aware
+    /// [`evaluate_sign_policy_selection`] is what distinguishes them at runtime.
     pub fn policy_mode(self) -> PolicyMode {
         match self {
             SignPolicySelection::Manual => PolicyMode::Manual,
@@ -725,17 +732,17 @@ fn serialize_window(window: &UsageWindow, now_wall_ms: u64) -> String {
     format!("{}:{}:{}", window.count, window.start_elapsed, now_wall_ms)
 }
 
-#[uniffi::export]
-pub fn evaluate_sign_policy(
-    policy_mode: PolicyMode,
+/// Shared auto-approval gate for the non-Manual policies. Auto-approves only a
+/// `SignEvent` of a non-sensitive kind, when opted in, the rate limiter allows
+/// it, and the assessed risk stays below `max_auto_score`; everything else falls
+/// to the UI. The only knob between the tiers is `max_auto_score`, so a stricter
+/// tier is a strict subset of a looser one.
+fn evaluate_auto(
     ctx: SigningRequestContext,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
+    max_auto_score: u32,
 ) -> SignPolicyEvaluation {
-    if policy_mode == PolicyMode::Manual {
-        return SignPolicyEvaluation::FallToUi;
-    }
-
     if ctx.operation != Nip55RequestType::SignEvent {
         return SignPolicyEvaluation::FallToUi;
     }
@@ -752,7 +759,7 @@ pub fn evaluate_sign_policy(
     let current_hour = ((now_ms() / 1000 % 86400) / 3600) as u32;
     let risk = assess_signing_risk(ctx, recent_count, current_hour);
 
-    if !is_opted_in || risk.score >= RISK_ESCALATION_THRESHOLD {
+    if !is_opted_in || risk.score >= max_auto_score {
         return SignPolicyEvaluation::FallToUi;
     }
 
@@ -760,6 +767,47 @@ pub fn evaluate_sign_policy(
         AutoSignDecision::Allowed { .. } => SignPolicyEvaluation::AutoApprove,
         _ => SignPolicyEvaluation::FallToUi,
     }
+}
+
+#[uniffi::export]
+pub fn evaluate_sign_policy(
+    policy_mode: PolicyMode,
+    ctx: SigningRequestContext,
+    is_opted_in: bool,
+    rate_check: AutoSignDecision,
+) -> SignPolicyEvaluation {
+    match policy_mode {
+        PolicyMode::Manual => SignPolicyEvaluation::FallToUi,
+        PolicyMode::Auto => evaluate_auto(ctx, is_opted_in, rate_check, RISK_ESCALATION_THRESHOLD),
+    }
+}
+
+/// Evaluate a request against the user's 3-value [`SignPolicySelection`], giving
+/// `Basic` and `Auto` distinct runtime behavior (#716) instead of collapsing both
+/// onto [`PolicyMode::Auto`]:
+///
+/// * `Manual` always falls to the UI.
+/// * `Auto` matches [`evaluate_sign_policy`] with [`PolicyMode::Auto`]: it
+///   auto-approves a non-sensitive `SignEvent` up to [`RISK_ESCALATION_THRESHOLD`].
+/// * `Basic` is a strict subset of `Auto` -- it auto-approves only when the
+///   assessed risk stays below [`BASIC_RISK_THRESHOLD`] (the `SigningAuthLevel::None`
+///   ceiling), so any request the risk model rates as needing even a PIN falls to
+///   the UI. This realizes the documented "Basic implies some prompting" without
+///   ever adding a blind-approve mode: neither tier auto-approves a sensitive
+///   kind, an encryption op, a rate-limited burst, or a high-risk request.
+#[uniffi::export]
+pub fn evaluate_sign_policy_selection(
+    selection: SignPolicySelection,
+    ctx: SigningRequestContext,
+    is_opted_in: bool,
+    rate_check: AutoSignDecision,
+) -> SignPolicyEvaluation {
+    let max_auto_score = match selection {
+        SignPolicySelection::Manual => return SignPolicyEvaluation::FallToUi,
+        SignPolicySelection::Basic => BASIC_RISK_THRESHOLD,
+        SignPolicySelection::Auto => RISK_ESCALATION_THRESHOLD,
+    };
+    evaluate_auto(ctx, is_opted_in, rate_check, max_auto_score)
 }
 
 #[cfg(test)]
@@ -1065,6 +1113,93 @@ mod tests {
         let ctx = test_ctx(Nip55RequestType::Nip44Encrypt, None);
         let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
+    }
+
+    fn allowed_recent(recent: u32) -> AutoSignDecision {
+        AutoSignDecision::Allowed {
+            hourly_count: 1,
+            daily_count: 1,
+            recent_count: recent,
+            hourly_limit: HOURLY_LIMIT,
+            daily_limit: DAILY_LIMIT,
+        }
+    }
+
+    #[test]
+    fn selection_manual_always_falls_to_ui() {
+        // Even a zero-risk request prompts under Manual.
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        let result =
+            evaluate_sign_policy_selection(SignPolicySelection::Manual, ctx, true, allowed(1, 1));
+        assert_eq!(result, SignPolicyEvaluation::FallToUi);
+    }
+
+    #[test]
+    fn selection_basic_and_auto_auto_approve_low_risk() {
+        // A non-sensitive SignEvent from a known app with no risk factors scores
+        // below the None ceiling, so both tiers auto-approve it.
+        for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
+            let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1));
+            assert_eq!(
+                result,
+                SignPolicyEvaluation::AutoApprove,
+                "{selection:?} should auto-approve a zero-risk request"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_basic_prompts_where_auto_approves_moderate_risk() {
+        // A high-frequency burst scores in the [20, 40) band: needs a PIN by the
+        // risk model, so Basic (ceiling 20) prompts while Auto (ceiling 40) still
+        // auto-approves. This is the distinguishing case between the two tiers.
+        let auto = evaluate_sign_policy_selection(
+            SignPolicySelection::Auto,
+            test_ctx(Nip55RequestType::SignEvent, Some(1)),
+            true,
+            allowed_recent(HIGH_FREQUENCY_THRESHOLD + 1),
+        );
+        assert_eq!(
+            auto,
+            SignPolicyEvaluation::AutoApprove,
+            "Auto approves moderate risk"
+        );
+
+        let basic = evaluate_sign_policy_selection(
+            SignPolicySelection::Basic,
+            test_ctx(Nip55RequestType::SignEvent, Some(1)),
+            true,
+            allowed_recent(HIGH_FREQUENCY_THRESHOLD + 1),
+        );
+        assert_eq!(
+            basic,
+            SignPolicyEvaluation::FallToUi,
+            "Basic prompts on moderate risk"
+        );
+    }
+
+    #[test]
+    fn selection_both_tiers_prompt_on_sensitive_kind() {
+        // Neither tier auto-approves a sensitive kind (no blind-approve mode).
+        for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
+            let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
+            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1));
+            assert_eq!(
+                result,
+                SignPolicyEvaluation::FallToUi,
+                "{selection:?} must prompt on a sensitive kind"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_both_tiers_prompt_when_not_opted_in() {
+        for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
+            let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+            let result = evaluate_sign_policy_selection(selection, ctx, false, allowed(1, 1));
+            assert_eq!(result, SignPolicyEvaluation::FallToUi);
+        }
     }
 
     struct MockPolicyStorage {
