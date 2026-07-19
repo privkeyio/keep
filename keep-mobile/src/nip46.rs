@@ -554,7 +554,20 @@ impl BunkerHandler {
             });
         }
 
+        // Cert-pin the bunker relays before serving, matching do_initialize.
+        // Held on the sync stack across the block_on (like do_initialize) so the
+        // trust-on-first-use pin persist cannot race a concurrent cert-pin FFI
+        // call. Lock order start_rotate_lock -> cert_pin_lock is acyclic: the
+        // cert-pin FFI methods and init never take start_rotate_lock.
+        let _cert_pins = self
+            .mobile
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let result = self.mobile.runtime.block_on(async {
+            let verified_relays = self.mobile.verify_and_pin_relays(&relays).await?;
+
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
 
@@ -640,7 +653,7 @@ impl BunkerHandler {
                 Server::new_frost_with_proxy(
                     frost_signer,
                     *transport_secret,
-                    &relays,
+                    &verified_relays,
                     server_callbacks,
                     config,
                     proxy,
@@ -654,7 +667,7 @@ impl BunkerHandler {
                 Server::new_network_frost_with_proxy(
                     network_signer,
                     *transport_secret,
-                    &relays,
+                    &verified_relays,
                     server_callbacks,
                     config,
                     proxy,
