@@ -101,6 +101,135 @@ pub enum PolicyMode {
     Auto,
 }
 
+/// The sign-policy SELECTION the user chose, distinct from the 2-value
+/// evaluation [`PolicyMode`]. Ordinals match keep-android's `SignPolicy`
+/// (Manual=0, Basic=1, Auto=2), so migrating the client's stored value is a
+/// pure read-through.
+///
+/// NOTE: `Basic` and `Auto` currently map to the SAME evaluation mode
+/// (`PolicyMode::Auto`), reproducing keep-android's present behavior where the
+/// two are indistinguishable at runtime (the only client branch collapses both
+/// to `PolicyMode::Auto`). Giving `Basic` a distinct curated-allow-set semantics
+/// is a separate product decision (#716) and is intentionally NOT implemented
+/// here; this type only hoists the SELECTION state into the core, behavior-neutral.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignPolicySelection {
+    Manual,
+    Basic,
+    Auto,
+}
+
+impl SignPolicySelection {
+    fn to_ordinal(self) -> u8 {
+        match self {
+            SignPolicySelection::Manual => 0,
+            SignPolicySelection::Basic => 1,
+            SignPolicySelection::Auto => 2,
+        }
+    }
+
+    /// Parse an ordinal, defaulting to the safest mode (`Manual`) on any
+    /// unknown/garbage value, matching keep-android's `fromOrdinal`.
+    fn from_ordinal(ordinal: u8) -> Self {
+        match ordinal {
+            1 => SignPolicySelection::Basic,
+            2 => SignPolicySelection::Auto,
+            _ => SignPolicySelection::Manual,
+        }
+    }
+
+    /// Map the selection onto the evaluation mode. `Basic` and `Auto` both map
+    /// to `Auto` today (behavior-neutral hoist); see the type note.
+    pub fn policy_mode(self) -> PolicyMode {
+        match self {
+            SignPolicySelection::Manual => PolicyMode::Manual,
+            SignPolicySelection::Basic | SignPolicySelection::Auto => PolicyMode::Auto,
+        }
+    }
+}
+
+/// Persistence for the sign-policy selection (global + per-app override). A
+/// simple string key/value store; the Android side backs it with its encrypted
+/// sign-policy prefs. Mirrors [`SigningRateLimiterStorage`].
+#[uniffi::export(with_foreign)]
+pub trait SignPolicySelectionStorage: Send + Sync {
+    fn load(&self, key: String) -> Option<String>;
+    fn save(&self, key: String, value: String);
+    fn remove(&self, key: String);
+}
+
+const GLOBAL_SIGN_POLICY_KEY: &str = "global_sign_policy";
+
+fn app_override_key(package: &str) -> String {
+    format!("sign_policy_override:{package}")
+}
+
+/// Core-owned store for the sign-policy selection, so the selection state and
+/// its override -> global -> Manual precedence live in one place rather than
+/// being reimplemented in each client (#716). Feeds the existing evaluation via
+/// [`SignPolicyStore::effective_policy_mode`].
+#[derive(uniffi::Object)]
+pub struct SignPolicyStore {
+    storage: Arc<dyn SignPolicySelectionStorage>,
+}
+
+#[uniffi::export]
+impl SignPolicyStore {
+    #[uniffi::constructor]
+    pub fn new(storage: Arc<dyn SignPolicySelectionStorage>) -> Self {
+        Self { storage }
+    }
+
+    /// The global sign-policy selection, defaulting to `Manual` when unset or
+    /// unparseable (fail safe).
+    pub fn global_policy(&self) -> SignPolicySelection {
+        self.storage
+            .load(GLOBAL_SIGN_POLICY_KEY.to_string())
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(SignPolicySelection::from_ordinal)
+            .unwrap_or(SignPolicySelection::Manual)
+    }
+
+    /// Persist the global sign-policy selection.
+    pub fn set_global_policy(&self, policy: SignPolicySelection) {
+        self.storage.save(
+            GLOBAL_SIGN_POLICY_KEY.to_string(),
+            policy.to_ordinal().to_string(),
+        );
+    }
+
+    /// The per-app override, or `None` if the app follows the global policy.
+    pub fn app_override(&self, package: String) -> Option<SignPolicySelection> {
+        self.storage
+            .load(app_override_key(&package))
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(SignPolicySelection::from_ordinal)
+    }
+
+    /// Set (`Some`) or clear (`None`) the per-app override.
+    pub fn set_app_override(&self, package: String, policy: Option<SignPolicySelection>) {
+        match policy {
+            Some(p) => self
+                .storage
+                .save(app_override_key(&package), p.to_ordinal().to_string()),
+            None => self.storage.remove(app_override_key(&package)),
+        }
+    }
+
+    /// Resolve the effective selection for a package: per-app override, else the
+    /// global policy, else `Manual`. Mirrors keep-android's precedence.
+    pub fn effective_policy(&self, package: String) -> SignPolicySelection {
+        self.app_override(package)
+            .unwrap_or_else(|| self.global_policy())
+    }
+
+    /// The evaluation [`PolicyMode`] for a package, ready to feed the existing
+    /// `evaluate_sign_policy` / decision machinery.
+    pub fn effective_policy_mode(&self, package: String) -> PolicyMode {
+        self.effective_policy(package).policy_mode()
+    }
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct UsageStats {
     pub hourly_count: u32,
@@ -936,5 +1065,107 @@ mod tests {
         let ctx = test_ctx(Nip55RequestType::Nip44Encrypt, None);
         let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
+    }
+
+    struct MockPolicyStorage {
+        map: Mutex<HashMap<String, String>>,
+    }
+    impl MockPolicyStorage {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                map: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+    impl SignPolicySelectionStorage for MockPolicyStorage {
+        fn load(&self, key: String) -> Option<String> {
+            self.map.lock().unwrap().get(&key).cloned()
+        }
+        fn save(&self, key: String, value: String) {
+            self.map.lock().unwrap().insert(key, value);
+        }
+        fn remove(&self, key: String) {
+            self.map.lock().unwrap().remove(&key);
+        }
+    }
+
+    #[test]
+    fn sign_policy_selection_maps_to_policy_mode() {
+        assert_eq!(
+            SignPolicySelection::Manual.policy_mode(),
+            PolicyMode::Manual
+        );
+        // Basic and Auto both map to Auto today (behavior-neutral hoist).
+        assert_eq!(SignPolicySelection::Basic.policy_mode(), PolicyMode::Auto);
+        assert_eq!(SignPolicySelection::Auto.policy_mode(), PolicyMode::Auto);
+    }
+
+    #[test]
+    fn sign_policy_selection_ordinal_round_trip_and_defaults() {
+        for p in [
+            SignPolicySelection::Manual,
+            SignPolicySelection::Basic,
+            SignPolicySelection::Auto,
+        ] {
+            assert_eq!(SignPolicySelection::from_ordinal(p.to_ordinal()), p);
+        }
+        // Unknown ordinals fail safe to Manual.
+        assert_eq!(
+            SignPolicySelection::from_ordinal(9),
+            SignPolicySelection::Manual
+        );
+    }
+
+    #[test]
+    fn sign_policy_store_global_defaults_to_manual_then_persists() {
+        let store = SignPolicyStore::new(MockPolicyStorage::new());
+        assert_eq!(store.global_policy(), SignPolicySelection::Manual);
+        store.set_global_policy(SignPolicySelection::Auto);
+        assert_eq!(store.global_policy(), SignPolicySelection::Auto);
+    }
+
+    #[test]
+    fn sign_policy_store_persists_across_new_instances() {
+        let storage = MockPolicyStorage::new();
+        SignPolicyStore::new(storage.clone()).set_global_policy(SignPolicySelection::Basic);
+        // A fresh store over the same backend (a restart) reads it back.
+        assert_eq!(
+            SignPolicyStore::new(storage).global_policy(),
+            SignPolicySelection::Basic
+        );
+    }
+
+    #[test]
+    fn sign_policy_store_override_precedence_and_clear() {
+        let store = SignPolicyStore::new(MockPolicyStorage::new());
+        store.set_global_policy(SignPolicySelection::Manual);
+        // No override -> follows global.
+        assert!(store.app_override("com.app".into()).is_none());
+        assert_eq!(
+            store.effective_policy_mode("com.app".into()),
+            PolicyMode::Manual
+        );
+        // Override wins over global.
+        store.set_app_override("com.app".into(), Some(SignPolicySelection::Auto));
+        assert_eq!(
+            store.app_override("com.app".into()),
+            Some(SignPolicySelection::Auto)
+        );
+        assert_eq!(
+            store.effective_policy_mode("com.app".into()),
+            PolicyMode::Auto
+        );
+        // A different app still follows global.
+        assert_eq!(
+            store.effective_policy("com.other".into()),
+            SignPolicySelection::Manual
+        );
+        // Clearing the override reverts to global.
+        store.set_app_override("com.app".into(), None);
+        assert!(store.app_override("com.app".into()).is_none());
+        assert_eq!(
+            store.effective_policy("com.app".into()),
+            SignPolicySelection::Manual
+        );
     }
 }
