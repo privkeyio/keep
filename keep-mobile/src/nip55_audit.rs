@@ -52,6 +52,21 @@ fn audit_entry_hash_inner(
 ) -> String {
     // Must match keep-android `PermissionStore.calculateEntryHash` byte-for-byte:
     // pipe-delimited UTF-8, empty string for absent prev_hash / event_kind.
+    //
+    // Trust boundary & serialization safety (see #802): tamper-evidence rests
+    // entirely on `hmac_key` -- a Keystore-held secret an attacker with audit-DB
+    // write access cannot read -- NOT on the row's database id. The row `id` is a
+    // local ordering/display value and is deliberately absent from this pre-image;
+    // chain POSITION is authenticated instead by `previous_hash` linking each
+    // entry to its predecessor's `entry_hash`. The `|` delimiter needs no escaping
+    // because no field can contain it: `previous_hash` is hex, `event_kind` and
+    // `timestamp` are integers, `was_automatic` is a bool, `request_type` and
+    // `decision` are closed enums, and `caller` is either the reserved `"self"`
+    // sentinel or a runtime-VERIFIED Android package name (charset [A-Za-z0-9_.],
+    // via `Nip55ContentProvider.getVerifiedCaller`). A length-prefixed (TLV)
+    // framing would be more robust in the abstract but is a coordinated
+    // keep-android byte-format change + row migration, unnecessary given these
+    // field domains.
     let content = format!(
         "{}|{}|{}|{}|{}|{}|{}",
         previous_hash.unwrap_or(""),
