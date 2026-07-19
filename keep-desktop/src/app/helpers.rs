@@ -28,6 +28,10 @@ impl App {
 
         let mut guard = lock_keep(&self.keep);
         if let Some(keep) = guard.as_mut() {
+            // Remove the on-disk active_share pointer before dropping the master
+            // key; set_active_share_key requires an unlocked vault, so it must
+            // precede lock().
+            let _ = keep.set_active_share_key(None);
             keep.lock();
         }
         *guard = None;
