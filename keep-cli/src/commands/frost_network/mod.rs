@@ -1777,6 +1777,45 @@ mod tests {
         assert!(!auto_approve_conflicts(false, false));
     }
 
+    #[test]
+    fn load_oprf_key_share_errors_on_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.share");
+        let err = load_oprf_key_share(&missing).unwrap_err().to_string();
+        assert!(err.contains("read OPRF share file"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn load_oprf_key_share_rejects_malformed_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.share");
+        std::fs::write(&path, b"not-a-valid-oprf-share").unwrap();
+        let err = load_oprf_key_share(&path).unwrap_err().to_string();
+        assert!(err.contains("invalid OPRF key share"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn load_oprf_key_share_round_trips_a_valid_share() {
+        use k256::elliptic_curve::rand_core::OsRng;
+        use k256::{elliptic_curve::Field, Scalar};
+
+        let mut rng = OsRng;
+        let secret = Scalar::random(&mut rng);
+        let shares = keep_core::oprf::threshold::split_key(&secret, 2, 3, rng).expect("split");
+        let bytes = keep_core::oprf::threshold::serialize_key_share(&shares[0]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("holder.share");
+        std::fs::write(&path, &bytes[..]).unwrap();
+
+        let loaded = load_oprf_key_share(&path).expect("load");
+        assert_eq!(
+            &keep_core::oprf::threshold::serialize_key_share(&loaded)[..],
+            &bytes[..],
+            "loaded share must re-serialize to the same bytes"
+        );
+    }
+
     #[cfg(unix)]
     fn temp_path_for(path: &Path) -> std::path::PathBuf {
         let mut s = path.as_os_str().to_owned();
