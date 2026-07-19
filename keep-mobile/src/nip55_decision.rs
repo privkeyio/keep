@@ -266,6 +266,13 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     // limiter fails open to the UI, i.e. falls through to gate 7). When not opted
     // in, feed a synthetic "allowed" so evaluate_sign_policy runs and applies its
     // own not-opted-in denial.
+    //
+    // This path takes the 2-value `PolicyMode`, so `Basic` and `Auto` behave
+    // identically here (both `PolicyMode::Auto`). The stricter `Basic` tier
+    // (`evaluate_sign_policy_selection`) becomes live once `Nip55DecisionInputs`
+    // carries the 3-value `SignPolicySelection` instead of the collapsed mode --
+    // a breaking FFI input change gated on the client version bump (#716). Until
+    // then this is fail-safe: `Basic` is never looser than `Auto`.
     let (policy_result, recent_count) = if inputs.is_opted_in {
         match &inputs.opt_in_rate_check {
             None => (SignPolicyEvaluation::FallToUi, 0),
