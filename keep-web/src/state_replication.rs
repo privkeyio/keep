@@ -363,6 +363,13 @@ async fn spawn_consumer(
         // Keep `client` owned by the task: its pool is ref-counted and shuts the relay down when the
         // last handle drops, so letting it fall out of scope here would silently kill the subscription.
         let _client = client;
+        // Escalate when future-bound rejections PERSIST without a successful apply: a single
+        // RejectedFuture self-heals, but a run of them with no `Applied` in between means this
+        // node is stuck (clock far behind the cluster, or a cluster-key poison attempt) and
+        // needs operator attention. `IgnoredStale` (already-applied replays) is normal and does
+        // not count; only an actual `Applied` clears the run.
+        const PERSISTENT_DIVERGENCE_THRESHOLD: u32 = 20;
+        let mut consecutive_future_rejections: u32 = 0;
         loop {
             let notification = match notifications.recv().await {
                 Ok(n) => n,
@@ -398,7 +405,7 @@ async fn spawn_consumer(
                         // constrained until `apply_*` checks the allowlist, so Display would let a
                         // control character forge log lines.
                         match outcome {
-                            Ok(ReplicatedApply::Applied) => {}
+                            Ok(ReplicatedApply::Applied) => consecutive_future_rejections = 0,
                             // Not strictly newer than what we already applied: a stale or replayed event
                             // (rollback attempt from an untrusted relay). Ignore it, but record it.
                             Ok(ReplicatedApply::IgnoredStale) => tracing::warn!(
@@ -412,13 +419,24 @@ async fn spawn_consumer(
                             // behind its peers -- in which case every legitimate event is rejected until
                             // the clock is corrected, so check NTP before assuming an attack. Loud either
                             // way; mark untouched, so it self-heals once wall-clock passes created_at.
-                            Ok(ReplicatedApply::RejectedFuture) => tracing::error!(
-                                table = ?rec.table,
-                                record_id = ?rec.record_id,
-                                created_at = rec.created_at,
-                                now,
-                                "keep-state: rejected event past the future bound (cluster-key poison attempt, or this node's clock is behind its peers -- check NTP)"
-                            ),
+                            Ok(ReplicatedApply::RejectedFuture) => {
+                                tracing::error!(
+                                    table = ?rec.table,
+                                    record_id = ?rec.record_id,
+                                    created_at = rec.created_at,
+                                    now,
+                                    "keep-state: rejected event past the future bound (cluster-key poison attempt, or this node's clock is behind its peers -- check NTP)"
+                                );
+                                consecutive_future_rejections += 1;
+                                if consecutive_future_rejections % PERSISTENT_DIVERGENCE_THRESHOLD
+                                    == 0
+                                {
+                                    tracing::error!(
+                                        consecutive = consecutive_future_rejections,
+                                        "keep-state: PERSISTENT divergence -- {consecutive_future_rejections} events rejected past the future bound with no successful apply since; this node is likely frozen. Verify NTP / cluster clock and relay health."
+                                    );
+                                }
+                            }
                             Err(e) => tracing::warn!(
                                 table = ?rec.table,
                                 record_id = ?rec.record_id,
