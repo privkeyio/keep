@@ -150,10 +150,7 @@ impl KfpNode {
                     share_bytes,
                 );
                 let event = KfpEventBuilder::oprf_enroll(&self.keys, &pubkey, payload)?;
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                self.transport.send_event(&event).await?;
                 debug!(target_index, "Sent OPRF enrollment share");
             }
             Ok(())
@@ -381,10 +378,7 @@ impl KfpNode {
 
         let ack = OprfEnrollAckPayload::new(payload.session_id, self.share.metadata.identifier);
         let event = KfpEventBuilder::oprf_enroll_ack(&self.keys, &from, ack)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         debug!(
             session_id = %hex::encode(payload.session_id),

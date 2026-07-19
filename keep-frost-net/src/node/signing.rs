@@ -241,7 +241,7 @@ impl KfpNode {
 
         for pubkey in peer_pubkeys {
             let event = KfpEventBuilder::nonce_commitment(&self.keys, &pubkey, payload.clone())?;
-            if let Err(e) = self.client.send_event(&event).await {
+            if let Err(e) = self.transport.send_event(&event).await {
                 warn!(peer = %pubkey, error = %e, "Failed to broadcast nonce commitment to peer");
                 continue;
             }
@@ -267,10 +267,7 @@ impl KfpNode {
 
         let payload = self.build_nonce_commitment_payload(available)?;
         let event = KfpEventBuilder::nonce_commitment(&self.keys, pubkey, payload)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         Ok(())
     }
@@ -284,10 +281,7 @@ impl KfpNode {
         session_id: [u8; 32],
     ) -> Result<()> {
         let event = KfpEventBuilder::error(&self.keys, to, code, message, Some(session_id))?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
         Ok(())
     }
 
@@ -458,10 +452,7 @@ impl KfpNode {
             );
 
             let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
 
             debug!(
                 session_id = %hex::encode(request.session_id),
@@ -769,10 +760,7 @@ impl KfpNode {
         );
 
         let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         debug!(
             session_id = %hex::encode(request.session_id),
@@ -1009,10 +997,7 @@ impl KfpNode {
 
         for pubkey in peer_pubkeys {
             let event = KfpEventBuilder::signature_share(&self.keys, &pubkey, payload.clone())?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
         }
 
         debug!(session_id = %hex::encode(session_id), "Sent signature share");
@@ -1572,10 +1557,7 @@ impl KfpNode {
         let send_result: Result<()> = async {
             for (share_index, pubkey) in participant_peers {
                 let event = KfpEventBuilder::sign_request(&self.keys, &pubkey, request.clone())?;
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                self.transport.send_event(&event).await?;
 
                 if !using_pre_exchange {
                     let commit_event = KfpEventBuilder::commitment(
@@ -1583,10 +1565,7 @@ impl KfpNode {
                         &pubkey,
                         our_commit_payload.clone(),
                     )?;
-                    self.client
-                        .send_event(&commit_event)
-                        .await
-                        .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                    self.transport.send_event(&commit_event).await?;
                 }
 
                 debug!(share_index, using_pre_exchange, "Sent sign request");

@@ -124,10 +124,7 @@ impl KfpNode {
                 .sign_with_keys(&self.keys)
                 .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
         }
 
         info!(
@@ -504,10 +501,7 @@ impl KfpNode {
                 .sign_with_keys(&self.keys)
                 .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
         }
 
         let _ = self
@@ -712,10 +706,7 @@ impl KfpNode {
             .sign_with_keys(&self.keys)
             .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         info!(session_id = %hex::encode(session_id), "Sent descriptor contribution");
         Ok(())
@@ -851,10 +842,7 @@ impl KfpNode {
                 .sign_with_keys(&self.keys)
                 .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
         }
 
         info!(session_id = %hex::encode(session_id), "Sent finalized descriptor");
@@ -1075,10 +1063,7 @@ impl KfpNode {
                 .sign_with_keys(&self.keys)
                 .map_err(|e| FrostNetError::Nostr(e.to_string()))?;
 
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
         } else {
             let _ = descriptor_hash; // silence unused-variable warning when no ACK is sent
             debug!(
@@ -1176,7 +1161,7 @@ impl KfpNode {
             }
         };
 
-        if let Err(e) = self.client.send_event(&event).await {
+        if let Err(e) = self.transport.send_event(&event).await {
             debug!("Failed to send descriptor nack: {e}");
         }
     }
