@@ -6,9 +6,11 @@ mod enroll;
 mod oprf;
 mod psbt;
 mod signing;
+mod transport;
 
 pub use psbt::PsbtSessionSnapshot;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
+pub(crate) use transport::{CosignTransport, NostrTransport};
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -1040,7 +1042,7 @@ pub type DuressPersister = Arc<dyn Fn(&DuressFreeze) + Send + Sync>;
 
 pub struct KfpNode {
     pub(crate) keys: Keys,
-    pub(crate) client: Client,
+    pub(crate) transport: Arc<dyn CosignTransport>,
     pub(crate) share: SharePackage,
     pub(crate) group_pubkey: [u8; 32],
     pub(crate) sessions: Arc<RwLock<SessionManager>>,
@@ -1195,7 +1197,7 @@ pub(crate) fn sanitize_reason(reason: &str) -> String {
 /// single-flight guard bounds it to one copy at a time.
 struct AnnounceJob {
     keys: Keys,
-    client: Client,
+    transport: Arc<dyn CosignTransport>,
     group_pubkey: [u8; 32],
     share_index: u16,
     name: String,
@@ -1262,43 +1264,9 @@ impl KfpNode {
         }
 
         let keys = derive_keys_from_share(&share)?;
-        let client = match proxy {
-            Some(addr) => {
-                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
-                let opts = ClientOptions::new().connection(connection);
-                Client::builder().signer(keys.clone()).opts(opts).build()
-            }
-            None => Client::new(keys.clone()),
-        };
-
-        let relay_opts = default_relay_opts();
-
-        for relay in &relays {
-            client
-                .pool()
-                .add_relay(relay, relay_opts.clone())
-                .await
-                .map_err(|e| {
-                    FrostNetError::Transport(format!("Failed to add relay {relay}: {e}"))
-                })?;
-        }
-
-        client.connect().await;
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let relay_map = client.relays().await;
-                let any_connected = relay_map
-                    .values()
-                    .any(|r| matches!(r.status(), RelayStatus::Connected));
-                if any_connected {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .map_err(|_| FrostNetError::Transport("Timed out waiting for relay connection".into()))?;
+        let transport = Arc::new(
+            NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts()).await?,
+        ) as Arc<dyn CosignTransport>;
 
         let group_pubkey = *share.group_pubkey();
         let our_index = share.metadata.identifier;
@@ -1342,7 +1310,7 @@ impl KfpNode {
 
         Ok(Self {
             keys,
-            client,
+            transport,
             share,
             group_pubkey,
             sessions: Arc::new(RwLock::new(session_manager)),
@@ -1816,7 +1784,7 @@ impl KfpNode {
         let mut fail_count = 0usize;
         for pubkey in &peer_pubkeys {
             let event = KfpEventBuilder::xpub_announce(&self.keys, pubkey, payload.clone())?;
-            if let Err(e) = self.client.send_event(&event).await {
+            if let Err(e) = self.transport.send_event(&event).await {
                 warn!(peer = %pubkey, error = %e, "Failed to send xpub announcement");
                 fail_count += 1;
             }
@@ -2027,7 +1995,7 @@ impl KfpNode {
 
         Ok(AnnounceJob {
             keys: self.keys.clone(),
-            client: self.client.clone(),
+            transport: Arc::clone(&self.transport),
             group_pubkey: self.group_pubkey,
             share_index: self.share.metadata.identifier,
             name: self.share.metadata.name.clone(),
@@ -2076,10 +2044,7 @@ impl KfpNode {
             tpm_attestation,
         )?;
 
-        job.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        job.transport.send_event(&event).await?;
 
         info!(share_index = job.share_index, "Announced presence");
         Ok(())
@@ -2128,7 +2093,7 @@ impl KfpNode {
             .await
             .take()
             .ok_or_else(|| FrostNetError::Session("run() has already been started".into()))?;
-        let mut notifications = self.client.notifications();
+        let mut notifications = self.transport.notifications();
 
         let since = Timestamp::now() - Duration::from_secs(300);
 
@@ -2156,15 +2121,9 @@ impl KfpNode {
             .pubkey(self.keys.public_key())
             .since(since);
 
-        self.client
-            .subscribe(group_filter.clone(), None)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.subscribe(group_filter.clone()).await?;
 
-        self.client
-            .subscribe(direct_filter, None)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.subscribe(direct_filter).await?;
 
         // Coercion resistance: a duress beacon arrives as a NIP-59 gift wrap
         // authored by an EPHEMERAL key (not a fixed beacon key or group member), so
@@ -2182,10 +2141,7 @@ impl KfpNode {
             let giftwrap_filter = Filter::new()
                 .kind(Kind::GiftWrap)
                 .pubkey(self.keys.public_key());
-            self.client
-                .subscribe(giftwrap_filter, None)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.subscribe(giftwrap_filter).await?;
         }
 
         let fetch_filter = Filter::new()
@@ -2198,7 +2154,7 @@ impl KfpNode {
             .since(since);
 
         match self
-            .client
+            .transport
             .fetch_events(fetch_filter, Duration::from_secs(5))
             .await
         {
@@ -2747,10 +2703,7 @@ impl KfpNode {
 
     async fn handle_ping(&self, from: PublicKey, payload: PingPayload) -> Result<()> {
         let event = KfpEventBuilder::pong(&self.keys, &from, payload.challenge)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         self.peers.write().touch_by_pubkey(&from);
 
@@ -2826,7 +2779,7 @@ impl KfpNode {
         for (share_index, pubkey, _) in peers_snapshot {
             match KfpEventBuilder::ping(&self.keys, pubkey) {
                 Ok(event) => {
-                    if let Err(e) = self.client.send_event(&event).await {
+                    if let Err(e) = self.transport.send_event(&event).await {
                         warn!(
                             peer = %pubkey,
                             share_index,

@@ -695,10 +695,7 @@ impl KfpNode {
                     msg_type,
                     msg,
                 )?;
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                self.transport.send_event(&event).await?;
                 Ok(())
             }
             .await;
@@ -930,10 +927,7 @@ impl KfpNode {
             &msg,
         )?;
 
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         {
             let mut sessions = self.psbt_sessions.write();

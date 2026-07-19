@@ -181,10 +181,7 @@ impl KfpNode {
         );
 
         let event = KfpEventBuilder::oprf_eval_share(&self.keys, &from, payload)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         debug!(
             session_id = %hex::encode(request.session_id),
@@ -458,10 +455,7 @@ impl KfpNode {
             for (share_index, pubkey) in participant_peers {
                 let event =
                     KfpEventBuilder::oprf_eval_request(&self.keys, &pubkey, request.clone())?;
-                self.client
-                    .send_event(&event)
-                    .await
-                    .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+                self.transport.send_event(&event).await?;
                 debug!(share_index, "Sent OPRF eval request");
             }
             Ok(())

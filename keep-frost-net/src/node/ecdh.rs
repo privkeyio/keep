@@ -106,10 +106,7 @@ impl KfpNode {
         );
 
         let event = KfpEventBuilder::ecdh_share(&self.keys, &from, payload)?;
-        self.client
-            .send_event(&event)
-            .await
-            .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+        self.transport.send_event(&event).await?;
 
         debug!(
             session_id = %hex::encode(request.session_id),
@@ -289,17 +286,11 @@ impl KfpNode {
 
         for (share_index, pubkey) in participant_peers {
             let event = KfpEventBuilder::ecdh_request(&self.keys, &pubkey, request.clone())?;
-            self.client
-                .send_event(&event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&event).await?;
 
             let share_event =
                 KfpEventBuilder::ecdh_share(&self.keys, &pubkey, our_share_payload.clone())?;
-            self.client
-                .send_event(&share_event)
-                .await
-                .map_err(|e| FrostNetError::Transport(e.to_string()))?;
+            self.transport.send_event(&share_event).await?;
 
             debug!(share_index, "Sent ECDH request and share");
         }
