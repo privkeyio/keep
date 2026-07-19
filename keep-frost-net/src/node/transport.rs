@@ -20,7 +20,7 @@ use crate::error::{FrostNetError, Result};
 /// object-safe (`Arc<dyn CosignTransport>`), mirroring
 /// [`SigningHooks::approve_oprf_eval`](super::SigningHooks::approve_oprf_eval)
 /// and avoiding an `async-trait` dependency.
-pub(crate) trait CosignTransport: Send + Sync {
+pub trait CosignTransport: Send + Sync {
     fn send_event<'a>(
         &'a self,
         event: &'a Event,

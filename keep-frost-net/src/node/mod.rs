@@ -10,7 +10,8 @@ mod transport;
 
 pub use psbt::PsbtSessionSnapshot;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
-pub(crate) use transport::{CosignTransport, NostrTransport};
+pub use transport::CosignTransport;
+pub(crate) use transport::NostrTransport;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -1242,16 +1243,6 @@ impl KfpNode {
         proxy: Option<SocketAddr>,
         session_timeout: Option<Duration>,
     ) -> Result<Self> {
-        let descriptor_manager = match session_timeout {
-            Some(t) => DescriptorSessionManager::with_timeout(t)?,
-            None => DescriptorSessionManager::new(),
-        };
-
-        let psbt_manager = match session_timeout {
-            Some(t) => PsbtSessionManager::with_timeout(t)?,
-            None => PsbtSessionManager::new(),
-        };
-
         for relay in &relays {
             let validate = if ALLOW_INTERNAL_HOSTS {
                 validate_relay_url_allow_internal
@@ -1267,6 +1258,30 @@ impl KfpNode {
         let transport = Arc::new(
             NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts()).await?,
         ) as Arc<dyn CosignTransport>;
+
+        Self::assemble(share, keys, transport, nonce_store, session_timeout)
+    }
+
+    /// Synchronous assembly of a [`KfpNode`] from an already-connected
+    /// transport. Split out of [`Self::with_nonce_store`] so alternate
+    /// transports (e.g. an in-process test bus) can reuse the identical
+    /// wiring without a live relay connection.
+    fn assemble(
+        share: SharePackage,
+        keys: Keys,
+        transport: Arc<dyn CosignTransport>,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+        session_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let descriptor_manager = match session_timeout {
+            Some(t) => DescriptorSessionManager::with_timeout(t)?,
+            None => DescriptorSessionManager::new(),
+        };
+
+        let psbt_manager = match session_timeout {
+            Some(t) => PsbtSessionManager::with_timeout(t)?,
+            None => PsbtSessionManager::new(),
+        };
 
         let group_pubkey = *share.group_pubkey();
         let our_index = share.metadata.identifier;
@@ -1350,6 +1365,19 @@ impl KfpNode {
             descriptor_lookup: None,
             recovery_signer_registry: None,
         })
+    }
+
+    /// Build a node over a caller-supplied [`CosignTransport`], bypassing the
+    /// relay connection. Test-only: lets an in-process bus stand in for nostr.
+    #[cfg(feature = "testing")]
+    pub fn with_transport(
+        share: SharePackage,
+        transport: Arc<dyn CosignTransport>,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+        session_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        let keys = derive_keys_from_share(&share)?;
+        Self::assemble(share, keys, transport, nonce_store, session_timeout)
     }
 
     pub fn with_descriptor_lookup(mut self, lookup: Arc<dyn PersistedDescriptorLookup>) -> Self {
