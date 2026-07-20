@@ -562,7 +562,17 @@ impl KfpNode {
             ));
         }
 
-        self.verify_descriptor_hash_against_stored(&payload.descriptor_hash)?;
+        // A descriptor-hash mismatch is a fund-safety reject (the proposal spends
+        // from a descriptor we do not recognize). Surface it as PsbtAborted so
+        // observers see the abort, mirroring the session-creation-failure path
+        // below, rather than only propagating a warn-logged error (#803).
+        if let Err(e) = self.verify_descriptor_hash_against_stored(&payload.descriptor_hash) {
+            let _ = self.event_tx.send(KfpNodeEvent::PsbtAborted {
+                session_id: payload.session_id,
+                reason: format!("descriptor hash mismatch: {e}"),
+            });
+            return Err(e);
+        }
 
         // Canonicalize the wire-supplied fingerprints to lowercase once, mirroring
         // the proposer path (propose_psbt) and the stored recovery fingerprints.
