@@ -4,7 +4,7 @@
 
 use blake2::{Blake2b512, Digest};
 use rand::Rng;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 const POOL_SIZE: usize = 128;
@@ -141,9 +141,44 @@ fn mix_entropy(sources: &[&[u8]]) -> [u8; 32] {
     hash_to_32(hasher)
 }
 
+/// How many generations may pass before the entropy health check is re-run.
+/// Bounds how long a long-lived daemon can run on a single process-start verdict.
+const HEALTH_RECHECK_EVERY: u64 = 4096;
+
+/// Whether the entropy health check must re-run, given the pid it last passed
+/// under, the current pid, and the generations since. A pid change means a
+/// `fork()`/clone inherited our verdict (re-validate under the child), and the
+/// generation interval bounds how long a snapshot/restore that resumed under the
+/// SAME pid can coast on a stale verdict. Kept pure for direct testing.
+fn health_recheck_needed(last_ok_pid: u32, current_pid: u32, calls_since_check: u64) -> bool {
+    last_ok_pid != current_pid || calls_since_check >= HEALTH_RECHECK_EVERY
+}
+
+/// Gate every generation on a passing entropy health check, re-validating on
+/// process-identity change and at least every [`HEALTH_RECHECK_EVERY`]
+/// generations rather than trusting a single process-start verdict for the whole
+/// lifetime of a long-running co-signer. The fast path is lock-free: one relaxed
+/// increment and two atomic loads. Real pids are never 0, so the initial
+/// `last_ok_pid == 0` always forces the first check. Re-running on failure is
+/// intentional (a transiently-unhealthy RNG can recover; a failure is never
+/// cached as permanent), and remains fail-closed because callers propagate the
+/// error. This is defense-in-depth: [`random_bytes_mixed_internal`] already mixes
+/// RDRAND and timing jitter with the OS RNG, so a briefly-degraded OS source
+/// post-restore does not alone determine the output.
 fn ensure_entropy_health() -> Result<(), EntropyHealthError> {
-    static HEALTH_RESULT: OnceLock<Result<(), EntropyHealthError>> = OnceLock::new();
-    *HEALTH_RESULT.get_or_init(check_entropy_health_internal)
+    static LAST_OK_PID: AtomicU32 = AtomicU32::new(0);
+    static CALLS_SINCE_CHECK: AtomicU64 = AtomicU64::new(0);
+
+    let pid = std::process::id();
+    let calls_since_check = CALLS_SINCE_CHECK.fetch_add(1, Ordering::Relaxed);
+    if !health_recheck_needed(LAST_OK_PID.load(Ordering::Relaxed), pid, calls_since_check) {
+        return Ok(());
+    }
+
+    check_entropy_health_internal()?;
+    LAST_OK_PID.store(pid, Ordering::Relaxed);
+    CALLS_SINCE_CHECK.store(0, Ordering::Relaxed);
+    Ok(())
 }
 
 /// Generates 32 bytes of mixed entropy from multiple sources.
@@ -317,6 +352,33 @@ mod tests {
     #[test]
     fn test_entropy_health_check_passes() {
         assert!(check_entropy_health().is_ok());
+    }
+
+    #[test]
+    fn test_health_recheck_needed() {
+        let pid = 1234u32;
+        // Same pid, within the interval: no re-check.
+        assert!(!health_recheck_needed(pid, pid, 0));
+        assert!(!health_recheck_needed(pid, pid, HEALTH_RECHECK_EVERY - 1));
+        // Interval elapsed: re-check.
+        assert!(health_recheck_needed(pid, pid, HEALTH_RECHECK_EVERY));
+        // pid change (fork/clone) forces a re-check even at count 0.
+        assert!(health_recheck_needed(pid, pid + 1, 0));
+        // Initial state (last_ok_pid == 0, real pids are never 0) always checks.
+        assert!(health_recheck_needed(0, pid, 0));
+    }
+
+    #[test]
+    fn test_generation_survives_recheck_interval() {
+        // Exercise more generations than the re-check interval so the periodic
+        // re-validation path runs; every generation must still succeed and stay
+        // unique across the boundary.
+        let a = try_random_bytes::<32>().expect("first generation");
+        for _ in 0..(HEALTH_RECHECK_EVERY + 16) {
+            let _ = try_random_bytes::<32>().expect("generation across re-check");
+        }
+        let b = try_random_bytes::<32>().expect("generation after re-check");
+        assert_ne!(a, b, "outputs must differ across the re-check boundary");
     }
 
     #[test]
