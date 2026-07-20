@@ -274,7 +274,10 @@ pub fn cmd_frost_network_sign_hardware(
         spinner.finish();
 
         let sig_share_hex = hex::encode(&sig_share);
-        out.field("Our signature share", &sig_share_hex);
+        // The share is published in the signature event below (its intended
+        // egress); keep the raw material off the default console and behind
+        // RUST_LOG=debug rather than printing it unconditionally (#788).
+        debug!(share = %sig_share_hex, "generated our signature share");
 
         let sig_response = serde_json::json!({
             "request_id": hex::encode(session_id),
