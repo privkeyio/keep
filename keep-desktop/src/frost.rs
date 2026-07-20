@@ -111,6 +111,24 @@ fn parse_bitcoin_network(net: &str) -> Result<bitcoin::Network, String> {
     net.parse::<bitcoin::Network>().map_err(|e| format!("{e}"))
 }
 
+/// Validate that both assembled wallet descriptors parse as real ranged taproot
+/// descriptors on `network` before they are persisted. The descriptors are built
+/// from peer-supplied xpub contributions during coordination, so a malformed
+/// assembly must be rejected at this persistence boundary rather than surfacing
+/// later as an underivable wallet at address-derivation or spend time (#795).
+fn validate_wallet_descriptors(
+    external: &str,
+    internal: &str,
+    network: &str,
+) -> Result<(), String> {
+    let net = parse_bitcoin_network(network)?;
+    for (label, desc) in [("external", external), ("internal", internal)] {
+        keep_bitcoin::descriptor_address_at_index(desc, net, 0)
+            .map_err(|e| format!("refusing to store an invalid {label} wallet descriptor: {e}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn derive_xpub(
     keep_arc: Arc<Mutex<Option<Keep>>>,
     group_pubkey: [u8; 32],
@@ -1763,9 +1781,15 @@ impl App {
         let store_result = {
             let guard = lock_keep(&self.keep);
             match guard.as_ref() {
-                Some(keep) => keep
-                    .store_wallet_descriptor(&descriptor)
-                    .map_err(friendly_err),
+                Some(keep) => validate_wallet_descriptors(
+                    &external_descriptor,
+                    &internal_descriptor,
+                    &network,
+                )
+                .and_then(|()| {
+                    keep.store_wallet_descriptor(&descriptor)
+                        .map_err(friendly_err)
+                }),
                 None => Err("Keep not available".to_string()),
             }
         };
@@ -1827,5 +1851,35 @@ impl App {
             s.status = status;
         }
         iced::Task::none()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_wallet_descriptors;
+
+    // A valid ranged BIP-86 taproot descriptor (mainnet xpub).
+    const VALID: &str = "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)";
+
+    #[test]
+    fn validate_wallet_descriptors_accepts_valid_pair() {
+        assert!(validate_wallet_descriptors(VALID, VALID, "bitcoin").is_ok());
+    }
+
+    #[test]
+    fn validate_wallet_descriptors_rejects_malformed_external() {
+        assert!(validate_wallet_descriptors("tr(not-a-key)/0/*)", VALID, "bitcoin").is_err());
+    }
+
+    #[test]
+    fn validate_wallet_descriptors_rejects_malformed_internal() {
+        assert!(
+            validate_wallet_descriptors(VALID, "definitely not a descriptor", "bitcoin").is_err()
+        );
+    }
+
+    #[test]
+    fn validate_wallet_descriptors_rejects_unparseable_network() {
+        assert!(validate_wallet_descriptors(VALID, VALID, "notanetwork").is_err());
     }
 }
