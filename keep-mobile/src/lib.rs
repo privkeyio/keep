@@ -925,9 +925,30 @@ impl KeepMobile {
 
     pub fn get_active_share_metadata(&self) -> Option<ShareMetadataInfo> {
         let key = self.resolve_active_share().ok()?;
-        let data = self.storage.load_share_by_key(key).ok()?;
-        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
-        let metadata: ShareMetadata = serde_json::from_str(&stored.metadata_json).ok()?;
+        // As in `load_stored_share_info`: an active-share pointer that resolves
+        // but whose record is unreadable or malformed is corruption, not absence,
+        // so log it rather than returning a bare `None` (#792).
+        let data = match self.storage.load_share_by_key(key.clone()) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("failed to load active share for key {key}: {e}");
+                return None;
+            }
+        };
+        let stored: StoredShareData = match serde_json::from_slice(&data) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!("corrupt active share data for key {key}: {e}");
+                return None;
+            }
+        };
+        let metadata: ShareMetadata = match serde_json::from_str(&stored.metadata_json) {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                tracing::warn!("corrupt active share metadata for key {key}: {e}");
+                return None;
+            }
+        };
         Some((&metadata).into())
     }
 
@@ -3655,10 +3676,35 @@ impl KeepMobile {
     }
 
     fn load_stored_share_info(&self, key: String) -> Option<StoredShareInfo> {
-        let data = self.storage.load_share_by_key(key.clone()).ok()?;
-        let stored: StoredShareData = serde_json::from_slice(&data).ok()?;
+        // A share record that is referenced (by the metadata list or the
+        // active-share pointer) but cannot be read back or parsed is corruption
+        // or a failing storage layer, not an absent share. Log the distinction
+        // instead of silently collapsing it to "no share", so a corrupt active
+        // share is observable rather than looking like an un-provisioned device
+        // (#792). The return stays `Option`; letting callers tell corruption from
+        // absence needs an FFI-breaking `Result` change, tracked separately.
+        let data = match self.storage.load_share_by_key(key.clone()) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::warn!("failed to load stored share for key {key}: {e}");
+                return None;
+            }
+        };
+        let stored: StoredShareData = match serde_json::from_slice(&data) {
+            Ok(stored) => stored,
+            Err(e) => {
+                tracing::warn!("corrupt stored share data for key {key}: {e}");
+                return None;
+            }
+        };
         let metadata: keep_core::frost::ShareMetadata =
-            serde_json::from_str(&stored.metadata_json).ok()?;
+            match serde_json::from_str(&stored.metadata_json) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    tracing::warn!("corrupt share metadata for key {key}: {e}");
+                    return None;
+                }
+            };
 
         Some(StoredShareInfo {
             group_pubkey: key,
@@ -3829,6 +3875,40 @@ mod import_teardown_tests {
         assert_eq!(
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
+        );
+    }
+
+    // A corrupt active-share record must degrade gracefully to `None` without
+    // panicking: the active-share pointer is set, but its backing bytes are not
+    // valid share data. `get_active_share` returning `None` here is the fail-safe
+    // behavior (the caller sees no share); the value of #792 is that the
+    // corruption is now logged rather than silently swallowed.
+    #[test]
+    fn get_active_share_returns_none_on_corrupt_record() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let key = "deadbeef".to_string();
+        let meta = ShareMetadataInfo {
+            name: "corrupt".into(),
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: vec![0u8; 32],
+            did_backup: false,
+        };
+        // Seed unparseable bytes under a key the active-share pointer references.
+        storage
+            .store_share_by_key(key.clone(), b"not valid share json".to_vec(), meta)
+            .unwrap();
+        storage.set_active_share_key(Some(key)).unwrap();
+
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        assert!(
+            mobile.get_active_share().is_none(),
+            "a corrupt active-share record must degrade to None, not panic"
+        );
+        assert!(
+            mobile.get_active_share_metadata().is_none(),
+            "corrupt active-share metadata must degrade to None, not panic"
         );
     }
 
