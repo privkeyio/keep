@@ -906,6 +906,11 @@ fn url_decode(s: &str) -> Option<String> {
 fn is_safe_callback_url(url: &str) -> bool {
     const ALLOWED_SCHEMES: &[&str] = &["nostrsigner:", "nostr:", "https://"];
 
+    // Scheme is the correct trust boundary here: the callback target is defined
+    // by the calling app (NIP-55), so domain allowlisting is not meaningful (the
+    // app names its own return address). The check only rejects dangerous schemes
+    // (file:, javascript:, intent:, ...); the URL is otherwise handed back to the
+    // Android layer to route, not fetched by keep.
     let lower = url.to_lowercase();
     ALLOWED_SCHEMES.iter().any(|s| lower.starts_with(s))
 }
@@ -968,6 +973,12 @@ fn parse_pubkey_to_compressed(pubkey_hex: &str) -> Result<[u8; 33], KeepMobileEr
 
     match bytes.len() {
         32 => {
+            // Nostr x-only pubkeys carry no y-parity, so we prepend the even-y
+            // SEC1 tag (0x02) by convention. This does NOT assert the point is on
+            // the curve; the x-coordinate is validated where the key is actually
+            // used (e.g. ECDH rejects a non-curve x via AffinePoint::from_bytes
+            // before any secret is derived), so an invalid key fails there rather
+            // than being silently trusted here.
             let mut compressed = [0u8; 33];
             compressed[0] = 0x02;
             compressed[1..].copy_from_slice(&bytes);
