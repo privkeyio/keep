@@ -905,6 +905,19 @@ pub mod nip44 {
     mod v3_tests {
         use super::*;
         use base64::Engine;
+        use bitcoin::secp256k1::{
+            ecdh::shared_secret_point, Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey,
+        };
+        use serde_json::Value;
+        use sha2::Digest as _;
+
+        // Reference vectors (nostr-land/nip44v3 draft, as shipped by the Amber signer).
+        // Embedded so the tests are self-contained and prove byte-for-byte interop parity.
+        const VECTORS_JSON: &str = include_str!("testdata/nip44v3-vectors.json");
+
+        fn vectors() -> Value {
+            serde_json::from_str(VECTORS_JSON).unwrap()
+        }
 
         fn unhex(s: &str) -> Vec<u8> {
             (0..s.len())
@@ -919,24 +932,163 @@ pub mod nip44 {
             b.iter().map(|x| format!("{x:02x}")).collect()
         }
 
+        // NIP-44 shared secret: x-coordinate of `secret * pubkey`, with the peer
+        // pubkey reconstructed from its x-only form using EVEN parity.
+        fn ecdh_x(secret_hex: &str, peer: &XOnlyPublicKey) -> [u8; 32] {
+            let sk = SecretKey::from_slice(&unhex(secret_hex)).unwrap();
+            let full = PublicKey::from_x_only_public_key(*peer, Parity::Even);
+            shared_secret_point(&full, &sk)[..32].try_into().unwrap()
+        }
+
+        fn shared_from_pair(secret1: &str, secret2: &str) -> [u8; 32] {
+            let secp = Secp256k1::new();
+            let sk2 = SecretKey::from_slice(&unhex(secret2)).unwrap();
+            let (peer, _) = sk2.public_key(&secp).x_only_public_key();
+            ecdh_x(secret1, &peer)
+        }
+
+        fn scope_utf8(v: &Value) -> String {
+            String::from_utf8(unhex(v["scope_hex"].as_str().unwrap())).unwrap()
+        }
+
         #[test]
-        fn v3_target_size_matches_draft_table() {
-            let table: [(u64, u64); 12] = [
-                (0, 32),
-                (1, 32),
-                (32, 32),
-                (33, 64),
-                (34, 64),
-                (64, 64),
-                (65, 96),
-                (66, 96),
-                (96, 96),
-                (97, 128),
-                (98, 128),
-                (128, 128),
-            ];
-            for (len, expected) in table {
+        fn v3_target_size_matches_full_reference_table() {
+            let v = vectors();
+            let table = v["padded_length"].as_array().unwrap();
+            assert_eq!(table.len(), 176, "padded_length entry count");
+            for pair in table {
+                let len = pair[0].as_u64().unwrap();
+                let expected = pair[1].as_u64().unwrap();
                 assert_eq!(v3_target_size(len), expected, "target_size({len})");
+            }
+        }
+
+        // encrypt_decrypt: for every vector assert the ECDH-derived enc/mac keys match,
+        // the deterministic ciphertext is byte-for-byte identical, and it round-trips.
+        #[test]
+        fn v3_encrypt_decrypt_reference_vectors() {
+            let v = vectors();
+            let cases = v["encrypt_decrypt"].as_array().unwrap();
+            assert_eq!(cases.len(), 10, "encrypt_decrypt count");
+            let b64 = base64::engine::general_purpose::STANDARD;
+            for (i, c) in cases.iter().enumerate() {
+                let ss = shared_from_pair(
+                    c["secret1"].as_str().unwrap(),
+                    c["secret2"].as_str().unwrap(),
+                );
+                if i == 0 {
+                    assert_eq!(
+                        hex_lower(&ss),
+                        "dff79f877ba3953557c8502bf6da24c6f378419d138786e5ddd53034e84077d6",
+                        "vec0 shared secret cross-check"
+                    );
+                }
+                let nonce = unhex32(c["nonce"].as_str().unwrap());
+                let (enc, mac) = v3_derive_keys(&ss, &nonce).unwrap();
+                assert_eq!(
+                    hex_lower(&*enc),
+                    c["encryption_key"].as_str().unwrap(),
+                    "enc key vec {i}"
+                );
+                assert_eq!(
+                    hex_lower(&*mac),
+                    c["mac_key"].as_str().unwrap(),
+                    "mac key vec {i}"
+                );
+                let kind = c["kind"].as_u64().unwrap() as u32;
+                let scope = scope_utf8(c);
+                let pt = unhex(c["plaintext_hex"].as_str().unwrap());
+                let payload = encrypt_v3_with_nonce(&ss, &pt, kind, &scope, &nonce).unwrap();
+                assert_eq!(
+                    b64.encode(&payload),
+                    c["ciphertext"].as_str().unwrap(),
+                    "ciphertext vec {i}"
+                );
+                assert_eq!(decrypt_v3(&ss, &payload, kind, &scope).unwrap(), pt);
+            }
+        }
+
+        // decrypt_only: payloads with non-standard (but valid) padding must decrypt.
+        #[test]
+        fn v3_decrypt_only_reference_vectors() {
+            let v = vectors();
+            let cases = v["decrypt_only"].as_array().unwrap();
+            assert_eq!(cases.len(), 5, "decrypt_only count");
+            let b64 = base64::engine::general_purpose::STANDARD;
+            for (i, c) in cases.iter().enumerate() {
+                let ss = shared_from_pair(
+                    c["secret1"].as_str().unwrap(),
+                    c["secret2"].as_str().unwrap(),
+                );
+                let kind = c["kind"].as_u64().unwrap() as u32;
+                let scope = scope_utf8(c);
+                let payload = b64.decode(c["ciphertext"].as_str().unwrap()).unwrap();
+                let pt = decrypt_v3(&ss, &payload, kind, &scope).unwrap();
+                assert_eq!(
+                    hex_lower(&pt),
+                    c["plaintext_hex"].as_str().unwrap(),
+                    "vec {i}"
+                );
+            }
+        }
+
+        // long_encrypt_decrypt: large repeated-pattern plaintexts; the reference publishes
+        // the SHA-256 of the base64 payload rather than the payload itself.
+        #[test]
+        fn v3_long_encrypt_decrypt_reference_vectors() {
+            let v = vectors();
+            let cases = v["long_encrypt_decrypt"].as_array().unwrap();
+            assert_eq!(cases.len(), 18, "long_encrypt_decrypt count");
+            let b64 = base64::engine::general_purpose::STANDARD;
+            for (i, c) in cases.iter().enumerate() {
+                let ss = shared_from_pair(
+                    c["secret1"].as_str().unwrap(),
+                    c["secret2"].as_str().unwrap(),
+                );
+                let nonce = unhex32(c["nonce"].as_str().unwrap());
+                let kind = c["kind"].as_u64().unwrap() as u32;
+                let scope = scope_utf8(c);
+                let pattern = unhex(c["pattern_hex"].as_str().unwrap());
+                let repeat = c["repeat"].as_u64().unwrap() as usize;
+                let mut pt = Vec::with_capacity(pattern.len() * repeat);
+                for _ in 0..repeat {
+                    pt.extend_from_slice(&pattern);
+                }
+                let payload = encrypt_v3_with_nonce(&ss, &pt, kind, &scope, &nonce).unwrap();
+                let armored = b64.encode(&payload);
+                let digest = Sha256::digest(armored.as_bytes());
+                assert_eq!(
+                    hex_lower(&digest),
+                    c["ciphertext_sha256"].as_str().unwrap(),
+                    "ciphertext sha256 vec {i}"
+                );
+                assert_eq!(decrypt_v3(&ss, &payload, kind, &scope).unwrap(), pt);
+            }
+        }
+
+        // invalid_decryption: every malformed payload (bad MAC/padding/version/base64,
+        // context mismatch, out-of-bounds scope) must be rejected.
+        #[test]
+        fn v3_invalid_decryption_reference_vectors() {
+            let v = vectors();
+            let cases = v["invalid_decryption"].as_array().unwrap();
+            assert_eq!(cases.len(), 19, "invalid_decryption count");
+            let b64 = base64::engine::general_purpose::STANDARD;
+            for (i, c) in cases.iter().enumerate() {
+                let peer =
+                    XOnlyPublicKey::from_slice(&unhex(c["public"].as_str().unwrap())).unwrap();
+                let ss = ecdh_x(c["secret"].as_str().unwrap(), &peer);
+                let kind = c["kind"].as_u64().unwrap() as u32;
+                // Scope may be non-UTF-8 (one vector is deliberately invalid); a lossy
+                // decode still yields a rejection, which is the property under test.
+                let scope =
+                    String::from_utf8_lossy(&unhex(c["scope_hex"].as_str().unwrap())).into_owned();
+                let why = c["why"].as_str().unwrap();
+                let rejected = match b64.decode(c["ciphertext"].as_str().unwrap()) {
+                    Err(_) => true,
+                    Ok(payload) => decrypt_v3(&ss, &payload, kind, &scope).is_err(),
+                };
+                assert!(rejected, "invalid vec {i} ({why}) must be rejected");
             }
         }
 
