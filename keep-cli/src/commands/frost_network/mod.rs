@@ -1872,6 +1872,52 @@ mod tests {
         assert_eq!(std::fs::read(&bin).unwrap(), payload);
     }
 
+    // A crash between temp-create and rename can leave a stale `.tmp` behind.
+    // The next write must clear it (create_new would otherwise fail closed) and
+    // produce the correct content, so a crashed run cannot wedge the writer.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_clears_stale_temp_from_crashed_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        let tmp = temp_path_for(&path);
+        std::fs::write(&tmp, b"stale-garbage-from-crash").unwrap();
+
+        write_secret_file(&path, b"fresh-secret").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh-secret");
+        assert!(!tmp.exists(), "stale temp must be cleared, not left behind");
+    }
+
+    // If the destination is a symlink an attacker planted (pointing at a file
+    // they do not want us to clobber), the atomic rename must replace the symlink
+    // with our regular file rather than write through it to the target.
+    #[cfg(unix)]
+    #[test]
+    fn write_secret_file_replaces_symlinked_dest_without_writing_through() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim-untouched").unwrap();
+        let path = dir.path().join("secret");
+        symlink(&victim, &path).unwrap();
+
+        write_secret_file(&path, b"real-secret").unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"real-secret");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"victim-untouched",
+            "the symlink target must not be written through"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "destination must be replaced by a regular file, not remain a symlink"
+        );
+    }
+
     fn sample_freeze() -> keep_frost_net::DuressFreeze {
         keep_frost_net::DuressFreeze {
             beacon_pubkey: nostr_sdk::Keys::generate().public_key(),
