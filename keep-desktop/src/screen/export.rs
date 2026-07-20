@@ -11,22 +11,55 @@ use crate::app::MIN_EXPORT_PASSPHRASE_LEN;
 use crate::screen::shares::ShareEntry;
 use crate::theme;
 
+/// Estimate passphrase strength in bits of entropy and map it to a label.
+///
+/// The estimate is the search-space entropy `len * log2(pool)` for the character
+/// classes actually used, scaled by a repetition penalty derived from the ratio
+/// of distinct characters to length. The penalty is what a pure length + variety
+/// score misses: a long passphrase that reuses a tiny alphabet (e.g. twenty
+/// `a`s, or `abababab...`) carries far less entropy than its length implies and
+/// must not read as strong. The bands follow rough NIST-style guidance (a vault
+/// passphrase protects the exported share material, so the bar is deliberately
+/// conservative). This is a search-space heuristic, not a dictionary/pattern
+/// cracker; it strictly improves on length + variety without adding a dependency.
 fn passphrase_strength(passphrase: &str) -> (&'static str, iced::Color) {
-    let len = passphrase.chars().count();
-    let has_upper = passphrase.chars().any(|c| c.is_ascii_uppercase());
-    let has_digit = passphrase.chars().any(|c| c.is_ascii_digit());
-    let has_special = passphrase.chars().any(|c| !c.is_ascii_alphanumeric());
-    let variety: usize = [has_upper, has_digit, has_special]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-    let score = len + variety * 5;
+    let chars: Vec<char> = passphrase.chars().collect();
+    let len = chars.len();
+    if len == 0 {
+        return ("Weak", theme::color::ERROR);
+    }
 
-    if score < 20 {
+    let has_lower = chars.iter().any(|c| c.is_ascii_lowercase());
+    let has_upper = chars.iter().any(|c| c.is_ascii_uppercase());
+    let has_digit = chars.iter().any(|c| c.is_ascii_digit());
+    let has_special = chars.iter().any(|c| !c.is_ascii_alphanumeric());
+    // Approximate size of the alphabet the passphrase draws from.
+    let pool: u32 = [
+        (has_lower, 26),
+        (has_upper, 26),
+        (has_digit, 10),
+        (has_special, 33),
+    ]
+    .iter()
+    .filter(|(present, _)| *present)
+    .map(|(_, n)| *n)
+    .sum::<u32>()
+    .max(2);
+
+    let distinct = chars.iter().collect::<std::collections::HashSet<_>>().len();
+    // Distinct characters drive the entropy; each repeat beyond the distinct set
+    // adds only a quarter-character of credit, so a long low-alphabet string
+    // (twenty `a`s, `abab...`) cannot read as strong on length alone while a
+    // genuinely diverse passphrase is unpenalized.
+    const REPEAT_CREDIT: f64 = 0.25;
+    let effective_len = distinct as f64 + (len - distinct) as f64 * REPEAT_CREDIT;
+    let bits = effective_len * (pool as f64).log2();
+
+    if bits < 40.0 {
         ("Weak", theme::color::ERROR)
-    } else if score < 28 {
+    } else if bits < 60.0 {
         ("Fair", theme::color::TEXT_MUTED)
-    } else if score < 38 {
+    } else if bits < 80.0 {
         ("Good", theme::color::PRIMARY)
     } else {
         ("Strong", theme::color::SUCCESS)
@@ -376,5 +409,46 @@ impl State {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::passphrase_strength;
+
+    fn label(p: &str) -> &'static str {
+        passphrase_strength(p).0
+    }
+
+    #[test]
+    fn empty_is_weak() {
+        assert_eq!(label(""), "Weak");
+    }
+
+    #[test]
+    fn long_low_alphabet_strings_are_not_strong() {
+        // The gap a pure length + variety score missed: length alone must not
+        // carry a repetitive, low-entropy passphrase.
+        assert_eq!(label(&"a".repeat(15)), "Weak");
+        assert_eq!(label(&"a".repeat(20)), "Weak");
+        assert_eq!(label(&"ab".repeat(12)), "Weak"); // 24 chars, 2 distinct
+    }
+
+    #[test]
+    fn repetition_scores_below_diversity_at_equal_length() {
+        let repetitive = passphrase_strength(&"a".repeat(20)).0;
+        let diverse = passphrase_strength("abcdefghijklmnopqrst").0; // 20 distinct
+        assert_eq!(repetitive, "Weak");
+        assert_ne!(repetitive, diverse);
+    }
+
+    #[test]
+    fn diverse_passphrases_rate_well() {
+        // A long multi-word passphrase and a mixed-class one both clear the bar.
+        assert!(matches!(
+            label("correct horse battery staple"),
+            "Good" | "Strong"
+        ));
+        assert!(matches!(label("Tr0ub4dour&3xplore!!"), "Good" | "Strong"));
     }
 }
