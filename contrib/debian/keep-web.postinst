@@ -18,13 +18,24 @@ case "$1" in
 
         # Purge preserves the vault, so a reinstall can meet state owned by a
         # uid the account no longer has (the admin removed it by hand, or the
-        # vault was restored from a backup taken on another host). Reclaim it
-        # rather than letting the daemon fail on a directory it cannot write.
-        for path in /var/lib/keep-web /etc/keep-web/password /etc/keep-web/auth-token; do
+        # vault was restored from a backup taken on another host). Reclaim it,
+        # or the daemon fails with EACCES on its own vault. systemd's
+        # StateDirectory= only adjusts the top level, so the tree beneath it
+        # has to be walked here.
+        #
+        # Walked with find rather than chown -R: --no-dereference keeps a
+        # symlink planted by whichever account previously held the uid from
+        # redirecting the chown onto a file outside the vault, and -xdev stops
+        # it at a mount boundary.
+        for path in /etc/keep-web/password /etc/keep-web/auth-token; do
             if [ -e "$path" ]; then
-                chown -R keep-web:keep-web "$path"
+                chown keep-web:keep-web "$path"
             fi
         done
+        if [ -d /var/lib/keep-web ]; then
+            find /var/lib/keep-web -xdev -print0 \
+                | xargs -0 -r chown --no-dereference keep-web:keep-web
+        fi
 
         # /etc/keep-web holds the vault password and the admin API token, so
         # it must not be world readable. dpkg resets conffile modes when it
