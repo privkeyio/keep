@@ -370,7 +370,26 @@ fn read_auth_token(path: &Path) -> std::io::Result<String> {
         }
     }
 
-    let s = std::fs::read_to_string(path)?;
+    // The check above inspected the path; this opens it again, so the entry
+    // could have been swapped for a symlink in between. metadata() on the
+    // handle is an fstat of what was actually opened, so comparing identity
+    // across the two closes that window without reaching for libc.
+    let mut f = std::fs::File::open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = f.metadata()?;
+        if opened.ino() != md.ino() || opened.dev() != md.dev() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "auth_token changed while being read; refusing to use it",
+            ));
+        }
+    }
+
+    use std::io::Read;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
     let trimmed = s.trim();
 
     // Exactly what we mint: 32 random bytes, hex. Anything else is a truncated
