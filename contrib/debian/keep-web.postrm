@@ -3,26 +3,40 @@ set -e
 
 case "$1" in
     purge)
-        # Deliberately NOT removed on purge: /var/lib/keep-web holds the
-        # encrypted vault (a FROST share) and /etc/keep-web/password is the
-        # only key to it. Deleting either would be irrecoverable key loss, so
-        # both are left for the operator to remove by hand.
-        if [ -e /var/lib/keep-web ] || [ -e /etc/keep-web/password ]; then
-            cat >&2 <<'EOF'
-keep-web purged. Key material was left in place on purpose:
+        # The secrets under /etc go: Policy expects /etc clean after purge,
+        # and leaving the password beside the vault would leave a usable
+        # share on a host the operator believes was decommissioned (a purge
+        # during golden-image builds is routine, and its warning scrolls by
+        # unread).
+        rm -f /etc/keep-web/password /etc/keep-web/auth-token
+        rmdir /etc/keep-web 2>/dev/null || true
 
-  /var/lib/keep-web        encrypted vault (FROST share)
-  /etc/keep-web/password   vault password
+        # The vault stays: it holds the FROST share and deleting it would be
+        # irrecoverable key loss. Without the password it is inert ciphertext.
+        # The note survives the scrollback that swallows the message below.
+        if [ -d /var/lib/keep-web ]; then
+            cat > /var/lib/keep-web/README.retired <<'EOF'
+This directory holds an encrypted Keep FROST share left behind when the
+keep-web package was purged. The vault password and admin token that lived in
+/etc/keep-web were removed, so this data cannot be unlocked from what remains
+on this host.
 
-Remove them by hand once the share is retired or backed up elsewhere.
+Reinstalling keep-web and restoring the vault password reactivates this share.
+Delete this directory once the share is retired.
 EOF
-        else
-            rmdir /etc/keep-web 2>/dev/null || true
+            chmod 0600 /var/lib/keep-web/README.retired
+            cat >&2 <<'EOF'
+keep-web purged. /var/lib/keep-web was kept: it holds the encrypted FROST
+share, and deleting it would be irrecoverable key loss. The vault password and
+admin token under /etc/keep-web were removed, so the share cannot be unlocked
+from what is left on disk. Delete /var/lib/keep-web by hand once the share is
+retired.
+EOF
         fi
 
-        if [ -x "$(command -v deluser)" ]; then
-            deluser --quiet --system keep-web >/dev/null 2>&1 || true
-        fi
+        # The keep-web user is deliberately kept while /var/lib/keep-web
+        # exists: freeing the uid would hand ownership of the vault to
+        # whichever system account is allocated next.
     ;;
 
     remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)

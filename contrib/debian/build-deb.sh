@@ -35,15 +35,24 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$OUT_DIR"
 
-# dpkg-shlibdeps derives the real libc6/libgcc-s1 floor instead of guessing.
+# dpkg-shlibdeps derives the real library floor instead of guessing. Failures
+# must be loud: a silently empty Depends ships a package with no libc floor
+# that installs anywhere and then dies at exec. Callers must assign the result
+# to a variable so that `set -e` sees the non-zero status; a bare command
+# substitution inside a heredoc would swallow it.
 shlibdeps() {
     _sd=$WORK/shlibdeps
     rm -rf "$_sd"
     mkdir -p "$_sd/debian"
     printf 'Source: keep\nPackage: %s\nArchitecture: %s\n' "$1" "$ARCH" > "$_sd/debian/control"
     cp "$2" "$_sd/"
-    ( cd "$_sd" && dpkg-shlibdeps -O --ignore-missing-info "./$(basename "$2")" 2>/dev/null ) \
-        | sed 's/^shlibs:Depends=//'
+    _deps=$( cd "$_sd" && dpkg-shlibdeps -O "./$(basename "$2")" ) || return 1
+    _deps=$(printf '%s\n' "$_deps" | sed -n 's/^shlibs:Depends=//p')
+    if [ -z "$_deps" ]; then
+        echo "dpkg-shlibdeps produced no dependencies for $1" >&2
+        return 1
+    fi
+    printf '%s' "$_deps"
 }
 
 install_man() {
@@ -77,13 +86,27 @@ write_common() {
 
 finish() {
     _tree=$1 _pkg=$2
+
+    # Conffiles are excluded from md5sums, as dh_md5sums does: dpkg tracks
+    # them separately, and listing them makes `dpkg -V` report every host
+    # where the admin edited the config as modified.
+    _excl=$WORK/md5-exclude
+    : > "$_excl"
+    if [ -f "$_tree/DEBIAN/conffiles" ]; then
+        sed 's|^/||' "$_tree/DEBIAN/conffiles" > "$_excl"
+    fi
     ( cd "$_tree" && find . -type f ! -path './DEBIAN/*' -printf '%P\0' \
-        | LC_ALL=C sort -z | xargs -0 md5sum > DEBIAN/md5sums )
+        | LC_ALL=C sort -z | grep -zvxF -f "$_excl" | xargs -0 md5sum > DEBIAN/md5sums )
     sed -i "s|^Installed-Size:.*|Installed-Size: $(du -k -s --exclude=DEBIAN "$_tree" | cut -f1)|" \
         "$_tree/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$_tree" "$OUT_DIR/${_pkg}_${VERSION}_${ARCH}.deb" >/dev/null
     echo "built $OUT_DIR/${_pkg}_${VERSION}_${ARCH}.deb"
 }
+
+# Resolved up front, as plain assignments, so a dpkg-shlibdeps failure aborts
+# the build instead of being swallowed by the control-file heredocs.
+KEEP_DEPS=$(shlibdeps keep "$BIN_DIR/keep")
+KEEP_WEB_DEPS=$(shlibdeps keep-web "$BIN_DIR/keep-web")
 
 # ---------------------------------------------------------------- keep (CLI)
 
@@ -108,7 +131,7 @@ Section: utils
 Priority: optional
 Homepage: https://github.com/privkeyio/keep
 Installed-Size: 0
-Depends: $(shlibdeps keep "$BIN_DIR/keep")
+Depends: $KEEP_DEPS
 Description: Self-custodial key manager for Nostr and Bitcoin
  Keep stores Nostr and Bitcoin keys in an encrypted vault and signs with them
  without ever exposing the key material to the requesting application. It
@@ -148,7 +171,7 @@ Section: utils
 Priority: optional
 Homepage: https://github.com/privkeyio/keep
 Installed-Size: 0
-Depends: $(shlibdeps keep-web "$BIN_DIR/keep-web"), adduser, init-system-helpers (>= 1.52)
+Depends: $KEEP_WEB_DEPS, adduser, init-system-helpers (>= 1.52)
 Recommends: keep
 Description: Always-on FROST co-signer and web admin for Keep
  keep-web runs as a system service holding one share of a Keep FROST

@@ -3,25 +3,60 @@ set -e
 
 case "$1" in
     configure)
-        adduser --system \
-                --group \
-                --quiet \
-                --home /var/lib/keep-web \
-                --no-create-home \
-                --gecos "Keep web admin and FROST co-signer" \
-                keep-web
+        # adduser --system is idempotent for an existing system account but
+        # fails if a regular account of that name already exists, which would
+        # abort configure with the unit already unpacked.
+        if ! getent passwd keep-web >/dev/null; then
+            adduser --system \
+                    --group \
+                    --quiet \
+                    --home /var/lib/keep-web \
+                    --no-create-home \
+                    --gecos "Keep web admin and FROST co-signer" \
+                    keep-web
+        fi
+
+        # /etc/keep-web holds the vault password and the admin API token, so
+        # it must not be world readable. dpkg resets conffile modes when it
+        # replaces them, so re-apply on every configure, not just first
+        # install.
+        chown root:keep-web /etc/keep-web
+        chmod 0750 /etc/keep-web
+        chown root:keep-web /etc/keep-web/keep-web.env
+        chmod 0640 /etc/keep-web/keep-web.env
+
+        # Pin the admin API token. Left unset, the daemon mints a random one
+        # at every start and logs it. That token gates share export, and the
+        # journal is readable by the adm group and routinely shipped off-box.
+        # Owned by the daemon at 0600 rather than root:keep-web at 0640: the
+        # daemon warns about any secret it can read that is group accessible,
+        # and ProtectSystem=strict keeps /etc read-only to it, so it cannot
+        # rewrite what it owns. root reads it regardless.
+        if [ ! -e /etc/keep-web/auth-token ]; then
+            install -m 0600 -o keep-web -g keep-web /dev/null /etc/keep-web/auth-token
+            head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' \
+                > /etc/keep-web/auth-token
+        fi
 
         if [ ! -e /etc/keep-web/password ]; then
             cat >&2 <<'EOF'
 keep-web is installed but not enabled: no vault password is set.
 
-  1. Write the vault password to /etc/keep-web/password
-  2. chown root:keep-web /etc/keep-web/password && chmod 640 /etc/keep-web/password
-  3. Set KEEP_FROST_GROUP and review the relays in /etc/keep-web/keep-web.env
-  4. systemctl enable --now keep-web
+  1. Create the password file with its mode already restricted, then write
+     the vault password into it:
 
-The admin API listens on 127.0.0.1:8080 by default. Put it behind a reverse
-proxy or an onion service rather than exposing it directly.
+       sudo install -m 0600 -o keep-web -g keep-web /dev/null /etc/keep-web/password
+       sudo tee /etc/keep-web/password >/dev/null
+
+     Creating it first matters: writing the file before restricting it leaves
+     the vault password briefly world readable.
+
+  2. Set KEEP_FROST_GROUP and review the relays in /etc/keep-web/keep-web.env
+  3. systemctl enable --now keep-web
+
+The admin API token was generated in /etc/keep-web/auth-token. The API
+listens on 127.0.0.1:8080 and controls signing, including share export: put
+it behind a reverse proxy or an onion service rather than exposing it.
 EOF
         fi
     ;;

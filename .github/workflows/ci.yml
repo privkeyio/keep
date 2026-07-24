@@ -190,15 +190,46 @@ jobs:
         run: |
           docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
           docker build --no-cache -f Dockerfile.reproducible -o type=local,dest=./dist2 .
-          HASH1=$(sha256sum dist1/keep | cut -d' ' -f1)
-          HASH2=$(sha256sum dist2/keep | cut -d' ' -f1)
-          echo "Build 1: $HASH1"
-          echo "Build 2: $HASH2"
-          if [ "$HASH1" != "$HASH2" ]; then
-            echo "Reproducibility check failed"
+          for bin in keep keep-desktop keep-web; do
+            HASH1=$(sha256sum "dist1/$bin" | cut -d' ' -f1)
+            HASH2=$(sha256sum "dist2/$bin" | cut -d' ' -f1)
+            echo "$bin build 1: $HASH1"
+            echo "$bin build 2: $HASH2"
+            if [ "$HASH1" != "$HASH2" ]; then
+              echo "Reproducibility check failed for $bin"
+              exit 1
+            fi
+          done
+          echo "Reproducible build verified"
+
+  debian:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Debian packages
+        run: docker build -f contrib/debian/Dockerfile -o type=local,dest=./dist .
+      - name: Check package metadata
+        run: |
+          v=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
+          test -f "dist/keep_${v}_amd64.deb"
+          test -f "dist/keep-web_${v}_amd64.deb"
+          # A silently empty Depends would install anywhere and then die at exec.
+          dpkg-deb -f "dist/keep-web_${v}_amd64.deb" Depends | grep -q 'libc6 (>='
+          dpkg-deb -f "dist/keep_${v}_amd64.deb" Depends | grep -q 'libudev1'
+          # Conffiles must stay out of md5sums, or dpkg -V reports the config
+          # as modified on every host where the admin edited it.
+          dpkg-deb --ctrl-tarfile "dist/keep-web_${v}_amd64.deb" \
+            | tar -xO ./md5sums > md5sums.txt
+          if grep -q 'etc/keep-web' md5sums.txt; then
+            echo "conffile listed in md5sums" >&2
             exit 1
           fi
-          echo "Reproducible build verified"
+      - name: Lintian
+        run: |
+          docker run --rm -v "$PWD/dist:/debs:ro" debian:bookworm-slim sh -c \
+            'apt-get update -qq && apt-get install -y -qq lintian >/dev/null \
+             && lintian --fail-on warning,error /debs/*.deb'
 
   fuzz:
     runs-on: ubuntu-latest

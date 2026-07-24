@@ -30,6 +30,16 @@ file is group or world accessible.
 Vault password read directly from the environment. Discouraged: it leaks
 through /proc and crash dumps. Use \fBKEEP_PASSWORD_FILE\fR.
 .TP
+.B KEEP_WEB_AUTH_TOKEN_FILE
+Path to a file holding the bearer token that gates the admin API, including
+share export. The package generates
+.I /etc/keep-web/auth-token
+on install and points this at it. If neither this nor
+.B KEEP_WEB_AUTH_TOKEN
+is set, the daemon mints a random token at every start and logs it, which puts
+the credential in the journal and invalidates the operator's token on every
+restart.
+.TP
 .B KEEP_PATH
 Vault directory. The packaged default is
 .IR /var/lib/keep-web/vault ,
@@ -62,8 +72,14 @@ Log filter. Defaults to \fBinfo\fR.
 Service configuration. A conffile: local edits survive upgrades.
 .TP
 .I /etc/keep-web/password
-Vault password. Not shipped by the package; create it with mode 0640, owned
-root:keep\-web. The service does not start until it exists.
+Vault password. Not shipped by the package; create it with mode 0600, owned
+keep\-web:keep\-web, before writing the password into it. The service fails to
+start until it exists.
+.TP
+.I /etc/keep-web/auth-token
+Bearer token for the admin API, generated on install, mode 0600
+keep\-web:keep\-web. Both secrets sit in a 0750 root:keep\-web directory, so
+only root and the daemon can reach them.
 .TP
 .I /var/lib/keep-web/vault
 Encrypted vault holding the FROST share.
@@ -71,8 +87,16 @@ Encrypted vault holding the FROST share.
 The admin interface grants control over signing and must not be exposed
 directly to the network. Front it with a reverse proxy or an onion service.
 .PP
-Purging the package deliberately leaves the vault and the password file in
-place, because together they are the only copy of the FROST share.
+Purging the package removes the password and token under
+.IR /etc/keep-web ,
+but deliberately leaves the vault in
+.IR /var/lib/keep-web :
+it is the only copy of the FROST share, and deleting it would be
+irrecoverable. Without the password beside it the vault is inert ciphertext.
+The
+.B keep\-web
+account is kept for the same reason, so that nothing else inherits ownership
+of the vault by reusing its uid.
 .SH SEE ALSO
 .BR keep (1),
 .BR systemd.exec (5)

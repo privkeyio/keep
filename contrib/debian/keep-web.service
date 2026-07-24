@@ -3,7 +3,6 @@ Description=Keep Web Admin and FROST Co-Signer
 Documentation=https://github.com/privkeyio/keep/tree/main/keep-web
 After=network-online.target
 Wants=network-online.target
-ConditionPathExists=/etc/keep-web/password
 
 [Service]
 Type=exec
@@ -12,7 +11,13 @@ Group=keep-web
 ExecStart=/usr/bin/keep-web
 Restart=on-failure
 RestartSec=10
+# A co-signer that stops retrying drops the group below threshold silently,
+# so keep restarting rather than giving up after the default burst limit.
+StartLimitIntervalSec=0
 EnvironmentFile=/etc/keep-web/keep-web.env
+
+LimitNOFILE=8192
+TasksMax=512
 
 StateDirectory=keep-web
 StateDirectoryMode=0700
@@ -36,7 +41,10 @@ ProtectHostname=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+# AF_NETLINK is used by glibc getaddrinfo for source address selection and
+# AF_UNIX by the nss-resolve/nscd lookup paths; without them name resolution
+# degrades silently rather than failing.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
 MemoryDenyWriteExecute=yes
 LockPersonality=yes
 SystemCallArchitectures=native
