@@ -359,6 +359,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // directory at 0600. Never generated-and-logged: this token authorizes
     // share export, so the journal is the wrong place for it.
     let auth_token = match secret_from("KEEP_WEB_AUTH_TOKEN")? {
+        // secret_from only filters empties on the env-var branch, so an empty
+        // KEEP_WEB_AUTH_TOKEN_FILE arrives here as Some(""). Serving that would
+        // 401 every request forever with no diagnostic; fail loudly at boot.
+        Some(t) if t.trim().is_empty() => {
+            return Err(
+                "KEEP_WEB_AUTH_TOKEN[_FILE] is set but empty; unset it or provide a token".into(),
+            )
+        }
         Some(t) => {
             tracing::info!("auth token configured; bearer auth required on all endpoints");
             auth::AuthToken::new(t)

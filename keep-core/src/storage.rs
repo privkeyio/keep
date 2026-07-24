@@ -603,16 +603,6 @@ impl Storage {
             return Err(KeepError::NotFound(path.display().to_string()));
         }
 
-        // An existing but vault-less directory is "no Keep here" too, not an
-        // I/O error. Callers that provision on first run (keep-web, and any
-        // deployment where the parent creates the directory first: systemd
-        // StateDirectory=, a mounted volume, a Kubernetes emptyDir) match on
-        // NotFound, and without this they see Io(NotFound) from the header
-        // read and fail instead of creating the vault.
-        if !path.join("keep.hdr").exists() {
-            return Err(KeepError::NotFound(path.display().to_string()));
-        }
-
         // Reconcile any leftover rotation artifacts (`.hdr.tmp`, `.hdr.backup`,
         // `.db.backup`) before reading the header. Handles the mid-rotation
         // kill gap surfaced by #565's tests: without this, a crash inside
@@ -1763,27 +1753,6 @@ impl Drop for Storage {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-
-    #[test]
-    fn open_reports_not_found_for_existing_but_empty_dir() {
-        // Deployments where something else creates the directory first
-        // (systemd StateDirectory=, a mounted volume) must still look like a
-        // fresh install to callers that provision on NotFound, rather than
-        // surfacing an Io error from the header read.
-        let dir = tempdir().unwrap();
-        match Storage::open(dir.path()) {
-            Err(KeepError::NotFound(_)) => {}
-            Err(e) => panic!("expected NotFound for an empty dir, got {e:?}"),
-            Ok(_) => panic!("expected NotFound for an empty dir, got a Storage"),
-        }
-
-        // A missing path is still NotFound.
-        match Storage::open(&dir.path().join("nope")) {
-            Err(KeepError::NotFound(_)) => {}
-            Err(e) => panic!("expected NotFound for a missing dir, got {e:?}"),
-            Ok(_) => panic!("expected NotFound for a missing dir, got a Storage"),
-        }
-    }
 
     #[test]
     fn test_legacy_stored_share_blob_loads_as_secp256k1() {

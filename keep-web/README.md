@@ -13,10 +13,13 @@ but it runs anywhere you can set a few environment variables (Docker, systemd, a
 # Build
 cargo build --release -p keep-web
 
-# Minimum: a vault path, an unlock password, and an API token
+# Minimum: a vault path and an unlock password. Pinning the API token is
+# recommended so the credential lives outside the vault directory, which is
+# what filesystem backups and volume snapshots capture.
 KEEP_PATH=/data \
 KEEP_PASSWORD_FILE=/run/secrets/keep-password \
 KEEP_WEB_AUTH_TOKEN_FILE=/run/secrets/keep-web-token \
+# Deliberately widened from the 127.0.0.1 default: required in a container.
 KEEP_WEB_LISTEN=0.0.0.0:8080 \
 ./target/release/keep-web
 ```
@@ -49,7 +52,8 @@ the given file path instead (use this for secrets).
 ## Authentication
 
 Every `/api/*` route except `/api/health` and the WebSocket upgrade requires a
-`Authorization: Bearer <token>` header matching `KEEP_WEB_AUTH_TOKEN`. The WebSocket gates
+`Authorization: Bearer <token>` header matching `KEEP_WEB_AUTH_TOKEN`, or the token
+persisted at `$KEEP_PATH/auth_token` when that is unset. The WebSocket gates
 itself on a single-use ticket minted via the authed `/api/ws-ticket`, so the durable token
 never appears in a URL or proxy access log.
 

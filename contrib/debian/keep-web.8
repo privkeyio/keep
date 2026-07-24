@@ -36,9 +36,12 @@ share export. The package generates
 .I /etc/keep-web/auth-token
 on install and points this at it. If neither this nor
 .B KEEP_WEB_AUTH_TOKEN
-is set, the daemon mints a random token at every start and logs it, which puts
-the credential in the journal and invalidates the operator's token on every
-restart.
+is set, the daemon persists a generated token to
+.I $KEEP_PATH/auth_token
+instead. The package pins the
+.I /etc/keep-web
+copy so the credential is not inside the vault directory, which is what
+filesystem backups and volume snapshots capture.
 .TP
 .B KEEP_PATH
 Vault directory. The packaged default is

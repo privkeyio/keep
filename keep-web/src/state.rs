@@ -139,13 +139,67 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
     }
 
+    /// Writes a token file at 0600 so the mode gate does not mask the check
+    /// under test.
+    fn write_token_file(dir: &Path, contents: &str) {
+        let path = dir.join("auth_token");
+        std::fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     #[test]
     fn empty_auth_token_file_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("auth_token"), "   \n").unwrap();
+        write_token_file(dir.path(), "   \n");
         // Minting a replacement would silently invalidate the operator's token.
         let err = load_or_create_auth_token(dir.path()).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn malformed_auth_token_fails_closed() {
+        // A truncated write or a partial restore must not become a short,
+        // brute-forceable admin credential.
+        for bad in ["deadbeef", &"z".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+            let dir = tempfile::tempdir().unwrap();
+            write_token_file(dir.path(), bad);
+            let err = load_or_create_auth_token(dir.path())
+                .expect_err("expected malformed token to be rejected");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "input {bad:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_auth_token_is_refused() {
+        // Otherwise a planted link makes the daemon adopt attacker-known file
+        // contents as the admin bearer token.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("attacker_known");
+        std::fs::write(&target, "a".repeat(64)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("auth_token")).unwrap();
+
+        let err = load_or_create_auth_token(dir.path())
+            .expect_err("expected a symlinked token to be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_auth_token_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth_token");
+        std::fs::write(&path, "a".repeat(64)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let err = load_or_create_auth_token(dir.path())
+            .expect_err("expected a group-readable token to be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }
 
@@ -257,27 +311,72 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
 /// valid across restarts and upgrades.
 pub fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
     let path = vault_dir.join("auth_token");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                // Fail closed rather than mint a replacement: a truncated write
-                // must not silently invalidate the token the operator holds.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "auth_token file is empty; refusing to rotate credential",
-                ));
-            }
-            Ok(trimmed.to_string())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+
+    // Create-exclusive on the final path, so concurrent starts resolve to
+    // first-writer-wins. A rename-based write is last-writer-wins, which for a
+    // credential means the loser serves a token that exists on no disk and the
+    // operator reads one the live process rejects.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(&path) {
+        Ok(mut f) => {
+            use std::io::Write;
             let bytes: [u8; 32] = keep_core::crypto::random_bytes();
             let token = to_hex(&bytes);
-            write_secret_file(&path, &token)?;
-            Ok(token)
+            f.write_all(token.as_bytes())?;
+            f.sync_all()?;
+            return Ok(token);
         }
-        Err(e) => Err(e),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
     }
+
+    read_auth_token(&path)
+}
+
+/// Reads an existing token, refusing to follow a symlink and requiring the
+/// exact shape this daemon mints. A planted symlink would otherwise make the
+/// daemon adopt attacker-known file contents as the admin bearer token, and a
+/// truncated or tampered file would otherwise become a short, brute-forceable
+/// credential.
+fn read_auth_token(path: &Path) -> std::io::Result<String> {
+    // symlink_metadata does not traverse the final component, so a planted
+    // link is rejected rather than silently followed.
+    let md = std::fs::symlink_metadata(path)?;
+    if md.file_type().is_symlink() || !md.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth_token must be a regular file, not a symlink",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if md.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "auth_token is group/world accessible; refusing to use it",
+            ));
+        }
+    }
+
+    let s = std::fs::read_to_string(path)?;
+    let trimmed = s.trim();
+
+    // Exactly what we mint: 32 random bytes, hex. Anything else is a truncated
+    // write, a partial restore, or tampering; fail closed rather than serve it.
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "auth_token is malformed; expected 64 hex characters",
+        ));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Loads the persisted NIP-46 bunker secret, generating and storing one (`0600`)
