@@ -32,6 +32,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The package version comes from Cargo.toml while the release comes from
       # the tag. Without this, tagging without bumping publishes packages
       # carrying the previous version number alongside the new binaries.
@@ -51,6 +53,7 @@ jobs:
         with:
           name: debian
           path: dist/*.deb
+          if-no-files-found: error
 
   build-macos:
     runs-on: macos-latest
