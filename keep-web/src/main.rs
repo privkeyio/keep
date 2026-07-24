@@ -186,7 +186,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (env at boot or the live kill switch).
     let auto_approve = env_or("KEEP_FROST_AUTO_APPROVE", "false") == "true";
     let ui_dir = PathBuf::from(env_or("KEEP_WEB_UI_DIR", "ui/dist"));
-    let listen: SocketAddr = env_or("KEEP_WEB_LISTEN", "0.0.0.0:8080").parse()?;
+    // Loopback by default: the admin API controls signing, so binding every
+    // interface has to be a deliberate choice (containers set this explicitly).
+    let listen: SocketAddr = env_or("KEEP_WEB_LISTEN", "127.0.0.1:8080").parse()?;
     let password = secret_from("KEEP_PASSWORD")?
         .ok_or("KEEP_PASSWORD or KEEP_PASSWORD_FILE must be set for headless unlock")?;
 
@@ -353,7 +355,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let static_files = ServeDir::new(&ui_dir).fallback(serve_index);
 
     // Fail-closed bearer-token gate on every sensitive /api/* route.
-    let auth_token = auth::AuthToken::resolve(secret_from("KEEP_WEB_AUTH_TOKEN")?);
+    // Configured token wins; otherwise fall back to one persisted in the vault
+    // directory at 0600. Never generated-and-logged: this token authorizes
+    // share export, so the journal is the wrong place for it.
+    let auth_token = match secret_from("KEEP_WEB_AUTH_TOKEN")? {
+        // secret_from only filters empties on the env-var branch, so an empty
+        // KEEP_WEB_AUTH_TOKEN_FILE arrives here as Some(""). Serving that would
+        // 401 every request forever with no diagnostic; fail loudly at boot.
+        Some(t) if t.trim().is_empty() => {
+            return Err(
+                "KEEP_WEB_AUTH_TOKEN[_FILE] is set but empty; unset it or provide a token".into(),
+            )
+        }
+        Some(t) => {
+            tracing::info!("auth token configured; bearer auth required on all endpoints");
+            auth::AuthToken::new(t)
+        }
+        None => {
+            let token = state::load_or_create_auth_token(&vault_path)?;
+            tracing::warn!(
+                path = %vault_path.join("auth_token").display(),
+                "no auth token configured; using the persisted one (set KEEP_WEB_AUTH_TOKEN_FILE to pin it)"
+            );
+            auth::AuthToken::new(token)
+        }
+    };
 
     let authed = Router::new()
         .route("/api/bunker", get(api::bunker))

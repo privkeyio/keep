@@ -13,17 +13,21 @@ but it runs anywhere you can set a few environment variables (Docker, systemd, a
 # Build
 cargo build --release -p keep-web
 
-# Minimum: a vault path, an unlock password, and an API token
+# Minimum: a vault path and an unlock password. Pinning the API token is
+# recommended so the credential lives outside the vault directory, which is
+# what filesystem backups and volume snapshots capture.
 KEEP_PATH=/data \
 KEEP_PASSWORD_FILE=/run/secrets/keep-password \
 KEEP_WEB_AUTH_TOKEN_FILE=/run/secrets/keep-web-token \
+# Deliberately widened from the 127.0.0.1 default: required in a container.
 KEEP_WEB_LISTEN=0.0.0.0:8080 \
 ./target/release/keep-web
 ```
 
 If the vault at `KEEP_PATH` does not exist, it is created with the supplied password on
-first boot. If `KEEP_WEB_AUTH_TOKEN[_FILE]` is unset, a random token is generated and
-logged at startup (pin it in production so the token is stable).
+first boot. If `KEEP_WEB_AUTH_TOKEN[_FILE]` is unset, a random token is generated once and
+persisted to `$KEEP_PATH/auth_token` (mode `0600`); it is never written to the log, because
+it authorizes share export.
 
 ## Configuration
 
@@ -34,8 +38,8 @@ the given file path instead (use this for secrets).
 |----------|---------|-------------|
 | `KEEP_PATH` | `/data` | Vault directory. Created on first boot if absent |
 | `KEEP_PASSWORD` / `KEEP_PASSWORD_FILE` | (required) | Vault unlock password for headless start |
-| `KEEP_WEB_AUTH_TOKEN` / `_FILE` | random (logged) | Bearer token gating every `/api/*` route |
-| `KEEP_WEB_LISTEN` | `0.0.0.0:8080` | Listen address |
+| `KEEP_WEB_AUTH_TOKEN` / `_FILE` | persisted to `$KEEP_PATH/auth_token` | Bearer token gating every `/api/*` route |
+| `KEEP_WEB_LISTEN` | `127.0.0.1:8080` | Listen address. Containers must set `0.0.0.0:8080` explicitly |
 | `KEEP_WEB_UI_DIR` | `ui/dist` | Path to the built admin UI assets |
 | `KEEP_BUNKER_RELAY` | `KEEP_RELAY` then `wss://bucket.coracle.social` | Relay(s) for the NIP-46 bunker |
 | `KEEP_RELAY` | `wss://bucket.coracle.social` | Fallback relay |
@@ -48,7 +52,8 @@ the given file path instead (use this for secrets).
 ## Authentication
 
 Every `/api/*` route except `/api/health` and the WebSocket upgrade requires a
-`Authorization: Bearer <token>` header matching `KEEP_WEB_AUTH_TOKEN`. The WebSocket gates
+`Authorization: Bearer <token>` header matching `KEEP_WEB_AUTH_TOKEN`, or the token
+persisted at `$KEEP_PATH/auth_token` when that is unset. The WebSocket gates
 itself on a single-use ticket minted via the authed `/api/ws-ticket`, so the durable token
 never appears in a URL or proxy access log.
 

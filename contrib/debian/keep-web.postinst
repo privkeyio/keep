@@ -53,10 +53,21 @@ case "$1" in
         # daemon warns about any secret it can read that is group accessible,
         # and ProtectSystem=strict keeps /etc read-only to it, so it cannot
         # rewrite what it owns. root reads it regardless.
-        if [ ! -e /etc/keep-web/auth-token ]; then
-            install -m 0600 -o keep-web -g keep-web /dev/null /etc/keep-web/auth-token
-            head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' \
-                > /etc/keep-web/auth-token
+        # Generated into a temp file and moved into place, guarded on -s rather
+        # than -e: `install /dev/null` followed by a separate write would leave
+        # a permanently empty token if anything failed in between, and the
+        # daemon refuses to start on an empty token file.
+        if [ ! -s /etc/keep-web/auth-token ]; then
+            _tok=$(mktemp /etc/keep-web/.auth-token.XXXXXX)
+            if head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_tok" && [ -s "$_tok" ]; then
+                chown keep-web:keep-web "$_tok"
+                chmod 0600 "$_tok"
+                mv -f "$_tok" /etc/keep-web/auth-token
+            else
+                rm -f "$_tok"
+                echo "failed to generate /etc/keep-web/auth-token" >&2
+                exit 1
+            fi
         fi
 
         if [ ! -e /etc/keep-web/password ]; then
@@ -75,9 +86,17 @@ keep-web is installed but not enabled: no vault password is set.
   2. Set KEEP_FROST_GROUP and review the relays in /etc/keep-web/keep-web.env
   3. systemctl enable --now keep-web
 
-The admin API token was generated in /etc/keep-web/auth-token. The API
-listens on 127.0.0.1:8080 and controls signing, including share export: put
-it behind a reverse proxy or an onion service rather than exposing it.
+  4. Open the admin interface. It listens on 127.0.0.1:8080 and is not
+     reachable from the network on purpose, because it controls signing and
+     can export the share. From a remote machine, forward it over SSH:
+
+       ssh -L 8080:127.0.0.1:8080 <user>@<this-host>
+
+     then browse to http://127.0.0.1:8080 and sign in with the token in
+     /etc/keep-web/auth-token (sudo cat it). For a permanent setup, front it
+     with a reverse proxy or an onion service instead.
+
+See keep-web(8) for the full configuration reference.
 EOF
         fi
     ;;

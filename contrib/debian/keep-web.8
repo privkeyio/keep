@@ -36,9 +36,12 @@ share export. The package generates
 .I /etc/keep-web/auth-token
 on install and points this at it. If neither this nor
 .B KEEP_WEB_AUTH_TOKEN
-is set, the daemon mints a random token at every start and logs it, which puts
-the credential in the journal and invalidates the operator's token on every
-restart.
+is set, the daemon persists a generated token to
+.I $KEEP_PATH/auth_token
+instead. The package pins the
+.I /etc/keep-web
+copy so the credential is not inside the vault directory, which is what
+filesystem backups and volume snapshots capture.
 .TP
 .B KEEP_PATH
 Vault directory. The packaged default is
@@ -83,6 +86,26 @@ only root and the daemon can reach them.
 .TP
 .I /var/lib/keep-web/vault
 Encrypted vault holding the FROST share.
+.SH REACHING THE ADMIN INTERFACE
+The interface listens on
+.B 127.0.0.1:8080
+and is deliberately not reachable from the network: it grants control over
+signing and can export the share. To use it from another machine, forward the
+port over SSH:
+.PP
+.RS
+.EX
+ssh \-L 8080:127.0.0.1:8080 \fIuser\fR@\fIhost\fR
+.EE
+.RE
+.PP
+then browse to
+.B http://127.0.0.1:8080
+and sign in with the token from
+.IR /etc/keep-web/auth-token .
+For a permanent deployment, front it with a reverse proxy or an onion service
+rather than widening
+.BR KEEP_WEB_LISTEN .
 .SH NOTES
 The admin interface grants control over signing and must not be exposed
 directly to the network. Front it with a reverse proxy or an onion service.
