@@ -75,9 +75,17 @@ keep-web is installed but not enabled: no vault password is set.
   2. Set KEEP_FROST_GROUP and review the relays in /etc/keep-web/keep-web.env
   3. systemctl enable --now keep-web
 
-The admin API token was generated in /etc/keep-web/auth-token. The API
-listens on 127.0.0.1:8080 and controls signing, including share export: put
-it behind a reverse proxy or an onion service rather than exposing it.
+  4. Open the admin interface. It listens on 127.0.0.1:8080 and is not
+     reachable from the network on purpose, because it controls signing and
+     can export the share. From a remote machine, forward it over SSH:
+
+       ssh -L 8080:127.0.0.1:8080 <user>@<this-host>
+
+     then browse to http://127.0.0.1:8080 and sign in with the token in
+     /etc/keep-web/auth-token (sudo cat it). For a permanent setup, front it
+     with a reverse proxy or an onion service instead.
+
+See keep-web(8) for the full configuration reference.
 EOF
         fi
     ;;

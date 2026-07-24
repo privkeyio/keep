@@ -58,9 +58,18 @@ sudo editor /etc/keep-web/keep-web.env
 sudo systemctl enable --now keep-web
 ```
 
-The admin interface binds to `127.0.0.1:8080` by default. Front it with the
-reverse proxy in `nginx/keep.conf` or an onion service rather than exposing it
-directly. The vault lives in `/var/lib/keep-web`.
+The admin interface binds to `127.0.0.1:8080` and is not reachable from the
+network on purpose, since it controls signing and can export the share. To use
+it from another machine, forward the port over SSH:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 <user>@<host>
+```
+
+Then browse to `http://127.0.0.1:8080` and sign in with the token from
+`/etc/keep-web/auth-token` (`sudo cat` it). For a permanent deployment, front
+it with the reverse proxy in `nginx/keep.conf` or an onion service rather than
+widening `KEEP_WEB_LISTEN`. The vault lives in `/var/lib/keep-web`.
 
 The bearer token guarding the admin API is generated on install and readable
 by root at `/etc/keep-web/auth-token`. This token gates share export, so treat

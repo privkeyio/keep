@@ -8,31 +8,21 @@ use subtle::ConstantTimeEq;
 
 /// Shared bearer token gating every `/api/*` route and the WS upgrade.
 ///
-/// The token is read from `KEEP_WEB_AUTH_TOKEN`; if unset, a random one is
-/// generated at startup and logged once so the operator can retrieve it. The
-/// daemon is never run fully open (fail-closed).
+/// The token comes from `KEEP_WEB_AUTH_TOKEN[_FILE]`, or from the `auth_token`
+/// file persisted in the vault directory when neither is set. The value is
+/// never logged: it authorizes share export, so emitting it would put a
+/// credential equivalent to the share into the journal, which the `adm` group
+/// can read and log shippers forward off-box. The daemon is never run fully
+/// open (fail-closed).
 #[derive(Clone)]
 pub struct AuthToken(Arc<String>);
 
 impl AuthToken {
-    /// Resolve the auth token from an optionally-configured value, generating
-    /// and logging a random one if none was supplied (fail-closed: never open).
-    pub fn resolve(configured: Option<String>) -> Self {
-        match configured {
-            Some(t) if !t.trim().is_empty() => {
-                tracing::info!("auth token configured; bearer auth required on all endpoints");
-                Self(Arc::new(t.trim().to_string()))
-            }
-            _ => {
-                let bytes: [u8; 32] = keep_core::crypto::random_bytes();
-                let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-                tracing::warn!(
-                    token = %token,
-                    "no auth token configured; generated a random one (set KEEP_WEB_AUTH_TOKEN[_FILE] to pin it)"
-                );
-                Self(Arc::new(token))
-            }
-        }
+    /// Build from a resolved token. Callers supply either the configured value
+    /// or the persisted one; an all-whitespace value is rejected by the caller
+    /// rather than silently accepted here.
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(Arc::new(token.into().trim().to_string()))
     }
 
     fn matches(&self, candidate: &str) -> bool {
@@ -86,15 +76,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_uses_configured_or_generates() {
-        let configured = AuthToken::resolve(Some("  pinned  ".into()));
-        assert!(configured.matches("pinned"));
-
-        let a = AuthToken::resolve(None);
-        let b = AuthToken::resolve(Some("".into()));
-        // Generated tokens are random and non-empty.
-        assert!(!a.matches(""));
-        assert!(!a.matches(&b.0));
+    fn new_trims_surrounding_whitespace() {
+        // Secrets read from a file arrive with a trailing newline.
+        let t = AuthToken::new("  pinned  \n");
+        assert!(t.matches("pinned"));
+        assert!(!t.matches("  pinned  "));
     }
 
     #[test]

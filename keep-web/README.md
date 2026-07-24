@@ -22,8 +22,9 @@ KEEP_WEB_LISTEN=0.0.0.0:8080 \
 ```
 
 If the vault at `KEEP_PATH` does not exist, it is created with the supplied password on
-first boot. If `KEEP_WEB_AUTH_TOKEN[_FILE]` is unset, a random token is generated and
-logged at startup (pin it in production so the token is stable).
+first boot. If `KEEP_WEB_AUTH_TOKEN[_FILE]` is unset, a random token is generated once and
+persisted to `$KEEP_PATH/auth_token` (mode `0600`); it is never written to the log, because
+it authorizes share export.
 
 ## Configuration
 
@@ -34,8 +35,8 @@ the given file path instead (use this for secrets).
 |----------|---------|-------------|
 | `KEEP_PATH` | `/data` | Vault directory. Created on first boot if absent |
 | `KEEP_PASSWORD` / `KEEP_PASSWORD_FILE` | (required) | Vault unlock password for headless start |
-| `KEEP_WEB_AUTH_TOKEN` / `_FILE` | random (logged) | Bearer token gating every `/api/*` route |
-| `KEEP_WEB_LISTEN` | `0.0.0.0:8080` | Listen address |
+| `KEEP_WEB_AUTH_TOKEN` / `_FILE` | persisted to `$KEEP_PATH/auth_token` | Bearer token gating every `/api/*` route |
+| `KEEP_WEB_LISTEN` | `127.0.0.1:8080` | Listen address. Containers must set `0.0.0.0:8080` explicitly |
 | `KEEP_WEB_UI_DIR` | `ui/dist` | Path to the built admin UI assets |
 | `KEEP_BUNKER_RELAY` | `KEEP_RELAY` then `wss://bucket.coracle.social` | Relay(s) for the NIP-46 bunker |
 | `KEEP_RELAY` | `wss://bucket.coracle.social` | Fallback relay |

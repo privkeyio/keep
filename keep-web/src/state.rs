@@ -113,6 +113,40 @@ mod tests {
         store.issue("abc".into());
         assert!(!store.consume("def"));
     }
+
+    #[test]
+    fn auth_token_is_generated_once_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_auth_token(dir.path()).unwrap();
+        assert_eq!(first.len(), 64, "32 random bytes, hex encoded");
+
+        // Stable across restarts and upgrades: an operator's token must not be
+        // invalidated by a service restart.
+        let second = load_or_create_auth_token(dir.path()).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_token_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_auth_token(dir.path()).unwrap();
+        let mode = std::fs::metadata(dir.path().join("auth_token"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn empty_auth_token_file_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth_token"), "   \n").unwrap();
+        // Minting a replacement would silently invalidate the operator's token.
+        let err = load_or_create_auth_token(dir.path()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 }
 
 impl BunkerInfo {
@@ -214,6 +248,36 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+/// Loads the persisted admin API token, generating and storing one (`0600`) on
+/// first run. Kept on disk rather than logged: this token gates every `/api/*`
+/// route including share export, and the journal is readable by the `adm` group
+/// and routinely shipped off-box. Persisting it also keeps the operator's token
+/// valid across restarts and upgrades.
+pub fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
+    let path = vault_dir.join("auth_token");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                // Fail closed rather than mint a replacement: a truncated write
+                // must not silently invalidate the token the operator holds.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "auth_token file is empty; refusing to rotate credential",
+                ));
+            }
+            Ok(trimmed.to_string())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+            let token = to_hex(&bytes);
+            write_secret_file(&path, &token)?;
+            Ok(token)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Loads the persisted NIP-46 bunker secret, generating and storing one (`0600`)
