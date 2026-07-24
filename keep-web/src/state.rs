@@ -164,7 +164,12 @@ mod tests {
     fn malformed_auth_token_fails_closed() {
         // A truncated write or a partial restore must not become a short,
         // brute-forceable admin credential.
-        for bad in ["deadbeef", &"z".repeat(64), &"a".repeat(63), &"a".repeat(65)] {
+        for bad in [
+            "deadbeef",
+            &"z".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(65),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             write_token_file(dir.path(), bad);
             let err = load_or_create_auth_token(dir.path())
