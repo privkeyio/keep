@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "keep-agent"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "chrono",
@@ -4520,7 +4520,7 @@ dependencies = [
 
 [[package]]
 name = "keep-bitcoin"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "bitcoin",
  "getrandom 0.4.3",
@@ -4539,7 +4539,7 @@ dependencies = [
 
 [[package]]
 name = "keep-cli"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4591,7 +4591,7 @@ dependencies = [
 
 [[package]]
 name = "keep-core"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "aes 0.9.1",
  "argon2",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "keep-desktop"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -4673,14 +4673,14 @@ dependencies = [
 
 [[package]]
 name = "keep-enclave"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "keep-enclave-host",
 ]
 
 [[package]]
 name = "keep-enclave-host"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -4711,7 +4711,7 @@ dependencies = [
 
 [[package]]
 name = "keep-frost-net"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -4752,7 +4752,7 @@ dependencies = [
 
 [[package]]
 name = "keep-mobile"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "bitcoin",
@@ -4782,7 +4782,7 @@ dependencies = [
 
 [[package]]
 name = "keep-nip46"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "bitflags 2.13.1",
  "chrono",
@@ -4809,7 +4809,7 @@ dependencies = [
 
 [[package]]
 name = "keep-web"
-version = "0.7.5"
+version = "0.8.0"
 dependencies = [
  "axum",
  "hex",

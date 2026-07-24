@@ -1,0 +1,61 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # The secrets under /etc go: Policy expects /etc clean after purge,
+        # and leaving the password beside the vault would leave a usable
+        # share on a host the operator believes was decommissioned (a purge
+        # during golden-image builds is routine, and its warning scrolls by
+        # unread).
+        rm -f /etc/keep-web/password /etc/keep-web/auth-token
+        rmdir /etc/keep-web 2>/dev/null || true
+
+        # The vault stays: it holds the FROST share and deleting it would be
+        # irrecoverable key loss. Without the password it is inert ciphertext.
+        # The note survives the scrollback that swallows the message below.
+        if [ -d /var/lib/keep-web ]; then
+            cat > /var/lib/keep-web/README.retired <<'EOF'
+This directory holds an encrypted Keep FROST share left behind when the
+keep-web package was purged. The vault password and admin token that lived in
+/etc/keep-web were removed, so this data cannot be unlocked from what remains
+on this host.
+
+Reinstalling keep-web and restoring the vault password reactivates this share.
+Delete this directory once the share is retired.
+EOF
+            chmod 0600 /var/lib/keep-web/README.retired
+            cat >&2 <<'EOF'
+keep-web purged. /var/lib/keep-web was kept: it holds the encrypted FROST
+share, and deleting it would be irrecoverable key loss. The vault password and
+admin token under /etc/keep-web were removed, so the share cannot be unlocked
+from what is left on disk. Delete /var/lib/keep-web by hand once the share is
+retired.
+EOF
+        fi
+
+        # The keep-web user is deliberately kept while /var/lib/keep-web
+        # exists: freeing the uid would hand ownership of the vault to
+        # whichever system account is allocated next.
+    ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+if [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	systemctl --system daemon-reload >/dev/null || true
+fi
+
+if [ "$1" = "purge" ]; then
+	if [ -x "/usr/bin/deb-systemd-helper" ]; then
+		deb-systemd-helper purge 'keep-web.service' >/dev/null || true
+	fi
+fi
+
+exit 0

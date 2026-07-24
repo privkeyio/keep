@@ -9,6 +9,12 @@ contrib/
 ├── keep.env.example
 ├── Dockerfile
 ├── docker-compose.yml
+├── debian/
+│   ├── Dockerfile
+│   ├── build-deb.sh
+│   ├── keep-web.service
+│   ├── keep-web.env
+│   └── keep-web.{postinst,prerm,postrm}
 ├── systemd/
 │   ├── keep-serve.service
 │   └── keep-frost-serve@.service
@@ -18,6 +24,61 @@ contrib/
     ├── keep.bash
     ├── keep.zsh
     └── keep.fish
+```
+
+## Debian Packages
+
+Two packages are published with each release: `keep` (the command line
+interface) and `keep-web` (the always-on FROST co-signer and web admin,
+running as a systemd service). They install on Debian 12+ and Ubuntu 22.04+.
+
+Verify the download against the `SHA256SUMS` published with the release before
+installing. dpkg runs maintainer scripts as root, so a swapped package is root
+on the host, not merely a bad binary:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+sudo apt install ./keep_<version>_amd64.deb ./keep-web_<version>_amd64.deb
+```
+
+`keep-web` is installed disabled, because it cannot start until it has a vault
+password and a FROST group:
+
+```bash
+# 1. Vault password. Create the file with its mode already restricted, then
+#    write into it: writing first would leave the password briefly world
+#    readable.
+sudo install -m 600 -o keep-web -g keep-web /dev/null /etc/keep-web/password
+sudo tee /etc/keep-web/password >/dev/null   # type the password, then Ctrl-D
+
+# 2. Set KEEP_FROST_GROUP and review the relays
+sudo editor /etc/keep-web/keep-web.env
+
+# 3. Start it
+sudo systemctl enable --now keep-web
+```
+
+The admin interface binds to `127.0.0.1:8080` by default. Front it with the
+reverse proxy in `nginx/keep.conf` or an onion service rather than exposing it
+directly. The vault lives in `/var/lib/keep-web`.
+
+The bearer token guarding the admin API is generated on install and readable
+by root at `/etc/keep-web/auth-token`. This token gates share export, so treat
+it as key material. Leaving `KEEP_WEB_AUTH_TOKEN_FILE` unset would make the
+daemon mint a fresh token at every start and write it to the journal, which is
+why the package pins it.
+
+Only `/var/lib/keep-web` survives a purge. It holds the encrypted share and
+deleting it would be irrecoverable, so it is kept along with the `keep-web`
+account that owns it. The password and token under `/etc/keep-web` are
+removed, which leaves the vault as inert ciphertext rather than a usable share
+on a host you believe is decommissioned. Keep your vault password in your own
+password manager: it is not recoverable from what remains.
+
+To build the packages locally:
+
+```bash
+docker build -f contrib/debian/Dockerfile -o type=local,dest=./dist .
 ```
 
 ## Systemd Setup
