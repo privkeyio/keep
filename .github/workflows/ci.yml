@@ -214,8 +214,13 @@ jobs:
           v=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version *= *"\(.*\)"/\1/p' Cargo.toml)
           test -f "dist/keep_${v}_amd64.deb"
           test -f "dist/keep-web_${v}_amd64.deb"
-          # A silently empty Depends would install anywhere and then die at exec.
-          dpkg-deb -f "dist/keep-web_${v}_amd64.deb" Depends | grep -q 'libc6 (>='
+          # Assert the exact published floor, not merely that one exists: the
+          # packages are built on bookworm so they install on Debian 12 and
+          # Ubuntu 22.04, and a newer build host silently raises this.
+          for pkg in keep keep-web; do
+            dpkg-deb -f "dist/${pkg}_${v}_amd64.deb" Depends \
+              | grep -Eq '(^|, )libc6 \(>= 2\.34\)(,|$)'
+          done
           dpkg-deb -f "dist/keep_${v}_amd64.deb" Depends | grep -q 'libudev1'
           # Conffiles must stay out of md5sums, or dpkg -V reports the config
           # as modified on every host where the admin edited it.

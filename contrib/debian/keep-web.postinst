@@ -16,6 +16,16 @@ case "$1" in
                     keep-web
         fi
 
+        # Purge preserves the vault, so a reinstall can meet state owned by a
+        # uid the account no longer has (the admin removed it by hand, or the
+        # vault was restored from a backup taken on another host). Reclaim it
+        # rather than letting the daemon fail on a directory it cannot write.
+        for path in /var/lib/keep-web /etc/keep-web/password /etc/keep-web/auth-token; do
+            if [ -e "$path" ]; then
+                chown -R keep-web:keep-web "$path"
+            fi
+        done
+
         # /etc/keep-web holds the vault password and the admin API token, so
         # it must not be world readable. dpkg resets conffile modes when it
         # replaces them, so re-apply on every configure, not just first
