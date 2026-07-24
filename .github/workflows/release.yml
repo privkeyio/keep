@@ -19,12 +19,25 @@ jobs:
         run: |
           mv dist/keep keep-linux-x86_64
           mv dist/keep-desktop keep-desktop-linux-x86_64
+          mv dist/keep-web keep-web-linux-x86_64
       - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: |
             keep-linux-x86_64
             keep-desktop-linux-x86_64
+            keep-web-linux-x86_64
+
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build Debian packages
+        run: docker build -f contrib/debian/Dockerfile -o type=local,dest=./dist .
+      - uses: actions/upload-artifact@v7
+        with:
+          name: debian
+          path: dist/*.deb
 
   build-macos:
     runs-on: macos-latest
@@ -84,7 +97,7 @@ jobs:
             keep-desktop-windows-x86_64.exe
 
   release:
-    needs: [build-linux, build-macos, build-macos-arm, build-windows]
+    needs: [build-linux, build-deb, build-macos, build-macos-arm, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8

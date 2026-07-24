@@ -1,0 +1,53 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        adduser --system \
+                --group \
+                --quiet \
+                --home /var/lib/keep-web \
+                --no-create-home \
+                --gecos "Keep web admin and FROST co-signer" \
+                keep-web
+
+        if [ ! -e /etc/keep-web/password ]; then
+            cat >&2 <<'EOF'
+keep-web is installed but not enabled: no vault password is set.
+
+  1. Write the vault password to /etc/keep-web/password
+  2. chown root:keep-web /etc/keep-web/password && chmod 640 /etc/keep-web/password
+  3. Set KEEP_FROST_GROUP and review the relays in /etc/keep-web/keep-web.env
+  4. systemctl enable --now keep-web
+
+The admin API listens on 127.0.0.1:8080 by default. Put it behind a reverse
+proxy or an onion service rather than exposing it directly.
+EOF
+        fi
+    ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+# Systemd integration, modeled on dh_installsystemd --no-enable --no-start.
+# The daemon needs a vault password and a FROST group before it can do
+# anything, so a fresh install registers the unit without enabling it.
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	if deb-systemd-helper debian-installed 'keep-web.service'; then
+		deb-systemd-helper update-state 'keep-web.service' >/dev/null || true
+	fi
+	if [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null || true
+		if [ -n "$2" ]; then
+			deb-systemd-invoke try-restart 'keep-web.service' >/dev/null || true
+		fi
+	fi
+fi
+
+exit 0

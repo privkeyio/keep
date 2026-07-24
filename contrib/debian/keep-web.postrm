@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Deliberately NOT removed on purge: /var/lib/keep-web holds the
+        # encrypted vault (a FROST share) and /etc/keep-web/password is the
+        # only key to it. Deleting either would be irrecoverable key loss, so
+        # both are left for the operator to remove by hand.
+        if [ -e /var/lib/keep-web ] || [ -e /etc/keep-web/password ]; then
+            cat >&2 <<'EOF'
+keep-web purged. Key material was left in place on purpose:
+
+  /var/lib/keep-web        encrypted vault (FROST share)
+  /etc/keep-web/password   vault password
+
+Remove them by hand once the share is retired or backed up elsewhere.
+EOF
+        else
+            rmdir /etc/keep-web 2>/dev/null || true
+        fi
+
+        if [ -x "$(command -v deluser)" ]; then
+            deluser --quiet --system keep-web >/dev/null 2>&1 || true
+        fi
+    ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+    ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+if [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	systemctl --system daemon-reload >/dev/null || true
+fi
+
+if [ "$1" = "purge" ]; then
+	if [ -x "/usr/bin/deb-systemd-helper" ]; then
+		deb-systemd-helper purge 'keep-web.service' >/dev/null || true
+	fi
+fi
+
+exit 0

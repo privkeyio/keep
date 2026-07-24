@@ -1,0 +1,80 @@
+.TH KEEP-WEB 8 "@DATE@" "keep @VERSION@" "System Administration"
+.SH NAME
+keep\-web \- always-on FROST co-signer and web admin for Keep
+.SH SYNOPSIS
+.B keep\-web
+.SH DESCRIPTION
+.B keep\-web
+runs as a system service holding one share of a Keep FROST threshold key. It
+coordinates signatures with the other shareholders over Nostr relays, so a
+signature needs a quorum of devices and no single machine can sign on its own.
+It also answers NIP-46 bunker requests and serves a web admin interface for
+approving signing requests.
+.PP
+It takes no command line arguments; all configuration is read from the
+environment, which the packaged systemd unit loads from
+.IR /etc/keep-web/keep-web.env .
+.PP
+Signing is fail-closed. Requests wait for approval in the admin interface
+unless
+.B KEEP_FROST_AUTO_APPROVE
+is set to \fBtrue\fR, and a kill switch in the admin interface disables
+co-signing without stopping the service.
+.SH ENVIRONMENT
+.TP
+.B KEEP_PASSWORD_FILE
+Path to a file holding the vault password. Required. The daemon warns if the
+file is group or world accessible.
+.TP
+.B KEEP_PASSWORD
+Vault password read directly from the environment. Discouraged: it leaks
+through /proc and crash dumps. Use \fBKEEP_PASSWORD_FILE\fR.
+.TP
+.B KEEP_PATH
+Vault directory. The packaged default is
+.IR /var/lib/keep-web/vault ,
+created on first start.
+.TP
+.B KEEP_WEB_LISTEN
+Listen address. The packaged default is \fB127.0.0.1:8080\fR.
+.TP
+.B KEEP_WEB_UI_DIR
+Directory holding the admin interface. The packaged default is
+.IR /usr/share/keep-web/ui .
+.TP
+.B KEEP_BUNKER_RELAY
+Comma-separated Nostr relays for the NIP-46 bunker connection.
+.TP
+.B KEEP_FROST_GROUP
+The FROST group npub this node co-signs for.
+.TP
+.B KEEP_FROST_AUTO_APPROVE
+Set to \fBtrue\fR to sign without per-request approval. Defaults to false.
+.TP
+.B KEEP_STATE_RELAY
+Relay used to replicate signing state across a cluster of co-signers.
+.TP
+.B RUST_LOG
+Log filter. Defaults to \fBinfo\fR.
+.SH FILES
+.TP
+.I /etc/keep-web/keep-web.env
+Service configuration. A conffile: local edits survive upgrades.
+.TP
+.I /etc/keep-web/password
+Vault password. Not shipped by the package; create it with mode 0640, owned
+root:keep\-web. The service does not start until it exists.
+.TP
+.I /var/lib/keep-web/vault
+Encrypted vault holding the FROST share.
+.SH NOTES
+The admin interface grants control over signing and must not be exposed
+directly to the network. Front it with a reverse proxy or an onion service.
+.PP
+Purging the package deliberately leaves the vault and the password file in
+place, because together they are the only copy of the FROST share.
+.SH SEE ALSO
+.BR keep (1),
+.BR systemd.exec (5)
+.SH SECURITY
+Report vulnerabilities to security@privkey.io.

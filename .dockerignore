@@ -5,3 +5,4 @@ docs/
 *.md
 .gitignore
 .dockerignore
+node_modules/

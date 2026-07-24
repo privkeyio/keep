@@ -1,0 +1,90 @@
+.TH KEEP 1 "@DATE@" "keep @VERSION@" "User Commands"
+.SH NAME
+keep \- self-custodial key manager for Nostr and Bitcoin
+.SH SYNOPSIS
+.B keep
+[\fIOPTIONS\fR]
+.I COMMAND
+[\fIARGS\fR]
+.SH DESCRIPTION
+.B keep
+stores Nostr and Bitcoin keys in an encrypted vault and signs with them
+without exposing the key material to the requesting application. Keys may be
+split across several devices using FROST threshold signatures, so that no
+single device holds the whole secret.
+.PP
+The vault defaults to
+.IR ~/.keep .
+.SH OPTIONS
+.TP
+.BR \-p ", " \-\-path " " \fIPATH\fR
+Use the vault at \fIPATH\fR instead of the default.
+.TP
+.B \-\-hidden
+Operate on the hidden vault.
+.TP
+.B \-\-no\-mlock
+Do not lock secrets into memory. Accepts degraded security in exchange for
+running where mlock is unavailable.
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH COMMANDS
+.TP
+.B init
+Create a new encrypted vault.
+.TP
+.B generate ", " import ", " list ", " export ", " delete
+Manage Nostr keys in the vault.
+.TP
+.B secret
+Store, reveal, list, and remove arbitrary secrets.
+.TP
+.B serve
+Start the NIP-46 bunker and optional FROST network co-signer.
+.TP
+.B frost
+FROST threshold-signature operations: key generation, signing, and network
+coordination.
+.TP
+.B bitcoin ", " wallet
+Bitcoin address derivation, descriptor management, PSBT signing, and spend
+coordination.
+.TP
+.B backup ", " restore
+Write and restore passphrase-encrypted vault backups.
+.TP
+.B rotate\-password ", " rotate\-data\-key
+Change the unlock password, or re-encrypt every secret under a new data key.
+.TP
+.B audit
+Inspect, verify, export, or prune the audit log.
+.PP
+Run
+.B keep help
+.I COMMAND
+for the full option list of any subcommand.
+.SH ENVIRONMENT
+.TP
+.B KEEP_PASSWORD
+Vault password, for non-interactive use. Prefer
+.B KEEP_PASSWORD_FILE
+so the secret stays off the process environment.
+.TP
+.B KEEP_YES
+Assume yes for confirmation prompts.
+.SH FILES
+.TP
+.I ~/.keep
+Default vault directory.
+.SH SEE ALSO
+.BR keep-web (8)
+.PP
+Full documentation at
+.UR https://github.com/privkeyio/keep
+.UE
+.SH SECURITY
+Report vulnerabilities to security@privkey.io.
