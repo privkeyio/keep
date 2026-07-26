@@ -69,11 +69,21 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
 /// falls through to the persisted-token path. A present-but-empty credential is an
 /// operator error and fails startup rather than serving an unmatchable token.
 fn credential_dir_token() -> Result<Option<String>, Box<dyn std::error::Error>> {
-    const CREDENTIAL_NAME: &str = "keep-web-auth-token";
-    let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
+    credential_token_at(dir.as_deref())
+}
+
+const CREDENTIAL_NAME: &str = "keep-web-auth-token";
+
+/// Read the admin token from a systemd credentials directory, if `dir` is set and
+/// holds the credential. Split from the env lookup so it is unit-testable.
+fn credential_token_at(
+    dir: Option<&std::path::Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(dir) = dir else {
         return Ok(None);
     };
-    let path = std::path::Path::new(&dir).join(CREDENTIAL_NAME);
+    let path = dir.join(CREDENTIAL_NAME);
     if !path.exists() {
         return Ok(None);
     }
@@ -409,9 +419,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // share-equivalent admin credential.
                 let state_dir = std::env::var_os("STATE_DIRECTORY")
                     .and_then(|d| std::env::split_paths(&d).next());
-                let (token_path, in_vault) =
-                    state::choose_persist_path(state_dir.as_deref(), &vault_path);
-                let token = state::load_or_create_auth_token_at(&token_path)?;
+                let (token, token_path, in_vault) =
+                    state::resolve_persisted_auth_token(state_dir.as_deref(), &vault_path)?;
                 if in_vault {
                     tracing::warn!(
                         path = %token_path.display(),
@@ -475,6 +484,30 @@ mod tests {
     use super::*;
     use keep_core::Keep;
     use tempfile::tempdir;
+
+    #[test]
+    fn credential_token_none_when_dir_unset_or_absent() {
+        assert!(credential_token_at(None).unwrap().is_none());
+        let dir = tempdir().unwrap();
+        assert!(credential_token_at(Some(dir.path())).unwrap().is_none());
+    }
+
+    #[test]
+    fn credential_token_reads_present_credential_trimmed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), "  operator-token  ").unwrap();
+        assert_eq!(
+            credential_token_at(Some(dir.path())).unwrap().as_deref(),
+            Some("operator-token")
+        );
+    }
+
+    #[test]
+    fn credential_token_empty_fails_closed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), "   \n").unwrap();
+        assert!(credential_token_at(Some(dir.path())).is_err());
+    }
 
     fn unlocked_keep(dir: &std::path::Path) -> Keep {
         let mut keep = Keep::create(&dir.join("vault"), "password").unwrap();

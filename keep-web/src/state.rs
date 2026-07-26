@@ -141,6 +141,51 @@ mod tests {
         // An empty state directory is treated as absent.
         let (_, in_vault) = choose_persist_path(Some(Path::new("")), vault);
         assert!(in_vault);
+        // A state directory equal to the vault dir is not "outside" it: flag it so
+        // the backup warning still fires.
+        let (path, in_vault) = choose_persist_path(Some(vault), vault);
+        assert_eq!(path, Path::new("/data/auth_token"));
+        assert!(in_vault);
+    }
+
+    #[test]
+    fn resolve_adopts_existing_vault_token_without_rotating() {
+        let vault = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        // An existing deployment already generated a token in the vault dir.
+        let existing = load_or_create_auth_token_at(&vault.path().join("auth_token")).unwrap();
+
+        // Upgrading into a state directory must ADOPT that token (never rotate it,
+        // which would 401 the operator) and migrate it out of the vault.
+        let (token, path, in_vault) =
+            resolve_persisted_auth_token(Some(state.path()), vault.path()).unwrap();
+        assert_eq!(token, existing, "must not rotate the operator's token");
+        assert!(!in_vault);
+        assert_eq!(path, state.path().join("auth_token"));
+        assert!(path.exists(), "token now lives outside the vault");
+        assert!(
+            !vault.path().join("auth_token").exists(),
+            "the in-vault copy is removed so it stays out of backups"
+        );
+
+        // Stable on the next start.
+        let (again, _, _) = resolve_persisted_auth_token(Some(state.path()), vault.path()).unwrap();
+        assert_eq!(again, existing);
+    }
+
+    #[test]
+    fn resolve_mints_fresh_outside_vault_when_no_legacy_token() {
+        let vault = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (token, path, in_vault) =
+            resolve_persisted_auth_token(Some(state.path()), vault.path()).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(!in_vault);
+        assert_eq!(path, state.path().join("auth_token"));
+        assert!(
+            !vault.path().join("auth_token").exists(),
+            "nothing written into the vault directory"
+        );
     }
 
     #[test]
@@ -370,7 +415,12 @@ pub fn choose_persist_path(
     vault_dir: &Path,
 ) -> (std::path::PathBuf, bool) {
     match state_dir {
-        Some(dir) if !dir.as_os_str().is_empty() => (dir.join("auth_token"), false),
+        // A state dir that is the vault dir itself is not "outside" it: the token
+        // would still land in the backup path, so fall through to the vault case
+        // and keep the warning honest rather than suppressing it.
+        Some(dir) if !dir.as_os_str().is_empty() && dir != vault_dir => {
+            (dir.join("auth_token"), false)
+        }
         _ => (vault_dir.join("auth_token"), true),
     }
 }
@@ -404,6 +454,59 @@ pub fn load_or_create_auth_token_at(path: &Path) -> std::io::Result<String> {
     }
 
     read_auth_token(path)
+}
+
+/// Resolve the persisted admin token for the no-configured-token path. Chooses a
+/// location via [`choose_persist_path`], and when an outside-vault target is
+/// selected but not yet populated, adopts a legacy `$KEEP_PATH/auth_token` if one
+/// exists, migrating it out of the vault. This is what keeps an existing
+/// deployment from silently rotating its admin token on upgrade (a rotated token
+/// 401s the operator) while still moving the credential out of the backup path.
+/// Returns `(token, path, is_in_vault_dir)`.
+pub fn resolve_persisted_auth_token(
+    state_dir: Option<&Path>,
+    vault_dir: &Path,
+) -> std::io::Result<(String, std::path::PathBuf, bool)> {
+    let (target, in_vault) = choose_persist_path(state_dir, vault_dir);
+    if !in_vault && !target.exists() {
+        let legacy = vault_dir.join("auth_token");
+        if legacy.exists() {
+            migrate_auth_token(&legacy, &target)?;
+        }
+    }
+    let token = load_or_create_auth_token_at(&target)?;
+    Ok((token, target, in_vault))
+}
+
+/// Move an existing, validated token from `legacy` to `target` without rotating
+/// it: read (and validate) the current token, write it atomically at `target`
+/// (`0600`), then best-effort remove the vault copy so the credential leaves the
+/// backup path. A malformed legacy token fails closed (the caller then mints a
+/// fresh one at `target`). If `target` was created concurrently, the atomic write
+/// simply overwrites with the same adopted value.
+fn migrate_auth_token(legacy: &Path, target: &Path) -> std::io::Result<()> {
+    let token = match read_auth_token(legacy) {
+        Ok(t) => t,
+        // A malformed/tampered legacy token is not worth preserving; leave it for
+        // the caller to replace with a freshly minted token at `target`.
+        Err(_) => return Ok(()),
+    };
+    write_secret_file(target, &token)?;
+    if let Err(e) = std::fs::remove_file(legacy) {
+        tracing::warn!(
+            path = %legacy.display(),
+            error = %e,
+            "migrated the admin token out of the vault directory but could not remove the old \
+             in-vault copy; delete it manually so it stays out of vault backups"
+        );
+    } else {
+        tracing::info!(
+            from = %legacy.display(),
+            to = %target.display(),
+            "migrated the persisted admin token out of the vault directory"
+        );
+    }
+    Ok(())
 }
 
 /// Reads an existing token, refusing to follow a symlink and requiring the
