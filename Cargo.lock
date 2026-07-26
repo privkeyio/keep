@@ -748,6 +748,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4542,7 +4548,7 @@ name = "keep-cli"
 version = "0.8.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bitcoin",
  "bitflags 2.13.1",
  "chrono",
@@ -4595,7 +4601,7 @@ version = "0.8.0"
 dependencies = [
  "aes 0.9.1",
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bech32 0.12.0",
  "bincode",
  "bip39",
@@ -4642,7 +4648,7 @@ dependencies = [
 name = "keep-desktop"
 version = "0.8.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "bitcoin",
  "chrono",
  "dirs",
@@ -4683,7 +4689,7 @@ name = "keep-enclave-host"
 version = "0.8.0"
 dependencies = [
  "aes-gcm",
- "base64 0.22.1",
+ "base64 0.23.0",
  "bincode",
  "ciborium",
  "const-oid 0.10.2",
@@ -4713,7 +4719,7 @@ dependencies = [
 name = "keep-frost-net"
 version = "0.8.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "bitcoin",
  "chrono",
  "frost-secp256k1-tr",
@@ -4754,7 +4760,7 @@ dependencies = [
 name = "keep-mobile"
 version = "0.8.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.0",
  "bitcoin",
  "chrono",
  "flate2",

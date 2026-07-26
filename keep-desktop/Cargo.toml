@@ -19,7 +19,7 @@ tray-icon = "0.24"
 notify-rust = "4"
 nostr-sdk = { workspace = true }
 hex = { workspace = true }
-base64 = "0.22"
+base64 = "0.23"
 dirs = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }

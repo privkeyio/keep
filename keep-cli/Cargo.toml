@@ -36,7 +36,7 @@ hex = "0.4"
 
 urlencoding = "2.1"
 url = "2.5"
-base64 = "0.22"
+base64 = "0.23"
 
 frost-secp256k1-tr = "3.0.0"
 p256 = { version = "0.13", features = ["ecdsa"] }
