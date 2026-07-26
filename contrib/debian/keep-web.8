@@ -36,12 +36,20 @@ share export. The package generates
 .I /etc/keep-web/auth-token
 on install and points this at it. If neither this nor
 .B KEEP_WEB_AUTH_TOKEN
-is set, the daemon persists a generated token to
+is set, the daemon looks for an operator-provisioned credential named
+.I keep-web-auth-token
+under systemd's
+.B $CREDENTIALS_DIRECTORY
+.RB ( LoadCredential= ),
+then persists a generated token to
+.I $STATE_DIRECTORY/auth_token
+.RB ( StateDirectory= ,
+outside the vault). Only if none of those are available does it fall back to
 .I $KEEP_PATH/auth_token
-instead. The package pins the
-.I /etc/keep-web
-copy so the credential is not inside the vault directory, which is what
-filesystem backups and volume snapshots capture.
+inside the vault directory, with a warning: the bearer token is
+share-equivalent against a running daemon, so keeping it out of the vault
+directory keeps it out of the filesystem backups and volume snapshots that
+capture the vault.
 .TP
 .B KEEP_PATH
 Vault directory. The packaged default is

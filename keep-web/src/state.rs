@@ -126,6 +126,43 @@ mod tests {
         assert_eq!(first, second);
     }
 
+    #[test]
+    fn choose_persist_path_prefers_state_dir_outside_vault() {
+        let vault = Path::new("/data");
+        let state = Path::new("/var/lib/keep-web");
+        // A state directory is preferred and reported as outside the vault.
+        let (path, in_vault) = choose_persist_path(Some(state), vault);
+        assert_eq!(path, Path::new("/var/lib/keep-web/auth_token"));
+        assert!(!in_vault);
+        // No state directory falls back to the vault dir and flags it.
+        let (path, in_vault) = choose_persist_path(None, vault);
+        assert_eq!(path, Path::new("/data/auth_token"));
+        assert!(in_vault);
+        // An empty state directory is treated as absent.
+        let (_, in_vault) = choose_persist_path(Some(Path::new("")), vault);
+        assert!(in_vault);
+    }
+
+    #[test]
+    fn auth_token_persists_outside_the_vault_directory() {
+        // The generated token must live at the chosen path (a state dir), not in
+        // the vault dir, and remain stable across restarts.
+        let vault = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (path, in_vault) = choose_persist_path(Some(state.path()), vault.path());
+        assert!(!in_vault);
+
+        let first = load_or_create_auth_token_at(&path).unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(path.exists(), "token written to the state dir");
+        assert!(
+            !vault.path().join("auth_token").exists(),
+            "nothing written into the vault directory"
+        );
+        let second = load_or_create_auth_token_at(&path).unwrap();
+        assert_eq!(first, second);
+    }
+
     #[cfg(unix)]
     #[test]
     fn auth_token_file_is_owner_only() {
@@ -314,9 +351,34 @@ fn decode_hex32(s: &str) -> Option<[u8; 32]> {
 /// route including share export, and the journal is readable by the `adm` group
 /// and routinely shipped off-box. Persisting it also keeps the operator's token
 /// valid across restarts and upgrades.
-pub fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
-    let path = vault_dir.join("auth_token");
+/// Test convenience: persist the token directly in `vault_dir`. Production code
+/// uses [`choose_persist_path`] + [`load_or_create_auth_token_at`] so the token
+/// lands outside the vault directory.
+#[cfg(test)]
+fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
+    load_or_create_auth_token_at(&vault_dir.join("auth_token"))
+}
 
+/// Choose where to persist a generated admin token. Prefer a state directory
+/// OUTSIDE the vault (systemd `StateDirectory=`, i.e. `$STATE_DIRECTORY`) so a
+/// whole-directory vault backup (tar, rsync, VM/volume snapshot) does not carry
+/// this share-equivalent credential. Fall back to the vault directory only as a
+/// last resort. Returns `(path, is_in_vault_dir)` so the caller can warn when the
+/// token lands in the backup path.
+pub fn choose_persist_path(
+    state_dir: Option<&Path>,
+    vault_dir: &Path,
+) -> (std::path::PathBuf, bool) {
+    match state_dir {
+        Some(dir) if !dir.as_os_str().is_empty() => (dir.join("auth_token"), false),
+        _ => (vault_dir.join("auth_token"), true),
+    }
+}
+
+/// Loads the persisted admin API token from `path`, generating and storing one
+/// (`0600`) on first run. `path` should live outside the vault directory (see
+/// [`choose_persist_path`]) so it is not swept into a vault backup.
+pub fn load_or_create_auth_token_at(path: &Path) -> std::io::Result<String> {
     // Create-exclusive on the final path, so concurrent starts resolve to
     // first-writer-wins. A rename-based write is last-writer-wins, which for a
     // credential means the loser serves a token that exists on no disk and the
@@ -328,7 +390,7 @@ pub fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    match opts.open(&path) {
+    match opts.open(path) {
         Ok(mut f) => {
             use std::io::Write;
             let bytes: [u8; 32] = keep_core::crypto::random_bytes();
@@ -341,7 +403,7 @@ pub fn load_or_create_auth_token(vault_dir: &Path) -> std::io::Result<String> {
         Err(e) => return Err(e),
     }
 
-    read_auth_token(&path)
+    read_auth_token(path)
 }
 
 /// Reads an existing token, refusing to follow a symlink and requiring the
