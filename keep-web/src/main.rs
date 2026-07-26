@@ -63,6 +63,40 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
     Ok(std::fs::read_to_string(path)?.trim().to_string())
 }
 
+/// Read an operator-provisioned admin token from systemd's `$CREDENTIALS_DIRECTORY`
+/// (`LoadCredential=keep-web-auth-token:...`), if present. Returns `Ok(None)` when
+/// the directory is not set by systemd or holds no such credential, so the caller
+/// falls through to the persisted-token path. A present-but-empty credential is an
+/// operator error and fails startup rather than serving an unmatchable token.
+fn credential_dir_token() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY").map(std::path::PathBuf::from);
+    credential_token_at(dir.as_deref())
+}
+
+const CREDENTIAL_NAME: &str = "keep-web-auth-token";
+
+/// Read the admin token from a systemd credentials directory, if `dir` is set and
+/// holds the credential. Split from the env lookup so it is unit-testable.
+fn credential_token_at(
+    dir: Option<&std::path::Path>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    let path = dir.join(CREDENTIAL_NAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let token = read_secret_file(&path.to_string_lossy())?;
+    if token.is_empty() {
+        return Err(format!(
+            "systemd credential {CREDENTIAL_NAME} is present but empty; provide a token or remove it"
+        )
+        .into());
+    }
+    Ok(Some(token))
+}
+
 /// Resolve the optional shared cluster data key (keep-state replication). Reads via
 /// `secret_from` so `KEEP_STORAGE_KEY_FILE` is honored (keeps the raw key off the
 /// process environment, like the password and JWT key). Returns `None` when unset,
@@ -372,12 +406,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             auth::AuthToken::new(t)
         }
         None => {
-            let token = state::load_or_create_auth_token(&vault_path)?;
-            tracing::warn!(
-                path = %vault_path.join("auth_token").display(),
-                "no auth token configured; using the persisted one (set KEEP_WEB_AUTH_TOKEN_FILE to pin it)"
-            );
-            auth::AuthToken::new(token)
+            // Prefer an operator-provisioned credential from systemd's
+            // $CREDENTIALS_DIRECTORY (LoadCredential=): read-only and never
+            // written into the vault directory or a vault backup.
+            if let Some(token) = credential_dir_token()? {
+                tracing::info!("auth token loaded from systemd credentials directory");
+                auth::AuthToken::new(token)
+            } else {
+                // Persist a generated token, preferring a state directory OUTSIDE
+                // the vault ($STATE_DIRECTORY, systemd StateDirectory=) so a
+                // whole-directory vault backup does not carry this
+                // share-equivalent admin credential.
+                let state_dir = std::env::var_os("STATE_DIRECTORY")
+                    .and_then(|d| std::env::split_paths(&d).next());
+                let (token, token_path, in_vault) =
+                    state::resolve_persisted_auth_token(state_dir.as_deref(), &vault_path)?;
+                if in_vault {
+                    tracing::warn!(
+                        path = %token_path.display(),
+                        "no auth token configured and no state or credentials directory available; \
+                         persisted the admin token INSIDE the vault directory, so filesystem backups \
+                         (tar, rsync, VM/volume snapshots) will carry a live admin credential. Set \
+                         KEEP_WEB_AUTH_TOKEN_FILE, systemd StateDirectory=, or LoadCredential= to keep \
+                         it out of the vault backup."
+                    );
+                } else {
+                    tracing::info!(
+                        path = %token_path.display(),
+                        "no auth token configured; using the one persisted outside the vault directory"
+                    );
+                }
+                auth::AuthToken::new(token)
+            }
         }
     };
 
@@ -424,6 +484,30 @@ mod tests {
     use super::*;
     use keep_core::Keep;
     use tempfile::tempdir;
+
+    #[test]
+    fn credential_token_none_when_dir_unset_or_absent() {
+        assert!(credential_token_at(None).unwrap().is_none());
+        let dir = tempdir().unwrap();
+        assert!(credential_token_at(Some(dir.path())).unwrap().is_none());
+    }
+
+    #[test]
+    fn credential_token_reads_present_credential_trimmed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), "  operator-token  ").unwrap();
+        assert_eq!(
+            credential_token_at(Some(dir.path())).unwrap().as_deref(),
+            Some("operator-token")
+        );
+    }
+
+    #[test]
+    fn credential_token_empty_fails_closed() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(CREDENTIAL_NAME), "   \n").unwrap();
+        assert!(credential_token_at(Some(dir.path())).is_err());
+    }
 
     fn unlocked_keep(dir: &std::path::Path) -> Keep {
         let mut keep = Keep::create(&dir.join("vault"), "password").unwrap();
