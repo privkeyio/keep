@@ -266,14 +266,66 @@ pub struct Storage {
 }
 
 fn create_storage_dir(path: &Path) -> Result<()> {
-    if path.exists() {
-        return Err(KeepError::AlreadyExists(path.display().to_string()));
+    // `try_exists` so a permission error is not silently read as "absent".
+    let existed = path.try_exists()?;
+    if existed {
+        // A pre-existing path is acceptable only if it is a directory holding no
+        // vault artifacts, so first-run into a pre-created empty volume (a Docker
+        // named volume or a Kubernetes emptyDir) works without ever clobbering an
+        // existing vault. A rotation backup with no primary is external
+        // corruption that open()'s recovery would delete as stale, so refuse it
+        // too rather than provisioning over the sole surviving ciphertext.
+        if !path.is_dir() {
+            return Err(StorageError::invalid_format(format!(
+                "{} exists but is not a directory",
+                path.display()
+            ))
+            .into());
+        }
+        for artifact in [
+            "keep.hdr",
+            "keep.db",
+            "keep.vault",
+            "keep.hdr.backup",
+            "keep.db.backup",
+        ] {
+            if path.join(artifact).try_exists()? {
+                return Err(KeepError::AlreadyExists(path.display().to_string()));
+            }
+        }
+    } else {
+        fs::create_dir_all(path)?;
     }
-    fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        let perms = fs::Permissions::from_mode(0o700);
+        if existed {
+            // A pre-created volume's ownership is the operator's; tighten to 0700
+            // best-effort so first-boot is not blocked by a chmod the service user
+            // may not be permitted to make, but warn if it stays loose.
+            if let Err(e) = fs::set_permissions(path, perms) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "could not tighten the pre-existing vault directory to 0700; \
+                     ensure it is not group- or world-accessible"
+                );
+            }
+            // Refuse to provision into a directory others can WRITE to: a local
+            // user could then delete or swap the vault files. A merely readable
+            // directory leaks only filenames, so that stays the warning above.
+            let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+            if mode & 0o022 != 0 {
+                return Err(KeepError::PermissionDenied(format!(
+                    "vault directory {} is group/world-writable (mode {mode:o}); \
+                     refusing to provision",
+                    path.display()
+                )));
+            }
+        } else {
+            fs::set_permissions(path, perms)?;
+        }
     }
     Ok(())
 }
@@ -632,6 +684,12 @@ impl Storage {
                 )
                 .into());
             }
+            // No header and no vault data: an existing but empty vault directory
+            // (e.g. a pre-created Docker named volume or Kubernetes emptyDir).
+            // Report NotFound so a provisioning caller treats it as a fresh
+            // install rather than failing on the header read, which pairs with
+            // `create_storage_dir` accepting an existing empty directory.
+            return Err(KeepError::NotFound(path.display().to_string()));
         }
 
         let header_bytes = fs::read(&header_path)?;
@@ -1980,6 +2038,75 @@ mod tests {
             Storage::open(&path).expect("valid vault must open despite stale backups");
         storage.unlock("password").expect("unlock after open");
         assert!(storage.is_unlocked());
+    }
+
+    #[test]
+    fn open_existing_empty_directory_reports_not_found() {
+        // A pre-created empty volume must read as NotFound (not an IO error) so a
+        // provisioning caller treats it as a fresh install. Pairs with create
+        // accepting an existing empty directory.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::create_dir_all(&path).unwrap();
+        match Storage::open(&path) {
+            Err(KeepError::NotFound(_)) => {}
+            Err(e) => panic!("expected NotFound for an existing empty dir, got {e:?}"),
+            Ok(_) => panic!("must not open an empty directory as a vault"),
+        }
+    }
+
+    #[test]
+    fn create_into_existing_empty_directory_succeeds() {
+        // First-run into a pre-created empty volume (Docker named volume,
+        // Kubernetes emptyDir) must work rather than fail with AlreadyExists.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pre-made");
+        std::fs::create_dir_all(&path).unwrap();
+        {
+            let storage = Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+            assert!(storage.is_unlocked());
+        }
+        // Round-trips: the freshly created vault reopens and unlocks.
+        let mut reopened = Storage::open(&path).unwrap();
+        reopened.unlock("password").unwrap();
+        assert!(reopened.is_unlocked());
+    }
+
+    #[test]
+    fn create_refuses_existing_directory_holding_a_vault() {
+        // Re-creating over an existing vault must never clobber it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v");
+        Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+        match Storage::create(&path, "password", Argon2Params::TESTING) {
+            Err(KeepError::AlreadyExists(_)) => {}
+            Err(e) => panic!("expected AlreadyExists over an existing vault, got {e:?}"),
+            Ok(_) => panic!("must not create over an existing vault"),
+        }
+    }
+
+    #[test]
+    fn create_refuses_dir_holding_any_single_vault_artifact() {
+        // Each artifact alone (including a lone rotation backup, which open()'s
+        // recovery would delete as stale) must block provisioning, covering the
+        // standard, hidden-volume, and partially-corrupted layouts.
+        for artifact in [
+            "keep.hdr",
+            "keep.db",
+            "keep.vault",
+            "keep.hdr.backup",
+            "keep.db.backup",
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("v");
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(artifact), b"x").unwrap();
+            match Storage::create(&path, "password", Argon2Params::TESTING) {
+                Err(KeepError::AlreadyExists(_)) => {}
+                Err(e) => panic!("expected AlreadyExists for a dir holding {artifact}, got {e:?}"),
+                Ok(_) => panic!("must not provision into a dir holding {artifact}"),
+            }
+        }
     }
 
     #[test]
