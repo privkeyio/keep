@@ -169,6 +169,33 @@ fn parse_shared_data_key(raw: &str) -> Result<Zeroizing<[u8; 32]>, Box<dyn std::
     Ok(key)
 }
 
+/// Minimum length for an operator-configured admin bearer token. A shorter token
+/// is online-brute-forceable at request rate, so the daemon refuses to start
+/// rather than serve a weak credential. The token the daemon mints is 64 hex
+/// chars; a configured value may be a passphrase, so this is a character floor,
+/// not a hex-shape check.
+const MIN_CONFIGURED_TOKEN_CHARS: usize = 32;
+
+/// Validate a configured `KEEP_WEB_AUTH_TOKEN[_FILE]` value: reject empty or
+/// too-short. `AuthToken::new` trims, so the trimmed value is what becomes the
+/// credential and what is measured here.
+fn check_configured_token(token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "KEEP_WEB_AUTH_TOKEN[_FILE] is set but empty; unset it or provide a token".into(),
+        );
+    }
+    let len = trimmed.chars().count();
+    if len < MIN_CONFIGURED_TOKEN_CHARS {
+        return Err(format!(
+            "KEEP_WEB_AUTH_TOKEN[_FILE] is too short ({len} chars); the admin bearer token must be at least {MIN_CONFIGURED_TOKEN_CHARS} characters"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Fail closed when a fresh vault is about to be created for a node that joins a keep-state
 /// replication cluster (`KEEP_STATE_RELAY` set) without the shared cluster data key. Such a vault
 /// would be created with a per-node RANDOM key and could never decrypt records replicated by its
@@ -436,14 +463,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // share export, so the journal is the wrong place for it.
     let auth_token = match secret_from("KEEP_WEB_AUTH_TOKEN")? {
         // secret_from only filters empties on the env-var branch, so an empty
-        // KEEP_WEB_AUTH_TOKEN_FILE arrives here as Some(""). Serving that would
-        // 401 every request forever with no diagnostic; fail loudly at boot.
-        Some(t) if t.trim().is_empty() => {
-            return Err(
-                "KEEP_WEB_AUTH_TOKEN[_FILE] is set but empty; unset it or provide a token".into(),
-            )
-        }
+        // KEEP_WEB_AUTH_TOKEN_FILE arrives here as Some(""). Reject that, and any
+        // token below the minimum length, loudly at boot rather than serving a
+        // weak or unusable credential.
         Some(t) => {
+            check_configured_token(&t)?;
             tracing::info!("auth token configured; bearer auth required on all endpoints");
             auth::AuthToken::new(t)
         }
@@ -526,6 +550,28 @@ mod tests {
     use super::*;
     use keep_core::Keep;
     use tempfile::tempdir;
+
+    #[test]
+    fn configured_token_enforces_a_minimum_length_floor() {
+        // Empty / whitespace-only is rejected.
+        assert!(check_configured_token("").is_err());
+        assert!(check_configured_token("    ").is_err());
+        // Below the floor is rejected (measured after trimming, since AuthToken
+        // trims the value it stores).
+        assert!(check_configured_token("short").is_err());
+        assert!(check_configured_token(&"a".repeat(MIN_CONFIGURED_TOKEN_CHARS - 1)).is_err());
+        assert!(
+            check_configured_token(&format!(
+                "  {}  ",
+                "a".repeat(MIN_CONFIGURED_TOKEN_CHARS - 1)
+            ))
+            .is_err(),
+            "trimmed length below the floor must be rejected"
+        );
+        // At or above the floor is accepted.
+        assert!(check_configured_token(&"a".repeat(MIN_CONFIGURED_TOKEN_CHARS)).is_ok());
+        assert!(check_configured_token(&"a".repeat(64)).is_ok());
+    }
 
     #[cfg(unix)]
     #[test]
