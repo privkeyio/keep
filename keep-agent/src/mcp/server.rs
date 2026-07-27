@@ -751,4 +751,268 @@ mod tests {
         let r = resp.result.expect("result");
         assert_eq!(r["isError"], serde_json::json!(true));
     }
+
+    // --- keep-vfx3: end-to-end coverage of the financial-safety guards in the
+    // sign_bitcoin_psbt tool arm, plus the event-kind gates in sign_nostr_event.
+    // The predicate helpers are unit-tested in scope.rs/session.rs; these drive
+    // the actual MCP wiring through handle_request_async. ---
+
+    // A base64 PSBT with one output (`out_sats` to `output_spk`) funded by one
+    // input whose witness_utxo is `in_sats`, so analyze_psbt sees a valid tx
+    // (inputs >= outputs) with a controllable output amount and address. The
+    // output carries no owner tap metadata, so it is treated as a spend, not change.
+    fn psbt_base64_single_output(
+        output_spk: keep_bitcoin::bitcoin::ScriptBuf,
+        out_sats: u64,
+        in_sats: u64,
+    ) -> String {
+        use keep_bitcoin::bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, Psbt,
+            ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(out_sats),
+                script_pubkey: output_spk,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("valid unsigned tx");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(in_sats),
+            script_pubkey: ScriptBuf::new(),
+        });
+        keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
+    }
+
+    // The x-only key for a fixed seed. Seed 7 is `signing_server`'s own key, so
+    // `xonly_for_seed(7)` marks an output as recognized change (is_change_output
+    // matches the signer's key against the output's tap_internal_key).
+    fn xonly_for_seed(seed: u8) -> keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey {
+        use keep_bitcoin::bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[seed; 32]).expect("valid secret");
+        keypair.x_only_public_key().0
+    }
+
+    // A deterministic testnet p2tr address from a fixed seed (distinct seeds give
+    // distinct addresses). Testnet matches the tool's default network so
+    // analyze_psbt's `Address::from_script` yields the same string we assert on.
+    fn testnet_p2tr_address(seed: u8) -> keep_bitcoin::bitcoin::Address {
+        use keep_bitcoin::bitcoin::{key::Secp256k1, Address, Network};
+        Address::p2tr(
+            &Secp256k1::new(),
+            xonly_for_seed(seed),
+            None,
+            Network::Testnet,
+        )
+    }
+
+    // A base64 PSBT with two outputs: an external spend (`spend_sats` to
+    // `spend_spk`, no tap metadata -> not change) and a change output
+    // (`change_sats` to `change_spk`) whose tap_internal_key is set so
+    // is_change_output recognizes it as change. Funded by one input of `in_sats`.
+    fn psbt_base64_spend_and_change(
+        spend_spk: keep_bitcoin::bitcoin::ScriptBuf,
+        spend_sats: u64,
+        change_spk: keep_bitcoin::bitcoin::ScriptBuf,
+        change_sats: u64,
+        change_internal_key: keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey,
+        in_sats: u64,
+    ) -> String {
+        use keep_bitcoin::bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, Psbt,
+            ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
+        };
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(spend_sats),
+                    script_pubkey: spend_spk,
+                },
+                TxOut {
+                    value: Amount::from_sat(change_sats),
+                    script_pubkey: change_spk,
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("valid unsigned tx");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(in_sats),
+            script_pubkey: ScriptBuf::new(),
+        });
+        psbt.outputs[1].tap_internal_key = Some(change_internal_key);
+        keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_refuses_overspend() {
+        // A PSBT whose total output exceeds the session's max_amount_sats must be
+        // refused before any signing, through the actual MCP tool arm.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_max_amount(10_000),
+        )
+        .await;
+        let psbt =
+            psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 50_000, 60_000);
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("overspend must be refused, got {:?}", resp.result));
+        assert!(
+            e.message.contains("Amount exceeded"),
+            "expected an amount-exceeded refusal, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_counts_recognized_change_toward_the_amount_limit() {
+        // The amount guard caps total_output_sats, INCLUDING recognized change, not
+        // just the external (non-change) spend. This pins that semantic on purpose:
+        // is_change is derived from client-supplied PSBT output metadata
+        // (tap_internal_key), so trusting it to shrink the amount check would let a
+        // malicious client relabel a large output as change to exceed the cap. Here
+        // the external spend (8_000) is under the 10_000 limit but the total incl.
+        // change (58_000) is over, so the request must be refused. If the guard were
+        // changed to count only non-change spend, this test would fail.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_max_amount(10_000),
+        )
+        .await;
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            testnet_p2tr_address(7).script_pubkey(),
+            50_000,
+            xonly_for_seed(7),
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp.error.unwrap_or_else(|| {
+            panic!(
+                "total outputs over the limit (including change) must be refused, got {:?}",
+                resp.result
+            )
+        });
+        assert!(
+            e.message.contains("Amount exceeded"),
+            "expected an amount-exceeded refusal counting change, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_refuses_non_allowlisted_output() {
+        // A non-change output to an address outside the allowlist must be refused
+        // through the actual MCP tool arm.
+        let server = signing_server();
+        let allowed = testnet_p2tr_address(3);
+        let disallowed = testnet_p2tr_address(2);
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_address_allowlist([allowed.to_string()]),
+        )
+        .await;
+        let psbt = psbt_base64_single_output(disallowed.script_pubkey(), 10_000, 20_000);
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp.error.unwrap_or_else(|| {
+            panic!(
+                "non-allowlisted output must be refused, got {:?}",
+                resp.result
+            )
+        });
+        assert!(
+            e.message.contains("Address not allowed")
+                && e.message.contains(&disallowed.to_string()),
+            "expected an address-not-allowed refusal naming the output, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_nostr_event_rejects_kind_above_u16_max() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 70_000, "content": "x", "tags": []}),
+            ))
+            .await;
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("out-of-range kind must be refused, got {:?}", resp.result));
+        assert!(
+            e.message.contains("exceeds maximum value"),
+            "expected an out-of-range kind refusal, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_nostr_event_enforces_the_event_kind_allowlist() {
+        // A session restricted to kinds {1,4,7} must refuse to sign kind 5 before
+        // any key use, through the MCP tool arm.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::nostr_only().with_event_kinds([1, 4, 7]),
+        )
+        .await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 5, "content": "x", "tags": []}),
+            ))
+            .await;
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("disallowed kind must be refused, got {:?}", resp.result));
+        assert!(
+            e.message.contains("Event kind not allowed"),
+            "expected an event-kind refusal, got: {}",
+            e.message
+        );
+    }
 }
