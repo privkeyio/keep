@@ -795,18 +795,75 @@ mod tests {
         keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
+    // The x-only key for a fixed seed. Seed 7 is `signing_server`'s own key, so
+    // `xonly_for_seed(7)` marks an output as recognized change (is_change_output
+    // matches the signer's key against the output's tap_internal_key).
+    fn xonly_for_seed(seed: u8) -> keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey {
+        use keep_bitcoin::bitcoin::secp256k1::{Keypair, Secp256k1};
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[seed; 32]).expect("valid secret");
+        keypair.x_only_public_key().0
+    }
+
     // A deterministic testnet p2tr address from a fixed seed (distinct seeds give
     // distinct addresses). Testnet matches the tool's default network so
     // analyze_psbt's `Address::from_script` yields the same string we assert on.
     fn testnet_p2tr_address(seed: u8) -> keep_bitcoin::bitcoin::Address {
+        use keep_bitcoin::bitcoin::{key::Secp256k1, Address, Network};
+        Address::p2tr(
+            &Secp256k1::new(),
+            xonly_for_seed(seed),
+            None,
+            Network::Testnet,
+        )
+    }
+
+    // A base64 PSBT with two outputs: an external spend (`spend_sats` to
+    // `spend_spk`, no tap metadata -> not change) and a change output
+    // (`change_sats` to `change_spk`) whose tap_internal_key is set so
+    // is_change_output recognizes it as change. Funded by one input of `in_sats`.
+    fn psbt_base64_spend_and_change(
+        spend_spk: keep_bitcoin::bitcoin::ScriptBuf,
+        spend_sats: u64,
+        change_spk: keep_bitcoin::bitcoin::ScriptBuf,
+        change_sats: u64,
+        change_internal_key: keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey,
+        in_sats: u64,
+    ) -> String {
         use keep_bitcoin::bitcoin::{
-            secp256k1::{Keypair, Secp256k1},
-            Address, Network,
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, Psbt,
+            ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness,
         };
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[seed; 32]).expect("valid secret");
-        let (xonly, _) = keypair.x_only_public_key();
-        Address::p2tr(&secp, xonly, None, Network::Testnet)
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(spend_sats),
+                    script_pubkey: spend_spk,
+                },
+                TxOut {
+                    value: Amount::from_sat(change_sats),
+                    script_pubkey: change_spk,
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).expect("valid unsigned tx");
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(in_sats),
+            script_pubkey: ScriptBuf::new(),
+        });
+        psbt.outputs[1].tap_internal_key = Some(change_internal_key);
+        keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
     #[tokio::test]
@@ -833,6 +890,49 @@ mod tests {
         assert!(
             e.message.contains("Amount exceeded"),
             "expected an amount-exceeded refusal, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_counts_recognized_change_toward_the_amount_limit() {
+        // The amount guard caps total_output_sats, INCLUDING recognized change, not
+        // just the external (non-change) spend. This pins that semantic on purpose:
+        // is_change is derived from client-supplied PSBT output metadata
+        // (tap_internal_key), so trusting it to shrink the amount check would let a
+        // malicious client relabel a large output as change to exceed the cap. Here
+        // the external spend (8_000) is under the 10_000 limit but the total incl.
+        // change (58_000) is over, so the request must be refused. If the guard were
+        // changed to count only non-change spend, this test would fail.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_max_amount(10_000),
+        )
+        .await;
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            testnet_p2tr_address(7).script_pubkey(),
+            50_000,
+            xonly_for_seed(7),
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp.error.unwrap_or_else(|| {
+            panic!(
+                "total outputs over the limit (including change) must be refused, got {:?}",
+                resp.result
+            )
+        });
+        assert!(
+            e.message.contains("Amount exceeded"),
+            "expected an amount-exceeded refusal counting change, got: {}",
             e.message
         );
     }
