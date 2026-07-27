@@ -599,7 +599,10 @@ impl Storage {
 
     /// Open existing storage.
     pub fn open(path: &Path) -> Result<Self> {
-        if !path.exists() {
+        // `try_exists` (not `exists`) so a permission error surfaces as an error
+        // rather than being misread as "no vault here", which a provisioning
+        // caller would treat as a fresh install.
+        if !path.try_exists()? {
             return Err(KeepError::NotFound(path.display().to_string()));
         }
 
@@ -612,6 +615,25 @@ impl Storage {
         crate::rotation::recover_rotation_artifacts(path);
 
         let header_path = path.join("keep.hdr");
+        // Fund-safety guard: a directory holding vault artifacts (`keep.db`, or the
+        // hidden-volume `keep.vault`) but no header must never be reported as an
+        // empty path. A caller that provisions on "not found" would otherwise
+        // create a fresh vault over existing ciphertext (unrecoverable share loss)
+        // or over a hidden volume (breaking deniability). Report it as a distinct
+        // corrupt-format error, never `NotFound`, so the two states cannot be
+        // conflated regardless of how the header read's IO error maps.
+        if !header_path.try_exists()? {
+            let has_db = path.join("keep.db").try_exists()?;
+            let has_vault = path.join("keep.vault").try_exists()?;
+            if has_db || has_vault {
+                return Err(StorageError::invalid_format(
+                    "vault header (keep.hdr) missing but vault data is present; \
+                     refusing to open as an empty path",
+                )
+                .into());
+            }
+        }
+
         let header_bytes = fs::read(&header_path)?;
 
         if header_bytes.len() != HEADER_SIZE {
@@ -1886,6 +1908,54 @@ mod tests {
 
             storage.unlock("password").unwrap();
             assert!(storage.is_unlocked());
+        }
+    }
+
+    #[test]
+    fn open_missing_directory_reports_not_found() {
+        let dir = tempdir().unwrap();
+        match Storage::open(&dir.path().join("absent")) {
+            Err(KeepError::NotFound(_)) => {}
+            Err(e) => panic!("expected NotFound for a missing directory, got {e:?}"),
+            Ok(_) => panic!("expected NotFound for a missing directory, but open succeeded"),
+        }
+    }
+
+    #[test]
+    fn open_vault_missing_header_is_not_reported_as_not_found() {
+        // A vault whose header was deleted must never be mistaken for an empty
+        // path: a caller provisioning on NotFound would create a fresh vault over
+        // the existing keep.db, unrecoverably losing the shares it holds.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v");
+        Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+        std::fs::remove_file(path.join("keep.hdr")).unwrap();
+        assert!(path.join("keep.db").exists(), "vault data still present");
+        match Storage::open(&path) {
+            Err(KeepError::NotFound(_)) => {
+                panic!("must NOT report NotFound while vault data is present")
+            }
+            Err(_) => {} // a distinct corrupt-format error is correct
+            Ok(_) => panic!("must not open a vault with no header"),
+        }
+    }
+
+    #[test]
+    fn open_hidden_volume_dir_without_header_is_not_reported_as_not_found() {
+        // keep.vault (+ keep.db) with no keep.hdr is a hidden-volume layout;
+        // reporting it as NotFound would let a caller provision a plain vault over
+        // it, landing a keep.hdr next to keep.vault and breaking deniability.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hv");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("keep.vault"), b"ciphertext").unwrap();
+        std::fs::write(path.join("keep.db"), b"db").unwrap();
+        match Storage::open(&path) {
+            Err(KeepError::NotFound(_)) => {
+                panic!("must NOT report NotFound for a hidden-volume directory")
+            }
+            Err(_) => {}
+            Ok(_) => panic!("must not open a headerless hidden-volume directory"),
         }
     }
 
