@@ -44,23 +44,50 @@ pub(crate) fn secret_from(key: &str) -> Result<Option<String>, Box<dyn std::erro
 }
 
 fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
-    // The permission check is Unix-only (keep-web runs on Linux/StartOS); on
-    // other platforms the file is read without the mode warning so the
-    // workspace still builds (e.g. Windows CI).
+    // The symlink/regular-file guard and the permission check are Unix-only
+    // (keep-web runs on Linux/StartOS); on other platforms the file is read
+    // plainly so the workspace still builds (e.g. Windows CI).
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = std::fs::metadata(path)?;
-        let mode = meta.permissions().mode() & 0o777;
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let p = std::path::Path::new(path);
+        // Refuse a planted symlink (or any non-regular file) at the final
+        // component: following it would let whoever can create it redirect the
+        // read to an attacker-known file whose contents keep-web would then adopt
+        // as the secret (e.g. the admin bearer token gating share export).
+        // `symlink_metadata` does not traverse the final component. Mirrors the
+        // persisted-token reader `state::read_auth_token`.
+        let md = std::fs::symlink_metadata(p)?;
+        if md.file_type().is_symlink() || !md.is_file() {
+            return Err(format!("secret file {path} must be a regular file, not a symlink").into());
+        }
+        let mode = md.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
+            // A warning, not a rejection: these files are operator-provided and
+            // their ownership/mode legitimately varies (e.g. a 0640 root-managed
+            // secret). The symlink guard above is the security-critical part.
             tracing::warn!(
                 path,
                 mode = format!("{mode:o}"),
                 "secret file is group/world accessible; tighten to 0600"
             );
         }
+        // Reopen and confirm the opened file is the one just stat'd, closing the
+        // window where the path is swapped for a symlink between lstat and open.
+        let mut f = std::fs::File::open(p)?;
+        let opened = f.metadata()?;
+        if opened.ino() != md.ino() || opened.dev() != md.dev() {
+            return Err(format!("secret file {path} changed while being read; refusing").into());
+        }
+        let mut s = String::new();
+        f.read_to_string(&mut s)?;
+        Ok(s.trim().to_string())
     }
-    Ok(std::fs::read_to_string(path)?.trim().to_string())
+    #[cfg(not(unix))]
+    {
+        Ok(std::fs::read_to_string(path)?.trim().to_string())
+    }
 }
 
 /// Read an operator-provisioned admin token from systemd's `$CREDENTIALS_DIRECTORY`
@@ -490,6 +517,29 @@ mod tests {
     use super::*;
     use keep_core::Keep;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_file_rejects_symlink() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "attacker-known-token").unwrap();
+        let link = dir.path().join("auth-token");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(
+            read_secret_file(&link.to_string_lossy()).is_err(),
+            "a symlinked secret file must be refused, not followed to its target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_file_reads_regular_file_trimmed() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("token");
+        std::fs::write(&f, "  the-token\n").unwrap();
+        assert_eq!(read_secret_file(&f.to_string_lossy()).unwrap(), "the-token");
+    }
 
     #[test]
     fn credential_token_none_when_dir_unset_or_absent() {
