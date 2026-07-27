@@ -77,6 +77,9 @@ jobs:
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
       - run: cargo test -p keep-enclave-host --test integration_tests
+      # The MCP agent surface is behind the non-default `mcp` feature, so the
+      # workspace test run above never compiles it; run its tests explicitly.
+      - run: cargo test -p keep-agent --features mcp --lib
       # End-to-end CLI tests drive the release `keep` binary built above as a
       # subprocess (the tests locate `target/release/keep`), so run them in
       # --release too. Previously only compile-checked, never executed in CI.

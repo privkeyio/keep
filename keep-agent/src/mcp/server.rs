@@ -534,4 +534,167 @@ mod tests {
         let tools = result.get("tools").unwrap().as_array().unwrap();
         assert!(!tools.is_empty());
     }
+
+    // End-to-end coverage of the JSON-RPC surface (#461): drive real requests
+    // through `handle_request_async` and assert the initialize handshake, the
+    // advertised toolset, per-tool call results, and the session permission
+    // model (which gates every signing tool).
+    use crate::scope::SessionScope;
+    use crate::session::SessionConfig;
+
+    fn signing_server() -> McpServer {
+        // Deterministic key so a produced signature is reproducible in shape.
+        let secret = [7u8; 32];
+        let keys = nostr_sdk::Keys::parse(&hex::encode(secret)).expect("valid key");
+        let pubkey: [u8; 32] = keys.public_key().to_bytes();
+        McpServer::with_signing(pubkey, secret)
+    }
+
+    async fn install_session(server: &McpServer, scope: SessionScope) {
+        let config = SessionConfig::new(scope).with_duration_hours(1);
+        let (token, sid) = server.create_session(config).await.expect("create session");
+        server.set_session(token, sid).await;
+    }
+
+    fn rpc(method: &str, params: Value) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            .to_string()
+    }
+
+    fn call(name: &str, arguments: Value) -> String {
+        rpc(
+            "tools/call",
+            serde_json::json!({"name": name, "arguments": arguments}),
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_handshake_over_jsonrpc() {
+        let server = signing_server();
+        let resp = server
+            .handle_request_async(&rpc("initialize", Value::Null))
+            .await;
+        assert!(resp.error.is_none());
+        let r = resp.result.expect("initialize result");
+        assert!(r.get("protocolVersion").is_some());
+        assert!(r.get("serverInfo").is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_reports_the_signing_toolset() {
+        let server = signing_server();
+        let resp = server
+            .handle_request_async(&rpc("tools/list", Value::Null))
+            .await;
+        let r = resp.result.expect("tools/list result");
+        let names: Vec<String> = r["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        for expected in [
+            "sign_nostr_event",
+            "sign_bitcoin_psbt",
+            "get_nostr_pubkey",
+            "get_bitcoin_address",
+            "get_session_info",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "tools/list missing {expected}; got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_requires_an_active_session() {
+        // Fail-closed: with no session established, a signing tool is refused
+        // rather than executed.
+        let server = signing_server();
+        let resp = server
+            .handle_request_async(&call("get_nostr_pubkey", serde_json::json!({})))
+            .await;
+        let e = resp.error.expect("no-session call must error");
+        assert!(
+            e.message.contains("No active session"),
+            "got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_get_nostr_pubkey_succeeds_within_scope() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call("get_nostr_pubkey", serde_json::json!({})))
+            .await;
+        assert!(resp.error.is_none());
+        let r = resp.result.expect("result");
+        assert_eq!(r["isError"], serde_json::json!(false));
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert!(payload.get("npub").is_some() && payload.get("hex").is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_nostr_event_produces_a_signed_event() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "hello from the mcp test", "tags": []}),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "sign failed: {:?}", resp.error);
+        let r = resp.result.expect("result");
+        assert_eq!(r["isError"], serde_json::json!(false));
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let event: Value = serde_json::from_str(text).unwrap();
+        assert!(event.get("id").is_some() && event.get("sig").is_some());
+        assert_eq!(event["kind"], serde_json::json!(1));
+    }
+
+    #[tokio::test]
+    async fn mcp_enforces_the_operation_scope() {
+        // The permission model: a bitcoin-only session must NOT be able to sign a
+        // Nostr event; the operation is refused before any key is used.
+        let server = signing_server();
+        install_session(&server, SessionScope::bitcoin_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "x", "tags": []}),
+            ))
+            .await;
+        assert!(
+            resp.error.is_some(),
+            "an out-of-scope operation must be refused, got {:?}",
+            resp.result
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_unknown_method_is_rejected() {
+        let server = signing_server();
+        let resp = server
+            .handle_request_async(&rpc("does/not/exist", Value::Null))
+            .await;
+        let e = resp.error.expect("unknown method must error");
+        assert!(e.message.contains("Unknown method"), "got: {}", e.message);
+    }
+
+    #[tokio::test]
+    async fn mcp_unknown_tool_returns_a_tool_error() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call("no_such_tool", serde_json::json!({})))
+            .await;
+        // Unknown tool is a tool-level error (isError), not a JSON-RPC error.
+        let r = resp.result.expect("result");
+        assert_eq!(r["isError"], serde_json::json!(true));
+    }
 }
