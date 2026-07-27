@@ -63,14 +63,23 @@ fn read_secret_file(path: &str) -> Result<String, Box<dyn std::error::Error>> {
             return Err(format!("secret file {path} must be a regular file, not a symlink").into());
         }
         let mode = md.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            // A warning, not a rejection: these files are operator-provided and
-            // their ownership/mode legitimately varies (e.g. a 0640 root-managed
-            // secret). The symlink guard above is the security-critical part.
+        if mode & 0o022 != 0 {
+            // Group/world-WRITABLE: an attacker could rewrite the secret (admin
+            // token, vault password) in place, an integrity hole the symlink
+            // guard does not cover. Refuse, mirroring the vault-directory guard.
+            return Err(format!(
+                "secret file {path} is group/world-writable (mode {mode:o}); refusing to read it"
+            )
+            .into());
+        }
+        if mode & 0o044 != 0 {
+            // Merely group/world-READABLE is advisory hygiene, not a redirect or
+            // integrity hole: these files are operator-provided and their mode
+            // legitimately varies (e.g. a 0640 root-managed secret), so warn.
             tracing::warn!(
                 path,
                 mode = format!("{mode:o}"),
-                "secret file is group/world accessible; tighten to 0600"
+                "secret file is group/world-readable; tighten to 0600"
             );
         }
         // Reopen and confirm the opened file is the one just stat'd, closing the
@@ -535,10 +544,41 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_secret_file_reads_regular_file_trimmed() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = tempdir().unwrap();
         let f = dir.path().join("token");
         std::fs::write(&f, "  the-token\n").unwrap();
+        // A correctly-provisioned secret file is owner-only; set it explicitly so
+        // the test is independent of the runner's umask.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(read_secret_file(&f.to_string_lossy()).unwrap(), "the-token");
+    }
+
+    #[test]
+    fn read_secret_file_rejects_non_regular_file() {
+        // A directory (or a fifo/socket) at the path must be refused, not read:
+        // besides being wrong, reading a fifo would block startup indefinitely.
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("not-a-file");
+        std::fs::create_dir(&sub).unwrap();
+        assert!(
+            read_secret_file(&sub.to_string_lossy()).is_err(),
+            "a non-regular file must be refused"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_secret_file_rejects_group_or_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("token");
+        std::fs::write(&f, "secret").unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(
+            read_secret_file(&f.to_string_lossy()).is_err(),
+            "a group/world-writable secret file must be refused"
+        );
     }
 
     #[test]
@@ -551,7 +591,15 @@ mod tests {
     #[test]
     fn credential_token_reads_present_credential_trimmed() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join(CREDENTIAL_NAME), "  operator-token  ").unwrap();
+        let cred = dir.path().join(CREDENTIAL_NAME);
+        std::fs::write(&cred, "  operator-token  ").unwrap();
+        // systemd credentials are owner-only (0400); set 0600 so the read is
+        // independent of the runner's umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&cred, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(
             credential_token_at(Some(dir.path())).unwrap().as_deref(),
             Some("operator-token")
