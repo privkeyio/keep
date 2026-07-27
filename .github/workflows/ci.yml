@@ -77,6 +77,13 @@ jobs:
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
       - run: cargo test -p keep-enclave-host --test integration_tests
+      # keep-enclave-bin (the Nitro Enclave binary) is a separate workspace excluded
+      # from the root workspace, so `cargo test --workspace` never builds it. It is
+      # target_os=linux gated (vsock), so build and test it explicitly on Linux only,
+      # otherwise a compile break or test regression in the enclave signer/policy code
+      # would not be caught by CI.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo test --manifest-path keep-enclave/enclave/Cargo.toml
       # The MCP agent surface is behind the non-default `mcp` feature, so the
       # workspace test run above never compiles it; run its tests explicitly.
       - run: cargo test -p keep-agent --features mcp --lib
