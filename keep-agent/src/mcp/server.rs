@@ -556,9 +556,13 @@ mod tests {
         server.set_session(token, sid).await;
     }
 
-    fn rpc(method: &str, params: Value) -> String {
-        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    fn rpc_id(id: i64, method: &str, params: Value) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
             .to_string()
+    }
+
+    fn rpc(method: &str, params: Value) -> String {
+        rpc_id(1, method, params)
     }
 
     fn call(name: &str, arguments: Value) -> String {
@@ -572,12 +576,21 @@ mod tests {
     async fn mcp_initialize_handshake_over_jsonrpc() {
         let server = signing_server();
         let resp = server
-            .handle_request_async(&rpc("initialize", Value::Null))
+            .handle_request_async(&rpc_id(42, "initialize", Value::Null))
             .await;
         assert!(resp.error.is_none());
+        // The response must echo the request id (JSON-RPC correlation).
+        assert_eq!(resp.id, serde_json::json!(42));
         let r = resp.result.expect("initialize result");
-        assert!(r.get("protocolVersion").is_some());
-        assert!(r.get("serverInfo").is_some());
+        // Assert usable values, not just presence: `get()` also succeeds on null.
+        assert!(
+            r["protocolVersion"].as_str().is_some(),
+            "protocolVersion must be a non-null string"
+        );
+        assert!(
+            r["serverInfo"].as_object().is_some(),
+            "serverInfo must be a non-null object"
+        );
     }
 
     #[tokio::test]
@@ -719,8 +732,10 @@ mod tests {
     async fn mcp_unknown_method_is_rejected() {
         let server = signing_server();
         let resp = server
-            .handle_request_async(&rpc("does/not/exist", Value::Null))
+            .handle_request_async(&rpc_id(7, "does/not/exist", Value::Null))
             .await;
+        // The id is preserved even on the error path (JSON-RPC correlation).
+        assert_eq!(resp.id, serde_json::json!(7));
         let e = resp.error.expect("unknown method must error");
         assert!(e.message.contains("Unknown method"), "got: {}", e.message);
     }
