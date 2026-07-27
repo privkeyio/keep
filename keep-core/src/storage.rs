@@ -1932,10 +1932,13 @@ mod tests {
         std::fs::remove_file(path.join("keep.hdr")).unwrap();
         assert!(path.join("keep.db").exists(), "vault data still present");
         match Storage::open(&path) {
+            // The distinct corrupt-format error is the contract: pin it so a
+            // future fall-through to fs::read's Io(NotFound) is caught here.
+            Err(KeepError::StorageErr(StorageError::InvalidFormat { .. })) => {}
             Err(KeepError::NotFound(_)) => {
                 panic!("must NOT report NotFound while vault data is present")
             }
-            Err(_) => {} // a distinct corrupt-format error is correct
+            Err(e) => panic!("expected InvalidFormat, got {e:?}"),
             Ok(_) => panic!("must not open a vault with no header"),
         }
     }
@@ -1951,12 +1954,32 @@ mod tests {
         std::fs::write(path.join("keep.vault"), b"ciphertext").unwrap();
         std::fs::write(path.join("keep.db"), b"db").unwrap();
         match Storage::open(&path) {
+            Err(KeepError::StorageErr(StorageError::InvalidFormat { .. })) => {}
             Err(KeepError::NotFound(_)) => {
                 panic!("must NOT report NotFound for a hidden-volume directory")
             }
-            Err(_) => {}
+            Err(e) => panic!("expected InvalidFormat, got {e:?}"),
             Ok(_) => panic!("must not open a headerless hidden-volume directory"),
         }
+    }
+
+    #[test]
+    fn open_succeeds_with_valid_header_and_stale_rotation_backups() {
+        // The guard runs after recover_rotation_artifacts and must be a no-op when
+        // the header is present, even with stale rotation backups beside it: a
+        // valid vault must still open.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v");
+        Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+        // A backup that differs from the live header is treated as stale (the
+        // rewrite completed), so recovery deletes it without touching keep.db.
+        std::fs::write(path.join("keep.hdr.backup"), b"stale-different-header").unwrap();
+        std::fs::write(path.join("keep.db.backup"), b"stale-db").unwrap();
+
+        let mut storage =
+            Storage::open(&path).expect("valid vault must open despite stale backups");
+        storage.unlock("password").expect("unlock after open");
+        assert!(storage.is_unlocked());
     }
 
     #[test]
