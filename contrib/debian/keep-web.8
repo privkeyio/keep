@@ -44,7 +44,10 @@ under systemd's
 then persists a generated token to
 .I $STATE_DIRECTORY/auth_token
 .RB ( StateDirectory= ,
-outside the vault). Only if none of those are available does it fall back to
+which must be configured outside
+.IR $KEEP_PATH ;
+a state directory nested inside the vault is treated as in-vault and warned).
+Only if none of those are available does it fall back to
 .I $KEEP_PATH/auth_token
 inside the vault directory, with a warning: the bearer token is
 share-equivalent against a running daemon, so keeping it out of the vault

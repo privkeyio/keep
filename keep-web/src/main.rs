@@ -84,8 +84,14 @@ fn credential_token_at(
         return Ok(None);
     };
     let path = dir.join(CREDENTIAL_NAME);
-    if !path.exists() {
-        return Ok(None);
+    // Distinguish a genuinely absent credential (fall through to the persisted
+    // token) from a stat failure such as EACCES: `Path::exists` collapses both to
+    // false, which would silently mint a fallback token when a credential is
+    // present but unreadable. Fail closed on anything other than NotFound.
+    match path.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(e) => return Err(e.into()),
     }
     let token = read_secret_file(&path.to_string_lossy())?;
     if token.is_empty() {

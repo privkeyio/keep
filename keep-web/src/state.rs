@@ -146,6 +146,17 @@ mod tests {
         let (path, in_vault) = choose_persist_path(Some(vault), vault);
         assert_eq!(path, Path::new("/data/auth_token"));
         assert!(in_vault);
+        // A state dir NESTED inside the vault is still in the backup path.
+        let (_, in_vault) = choose_persist_path(Some(Path::new("/data/state")), vault);
+        assert!(in_vault);
+        // A state dir that is a PARENT of the vault is genuinely outside it (the
+        // packaged /var/lib/keep-web vs vault /var/lib/keep-web/vault).
+        let (path, in_vault) = choose_persist_path(
+            Some(Path::new("/var/lib/keep-web")),
+            Path::new("/var/lib/keep-web/vault"),
+        );
+        assert_eq!(path, Path::new("/var/lib/keep-web/auth_token"));
+        assert!(!in_vault);
     }
 
     #[test]
@@ -415,10 +426,14 @@ pub fn choose_persist_path(
     vault_dir: &Path,
 ) -> (std::path::PathBuf, bool) {
     match state_dir {
-        // A state dir that is the vault dir itself is not "outside" it: the token
-        // would still land in the backup path, so fall through to the vault case
-        // and keep the warning honest rather than suppressing it.
-        Some(dir) if !dir.as_os_str().is_empty() && dir != vault_dir => {
+        // A state dir that is the vault dir, or nested inside it, is not "outside"
+        // the backup path: the token would still be swept into a vault snapshot.
+        // `starts_with` is component-wise, so `/data/state` under vault `/data` is
+        // caught, while a state dir that is a PARENT of the vault (the packaged
+        // `/var/lib/keep-web` vs vault `/var/lib/keep-web/vault`) is correctly
+        // treated as outside. Fall through to the vault case so the warning stays
+        // honest rather than being suppressed.
+        Some(dir) if !dir.as_os_str().is_empty() && !dir.starts_with(vault_dir) => {
             (dir.join("auth_token"), false)
         }
         _ => (vault_dir.join("auth_token"), true),
