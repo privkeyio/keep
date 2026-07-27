@@ -669,11 +669,50 @@ mod tests {
                 serde_json::json!({"kind": 1, "content": "x", "tags": []}),
             ))
             .await;
+        // Assert it failed for the RIGHT reason (the scope check), not some
+        // unrelated error that would also set `error`.
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("out-of-scope op must be refused, got {:?}", resp.result));
         assert!(
-            resp.error.is_some(),
-            "an out-of-scope operation must be refused, got {:?}",
-            resp.result
+            e.message.contains("not allowed"),
+            "expected an operation-not-allowed refusal, got: {}",
+            e.message
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_get_bitcoin_address_succeeds_within_scope() {
+        let server = signing_server();
+        install_session(&server, SessionScope::bitcoin_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "get_bitcoin_address",
+                serde_json::json!({"type": "p2tr", "network": "testnet"}),
+            ))
+            .await;
+        assert!(
+            resp.error.is_none(),
+            "get_bitcoin_address failed: {:?}",
+            resp.error
+        );
+        let r = resp.result.expect("result");
+        assert_eq!(r["isError"], serde_json::json!(false));
+        let payload: Value =
+            serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload.get("address").is_some());
+    }
+
+    #[tokio::test]
+    async fn mcp_get_session_info_reports_the_active_session() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call("get_session_info", serde_json::json!({})))
+            .await;
+        assert!(resp.error.is_none());
+        let r = resp.result.expect("result");
+        assert_eq!(r["isError"], serde_json::json!(false));
     }
 
     #[tokio::test]
