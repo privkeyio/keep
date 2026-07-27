@@ -127,6 +127,72 @@ mod tests {
     }
 
     #[test]
+    fn bunker_secret_first_writer_wins_and_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_bunker_secret(dir.path()).unwrap();
+        assert_eq!(first.len(), 32, "16 random bytes, hex encoded");
+        // A second call (as a race loser or a restart would) reads the winner's
+        // secret rather than minting a divergent one.
+        let second = load_or_create_bunker_secret(dir.path()).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn bunker_secret_rejects_malformed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bunker_secret"), "short-and-not-hex").unwrap();
+        assert!(
+            load_or_create_bunker_secret(dir.path()).is_err(),
+            "a truncated/malformed secret must fail closed, not be served"
+        );
+    }
+
+    #[test]
+    fn transport_key_first_writer_wins_and_is_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_transport_key(dir.path()).unwrap();
+        let second = load_or_create_transport_key(dir.path()).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn transport_key_rejects_malformed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bunker_transport_key"), "deadbeef").unwrap();
+        assert!(
+            load_or_create_transport_key(dir.path()).is_err(),
+            "a truncated/malformed key must fail closed"
+        );
+    }
+
+    #[test]
+    fn bunker_credentials_reject_empty_file() {
+        // The phantom-window case: a winner creates the file before writing, and a
+        // concurrent loser reads it empty. An empty file must fail closed, never
+        // be served, for both credentials.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bunker_secret"), "").unwrap();
+        assert!(load_or_create_bunker_secret(dir.path()).is_err());
+        std::fs::write(dir.path().join("bunker_transport_key"), "").unwrap();
+        assert!(load_or_create_transport_key(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bunker_secret_rejects_symlink() {
+        // A planted symlink in the vault dir must not be followed to an
+        // attacker-chosen target, matching the auth-token reader.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::write(&target, "a".repeat(32)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("bunker_secret")).unwrap();
+        assert!(
+            load_or_create_bunker_secret(dir.path()).is_err(),
+            "a symlinked bunker_secret must be refused, not followed"
+        );
+    }
+
+    #[test]
     fn choose_persist_path_prefers_state_dir_outside_vault() {
         let vault = Path::new("/data");
         let state = Path::new("/var/lib/keep-web");
@@ -530,13 +596,28 @@ fn migrate_auth_token(legacy: &Path, target: &Path) -> std::io::Result<()> {
 /// truncated or tampered file would otherwise become a short, brute-forceable
 /// credential.
 fn read_auth_token(path: &Path) -> std::io::Result<String> {
-    // symlink_metadata does not traverse the final component, so a planted
-    // link is rejected rather than silently followed.
+    // 32 random bytes, hex, minted by this daemon.
+    read_hardened_hex_secret(path, 64, "auth_token")
+}
+
+/// Read a keep-web-minted hex secret from `path` with the hardening every
+/// credential-equivalent file needs: reject a symlink or non-regular file at the
+/// final component, require owner-only permissions, re-open and confirm the
+/// opened file's inode/device match the stat (closing the lstat->open swap
+/// window), and require exactly `expected_hex_len` hex characters so a truncated,
+/// partially-restored, or tampered file fails closed rather than being served.
+fn read_hardened_hex_secret(
+    path: &Path,
+    expected_hex_len: usize,
+    label: &str,
+) -> std::io::Result<String> {
+    // symlink_metadata does not traverse the final component, so a planted link
+    // is rejected rather than silently followed.
     let md = std::fs::symlink_metadata(path)?;
     if md.file_type().is_symlink() || !md.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "auth_token must be a regular file, not a symlink",
+            format!("{label} must be a regular file, not a symlink"),
         ));
     }
     #[cfg(unix)]
@@ -545,15 +626,15 @@ fn read_auth_token(path: &Path) -> std::io::Result<String> {
         if md.permissions().mode() & 0o077 != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "auth_token is group/world accessible; refusing to use it",
+                format!("{label} is group/world accessible; refusing to use it"),
             ));
         }
     }
 
-    // The check above inspected the path; this opens it again, so the entry
-    // could have been swapped for a symlink in between. metadata() on the
-    // handle is an fstat of what was actually opened, so comparing identity
-    // across the two closes that window without reaching for libc.
+    // The check above inspected the path; this opens it again, so the entry could
+    // have been swapped for a symlink in between. metadata() on the handle is an
+    // fstat of what was actually opened, so comparing identity across the two
+    // closes that window without reaching for libc.
     let mut f = std::fs::File::open(path)?;
     #[cfg(unix)]
     {
@@ -562,7 +643,7 @@ fn read_auth_token(path: &Path) -> std::io::Result<String> {
         if opened.ino() != md.ino() || opened.dev() != md.dev() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "auth_token changed while being read; refusing to use it",
+                format!("{label} changed while being read; refusing to use it"),
             ));
         }
     }
@@ -571,13 +652,10 @@ fn read_auth_token(path: &Path) -> std::io::Result<String> {
     let mut s = String::new();
     f.read_to_string(&mut s)?;
     let trimmed = s.trim();
-
-    // Exactly what we mint: 32 random bytes, hex. Anything else is a truncated
-    // write, a partial restore, or tampering; fail closed rather than serve it.
-    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if trimmed.len() != expected_hex_len || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "auth_token is malformed; expected 64 hex characters",
+            format!("{label} is malformed; expected {expected_hex_len} hex characters"),
         ));
     }
     Ok(trimmed.to_string())
@@ -587,30 +665,63 @@ fn read_auth_token(path: &Path) -> std::io::Result<String> {
 /// on first run. Must be stable so the advertised bunker URL (which embeds it)
 /// doesn't change across restarts. A write failure is propagated so startup
 /// fails rather than rotating to an ephemeral secret that breaks saved clients.
-pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String> {
-    let path = vault_dir.join("bunker_secret");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                // The file exists but is empty (e.g. a truncated write): fail
-                // closed rather than mint a new secret that would change the
-                // advertised bunker URL and break saved client connections.
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "bunker_secret file is empty; refusing to rotate credential",
-                ));
-            }
-            Ok(trimmed.to_string())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let bytes: [u8; 16] = keep_core::crypto::random_bytes();
-            let secret = to_hex(&bytes);
-            write_secret_file(&path, &secret)?;
-            Ok(secret)
-        }
+/// Create `path` exclusively (`0600` on Unix) for first-writer-wins semantics:
+/// two concurrent starts on the same vault dir cannot each mint a different
+/// secret (the loser would serve an in-memory value disagreeing with disk).
+/// Returns `Some(file)` when we created it (the caller writes the generated
+/// secret), or `None` when it already existed (the caller re-reads the winner's).
+fn create_secret_file_exclusive(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    match opts.open(path) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// CSPRNG bytes for a credential, propagating a health-check failure as an error
+/// rather than panicking (these loaders return `io::Result`, so startup fails
+/// cleanly instead of aborting the process).
+fn try_random<const N: usize>() -> std::io::Result<[u8; N]> {
+    keep_core::crypto::try_random_bytes::<N>().map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Best-effort fsync of a path's parent directory so a freshly created entry is
+/// durable across a crash; without it the entry can be lost and the secret
+/// regenerated (rotating the bunker identity) on the next boot.
+fn fsync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String> {
+    let path = vault_dir.join("bunker_secret");
+    // First-writer-wins on the final path: create-exclusive rather than
+    // read-then-write-via-rename, so concurrent starts cannot mint divergent
+    // bunker secrets (which would advertise different bunker URLs).
+    if let Some(mut f) = create_secret_file_exclusive(&path)? {
+        use std::io::Write;
+        let bytes = try_random::<16>()?;
+        let secret = to_hex(&bytes);
+        f.write_all(secret.as_bytes())?;
+        f.sync_all()?;
+        fsync_parent_dir(&path);
+        return Ok(secret);
+    }
+    // Lost the race, or a normal restart: read the winner's secret through the
+    // same hardened reader as the auth token (symlink/perm/inode guards + exact
+    // 16-byte hex shape), so a truncated write, tamper, or planted symlink fails
+    // closed rather than being served as a credential.
+    read_hardened_hex_secret(&path, 32, "bunker_secret")
 }
 
 /// Loads the persisted NIP-46 transport key (the bunker URL's own identity),
@@ -619,24 +730,27 @@ pub fn load_or_create_bunker_secret(vault_dir: &Path) -> std::io::Result<String>
 /// connections keep working.
 pub fn load_or_create_transport_key(vault_dir: &Path) -> std::io::Result<[u8; 32]> {
     let path = vault_dir.join("bunker_transport_key");
-    match std::fs::read_to_string(&path) {
-        Ok(s) => decode_hex32(s.trim()).ok_or_else(|| {
-            // The file exists but is malformed (e.g. a truncated write): fail
-            // closed rather than mint a new key that would change the bunker
-            // URL's pubkey and break saved client connections.
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bunker_transport_key file is malformed; refusing to rotate identity",
-            )
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let bytes: [u8; 32] = keep_core::crypto::random_bytes();
-            let hex = to_hex(&bytes);
-            write_secret_file(&path, &hex)?;
-            Ok(bytes)
-        }
-        Err(e) => Err(e),
+    // First-writer-wins on the final path (see load_or_create_bunker_secret): a
+    // divergent transport key across concurrent starts would change the bunker
+    // URL's pubkey and break saved client connections.
+    if let Some(mut f) = create_secret_file_exclusive(&path)? {
+        use std::io::Write;
+        let bytes = try_random::<32>()?;
+        let hex = to_hex(&bytes);
+        f.write_all(hex.as_bytes())?;
+        f.sync_all()?;
+        fsync_parent_dir(&path);
+        return Ok(bytes);
     }
+    // Lost the race, or a normal restart: read the winner's key through the same
+    // hardened reader (symlink/perm/inode guards + exact 64-hex shape).
+    let hex = read_hardened_hex_secret(&path, 64, "bunker_transport_key")?;
+    decode_hex32(&hex).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "bunker_transport_key is malformed; refusing to rotate identity",
+        )
+    })
 }
 
 /// An event pushed to connected WebSocket clients.
