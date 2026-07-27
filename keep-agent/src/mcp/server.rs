@@ -355,13 +355,24 @@ impl McpServer {
 
                     if let Some(ref allowlist) = session.scope().address_allowlist {
                         for output in &analysis.outputs {
-                            if !output.is_change {
-                                if let Some(ref addr) = output.address {
-                                    if !allowlist.contains(&addr.to_string()) {
-                                        return Err(AgentError::AddressNotAllowed(
-                                            addr.to_string(),
-                                        ));
-                                    }
+                            if output.is_change {
+                                continue;
+                            }
+                            // Fail closed. A spend output whose address cannot be
+                            // determined (a non-standard script, or an address for a
+                            // network other than the signer's) cannot be confirmed
+                            // against the allowlist, so refuse rather than sign an
+                            // unverifiable destination.
+                            match output.address {
+                                Some(ref addr) if allowlist.contains(addr) => {}
+                                Some(ref addr) => {
+                                    return Err(AgentError::AddressNotAllowed(addr.clone()))
+                                }
+                                None => {
+                                    return Err(AgentError::AddressNotAllowed(format!(
+                                        "output {} has no recognizable address",
+                                        output.index
+                                    )))
                                 }
                             }
                         }
@@ -966,6 +977,41 @@ mod tests {
             e.message.contains("Address not allowed")
                 && e.message.contains(&disallowed.to_string()),
             "expected an address-not-allowed refusal naming the output, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_refuses_output_with_undecodable_address_under_allowlist() {
+        // Fail closed: a non-change spend output whose scriptPubKey does not decode
+        // to an address cannot be confirmed against the allowlist, so it must be
+        // refused rather than signed. Previously such an output escaped the check.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only()
+                .with_address_allowlist([testnet_p2tr_address(3).to_string()]),
+        )
+        .await;
+        // A bare OP_RETURN script has no address encoding, so Address::from_script
+        // yields None and analyze_psbt records the output's address as None.
+        let undecodable = keep_bitcoin::bitcoin::ScriptBuf::from_bytes(vec![0x6a]);
+        let psbt = psbt_base64_single_output(undecodable, 10_000, 20_000);
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp.error.unwrap_or_else(|| {
+            panic!(
+                "undecodable output must be refused under an allowlist, got {:?}",
+                resp.result
+            )
+        });
+        assert!(
+            e.message.contains("no recognizable address"),
+            "expected a fail-closed refusal for the undecodable output, got: {}",
             e.message
         );
     }
