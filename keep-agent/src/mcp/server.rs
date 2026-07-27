@@ -1017,6 +1017,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_rejects_forged_change_paying_a_non_allowlisted_address() {
+        // A malicious client cannot bypass the allowlist by forging change: an output
+        // paying an attacker address (seed 2) while attaching the signer's own x-only
+        // key (seed 7) as tap_internal_key is NOT genuine change, because change is
+        // determined from the actual scriptPubKey (must pay the signer's own key-path
+        // output), not from forgeable PSBT metadata. So it is subject to the allowlist
+        // and refused, even though output 0 pays the allowlisted address.
+        let server = signing_server();
+        let allowed = testnet_p2tr_address(3);
+        let attacker = testnet_p2tr_address(2);
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_address_allowlist([allowed.to_string()]),
+        )
+        .await;
+        let psbt = psbt_base64_spend_and_change(
+            allowed.script_pubkey(),
+            1_000,
+            attacker.script_pubkey(),
+            5_000,
+            xonly_for_seed(7),
+            10_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp.error.unwrap_or_else(|| {
+            panic!(
+                "forged-change output to a non-allowlisted address must be refused, got {:?}",
+                resp.result
+            )
+        });
+        assert!(
+            e.message.contains("Address not allowed") && e.message.contains(&attacker.to_string()),
+            "expected an allowlist refusal naming the forged-change output, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_sign_nostr_event_rejects_kind_above_u16_max() {
         let server = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;

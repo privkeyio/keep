@@ -206,20 +206,18 @@ impl PsbtSigner {
     }
 
     fn is_change_output(&self, psbt: &Psbt, index: usize) -> bool {
-        if let Some(output) = psbt.outputs.get(index) {
-            for pubkey in output.tap_key_origins.keys() {
-                if pubkey == &self.x_only_pubkey {
-                    return true;
-                }
-            }
-
-            if let Some(internal_key) = &output.tap_internal_key {
-                if internal_key == &self.x_only_pubkey {
-                    return true;
-                }
-            }
-        }
-        false
+        // Genuine change pays the signer's own key-path output. Derive the expected
+        // scriptPubKey from the signer's key and compare it against the actual
+        // output script, rather than trusting client-supplied PSBT metadata
+        // (tap_internal_key / tap_key_origins). That metadata is forgeable by an
+        // untrusted PSBT author, who could otherwise attach the signer's x-only key
+        // to an arbitrary-destination output to mark it as "change" and slip it past
+        // spend policies (amount / allowlist) that exempt change.
+        let Some(txout) = psbt.unsigned_tx.output.get(index) else {
+            return false;
+        };
+        let own_spk = bitcoin::ScriptBuf::new_p2tr(&self.secp, self.x_only_pubkey, None);
+        txout.script_pubkey == own_spk
     }
 }
 
@@ -393,6 +391,73 @@ mod tests {
         assert!(
             psbt.inputs[0].tap_key_sig.is_some(),
             "a signature must be written for our own input"
+        );
+    }
+
+    // Build a PSBT paying `out_sats` to `output_spk`, funded by an `in_sats` input,
+    // optionally forging `output_internal_key` into the output's PSBT metadata.
+    fn psbt_paying(
+        output_spk: bitcoin::ScriptBuf,
+        out_sats: u64,
+        in_sats: u64,
+        output_internal_key: Option<XOnlyPublicKey>,
+    ) -> Psbt {
+        use bitcoin::{
+            absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, Sequence,
+            Transaction, TxIn, Witness,
+        };
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(out_sats),
+                script_pubkey: output_spk,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(in_sats),
+            script_pubkey: bitcoin::ScriptBuf::new(),
+        });
+        psbt.outputs[0].tap_internal_key = output_internal_key;
+        psbt
+    }
+
+    #[test]
+    fn change_is_the_signers_own_key_path_output_not_forged_metadata() {
+        let mut secret = [3u8; 32];
+        let signer = PsbtSigner::new(&mut secret, Network::Testnet).unwrap();
+        let own = own_address(&signer);
+        let mut attacker_secret = [9u8; 32];
+        let attacker = other_address(&mut attacker_secret);
+
+        // An output paying the signer's own key-path address is change...
+        let change = psbt_paying(own.script_pubkey(), 10_000, 20_000, None);
+        assert!(
+            signer.analyze(&change).unwrap().outputs[0].is_change,
+            "an output paying the signer's own key-path address must be change"
+        );
+
+        // ...but an output paying an attacker address is NOT change, even with the
+        // signer's x-only key forged into the output's tap_internal_key.
+        let forged = psbt_paying(
+            attacker.script_pubkey(),
+            10_000,
+            20_000,
+            Some(signer.x_only_public_key()),
+        );
+        assert!(
+            !signer.analyze(&forged).unwrap().outputs[0].is_change,
+            "forged tap_internal_key must not make an attacker-destination output change"
         );
     }
 }
