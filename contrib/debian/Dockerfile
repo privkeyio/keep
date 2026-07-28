@@ -12,7 +12,9 @@
 # Building on bookworm also holds the dependency floor low enough to install on
 # Debian 12 and Ubuntu 22.04. A newer base silently raises it.
 
-FROM rust:1.89.0-slim-bookworm AS rust-builder
+# Pinned by digest so a moved tag cannot redirect the release build. Keep this
+# digest in step with Dockerfile.reproducible (same base, bit-identical binaries).
+FROM rust:1.89.0-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS rust-builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev-dev \
     libgtk-3-dev \
@@ -46,12 +48,12 @@ RUN cargo build --release --locked
 # Build the admin SPA. --ignore-scripts keeps dependency lifecycle hooks out of
 # the release pipeline: this bundle is what an operator reads when deciding
 # whether to approve a signature.
-FROM node:20-bookworm-slim AS ui-builder
+FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0 AS ui-builder
 WORKDIR /ui
 COPY keep-web/ui/ ./
 RUN npm ci --ignore-scripts && npm run build
 
-FROM debian:bookworm-slim AS packager
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS packager
 RUN apt-get update && apt-get install -y --no-install-recommends \
     dpkg-dev \
     && rm -rf /var/lib/apt/lists/*
