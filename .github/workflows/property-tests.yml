@@ -7,10 +7,10 @@ jobs:
   property-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Run property tests (keep-core)
         run: cargo test -p keep-core --features testing --test property_tests
       - name: Run property tests (keep-frost-net)

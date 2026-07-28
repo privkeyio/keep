@@ -17,14 +17,14 @@ jobs:
   deny:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
   lint:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft != true && github.event_name != 'schedule'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies
         run: |
           # GitHub-hosted runners preload third-party apt repos (Microsoft, Google)
@@ -36,7 +36,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
       # keep-agent-py and keep-agent-ts are excluded from the workspace (cdylib
@@ -55,7 +55,7 @@ jobs:
       matrix:
         os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -69,7 +69,7 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: xcode-select --install || true
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.os }}
       - run: cargo build --release
@@ -96,9 +96,9 @@ jobs:
     runs-on: windows-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: windows-latest
       - run: cargo build --release
@@ -120,7 +120,7 @@ jobs:
       CARGO_NDK_VERSION: "4.1.2"
       ANDROID_TARGET: aarch64-linux-android
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies
         run: |
           # GitHub-hosted runners preload third-party apt repos (Microsoft, Google)
@@ -131,11 +131,11 @@ jobs:
           # aws-lc-sys (via rustls) compiles bundled C through the NDK's cmake
           # toolchain, which only reliably supports the Ninja generator.
           sudo apt-get install -y ninja-build
-      - uses: actions/setup-java@v5
+      - uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
         with:
           distribution: temurin
           java-version: "21"
-      - uses: android-actions/setup-android@v4
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
       - name: Install Android NDK
         run: sdkmanager --install "ndk;$NDK_VERSION"
       # rust-toolchain.toml pins the channel, so the Android target has to be added
@@ -144,10 +144,10 @@ jobs:
         with:
           toolchain: "1.89.0"
           targets: aarch64-linux-android
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: android
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
       - name: Cross-compile keep-mobile for Android
@@ -174,7 +174,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies
         run: |
           # GitHub-hosted runners preload third-party apt repos (Microsoft, Google)
@@ -186,7 +186,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.89"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: msrv
       - run: cargo check --all-targets --features testing
@@ -195,7 +195,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Build twice and compare
         run: |
           docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
@@ -216,7 +216,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Build Debian packages
         run: docker build -f contrib/debian/Dockerfile -o type=local,dest=./dist .
       - name: Check package metadata
@@ -250,7 +250,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.draft != true
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies
         run: |
           # GitHub-hosted runners preload third-party apt repos (Microsoft, Google)
