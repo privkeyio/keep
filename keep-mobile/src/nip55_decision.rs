@@ -102,7 +102,9 @@ pub struct Nip55DecisionInputs {
     pub has_signed_kind_before: bool,
     /// Age of the app's first grant, if known.
     pub app_age_ms: Option<u64>,
-    /// Current local hour (0-23) for risk scoring.
+    /// The caller's current LOCAL hour (0-23) for risk scoring. It drives both
+    /// the gate-6 auto-approve decision and the gate-7 risk shown in the prompt,
+    /// so the score that gates the decision cannot diverge from the displayed one.
     pub current_hour: u32,
 
     /// Whether the app grant is expired: `None` (a lookup timeout) and
@@ -271,8 +273,10 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     //
     // This path takes the user's 3-value `SignPolicySelection`, so each tier gets
     // its own behavior: `Manual` never auto-approves, `Basic` auto-approves only
-    // below the stricter `BASIC_RISK_THRESHOLD`, and `Auto` auto-approves up to
-    // `RISK_ESCALATION_THRESHOLD`. `Basic` is therefore a strict subset of `Auto`.
+    // below the stricter `BASIC_RISK_THRESHOLD`, and `Auto` auto-approves only
+    // below `RISK_ESCALATION_THRESHOLD`. `Basic` is therefore a strict subset of
+    // `Auto`. Both tiers score against `inputs.current_hour`, the same local hour
+    // gate 7 displays.
     let (policy_result, recent_count) = if inputs.is_opted_in {
         match &inputs.opt_in_rate_check {
             None => (SignPolicyEvaluation::FallToUi, 0),
@@ -282,6 +286,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
                     ctx.clone(),
                     true,
                     rate_check.clone(),
+                    inputs.current_hour,
                 ),
                 recent_count_of(rate_check),
             ),
@@ -295,7 +300,13 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
             daily_limit: NON_OPT_IN_DAILY_LIMIT,
         };
         (
-            evaluate_sign_policy_selection(inputs.policy_selection, ctx.clone(), false, fabricated),
+            evaluate_sign_policy_selection(
+                inputs.policy_selection,
+                ctx.clone(),
+                false,
+                fabricated,
+                inputs.current_hour,
+            ),
             0,
         )
     };
@@ -700,8 +711,8 @@ mod tests {
 
     // Gate 6: the Basic tier is a strictly stricter auto-approval band than Auto.
     // A benign SignEvent from an app of unknown age (+5) inside a high-frequency
-    // burst (+20) scores 25, between BASIC_RISK_THRESHOLD (20) and
-    // RISK_ESCALATION_THRESHOLD (40).
+    // burst (+20) scores exactly 25 at the fixture's normal local hour (12),
+    // between BASIC_RISK_THRESHOLD (20) and RISK_ESCALATION_THRESHOLD (40).
     fn mid_band_risk_base() -> Nip55DecisionInputs {
         let mut i = base();
         i.is_opted_in = true;
@@ -729,10 +740,9 @@ mod tests {
         i.policy_selection = SignPolicySelection::Basic;
         match evaluate_nip55_request(i) {
             Nip55Outcome::RequireUi { risk, .. } => {
-                assert!(
-                    risk.score > 20 && risk.score < 40,
-                    "expected a score between the Basic and Auto thresholds, got {}",
-                    risk.score
+                assert_eq!(
+                    risk.score, 25,
+                    "expected the deterministic mid-band score between the Basic and Auto thresholds"
                 );
             }
             other => panic!("expected RequireUi, got {other:?}"),
