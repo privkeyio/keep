@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use ::base64::Engine;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -171,6 +172,8 @@ fn parse_permission_string(perms: &str) -> (Permission, HashSet<Kind>) {
                 "nip04_decrypt" => result |= Permission::NIP04_DECRYPT,
                 "nip44_encrypt" => result |= Permission::NIP44_ENCRYPT,
                 "nip44_decrypt" => result |= Permission::NIP44_DECRYPT,
+                "nip44v3_encrypt" => result |= Permission::NIP44_V3_ENCRYPT,
+                "nip44v3_decrypt" => result |= Permission::NIP44_V3_DECRYPT,
                 _ => {}
             }
         }
@@ -735,6 +738,67 @@ impl SignerHandler {
             .log(AuditEntry::new(AuditAction::Nip44Decrypt, app_pubkey).with_peer_pubkey(sender));
 
         Ok(plaintext)
+    }
+
+    pub async fn handle_nip44_v3_encrypt(
+        &self,
+        app_pubkey: PublicKey,
+        recipient: PublicKey,
+        kind: u32,
+        scope: &str,
+        plaintext: &str,
+    ) -> Result<String> {
+        self.check_kill_switch()?;
+        self.check_rate_limit(&app_pubkey).await?;
+        self.require_permission(&app_pubkey, Permission::NIP44_V3_ENCRYPT)
+            .await?;
+        self.require_approval(app_pubkey, "nip44v3_encrypt").await?;
+        self.check_kill_switch()?;
+        let secret = self.primary_secret_key().await?;
+        let ss = keep_core::crypto::nip44::shared_secret(
+            &secret.to_secret_bytes(),
+            &recipient.to_bytes(),
+        )
+        .map_err(|e| CryptoError::encryption(format!("NIP-44 v3 ECDH: {e}")))?;
+        let payload = keep_core::crypto::nip44::encrypt_v3(&ss, plaintext.as_bytes(), kind, scope)
+            .map_err(|e| CryptoError::encryption(format!("NIP-44 v3: {e}")))?;
+        let b64 = ::base64::engine::general_purpose::STANDARD.encode(&payload);
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::Nip44V3Encrypt, app_pubkey).with_peer_pubkey(recipient),
+        );
+        Ok(b64)
+    }
+
+    pub async fn handle_nip44_v3_decrypt(
+        &self,
+        app_pubkey: PublicKey,
+        sender: PublicKey,
+        kind: u32,
+        scope: &str,
+        ciphertext_b64: &str,
+    ) -> Result<String> {
+        self.check_kill_switch()?;
+        self.check_rate_limit(&app_pubkey).await?;
+        self.require_permission(&app_pubkey, Permission::NIP44_V3_DECRYPT)
+            .await?;
+        self.require_approval(app_pubkey, "nip44v3_decrypt").await?;
+        self.check_kill_switch()?;
+        let secret = self.primary_secret_key().await?;
+        let ss =
+            keep_core::crypto::nip44::shared_secret(&secret.to_secret_bytes(), &sender.to_bytes())
+                .map_err(|e| CryptoError::decryption(format!("NIP-44 v3 ECDH: {e}")))?;
+        let payload = ::base64::engine::general_purpose::STANDARD
+            .decode(ciphertext_b64)
+            .map_err(|_| CryptoError::decryption("NIP-44 v3: invalid base64".to_string()))?;
+        let plaintext = keep_core::crypto::nip44::decrypt_v3(&ss, &payload, kind, scope)
+            .map_err(|e| CryptoError::decryption(format!("NIP-44 v3: {e}")))?;
+        let out = String::from_utf8(plaintext)
+            .map_err(|_| CryptoError::decryption("NIP-44 v3: invalid utf8".to_string()))?;
+        self.audit
+            .lock()
+            .await
+            .log(AuditEntry::new(AuditAction::Nip44V3Decrypt, app_pubkey).with_peer_pubkey(sender));
+        Ok(out)
     }
 
     pub async fn handle_nip04_encrypt(
@@ -1493,6 +1557,106 @@ mod tests {
 
         assert!(!ciphertext.is_empty());
         assert_ne!(ciphertext, plaintext);
+    }
+
+    #[tokio::test]
+    async fn test_nip44_v3_encrypt_decrypt_roundtrip() {
+        let handler = setup_handler();
+        let app_pubkey = Keys::generate().public_key();
+        let peer = Keys::generate().public_key();
+
+        handler
+            .handle_connect(app_pubkey, None, None, None)
+            .await
+            .unwrap();
+        {
+            let mut pm = handler.permissions.lock().await;
+            pm.grant(
+                app_pubkey,
+                "Test".into(),
+                Permission::NIP44_V3_ENCRYPT | Permission::NIP44_V3_DECRYPT,
+            );
+        }
+
+        let plaintext = "Hello, NIP-44 v3!";
+        let kind = 4u32;
+        let scope = "dm";
+        let b64 = handler
+            .handle_nip44_v3_encrypt(app_pubkey, peer, kind, scope, plaintext)
+            .await
+            .unwrap();
+        assert!(!b64.is_empty());
+        assert_ne!(b64, plaintext);
+
+        // Same signer secret + same peer => identical shared secret, so decrypt
+        // round-trips through the handler.
+        let out = handler
+            .handle_nip44_v3_decrypt(app_pubkey, peer, kind, scope, &b64)
+            .await
+            .unwrap();
+        assert_eq!(out, plaintext);
+
+        // Context binding: a wrong kind or wrong scope must fail decryption.
+        assert!(handler
+            .handle_nip44_v3_decrypt(app_pubkey, peer, kind + 1, scope, &b64)
+            .await
+            .is_err());
+        assert!(handler
+            .handle_nip44_v3_decrypt(app_pubkey, peer, kind, "other", &b64)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_nip44_v3_permission_distinct_from_v2() {
+        // No auto_approve: an app holds exactly the permissions granted, so the
+        // v2/v3 method-level distinction is observable (auto_approve would grant
+        // Permission::ALL at connect and mask it).
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let peer = Keys::generate().public_key();
+
+        // An app granted only v2 encrypt/decrypt is denied a v3 encrypt.
+        let app_v2 = Keys::generate().public_key();
+        {
+            let mut pm = handler.permissions.lock().await;
+            pm.grant(
+                app_v2,
+                "v2".into(),
+                Permission::NIP44_ENCRYPT | Permission::NIP44_DECRYPT,
+            );
+        }
+        assert!(handler
+            .handle_nip44_v3_encrypt(app_v2, peer, 1, "", "hi")
+            .await
+            .is_err());
+
+        // The reverse: an app granted only v3 is denied v2 encrypt.
+        let app_v3 = Keys::generate().public_key();
+        {
+            let mut pm = handler.permissions.lock().await;
+            pm.grant(
+                app_v3,
+                "v3".into(),
+                Permission::NIP44_V3_ENCRYPT | Permission::NIP44_V3_DECRYPT,
+            );
+        }
+        assert!(handler
+            .handle_nip44_encrypt(app_v3, peer, "hi")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn test_parse_permission_string_v3() {
+        let (perms, kinds) = parse_permission_string("nip44v3_encrypt,nip44v3_decrypt");
+        assert!(perms.contains(Permission::NIP44_V3_ENCRYPT));
+        assert!(perms.contains(Permission::NIP44_V3_DECRYPT));
+        assert!(perms.contains(Permission::GET_PUBLIC_KEY));
+        assert!(!perms.contains(Permission::NIP44_ENCRYPT));
+        assert!(kinds.is_empty());
     }
 
     #[tokio::test]

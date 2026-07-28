@@ -4790,6 +4790,7 @@ dependencies = [
 name = "keep-nip46"
 version = "0.8.0"
 dependencies = [
+ "base64 0.23.0",
  "bitflags 2.13.1",
  "chrono",
  "frost-secp256k1-tr",
