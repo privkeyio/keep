@@ -998,6 +998,12 @@ fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> 
         "nip04_decrypt" => Ok(Nip55RequestType::Nip04Decrypt),
         "nip44_encrypt" => Ok(Nip55RequestType::Nip44Encrypt),
         "nip44_decrypt" => Ok(Nip55RequestType::Nip44Decrypt),
+        // v3 is a distinct signer type from v2 (its own grantable permission). The
+        // intent-URI path still fails closed at dispatch because it cannot supply the
+        // required kind/scope; this only makes v3 routable via a directly-constructed
+        // request and pre-authorizable in the declared-permissions array.
+        "nip44_v3_encrypt" => Ok(Nip55RequestType::Nip44V3Encrypt),
+        "nip44_v3_decrypt" => Ok(Nip55RequestType::Nip44V3Decrypt),
         "decrypt_zap_event" => Ok(Nip55RequestType::DecryptZapEvent),
         _ => Err(KeepMobileError::InvalidSession),
     }
@@ -1225,6 +1231,23 @@ mod tests {
         let ss = [7u8; 32];
         let sealed = nip44_v3_seal(&ss, "hello v3", 4, "dm").unwrap();
         assert_eq!(nip44_v3_open(&ss, &sealed, 4, "dm").unwrap(), "hello v3");
+    }
+
+    #[test]
+    fn parse_request_type_maps_v3_to_distinct_types() {
+        assert_eq!(
+            parse_request_type("nip44_v3_encrypt").unwrap(),
+            Nip55RequestType::Nip44V3Encrypt
+        );
+        assert_eq!(
+            parse_request_type("nip44_v3_decrypt").unwrap(),
+            Nip55RequestType::Nip44V3Decrypt
+        );
+        // Distinct from v2, so a v2 grant never covers v3.
+        assert_ne!(
+            parse_request_type("nip44_v3_encrypt").unwrap(),
+            Nip55RequestType::Nip44Encrypt
+        );
     }
 
     #[test]
