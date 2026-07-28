@@ -1011,8 +1011,8 @@ fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> 
         // intent-URI path still fails closed at dispatch because it cannot supply the
         // required kind/scope; this only makes v3 routable via a directly-constructed
         // request and pre-authorizable in the declared-permissions array.
-        "nip44_v3_encrypt" => Ok(Nip55RequestType::Nip44V3Encrypt),
-        "nip44_v3_decrypt" => Ok(Nip55RequestType::Nip44V3Decrypt),
+        "nip44v3_encrypt" => Ok(Nip55RequestType::Nip44V3Encrypt),
+        "nip44v3_decrypt" => Ok(Nip55RequestType::Nip44V3Decrypt),
         "decrypt_zap_event" => Ok(Nip55RequestType::DecryptZapEvent),
         _ => Err(KeepMobileError::InvalidSession),
     }
@@ -1245,29 +1245,29 @@ mod tests {
     #[test]
     fn parse_request_type_maps_v3_to_distinct_types() {
         assert_eq!(
-            parse_request_type("nip44_v3_encrypt").unwrap(),
+            parse_request_type("nip44v3_encrypt").unwrap(),
             Nip55RequestType::Nip44V3Encrypt
         );
         assert_eq!(
-            parse_request_type("nip44_v3_decrypt").unwrap(),
+            parse_request_type("nip44v3_decrypt").unwrap(),
             Nip55RequestType::Nip44V3Decrypt
         );
         // Distinct from v2, so a v2 grant never covers v3.
         assert_ne!(
-            parse_request_type("nip44_v3_encrypt").unwrap(),
+            parse_request_type("nip44v3_encrypt").unwrap(),
             Nip55RequestType::Nip44Encrypt
         );
     }
 
     #[test]
     fn parse_query_params_carries_v3_kind_and_scope() {
-        let p = parse_query_params("type=nip44_v3_encrypt&kind=4&scope=dm").unwrap();
+        let p = parse_query_params("type=nip44v3_encrypt&kind=4&scope=dm").unwrap();
         assert_eq!(p.request_type, Nip55RequestType::Nip44V3Encrypt);
         assert_eq!(p.kind, Some(4));
         assert_eq!(p.scope, Some("dm".to_string()));
         // A non-numeric kind stays None, so the v3 dispatch fails closed rather
         // than defaulting the context.
-        let bad = parse_query_params("type=nip44_v3_encrypt&kind=notanumber&scope=dm").unwrap();
+        let bad = parse_query_params("type=nip44v3_encrypt&kind=notanumber&scope=dm").unwrap();
         assert_eq!(bad.kind, None);
     }
 
