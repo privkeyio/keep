@@ -127,6 +127,31 @@ mod tests {
     }
 
     #[test]
+    fn sweep_removes_stale_temp_debris_but_spares_the_token_and_fresh_temps() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("auth_token");
+        std::fs::write(&token, "live").unwrap();
+        let debris = dir.path().join("auth_token.tmp.123.deadbeef");
+        std::fs::write(&debris, "orphan").unwrap();
+        let unrelated = dir.path().join("keep.db");
+        std::fs::write(&unrelated, "data").unwrap();
+
+        // min_age 0: the temp (any age) is swept; the live token and unrelated
+        // files (which do not match the `<name>.tmp.` prefix) are untouched.
+        sweep_stale_temp_files(&token, std::time::Duration::ZERO);
+        assert!(token.exists(), "the live token must never be swept");
+        assert!(!debris.exists(), "stale temp debris must be swept");
+        assert!(unrelated.exists(), "unrelated files must not be swept");
+
+        // A fresh temp is spared when it is younger than min_age: a concurrent
+        // writer's in-flight temp is not deleted out from under its rename.
+        let fresh = dir.path().join("auth_token.tmp.456.cafef00d");
+        std::fs::write(&fresh, "in-flight").unwrap();
+        sweep_stale_temp_files(&token, std::time::Duration::from_secs(3600));
+        assert!(fresh.exists(), "a temp younger than min_age must be spared");
+    }
+
+    #[test]
     fn bunker_secret_first_writer_wins_and_is_stable() {
         let dir = tempfile::tempdir().unwrap();
         let first = load_or_create_bunker_secret(dir.path()).unwrap();
@@ -457,6 +482,47 @@ fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Age past which a `write_secret_file` temp sibling is treated as orphaned. A
+/// live write renames its temp within milliseconds, so anything older was left by
+/// a crash (SIGKILL between `create_new` and `rename`) and is safe to remove
+/// without racing a concurrent writer's in-flight temp.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Best-effort sweep of stale `<name>.tmp.*` debris left by an interrupted
+/// `write_secret_file` (currently only reachable via `migrate_auth_token`). Such
+/// files never became the live credential, but they linger at `0600` in the vault
+/// dir and every filesystem backup, looking exactly like a credential to anyone
+/// auditing the directory. Only files older than `min_age` are removed so a
+/// concurrent writer's fresh temp is never deleted mid-write. Errors are ignored.
+fn sweep_stale_temp_files(path: &Path, min_age: std::time::Duration) {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+    else {
+        return;
+    };
+    let prefix = format!("{name}.tmp.");
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if !fname.starts_with(&prefix) {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn decode_hex32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
@@ -510,6 +576,11 @@ pub fn choose_persist_path(
 /// (`0600`) on first run. `path` should live outside the vault directory (see
 /// [`choose_persist_path`]) so it is not swept into a vault backup.
 pub fn load_or_create_auth_token_at(path: &Path) -> std::io::Result<String> {
+    // Sweep stale write_secret_file temp debris (e.g. from an interrupted token
+    // migration) so credential-shaped files do not accumulate in the vault dir and
+    // its backups. Best-effort; runs on every startup that resolves the token.
+    sweep_stale_temp_files(path, STALE_TEMP_AGE);
+
     // Create-exclusive on the final path, so concurrent starts resolve to
     // first-writer-wins. A rename-based write is last-writer-wins, which for a
     // credential means the loser serves a token that exists on no disk and the
