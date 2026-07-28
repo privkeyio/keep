@@ -4,7 +4,6 @@
 use crate::nip55::Nip55RequestType;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const HIGH_FREQUENCY_THRESHOLD: u32 = 10;
 const NEW_APP_THRESHOLD_MS: u64 = 24 * 60 * 60 * 1000;
@@ -173,8 +172,8 @@ fn app_override_key(package: &str) -> String {
 
 /// Core-owned store for the sign-policy selection, so the selection state and
 /// its override -> global -> Manual precedence live in one place rather than
-/// being reimplemented in each client (#716). Feeds the existing evaluation via
-/// [`SignPolicyStore::effective_policy_mode`].
+/// being reimplemented in each client (#716). Feeds the evaluation via
+/// [`SignPolicyStore::effective_policy`] + [`evaluate_sign_policy_selection`].
 #[derive(uniffi::Object)]
 pub struct SignPolicyStore {
     storage: Arc<dyn SignPolicySelectionStorage>,
@@ -230,8 +229,11 @@ impl SignPolicyStore {
             .unwrap_or_else(|| self.global_policy())
     }
 
-    /// The evaluation [`PolicyMode`] for a package, ready to feed the existing
-    /// `evaluate_sign_policy` / decision machinery.
+    /// Legacy bridge to the 2-value [`PolicyMode`], for callers still on the
+    /// 2-value [`evaluate_sign_policy`]. It collapses `Basic` onto
+    /// [`PolicyMode::Auto`], which silently re-disables the stricter `Basic` tier
+    /// -- do NOT route the decision path through it. Use [`Self::effective_policy`]
+    /// with [`evaluate_sign_policy_selection`] instead.
     pub fn effective_policy_mode(&self, package: String) -> PolicyMode {
         self.effective_policy(package).policy_mode()
     }
@@ -353,13 +355,6 @@ pub fn assess_signing_risk(
         factors,
         required_auth,
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX epoch")
-        .as_millis() as u64
 }
 
 const HOURLY_KEY_PREFIX: &str = "hourly_";
@@ -739,11 +734,16 @@ fn serialize_window(window: &UsageWindow, now_wall_ms: u64) -> String {
 /// it, and the assessed risk stays below `max_auto_score`; everything else falls
 /// to the UI. The only knob between the tiers is `max_auto_score`, so a stricter
 /// tier is a strict subset of a looser one.
+///
+/// `current_hour` is the caller's LOCAL hour (0-23), the same value fed to
+/// [`assess_signing_risk`] for display, so the score that gates this decision is
+/// the score the user is shown.
 fn evaluate_auto(
     ctx: SigningRequestContext,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
     max_auto_score: u32,
+    current_hour: u32,
 ) -> SignPolicyEvaluation {
     if ctx.operation != Nip55RequestType::SignEvent {
         return SignPolicyEvaluation::FallToUi;
@@ -758,7 +758,6 @@ fn evaluate_auto(
         _ => 0,
     };
 
-    let current_hour = ((now_ms() / 1000 % 86400) / 3600) as u32;
     let risk = assess_signing_risk(ctx, recent_count, current_hour);
 
     if !is_opted_in || risk.score >= max_auto_score {
@@ -771,16 +770,29 @@ fn evaluate_auto(
     }
 }
 
+/// Evaluate a request against the legacy 2-value [`PolicyMode`].
+///
+/// `current_hour` is the caller's LOCAL hour (0-23), NOT a UTC hour, and it must
+/// be the same hour the caller passes to [`assess_signing_risk`] for the prompt.
+/// The `UnusualTime` risk factor is time-of-day sensitive, so a divergent hour
+/// would gate the decision on a different score than the one shown to the user.
 #[uniffi::export]
 pub fn evaluate_sign_policy(
     policy_mode: PolicyMode,
     ctx: SigningRequestContext,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
+    current_hour: u32,
 ) -> SignPolicyEvaluation {
     match policy_mode {
         PolicyMode::Manual => SignPolicyEvaluation::FallToUi,
-        PolicyMode::Auto => evaluate_auto(ctx, is_opted_in, rate_check, RISK_ESCALATION_THRESHOLD),
+        PolicyMode::Auto => evaluate_auto(
+            ctx,
+            is_opted_in,
+            rate_check,
+            RISK_ESCALATION_THRESHOLD,
+            current_hour,
+        ),
     }
 }
 
@@ -797,19 +809,25 @@ pub fn evaluate_sign_policy(
 ///   the UI. This realizes the documented "Basic implies some prompting" without
 ///   ever adding a blind-approve mode: neither tier auto-approves a sensitive
 ///   kind, an encryption op, a rate-limited burst, or a high-risk request.
+///
+/// `current_hour` is the caller's LOCAL hour (0-23), NOT a UTC hour, and it must
+/// be the same hour the caller passes to [`assess_signing_risk`] for the prompt.
+/// The `UnusualTime` risk factor is time-of-day sensitive, so a divergent hour
+/// would gate the decision on a different score than the one shown to the user.
 #[uniffi::export]
 pub fn evaluate_sign_policy_selection(
     selection: SignPolicySelection,
     ctx: SigningRequestContext,
     is_opted_in: bool,
     rate_check: AutoSignDecision,
+    current_hour: u32,
 ) -> SignPolicyEvaluation {
     let max_auto_score = match selection {
         SignPolicySelection::Manual => return SignPolicyEvaluation::FallToUi,
         SignPolicySelection::Basic => BASIC_RISK_THRESHOLD,
         SignPolicySelection::Auto => RISK_ESCALATION_THRESHOLD,
     };
-    evaluate_auto(ctx, is_opted_in, rate_check, max_auto_score)
+    evaluate_auto(ctx, is_opted_in, rate_check, max_auto_score, current_hour)
 }
 
 #[cfg(test)]
@@ -1073,28 +1091,28 @@ mod tests {
     #[test]
     fn test_evaluate_sign_policy_manual() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, None);
-        let result = evaluate_sign_policy(PolicyMode::Manual, ctx, false, allowed(0, 0));
+        let result = evaluate_sign_policy(PolicyMode::Manual, ctx, false, allowed(0, 0), 12);
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_sensitive() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
-        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1), 12);
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_approved() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1), 12);
         assert_eq!(result, SignPolicyEvaluation::AutoApprove);
     }
 
     #[test]
     fn test_evaluate_sign_policy_auto_not_opted_in() {
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, false, allowed(0, 0));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, false, allowed(0, 0), 12);
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
@@ -1106,6 +1124,7 @@ mod tests {
             ctx,
             true,
             AutoSignDecision::HourlyLimitExceeded,
+            12,
         );
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
@@ -1113,7 +1132,7 @@ mod tests {
     #[test]
     fn test_evaluate_sign_policy_encrypt_falls_to_ui() {
         let ctx = test_ctx(Nip55RequestType::Nip44Encrypt, None);
-        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1));
+        let result = evaluate_sign_policy(PolicyMode::Auto, ctx, true, allowed(1, 1), 12);
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
@@ -1131,8 +1150,13 @@ mod tests {
     fn selection_manual_always_falls_to_ui() {
         // Even a zero-risk request prompts under Manual.
         let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-        let result =
-            evaluate_sign_policy_selection(SignPolicySelection::Manual, ctx, true, allowed(1, 1));
+        let result = evaluate_sign_policy_selection(
+            SignPolicySelection::Manual,
+            ctx,
+            true,
+            allowed(1, 1),
+            12,
+        );
         assert_eq!(result, SignPolicyEvaluation::FallToUi);
     }
 
@@ -1142,7 +1166,7 @@ mod tests {
         // below the None ceiling, so both tiers auto-approve it.
         for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
             let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1));
+            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1), 12);
             assert_eq!(
                 result,
                 SignPolicyEvaluation::AutoApprove,
@@ -1161,6 +1185,7 @@ mod tests {
             test_ctx(Nip55RequestType::SignEvent, Some(1)),
             true,
             allowed_recent(HIGH_FREQUENCY_THRESHOLD + 1),
+            12,
         );
         assert_eq!(
             auto,
@@ -1173,6 +1198,7 @@ mod tests {
             test_ctx(Nip55RequestType::SignEvent, Some(1)),
             true,
             allowed_recent(HIGH_FREQUENCY_THRESHOLD + 1),
+            12,
         );
         assert_eq!(
             basic,
@@ -1186,7 +1212,7 @@ mod tests {
         // Neither tier auto-approves a sensitive kind (no blind-approve mode).
         for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
             let ctx = test_ctx(Nip55RequestType::SignEvent, Some(4));
-            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1));
+            let result = evaluate_sign_policy_selection(selection, ctx, true, allowed(1, 1), 12);
             assert_eq!(
                 result,
                 SignPolicyEvaluation::FallToUi,
@@ -1196,10 +1222,60 @@ mod tests {
     }
 
     #[test]
+    fn selection_uses_the_callers_local_hour_not_a_utc_clock() {
+        // A newly installed app (+15) is under the Basic ceiling (20) at a normal
+        // local hour, but the UnusualTime factor (+10) pushes it to 25 at 03:00
+        // local, crossing the ceiling. The evaluator must see the caller's local
+        // hour, otherwise a user in a non-UTC zone gets a silent auto-approval at
+        // a time the risk model rates as unusual.
+        let new_app = || SigningRequestContext {
+            operation: Nip55RequestType::SignEvent,
+            package_name: "com.test".to_string(),
+            event_kind: Some(1),
+            has_signed_kind_before: true,
+            app_age_ms: Some(0),
+        };
+
+        assert_eq!(
+            assess_signing_risk(new_app(), 0, 12).score,
+            15,
+            "normal-hour score must sit under the Basic ceiling"
+        );
+        assert_eq!(
+            assess_signing_risk(new_app(), 0, 3).score,
+            25,
+            "unusual-hour score must cross the Basic ceiling"
+        );
+
+        assert_eq!(
+            evaluate_sign_policy_selection(
+                SignPolicySelection::Basic,
+                new_app(),
+                true,
+                allowed(1, 1),
+                12,
+            ),
+            SignPolicyEvaluation::AutoApprove,
+            "auto-approves at a normal local hour"
+        );
+        assert_eq!(
+            evaluate_sign_policy_selection(
+                SignPolicySelection::Basic,
+                new_app(),
+                true,
+                allowed(1, 1),
+                3,
+            ),
+            SignPolicyEvaluation::FallToUi,
+            "falls to the UI at an unusual local hour"
+        );
+    }
+
+    #[test]
     fn selection_both_tiers_prompt_when_not_opted_in() {
         for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
             let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
-            let result = evaluate_sign_policy_selection(selection, ctx, false, allowed(1, 1));
+            let result = evaluate_sign_policy_selection(selection, ctx, false, allowed(1, 1), 12);
             assert_eq!(result, SignPolicyEvaluation::FallToUi);
         }
     }
