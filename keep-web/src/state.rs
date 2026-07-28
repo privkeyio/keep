@@ -489,11 +489,13 @@ fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
 const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Best-effort sweep of stale `<name>.tmp.*` debris left by an interrupted
-/// `write_secret_file` (currently only reachable via `migrate_auth_token`). Such
-/// files never became the live credential, but they linger at `0600` in the vault
-/// dir and every filesystem backup, looking exactly like a credential to anyone
-/// auditing the directory. Only files older than `min_age` are removed so a
-/// concurrent writer's fresh temp is never deleted mid-write. Errors are ignored.
+/// `write_secret_file` (currently only reachable via `migrate_auth_token`, which
+/// runs only when the token persists outside the vault, so the debris lands in the
+/// state/persist dir). Such files never became the live credential, but they linger
+/// at `0600` in that dir and every filesystem backup of it, looking exactly like a
+/// credential to anyone auditing the directory. Only files older than `min_age` are
+/// removed so a concurrent writer's fresh temp is never deleted mid-write. Errors
+/// are ignored.
 fn sweep_stale_temp_files(path: &Path, min_age: std::time::Duration) {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
     else {
@@ -577,8 +579,9 @@ pub fn choose_persist_path(
 /// [`choose_persist_path`]) so it is not swept into a vault backup.
 pub fn load_or_create_auth_token_at(path: &Path) -> std::io::Result<String> {
     // Sweep stale write_secret_file temp debris (e.g. from an interrupted token
-    // migration) so credential-shaped files do not accumulate in the vault dir and
-    // its backups. Best-effort; runs on every startup that resolves the token.
+    // migration) so credential-shaped files do not accumulate in this token's
+    // directory and its backups. Best-effort; runs on every startup that resolves
+    // the token.
     sweep_stale_temp_files(path, STALE_TEMP_AGE);
 
     // Create-exclusive on the final path, so concurrent starts resolve to
