@@ -48,6 +48,14 @@ const PERM_FLAGS: &[(&str, u32)] = &[
         "nip44_decrypt",
         keep_nip46::Permission::NIP44_DECRYPT.bits(),
     ),
+    (
+        "nip44v3_encrypt",
+        keep_nip46::Permission::NIP44_V3_ENCRYPT.bits(),
+    ),
+    (
+        "nip44v3_decrypt",
+        keep_nip46::Permission::NIP44_V3_DECRYPT.bits(),
+    ),
 ];
 
 impl ConnectedClient {

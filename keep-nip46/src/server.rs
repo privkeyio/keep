@@ -832,7 +832,10 @@ pub(crate) async fn dispatch_request(
             }
         }
         "nip44v3_encrypt" | "nip44v3_decrypt" => {
-            if request.params.len() < 2 {
+            // The v3 param layout is exactly [pubkey, kind, scope, payload]. Require all
+            // four so a short vector (e.g. [pubkey, kind, payload]) fails loud rather
+            // than silently binding scope=payload via positional defaulting.
+            if request.params.len() < 4 {
                 return Nip46Response::error(id, "Missing parameters");
             }
             let peer = match PublicKey::from_hex(&request.params[0]) {
@@ -844,8 +847,8 @@ pub(crate) async fn dispatch_request(
                 Ok(k) => k,
                 Err(_) => return Nip46Response::error(id, "Invalid or missing kind"),
             };
-            let scope = request.params.get(2).map(String::as_str).unwrap_or("");
-            let payload = request.params.get(3).map(String::as_str).unwrap_or("");
+            let scope = request.params[2].as_str();
+            let payload = request.params[3].as_str();
             let result = match request.method.as_str() {
                 "nip44v3_encrypt" => {
                     handler
@@ -952,10 +955,11 @@ mod tests {
             &mut connect_auth,
         )
         .await;
-        assert!(resp.error.is_some());
+        // Rejected at the dispatch layer (kind parse), before any permission or cipher.
+        assert_eq!(resp.error.as_deref(), Some("Invalid or missing kind"));
         assert!(resp.result.is_none());
 
-        // Missing kind entirely (only the pubkey) -> "Missing parameters".
+        // Too few params (only the pubkey) -> "Missing parameters", before kind parse.
         let resp = dispatch_request(
             &handler,
             user,
@@ -969,7 +973,7 @@ mod tests {
             &mut connect_auth,
         )
         .await;
-        assert!(resp.error.is_some());
+        assert_eq!(resp.error.as_deref(), Some("Missing parameters"));
         assert!(resp.result.is_none());
     }
 
