@@ -428,8 +428,8 @@ impl Nip55Handler {
             id: params.id,
             current_user: params.current_user,
             permissions: params.permissions,
-            kind: None,
-            scope: None,
+            kind: params.kind,
+            scope: params.scope,
         })
     }
 
@@ -884,6 +884,8 @@ struct QueryParams {
     id: Option<String>,
     current_user: Option<String>,
     permissions: Option<String>,
+    kind: Option<u32>,
+    scope: Option<String>,
 }
 
 fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
@@ -896,6 +898,8 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
         id: None,
         current_user: None,
         permissions: None,
+        kind: None,
+        scope: None,
     };
 
     for param in query.split('&') {
@@ -918,6 +922,11 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
             "id" => params.id = Some(decoded),
             "current_user" => params.current_user = Some(decoded),
             "permissions" => params.permissions = Some(decoded),
+            // NIP-44 v3 context, carried as query params exactly like the reference
+            // signer (Amber): `kind` (u32) and `scope` (string). A non-numeric kind
+            // stays None, so the v3 dispatch fails closed rather than defaulting.
+            "kind" => params.kind = decoded.parse::<u32>().ok(),
+            "scope" => params.scope = Some(decoded),
             _ => {}
         }
     }
@@ -1248,6 +1257,18 @@ mod tests {
             parse_request_type("nip44_v3_encrypt").unwrap(),
             Nip55RequestType::Nip44Encrypt
         );
+    }
+
+    #[test]
+    fn parse_query_params_carries_v3_kind_and_scope() {
+        let p = parse_query_params("type=nip44_v3_encrypt&kind=4&scope=dm").unwrap();
+        assert_eq!(p.request_type, Nip55RequestType::Nip44V3Encrypt);
+        assert_eq!(p.kind, Some(4));
+        assert_eq!(p.scope, Some("dm".to_string()));
+        // A non-numeric kind stays None, so the v3 dispatch fails closed rather
+        // than defaulting the context.
+        let bad = parse_query_params("type=nip44_v3_encrypt&kind=notanumber&scope=dm").unwrap();
+        assert_eq!(bad.kind, None);
     }
 
     #[test]
