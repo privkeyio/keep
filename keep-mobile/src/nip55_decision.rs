@@ -758,6 +758,43 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
+    // Gate 6 must score against `inputs.current_hour` (the caller's LOCAL hour),
+    // not any clock of its own. A new app (+15) sits just under BASIC_RISK_THRESHOLD
+    // (20) at a normal hour, so the extra UnusualTime (+10) at an unusual hour is
+    // what tips it to the UI. Pinning both ends here means substituting a fixed
+    // hour, or reintroducing a wall-clock read, fails this test rather than
+    // silently widening the Basic band at night.
+    fn new_app_basic_base() -> Nip55DecisionInputs {
+        let mut i = base();
+        i.is_opted_in = true;
+        i.policy_selection = SignPolicySelection::Basic;
+        i.app_age_ms = Some(DAY_MS / 2);
+        i.opt_in_rate_check = Some(allowed());
+        i
+    }
+
+    #[test]
+    fn basic_auto_approves_a_new_app_at_a_normal_local_hour() {
+        let mut i = new_app_basic_base();
+        i.current_hour = 12;
+        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    #[test]
+    fn basic_falls_to_ui_for_the_same_request_at_an_unusual_local_hour() {
+        let mut i = new_app_basic_base();
+        i.current_hour = 3;
+        match evaluate_nip55_request(i) {
+            Nip55Outcome::RequireUi { risk, .. } => {
+                assert_eq!(
+                    risk.score, 25,
+                    "the unusual local hour must add UnusualTime on top of NewApp"
+                );
+            }
+            other => panic!("expected RequireUi at an unusual local hour, got {other:?}"),
+        }
+    }
+
     #[test]
     fn low_risk_auto_approves_under_both_basic_and_auto() {
         for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
