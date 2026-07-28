@@ -19,6 +19,8 @@ bitflags::bitflags! {
         const NIP04_DECRYPT  = 0b00001000;
         const NIP44_ENCRYPT  = 0b00010000;
         const NIP44_DECRYPT  = 0b00100000;
+        const NIP44_V3_ENCRYPT = 0b01000000;
+        const NIP44_V3_DECRYPT = 0b10000000;
 
         const DEFAULT = Self::GET_PUBLIC_KEY.bits();
 
@@ -27,7 +29,9 @@ bitflags::bitflags! {
                   | Self::NIP04_ENCRYPT.bits()
                   | Self::NIP04_DECRYPT.bits()
                   | Self::NIP44_ENCRYPT.bits()
-                  | Self::NIP44_DECRYPT.bits();
+                  | Self::NIP44_DECRYPT.bits()
+                  | Self::NIP44_V3_ENCRYPT.bits()
+                  | Self::NIP44_V3_DECRYPT.bits();
     }
 }
 
@@ -41,6 +45,8 @@ impl Permission {
         (Permission::NIP04_DECRYPT, "nip04_decrypt"),
         (Permission::NIP44_ENCRYPT, "nip44_encrypt"),
         (Permission::NIP44_DECRYPT, "nip44_decrypt"),
+        (Permission::NIP44_V3_ENCRYPT, "nip44v3_encrypt"),
+        (Permission::NIP44_V3_DECRYPT, "nip44v3_decrypt"),
     ];
 
     /// Resolve a single canonical name (snake_case, also accepts no-underscore
@@ -623,6 +629,25 @@ impl Default for PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip44_v3_flags_resolve_and_are_in_all() {
+        assert_eq!(
+            Permission::from_canonical_name("nip44v3_encrypt"),
+            Some(Permission::NIP44_V3_ENCRYPT)
+        );
+        assert_eq!(
+            Permission::from_canonical_name("nip44v3_decrypt"),
+            Some(Permission::NIP44_V3_DECRYPT)
+        );
+        assert!(Permission::ALL.contains(Permission::NIP44_V3_ENCRYPT));
+        assert!(Permission::ALL.contains(Permission::NIP44_V3_DECRYPT));
+        // Round-trips through the name table.
+        assert_eq!(
+            Permission::NIP44_V3_ENCRYPT.to_names(),
+            "nip44v3_encrypt".to_string()
+        );
+    }
 
     #[test]
     fn test_permission_manager() {

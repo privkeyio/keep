@@ -901,13 +901,29 @@ pub mod nip44 {
         v3_unpad(&buf)
     }
 
+    /// NIP-44 ECDH shared secret: the x-coordinate of `secret * peer`, with the peer
+    /// x-only pubkey reconstructed using even parity. This is the raw input to
+    /// [`encrypt_v3`] / [`decrypt_v3`] (which apply their own HKDF).
+    pub fn shared_secret(secret: &[u8; 32], peer_x_only: &[u8; 32]) -> Result<[u8; 32]> {
+        use bitcoin::secp256k1::{
+            ecdh::shared_secret_point, Parity, PublicKey, SecretKey, XOnlyPublicKey,
+        };
+        let sk = SecretKey::from_slice(secret)
+            .map_err(|e| CryptoError::invalid_key(format!("nip44 ecdh secret: {e}")))?;
+        let xonly = XOnlyPublicKey::from_slice(peer_x_only)
+            .map_err(|e| CryptoError::invalid_key(format!("nip44 ecdh pubkey: {e}")))?;
+        let full = PublicKey::from_x_only_public_key(xonly, Parity::Even);
+        let point = shared_secret_point(&full, &sk);
+        Ok(point[..32]
+            .try_into()
+            .expect("shared_secret_point returns 64 bytes"))
+    }
+
     #[cfg(test)]
     mod v3_tests {
         use super::*;
         use base64::Engine;
-        use bitcoin::secp256k1::{
-            ecdh::shared_secret_point, Parity, PublicKey, Secp256k1, SecretKey, XOnlyPublicKey,
-        };
+        use bitcoin::secp256k1::{Secp256k1, SecretKey, XOnlyPublicKey};
         use serde_json::Value;
         use sha2::Digest as _;
 
@@ -935,9 +951,8 @@ pub mod nip44 {
         // NIP-44 shared secret: x-coordinate of `secret * pubkey`, with the peer
         // pubkey reconstructed from its x-only form using EVEN parity.
         fn ecdh_x(secret_hex: &str, peer: &XOnlyPublicKey) -> [u8; 32] {
-            let sk = SecretKey::from_slice(&unhex(secret_hex)).unwrap();
-            let full = PublicKey::from_x_only_public_key(*peer, Parity::Even);
-            shared_secret_point(&full, &sk)[..32].try_into().unwrap()
+            let sk_bytes = unhex32(secret_hex);
+            super::shared_secret(&sk_bytes, &peer.serialize()).unwrap()
         }
 
         fn shared_from_pair(secret1: &str, secret2: &str) -> [u8; 32] {

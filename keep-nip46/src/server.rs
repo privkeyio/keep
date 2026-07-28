@@ -831,6 +831,48 @@ pub(crate) async fn dispatch_request(
                 }
             }
         }
+        "nip44v3_encrypt" | "nip44v3_decrypt" => {
+            // The v3 param layout is exactly [pubkey, kind, scope, payload]. Require all
+            // four so a short vector (e.g. [pubkey, kind, payload]) fails loud rather
+            // than silently binding scope=payload via positional defaulting.
+            if request.params.len() < 4 {
+                return Nip46Response::error(id, "Missing parameters");
+            }
+            let peer = match PublicKey::from_hex(&request.params[0]) {
+                Ok(pk) => pk,
+                Err(_) => return Nip46Response::error(id, "Invalid pubkey"),
+            };
+            // kind is mandatory and must be a u32 — fail closed on missing/unparseable.
+            let kind = match request.params[1].parse::<u32>() {
+                Ok(k) => k,
+                Err(_) => return Nip46Response::error(id, "Invalid or missing kind"),
+            };
+            let scope = request.params[2].as_str();
+            let payload = request.params[3].as_str();
+            let result = match request.method.as_str() {
+                "nip44v3_encrypt" => {
+                    handler
+                        .handle_nip44_v3_encrypt(app_pubkey, peer, kind, scope, payload)
+                        .await
+                }
+                "nip44v3_decrypt" => {
+                    handler
+                        .handle_nip44_v3_decrypt(app_pubkey, peer, kind, scope, payload)
+                        .await
+                }
+                other => {
+                    warn!(method = %other, "v3 encryption dispatch received unrouted method");
+                    return Nip46Response::error(id, "Unsupported method");
+                }
+            };
+            match result {
+                Ok(data) => Nip46Response::ok(id, &data),
+                Err(e) => {
+                    warn!(error = %e, method = %request.method, "v3 encryption method failed");
+                    Nip46Response::error(id, crate::error::sanitize_error_for_client(&e))
+                }
+            }
+        }
         "switch_relays" => match handler.handle_switch_relays(app_pubkey).await {
             Ok(Some(relays)) => match serde_json::to_string(&relays) {
                 Ok(json) => Nip46Response::ok(id, &json),
@@ -883,6 +925,56 @@ mod tests {
 
         let secret = bunker_secret.expect("expected_secret should surface as bunker secret");
         assert_eq!(secret.as_str(), "my-secret");
+    }
+
+    #[tokio::test]
+    async fn dispatch_v3_fails_closed_on_bad_kind() {
+        // A v3 request whose kind is missing or unparseable must return an error
+        // from the dispatch layer without ever invoking the cipher. The keyring
+        // holds no key, so any call into the crypto path would fail differently.
+        let keyring = Arc::new(Mutex::new(Keyring::new()));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, permissions, audit, None);
+        let user = nostr_sdk::Keys::generate().public_key();
+        let app = nostr_sdk::Keys::generate().public_key();
+        let peer = nostr_sdk::Keys::generate().public_key();
+
+        // Non-numeric kind -> "Invalid or missing kind".
+        let mut connect_auth = None;
+        let resp = dispatch_request(
+            &handler,
+            user,
+            app,
+            Nip46Request {
+                id: "1".into(),
+                method: "nip44v3_encrypt".into(),
+                params: vec![peer.to_hex(), "notanumber".into(), "dm".into(), "hi".into()],
+            },
+            65536,
+            &mut connect_auth,
+        )
+        .await;
+        // Rejected at the dispatch layer (kind parse), before any permission or cipher.
+        assert_eq!(resp.error.as_deref(), Some("Invalid or missing kind"));
+        assert!(resp.result.is_none());
+
+        // Too few params (only the pubkey) -> "Missing parameters", before kind parse.
+        let resp = dispatch_request(
+            &handler,
+            user,
+            app,
+            Nip46Request {
+                id: "2".into(),
+                method: "nip44v3_decrypt".into(),
+                params: vec![peer.to_hex()],
+            },
+            65536,
+            &mut connect_auth,
+        )
+        .await;
+        assert_eq!(resp.error.as_deref(), Some("Missing parameters"));
+        assert!(resp.result.is_none());
     }
 
     fn sample_stored(
