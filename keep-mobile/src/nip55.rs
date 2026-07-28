@@ -126,14 +126,21 @@ pub fn nip55_parse_permissions(json: Option<String>) -> Vec<Nip55DeclaredPermiss
         if request_type == Nip55RequestType::GetPublicKey {
             continue;
         }
-        let kind = if request_type == Nip55RequestType::SignEvent {
+        let kind = if matches!(
+            request_type,
+            Nip55RequestType::SignEvent
+                | Nip55RequestType::Nip44V3Encrypt
+                | Nip55RequestType::Nip44V3Decrypt
+        ) {
             let Some(kind) = entry
                 .get("kind")
                 .and_then(|k| k.as_i64())
                 .and_then(|k| i32::try_from(k).ok())
                 .filter(|k| (0..=MAX_EVENT_KIND).contains(k))
             else {
-                // A sign_event permission with no (valid) kind cannot be granted.
+                // sign_event and NIP-44 v3 permissions are kind-scoped: an entry with
+                // no (valid) kind cannot be granted, so it is dropped rather than
+                // becoming a blanket all-kinds grant.
                 continue;
             };
             Some(kind)
@@ -1537,6 +1544,21 @@ mod tests {
             vec![Nip55DeclaredPermission {
                 request_type: Nip55RequestType::Nip04Encrypt,
                 kind: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_permissions_v3_requires_a_kind() {
+        // A kind-less v3 declared permission is dropped (never an all-kinds grant),
+        // mirroring sign_event; a v3 entry with a valid kind is kept, kind-scoped.
+        let json = r#"[{"type":"nip44v3_decrypt"},{"type":"nip44v3_encrypt","kind":4}]"#;
+        let perms = nip55_parse_permissions(Some(json.into()));
+        assert_eq!(
+            perms,
+            vec![Nip55DeclaredPermission {
+                request_type: Nip55RequestType::Nip44V3Encrypt,
+                kind: Some(4),
             }]
         );
     }
