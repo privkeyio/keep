@@ -293,6 +293,8 @@ pub fn assess_signing_risk(
         | Nip55RequestType::Nip44Encrypt
         | Nip55RequestType::Nip04Decrypt
         | Nip55RequestType::Nip44Decrypt
+        | Nip55RequestType::Nip44V3Encrypt
+        | Nip55RequestType::Nip44V3Decrypt
         | Nip55RequestType::DecryptZapEvent => {
             factors.push(SigningRiskFactor::SensitiveOperation);
         }
