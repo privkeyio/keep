@@ -1,7 +1,11 @@
 # SPDX-FileCopyrightText: © 2026 PrivKey LLC
 # SPDX-License-Identifier: MIT
 
-FROM rust:1.89.0-slim-bookworm AS builder
+# Pinned by digest (not just tag) so the build stays reproducible over time and
+# a moved tag cannot redirect it to a different base. Keep this digest in step
+# with contrib/debian/Dockerfile, which compiles the same binaries and must stay
+# bit-identical.
+FROM rust:1.89.0-slim-bookworm@sha256:d7fc7de78bb8c1469933aeecbf801314d30d7d6e9f0578bba4cfa285bfa37fe6 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libudev-dev \
