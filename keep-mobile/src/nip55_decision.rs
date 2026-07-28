@@ -9,7 +9,7 @@
 //! DENY-wins rules across two files -- a divergence risk in security-critical
 //! signing. This module hoists that decision into Rust so both paths share one
 //! source of truth. It composes the existing policy primitives
-//! (`nip55_relay_auth_gate`, `evaluate_sign_policy`, `nip55_resolve_decision`,
+//! (`nip55_relay_auth_gate`, `evaluate_sign_policy_selection`, `nip55_resolve_decision`,
 //! `assess_signing_risk`) in the exact gate order:
 //!
 //!   caller-verified -> kill-switch -> lock -> front-door rate limit ->
@@ -29,8 +29,8 @@ use crate::nip55::{
 };
 use crate::nip55_policy::{nip55_resolve_decision, Nip55PermissionDecision, Nip55StoredPermission};
 use crate::signing_policy::{
-    assess_signing_risk, evaluate_sign_policy, AutoSignDecision, PolicyMode, SignPolicyEvaluation,
-    SigningAuthLevel, SigningRequestContext, SigningRiskAssessment,
+    assess_signing_risk, evaluate_sign_policy_selection, AutoSignDecision, SignPolicyEvaluation,
+    SignPolicySelection, SigningAuthLevel, SigningRequestContext, SigningRiskAssessment,
 };
 
 const KIND_NIP42_AUTH: u32 = 22242;
@@ -47,9 +47,9 @@ pub enum Nip55VelocityCheck {
 }
 
 // When a caller is not opted in to auto-signing, the sign-policy gate is fed a
-// synthetic "allowed" rate-check so `evaluate_sign_policy` runs; the not-opted-in
-// denial itself happens inside `evaluate_sign_policy` via its `!is_opted_in`
-// check. These limits are cosmetic (only the variant and `recent_count` reach the
+// synthetic "allowed" rate-check so `evaluate_sign_policy_selection` runs; the
+// not-opted-in denial itself happens inside it via its `!is_opted_in` check.
+// These limits are cosmetic (only the variant and `recent_count` reach the
 // decision) and mirror the Android `VelocityConfig` defaults.
 const NON_OPT_IN_HOURLY_LIMIT: u32 = 1000;
 const NON_OPT_IN_DAILY_LIMIT: u32 = 5000;
@@ -88,9 +88,11 @@ pub struct Nip55DecisionInputs {
     /// Whether reading the whitelist failed; `true` forces an auto-reject.
     pub relay_whitelist_read_failed: bool,
 
-    /// The resolved sign policy (per-app override -> global -> Manual default),
-    /// mapped to Auto/Manual by the caller.
-    pub policy_mode: PolicyMode,
+    /// The user's resolved 3-value sign-policy selection (per-app override ->
+    /// global -> Manual default): Manual / Basic / Auto. `Basic` is a stricter
+    /// auto-approval tier than `Auto`, auto-approving only requests the risk model
+    /// rates as needing no extra authentication.
+    pub policy_selection: SignPolicySelection,
     /// Whether the caller is opted in to auto-signing.
     pub is_opted_in: bool,
     /// The opt-in rate-limiter result. `None` (limiter unavailable, or its check
@@ -264,21 +266,19 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
 
     // Gate 6: sign policy. When opted in, use the limiter result (an unavailable
     // limiter fails open to the UI, i.e. falls through to gate 7). When not opted
-    // in, feed a synthetic "allowed" so evaluate_sign_policy runs and applies its
-    // own not-opted-in denial.
+    // in, feed a synthetic "allowed" so evaluate_sign_policy_selection runs and
+    // applies its own not-opted-in denial.
     //
-    // This path takes the 2-value `PolicyMode`, so `Basic` and `Auto` behave
-    // identically here (both `PolicyMode::Auto`). The stricter `Basic` tier
-    // (`evaluate_sign_policy_selection`) becomes live once `Nip55DecisionInputs`
-    // carries the 3-value `SignPolicySelection` instead of the collapsed mode --
-    // a breaking FFI input change gated on the client version bump (#716). Until
-    // then this is fail-safe: `Basic` is never looser than `Auto`.
+    // This path takes the user's 3-value `SignPolicySelection`, so each tier gets
+    // its own behavior: `Manual` never auto-approves, `Basic` auto-approves only
+    // below the stricter `BASIC_RISK_THRESHOLD`, and `Auto` auto-approves up to
+    // `RISK_ESCALATION_THRESHOLD`. `Basic` is therefore a strict subset of `Auto`.
     let (policy_result, recent_count) = if inputs.is_opted_in {
         match &inputs.opt_in_rate_check {
             None => (SignPolicyEvaluation::FallToUi, 0),
             Some(rate_check) => (
-                evaluate_sign_policy(
-                    inputs.policy_mode.clone(),
+                evaluate_sign_policy_selection(
+                    inputs.policy_selection,
                     ctx.clone(),
                     true,
                     rate_check.clone(),
@@ -295,7 +295,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
             daily_limit: NON_OPT_IN_DAILY_LIMIT,
         };
         (
-            evaluate_sign_policy(inputs.policy_mode.clone(), ctx.clone(), false, fabricated),
+            evaluate_sign_policy_selection(inputs.policy_selection, ctx.clone(), false, fabricated),
             0,
         )
     };
@@ -384,7 +384,7 @@ mod tests {
             velocity_check: Nip55VelocityCheck::Allowed,
             relay_whitelist: vec![],
             relay_whitelist_read_failed: false,
-            policy_mode: PolicyMode::Manual,
+            policy_selection: SignPolicySelection::Manual,
             is_opted_in: false,
             opt_in_rate_check: None,
             has_signed_kind_before: true,
@@ -548,7 +548,7 @@ mod tests {
         i.event_json = relay_auth_event("relay.notallowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert_eq!(
             reject_reason(&evaluate_nip55_request(i)),
@@ -588,7 +588,7 @@ mod tests {
             .to_string();
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert_eq!(
             reject_reason(&evaluate_nip55_request(i)),
@@ -634,7 +634,7 @@ mod tests {
         let mut i = base();
         i.event_json = r#"{"kind":4}"#.to_string();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
@@ -644,7 +644,7 @@ mod tests {
     fn opted_in_auto_policy_benign_auto_approves() {
         let mut i = base();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
     }
@@ -653,7 +653,7 @@ mod tests {
     fn not_opted_in_auto_policy_never_auto_approves() {
         let mut i = base();
         i.is_opted_in = false;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         // Falls through to gate 7; no stored grant -> RequireUi (not AutoApprove).
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
@@ -662,7 +662,7 @@ mod tests {
     fn opted_in_sensitive_kind_falls_to_ui() {
         let mut i = base();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.event_json = r#"{"kind":4}"#.to_string(); // sensitive (NIP-04 DM)
         i.opt_in_rate_check = Some(allowed());
         assert!(is_require_ui(&evaluate_nip55_request(i)));
@@ -672,7 +672,7 @@ mod tests {
     fn opted_in_limiter_unavailable_falls_to_ui() {
         let mut i = base();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = None;
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
@@ -681,7 +681,7 @@ mod tests {
     fn opted_in_rate_limited_falls_to_ui() {
         let mut i = base();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(AutoSignDecision::HourlyLimitExceeded);
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
@@ -692,10 +692,75 @@ mod tests {
         // standing ALLOW grant.
         let mut i = base();
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = None;
         i.stored_exact_permission = Some(perm("allow"));
         assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    // Gate 6: the Basic tier is a strictly stricter auto-approval band than Auto.
+    // A benign SignEvent from an app of unknown age (+5) inside a high-frequency
+    // burst (+20) scores 25, between BASIC_RISK_THRESHOLD (20) and
+    // RISK_ESCALATION_THRESHOLD (40).
+    fn mid_band_risk_base() -> Nip55DecisionInputs {
+        let mut i = base();
+        i.is_opted_in = true;
+        i.app_age_ms = None;
+        i.opt_in_rate_check = Some(AutoSignDecision::Allowed {
+            hourly_count: 12,
+            daily_count: 12,
+            recent_count: 11,
+            hourly_limit: 100,
+            daily_limit: 500,
+        });
+        i
+    }
+
+    #[test]
+    fn mid_band_risk_auto_approves_under_auto() {
+        let mut i = mid_band_risk_base();
+        i.policy_selection = SignPolicySelection::Auto;
+        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    #[test]
+    fn mid_band_risk_falls_to_ui_under_basic() {
+        let mut i = mid_band_risk_base();
+        i.policy_selection = SignPolicySelection::Basic;
+        match evaluate_nip55_request(i) {
+            Nip55Outcome::RequireUi { risk, .. } => {
+                assert!(
+                    risk.score > 20 && risk.score < 40,
+                    "expected a score between the Basic and Auto thresholds, got {}",
+                    risk.score
+                );
+            }
+            other => panic!("expected RequireUi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_policy_never_auto_approves() {
+        let mut i = base();
+        i.is_opted_in = true;
+        i.policy_selection = SignPolicySelection::Manual;
+        i.opt_in_rate_check = Some(allowed());
+        assert!(is_require_ui(&evaluate_nip55_request(i)));
+    }
+
+    #[test]
+    fn low_risk_auto_approves_under_both_basic_and_auto() {
+        for selection in [SignPolicySelection::Basic, SignPolicySelection::Auto] {
+            let mut i = base();
+            i.is_opted_in = true;
+            i.policy_selection = selection;
+            i.opt_in_rate_check = Some(allowed());
+            assert_eq!(
+                evaluate_nip55_request(i),
+                Nip55Outcome::AutoApprove,
+                "{selection:?} should auto-approve a low-risk request"
+            );
+        }
     }
 
     // Gate 7: expiry, lookup, standing decision.
@@ -808,7 +873,7 @@ mod tests {
         let mut i = base();
         i.request_type = Nip55RequestType::Nip44Encrypt;
         i.is_opted_in = true;
-        i.policy_mode = PolicyMode::Auto;
+        i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         match evaluate_nip55_request(i) {
             Nip55Outcome::RequireUi { risk, .. } => {
