@@ -419,6 +419,8 @@ enum Nip55RequestType {
     "Nip04Decrypt",
     "Nip44Encrypt",
     "Nip44Decrypt",
+    "Nip44V3Encrypt",
+    "Nip44V3Decrypt",
     "DecryptZapEvent",
 };
 
@@ -432,6 +434,8 @@ dictionary Nip55Request {
     string? id;
     string? current_user;
     string? permissions;
+    u32? kind;
+    string? scope;
 };
 
 dictionary Nip55Response {

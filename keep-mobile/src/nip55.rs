@@ -48,6 +48,8 @@ pub enum Nip55RequestType {
     Nip04Decrypt,
     Nip44Encrypt,
     Nip44Decrypt,
+    Nip44V3Encrypt,
+    Nip44V3Decrypt,
     DecryptZapEvent,
 }
 
@@ -68,6 +70,8 @@ pub struct Nip55Request {
     pub id: Option<String>,
     pub current_user: Option<String>,
     pub permissions: Option<String>,
+    pub kind: Option<u32>,
+    pub scope: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -373,6 +377,24 @@ impl Nip55Handler {
                 let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
                 self.handle_nip44_decrypt(request.content, pk)
             }
+            Nip55RequestType::Nip44V3Encrypt => {
+                let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
+                let kind = request.kind.ok_or(KeepMobileError::InvalidSession)?;
+                let scope = request
+                    .scope
+                    .clone()
+                    .ok_or(KeepMobileError::InvalidSession)?;
+                self.handle_nip44_v3_encrypt(request.content, pk, kind, scope)
+            }
+            Nip55RequestType::Nip44V3Decrypt => {
+                let pk = pubkey.ok_or(KeepMobileError::InvalidSession)?;
+                let kind = request.kind.ok_or(KeepMobileError::InvalidSession)?;
+                let scope = request
+                    .scope
+                    .clone()
+                    .ok_or(KeepMobileError::InvalidSession)?;
+                self.handle_nip44_v3_decrypt(request.content, pk, kind, scope)
+            }
             Nip55RequestType::DecryptZapEvent => self.handle_decrypt_zap_event(request.content),
         };
 
@@ -406,6 +428,8 @@ impl Nip55Handler {
             id: params.id,
             current_user: params.current_user,
             permissions: params.permissions,
+            kind: params.kind,
+            scope: params.scope,
         })
     }
 
@@ -557,6 +581,32 @@ impl Nip55Handler {
             msg: "invalid content".into(),
         })?;
 
+        Ok(Nip55Response::ok(result))
+    }
+
+    fn handle_nip44_v3_encrypt(
+        &self,
+        plaintext: String,
+        pubkey: String,
+        kind: u32,
+        scope: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
+        let result = nip44_v3_seal(&shared_secret, &plaintext, kind, &scope)?;
+        Ok(Nip55Response::ok(result))
+    }
+
+    fn handle_nip44_v3_decrypt(
+        &self,
+        ciphertext: String,
+        pubkey: String,
+        kind: u32,
+        scope: String,
+    ) -> Result<Nip55Response, KeepMobileError> {
+        let pubkey_bytes = parse_pubkey_to_compressed(&pubkey)?;
+        let shared_secret = self.request_ecdh(&pubkey_bytes)?;
+        let result = nip44_v3_open(&shared_secret, &ciphertext, kind, &scope)?;
         Ok(Nip55Response::ok(result))
     }
 
@@ -834,6 +884,8 @@ struct QueryParams {
     id: Option<String>,
     current_user: Option<String>,
     permissions: Option<String>,
+    kind: Option<u32>,
+    scope: Option<String>,
 }
 
 fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
@@ -846,6 +898,8 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
         id: None,
         current_user: None,
         permissions: None,
+        kind: None,
+        scope: None,
     };
 
     for param in query.split('&') {
@@ -868,6 +922,11 @@ fn parse_query_params(query: &str) -> Result<QueryParams, KeepMobileError> {
             "id" => params.id = Some(decoded),
             "current_user" => params.current_user = Some(decoded),
             "permissions" => params.permissions = Some(decoded),
+            // NIP-44 v3 context, carried as query params exactly like the reference
+            // signer (Amber): `kind` (u32) and `scope` (string). A non-numeric kind
+            // stays None, so the v3 dispatch fails closed rather than defaulting.
+            "kind" => params.kind = decoded.parse::<u32>().ok(),
+            "scope" => params.scope = Some(decoded),
             _ => {}
         }
     }
@@ -934,6 +993,8 @@ fn is_rate_limited_type(t: &Nip55RequestType) -> bool {
         | Nip55RequestType::Nip04Decrypt
         | Nip55RequestType::Nip44Encrypt
         | Nip55RequestType::Nip44Decrypt
+        | Nip55RequestType::Nip44V3Encrypt
+        | Nip55RequestType::Nip44V3Decrypt
         | Nip55RequestType::DecryptZapEvent => true,
     }
 }
@@ -946,6 +1007,12 @@ fn parse_request_type(value: &str) -> Result<Nip55RequestType, KeepMobileError> 
         "nip04_decrypt" => Ok(Nip55RequestType::Nip04Decrypt),
         "nip44_encrypt" => Ok(Nip55RequestType::Nip44Encrypt),
         "nip44_decrypt" => Ok(Nip55RequestType::Nip44Decrypt),
+        // v3 is a distinct signer type from v2 (its own grantable permission). The
+        // intent-URI path still fails closed at dispatch because it cannot supply the
+        // required kind/scope; this only makes v3 routable via a directly-constructed
+        // request and pre-authorizable in the declared-permissions array.
+        "nip44_v3_encrypt" => Ok(Nip55RequestType::Nip44V3Encrypt),
+        "nip44_v3_decrypt" => Ok(Nip55RequestType::Nip44V3Decrypt),
         "decrypt_zap_event" => Ok(Nip55RequestType::DecryptZapEvent),
         _ => Err(KeepMobileError::InvalidSession),
     }
@@ -989,6 +1056,45 @@ fn parse_pubkey_to_compressed(pubkey_hex: &str) -> Result<[u8; 33], KeepMobileEr
             .map_err(|_| KeepMobileError::InvalidSession),
         _ => Err(KeepMobileError::InvalidSession),
     }
+}
+
+// NIP-44 v3 seal: encrypt `plaintext` under the (kind, scope) context and
+// base64-encode the raw payload. Pure over the shared secret (no ECDH), so it is
+// unit-testable against reference vectors.
+fn nip44_v3_seal(
+    shared_secret: &[u8; 32],
+    plaintext: &str,
+    kind: u32,
+    scope: &str,
+) -> Result<String, KeepMobileError> {
+    let payload =
+        nip44::encrypt_v3(shared_secret, plaintext.as_bytes(), kind, scope).map_err(|_| {
+            KeepMobileError::FrostError {
+                msg: "encryption failed".into(),
+            }
+        })?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&payload))
+}
+
+// NIP-44 v3 open: base64-decode the payload and decrypt it, verifying the
+// (kind, scope) context binds. Pure over the shared secret (no ECDH).
+fn nip44_v3_open(
+    shared_secret: &[u8; 32],
+    b64: &str,
+    kind: u32,
+    scope: &str,
+) -> Result<String, KeepMobileError> {
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|_| KeepMobileError::InvalidSession)?;
+    let decrypted = nip44::decrypt_v3(shared_secret, &payload, kind, scope).map_err(|_| {
+        KeepMobileError::FrostError {
+            msg: "decryption failed".into(),
+        }
+    })?;
+    String::from_utf8(decrypted).map_err(|_| KeepMobileError::Serialization {
+        msg: "invalid content".into(),
+    })
 }
 
 pub(crate) fn validate_nostr_event(event: &serde_json::Value) -> Result<(), KeepMobileError> {
@@ -1128,6 +1234,75 @@ pub(crate) fn build_structured_nostr_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nip44_v3_roundtrip_returns_plaintext() {
+        let ss = [7u8; 32];
+        let sealed = nip44_v3_seal(&ss, "hello v3", 4, "dm").unwrap();
+        assert_eq!(nip44_v3_open(&ss, &sealed, 4, "dm").unwrap(), "hello v3");
+    }
+
+    #[test]
+    fn parse_request_type_maps_v3_to_distinct_types() {
+        assert_eq!(
+            parse_request_type("nip44_v3_encrypt").unwrap(),
+            Nip55RequestType::Nip44V3Encrypt
+        );
+        assert_eq!(
+            parse_request_type("nip44_v3_decrypt").unwrap(),
+            Nip55RequestType::Nip44V3Decrypt
+        );
+        // Distinct from v2, so a v2 grant never covers v3.
+        assert_ne!(
+            parse_request_type("nip44_v3_encrypt").unwrap(),
+            Nip55RequestType::Nip44Encrypt
+        );
+    }
+
+    #[test]
+    fn parse_query_params_carries_v3_kind_and_scope() {
+        let p = parse_query_params("type=nip44_v3_encrypt&kind=4&scope=dm").unwrap();
+        assert_eq!(p.request_type, Nip55RequestType::Nip44V3Encrypt);
+        assert_eq!(p.kind, Some(4));
+        assert_eq!(p.scope, Some("dm".to_string()));
+        // A non-numeric kind stays None, so the v3 dispatch fails closed rather
+        // than defaulting the context.
+        let bad = parse_query_params("type=nip44_v3_encrypt&kind=notanumber&scope=dm").unwrap();
+        assert_eq!(bad.kind, None);
+    }
+
+    #[test]
+    fn nip44_v3_open_rejects_wrong_kind() {
+        let ss = [7u8; 32];
+        let sealed = nip44_v3_seal(&ss, "hello v3", 4, "dm").unwrap();
+        assert!(nip44_v3_open(&ss, &sealed, 5, "dm").is_err());
+    }
+
+    #[test]
+    fn nip44_v3_open_rejects_wrong_scope() {
+        let ss = [7u8; 32];
+        let sealed = nip44_v3_seal(&ss, "hello v3", 4, "dm").unwrap();
+        assert!(nip44_v3_open(&ss, &sealed, 4, "other").is_err());
+    }
+
+    #[test]
+    fn nip44_v3_open_rejects_tampered_payload() {
+        let ss = [7u8; 32];
+        let sealed = nip44_v3_seal(&ss, "hello v3", 4, "dm").unwrap();
+        let mut raw = base64::engine::general_purpose::STANDARD
+            .decode(&sealed)
+            .unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        let tampered = base64::engine::general_purpose::STANDARD.encode(&raw);
+        assert!(nip44_v3_open(&ss, &tampered, 4, "dm").is_err());
+    }
+
+    #[test]
+    fn nip44_v3_open_rejects_non_base64() {
+        let ss = [7u8; 32];
+        assert!(nip44_v3_open(&ss, "not base64 !!!", 4, "dm").is_err());
+    }
 
     #[test]
     fn signable_kind_reads_numeric_kind() {
