@@ -1188,9 +1188,16 @@ mod tests {
     /// Stored data that will not decode is a fault, not an empty window.
     struct CorruptStorage;
     impl SigningRateLimiterStorage for CorruptStorage {
-        fn load(&self, _key: String) -> StorageRead {
-            StorageRead::Found {
-                value: "not-a-window".to_string(),
+        fn load(&self, key: String) -> StorageRead {
+            // Only the counters are corrupt, for the same reason UnreadableStorage
+            // is scoped: an undecodable cooling-off value would refuse first and
+            // the window decode path would never run.
+            if key.starts_with(HOURLY_KEY_PREFIX) || key.starts_with(DAILY_KEY_PREFIX) {
+                StorageRead::Found {
+                    value: "not-a-window".to_string(),
+                }
+            } else {
+                StorageRead::Absent
             }
         }
         fn save(&self, _key: String, _value: String) -> bool {
@@ -1207,6 +1214,39 @@ mod tests {
     #[test]
     fn undecodable_counter_refuses_instead_of_restarting_the_window() {
         let limiter = SigningRateLimiter::new(Arc::new(CorruptStorage));
+        assert_eq!(
+            limiter.check_and_record("com.test".to_string(), 1000, 1000),
+            AutoSignDecision::StorageUnavailable
+        );
+    }
+
+    /// An undecodable cooling-off value must refuse too, rather than read as
+    /// "no penalty recorded" and let a cooled-off package straight through.
+    struct CorruptCoolingOffStorage;
+    impl SigningRateLimiterStorage for CorruptCoolingOffStorage {
+        fn load(&self, key: String) -> StorageRead {
+            if key.starts_with(COOLED_OFF_KEY_PREFIX) {
+                StorageRead::Found {
+                    value: "not-a-timestamp".to_string(),
+                }
+            } else {
+                StorageRead::Absent
+            }
+        }
+        fn save(&self, _key: String, _value: String) -> bool {
+            true
+        }
+        fn remove(&self, _key: String) -> bool {
+            true
+        }
+        fn clear(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn undecodable_cooling_off_refuses_instead_of_reading_as_no_penalty() {
+        let limiter = SigningRateLimiter::new(Arc::new(CorruptCoolingOffStorage));
         assert_eq!(
             limiter.check_and_record("com.test".to_string(), 1000, 1000),
             AutoSignDecision::StorageUnavailable
