@@ -158,20 +158,31 @@ impl SignPolicySelection {
 /// simple string key/value store; the Android side backs it with its encrypted
 /// sign-policy prefs.
 ///
-/// `save` and `remove` report whether the write actually persisted, and the
-/// implementation must answer honestly: return the platform's own durable-write
-/// result rather than `true` for "did not throw". A caller cannot re-read to
-/// check, because a store that caches in memory ahead of its backing file will
-/// serve the value a failed write left behind. Selection state gates signing, so
-/// a caller that cannot confirm a write has to assume the old value still
-/// applies. Unlike [`SigningRateLimiterStorage`], which is advisory.
+/// `save` and `remove` report whether the write durably persisted. The return
+/// must be the platform's own durable-write result, NOT a "did not throw" flag:
+/// wrapping the call and reporting that no exception escaped is the same as
+/// reporting nothing, and reintroduces the defect this signal exists to remove.
+///
+/// `false` means INDETERMINATE, not "the old value survived". A store that
+/// caches in memory ahead of its backing file will serve the value a failed
+/// write left behind, so after `false` either value may be the one in force, and
+/// the selection is read straight from here on every signing decision. A caller
+/// must therefore treat `false` as "I do not know what is stored" and repair it
+/// by re-asserting the stricter of the old and new selections (or `Manual`),
+/// rather than assuming the change simply did not happen.
 #[uniffi::export(with_foreign)]
 pub trait SignPolicySelectionStorage: Send + Sync {
     fn load(&self, key: String) -> Option<String>;
     /// Persist `value` under `key`. Returns whether it durably persisted.
     fn save(&self, key: String, value: String) -> bool;
-    /// Delete `key`. Returns whether the deletion durably persisted. Deleting a
-    /// key that is already absent is a success.
+    /// Delete `key`. Returns whether the deletion reached the durable store.
+    ///
+    /// A key that is genuinely absent from the durable store is a success. A
+    /// lookup that could not determine absence is NOT: an implementation whose
+    /// key derivation or index is unavailable must return `false` rather than
+    /// treat "I cannot see it" as "it is gone", or a live entry stays on disk
+    /// and becomes enforceable again once lookup recovers. Do not short-circuit
+    /// on a cached `contains`.
     fn remove(&self, key: String) -> bool;
 }
 
@@ -207,9 +218,12 @@ impl SignPolicyStore {
             .unwrap_or(SignPolicySelection::Manual)
     }
 
-    /// Persist the global sign-policy selection. Returns whether it persisted;
-    /// on `false` the previously stored selection is still the one in force, so
-    /// a caller must not report the change as applied.
+    /// Persist the global sign-policy selection. `true` means the global key
+    /// reached the durable store, not that this selection now governs any given
+    /// package: a per-app override still wins (see [`Self::effective_policy`]).
+    ///
+    /// `false` is indeterminate, so the caller must repair rather than assume
+    /// the old value held; see [`SignPolicySelectionStorage`].
     pub fn set_global_policy(&self, policy: SignPolicySelection) -> bool {
         self.storage.save(
             GLOBAL_SIGN_POLICY_KEY.to_string(),
@@ -232,7 +246,8 @@ impl SignPolicyStore {
     /// global policy, so a caller that treats an unconfirmed clear as done can
     /// drop the record that the override still exists and leave it in force with
     /// nothing tracking it. Callers must keep their own index until this reports
-    /// `true`.
+    /// `true`, and must re-attempt on `false` rather than assume the override
+    /// was left untouched, since `false` does not say which value is stored.
     pub fn set_app_override(&self, package: String, policy: Option<SignPolicySelection>) -> bool {
         match policy {
             Some(p) => self
