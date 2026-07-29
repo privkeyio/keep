@@ -5,7 +5,6 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::path::Path;
 
-use ::rand::Rng;
 use nostr_sdk::prelude::*;
 use tracing::debug;
 
@@ -37,8 +36,9 @@ pub fn cmd_frost_network_sign_hardware(
     let mut message_arr = [0u8; 32];
     message_arr.copy_from_slice(&message_bytes);
 
-    let mut session_id = [0u8; 32];
-    ::rand::rng().fill_bytes(&mut session_id);
+    // Route through the core helper rather than a thread RNG: it applies the
+    // entropy health check and fails closed, which a direct `rand::rng()` skips.
+    let session_id: [u8; 32] = keep_core::entropy::try_random_bytes()?;
 
     out.newline();
     out.header("FROST Hardware Sign via Relay");
@@ -380,12 +380,12 @@ pub fn cmd_frost_network_nonce_precommit(
     let spinner = out.spinner(&format!("Generating {count} nonce commitments..."));
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
-    let mut rng = ::rand::rng();
     for i in 0..count {
-        let mut dummy_session = [0u8; 32];
-        let mut dummy_message = [0u8; 32];
-        rng.fill_bytes(&mut dummy_session);
-        rng.fill_bytes(&mut dummy_message);
+        // Named dummy, but these are the session and message the device binds
+        // its nonce commitment to, so they get the same checked entropy as a
+        // real signing session rather than a thread RNG.
+        let dummy_session: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let dummy_message: [u8; 32] = keep_core::entropy::try_random_bytes()?;
         let (commitment, _) = signer
             .frost_commit(group, &dummy_session, &dummy_message)
             .map_err(|e| KeepError::FrostErr(FrostError::commitment(format!("nonce {i}: {e}"))))?;
