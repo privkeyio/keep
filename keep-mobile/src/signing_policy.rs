@@ -156,12 +156,23 @@ impl SignPolicySelection {
 
 /// Persistence for the sign-policy selection (global + per-app override). A
 /// simple string key/value store; the Android side backs it with its encrypted
-/// sign-policy prefs. Mirrors [`SigningRateLimiterStorage`].
+/// sign-policy prefs.
+///
+/// `save` and `remove` report whether the write actually persisted, and the
+/// implementation must answer honestly: return the platform's own durable-write
+/// result rather than `true` for "did not throw". A caller cannot re-read to
+/// check, because a store that caches in memory ahead of its backing file will
+/// serve the value a failed write left behind. Selection state gates signing, so
+/// a caller that cannot confirm a write has to assume the old value still
+/// applies. Unlike [`SigningRateLimiterStorage`], which is advisory.
 #[uniffi::export(with_foreign)]
 pub trait SignPolicySelectionStorage: Send + Sync {
     fn load(&self, key: String) -> Option<String>;
-    fn save(&self, key: String, value: String);
-    fn remove(&self, key: String);
+    /// Persist `value` under `key`. Returns whether it durably persisted.
+    fn save(&self, key: String, value: String) -> bool;
+    /// Delete `key`. Returns whether the deletion durably persisted. Deleting a
+    /// key that is already absent is a success.
+    fn remove(&self, key: String) -> bool;
 }
 
 const GLOBAL_SIGN_POLICY_KEY: &str = "global_sign_policy";
@@ -196,12 +207,14 @@ impl SignPolicyStore {
             .unwrap_or(SignPolicySelection::Manual)
     }
 
-    /// Persist the global sign-policy selection.
-    pub fn set_global_policy(&self, policy: SignPolicySelection) {
+    /// Persist the global sign-policy selection. Returns whether it persisted;
+    /// on `false` the previously stored selection is still the one in force, so
+    /// a caller must not report the change as applied.
+    pub fn set_global_policy(&self, policy: SignPolicySelection) -> bool {
         self.storage.save(
             GLOBAL_SIGN_POLICY_KEY.to_string(),
             policy.to_ordinal().to_string(),
-        );
+        )
     }
 
     /// The per-app override, or `None` if the app follows the global policy.
@@ -212,8 +225,15 @@ impl SignPolicyStore {
             .map(SignPolicySelection::from_ordinal)
     }
 
-    /// Set (`Some`) or clear (`None`) the per-app override.
-    pub fn set_app_override(&self, package: String, policy: Option<SignPolicySelection>) {
+    /// Set (`Some`) or clear (`None`) the per-app override. Returns whether the
+    /// write persisted.
+    ///
+    /// A failed clear matters most: an override is typically stricter than the
+    /// global policy, so a caller that treats an unconfirmed clear as done can
+    /// drop the record that the override still exists and leave it in force with
+    /// nothing tracking it. Callers must keep their own index until this reports
+    /// `true`.
+    pub fn set_app_override(&self, package: String, policy: Option<SignPolicySelection>) -> bool {
         match policy {
             Some(p) => self
                 .storage
@@ -1294,12 +1314,46 @@ mod tests {
         fn load(&self, key: String) -> Option<String> {
             self.map.lock().unwrap().get(&key).cloned()
         }
-        fn save(&self, key: String, value: String) {
+        fn save(&self, key: String, value: String) -> bool {
             self.map.lock().unwrap().insert(key, value);
+            true
         }
-        fn remove(&self, key: String) {
+        fn remove(&self, key: String) -> bool {
             self.map.lock().unwrap().remove(&key);
+            true
         }
+    }
+
+    /// A store whose writes never persist, modelling a backing file that fails
+    /// while an in-memory cache still answers reads. Proves the setters report
+    /// the failure instead of it being invisible.
+    struct FailingPolicyStorage;
+    impl SignPolicySelectionStorage for FailingPolicyStorage {
+        fn load(&self, _key: String) -> Option<String> {
+            None
+        }
+        fn save(&self, _key: String, _value: String) -> bool {
+            false
+        }
+        fn remove(&self, _key: String) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn setters_report_whether_the_write_persisted() {
+        let ok = SignPolicyStore::new(MockPolicyStorage::new());
+        assert!(ok.set_global_policy(SignPolicySelection::Basic));
+        assert!(ok.set_app_override("com.example".into(), Some(SignPolicySelection::Manual)));
+        assert!(ok.set_app_override("com.example".into(), None));
+
+        // A store that cannot persist must say so, for both the set and the
+        // clear: a caller that assumed success would drop the only record that
+        // the old, possibly looser, selection is still in force.
+        let bad = SignPolicyStore::new(Arc::new(FailingPolicyStorage));
+        assert!(!bad.set_global_policy(SignPolicySelection::Auto));
+        assert!(!bad.set_app_override("com.example".into(), Some(SignPolicySelection::Auto)));
+        assert!(!bad.set_app_override("com.example".into(), None));
     }
 
     #[test]
