@@ -46,10 +46,20 @@ pub struct WsTicket {
 /// Gated by the bearer middleware; the ticket (not the durable token) is what
 /// rides in the WS URL.
 pub async fn ws_ticket(State(state): State<AppState>) -> impl IntoResponse {
-    let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+    // Refuse rather than issue a ticket the health check has flagged: the ticket
+    // authorizes a WebSocket upgrade, so a suspect value must never leave here.
+    // This covers the health-check verdict only; a hard OS-entropy failure still
+    // unwinds inside the RNG itself, which is tracked separately in keep-core.
+    let Ok(bytes) = keep_core::crypto::try_random_bytes::<32>() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entropy unavailable, try again",
+        )
+            .into_response();
+    };
     let ticket: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     state.ws_tickets.issue(ticket.clone());
-    Json(WsTicket { ticket })
+    Json(WsTicket { ticket }).into_response()
 }
 
 /// Returns the bunker connection details. The `url` carries the connection
