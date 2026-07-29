@@ -46,10 +46,19 @@ pub struct WsTicket {
 /// Gated by the bearer middleware; the ticket (not the durable token) is what
 /// rides in the WS URL.
 pub async fn ws_ticket(State(state): State<AppState>) -> impl IntoResponse {
-    let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+    // Fail the request rather than panicking if the RNG health check trips: a
+    // guessable ticket would authorize a WebSocket upgrade, and an unwind inside
+    // the handler would take down an always-on co-signer over a recoverable fault.
+    let Ok(bytes) = keep_core::crypto::try_random_bytes::<32>() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "entropy unavailable, try again",
+        )
+            .into_response();
+    };
     let ticket: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     state.ws_tickets.issue(ticket.clone());
-    Json(WsTicket { ticket })
+    Json(WsTicket { ticket }).into_response()
 }
 
 /// Returns the bunker connection details. The `url` carries the connection

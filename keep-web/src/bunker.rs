@@ -49,8 +49,14 @@ struct WebCallbacks {
 /// Random, unguessable approval id (defense-in-depth alongside the auth gate).
 /// Masked to 53 bits so the value round-trips losslessly through a JS Number
 /// (IEEE-754 double) in the browser client.
-fn random_approval_id() -> u64 {
-    u64::from_le_bytes(keep_core::crypto::random_bytes()) & ((1u64 << 53) - 1)
+///
+/// `None` when the RNG health check trips. Unguessability is the whole point of
+/// this value, so the caller refuses the approval rather than falling back to
+/// anything predictable.
+fn random_approval_id() -> Option<u64> {
+    keep_core::crypto::try_random_bytes::<8>()
+        .ok()
+        .map(|bytes| u64::from_le_bytes(bytes) & ((1u64 << 53) - 1))
 }
 
 impl ServerCallbacks for WebCallbacks {
@@ -80,7 +86,17 @@ impl ServerCallbacks for WebCallbacks {
             });
             return false.into();
         }
-        let id = random_approval_id();
+        // Fail closed: without a sound random id the approval channel would be
+        // guessable, so refuse the request the same way a disabled kill switch does.
+        let Some(id) = random_approval_id() else {
+            let _ = self.events.send(Event::Log {
+                app: "frost".into(),
+                action: "refused (entropy unavailable)".into(),
+                success: false,
+                detail: Some("random number generator health check failed".into()),
+            });
+            return false.into();
+        };
         let (tx, rx) = channel();
         if let Ok(mut map) = self.approvals.lock() {
             map.insert(id, tx);
@@ -424,7 +440,8 @@ mod tests {
     fn approval_id_is_js_safe() {
         const MAX_SAFE: u64 = (1u64 << 53) - 1;
         for _ in 0..10_000 {
-            assert!(random_approval_id() <= MAX_SAFE);
+            let id = random_approval_id().expect("healthy RNG yields an approval id");
+            assert!(id <= MAX_SAFE);
         }
     }
 
