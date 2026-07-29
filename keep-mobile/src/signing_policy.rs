@@ -92,6 +92,12 @@ pub enum AutoSignDecision {
     CoolingOff {
         until_ms: u64,
     },
+    /// The usage counters could not be durably recorded, so this request cannot
+    /// be counted toward the hourly and daily ceilings. Auto-signing is refused
+    /// rather than allowed: continuing would let every subsequent request reuse
+    /// the same un-incremented window and bypass the limits entirely. Appended
+    /// last so the existing variants keep their wire ordinals.
+    StorageUnavailable,
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
@@ -417,9 +423,18 @@ struct UsageWindow {
 #[uniffi::export(with_foreign)]
 pub trait SigningRateLimiterStorage: Send + Sync {
     fn load(&self, key: String) -> Option<String>;
-    fn save(&self, key: String, value: String);
-    fn remove(&self, key: String);
-    fn clear(&self);
+    /// Persist `value` under `key`. Returns whether it durably persisted.
+    ///
+    /// As with [`SignPolicySelectionStorage`], the return must be the platform's
+    /// own durable-write result, not a "did not throw" flag. These counters are
+    /// not telemetry: [`SigningRateLimiter::check_and_record`] gates auto-signing
+    /// on them, so a write that silently vanishes means the request is never
+    /// counted, the hourly and daily ceilings never accumulate toward their
+    /// limits, and a cooling-off penalty is dropped. That widens the sustained
+    /// auto-approval rate rather than losing a statistic.
+    fn save(&self, key: String, value: String) -> bool;
+    fn remove(&self, key: String) -> bool;
+    fn clear(&self) -> bool;
 }
 
 /// Per-package velocity limiter for opt-in auto-signing. Hourly and daily
@@ -500,8 +515,16 @@ impl SigningRateLimiter {
             return AutoSignDecision::UnusualActivity;
         }
 
-        self.save_window(HOURLY_KEY_PREFIX, &package_name, &hourly, now_wall_ms);
-        self.save_window(DAILY_KEY_PREFIX, &package_name, &daily, now_wall_ms);
+        // Both counters must land before this request can be called allowed. If
+        // either write is lost, the window stays un-incremented and every later
+        // request reads the same count, so the hourly and daily ceilings would
+        // never be reached and auto-signing would be effectively unlimited.
+        // Refusing costs a prompt; continuing removes the limit.
+        let hourly_saved = self.save_window(HOURLY_KEY_PREFIX, &package_name, &hourly, now_wall_ms);
+        let daily_saved = self.save_window(DAILY_KEY_PREFIX, &package_name, &daily, now_wall_ms);
+        if !hourly_saved || !daily_saved {
+            return AutoSignDecision::StorageUnavailable;
+        }
 
         AutoSignDecision::Allowed {
             hourly_count: hourly.count,
@@ -612,17 +635,19 @@ impl SigningRateLimiter {
         }
     }
 
+    /// Returns whether the counter durably persisted. A `false` here means this
+    /// request was not counted, so the caller must not report it as allowed.
     fn save_window(
         &self,
         prefix: &str,
         package_name: &str,
         window: &UsageWindow,
         now_wall_ms: u64,
-    ) {
+    ) -> bool {
         self.storage.save(
             key(prefix, package_name),
             serialize_window(window, now_wall_ms),
-        );
+        )
     }
 
     /// Increment the in-memory unusual-activity window (60s); not persisted.
@@ -997,15 +1022,69 @@ mod tests {
         fn load(&self, key: String) -> Option<String> {
             self.map.lock().unwrap().get(&key).cloned()
         }
-        fn save(&self, key: String, value: String) {
+        fn save(&self, key: String, value: String) -> bool {
             self.map.lock().unwrap().insert(key, value);
+            true
         }
-        fn remove(&self, key: String) {
+        fn remove(&self, key: String) -> bool {
             self.map.lock().unwrap().remove(&key);
+            true
         }
-        fn clear(&self) {
+        fn clear(&self) -> bool {
             self.map.lock().unwrap().clear();
+            true
         }
+    }
+
+    /// Storage whose writes never persist while reads keep working, modelling a
+    /// backing file that fails silently. Drives the path where the usage counters
+    /// cannot be recorded.
+    struct UnwritableStorage;
+    impl SigningRateLimiterStorage for UnwritableStorage {
+        fn load(&self, _key: String) -> Option<String> {
+            None
+        }
+        fn save(&self, _key: String, _value: String) -> bool {
+            false
+        }
+        fn remove(&self, _key: String) -> bool {
+            false
+        }
+        fn clear(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn unrecordable_usage_refuses_instead_of_allowing() {
+        // The counters cannot be persisted, so this request cannot be counted
+        // toward the ceilings. Allowing it would let every later request reuse
+        // the same un-incremented window and never reach a limit.
+        let limiter = SigningRateLimiter::new(Arc::new(UnwritableStorage));
+        for i in 0..5 {
+            let result = limiter.check_and_record("com.test".to_string(), 1000 + i, 1000 + i);
+            assert_eq!(
+                result,
+                AutoSignDecision::StorageUnavailable,
+                "an uncounted request must not be reported as allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn unrecordable_usage_does_not_auto_approve() {
+        // The decision path must treat it as a refusal, not just the limiter.
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        assert_eq!(
+            evaluate_sign_policy_selection(
+                SignPolicySelection::Auto,
+                ctx,
+                true,
+                AutoSignDecision::StorageUnavailable,
+                12,
+            ),
+            SignPolicyEvaluation::FallToUi
+        );
     }
 
     #[test]
