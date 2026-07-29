@@ -160,6 +160,42 @@ impl SignPolicySelection {
     }
 }
 
+/// Outcome of reading a usage window: a live window, a legitimately fresh one,
+/// or a read that could not be trusted. Internal to the limiter.
+enum WindowRead {
+    Active(UsageWindow),
+    Fresh,
+    Unavailable,
+}
+
+impl WindowRead {
+    /// Count for reporting only, where an unreadable window shows as zero. The
+    /// authorization path must not use this: it has to distinguish "no usage"
+    /// from "unknown usage" and refuse on the latter.
+    fn display_count(&self) -> u32 {
+        match self {
+            WindowRead::Active(w) => w.count,
+            WindowRead::Fresh | WindowRead::Unavailable => 0,
+        }
+    }
+}
+
+/// Outcome of a rate-limiter storage read.
+///
+/// The distinction between `Absent` and `Unavailable` is load-bearing. A missing
+/// key legitimately means "no usage recorded yet", so the window starts fresh. A
+/// read that failed means nothing is known, and starting fresh there would reset
+/// the count on every request and make the hourly and daily ceilings unreachable.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum StorageRead {
+    /// The key holds this value.
+    Found { value: String },
+    /// The key is genuinely not present.
+    Absent,
+    /// The value could not be read or decoded. Callers must fail closed.
+    Unavailable,
+}
+
 /// Persistence for the sign-policy selection (global + per-app override). A
 /// simple string key/value store; the Android side backs it with its encrypted
 /// sign-policy prefs.
@@ -422,7 +458,11 @@ struct UsageWindow {
 /// `nip55_auto_signing` prefs.
 #[uniffi::export(with_foreign)]
 pub trait SigningRateLimiterStorage: Send + Sync {
-    fn load(&self, key: String) -> Option<String>;
+    /// Read `key`. `Absent` and `Unavailable` must not be conflated: a counter
+    /// that could not be read is not the same as a package with no history, and
+    /// treating the former as the latter restarts the window at zero on every
+    /// request, which removes the ceiling just as effectively as a lost write.
+    fn load(&self, key: String) -> StorageRead;
     /// Persist `value` under `key`. Returns whether it durably persisted.
     ///
     /// As with [`SignPolicySelectionStorage`], the return must be the platform's
@@ -475,7 +515,13 @@ impl SigningRateLimiter {
     ) -> AutoSignDecision {
         let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
 
-        let cooled = self.cooled_off_state(&package_name, now_elapsed_ms, now_wall_ms);
+        // Every read below fails closed. Unknown prior usage is not "no prior
+        // usage": treating it as none would restart the window on each request
+        // and make the ceilings unreachable, which is the same bypass a lost
+        // write produces.
+        let Some(cooled) = self.cooled_off_state(&package_name, now_elapsed_ms, now_wall_ms) else {
+            return AutoSignDecision::StorageUnavailable;
+        };
         if cooled.active() {
             return AutoSignDecision::CoolingOff {
                 until_ms: cooled.until_wall_ms(now_elapsed_ms, now_wall_ms),
@@ -485,25 +531,29 @@ impl SigningRateLimiter {
         // Compute would-be counts first; a denied request must not increment the
         // persisted counter, so the windows are only saved once every limit
         // passes.
-        let hourly = self.next_window(
+        let Some(hourly) = self.next_window(
             HOURLY_KEY_PREFIX,
             &package_name,
             HOUR_MS,
             now_elapsed_ms,
             now_wall_ms,
-        );
+        ) else {
+            return AutoSignDecision::StorageUnavailable;
+        };
         if hourly.count > HOURLY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
             return AutoSignDecision::HourlyLimitExceeded;
         }
 
-        let daily = self.next_window(
+        let Some(daily) = self.next_window(
             DAILY_KEY_PREFIX,
             &package_name,
             DAY_MS,
             now_elapsed_ms,
             now_wall_ms,
-        );
+        ) else {
+            return AutoSignDecision::StorageUnavailable;
+        };
         if daily.count > DAILY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
             return AutoSignDecision::DailyLimitExceeded;
@@ -571,8 +621,7 @@ impl SigningRateLimiter {
                 now_elapsed_ms,
                 now_wall_ms,
             )
-            .map(|w| w.count)
-            .unwrap_or(0);
+            .display_count();
         let daily_count = self
             .read_window(
                 DAILY_KEY_PREFIX,
@@ -581,8 +630,7 @@ impl SigningRateLimiter {
                 now_elapsed_ms,
                 now_wall_ms,
             )
-            .map(|w| w.count)
-            .unwrap_or(0);
+            .display_count();
         UsageStats {
             hourly_count,
             daily_count,
@@ -603,13 +651,26 @@ impl SigningRateLimiter {
         window_ms: u64,
         now_elapsed_ms: u64,
         now_wall_ms: u64,
-    ) -> Option<UsageWindow> {
-        let raw = self.storage.load(key(prefix, package_name))?;
-        let window = parse_window(&raw, now_elapsed_ms, now_wall_ms)?;
+    ) -> WindowRead {
+        let raw = match self.storage.load(key(prefix, package_name)) {
+            StorageRead::Found { value } => value,
+            // No history yet: a genuinely fresh window, not a fault.
+            StorageRead::Absent => return WindowRead::Fresh,
+            StorageRead::Unavailable => return WindowRead::Unavailable,
+        };
+        // Stored but undecodable is a fault, not a fresh window: treating corrupt
+        // data as "no usage" would reset the counter on every request.
+        let Some(window) = parse_window(&raw, now_elapsed_ms, now_wall_ms) else {
+            return WindowRead::Unavailable;
+        };
         let active = now_elapsed_ms
             .checked_sub(window.start_elapsed)
             .is_some_and(|elapsed| elapsed < window_ms);
-        active.then_some(window)
+        if active {
+            WindowRead::Active(window)
+        } else {
+            WindowRead::Fresh
+        }
     }
 
     /// Compute the window the next increment would produce, without persisting
@@ -622,16 +683,18 @@ impl SigningRateLimiter {
         window_ms: u64,
         now_elapsed_ms: u64,
         now_wall_ms: u64,
-    ) -> UsageWindow {
+    ) -> Option<UsageWindow> {
         match self.read_window(prefix, package_name, window_ms, now_elapsed_ms, now_wall_ms) {
-            Some(mut w) => {
+            WindowRead::Active(mut w) => {
                 w.count = w.count.saturating_add(1);
-                w
+                Some(w)
             }
-            None => UsageWindow {
+            WindowRead::Fresh => Some(UsageWindow {
                 count: 1,
                 start_elapsed: now_elapsed_ms,
-            },
+            }),
+            // Unknown prior usage: the caller must refuse rather than assume none.
+            WindowRead::Unavailable => None,
         }
     }
 
@@ -695,19 +758,23 @@ impl SigningRateLimiter {
         package_name: &str,
         now_elapsed_ms: u64,
         now_wall_ms: u64,
-    ) -> CooledOffState {
+    ) -> Option<CooledOffState> {
+        // An unreadable penalty must not read as "not penalised": that is how a
+        // cooling-off period would be skipped by a store that cannot be read.
         let wall_until = self
             .load_u64(&key(COOLED_OFF_KEY_PREFIX, package_name))
+            .ok()?
             .filter(|&u| u > 0 && now_wall_ms < u);
         let elapsed_until = self
             .load_u64(&key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name))
+            .ok()?
             .filter(|&u| {
                 u > 0 && now_elapsed_ms < u && u - now_elapsed_ms <= COOLING_OFF_PERIOD_MS
             });
-        CooledOffState {
+        Some(CooledOffState {
             wall_until,
             elapsed_until,
-        }
+        })
     }
 
     fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) {
@@ -721,8 +788,16 @@ impl SigningRateLimiter {
         );
     }
 
-    fn load_u64(&self, key: &str) -> Option<u64> {
-        self.storage.load(key.to_string())?.parse::<u64>().ok()
+    /// `Ok(None)` is a genuinely unset key; `Err(())` is a read that failed or a
+    /// value that would not decode, which callers must treat as unknown rather
+    /// than as "no penalty recorded".
+    #[allow(clippy::result_unit_err)]
+    fn load_u64(&self, key: &str) -> Result<Option<u64>, ()> {
+        match self.storage.load(key.to_string()) {
+            StorageRead::Found { value } => value.parse::<u64>().map(Some).map_err(|_| ()),
+            StorageRead::Absent => Ok(None),
+            StorageRead::Unavailable => Err(()),
+        }
     }
 }
 
@@ -1019,8 +1094,13 @@ mod tests {
         }
     }
     impl SigningRateLimiterStorage for MockStorage {
-        fn load(&self, key: String) -> Option<String> {
-            self.map.lock().unwrap().get(&key).cloned()
+        fn load(&self, key: String) -> StorageRead {
+            match self.map.lock().unwrap().get(&key) {
+                Some(value) => StorageRead::Found {
+                    value: value.clone(),
+                },
+                None => StorageRead::Absent,
+            }
         }
         fn save(&self, key: String, value: String) -> bool {
             self.map.lock().unwrap().insert(key, value);
@@ -1041,8 +1121,8 @@ mod tests {
     /// cannot be recorded.
     struct UnwritableStorage;
     impl SigningRateLimiterStorage for UnwritableStorage {
-        fn load(&self, _key: String) -> Option<String> {
-            None
+        fn load(&self, _key: String) -> StorageRead {
+            StorageRead::Absent
         }
         fn save(&self, _key: String, _value: String) -> bool {
             false
@@ -1053,6 +1133,84 @@ mod tests {
         fn clear(&self) -> bool {
             false
         }
+    }
+
+    /// Writes land, but reads never do. Before reads failed closed this was the
+    /// wider hole: an unreadable counter looked like a fresh window, so the count
+    /// restarted every request and the hourly ceiling was never approached.
+    struct UnreadableStorage {
+        map: Mutex<HashMap<String, String>>,
+    }
+    impl SigningRateLimiterStorage for UnreadableStorage {
+        fn load(&self, key: String) -> StorageRead {
+            // Only the usage counters are unreadable. The cooling-off keys answer
+            // normally so this isolates the window path: without that, the
+            // cooling-off read fails closed first and the test would pass even if
+            // an unreadable window were still treated as a fresh one.
+            if key.starts_with(HOURLY_KEY_PREFIX) || key.starts_with(DAILY_KEY_PREFIX) {
+                StorageRead::Unavailable
+            } else {
+                StorageRead::Absent
+            }
+        }
+        fn save(&self, key: String, value: String) -> bool {
+            self.map.lock().unwrap().insert(key, value);
+            true
+        }
+        fn remove(&self, key: String) -> bool {
+            self.map.lock().unwrap().remove(&key);
+            true
+        }
+        fn clear(&self) -> bool {
+            self.map.lock().unwrap().clear();
+            true
+        }
+    }
+
+    #[test]
+    fn unreadable_usage_refuses_instead_of_restarting_the_window() {
+        let limiter = SigningRateLimiter::new(Arc::new(UnreadableStorage {
+            map: Mutex::new(HashMap::new()),
+        }));
+        // Well past the hourly ceiling: if an unreadable counter were treated as
+        // a fresh window, every one of these would come back Allowed.
+        for i in 0..(HOURLY_LIMIT + 20) {
+            let result =
+                limiter.check_and_record("com.test".to_string(), 1000 + i as u64, 1000 + i as u64);
+            assert_eq!(
+                result,
+                AutoSignDecision::StorageUnavailable,
+                "unknown prior usage must not be treated as no prior usage"
+            );
+        }
+    }
+
+    /// Stored data that will not decode is a fault, not an empty window.
+    struct CorruptStorage;
+    impl SigningRateLimiterStorage for CorruptStorage {
+        fn load(&self, _key: String) -> StorageRead {
+            StorageRead::Found {
+                value: "not-a-window".to_string(),
+            }
+        }
+        fn save(&self, _key: String, _value: String) -> bool {
+            true
+        }
+        fn remove(&self, _key: String) -> bool {
+            true
+        }
+        fn clear(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn undecodable_counter_refuses_instead_of_restarting_the_window() {
+        let limiter = SigningRateLimiter::new(Arc::new(CorruptStorage));
+        assert_eq!(
+            limiter.check_and_record("com.test".to_string(), 1000, 1000),
+            AutoSignDecision::StorageUnavailable
+        );
     }
 
     #[test]
