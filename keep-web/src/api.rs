@@ -46,9 +46,10 @@ pub struct WsTicket {
 /// Gated by the bearer middleware; the ticket (not the durable token) is what
 /// rides in the WS URL.
 pub async fn ws_ticket(State(state): State<AppState>) -> impl IntoResponse {
-    // Fail the request rather than panicking if the RNG health check trips: a
-    // guessable ticket would authorize a WebSocket upgrade, and an unwind inside
-    // the handler would take down an always-on co-signer over a recoverable fault.
+    // Refuse rather than issue a ticket the health check has flagged: the ticket
+    // authorizes a WebSocket upgrade, so a suspect value must never leave here.
+    // This covers the health-check verdict only; a hard OS-entropy failure still
+    // unwinds inside the RNG itself, which is tracked separately in keep-core.
     let Ok(bytes) = keep_core::crypto::try_random_bytes::<32>() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,

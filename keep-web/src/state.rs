@@ -448,7 +448,7 @@ fn write_secret_file(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     // Per-write temp name (PID + random suffix) so a concurrent writer cannot
     // clobber an in-flight temp file before its rename.
-    let suffix: [u8; 8] = keep_core::crypto::random_bytes();
+    let suffix: [u8; 8] = try_random()?;
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), to_hex(&suffix)));
 
     let write = || -> std::io::Result<()> {
@@ -598,7 +598,7 @@ pub fn load_or_create_auth_token_at(path: &Path) -> std::io::Result<String> {
     match opts.open(path) {
         Ok(mut f) => {
             use std::io::Write;
-            let bytes: [u8; 32] = keep_core::crypto::random_bytes();
+            let bytes: [u8; 32] = try_random()?;
             let token = to_hex(&bytes);
             f.write_all(token.as_bytes())?;
             f.sync_all()?;
