@@ -2274,7 +2274,11 @@ impl KeepMobile {
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
                 group_pubkey: group_pubkey_bytes,
-                did_backup: true,
+                // Preserve what the backup recorded rather than asserting it.
+                // Marking a share backed up when it was not suppresses the
+                // prompt telling the user to back it up, and keep-core's own
+                // restore already carries the recorded value through.
+                did_backup: bs.did_backup,
             };
 
             let share_meta = keep_core::frost::ShareMetadata {
@@ -2286,7 +2290,7 @@ impl KeepMobile {
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
-                did_backup: true,
+                did_backup: bs.did_backup,
             };
 
             let stored = StoredShareData {
@@ -4333,5 +4337,160 @@ mod cert_pin_ffi_tests {
         // Non-wss and unparseable relays are not treated as pin-skips.
         assert!(!super::wss_relay_lacks_pin("ws://relay.example.com", &pins));
         assert!(!super::wss_relay_lacks_pin("not a url", &pins));
+    }
+}
+
+#[cfg(test)]
+mod restore_backup_metadata_tests {
+    use super::*;
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// Records the metadata handed to the store, which the other mocks discard.
+    /// Restore writes the backed-up flag in two places, the metadata passed to
+    /// storage and the metadata serialized into the record, so a test reading
+    /// only one of them can pass while the other is still wrong.
+    #[derive(Default)]
+    struct RecordingStorage {
+        data: StdMutex<HashMap<String, Vec<u8>>>,
+        metas: StdMutex<Vec<ShareMetadataInfo>>,
+        active: StdMutex<Option<String>>,
+    }
+
+    impl SecureStorage for RecordingStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            Err(KeepMobileError::StorageNotFound)
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            meta: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().insert(key, data);
+            self.metas.lock().unwrap().push(meta);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            self.metas.lock().unwrap().clone()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            self.active.lock().unwrap().clone()
+        }
+        fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
+            *self.active.lock().unwrap() = key;
+            Ok(())
+        }
+    }
+
+    fn backup_share(did_backup: bool) -> keep_core::backup::BackupShare {
+        keep_core::backup::BackupShare {
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: hex::encode([7u8; 32]),
+            name: "restored".into(),
+            created_at: 1_700_000_000,
+            last_used: None,
+            sign_count: 0,
+            did_backup,
+            // Restore hex-decodes these and stores the bytes without parsing
+            // them, so opaque values exercise the metadata path fine.
+            key_package: hex::encode([1u8; 48]),
+            pubkey_package: hex::encode([2u8; 48]),
+            ciphersuite: Default::default(),
+        }
+    }
+
+    fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(did_backup)],
+            vec![],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build");
+
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+
+        let key = hex::encode([7u8; 32]);
+        let raw = storage.load_share_by_key(key).expect("share stored");
+        let stored: StoredShareData = serde_json::from_slice(&raw).expect("record parses");
+        (Arc::clone(&storage), stored.metadata_json)
+    }
+
+    /// Selects by name: non-share records such as the policy and any descriptors
+    /// are persisted through the same storage method, so the recorded metadata
+    /// is not a single entry.
+    fn restored_share_meta(storage: &RecordingStorage) -> ShareMetadataInfo {
+        storage
+            .metas
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.name == "restored")
+            .cloned()
+            .expect("the restored share's metadata should reach storage")
+    }
+
+    #[test]
+    fn a_share_that_was_not_backed_up_does_not_come_back_marked_backed_up() {
+        let (storage, metadata_json) = restore_one(false);
+
+        assert!(
+            metadata_json.contains("\"did_backup\":false"),
+            "record should keep the recorded flag, got: {metadata_json}"
+        );
+        assert!(
+            !restored_share_meta(&storage).did_backup,
+            "the metadata handed to storage must agree with the record"
+        );
+    }
+
+    #[test]
+    fn a_share_that_was_backed_up_stays_marked_backed_up() {
+        let (storage, metadata_json) = restore_one(true);
+
+        assert!(
+            metadata_json.contains("\"did_backup\":true"),
+            "a true flag must survive too, or the fix would just invert the bug: {metadata_json}"
+        );
+        assert!(restored_share_meta(&storage).did_backup);
     }
 }
