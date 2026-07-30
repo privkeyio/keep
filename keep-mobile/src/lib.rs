@@ -1098,6 +1098,16 @@ impl KeepMobile {
             .transpose()
     }
 
+    /// Generates a threshold key set using a trusted dealer.
+    ///
+    /// **The full private key exists on this device during generation.** Every
+    /// share is derived here before being distributed, so a device compromised
+    /// at this moment exposes the key regardless of the threshold chosen. The
+    /// threshold protects signing afterwards; it does not protect generation.
+    ///
+    /// Prefer distributed key generation where each participant contributes
+    /// entropy and the whole key is never assembled anywhere. Use this only when
+    /// that is not available, and treat the generating device accordingly.
     pub fn frost_generate(
         &self,
         threshold: u16,
@@ -1115,6 +1125,14 @@ impl KeepMobile {
         Self::build_generation_result(&shares, &passphrase)
     }
 
+    /// Splits an existing private key into threshold shares using a trusted
+    /// dealer.
+    ///
+    /// **The key is present in full on this device**, both as the input being
+    /// split and while the shares are derived. The same caveat as
+    /// [`Self::frost_generate`] applies, and additionally the key existed before
+    /// this call, so it may already be recorded elsewhere: splitting it does not
+    /// retract earlier copies.
     pub fn frost_split(
         &self,
         mut existing_key: String,
