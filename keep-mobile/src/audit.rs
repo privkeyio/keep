@@ -220,8 +220,10 @@ fn monotonic_timestamp(now: i64, tail: i64) -> (i64, bool) {
     if now >= tail {
         return (now, false);
     }
-    // saturating: `now` may be far negative and `tail` may be the empty-chain
-    // sentinel, so a subtraction here could overflow.
+    // Saturating because `tail` can be attacker-influenced up to `i64::MAX` via a
+    // planted row, and a plain add would overflow for a `now` near the top of the
+    // range. The empty-chain sentinel never reaches here: `now >= i64::MIN` always
+    // takes the branch above.
     if tail <= now.saturating_add(MAX_TAIL_DRIFT_SECS) {
         (tail, false)
     } else {
@@ -955,8 +957,11 @@ mod tests {
 
     #[test]
     fn clearing_forgets_the_previous_timestamp() {
+        // Inside the drift window on purpose. Seeded beyond it, the bound would
+        // refuse the stale tail anyway and the assertion below would hold with
+        // the reset deleted, which is the test passing for the wrong reason.
         let storage = Arc::new(MockStorage::new());
-        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 30);
 
         let log = AuditLog::new(storage.clone()).unwrap();
         log.clear_entries("CLEAR_ALL_ENTRIES".into()).unwrap();
@@ -965,8 +970,10 @@ mod tests {
 
         let times = timestamps(&storage);
         assert_eq!(times.len(), 1, "the clear should have emptied storage");
+        // Not merely "under the future tail": with the reset removed, the entry
+        // would be pulled up to the seeded tail, which is ahead of now.
         assert!(
-            times.last().unwrap() < &(chrono::Utc::now().timestamp() + 60),
+            times[0] <= chrono::Utc::now().timestamp(),
             "a cleared log must not carry the old chain's time forward: {times:?}"
         );
     }
@@ -1227,6 +1234,89 @@ mod tests {
             self.entries.lock().unwrap().clear();
             Ok(())
         }
+    }
+
+    /// The signing chain is the one wired in production, recording every
+    /// approval and denial, so its clamp needs its own coverage rather than
+    /// relying on the other chain's tests.
+    ///
+    /// There is no equivalent here of the other chain's "a clamped entry still
+    /// verifies" test: this chain builds a hash chain but exposes no way to
+    /// verify it, which is tracked separately. That gap is why the ordering of
+    /// the clamp against `finalize` is only pinned on the other chain.
+    fn seed_signing_entry_at(storage: &MockSigningStorage, timestamp: i64) {
+        let mut entry = SigningAuditEntry::new(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app_a",
+            [0u8; 32],
+        );
+        entry.timestamp = timestamp;
+        let entry = entry.finalize();
+        storage
+            .store_entry(serde_json::to_string(&entry).unwrap())
+            .unwrap();
+    }
+
+    fn signing_timestamps(storage: &MockSigningStorage) -> Vec<i64> {
+        storage
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|j| {
+                serde_json::from_str::<SigningAuditEntry>(j)
+                    .unwrap()
+                    .timestamp
+            })
+            .collect()
+    }
+
+    fn log_one_signing(log: &SigningAuditLog) {
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app_a".into(),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signing_chain_does_not_record_an_entry_older_than_the_one_before_it() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let future = chrono::Utc::now().timestamp() + 30;
+        seed_signing_entry_at(&storage, future);
+
+        let log = SigningAuditLog::new(storage.clone()).unwrap();
+        log_one_signing(&log);
+
+        let times = signing_timestamps(&storage);
+        assert!(
+            times[1] >= times[0],
+            "chain order and timestamp order must agree: {times:?}"
+        );
+    }
+
+    #[test]
+    fn signing_chain_does_not_let_a_future_tail_pin_later_entries() {
+        let storage = Arc::new(MockSigningStorage::new());
+        seed_signing_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+
+        let log = SigningAuditLog::new(storage.clone()).unwrap();
+        log_one_signing(&log);
+        log_one_signing(&log);
+
+        let times = signing_timestamps(&storage);
+        let ceiling = chrono::Utc::now().timestamp() + 60;
+        assert!(
+            times[1] < ceiling && times[2] < ceiling,
+            "a future tail must not propagate on the production chain: {times:?}"
+        );
     }
 
     #[test]
