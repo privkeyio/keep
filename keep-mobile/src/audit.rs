@@ -167,7 +167,7 @@ impl TryFrom<AuditEntry> for AuditEntryExport {
 ///
 /// # Contract: `store_entry` must be non-blocking
 ///
-/// [`AuditLog::log_event`] holds the chain's `last_hash` mutex across the call to
+/// [`AuditLog::log_event`] holds the chain's chain-tail mutex across the call to
 /// [`store_entry`](Self::store_entry): the lock must span
 /// compute-previous-hash → store → advance-hash so two concurrent writers cannot
 /// chain onto the same previous hash and fork the log. Releasing the lock earlier
@@ -185,10 +185,64 @@ pub trait AuditStorage: Send + Sync {
     fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError>;
 }
 
+/// How far ahead of the clock a chain tail may pull a new entry's timestamp.
+///
+/// Mirrors the bound the state replication path uses for the same problem: a
+/// monotonic timestamp over a wall clock nobody controls.
+const MAX_TAIL_DRIFT_SECS: i64 = 60;
+
+/// The timestamp to record for an entry following one stamped `tail`.
+///
+/// Order along the chain is fixed by the prev-hash linkage, but the timestamp
+/// comes from the wall clock, which can move backwards on an NTP correction or
+/// because the device's clock was changed. Left alone, an entry then reads as
+/// older than the one it follows, so a reader sorting by time sees an order the
+/// chain contradicts, and someone able to move the clock can make an action
+/// appear to precede one it actually followed.
+///
+/// So `now` is pulled up to `tail`, but only within a bound, and that bound is
+/// the point. An unbounded pull-up means a single entry stamped far in the
+/// future, from a clock set forward or written straight into storage, silently
+/// pins every later entry to that value for the life of the chain. This chain is
+/// an unkeyed hash chain, so storage write access is enough to plant one, and
+/// verification would still pass. That trades one visible outlier for permanent
+/// invisible corruption, which is worse than the disorder it prevents.
+///
+/// Outside the bound the pull-up is abandoned and the real clock reading is
+/// recorded, leaving the anomaly as the single out-of-order entry it already was.
+/// Monotonicity is deliberately not preserved in that case; keeping the log
+/// honest matters more than keeping it sorted.
+///
+/// Rejecting the entry instead is not an option: that drops the record of
+/// whatever just happened and hands anyone who can move the clock backwards a
+/// way to suppress audit logging entirely.
+fn monotonic_timestamp(now: i64, tail: i64) -> (i64, bool) {
+    if now >= tail {
+        return (now, false);
+    }
+    // Saturating because `tail` can be attacker-influenced up to `i64::MAX` via a
+    // planted row, and a plain add would overflow for a `now` near the top of the
+    // range. The empty-chain sentinel never reaches here: `now >= i64::MIN` always
+    // takes the branch above.
+    if tail <= now.saturating_add(MAX_TAIL_DRIFT_SECS) {
+        (tail, false)
+    } else {
+        (now, true)
+    }
+}
+
+/// The tail of the hash chain: the previous entry's hash and the timestamp it
+/// carried. Kept in one lock because an entry is only well-formed against both,
+/// and a split lock could let one advance without the other.
+struct ChainTail {
+    hash: [u8; 32],
+    timestamp: i64,
+}
+
 #[derive(uniffi::Object)]
 pub struct AuditLog {
     storage: std::sync::Arc<dyn AuditStorage>,
-    last_hash: std::sync::Mutex<[u8; 32]>,
+    tail: std::sync::Mutex<ChainTail>,
 }
 
 impl AuditLog {
@@ -218,25 +272,32 @@ impl AuditLog {
 impl AuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn AuditStorage>) -> Result<Self, KeepMobileError> {
-        let last_hash = if let Some(last_json) = storage.load_last_entry()? {
-            let entry: AuditEntry =
-                serde_json::from_str(&last_json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid audit entry: {e}"),
+        let tail =
+            if let Some(last_json) = storage.load_last_entry()? {
+                let entry: AuditEntry = serde_json::from_str(&last_json).map_err(|e| {
+                    KeepMobileError::Serialization {
+                        msg: format!("Invalid audit entry: {e}"),
+                    }
                 })?;
-            entry
-                .hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| KeepMobileError::Serialization {
-                    msg: "Invalid hash length".into(),
-                })?
-        } else {
-            [0u8; 32]
-        };
+                let hash: [u8; 32] = entry.hash.as_slice().try_into().map_err(|_| {
+                    KeepMobileError::Serialization {
+                        msg: "Invalid hash length".into(),
+                    }
+                })?;
+                ChainTail {
+                    hash,
+                    timestamp: entry.timestamp,
+                }
+            } else {
+                ChainTail {
+                    hash: [0u8; 32],
+                    timestamp: i64::MIN,
+                }
+            };
 
         Ok(Self {
             storage,
-            last_hash: std::sync::Mutex::new(last_hash),
+            tail: std::sync::Mutex::new(tail),
         })
     }
 
@@ -247,8 +308,8 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
@@ -261,7 +322,17 @@ impl AuditLog {
             });
         }
 
-        let mut entry = AuditEntry::new(event_type, *last_hash);
+        let mut entry = AuditEntry::new(event_type, tail.hash);
+        let (timestamp, tail_implausible) = monotonic_timestamp(entry.timestamp, tail.timestamp);
+        if tail_implausible {
+            tracing::warn!(
+                tail = tail.timestamp,
+                now = entry.timestamp,
+                "audit chain tail is implausibly far ahead of the clock; recording the real time \
+                 rather than propagating it"
+            );
+        }
+        entry.timestamp = timestamp;
         if let Some(pk) = pubkey {
             entry = entry.with_pubkey(&pk);
         }
@@ -283,8 +354,10 @@ impl AuditLog {
                     msg: "Invalid hash length".into(),
                 })?;
 
+        let stored_timestamp = entry.timestamp;
         self.storage.store_entry(entry_json)?;
-        *last_hash = new_hash;
+        tail.hash = new_hash;
+        tail.timestamp = stored_timestamp;
 
         Ok(())
     }
@@ -345,14 +418,18 @@ impl AuditLog {
     }
 
     pub fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
         self.storage.clear_entries(confirm)?;
-        *last_hash = [0u8; 32];
+        // Reset both halves. Leaving the timestamp behind would clamp the first
+        // entry of the new chain to the cleared chain's last time, carrying a
+        // trace of the old log into one meant to start empty.
+        tail.hash = [0u8; 32];
+        tail.timestamp = i64::MIN;
         Ok(())
     }
 }
@@ -551,7 +628,7 @@ pub trait SigningAuditStorage: Send + Sync {
 #[derive(uniffi::Object)]
 pub struct SigningAuditLog {
     storage: std::sync::Arc<dyn SigningAuditStorage>,
-    last_hash: std::sync::Mutex<[u8; 32]>,
+    tail: std::sync::Mutex<ChainTail>,
 }
 
 impl SigningAuditLog {
@@ -581,25 +658,32 @@ impl SigningAuditLog {
 impl SigningAuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn SigningAuditStorage>) -> Result<Self, KeepMobileError> {
-        let last_hash = if let Some(last_json) = storage.load_last_entry()? {
-            let entry: SigningAuditEntry =
-                serde_json::from_str(&last_json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid signing audit entry: {e}"),
+        let tail =
+            if let Some(last_json) = storage.load_last_entry()? {
+                let entry: SigningAuditEntry = serde_json::from_str(&last_json).map_err(|e| {
+                    KeepMobileError::Serialization {
+                        msg: format!("Invalid signing audit entry: {e}"),
+                    }
                 })?;
-            entry
-                .hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| KeepMobileError::Serialization {
-                    msg: "Invalid hash length".into(),
-                })?
-        } else {
-            [0u8; 32]
-        };
+                let hash: [u8; 32] = entry.hash.as_slice().try_into().map_err(|_| {
+                    KeepMobileError::Serialization {
+                        msg: "Invalid hash length".into(),
+                    }
+                })?;
+                ChainTail {
+                    hash,
+                    timestamp: entry.timestamp,
+                }
+            } else {
+                ChainTail {
+                    hash: [0u8; 32],
+                    timestamp: i64::MIN,
+                }
+            };
 
         Ok(Self {
             storage,
-            last_hash: std::sync::Mutex::new(last_hash),
+            tail: std::sync::Mutex::new(tail),
         })
     }
 
@@ -614,8 +698,8 @@ impl SigningAuditLog {
         event_kind: Option<u32>,
         reason: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
@@ -631,7 +715,20 @@ impl SigningAuditLog {
         }
 
         let mut entry =
-            SigningAuditEntry::new(request_type, decision, was_automatic, &caller, *last_hash);
+            SigningAuditEntry::new(request_type, decision, was_automatic, &caller, tail.hash);
+        // Same bounded pull-up as the other chain. This is the one wired in
+        // production, recording every signing approval and denial, so the
+        // ordering guarantee matters here more than there.
+        let (timestamp, tail_implausible) = monotonic_timestamp(entry.timestamp, tail.timestamp);
+        if tail_implausible {
+            tracing::warn!(
+                tail = tail.timestamp,
+                now = entry.timestamp,
+                "signing audit chain tail is implausibly far ahead of the clock; recording the \
+                 real time rather than propagating it"
+            );
+        }
+        entry.timestamp = timestamp;
         if let Some(name) = caller_name {
             entry = entry.with_caller_name(&name);
         }
@@ -655,8 +752,10 @@ impl SigningAuditLog {
                     msg: "Invalid hash length".into(),
                 })?;
 
+        let stored_timestamp = entry.timestamp;
         self.storage.store_entry(entry_json)?;
-        *last_hash = new_hash;
+        tail.hash = new_hash;
+        tail.timestamp = stored_timestamp;
 
         Ok(())
     }
@@ -702,14 +801,18 @@ impl SigningAuditLog {
     }
 
     pub fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
         self.storage.clear_entries(confirm)?;
-        *last_hash = [0u8; 32];
+        // Reset both halves, as the other chain does: a leftover timestamp
+        // would pull the first entry of a fresh chain up to the cleared
+        // chain's last time.
+        tail.hash = [0u8; 32];
+        tail.timestamp = i64::MIN;
         Ok(())
     }
 }
@@ -718,6 +821,162 @@ impl SigningAuditLog {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// A stored tail whose timestamp is far in the future stands in for the wall
+    /// clock having moved backwards, without touching the system clock.
+    fn seed_entry_at(storage: &MockStorage, timestamp: i64) {
+        let mut entry = AuditEntry::new(AuditEventType::Sign, [0u8; 32]);
+        entry.timestamp = timestamp;
+        let entry = entry.finalize();
+        storage
+            .store_entry(serde_json::to_string(&entry).unwrap())
+            .unwrap();
+    }
+
+    fn timestamps(storage: &MockStorage) -> Vec<i64> {
+        storage
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|j| serde_json::from_str::<AuditEntry>(j).unwrap().timestamp)
+            .collect()
+    }
+
+    #[test]
+    fn a_tail_within_the_drift_window_pulls_the_entry_up() {
+        let now = 1_700_000_000;
+        assert_eq!(monotonic_timestamp(now, now + 5), (now + 5, false));
+    }
+
+    #[test]
+    fn a_tail_far_in_the_future_is_not_adopted() {
+        // The point of the bound. Adopting this would pin every later entry to
+        // it for the life of the chain, and verification would still pass, so
+        // the corruption would be permanent and invisible.
+        let now = 1_700_000_000;
+        let (ts, flagged) = monotonic_timestamp(now, now + 86_400);
+        assert_eq!(ts, now, "the real clock reading must be kept");
+        assert!(flagged, "the anomaly must be reported");
+    }
+
+    #[test]
+    fn a_sane_clock_is_never_pulled_backwards() {
+        let now = 1_700_000_000;
+        assert_eq!(monotonic_timestamp(now, now - 500), (now, false));
+    }
+
+    #[test]
+    fn the_empty_chain_sentinel_does_not_overflow() {
+        // `tail - now` would overflow here; the comparison must be saturating.
+        let (ts, flagged) = monotonic_timestamp(i64::MIN + 1, i64::MIN);
+        assert_eq!(ts, i64::MIN + 1);
+        assert!(!flagged);
+    }
+
+    #[test]
+    fn a_future_tail_does_not_pin_later_entries() {
+        // End to end: after a future-dated entry, the next two carry real times
+        // rather than inheriting the future one.
+        let storage = Arc::new(MockStorage::new());
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        let ceiling = chrono::Utc::now().timestamp() + 60;
+        assert!(
+            times[1] < ceiling && times[2] < ceiling,
+            "a future tail must not propagate: {times:?}"
+        );
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_produce_an_entry_older_than_the_one_before_it() {
+        // A plausible skew, inside the drift window, which is the case where
+        // monotonicity is preserved. A tail beyond the window is deliberately not
+        // adopted; see `a_future_tail_does_not_pin_later_entries`.
+        let storage = Arc::new(MockStorage::new());
+        let future = chrono::Utc::now().timestamp() + 30;
+        seed_entry_at(&storage, future);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        assert_eq!(times.len(), 2);
+        assert!(
+            times[1] >= times[0],
+            "chain order and timestamp order must agree: {times:?}"
+        );
+    }
+
+    #[test]
+    fn a_clamped_entry_still_verifies_against_the_chain() {
+        // The timestamp is hashed, so clamping has to happen before finalize or
+        // the stored hash will not match the stored fields.
+        let storage = Arc::new(MockStorage::new());
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 30);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        assert!(
+            log.verify_chain().unwrap(),
+            "a clamped entry must still hash correctly"
+        );
+    }
+
+    #[test]
+    fn a_normal_clock_is_left_alone() {
+        // Guards against the clamp becoming a blanket rewrite: with a sane tail,
+        // the new entry should carry roughly now, not the previous value.
+        let storage = Arc::new(MockStorage::new());
+        let past = chrono::Utc::now().timestamp() - 86_400;
+        seed_entry_at(&storage, past);
+
+        let before = chrono::Utc::now().timestamp();
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        // Both sides. A one-sided check survives any wrong-but-larger value,
+        // including pulling up to the tail plus one.
+        assert!(
+            times[1] >= before && times[1] <= chrono::Utc::now().timestamp(),
+            "an unpulled entry should carry the current time: {times:?}, before={before}"
+        );
+    }
+
+    #[test]
+    fn clearing_forgets_the_previous_timestamp() {
+        // Inside the drift window on purpose. Seeded beyond it, the bound would
+        // refuse the stale tail anyway and the assertion below would hold with
+        // the reset deleted, which is the test passing for the wrong reason.
+        let storage = Arc::new(MockStorage::new());
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 30);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.clear_entries("CLEAR_ALL_ENTRIES".into()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        assert_eq!(times.len(), 1, "the clear should have emptied storage");
+        // Not merely "under the future tail": with the reset removed, the entry
+        // would be pulled up to the seeded tail, which is ahead of now.
+        assert!(
+            times[0] <= chrono::Utc::now().timestamp(),
+            "a cleared log must not carry the old chain's time forward: {times:?}"
+        );
+    }
 
     fn assert_lowercase_hex(s: &str) {
         assert_eq!(s.len(), 64);
@@ -975,6 +1234,89 @@ mod tests {
             self.entries.lock().unwrap().clear();
             Ok(())
         }
+    }
+
+    /// The signing chain is the one wired in production, recording every
+    /// approval and denial, so its clamp needs its own coverage rather than
+    /// relying on the other chain's tests.
+    ///
+    /// There is no equivalent here of the other chain's "a clamped entry still
+    /// verifies" test: this chain builds a hash chain but exposes no way to
+    /// verify it, which is tracked separately. That gap is why the ordering of
+    /// the clamp against `finalize` is only pinned on the other chain.
+    fn seed_signing_entry_at(storage: &MockSigningStorage, timestamp: i64) {
+        let mut entry = SigningAuditEntry::new(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app_a",
+            [0u8; 32],
+        );
+        entry.timestamp = timestamp;
+        let entry = entry.finalize();
+        storage
+            .store_entry(serde_json::to_string(&entry).unwrap())
+            .unwrap();
+    }
+
+    fn signing_timestamps(storage: &MockSigningStorage) -> Vec<i64> {
+        storage
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|j| {
+                serde_json::from_str::<SigningAuditEntry>(j)
+                    .unwrap()
+                    .timestamp
+            })
+            .collect()
+    }
+
+    fn log_one_signing(log: &SigningAuditLog) {
+        log.log_event(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "app_a".into(),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn signing_chain_does_not_record_an_entry_older_than_the_one_before_it() {
+        let storage = Arc::new(MockSigningStorage::new());
+        let future = chrono::Utc::now().timestamp() + 30;
+        seed_signing_entry_at(&storage, future);
+
+        let log = SigningAuditLog::new(storage.clone()).unwrap();
+        log_one_signing(&log);
+
+        let times = signing_timestamps(&storage);
+        assert!(
+            times[1] >= times[0],
+            "chain order and timestamp order must agree: {times:?}"
+        );
+    }
+
+    #[test]
+    fn signing_chain_does_not_let_a_future_tail_pin_later_entries() {
+        let storage = Arc::new(MockSigningStorage::new());
+        seed_signing_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+
+        let log = SigningAuditLog::new(storage.clone()).unwrap();
+        log_one_signing(&log);
+        log_one_signing(&log);
+
+        let times = signing_timestamps(&storage);
+        let ceiling = chrono::Utc::now().timestamp() + 60;
+        assert!(
+            times[1] < ceiling && times[2] < ceiling,
+            "a future tail must not propagate on the production chain: {times:?}"
+        );
     }
 
     #[test]
