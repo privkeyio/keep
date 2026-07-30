@@ -6,6 +6,19 @@ pub struct SignRequest {
     pub id: String,
     pub session_id: Vec<u8>,
     pub message_type: String,
+    /// Whether [`Self::message_type`] was proven against the signed bytes rather
+    /// than merely asserted by the requester.
+    ///
+    /// True when the request carried a structured body and the responder
+    /// recomputed the digest that body produces and got the bytes being signed.
+    /// A caller cannot relabel a Bitcoin sighash as a nostr event that way,
+    /// because the canonical hash of the supplied event would not equal the
+    /// sighash. False means nothing checked the label and it is a bare claim.
+    ///
+    /// Surfaces should say which one they are showing. A qualifier on every
+    /// request, including the ones that are provable, teaches people to ignore
+    /// it.
+    pub type_verified: bool,
     pub message_preview: String,
     pub from_peer: u16,
     pub timestamp: u64,
