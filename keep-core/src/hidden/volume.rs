@@ -1273,15 +1273,25 @@ mod tests {
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 6-8 on same instance for tight timing.
-        // After 5 failures, delay=1s. After 6, delay=2s. After 7, delay=4s.
-        // Three rapid attempts ensures we hit rate limiting even on very
-        // slow CI runners where individual Argon2 calls take >1s.
+        // Keep attempting until one is refused rather than asserting on a
+        // fixed attempt. The backoff is measured from the last failure and
+        // doubles past the free allowance (1s, 2s, 4s, ...), while an attempt
+        // costs a constant Argon2 derivation, so on a slow runner the window
+        // can expire before the next attempt arrives and no particular attempt
+        // is guaranteed to be refused. Because the delay grows exponentially
+        // and the derivation cost does not, it overtakes that cost within a few
+        // attempts. Bounded so a real regression fails here instead of looping.
         let mut storage = HiddenStorage::open(&path).unwrap();
-        let _ = storage.unlock_outer("wrong");
-        let _ = storage.unlock_outer("wrong");
-        let result = storage.unlock_outer("wrong");
-        assert!(matches!(result, Err(KeepError::RateLimited(_))));
+        let refused = (0..8).any(|_| {
+            matches!(
+                storage.unlock_outer("wrong"),
+                Err(KeepError::RateLimited(_))
+            )
+        });
+        assert!(
+            refused,
+            "rate limiting never engaged after repeated outer failures"
+        );
     }
 
     #[test]
@@ -1307,15 +1317,25 @@ mod tests {
             assert!(!matches!(result, Err(KeepError::RateLimited(_))));
         }
 
-        // Attempts 6-8 on same instance for tight timing.
-        // After 5 failures, delay=1s. After 6, delay=2s. After 7, delay=4s.
-        // Three rapid attempts ensures we hit rate limiting even on very
-        // slow CI runners where individual Argon2 calls take >1s.
+        // Keep attempting until one is refused rather than asserting on a
+        // fixed attempt. The backoff is measured from the last failure and
+        // doubles past the free allowance (1s, 2s, 4s, ...), while an attempt
+        // costs a constant Argon2 derivation, so on a slow runner the window
+        // can expire before the next attempt arrives and no particular attempt
+        // is guaranteed to be refused. Because the delay grows exponentially
+        // and the derivation cost does not, it overtakes that cost within a few
+        // attempts. Bounded so a real regression fails here instead of looping.
         let mut storage = HiddenStorage::open(&path).unwrap();
-        let _ = storage.unlock_hidden("wrong");
-        let _ = storage.unlock_hidden("wrong");
-        let result = storage.unlock_hidden("wrong");
-        assert!(matches!(result, Err(KeepError::RateLimited(_))));
+        let refused = (0..8).any(|_| {
+            matches!(
+                storage.unlock_hidden("wrong"),
+                Err(KeepError::RateLimited(_))
+            )
+        });
+        assert!(
+            refused,
+            "rate limiting never engaged after repeated hidden failures"
+        );
     }
 
     #[test]
