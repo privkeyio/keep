@@ -70,6 +70,7 @@ dictionary SignRequest {
     string id;
     sequence<u8> session_id;
     string message_type;
+    boolean type_verified;
     string message_preview;
     u16 from_peer;
     u64 timestamp;

@@ -219,14 +219,26 @@ fn init_logging() {
 
 /// Builds the approval-facing request from a coordination session.
 ///
-/// The label is carried across so the prompt is not an unlabelled hash, but it
-/// is **requester-supplied and not bound to the signed bytes**, so a peer can
-/// relabel a sighash as anything it likes. It is a hint about what the requester
-/// claims, never proof of what the bytes are, and nothing downstream may treat
-/// it as the domain discriminator. The hooks that would refuse a mislabelled
-/// request do not run here: installing hooks replaces the set rather than
-/// composing with it, so this crate's hooks are the only pre-sign policy on
-/// mobile.
+/// The label is carried across so the prompt is not an unlabelled hash. Whether
+/// it can be trusted depends entirely on [`SignRequest::type_verified`], and the
+/// two cases must not be conflated.
+///
+/// When that flag is false the label is **requester-supplied and not bound to
+/// the signed bytes**, so a peer can relabel a sighash as anything it likes. It
+/// is then a hint about what the requester claims, never proof of what the bytes
+/// are, and nothing may treat it as the domain discriminator. That is the common
+/// case today, because the hooks that would require a structured body do not run
+/// here: installing hooks replaces the set rather than composing with it, so this
+/// crate's hooks are the only pre-sign policy on mobile.
+///
+/// When it is true the label was proven against the signed bytes, and it is one
+/// of exactly two known constants. What that proves is narrow and worth stating
+/// so surfaces do not overclaim: it establishes the *domain* of the bytes, not
+/// their contents. A verified Bitcoin sighash means these bytes really are a
+/// taproot key-spend sighash for the supplied transaction. It does not mean the
+/// transaction spends what the user expects, to whom they expect, or that the
+/// prevout scripts belong to this group. Wording that reads as a blanket
+/// "verified" would claim far more than was checked.
 ///
 /// Because it reaches a prompt and a notification, it goes through the same
 /// sanitizer every other adversary-authored prompt field in this codebase uses,
@@ -251,6 +263,13 @@ fn sign_request_from_session(session: &keep_frost_net::SessionInfo) -> SignReque
             &session.message_type,
             MESSAGE_TYPE_DISPLAY_MAX,
         ),
+        // A structured body present here has already been checked: the responder
+        // recomputes the digest that body produces and refuses the request when
+        // it does not equal the bytes being signed, before this hook runs. An
+        // unknown label with a body attached is refused outright. So a payload
+        // surviving to this point means the label matches the content, and its
+        // absence means nothing verified it.
+        type_verified: session.structured_payload.is_some(),
         message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
         from_peer: session.requester,
         timestamp: std::time::SystemTime::now()
@@ -3900,6 +3919,7 @@ mod import_teardown_tests {
                     id: "seed".into(),
                     session_id: vec![0u8; 32],
                     message_type: String::new(),
+                    type_verified: false,
                     message_preview: String::new(),
                     from_peer: 0,
                     timestamp: 0,
@@ -4566,6 +4586,17 @@ mod restore_backup_metadata_tests {
 mod sign_request_mapping_tests {
     use super::*;
 
+    fn session_with_payload(
+        message_type: &str,
+        requester: u16,
+        structured_payload: Option<Vec<u8>>,
+    ) -> keep_frost_net::SessionInfo {
+        keep_frost_net::SessionInfo {
+            structured_payload,
+            ..session(message_type, requester)
+        }
+    }
+
     fn session(message_type: &str, requester: u16) -> keep_frost_net::SessionInfo {
         keep_frost_net::SessionInfo {
             session_id: [9u8; 32],
@@ -4625,6 +4656,26 @@ mod sign_request_mapping_tests {
         // The stripping must not eat the normal case it exists to display.
         let req = sign_request_from_session(&session("bitcoin-sighash", 1));
         assert_eq!(req.message_type, "bitcoin-sighash");
+    }
+
+    #[test]
+    fn a_request_without_a_structured_body_is_not_verified() {
+        // Nothing checked the label, so surfaces must not present it as settled.
+        let req = sign_request_from_session(&session("nostr-event", 1));
+        assert!(!req.type_verified);
+    }
+
+    #[test]
+    fn a_request_with_a_structured_body_is_verified() {
+        // Reaching this point with a body attached means the responder already
+        // recomputed the digest from it and matched the signed bytes; a mismatch
+        // or an unknown label is refused before the hook runs.
+        let req = sign_request_from_session(&session_with_payload(
+            "bitcoin-sighash",
+            1,
+            Some(b"{}".to_vec()),
+        ));
+        assert!(req.type_verified);
     }
 
     #[test]
