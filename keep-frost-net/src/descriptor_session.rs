@@ -1106,6 +1106,94 @@ mod tests {
         );
     }
 
+    /// Paths through `reconstruct_descriptor` not already covered by the
+    /// invalid-network and missing-contribution tests above: a contribution that
+    /// is present but unusable, an external key slot, and the tier-free wallet.
+    mod reconstruct {
+        use super::*;
+
+        fn contribution(xpub: &str) -> XpubContribution {
+            XpubContribution {
+                account_xpub: xpub.into(),
+                fingerprint: "aabbccdd".into(),
+            }
+        }
+
+        fn one_participant_policy() -> WalletPolicy {
+            WalletPolicy {
+                recovery_tiers: vec![PolicyTier {
+                    threshold: 1,
+                    key_slots: vec![KeySlot::Participant { share_index: 1 }],
+                    timelock_months: 6,
+                }],
+                version: 1,
+            }
+        }
+
+        #[test]
+        fn rejects_a_contribution_that_is_not_a_usable_xpub() {
+            let mut contributions = BTreeMap::new();
+            // Passes the session-level prefix check for a test network but is not
+            // decodable, so it fails at conversion rather than at validation.
+            contributions.insert(1u16, contribution("tpub1zzzzzzzzzzzzzzz"));
+
+            let err = reconstruct_descriptor(
+                &[1u8; 32],
+                &one_participant_policy(),
+                &contributions,
+                "signet",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("xpub conversion failed"),
+                "expected a conversion failure, got: {err}"
+            );
+        }
+
+        #[test]
+        fn an_external_key_slot_does_not_need_a_contribution() {
+            let policy = WalletPolicy {
+                recovery_tiers: vec![PolicyTier {
+                    threshold: 1,
+                    key_slots: vec![KeySlot::External {
+                        xpub: "tpub1zzzzzzzzzzzzzzz".into(),
+                        fingerprint: "aabbccdd".into(),
+                    }],
+                    timelock_months: 6,
+                }],
+                version: 1,
+            };
+
+            // No contributions at all: an external slot carries its own key, so the
+            // failure must come from the key itself, never from a lookup.
+            let err = reconstruct_descriptor(&[1u8; 32], &policy, &BTreeMap::new(), "signet")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains("missing xpub contribution"),
+                "external slots must not be looked up in contributions, got: {err}"
+            );
+        }
+
+        #[test]
+        fn a_policy_with_no_recovery_tiers_builds_a_descriptor_pair() {
+            let policy = WalletPolicy {
+                recovery_tiers: vec![],
+                version: 1,
+            };
+
+            let (external, internal) =
+                reconstruct_descriptor(&[1u8; 32], &policy, &BTreeMap::new(), "signet")
+                    .expect("a key-path-only wallet should reconstruct");
+            assert!(!external.is_empty() && !internal.is_empty());
+            assert_ne!(
+                external, internal,
+                "receive and change descriptors must differ"
+            );
+        }
+    }
+
     fn test_policy() -> WalletPolicy {
         WalletPolicy {
             recovery_tiers: vec![PolicyTier {
