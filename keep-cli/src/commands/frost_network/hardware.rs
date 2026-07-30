@@ -380,14 +380,27 @@ pub fn cmd_frost_network_nonce_precommit(
     let spinner = out.spinner(&format!("Generating {count} nonce commitments..."));
     let mut nonces = Vec::new();
     let mut commitments_hex = Vec::new();
-    for i in 0..count {
-        // Named dummy, but these are the session and message the device binds
-        // its nonce commitment to, so they get the same checked entropy as a
-        // real signing session rather than a thread RNG.
-        let dummy_session: [u8; 32] = keep_core::entropy::try_random_bytes()?;
-        let dummy_message: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+
+    // Draw every pair up front. The device allocates a session slot and writes a
+    // nonce checkpoint for each commitment, and the host keeps only the
+    // commitment hex, so it can never clear one it did not record. Failing
+    // partway through the loop would leave those behind; failing here leaves
+    // nothing behind, because no commitment has been requested yet.
+    //
+    // These are named dummy because they stand in for a real request, but they
+    // are the session and message the device binds its commitment to, so they
+    // get the same checked entropy as a real signing session. They do not feed
+    // the nonce itself: the device seeds that from its own RNG.
+    let mut pairs = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let session: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let message: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        pairs.push((session, message));
+    }
+
+    for (i, (dummy_session, dummy_message)) in pairs.iter().enumerate() {
         let (commitment, _) = signer
-            .frost_commit(group, &dummy_session, &dummy_message)
+            .frost_commit(group, dummy_session, dummy_message)
             .map_err(|e| KeepError::FrostErr(FrostError::commitment(format!("nonce {i}: {e}"))))?;
         let commitment_hex = hex::encode(&commitment);
         commitments_hex.push(commitment_hex.clone());
