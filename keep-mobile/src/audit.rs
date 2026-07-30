@@ -167,7 +167,7 @@ impl TryFrom<AuditEntry> for AuditEntryExport {
 ///
 /// # Contract: `store_entry` must be non-blocking
 ///
-/// [`AuditLog::log_event`] holds the chain's `last_hash` mutex across the call to
+/// [`AuditLog::log_event`] holds the chain's chain-tail mutex across the call to
 /// [`store_entry`](Self::store_entry): the lock must span
 /// compute-previous-hash → store → advance-hash so two concurrent writers cannot
 /// chain onto the same previous hash and fork the log. Releasing the lock earlier
@@ -185,10 +185,18 @@ pub trait AuditStorage: Send + Sync {
     fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError>;
 }
 
+/// The tail of the hash chain: the previous entry's hash and the timestamp it
+/// carried. Kept in one lock because an entry is only well-formed against both,
+/// and a split lock could let one advance without the other.
+struct ChainTail {
+    hash: [u8; 32],
+    timestamp: i64,
+}
+
 #[derive(uniffi::Object)]
 pub struct AuditLog {
     storage: std::sync::Arc<dyn AuditStorage>,
-    last_hash: std::sync::Mutex<[u8; 32]>,
+    tail: std::sync::Mutex<ChainTail>,
 }
 
 impl AuditLog {
@@ -218,25 +226,32 @@ impl AuditLog {
 impl AuditLog {
     #[uniffi::constructor]
     pub fn new(storage: std::sync::Arc<dyn AuditStorage>) -> Result<Self, KeepMobileError> {
-        let last_hash = if let Some(last_json) = storage.load_last_entry()? {
-            let entry: AuditEntry =
-                serde_json::from_str(&last_json).map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Invalid audit entry: {e}"),
+        let tail =
+            if let Some(last_json) = storage.load_last_entry()? {
+                let entry: AuditEntry = serde_json::from_str(&last_json).map_err(|e| {
+                    KeepMobileError::Serialization {
+                        msg: format!("Invalid audit entry: {e}"),
+                    }
                 })?;
-            entry
-                .hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| KeepMobileError::Serialization {
-                    msg: "Invalid hash length".into(),
-                })?
-        } else {
-            [0u8; 32]
-        };
+                let hash: [u8; 32] = entry.hash.as_slice().try_into().map_err(|_| {
+                    KeepMobileError::Serialization {
+                        msg: "Invalid hash length".into(),
+                    }
+                })?;
+                ChainTail {
+                    hash,
+                    timestamp: entry.timestamp,
+                }
+            } else {
+                ChainTail {
+                    hash: [0u8; 32],
+                    timestamp: i64::MIN,
+                }
+            };
 
         Ok(Self {
             storage,
-            last_hash: std::sync::Mutex::new(last_hash),
+            tail: std::sync::Mutex::new(tail),
         })
     }
 
@@ -247,8 +262,8 @@ impl AuditLog {
         success: bool,
         details: Option<String>,
     ) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
@@ -261,7 +276,22 @@ impl AuditLog {
             });
         }
 
-        let mut entry = AuditEntry::new(event_type, *last_hash);
+        let mut entry = AuditEntry::new(event_type, tail.hash);
+        // Never let a recorded time move backwards along the chain. Order here
+        // is fixed by the prev_hash linkage, but the timestamp comes from the
+        // wall clock, which can jump back on an NTP correction or because the
+        // device's clock was changed. Without this an entry can read as older
+        // than the one it follows: anyone sorting by time sees an order the
+        // chain contradicts, and someone able to move the clock can make an
+        // action appear to precede one it actually followed.
+        //
+        // Clamped rather than rejected. Refusing the entry would drop the record
+        // of whatever just happened, which is worse for an audit log than a
+        // timestamp that is slightly late. Equal timestamps are fine; the chain
+        // still orders them.
+        if entry.timestamp < tail.timestamp {
+            entry.timestamp = tail.timestamp;
+        }
         if let Some(pk) = pubkey {
             entry = entry.with_pubkey(&pk);
         }
@@ -283,8 +313,10 @@ impl AuditLog {
                     msg: "Invalid hash length".into(),
                 })?;
 
+        let stored_timestamp = entry.timestamp;
         self.storage.store_entry(entry_json)?;
-        *last_hash = new_hash;
+        tail.hash = new_hash;
+        tail.timestamp = stored_timestamp;
 
         Ok(())
     }
@@ -345,14 +377,18 @@ impl AuditLog {
     }
 
     pub fn clear_entries(&self, confirm: String) -> Result<(), KeepMobileError> {
-        let mut last_hash = self
-            .last_hash
+        let mut tail = self
+            .tail
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Lock poisoned".into(),
             })?;
         self.storage.clear_entries(confirm)?;
-        *last_hash = [0u8; 32];
+        // Reset both halves. Leaving the timestamp behind would clamp the first
+        // entry of the new chain to the cleared chain's last time, carrying a
+        // trace of the old log into one meant to start empty.
+        tail.hash = [0u8; 32];
+        tail.timestamp = i64::MIN;
         Ok(())
     }
 }
@@ -718,6 +754,98 @@ impl SigningAuditLog {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    /// A stored tail whose timestamp is far in the future stands in for the wall
+    /// clock having moved backwards, without touching the system clock.
+    fn seed_entry_at(storage: &MockStorage, timestamp: i64) {
+        let mut entry = AuditEntry::new(AuditEventType::Sign, [0u8; 32]);
+        entry.timestamp = timestamp;
+        let entry = entry.finalize();
+        storage
+            .store_entry(serde_json::to_string(&entry).unwrap())
+            .unwrap();
+    }
+
+    fn timestamps(storage: &MockStorage) -> Vec<i64> {
+        storage
+            .entries
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|j| serde_json::from_str::<AuditEntry>(j).unwrap().timestamp)
+            .collect()
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_produce_an_entry_older_than_the_one_before_it() {
+        let storage = Arc::new(MockStorage::new());
+        let future = chrono::Utc::now().timestamp() + 86_400;
+        seed_entry_at(&storage, future);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        assert_eq!(times.len(), 2);
+        assert!(
+            times[1] >= times[0],
+            "chain order and timestamp order must agree: {times:?}"
+        );
+    }
+
+    #[test]
+    fn a_clamped_entry_still_verifies_against_the_chain() {
+        // The timestamp is hashed, so clamping has to happen before finalize or
+        // the stored hash will not match the stored fields.
+        let storage = Arc::new(MockStorage::new());
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        assert!(
+            log.verify_chain().unwrap(),
+            "a clamped entry must still hash correctly"
+        );
+    }
+
+    #[test]
+    fn a_normal_clock_is_left_alone() {
+        // Guards against the clamp becoming a blanket rewrite: with a sane tail,
+        // the new entry should carry roughly now, not the previous value.
+        let storage = Arc::new(MockStorage::new());
+        let past = chrono::Utc::now().timestamp() - 86_400;
+        seed_entry_at(&storage, past);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        assert!(
+            times[1] > past,
+            "an unclamped entry should use the current time: {times:?}"
+        );
+    }
+
+    #[test]
+    fn clearing_forgets_the_previous_timestamp() {
+        let storage = Arc::new(MockStorage::new());
+        seed_entry_at(&storage, chrono::Utc::now().timestamp() + 86_400);
+
+        let log = AuditLog::new(storage.clone()).unwrap();
+        log.clear_entries("CLEAR_ALL_ENTRIES".into()).unwrap();
+        log.log_event(AuditEventType::Sign, None, true, None)
+            .unwrap();
+
+        let times = timestamps(&storage);
+        assert!(
+            times.last().unwrap() < &(chrono::Utc::now().timestamp() + 60),
+            "a cleared log must not carry the old chain's time forward: {times:?}"
+        );
+    }
 
     fn assert_lowercase_hex(s: &str) {
         assert_eq!(s.len(), 64);
