@@ -2325,7 +2325,12 @@ impl KeepMobile {
                 vk_bytes,
                 bk.name.clone(),
                 None,
-                true,
+                // Keys carry no recorded flag to preserve, so this is a choice
+                // rather than a restoration. It matches `import_nsec`, and it is
+                // the safe direction: the flag tracks whether the user has saved
+                // this key's seed words, which restoring a vault file does not
+                // establish. Claiming otherwise hides the prompt to save them.
+                false,
             )
             .map_err(|e| KeepMobileError::BackupError {
                 msg: format!("nsec share data: {e}"),
@@ -4455,16 +4460,17 @@ mod restore_backup_metadata_tests {
         (Arc::clone(&storage), stored.metadata_json)
     }
 
-    /// Selects by name: non-share records such as the policy and any descriptors
-    /// are persisted through the same storage method, so the recorded metadata
-    /// is not a single entry.
+    /// Selects by group key rather than name: non-share records such as the
+    /// policy and any descriptors are persisted through the same storage method,
+    /// so the recorded metadata is not a single entry, and a name is
+    /// user-controlled data that a future record could collide with.
     fn restored_share_meta(storage: &RecordingStorage) -> ShareMetadataInfo {
         storage
             .metas
             .lock()
             .unwrap()
             .iter()
-            .find(|m| m.name == "restored")
+            .find(|m| m.group_pubkey == [7u8; 32])
             .cloned()
             .expect("the restored share's metadata should reach storage")
     }
@@ -4473,8 +4479,10 @@ mod restore_backup_metadata_tests {
     fn a_share_that_was_not_backed_up_does_not_come_back_marked_backed_up() {
         let (storage, metadata_json) = restore_one(false);
 
+        let recorded: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&metadata_json).expect("record parses");
         assert!(
-            metadata_json.contains("\"did_backup\":false"),
+            !recorded.did_backup,
             "record should keep the recorded flag, got: {metadata_json}"
         );
         assert!(
@@ -4487,8 +4495,10 @@ mod restore_backup_metadata_tests {
     fn a_share_that_was_backed_up_stays_marked_backed_up() {
         let (storage, metadata_json) = restore_one(true);
 
+        let recorded: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&metadata_json).expect("record parses");
         assert!(
-            metadata_json.contains("\"did_backup\":true"),
+            recorded.did_backup,
             "a true flag must survive too, or the fix would just invert the bug: {metadata_json}"
         );
         assert!(restored_share_meta(&storage).did_backup);
