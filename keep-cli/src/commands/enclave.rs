@@ -36,8 +36,10 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
     if local {
         check_local_gate()?;
         out.field("Mode", "Local (Mock)");
-        let client = keep_enclave_host::MockEnclaveClient::new();
+        // Draw before constructing the client, so an entropy failure happens
+        // before anything is opened. Same ordering as the hardware signing path.
         let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let client = keep_enclave_host::MockEnclaveClient::new();
 
         let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
         match client.process_request(request) {
@@ -58,8 +60,8 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
 
     #[cfg(target_os = "linux")]
     {
-        let client = keep_enclave_host::EnclaveClient::with_cid(cid);
         let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let client = keep_enclave_host::EnclaveClient::with_cid(cid);
 
         match client.get_attestation(nonce) {
             Ok(_) => {
@@ -94,8 +96,10 @@ pub fn cmd_enclave_verify(
     if local {
         check_local_gate()?;
         out.field("Mode", "Local (Mock)");
-        let client = keep_enclave_host::MockEnclaveClient::new();
+        // Draw before constructing the client, so an entropy failure happens
+        // before anything is opened. Same ordering as the hardware signing path.
         let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let client = keep_enclave_host::MockEnclaveClient::new();
 
         let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
         match client.process_request(request) {
@@ -118,8 +122,8 @@ pub fn cmd_enclave_verify(
 
     #[cfg(target_os = "linux")]
     {
-        let client = keep_enclave_host::EnclaveClient::with_cid(cid);
         let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
+        let client = keep_enclave_host::EnclaveClient::with_cid(cid);
 
         let spinner = out.spinner("Fetching attestation...");
         let attestation_doc = client.get_attestation(nonce).map_err(|e| {

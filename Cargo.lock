@@ -4572,7 +4572,6 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "p256",
- "rand 0.10.2",
  "ratatui",
  "reqwest",
  "rustls",
