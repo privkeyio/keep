@@ -3,7 +3,6 @@
 
 use std::path::Path;
 
-use rand::Rng;
 use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
@@ -38,8 +37,7 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
         check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
-        let mut nonce = [0u8; 32];
-        rand::rng().fill_bytes(&mut nonce);
+        let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
 
         let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
         match client.process_request(request) {
@@ -61,8 +59,7 @@ pub fn cmd_enclave_status(out: &Output, cid: u32, local: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         let client = keep_enclave_host::EnclaveClient::with_cid(cid);
-        let mut nonce = [0u8; 32];
-        rand::rng().fill_bytes(&mut nonce);
+        let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
 
         match client.get_attestation(nonce) {
             Ok(_) => {
@@ -98,8 +95,7 @@ pub fn cmd_enclave_verify(
         check_local_gate()?;
         out.field("Mode", "Local (Mock)");
         let client = keep_enclave_host::MockEnclaveClient::new();
-        let mut nonce = [0u8; 32];
-        rand::rng().fill_bytes(&mut nonce);
+        let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
 
         let request = keep_enclave_host::EnclaveRequest::GetAttestation { nonce };
         match client.process_request(request) {
@@ -123,8 +119,7 @@ pub fn cmd_enclave_verify(
     #[cfg(target_os = "linux")]
     {
         let client = keep_enclave_host::EnclaveClient::with_cid(cid);
-        let mut nonce = [0u8; 32];
-        rand::rng().fill_bytes(&mut nonce);
+        let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
 
         let spinner = out.spinner("Fetching attestation...");
         let attestation_doc = client.get_attestation(nonce).map_err(|e| {
