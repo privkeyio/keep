@@ -217,6 +217,35 @@ fn init_logging() {
     });
 }
 
+/// Builds the approval-facing request from a coordination session.
+///
+/// The label and the requester are carried across deliberately. FROST signs the
+/// 32 bytes verbatim, so a nostr event digest and a Bitcoin taproot sighash are
+/// byte-identical on the wire and the label is the only thing distinguishing
+/// them; the Android summary falls back to it when there is nothing else to
+/// show, so dropping it leaves the user approving an unlabelled hash. The
+/// requester identifies which peer asked, which is the other half of deciding
+/// whether a request is expected.
+///
+/// `metadata` stays empty. Its fields come from the session's structured
+/// payload, which needs decoding per message type before it can be trusted to
+/// populate an amount or a destination, and showing a wrong amount would be
+/// worse than showing none.
+fn sign_request_from_session(session: &keep_frost_net::SessionInfo) -> SignRequest {
+    SignRequest {
+        id: hex::encode(session.session_id),
+        session_id: session.session_id.to_vec(),
+        message_type: session.message_type.clone(),
+        message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
+        from_peer: session.requester,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        metadata: None,
+    }
+}
+
 const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
@@ -3458,18 +3487,7 @@ impl KeepMobile {
                         continue;
                     }
                     guard.push(PendingRequest {
-                        info: SignRequest {
-                            id: hex::encode(session.session_id),
-                            session_id: session.session_id.to_vec(),
-                            message_type: String::new(),
-                            message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
-                            from_peer: 0,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            metadata: None,
-                        },
+                        info: sign_request_from_session(&session),
                         response_tx,
                     });
                     drop(guard);
@@ -4520,5 +4538,55 @@ mod restore_backup_metadata_tests {
             "a true flag must survive too, or the fix would just invert the bug: {metadata_json}"
         );
         assert!(restored_share_meta(&storage).did_backup);
+    }
+}
+
+#[cfg(test)]
+mod sign_request_mapping_tests {
+    use super::*;
+
+    fn session(message_type: &str, requester: u16) -> keep_frost_net::SessionInfo {
+        keep_frost_net::SessionInfo {
+            session_id: [9u8; 32],
+            message: vec![0xab; 32],
+            threshold: 2,
+            participants: vec![1, 2, 3],
+            requester,
+            message_type: message_type.into(),
+            structured_payload: None,
+            derivation_path: vec![],
+        }
+    }
+
+    #[test]
+    fn the_label_reaches_the_approval_request() {
+        // Without this the Android summary falls back to an empty string and the
+        // user approves 32 bytes with nothing saying which domain they belong to.
+        let req = sign_request_from_session(&session("nostr-event", 3));
+        assert_eq!(req.message_type, "nostr-event");
+    }
+
+    #[test]
+    fn a_bitcoin_label_is_not_confused_with_a_nostr_one() {
+        // The two digests are byte-identical, so the label is the only thing
+        // carrying the difference through to the person approving.
+        let nostr = sign_request_from_session(&session("nostr-event", 1));
+        let bitcoin = sign_request_from_session(&session("bitcoin-sighash", 1));
+        assert_ne!(nostr.message_type, bitcoin.message_type);
+        assert_eq!(bitcoin.message_type, "bitcoin-sighash");
+    }
+
+    #[test]
+    fn the_requesting_peer_reaches_the_approval_request() {
+        let req = sign_request_from_session(&session("nostr-event", 4));
+        assert_eq!(req.from_peer, 4, "the approver needs to know who asked");
+    }
+
+    #[test]
+    fn the_preview_is_bounded_and_hex() {
+        let req = sign_request_from_session(&session("nostr-event", 1));
+        // Eight bytes rendered as hex, not the whole digest.
+        assert_eq!(req.message_preview.len(), 16);
+        assert!(req.message_preview.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
