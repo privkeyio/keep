@@ -217,6 +217,56 @@ fn init_logging() {
     });
 }
 
+/// Builds the approval-facing request from a coordination session.
+///
+/// The label is carried across so the prompt is not an unlabelled hash, but it
+/// is **requester-supplied and not bound to the signed bytes**, so a peer can
+/// relabel a sighash as anything it likes. It is a hint about what the requester
+/// claims, never proof of what the bytes are, and nothing downstream may treat
+/// it as the domain discriminator. The hooks that would refuse a mislabelled
+/// request do not run here: installing hooks replaces the set rather than
+/// composing with it, so this crate's hooks are the only pre-sign policy on
+/// mobile.
+///
+/// Because it reaches a prompt and a notification, it goes through the same
+/// sanitizer every other adversary-authored prompt field in this codebase uses,
+/// which strips control characters and bidi overrides and caps the length. A
+/// newline here would otherwise render as extra lines in the notification body,
+/// and a right-to-left override would let the requester rewrite the text around
+/// it.
+///
+/// The requester index is authenticated: it is resolved from the signature-
+/// verified sender rather than taken from the payload, so a peer cannot claim
+/// another peer's index.
+///
+/// `metadata` stays empty. Its fields come from the session's structured
+/// payload, which needs decoding per message type before it can be trusted to
+/// populate an amount or a destination, and showing a wrong amount would be
+/// worse than showing none.
+fn sign_request_from_session(session: &keep_frost_net::SessionInfo) -> SignRequest {
+    SignRequest {
+        id: hex::encode(session.session_id),
+        session_id: session.session_id.to_vec(),
+        message_type: keep_nip46::handler::sanitize_prompt_field(
+            &session.message_type,
+            MESSAGE_TYPE_DISPLAY_MAX,
+        ),
+        message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
+        from_peer: session.requester,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        metadata: None,
+    }
+}
+
+/// Display cap for the requester-supplied label, matching the method-name cap
+/// used for the other short prompt field in this codebase. The wire validator
+/// already bounds it, but that bound lives in another crate and does not apply
+/// to a session built by any other route.
+const MESSAGE_TYPE_DISPLAY_MAX: usize = 32;
+
 const MAX_PENDING_REQUESTS: usize = 100;
 const SIGNING_RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_IMPORT_DATA_SIZE: usize = 64 * 1024;
@@ -3458,18 +3508,7 @@ impl KeepMobile {
                         continue;
                     }
                     guard.push(PendingRequest {
-                        info: SignRequest {
-                            id: hex::encode(session.session_id),
-                            session_id: session.session_id.to_vec(),
-                            message_type: String::new(),
-                            message_preview: hex::encode(&session.message[..session.message.len().min(8)]),
-                            from_peer: 0,
-                            timestamp: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                            metadata: None,
-                        },
+                        info: sign_request_from_session(&session),
                         response_tx,
                     });
                     drop(guard);
@@ -4520,5 +4559,95 @@ mod restore_backup_metadata_tests {
             "a true flag must survive too, or the fix would just invert the bug: {metadata_json}"
         );
         assert!(restored_share_meta(&storage).did_backup);
+    }
+}
+
+#[cfg(test)]
+mod sign_request_mapping_tests {
+    use super::*;
+
+    fn session(message_type: &str, requester: u16) -> keep_frost_net::SessionInfo {
+        keep_frost_net::SessionInfo {
+            session_id: [9u8; 32],
+            message: vec![0xab; 32],
+            threshold: 2,
+            participants: vec![1, 2, 3],
+            requester,
+            message_type: message_type.into(),
+            structured_payload: None,
+            derivation_path: vec![],
+        }
+    }
+
+    #[test]
+    fn the_label_reaches_the_approval_request() {
+        // Without this the Android summary falls back to an empty string and the
+        // user approves 32 bytes with nothing saying which domain they belong to.
+        let req = sign_request_from_session(&session("nostr-event", 3));
+        assert_eq!(req.message_type, "nostr-event");
+    }
+
+    #[test]
+    fn a_newline_cannot_add_lines_to_the_prompt() {
+        // The notification renders the summary as multi-line text, so an
+        // embedded newline would let the requester append their own lines
+        // beneath the real one.
+        let req = sign_request_from_session(&session("nostr-event\nApproved by Keep", 1));
+        assert!(
+            !req.message_type.contains('\n'),
+            "got: {:?}",
+            req.message_type
+        );
+    }
+
+    #[test]
+    fn a_bidi_override_cannot_rewrite_the_text_around_it() {
+        let req = sign_request_from_session(&session("nostr\u{202E}drowssap", 1));
+        assert!(
+            !req.message_type.contains('\u{202E}'),
+            "got: {:?}",
+            req.message_type
+        );
+    }
+
+    #[test]
+    fn an_overlong_label_cannot_crowd_out_the_rest_of_the_prompt() {
+        let req = sign_request_from_session(&session(&"A".repeat(64), 1));
+        assert!(
+            req.message_type.chars().count() <= MESSAGE_TYPE_DISPLAY_MAX + 3,
+            "got {} chars",
+            req.message_type.chars().count()
+        );
+    }
+
+    #[test]
+    fn an_ordinary_label_survives_sanitizing_intact() {
+        // The stripping must not eat the normal case it exists to display.
+        let req = sign_request_from_session(&session("bitcoin-sighash", 1));
+        assert_eq!(req.message_type, "bitcoin-sighash");
+    }
+
+    #[test]
+    fn the_untouched_fields_are_untouched() {
+        // Pins the half of the extraction that was meant to be behaviour-preserving.
+        let s = session("nostr-event", 2);
+        let req = sign_request_from_session(&s);
+        assert_eq!(req.id, hex::encode(s.session_id));
+        assert_eq!(req.session_id, s.session_id.to_vec());
+        assert!(req.metadata.is_none());
+    }
+
+    #[test]
+    fn the_requesting_peer_reaches_the_approval_request() {
+        let req = sign_request_from_session(&session("nostr-event", 4));
+        assert_eq!(req.from_peer, 4, "the approver needs to know who asked");
+    }
+
+    #[test]
+    fn the_preview_is_bounded_and_hex() {
+        let req = sign_request_from_session(&session("nostr-event", 1));
+        // Eight bytes rendered as hex, not the whole digest.
+        assert_eq!(req.message_preview.len(), 16);
+        assert!(req.message_preview.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
