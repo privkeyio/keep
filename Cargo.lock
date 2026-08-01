@@ -223,7 +223,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -234,7 +234,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2358,7 +2358,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2575,7 +2575,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4503,7 +4503,7 @@ dependencies = [
 
 [[package]]
 name = "keep-agent"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "chrono",
@@ -4526,7 +4526,7 @@ dependencies = [
 
 [[package]]
 name = "keep-bitcoin"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "bitcoin",
  "getrandom 0.4.3",
@@ -4545,7 +4545,7 @@ dependencies = [
 
 [[package]]
 name = "keep-cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -4596,7 +4596,7 @@ dependencies = [
 
 [[package]]
 name = "keep-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "aes 0.9.1",
  "argon2",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "keep-desktop"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.23.0",
  "bitcoin",
@@ -4678,14 +4678,14 @@ dependencies = [
 
 [[package]]
 name = "keep-enclave"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "keep-enclave-host",
 ]
 
 [[package]]
 name = "keep-enclave-host"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "aes-gcm",
  "base64 0.23.0",
@@ -4716,7 +4716,7 @@ dependencies = [
 
 [[package]]
 name = "keep-frost-net"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.23.0",
  "bitcoin",
@@ -4757,7 +4757,7 @@ dependencies = [
 
 [[package]]
 name = "keep-mobile"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.23.0",
  "bitcoin",
@@ -4787,7 +4787,7 @@ dependencies = [
 
 [[package]]
 name = "keep-nip46"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.23.0",
  "bitflags 2.13.1",
@@ -4815,7 +4815,7 @@ dependencies = [
 
 [[package]]
 name = "keep-web"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "axum",
  "hex",
@@ -5455,7 +5455,7 @@ dependencies = [
  "once_cell",
  "png",
  "thiserror 2.0.19",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5798,9 +5798,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-relay-pool"
-version = "0.44.1"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91b2c039df4f96c4bf7dae52a74fd5516ad6dda83a11c0c69dea91b5255a4f37"
+checksum = "fb94d61a467a869a6790b907838a9bea82c813d567d9fcbac995f207be8cee4b"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -5849,7 +5849,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7818,7 +7818,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8553,7 +8553,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8828,7 +8828,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8850,7 +8850,7 @@ dependencies = [
  "parking_lot",
  "rustix 1.1.4",
  "signal-hook",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9488,7 +9488,7 @@ dependencies = [
  "once_cell",
  "png",
  "thiserror 2.0.19",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9594,7 +9594,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -10585,7 +10585,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
