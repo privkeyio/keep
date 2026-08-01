@@ -287,7 +287,7 @@ report() { # $1 = findings, $2 = headline, $3.. = hints
 # ------------------------------------------------- 1. getrandom / fill_bytes --
 # Only real calls: `getrandom(` / `getrandom::fill(` -- never a type position
 # like `getrandom::Error`, which has no open paren after the name.
-rng_bad=$(scan_rust 'getrandom[a-z_:]*[ \t]*\(|try_fill_bytes[ \t]*\(') || {
+rng_bad=$(scan_rust 'getrandom[a-z_:]*[ \t]*[(]|try_fill_bytes[ \t]*[(]') || {
   fail "the scanner itself failed; refusing to report a clean tree"
   exit 1
 }
@@ -299,7 +299,7 @@ report "$rng_bad" "RNG error not handled (leaves the buffer zeroed):" \
 # inherits the #[cfg(test)] and comment handling instead of crying wolf on test
 # code.
 swallow_bad=$(scan_rust '(getrandom|fill_bytes|try_fill|random_bytes)[a-z_:]*[ \t]*[(<]' \
-  '\.(ok\(\)|unwrap_or\(|unwrap_or_default\(|unwrap_or_else\()') || {
+  '\\.(ok\\(\\)|unwrap_or\\(|unwrap_or_default\\(|unwrap_or_else\\()') || {
   fail "the scanner itself failed; refusing to report a clean tree"
   exit 1
 }
@@ -307,7 +307,7 @@ report "$swallow_bad" "RNG failure collapsed into a value instead of an error:" 
   'propagate the error; a default [u8; N] is all zeros'
 
 # ------------------------------------------------------- 3. seeded PRNGs ----
-seeded_bad=$(scan_rust 'seed_from_u64[ \t]*\(|from_seed[ \t]*\(|SmallRng') || {
+seeded_bad=$(scan_rust 'seed_from_u64[ \t]*[(]|from_seed[ \t]*[(]|SmallRng') || {
   fail "the scanner itself failed; refusing to report a clean tree"
   exit 1
 }
