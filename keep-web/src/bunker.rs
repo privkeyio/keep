@@ -54,6 +54,8 @@ struct WebCallbacks {
 /// this value, so the caller refuses the approval rather than falling back to
 /// anything predictable.
 fn random_approval_id() -> Option<u64> {
+    // rng-hygiene: ok - the .ok() converts the health-check failure into None,
+    // and the caller refuses the approval on None (see the doc comment above).
     keep_core::crypto::try_random_bytes::<8>()
         .ok()
         .map(|bytes| u64::from_le_bytes(bytes) & ((1u64 << 53) - 1))

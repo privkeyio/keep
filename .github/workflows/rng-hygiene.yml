@@ -12,6 +12,11 @@ name: RNG Hygiene
 # path-filtered job can never be a required status check -- PRs touching none of
 # the filtered globs report nothing and block forever.
 
+# Least privilege, and the action is pinned by commit SHA, matching ci.yml and
+# release.yml. A mutable tag on a guard workflow is its own supply-chain hole.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -23,7 +28,7 @@ jobs:
     name: No predictable-RNG fallbacks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Check for silent RNG fallbacks
         run: ./scripts/check-rng-hygiene.sh

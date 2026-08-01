@@ -555,24 +555,39 @@ fn getrandom(buf: &mut [u8]) -> Result<()> {
         return Ok(());
     }
 
-    let request = Request::GetRandom {};
-    let response = nsm_process_request(fd, request);
-    nsm_exit(fd);
-
-    match response {
-        Response::GetRandom { random } => {
-            let copy_len = buf.len().min(random.len());
-            buf[..copy_len].copy_from_slice(&random[..copy_len]);
-            if copy_len < buf.len() {
-                ::getrandom::getrandom(&mut buf[copy_len..]).map_err(|e| {
-                    EnclaveError::Nsm(format!("getrandom fallback for remainder failed: {}", e))
-                })?;
+    // Ask the NSM again for the remainder rather than topping the buffer up from
+    // the OS RNG. A short GetRandom response is normal (the NSM returns what it
+    // has), and silently filling the tail from a different source is a partial
+    // downgrade of the attested entropy for every draw larger than one response
+    // -- which is every 32-byte key. keep-agent's fill_from_nsm loops for the
+    // same reason; this is the same behaviour, on the crate's own nsm-api major.
+    let mut filled = 0;
+    let mut result = Ok(());
+    while filled < buf.len() {
+        let response = nsm_process_request(fd, Request::GetRandom {});
+        match response {
+            Response::GetRandom { random } => {
+                if random.is_empty() {
+                    // Would spin forever; treat an empty response as a failure.
+                    result = Err(EnclaveError::Nsm("GetRandom returned no bytes".into()));
+                    break;
+                }
+                let copy_len = (buf.len() - filled).min(random.len());
+                buf[filled..filled + copy_len].copy_from_slice(&random[..copy_len]);
+                filled += copy_len;
             }
-            Ok(())
+            Response::Error(e) => {
+                result = Err(EnclaveError::Nsm(format!("GetRandom failed: {:?}", e)));
+                break;
+            }
+            _ => {
+                result = Err(EnclaveError::Nsm("Unexpected response".into()));
+                break;
+            }
         }
-        Response::Error(e) => Err(EnclaveError::Nsm(format!("GetRandom failed: {:?}", e))),
-        _ => Err(EnclaveError::Nsm("Unexpected response".into())),
     }
+    nsm_exit(fd);
+    result
 }
 
 #[cfg(not(target_os = "linux"))]

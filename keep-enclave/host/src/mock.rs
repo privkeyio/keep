@@ -452,7 +452,8 @@ fn create_mock_attestation_document(
     };
 
     let mut payload = Vec::new();
-    ciborium::into_writer(&attestation, &mut payload).unwrap_or_default();
+    ciborium::into_writer(&attestation, &mut payload)
+        .map_err(|e| format!("Mock attestation payload serialization failed: {e}"))?;
 
     let protected = vec![0xa1, 0x01, 0x38, 0x22];
     let unprotected = ciborium::Value::Map(vec![]);
@@ -469,7 +470,8 @@ fn create_mock_attestation_document(
     ]);
 
     let mut document = Vec::new();
-    ciborium::into_writer(&cose_sign1, &mut document).unwrap_or_default();
+    ciborium::into_writer(&cose_sign1, &mut document)
+        .map_err(|e| format!("Mock attestation document serialization failed: {e}"))?;
 
     Ok(document)
 }
