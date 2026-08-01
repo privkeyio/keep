@@ -80,7 +80,7 @@ pub fn cmd_frost_network_sign_hardware(
     }
 
     if !nonce_store
-        .check_and_add_nonce(group_npub, &commitment_hex)
+        .check_and_add_nonce(group_npub, &commitment_hex, Some(&hex::encode(session_id)))
         .map_err(|e| {
             KeepError::StorageErr(StorageError::database(format!("nonce tracking: {e}")))
         })?
