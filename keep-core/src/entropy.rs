@@ -282,23 +282,50 @@ fn check_bit_distribution(samples: &[[u8; 32]]) -> bool {
     })
 }
 
-fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
-    let samples: [[u8; 32]; 3] = std::array::from_fn(|_| random_bytes_mixed_internal());
+const MIN_HAMMING: u32 = 64;
 
+/// Applies the health criteria to three samples: none all-zero, all distinct,
+/// no byte position constant across all three, and every pair at least
+/// [`MIN_HAMMING`] bits apart.
+fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
     let all_nonzero = samples.iter().all(|s| s.iter().any(|&b| b != 0));
     let all_unique =
         samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
 
-    if !all_nonzero || !all_unique || !check_bit_distribution(&samples) {
+    if !all_nonzero || !all_unique || !check_bit_distribution(samples) {
+        return false;
+    }
+
+    [(0, 1), (1, 2), (0, 2)]
+        .iter()
+        .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING)
+}
+
+/// Draws three samples straight from the OS RNG, with nothing mixed in.
+fn os_samples() -> [[u8; 32]; 3] {
+    std::array::from_fn(|_| {
+        let mut buf = [0u8; 32];
+        gather_os_entropy(&mut buf);
+        buf
+    })
+}
+
+fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
+    // The OS source is checked on its own, before anything is mixed in. Checking
+    // only the mixed output cannot detect a degraded OS RNG at all: every mix
+    // folds in a monotonically incrementing counter, 64 timing deltas, and live
+    // heap and stack addresses, so three post-mix samples come out distinct,
+    // non-zero and ~128 bits apart even if gather_os_entropy() wrote a constant.
+    // A gate that can only observe the combiner is the same shape as the bug
+    // this whole check exists to catch.
+    if !samples_look_random(&os_samples()) {
         return Err(EntropyHealthError);
     }
 
-    const MIN_HAMMING: u32 = 64;
-    let sufficient_distance = [(0, 1), (1, 2), (0, 2)]
-        .iter()
-        .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING);
-
-    if !sufficient_distance {
+    // The mixed output is checked too, which catches a broken mixer rather than
+    // a broken source.
+    let mixed: [[u8; 32]; 3] = std::array::from_fn(|_| random_bytes_mixed_internal());
+    if !samples_look_random(&mixed) {
         return Err(EntropyHealthError);
     }
 
@@ -407,5 +434,48 @@ mod tests {
         let bytes: [u8; 128] = random_bytes();
         assert!(!bytes.iter().all(|&b| b == 0));
         assert_ne!(&bytes[..32], &bytes[32..64]);
+    }
+
+    #[test]
+    fn mixing_hides_a_dead_os_source() {
+        // The reason check_entropy_health_internal samples the OS RNG directly
+        // instead of only its own mixed output. Here the OS pool is a constant --
+        // the worst case a degraded source can produce -- and the mixed samples
+        // still satisfy every health criterion, because the mix folds in a
+        // monotonic counter, timing deltas, and live heap and stack addresses.
+        // A gate that only ever saw this output could not fail.
+        let dead_os_pool = [0u8; POOL_SIZE];
+        let masked: [[u8; 32]; 3] = std::array::from_fn(|_| {
+            let timing = gather_timing_jitter();
+            let context = gather_process_context();
+            mix_entropy(&[&dead_os_pool, &timing, &context])
+        });
+        assert!(
+            samples_look_random(&masked),
+            "if this ever fails the masking is gone and the pre-mix check may be redundant"
+        );
+    }
+
+    #[test]
+    fn health_criteria_reject_a_degraded_source() {
+        // What the pre-mix check catches, given the above.
+        assert!(!samples_look_random(&[[0u8; 32]; 3]), "all zeros");
+        assert!(
+            !samples_look_random(&[[0x5au8; 32]; 3]),
+            "constant, repeated"
+        );
+
+        let mut stuck = [[0x5au8; 32]; 3];
+        stuck[1][0] = 0x01;
+        stuck[2][0] = 0x02;
+        assert!(
+            !samples_look_random(&stuck),
+            "distinct but far below the Hamming floor"
+        );
+
+        assert!(
+            samples_look_random(&os_samples()),
+            "a healthy OS RNG passes"
+        );
     }
 }

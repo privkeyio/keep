@@ -82,10 +82,13 @@ impl MockEnclaveClient {
 
     fn mock_attestation(&self, nonce: [u8; 32]) -> EnclaveResponse {
         match self.get_ephemeral_pubkey() {
-            Ok(pubkey) => {
-                let mock_doc = create_mock_attestation_document(&nonce, &pubkey);
-                EnclaveResponse::Attestation { document: mock_doc }
-            }
+            Ok(pubkey) => match create_mock_attestation_document(&nonce, &pubkey) {
+                Ok(mock_doc) => EnclaveResponse::Attestation { document: mock_doc },
+                Err(message) => EnclaveResponse::Error {
+                    code: ErrorCode::InternalError,
+                    message,
+                },
+            },
             Err(msg) => EnclaveResponse::Error {
                 code: ErrorCode::InternalError,
                 message: msg,
@@ -417,13 +420,20 @@ impl Default for MockEnclaveClient {
     }
 }
 
-fn create_mock_attestation_document(nonce: &[u8; 32], pubkey: &[u8; 32]) -> Vec<u8> {
+/// Returns an error rather than a zero-filled document when the RNG fails. The
+/// buffers below start zeroed, so a warn-and-continue here would hand back a
+/// well-formed attestation whose signature, certificate, and module id are all
+/// constant -- and mock or not, a caller cannot tell that apart from a real one.
+fn create_mock_attestation_document(
+    nonce: &[u8; 32],
+    pubkey: &[u8; 32],
+) -> std::result::Result<Vec<u8>, String> {
     let mut pcrs: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     pcrs.insert(0, MOCK_PCR0.to_vec());
     pcrs.insert(1, MOCK_PCR1.to_vec());
     pcrs.insert(2, MOCK_PCR2.to_vec());
 
-    let module_id = format!("i-mock-{:016x}", rand_u64());
+    let module_id = format!("i-mock-{:016x}", rand_u64()?);
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -434,23 +444,23 @@ fn create_mock_attestation_document(nonce: &[u8; 32], pubkey: &[u8; 32]) -> Vec<
         digest: "SHA384".to_string(),
         timestamp,
         pcrs,
-        certificate: create_mock_certificate(),
-        cabundle: vec![create_mock_certificate(), create_mock_certificate()],
+        certificate: create_mock_certificate()?,
+        cabundle: vec![create_mock_certificate()?, create_mock_certificate()?],
         public_key: Some(pubkey.to_vec()),
         user_data: None,
         nonce: Some(nonce.to_vec()),
     };
 
     let mut payload = Vec::new();
-    ciborium::into_writer(&attestation, &mut payload).unwrap_or_default();
+    ciborium::into_writer(&attestation, &mut payload)
+        .map_err(|e| format!("Mock attestation payload serialization failed: {e}"))?;
 
     let protected = vec![0xa1, 0x01, 0x38, 0x22];
     let unprotected = ciborium::Value::Map(vec![]);
 
     let mut signature = [0u8; 96];
-    if let Err(e) = getrandom::fill(&mut signature) {
-        warn!("create_mock_attestation_document: RNG failed for signature: {e}");
-    }
+    getrandom::fill(&mut signature)
+        .map_err(|e| format!("Mock attestation signature RNG failed: {e}"))?;
 
     let cose_sign1 = ciborium::Value::Array(vec![
         ciborium::Value::Bytes(protected),
@@ -460,23 +470,22 @@ fn create_mock_attestation_document(nonce: &[u8; 32], pubkey: &[u8; 32]) -> Vec<
     ]);
 
     let mut document = Vec::new();
-    ciborium::into_writer(&cose_sign1, &mut document).unwrap_or_default();
+    ciborium::into_writer(&cose_sign1, &mut document)
+        .map_err(|e| format!("Mock attestation document serialization failed: {e}"))?;
 
-    document
+    Ok(document)
 }
 
-fn create_mock_certificate() -> Vec<u8> {
+fn create_mock_certificate() -> std::result::Result<Vec<u8>, String> {
     let mut cert = Vec::with_capacity(256);
     cert.extend_from_slice(&[0x30, 0x82, 0x01, 0x00]);
 
     let mut random = [0u8; 64];
-    if let Err(e) = getrandom::fill(&mut random) {
-        warn!("create_mock_certificate: RNG failed: {e}");
-    }
+    getrandom::fill(&mut random).map_err(|e| format!("Mock certificate RNG failed: {e}"))?;
     cert.extend_from_slice(&random);
 
     cert.resize(256, 0);
-    cert
+    Ok(cert)
 }
 
 #[derive(serde::Serialize)]
@@ -492,12 +501,10 @@ struct MockAttestationDoc {
     nonce: Option<Vec<u8>>,
 }
 
-fn rand_u64() -> u64 {
+fn rand_u64() -> std::result::Result<u64, String> {
     let mut bytes = [0u8; 8];
-    if let Err(e) = getrandom::fill(&mut bytes) {
-        warn!("rand_u64: RNG failed: {e}");
-    }
-    u64::from_le_bytes(bytes)
+    getrandom::fill(&mut bytes).map_err(|e| format!("RNG failed: {e}"))?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

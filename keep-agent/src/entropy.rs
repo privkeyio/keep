@@ -18,6 +18,15 @@ static NSM_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 ///
 /// This function probes for the NSM device on first call and caches the result.
 /// On non-Linux platforms or when the `enclave` feature is disabled, always returns `false`.
+///
+/// The probe result is also the *only* signal that the NSM is gone, and it is
+/// cached for the process lifetime, so a failed probe is reported once here.
+/// Without that, the likelier NSM fault -- the device node missing, or the open
+/// failing under fd pressure -- makes this return `false`, skips the enclave
+/// branch in [`get_entropy`] entirely, and leaves the OS RNG in use with nothing
+/// logged. Detecting "are we in an enclave" by probing the very device whose
+/// loss we want to hear about cannot distinguish the two on its own; building
+/// with the `enclave` feature is the statement that the NSM is expected.
 #[cfg(all(target_os = "linux", feature = "enclave"))]
 pub fn is_nitro_enclave() -> bool {
     *NSM_AVAILABLE.get_or_init(|| {
@@ -26,6 +35,11 @@ pub fn is_nitro_enclave() -> bool {
             aws_nitro_enclaves_nsm_api::driver::nsm_exit(fd);
             true
         } else {
+            tracing::warn!(
+                fd,
+                "NSM device did not open; this build expects a Nitro Secure Module, so entropy \
+                 will come from the OS RNG for the rest of this process"
+            );
             false
         }
     })
@@ -44,12 +58,27 @@ pub fn is_nitro_enclave() -> bool {
 ///
 /// When running inside an AWS Nitro Enclave (with the `enclave` feature enabled),
 /// uses the hardware NSM for entropy. Falls back to the OS entropy source otherwise.
+///
+/// Outside an enclave that fallback is the normal path. *Inside* one it is a
+/// hardware fault: the NSM is the attested entropy source, and losing it while
+/// still producing bytes is exactly the kind of quiet downgrade that stays
+/// invisible until someone audits the output. The OS RNG in an enclave is itself
+/// NSM-seeded, so substituting it is not weak, but it is never silent either.
 pub fn get_entropy<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
 
     #[cfg(all(target_os = "linux", feature = "enclave"))]
-    if is_nitro_enclave() && fill_from_nsm(&mut buf) {
-        return buf;
+    if is_nitro_enclave() {
+        if fill_from_nsm(&mut buf) {
+            return buf;
+        }
+        // Per draw, not once: unlike a missing device (reported once, from the
+        // cached probe in is_nitro_enclave), a failing request is transient, and
+        // how often it happens is the signal.
+        tracing::error!(
+            bytes = N,
+            "NSM entropy request failed inside a Nitro Enclave; falling back to the OS RNG"
+        );
     }
 
     rand::rng().fill_bytes(&mut buf);
