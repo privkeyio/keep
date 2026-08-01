@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,9 +17,39 @@ pub struct NonceEntry {
     pub session_id: Option<String>,
 }
 
+/// Bumped when the meaning of an on-disk field changes.
+///
+/// A store written before the reject branch worked has `used: false` on
+/// commitments that were in fact claimed and signed, indistinguishable from a
+/// genuinely unused pre-committed nonce. Such a store would hand every legacy
+/// entry back exactly once, in the one population that provably ran the broken
+/// guard. Loading a versionless store therefore marks its entries claimed: the
+/// cost is re-running the pre-commitment step, which is the fail-closed
+/// direction.
+const STORE_VERSION: u32 = 1;
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct NonceStoreData {
+    #[serde(default)]
+    version: u32,
     nonces: HashMap<String, Vec<NonceEntry>>,
+}
+
+impl NonceStoreData {
+    fn migrate(&mut self) {
+        if self.version >= STORE_VERSION {
+            return;
+        }
+        for entries in self.nonces.values_mut() {
+            for entry in entries.iter_mut() {
+                entry.used = true;
+                if entry.used_at.is_none() {
+                    entry.used_at = Some(entry.created_at);
+                }
+            }
+        }
+        self.version = STORE_VERSION;
+    }
 }
 
 pub struct NonceStore {
@@ -33,7 +63,10 @@ impl NonceStore {
         let data = if store_path.exists() {
             let content =
                 std::fs::read_to_string(&store_path).context("Failed to read nonce store")?;
-            serde_json::from_str(&content).context("Failed to parse nonce store")?
+            let mut parsed: NonceStoreData =
+                serde_json::from_str(&content).context("Failed to parse nonce store")?;
+            parsed.migrate();
+            parsed
         } else {
             NonceStoreData::default()
         };
@@ -69,9 +102,15 @@ impl NonceStore {
                 .read_to_string(&mut content)
                 .context("Failed to read nonce store")?;
             if content.is_empty() {
-                NonceStoreData::default()
+                NonceStoreData {
+                    version: STORE_VERSION,
+                    ..Default::default()
+                }
             } else {
-                serde_json::from_str(&content).context("Failed to parse nonce store")?
+                let mut parsed: NonceStoreData =
+                    serde_json::from_str(&content).context("Failed to parse nonce store")?;
+                parsed.migrate();
+                parsed
             }
         };
 
@@ -79,7 +118,7 @@ impl NonceStore {
 
         let content =
             serde_json::to_string_pretty(&data).context("Failed to serialize nonce store")?;
-        Self::write_locked(&file, &content)?;
+        Self::write_locked(&self.path, &content)?;
 
         self.data = data;
 
@@ -88,17 +127,34 @@ impl NonceStore {
         Ok(result)
     }
 
-    fn write_locked(file: &File, content: &str) -> Result<()> {
-        file.set_len(0).context("Failed to truncate nonce store")?;
-        let mut writer = file;
-        use std::io::Seek;
-        writer
-            .seek(std::io::SeekFrom::Start(0))
-            .context("Failed to seek nonce store")?;
-        writer
-            .write_all(content.as_bytes())
+    /// Writes via a temporary file, fsync, then rename.
+    ///
+    /// Both halves matter for a replay guard. `File::flush` is a no-op, so the
+    /// previous truncate-seek-write left a claim record in the page cache only:
+    /// power loss between claiming a nonce and signing with it lost the record,
+    /// which is exactly the reboot-replay case this store exists to stop. And
+    /// truncating in place meant a crash mid-write left partial JSON, after
+    /// which every later run fails to parse and the obvious fix is to delete
+    /// the file, taking all replay protection with it. A rename is atomic, so
+    /// the store is always either the old contents or the new ones.
+    fn write_locked(path: &Path, content: &str) -> Result<()> {
+        let tmp_path = path.with_extension("tmp");
+        let mut tmp = {
+            let mut opts = OpenOptions::new();
+            opts.create(true).write(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&tmp_path)
+                .context("Failed to open nonce store temp file")?
+        };
+        tmp.write_all(content.as_bytes())
             .context("Failed to write nonce store")?;
-        writer.flush().context("Failed to flush nonce store")?;
+        tmp.sync_all().context("Failed to fsync nonce store")?;
+        drop(tmp);
+        std::fs::rename(&tmp_path, path).context("Failed to replace nonce store")?;
         Ok(())
     }
 
@@ -146,9 +202,15 @@ impl NonceStore {
     /// Pre-committed nonces (`add_nonce`, the kind-21106 flow) are stored
     /// unused and are claimed here on first use, which is why this cannot simply
     /// reject on presence.
-    pub fn check_and_add_nonce(&mut self, group: &str, commitment: &str) -> Result<bool> {
+    pub fn check_and_add_nonce(
+        &mut self,
+        group: &str,
+        commitment: &str,
+        session_id: Option<&str>,
+    ) -> Result<bool> {
         let group = group.to_string();
         let commitment = commitment.to_string();
+        let session_id = session_id.map(String::from);
 
         self.with_lock(|data| {
             let entries = data.nonces.entry(group).or_default();
@@ -164,6 +226,7 @@ impl NonceStore {
                 }
                 entry.used = true;
                 entry.used_at = Some(now);
+                entry.session_id = session_id;
                 return Ok(true);
             }
 
@@ -172,37 +235,10 @@ impl NonceStore {
                 created_at: now,
                 used: true,
                 used_at: Some(now),
-                session_id: None,
+                session_id,
             });
             Ok(true)
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn is_nonce_used(&self, group: &str, commitment: &str) -> bool {
-        self.data
-            .nonces
-            .get(group)
-            .map(|entries| entries.iter().any(|e| e.commitment == commitment && e.used))
-            .unwrap_or(false)
-    }
-
-    #[allow(dead_code)]
-    pub fn get_available_nonces(&self, group: &str) -> Vec<&NonceEntry> {
-        self.data
-            .nonces
-            .get(group)
-            .map(|entries| entries.iter().filter(|e| !e.used).collect())
-            .unwrap_or_default()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_used_nonces(&self, group: &str) -> Vec<&NonceEntry> {
-        self.data
-            .nonces
-            .get(group)
-            .map(|entries| entries.iter().filter(|e| e.used).collect())
-            .unwrap_or_default()
     }
 
     pub fn nonce_stats(&self, group: &str) -> (usize, usize) {
@@ -216,30 +252,15 @@ impl NonceStore {
             })
             .unwrap_or((0, 0))
     }
-
-    #[allow(dead_code)]
-    pub fn clear_used_nonces(&mut self, group: &str) -> Result<usize> {
-        let group = group.to_string();
-
-        self.with_lock(|data| {
-            let count = if let Some(entries) = data.nonces.get_mut(&group) {
-                let before = entries.len();
-                entries.retain(|e| !e.used);
-                before - entries.len()
-            } else {
-                0
-            };
-            Ok(count)
-        })
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // `open` joins the file name onto its argument, so this takes the directory.
     fn store(dir: &std::path::Path) -> NonceStore {
-        NonceStore::open(&dir.join("nonces.json")).unwrap()
+        NonceStore::open(dir).unwrap()
     }
 
     #[test]
@@ -247,13 +268,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path());
 
-        assert!(s.check_and_add_nonce("group", "aabb").unwrap(), "first use");
         assert!(
-            !s.check_and_add_nonce("group", "aabb").unwrap(),
+            s.check_and_add_nonce("group", "aabb", None).unwrap(),
+            "first use"
+        );
+        assert!(
+            !s.check_and_add_nonce("group", "aabb", None).unwrap(),
             "a second claim of the same commitment is nonce reuse and must be refused"
         );
         assert!(
-            !s.check_and_add_nonce("group", "aabb").unwrap(),
+            !s.check_and_add_nonce("group", "aabb", None).unwrap(),
             "and stays refused"
         );
     }
@@ -268,14 +292,77 @@ mod tests {
         assert_eq!(s.nonce_stats("group"), (1, 0));
 
         assert!(
-            s.check_and_add_nonce("group", "ccdd").unwrap(),
+            s.check_and_add_nonce("group", "ccdd", None).unwrap(),
             "a pre-committed nonce must still be usable once"
         );
         assert_eq!(s.nonce_stats("group"), (0, 1), "claiming marks it used");
         assert!(
-            !s.check_and_add_nonce("group", "ccdd").unwrap(),
+            !s.check_and_add_nonce("group", "ccdd", None).unwrap(),
             "but only once"
         );
+    }
+
+    #[test]
+    fn a_second_live_handle_cannot_re_hand_the_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        // `b` is opened before `a` claims, so its in-memory snapshot is stale.
+        // The reject has to come from the re-read under the flock, not from
+        // whatever the handle happened to load at open time.
+        let (mut a, mut b) = (store(dir.path()), store(dir.path()));
+
+        assert!(a.check_and_add_nonce("g", "7788", None).unwrap());
+        assert!(
+            !b.check_and_add_nonce("g", "7788", None).unwrap(),
+            "a concurrently-open handle must not hand the nonce out again"
+        );
+    }
+
+    #[test]
+    fn re_registering_a_claimed_nonce_does_not_resurrect_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path());
+
+        assert!(s.check_and_add_nonce("group", "99aa", None).unwrap());
+        // Re-running the pre-commitment loop must not reset the entry.
+        s.add_nonce("group", "99aa").unwrap();
+        assert_eq!(s.nonce_stats("group"), (0, 1));
+        assert!(
+            !s.check_and_add_nonce("group", "99aa", None).unwrap(),
+            "a claimed nonce stays claimed after add_nonce sees it again"
+        );
+    }
+
+    #[test]
+    fn a_legacy_store_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A store written before the reject branch worked: no version, and
+        // entries that were claimed and signed still recorded as unused.
+        std::fs::write(
+            dir.path().join("nonce_store.json"),
+            r#"{"nonces":{"group":[{"commitment":"bbcc","created_at":1,"used":false,"used_at":null,"session_id":null}]}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            !store(dir.path())
+                .check_and_add_nonce("group", "bbcc", None)
+                .unwrap(),
+            "entries from a store that ran the broken guard must not get one free reuse"
+        );
+    }
+
+    #[test]
+    fn the_session_that_burned_a_nonce_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path());
+        assert!(s
+            .check_and_add_nonce("group", "ddee", Some("sess-1"))
+            .unwrap());
+        let entry = s.data.nonces["group"]
+            .iter()
+            .find(|e| e.commitment == "ddee")
+            .unwrap();
+        assert_eq!(entry.session_id.as_deref(), Some("sess-1"));
     }
 
     #[test]
@@ -283,9 +370,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut s = store(dir.path());
 
-        assert!(s.check_and_add_nonce("a", "eeff").unwrap());
+        assert!(s.check_and_add_nonce("a", "eeff", None).unwrap());
         assert!(
-            s.check_and_add_nonce("b", "eeff").unwrap(),
+            s.check_and_add_nonce("b", "eeff", None).unwrap(),
             "the same bytes under a different group are a different nonce"
         );
     }
@@ -294,11 +381,11 @@ mod tests {
     fn the_rejection_survives_a_reopen() {
         let dir = tempfile::tempdir().unwrap();
         assert!(store(dir.path())
-            .check_and_add_nonce("group", "1234")
+            .check_and_add_nonce("group", "1234", None)
             .unwrap());
         assert!(
             !store(dir.path())
-                .check_and_add_nonce("group", "1234")
+                .check_and_add_nonce("group", "1234", None)
                 .unwrap(),
             "a reboot must not hand the nonce back"
         );
