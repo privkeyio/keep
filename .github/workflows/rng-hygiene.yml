@@ -1,0 +1,29 @@
+name: RNG Hygiene
+
+# See scripts/check-rng-hygiene.sh for the rules this enforces and the COLDCARD
+# firmware disclosure that motivated them.
+#
+# Deliberately separate from ci.yml: this is pure shell and finishes in a second,
+# while the Rust jobs need a toolchain and a warm cache. Keeping it standalone
+# means an RNG defect is reported immediately and stays reportable even when the
+# build matrix is broken for unrelated reasons.
+#
+# No `paths:` filter on purpose. The script scans the whole tracked tree, and a
+# path-filtered job can never be a required status check -- PRs touching none of
+# the filtered globs report nothing and block forever.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    name: No predictable-RNG fallbacks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for silent RNG fallbacks
+        run: ./scripts/check-rng-hygiene.sh

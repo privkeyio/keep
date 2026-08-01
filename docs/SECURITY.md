@@ -13,6 +13,16 @@
 | Threshold Sigs | FROST with BIP-340 Schnorr |
 | Hardware Isolation | AWS Nitro Enclaves with attestation-based KMS |
 
+## Randomness
+
+A degraded RNG path must never succeed quietly. Nonces, IVs, salts, challenges, key material, and any identifier that goes on the wire come from the OS CSPRNG, and a CSPRNG failure fails the operation rather than falling back to a zeroed buffer or a seeded PRNG.
+
+`keep-core::entropy` mixes OS randomness with RDRAND (where available), timing jitter, and process context through BLAKE2b. Because that mix keeps producing plausible-looking output even when one source has degraded, every public entry point runs `ensure_entropy_health()` first: three fresh samples must be non-zero, distinct, and at least 64 bits apart in Hamming distance, re-validated on pid change and at least every 4096 generations. A failure is a `Result`, propagated by callers, not a warning.
+
+Where an attested hardware entropy source is in play, losing it is reported. `keep-agent` logs when it is inside a Nitro Enclave and an NSM entropy request fails before it falls back to the OS RNG, and the enclave binary logs once when the NSM device is unavailable. Neither fallback is cryptographically weak (an enclave's OS RNG is itself NSM-seeded), but neither is silent either.
+
+`scripts/check-rng-hygiene.sh` enforces this in CI: unhandled `getrandom` errors, RNG failures collapsed into a default value, seeded PRNGs in production code, and any public entropy entry point that reaches the mixer without the health gate. Deliberate non-crypto randomness is allowed with an inline `// rng-hygiene: ok - <reason>` marker. Know what the guard does not cover: it is a grep, so it catches the shape and not the intent, it does not inspect dependencies, and rule 4 checks that the gate is called, not that the health check itself is sound. The rule exists because this class of bug is silent by construction, as in the COLDCARD firmware disclosure the script header cites.
+
 ## Memory Locking
 
 Keep uses `mlock(2)` to prevent secret key material from being paged to disk. If mlock fails (common on systems with low `RLIMIT_MEMLOCK`), Keep warns but continues with degraded security.

@@ -44,12 +44,24 @@ pub fn is_nitro_enclave() -> bool {
 ///
 /// When running inside an AWS Nitro Enclave (with the `enclave` feature enabled),
 /// uses the hardware NSM for entropy. Falls back to the OS entropy source otherwise.
+///
+/// Outside an enclave that fallback is the normal path. *Inside* one it is a
+/// hardware fault: the NSM is the attested entropy source, and losing it while
+/// still producing bytes is exactly the kind of quiet downgrade that stays
+/// invisible until someone audits the output. The OS RNG in an enclave is itself
+/// NSM-seeded, so substituting it is not weak, but it is never silent either.
 pub fn get_entropy<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
 
     #[cfg(all(target_os = "linux", feature = "enclave"))]
-    if is_nitro_enclave() && fill_from_nsm(&mut buf) {
-        return buf;
+    if is_nitro_enclave() {
+        if fill_from_nsm(&mut buf) {
+            return buf;
+        }
+        tracing::error!(
+            bytes = N,
+            "NSM entropy request failed inside a Nitro Enclave; falling back to the OS RNG"
+        );
     }
 
     rand::rng().fill_bytes(&mut buf);

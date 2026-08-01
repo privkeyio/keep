@@ -525,12 +525,31 @@ fn derive_audit_hmac_key(ephemeral_secret: &[u8; 32]) -> [u8; 32] {
 }
 
 #[cfg(target_os = "linux")]
+fn report_nsm_unavailable() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let msg = "NSM unavailable; entropy is coming from the OS RNG, not the Nitro Secure Module";
+        #[cfg(feature = "tracing")]
+        tracing::warn!("{}", msg);
+        #[cfg(not(feature = "tracing"))]
+        eprintln!("{}", msg);
+    });
+}
+
+#[cfg(target_os = "linux")]
 fn getrandom(buf: &mut [u8]) -> Result<()> {
     use aws_nitro_enclaves_nsm_api::api::{Request, Response};
     use aws_nitro_enclaves_nsm_api::driver::{nsm_exit, nsm_init, nsm_process_request};
 
     let fd = nsm_init();
     if fd < 0 {
+        // Outside an enclave (dev boxes are target_os = "linux" too) this is the
+        // only path that works, so it stays a fallback rather than an error. But
+        // inside one, losing the NSM while still handing back bytes is a quiet
+        // downgrade of the attested entropy source, so say so: once, not per
+        // draw, since key generation calls this in a loop.
+        report_nsm_unavailable();
         ::getrandom::getrandom(buf)
             .map_err(|e| EnclaveError::Nsm(format!("getrandom fallback failed: {}", e)))?;
         return Ok(());
