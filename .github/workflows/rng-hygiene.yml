@@ -29,6 +29,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # This job checks out a PR branch and then EXECUTES a script from it.
+          # actions/checkout persists GITHUB_TOKEN into .git/config by default,
+          # leaving it readable by PR-authored code. Nothing here needs git
+          # credentials; `permissions: contents: read` above bounds the scope,
+          # this removes the token from the working tree entirely.
+          persist-credentials: false
 
       - name: Check for silent RNG fallbacks
         run: ./scripts/check-rng-hygiene.sh
