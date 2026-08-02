@@ -37,5 +37,12 @@ jobs:
           # this removes the token from the working tree entirely.
           persist-credentials: false
 
+      # Assert the guard's rules before trusting them. Sibling guards in
+      # keep-node, keep-esp32 and keep-android each had a split-token evasion
+      # that no test would have caught. This scanner already buffers across
+      # lines; these cases are what keeps that true.
+      - name: Self-test the RNG hygiene guard
+        run: ./scripts/test-rng-hygiene.sh
+
       - name: Check for silent RNG fallbacks
         run: ./scripts/check-rng-hygiene.sh
