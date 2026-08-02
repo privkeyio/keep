@@ -49,10 +49,18 @@ run_probe() {
     GIT_INDEX_FILE="$TMPD/index" git read-tree HEAD 2>/dev/null
     GIT_INDEX_FILE="$TMPD/index" git add -f "$name" 2>/dev/null
 
+    # Both that the tree is populated AND that this probe is in it. Discarding
+    # the git errors above means a failed `git add` would otherwise leave the
+    # guard scanning a probe-free tree, and the case would be judged on a file
+    # the guard never saw.
     local staged
     staged=$(GIT_INDEX_FILE="$TMPD/index" git ls-files | wc -l)
     if [ "$staged" -lt 10 ]; then
         echo "  HARNESS BROKEN: only $staged file(s) staged; the guard would scan almost nothing"
+        fails=$((fails + 1)); rm -f "$name"; PROBE=""; return
+    fi
+    if ! GIT_INDEX_FILE="$TMPD/index" git ls-files --error-unmatch "$name" >/dev/null 2>&1; then
+        echo "  HARNESS BROKEN: $name was not staged; the guard would never see it"
         fails=$((fails + 1)); rm -f "$name"; PROBE=""; return
     fi
 
