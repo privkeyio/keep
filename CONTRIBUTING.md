@@ -11,6 +11,12 @@ cargo test
 
 Requires Rust 1.85+.
 
+## Invariants
+
+Read [docs/INVARIANTS.md](docs/INVARIANTS.md) before changing storage, migration,
+or anything that deletes data. It records rules this codebase has broken more
+than once, each caught by review or a failing test rather than by inspection.
+
 ## Code Style
 
 - Run `cargo fmt` before committing
