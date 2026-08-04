@@ -445,13 +445,46 @@ impl SigningHooks for MobileSigningHooks {
         // request the policy refuses now. Putting it after would let exactly
         // the requests that skip the prompt also skip the policy.
         //
-        // Refusing the raw label is unconditional because nothing legitimately
-        // sends it to a phone. Requiring a structured body on every request is
-        // the stronger policy and is deliberately not applied here: the
-        // payload is optional at the request site, so making it mandatory
-        // would refuse initiators that do not attach one, and a co-signer that
-        // cannot sign reads as broken rather than as protected.
+        // Requiring a structured body on every request is the stronger policy
+        // and is deliberately not applied here: the payload is optional at the
+        // request site, so making it mandatory would refuse initiators that do
+        // not attach one, and a co-signer that cannot sign reads as broken
+        // rather than as protected.
+        //
+        // The CLI's `frost network sign` does send the raw label, so this is
+        // not a label nothing produces. A refusal there is not fatal: the
+        // coordinator excludes the index and fails over, and only errors when
+        // this share is needed to reach threshold. A phone holding key material
+        // is the right place to be stricter than the default serve policy.
         keep_frost_net::RefuseRawSignatureHooks.pre_sign(session)?;
+
+        // Refuse anything whose *displayed* label is blank or raw, normalising
+        // exactly the way the prompt does before deciding.
+        //
+        // Two gaps close here, and both come from the check and the display
+        // disagreeing about what a label says. The policy above compares the
+        // untouched string, while the prompt strips zero-width characters, so
+        // a label of "raw\u{200b}" is not refused and still renders as "raw".
+        // And an empty label defeats a denylist outright while rendering worse
+        // than the label it evades: the surface drops a blank label entirely,
+        // taking the "claimed:" qualifier with it, so the request carrying no
+        // stated domain at all would show fewer warnings than one that says
+        // "raw". The most dangerous request must not be the least alarming.
+        let shown = keep_nip46::handler::sanitize_prompt_field(
+            &session.message_type,
+            MESSAGE_TYPE_DISPLAY_MAX,
+        );
+        let shown = shown.trim();
+        if shown.is_empty() || shown.eq_ignore_ascii_case(keep_frost_net::MSG_TYPE_RAW) {
+            return Err(keep_frost_net::FrostNetError::PolicyViolation(format!(
+                "co-signer refuses a request whose label displays as {}: \
+                 an approval prompt cannot describe what it is asking about. \
+                 session_id={}, requester=share {}",
+                if shown.is_empty() { "blank" } else { "raw" },
+                hex::encode(session.session_id),
+                session.requester
+            )));
+        }
 
         if self.consume_pre_approval(&session.message) {
             return Ok(());
@@ -4850,6 +4883,72 @@ mod baseline_presign_policy_tests {
             format!("{err}").contains("raw"),
             "refusal should name the policy that fired, got: {err}"
         );
+    }
+
+    /// The gap a denylist leaves. An empty label is not "raw", so the string
+    /// comparison misses it, and the approval surface drops a blank label
+    /// along with the "claimed:" qualifier that would have marked it
+    /// unverified. Before this guard the request carrying no stated domain at
+    /// all rendered with fewer warnings than one that admitted to being raw.
+    #[test]
+    fn a_label_that_would_display_as_blank_is_refused() {
+        for label in ["", "   ", "\u{200b}", " \u{200b} "] {
+            let storage = KillSwitchOffStorage::with_switch_off();
+            let (request_tx, _request_rx) = mpsc::channel(1);
+            let hooks = MobileSigningHooks {
+                request_tx,
+                pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+                storage: Arc::new(storage),
+            };
+            let err = hooks
+                .pre_sign(&session_with(label, vec![1u8; 32]))
+                .expect_err("a label that displays as blank must be refused");
+            assert!(
+                format!("{err}").contains("blank"),
+                "expected the blank-label refusal for {label:?}, got: {err}"
+            );
+        }
+    }
+
+    /// The check and the display have to agree on what the label says. The
+    /// upstream policy compares the untouched string while the prompt strips
+    /// zero-width characters, so this value evades the comparison and still
+    /// renders as "raw".
+    #[test]
+    fn raw_with_a_zero_width_character_is_refused() {
+        let storage = KillSwitchOffStorage::with_switch_off();
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let hooks = MobileSigningHooks {
+            request_tx,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::new(storage),
+        };
+        let err = hooks
+            .pre_sign(&session_with("raw\u{200b}", vec![2u8; 32]))
+            .expect_err("a label displaying as raw must be refused however it is spelled");
+        assert!(
+            format!("{err}").contains("raw"),
+            "refusal should name the policy that fired, got: {err}"
+        );
+    }
+
+    /// A raw request with no pre-approval. Less about coverage than about
+    /// failing fast: delete the policy and this path falls through to the
+    /// interactive prompt, where the send succeeds and the test then waits out
+    /// the full response timeout instead of failing. A regression that stalls
+    /// the suite is harder to read than one that fails.
+    #[test]
+    fn raw_without_a_pre_approval_is_refused_rather_than_prompted() {
+        let storage = KillSwitchOffStorage::with_switch_off();
+        let (request_tx, _request_rx) = mpsc::channel(1);
+        let hooks = MobileSigningHooks {
+            request_tx,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::new(storage),
+        };
+        hooks
+            .pre_sign(&session_with("raw", vec![4u8; 32]))
+            .expect_err("a raw request must be refused without reaching the prompt");
     }
 
     /// The guard must not swallow the requests it exists to let through: a
