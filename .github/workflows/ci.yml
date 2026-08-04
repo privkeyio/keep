@@ -53,7 +53,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ github.event_name == 'push' && fromJSON('["ubuntu-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
+        # macOS runs on pull requests too, not only on push. It is the one
+        # platform job that has caught a real failure, and it caught it after
+        # merge: a timing-sensitive test that passes on a fast runner and fails
+        # on a slow one turned main red from a pull request that was fully
+        # green. Finding that before merge costs runner minutes; finding it
+        # after costs a red main plus the work to bisect it.
+        #
+        # The packaging jobs below stay push-only deliberately. They verify how
+        # artifacts are assembled rather than how the code behaves, so they are
+        # far less likely to catch a logic change, and they are the expensive
+        # ones to run per pull request.
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install dependencies (Linux)
