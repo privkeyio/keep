@@ -380,6 +380,7 @@ impl KfpNode {
 mod gate_tests {
     use super::*;
     use crate::node::PeerPolicy;
+    use crate::peer::Peer;
     use keep_core::frost::{ThresholdConfig, TrustedDealer};
     use nostr_relay_builder::MockRelay;
 
@@ -490,6 +491,78 @@ mod gate_tests {
             node.handle_ecdh_share(from, payload).await,
             Err(FrostNetError::UntrustedPeer(_))
         ));
+    }
+
+    /// Seeds a session plus one registered participant, so the participant
+    /// gate has something to accept as well as something to reject. Returns
+    /// the registered peer's key.
+    fn seed_session_with_participant(node: &KfpNode, session_id: [u8; 32]) -> PublicKey {
+        let participant = Keys::generate().public_key();
+        node.peers.write().add_peer(Peer::new(participant, 2));
+        node.ecdh_sessions
+            .write()
+            .get_or_create_session(session_id, [2u8; 33], 2, vec![1, 2])
+            .expect("session seeds");
+        participant
+    }
+
+    /// A completed-secret announcement from a key that is not a participant in
+    /// the session is rejected.
+    ///
+    /// This gate had no test. The nearby unknown-session test returns at the
+    /// session lookup twenty lines earlier and never reaches it, so the
+    /// function reads as covered while the authorisation inside it is not.
+    /// Mutation testing is what surfaced it: both inverting the pubkey
+    /// comparison and deleting the negation on the result survived, and either
+    /// one admits a non-participant to a derived shared secret.
+    #[tokio::test]
+    async fn handle_ecdh_complete_rejects_a_non_participant() {
+        let (node, _relay) = test_node().await;
+        let session_id = [4u8; 32];
+        let _registered = seed_session_with_participant(&node, session_id);
+
+        let outsider = Keys::generate().public_key();
+        let payload = EcdhCompletePayload {
+            session_id,
+            shared_secret: Zeroizing::new(vec![0u8; 32]),
+        };
+        assert!(
+            matches!(
+                node.handle_ecdh_complete(outsider, payload).await,
+                Err(FrostNetError::UntrustedPeer(_))
+            ),
+            "a key that is not a session participant must not be admitted"
+        );
+    }
+
+    /// The positive control for the test above, and the reason it is not
+    /// vacuous. With no peer registered, `get_peer` returns nothing and every
+    /// sender fails the gate, so a refusal on its own proves only that
+    /// something refused. This sends the *registered* participant's key and
+    /// requires the failure to move past the gate to the secret-length check,
+    /// which shows the gate discriminates on identity rather than rejecting
+    /// everything that reaches it.
+    #[tokio::test]
+    async fn handle_ecdh_complete_admits_a_registered_participant_past_the_gate() {
+        let (node, _relay) = test_node().await;
+        let session_id = [5u8; 32];
+        let registered = seed_session_with_participant(&node, session_id);
+
+        let payload = EcdhCompletePayload {
+            session_id,
+            // Deliberately the wrong length: past the participant gate the
+            // next thing that happens is the length conversion, so this
+            // separates "got through the gate" from "was refused by it".
+            shared_secret: Zeroizing::new(vec![0u8; 31]),
+        };
+        let err = node
+            .handle_ecdh_complete(registered, payload)
+            .await
+            .expect_err("a 31-byte secret cannot convert");
+        assert!(
+            matches!(err, FrostNetError::Crypto(_)),
+            "a registered participant must reach the secret parse, got: {err}"
+        );
     }
 
     /// A completed-secret announcement for an unknown session is rejected
