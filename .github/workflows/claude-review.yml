@@ -1,0 +1,106 @@
+name: Claude Review
+
+# An adversarial reviewer that runs as a status check rather than a comment, so
+# the step that has actually been catching defects cannot be skipped.
+#
+# The case for gating on this: every fix in this repository that turned out worse
+# than the bug it replaced passed CI. A clamp that made audit corruption permanent
+# and invisible, a latch that froze registry maintenance for the process lifetime,
+# a lookup fix that resurrected deleted values, and a storage migration that erased
+# a share after a write that reported success while storing nothing. Tests were
+# green for all of them. Review caught all of them. See docs/INVARIANTS.md.
+#
+# No `paths:` filter, deliberately, for the same reason the RNG guard has none: a
+# path-filtered job can never be a required status check, because a pull request
+# touching none of the filtered globs reports nothing and blocks forever.
+
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  review:
+    # This name is the status-check context. Changing it silently detaches the
+    # branch-protection rule, which fails open rather than closed.
+    name: No unresolved review blockers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history: the review diffs against the merge base, which is not
+          # present in a shallow clone.
+          fetch-depth: 0
+
+      - id: review
+        # Pinned by commit rather than the v1 tag. A mutable tag on a job that
+        # gates merges is its own supply-chain hole, matching ci.yml and the RNG
+        # guard.
+        uses: anthropics/claude-code-action@86180fa9e4d311eed10c9cc49854c53dab5d517a # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Review this pull request's diff against the merge base for defects
+            the test suite cannot catch. Read docs/INVARIANTS.md first: it records
+            the rules this codebase has broken more than once, each of them in
+            code that had already been reviewed, compiled and passed CI.
+
+            This is a Bitcoin signing system. A lost key share is unrecoverable
+            and the funds it protects are gone, so weight findings by what happens
+            when they are wrong, not by how likely they look.
+
+            Block only on these. Everything else is a note.
+
+            - Data that can be destroyed or made unreachable. Especially a source
+              erased after a write whose success was assumed rather than read
+              back, and anything treating the existence of a name, a key or a
+              registry entry as proof the value behind it is retrievable.
+            - A failure that resolves to the more permissive outcome. A read error
+              that becomes a default, an unknown state that becomes allow, a
+              guard relaxed in the course of bounding a cost.
+            - A test that asserts the broken behavior is correct, or that passes
+              whether or not the code under test runs. State plainly which of the
+              two, and what the test would need to assert instead.
+            - Key material, seed words or share bytes reaching a log, an error
+              message, a notification or any other egress.
+
+            For each blocker give the file, the line, and a concrete failure: the
+            input or state that triggers it and what the user loses. A finding you
+            cannot make fail is a note, not a blocker.
+
+            Do not block on style, naming, formatting, test coverage in the
+            abstract, or a preference for how something might be structured. A
+            reviewer that blocks on everything gets turned off, and then nothing
+            is reviewed at all.
+          claude_args: |
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["pass","block"]},"summary":{"type":"string"},"blockers":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"finding":{"type":"string"},"failure":{"type":"string"}},"required":["file","finding","failure"]}}},"required":["verdict","summary","blockers"]}'
+
+      - name: Fail on blockers
+        env:
+          RESULT: ${{ steps.review.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+
+          # An empty or unparseable result means the review did not reach a
+          # verdict. Treat that as a failure rather than a pass: a gate that
+          # opens when it cannot evaluate is not a gate.
+          if [ -z "${RESULT}" ] || ! printf '%s' "${RESULT}" | jq -e . >/dev/null 2>&1; then
+            echo "::error::The review produced no parseable verdict. Failing closed."
+            exit 1
+          fi
+
+          printf '%s' "${RESULT}" | jq -r '.summary'
+
+          printf '%s' "${RESULT}" | jq -r '
+            .blockers[]? |
+            "::error file=\(.file)\(if .line then ",line=\(.line)" else "" end)::\(.finding) — \(.failure)"
+          '
+
+          if [ "$(printf '%s' "${RESULT}" | jq -r '.verdict')" = "block" ]; then
+            echo "::error::Review found blockers. Fix them, or state why each is wrong."
+            exit 1
+          fi
+          echo "No blockers."
