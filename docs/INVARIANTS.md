@@ -64,8 +64,11 @@ in place.
 
 ## A search that finds things cannot prove absence
 
-`grep -c` returning zero means your pattern did not match. It does not mean the
-thing is not there.
+`grep -c` printing `0` means your pattern did not match. It does not mean the
+thing is not there. Note the two senses of "returns" here, because conflating
+them is its own bug: the printed count is `0` on no match, while the exit status
+is `1`. A script branching on the exit status and a person reading the number are
+looking at opposite values.
 
 Four claims in the hardening backlogs were wrong because of one search:
 looking for lines containing both a symbol and the word "test". A test
@@ -95,8 +98,15 @@ Tests that needed to corrupt one stored entry picked it with predicates like
 "the first entry whose value starts with the version marker", which also matches
 the derivation key and the registry. Corrupting the derivation key throws out of
 the read path and produces a failure unrelated to the thing under test. The
-reliable method is to snapshot, perform the write, and diff, asserting that
-exactly one entry changed.
+reliable method is to snapshot, perform the write, and diff, then assert on what
+you actually expect that write to have changed.
+
+Do not reflexively assert that exactly one entry changed. That is right only
+when the write genuinely touches one, and it is wrong for a write that also
+updates a version, an index or a companion value. Asserting the count rather
+than the expectation is the previous rule's mistake in a new place: it pins an
+artifact of today's implementation instead of the property you care about, and
+it will fail on a correct change that happens to write one more thing.
 
 ## A test that has never failed proves nothing
 
