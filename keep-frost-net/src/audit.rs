@@ -36,6 +36,20 @@ pub enum SigningOperation {
     SignatureShareSent,
     SignatureCompleted,
     SignatureReceived,
+    /// A sign request this node refused before taking part.
+    ///
+    /// Every other variant records something that happened. Without this one
+    /// the log answers "what did we sign" but not "what were we asked to sign
+    /// and declined", so a peer probing a co-signer leaves no durable trace:
+    /// the refusal path emits a warning and nothing else, and warnings are not
+    /// evidence a holder still has next week.
+    ///
+    /// Carries no reason. The message a policy returns is a formatted string
+    /// that a custom hook could build from requester-supplied content, and an
+    /// audit log is the wrong place to accept text an adversary influences.
+    /// The session id and message hash already identify which request was
+    /// refused; the reason stays in the log line.
+    SignRequestRefused,
 }
 
 impl SigningAuditEntry {
@@ -84,6 +98,12 @@ impl SigningAuditEntry {
 }
 
 impl SigningOperation {
+    /// Stable wire numbering for the entry HMAC.
+    ///
+    /// These values are covered by the HMAC, so they are append-only: renumber
+    /// one and every entry already written under the old numbering fails
+    /// verification, which reads as tampering rather than as a version skew.
+    /// New operations take the next unused value and nothing else moves.
     fn discriminant(&self) -> u8 {
         match self {
             SigningOperation::SignRequestInitiated => 0,
@@ -91,6 +111,7 @@ impl SigningOperation {
             SigningOperation::SignatureShareSent => 2,
             SigningOperation::SignatureCompleted => 3,
             SigningOperation::SignatureReceived => 4,
+            SigningOperation::SignRequestRefused => 5,
         }
     }
 }

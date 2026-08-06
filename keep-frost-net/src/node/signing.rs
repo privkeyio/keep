@@ -518,6 +518,24 @@ impl KfpNode {
                 session_id = %hex::encode(request.session_id),
                 "Sign request refused by pre-sign policy; signaling requester"
             );
+            // Record the refusal durably. A warning is not evidence: a holder
+            // asking later whether anyone probed them with requests this node
+            // declined has nothing to consult otherwise. This also covers the
+            // kill switch, which refuses by returning an error from the same
+            // hook and would likewise have left no trace.
+            // Record the refusal durably. A warning is not evidence: a holder
+            // asking later whether anyone probed them with requests this node
+            // declined has nothing to consult otherwise. This also covers the
+            // kill switch, which refuses by returning an error from the same
+            // hook and would likewise have left no trace.
+            self.audit_log.log_signing_operation(
+                request.session_id,
+                &request.message,
+                None,
+                request.participants.clone(),
+                self.share.metadata.identifier,
+                SigningOperation::SignRequestRefused,
+            );
             self.send_session_error(
                 &from,
                 "policy_violation",
@@ -1949,6 +1967,41 @@ mod gate_tests {
         let from = Keys::generate().public_key();
         let req = SignRequestPayload::new([1u8; 32], [0xAA; 32], vec![0u8; 32], "test", vec![1]);
         assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
+    /// A refused request leaves a durable record.
+    ///
+    /// Every other audit operation records something that happened, so before
+    /// this the log answered "what did we sign" but not "what were we asked to
+    /// sign and declined". A peer probing a co-signer left only a warning, and
+    /// a warning is not something a holder still has to consult later.
+    #[tokio::test]
+    async fn a_refused_sign_request_is_recorded_in_the_audit_log() {
+        let (node, _relay) = test_node().await;
+        node.set_hooks(std::sync::Arc::new(crate::RefuseRawSignatureHooks));
+
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(crate::peer::Peer::new(peer, 2));
+
+        let session_id = [0x33u8; 32];
+        let group = *node.group_pubkey();
+        let req = SignRequestPayload::new(session_id, group, vec![0u8; 32], "raw", vec![1, 2]);
+        node.handle_sign_request(peer, req)
+            .await
+            .expect("a refusal is reported to the requester, not surfaced as an error here");
+
+        let entries = node.audit_log().get_entries_for_session(&session_id);
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.operation, SigningOperation::SignRequestRefused)),
+            "the refusal must be recorded; got {:?}",
+            entries.iter().map(|e| &e.operation).collect::<Vec<_>>()
+        );
+        assert!(
+            node.audit_log().verify_all(),
+            "the new operation must be covered by the entry HMAC like every other one"
+        );
     }
 
     /// A sign request whose participant set excludes our own identifier is
