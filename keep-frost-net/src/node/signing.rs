@@ -381,6 +381,29 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Record a refusal of `request` that the requester is being told about.
+    ///
+    /// Both notified refusal paths go through here so they cannot drift into
+    /// recording different things. A warning is not evidence: a holder asking
+    /// later whether anyone sent requests this node declined has nothing to
+    /// consult otherwise.
+    ///
+    /// Called before the notification is sent, deliberately. The fact recorded
+    /// is that we refused, which holds whether or not the peer could be told,
+    /// and a refusal that could not be delivered is the one most worth keeping.
+    /// That differs from the accept path, which logs after its send because
+    /// there the recorded fact is the send itself.
+    fn record_refusal(&self, request: &SignRequestPayload) {
+        self.audit_log.log_signing_operation(
+            request.session_id,
+            &request.message,
+            None,
+            request.participants.clone(),
+            self.share.metadata.identifier,
+            SigningOperation::SignRequestRefused,
+        );
+    }
+
     pub(crate) async fn handle_sign_request(
         &self,
         from: PublicKey,
@@ -499,21 +522,11 @@ impl KfpNode {
                     error = %e,
                     "Sign request refused: structured payload does not match digest"
                 );
-                // Audited for the same reason as the policy refusal below, and
-                // with more cause. This fires when a requester's structured body
-                // does not produce the digest it asked us to sign, which is an
-                // attempted cross-domain relabel rather than a configuration
-                // saying no. Both sit past peer admission, so both are a known
-                // member's behaviour and worth keeping; recording one and not
-                // the other would leave the sharper signal invisible.
-                self.audit_log.log_signing_operation(
-                    request.session_id,
-                    &request.message,
-                    None,
-                    request.participants.clone(),
-                    self.share.metadata.identifier,
-                    SigningOperation::SignRequestRefused,
-                );
+                // Audited with more cause than the policy refusal below: this
+                // fires when a requester's structured body does not produce the
+                // digest it asked us to sign, which is an attempted
+                // cross-domain relabel rather than a configuration saying no.
+                self.record_refusal(&request);
                 self.send_session_error(
                     &from,
                     "policy_violation",
@@ -534,25 +547,9 @@ impl KfpNode {
                 error = %e,
                 "Sign request refused by pre-sign policy; signaling requester"
             );
-            // Record the refusal durably. A warning is not evidence: a holder
-            // asking later whether anyone probed them with requests this node
-            // declined has nothing to consult otherwise. This also covers the
-            // kill switch and the desktop approval prompt, which refuse by
-            // returning an error from this same hook and would likewise have
-            // left no trace. The entry is written before the notification is
-            // sent, deliberately: the fact recorded is that we refused, which
-            // holds whether or not the peer could be told, and a refusal that
-            // could not be delivered is the one most worth keeping. That
-            // differs from the accept path below, which logs after its send
-            // because there the recorded fact is the send itself.
-            self.audit_log.log_signing_operation(
-                request.session_id,
-                &request.message,
-                None,
-                request.participants.clone(),
-                self.share.metadata.identifier,
-                SigningOperation::SignRequestRefused,
-            );
+            // Covers the kill switch and the desktop approval prompt too: both
+            // refuse by returning an error from this same hook.
+            self.record_refusal(&request);
             self.send_session_error(
                 &from,
                 "policy_violation",
