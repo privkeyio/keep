@@ -483,6 +483,11 @@ mod tests {
     /// code exactly one winner is guaranteed, so this cannot fail spuriously.
     /// On the broken code it needs the threads to overlap, which repeating the
     /// round makes very likely without making a green run a lie.
+    ///
+    /// It covers the stale-read half only. Reverting just the lock leaves this
+    /// green, because with the read taken by path there is no stale handle to
+    /// read from. The exclusion half is pinned separately, below, by asserting
+    /// the locked inode is the one thing the write path never replaces.
     #[test]
     fn concurrent_handles_hand_out_a_commitment_exactly_once() {
         for round in 0..40 {
@@ -503,17 +508,18 @@ mod tests {
                         let mut s = NonceStore::open(&path).unwrap();
                         barrier.wait();
                         s.check_and_add_nonce("g", "contested", None)
-                            .unwrap_or(false)
                     })
                 })
                 .collect();
 
-            let winners = handles
+            // Every thread must succeed, not merely not-win. Mapping errors to
+            // "not granted" would let an implementation that fails under
+            // contention for seven of eight callers still show one winner.
+            let outcomes: Vec<bool> = handles
                 .into_iter()
-                .filter(|_| true)
-                .map(|h| h.join().unwrap())
-                .filter(|granted| *granted)
-                .count();
+                .map(|h| h.join().unwrap().expect("a contended claim must not error"))
+                .collect();
+            let winners = outcomes.iter().filter(|granted| **granted).count();
 
             assert_eq!(
                 winners, 1,
@@ -521,5 +527,46 @@ mod tests {
                  more than one means two signature shares under one nonce"
             );
         }
+    }
+
+    /// The locked file must be the one thing a claim does not replace.
+    ///
+    /// This is the invariant the whole fix rests on, and unlike the race above
+    /// it is directly observable: a claim replaces the store, so the store's
+    /// inode changes, and it must not touch the lock's. Locking the store made
+    /// those the same inode, so the lock was destroyed by the very operation it
+    /// was meant to be protecting.
+    ///
+    /// Deterministic and thread-free. It also fails if someone later deletes
+    /// the lock file between calls as a cleanup, which is the realistic way
+    /// this regresses.
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_replaces_the_store_and_never_the_lock() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path());
+        s.check_and_add_nonce("g", "first", None).unwrap();
+
+        let store_path = dir.path().join("nonce_store.json");
+        let lock_path = dir.path().join("nonce_store.lock");
+        let store_before = std::fs::metadata(&store_path).unwrap().ino();
+        let lock_before = std::fs::metadata(&lock_path).unwrap().ino();
+
+        s.check_and_add_nonce("g", "second", None).unwrap();
+
+        assert_ne!(
+            store_before,
+            std::fs::metadata(&store_path).unwrap().ino(),
+            "a claim is written by replacing the store, so its inode must change"
+        );
+        assert_eq!(
+            lock_before,
+            std::fs::metadata(&lock_path).unwrap().ino(),
+            "the locked file must survive the claim; if the write path replaces \
+             it, callers end up holding locks on different inodes and exclusion \
+             silently stops applying"
+        );
     }
 }
