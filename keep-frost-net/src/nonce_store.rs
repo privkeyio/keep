@@ -28,6 +28,25 @@ pub struct FileNonceStore {
 
 impl FileNonceStore {
     pub fn new(path: &Path) -> Result<Self> {
+        // The lock and temp siblings are derived by replacing the extension,
+        // so a store named `*.lock` or `*.tmp` derives a sibling equal to
+        // itself. Both writer paths open the lock with `truncate(true)`, so a
+        // `.lock` store would be zeroed on the next record and left holding
+        // only the entry that just arrived: every previously consumed id gone
+        // from disk, and the guard silently empty after the next restart.
+        // Refuse the name rather than let the collision erase the store.
+        let collides = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .is_some_and(|e| e == "lock" || e == "tmp");
+        if collides {
+            return Err(FrostNetError::Session(format!(
+                "Nonce store path {} must not end in .lock or .tmp: those \
+                 extensions collide with the store's own lock and temp files",
+                path.display()
+            )));
+        }
+
         let consumed = Arc::new(RwLock::new(HashSet::new()));
         let insertion_order = Arc::new(RwLock::new(VecDeque::new()));
 
@@ -420,6 +439,29 @@ mod tests {
     /// The lost record is the most recently consumed session, because a short
     /// entry is a partial append. Skipping it silently returned that session id
     /// to the available set, so the recovery path itself produced the replay
+    /// A store named like its own lock or temp sibling is refused.
+    ///
+    /// Not a style rule: both writer paths open the lock with `truncate(true)`,
+    /// so a `.lock` store is erased by its own first write and the guard comes
+    /// back empty after a restart.
+    #[test]
+    fn a_store_named_like_its_own_lock_is_refused() {
+        let dir = tempdir().unwrap();
+
+        for name in ["nonces.lock", "nonces.tmp", "nonces.LOCK"] {
+            let path = dir.path().join(name);
+            assert!(
+                FileNonceStore::new(&path).is_err(),
+                "{name} derives a sibling equal to itself and must be refused"
+            );
+        }
+
+        assert!(
+            FileNonceStore::new(&dir.path().join("nonces.locked")).is_ok(),
+            "a name that merely starts with the same letters is fine"
+        );
+    }
+
     /// this store exists to prevent, and the only signal was a warning nobody
     /// reads after a crash.
     #[test]
