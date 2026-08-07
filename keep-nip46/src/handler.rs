@@ -18,7 +18,9 @@ use keep_core::keyring::Keyring;
 
 use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
-use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
+use crate::permissions::{
+    AppPermission, ApprovalDecision, Permission, PermissionDuration, PermissionManager,
+};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
     ApprovalRequest, ApprovalResult, ConnectAuthorization, HttpAuthDetails, RememberDuration,
@@ -517,13 +519,33 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
             .await?;
 
-        let needs_approval = self
-            .permissions
-            .lock()
-            .await
-            .needs_approval(&app_pubkey, kind);
+        // A refusal the user already gave is consulted before prompting. Without
+        // this, saying no decides one request and nothing more: a client that
+        // retries turns a single refusal into a prompt every retry interval,
+        // and the only way to stop it is revoking the app entirely, which is a
+        // far broader answer than the one the user gave.
+        let decision = self.permissions.lock().await.decide(&app_pubkey, kind);
+        // Matched exhaustively rather than compared. A fourth variant added
+        // later would match neither `== Deny` nor `== Ask` and fall through
+        // both blocks into signing, which is a fail-open at a signing boundary
+        // and precisely what this enum exists to prevent. A match makes that a
+        // compile error instead of a silent authorisation.
+        let ask = match decision {
+            ApprovalDecision::Deny => {
+                // Deliberately not audited. The user's refusal was recorded when
+                // they gave it; this is that answer being replayed, not a new
+                // decision. Auditing here would write one entry per retry at
+                // line rate into the same ring that carries signing history,
+                // which is the amplification a sibling crate had to undo one
+                // change earlier: an unbounded stream evicting the record it
+                // was added to strengthen.
+                return Err(KeepError::UserRejected);
+            }
+            ApprovalDecision::Ask => true,
+            ApprovalDecision::Allow => false,
+        };
 
-        if needs_approval {
+        if ask {
             let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
@@ -544,6 +566,31 @@ impl SignerHandler {
                 .await;
 
             if !result.approved {
+                // The result already carried a duration; nothing read it on this
+                // branch, so "no, and stop asking for an hour" was
+                // indistinguishable from "no, this once". Recording it is what
+                // makes a refusal hold against a client that retries.
+                //
+                // Only bounded windows are remembered. `Forever` yields no
+                // duration here, and that is the right outcome rather than a
+                // gap: these refusals are in-memory, so a forever refusal would
+                // quietly disappear on the next restart, and promising forever
+                // while delivering until-restart is worse than not offering it.
+                // Revoking the app is the instrument for a permanent no.
+                //
+                // NIP-98 is clamped exactly as an approval is, so a refusal can
+                // never be remembered longer than an approval could.
+                let remember = if kind == NIP98_HTTP_AUTH {
+                    clamp_nip98_remember(result.remember)
+                } else {
+                    result.remember
+                };
+                if let Some(secs) = remember.as_seconds() {
+                    self.permissions
+                        .lock()
+                        .await
+                        .deny_kind_for(&app_pubkey, kind, secs);
+                }
                 self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
@@ -1989,6 +2036,112 @@ mod tests {
             }
         }
         fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    }
+
+    /// Rejects every request with a fixed `remember`, counting prompts.
+    struct RejectingCallbacks {
+        remember: RememberDuration,
+        sign_event_prompts: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::types::ServerCallbacks for RejectingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            // Only signing is refused. Rejecting the connect too would fail the
+            // handshake and the test would never reach the path under test.
+            if request.method != "sign_event" {
+                return ApprovalResult::approved_once();
+            }
+            self.sign_event_prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ApprovalResult {
+                approved: false,
+                remember: self.remember,
+            }
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    }
+
+    async fn rejecting_handler(
+        remember: RememberDuration,
+    ) -> (SignerHandler, Arc<RejectingCallbacks>, PublicKey, PublicKey) {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RejectingCallbacks {
+            remember,
+            sign_event_prompts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        (handler, cb, app, signer_pk)
+    }
+
+    /// The wiring, end to end through the handler rather than the permission
+    /// map. A refusal carrying a duration must stop the next request without
+    /// prompting a second time.
+    #[tokio::test]
+    async fn a_remembered_rejection_refuses_the_next_request_without_prompting() {
+        let (handler, cb, app, signer_pk) = rejecting_handler(RememberDuration::OneHour).await;
+
+        for body in ["one", "two", "three"] {
+            let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], body);
+            assert!(handler.handle_sign_event(app, ev).await.is_err());
+        }
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the user should be asked once; the refusal answers the retries"
+        );
+    }
+
+    /// The negative that matters most. A one-shot refusal must leave nothing
+    /// behind: if it recorded a window, every "no, this once" would become a
+    /// lasting silent block the user never asked for.
+    #[tokio::test]
+    async fn a_one_shot_rejection_records_nothing() {
+        let (handler, cb, app, signer_pk) = rejecting_handler(RememberDuration::JustThisTime).await;
+
+        for body in ["one", "two", "three"] {
+            let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], body);
+            assert!(handler.handle_sign_event(app, ev).await.is_err());
+        }
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "a one-shot refusal must not silently persist; every request should still ask"
+        );
+    }
+
+    /// A remembered refusal is scoped to the kind it was given for.
+    #[tokio::test]
+    async fn a_remembered_rejection_does_not_cover_other_kinds() {
+        let (handler, cb, app, signer_pk) = rejecting_handler(RememberDuration::OneHour).await;
+
+        let first = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "a");
+        assert!(handler.handle_sign_event(app, first).await.is_err());
+
+        let other = UnsignedEvent::new(
+            signer_pk,
+            Timestamp::now(),
+            Kind::from(30023u16),
+            vec![],
+            "b",
+        );
+        assert!(handler.handle_sign_event(app, other).await.is_err());
+
+        assert_eq!(
+            cb.sign_event_prompts
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "refusing one kind must not silently refuse a different one"
+        );
     }
 
     #[tokio::test]

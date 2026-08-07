@@ -102,6 +102,21 @@ impl PermissionDuration {
     }
 }
 
+/// What to do with a request without asking the user.
+///
+/// A boolean cannot carry this. "Do not prompt" is two different answers,
+/// allow and refuse, and collapsing them is how a remembered refusal would
+/// turn into a silent approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    /// A live grant covers it; proceed without prompting.
+    Allow,
+    /// A live refusal covers it; reject without prompting.
+    Deny,
+    /// Nothing on record; ask.
+    Ask,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPermission {
     pub pubkey: PublicKey,
@@ -123,6 +138,22 @@ pub struct AppPermission {
     /// or restored across a restart.
     #[serde(skip)]
     pub timed_kind_grants: HashMap<Kind, u64>,
+    /// Per-app, per-kind refusals with an explicit expiry (unix epoch seconds).
+    ///
+    /// The grant fields above answer "may this app do this without asking".
+    /// This answers "has the user already said no, recently enough that asking
+    /// again would be pestering them". Without it a rejection decides one
+    /// request and nothing more, which is fine for a person, who stops asking,
+    /// and wrong for an automated client, which retries: one refusal becomes a
+    /// prompt every retry interval, and the only way to stop it is revoking the
+    /// app outright, an answer far broader than the one being given.
+    ///
+    /// Not serialized, and deliberately not persisted in this change. A denial
+    /// that survives a restart is a stronger instrument than the problem needs:
+    /// within a session it stops the pestering completely, and after a restart
+    /// the client asks once more and is told no once more.
+    #[serde(skip)]
+    pub timed_kind_denials: HashMap<Kind, u64>,
     pub connected_at: Timestamp,
     pub last_used: Timestamp,
     pub request_count: u64,
@@ -150,6 +181,7 @@ impl AppPermission {
             permissions: Permission::DEFAULT,
             auto_approve_kinds: HashSet::from([Kind::Reaction]),
             timed_kind_grants: HashMap::new(),
+            timed_kind_denials: HashMap::new(),
             connected_at: Timestamp::now(),
             last_used: Timestamp::now(),
             request_count: 0,
@@ -165,6 +197,13 @@ impl AppPermission {
         self.timed_kind_grants
             .get(&kind)
             .is_some_and(|expiry| now_unix_secs() < *expiry)
+    }
+
+    /// Whether a live refusal covers `kind`.
+    pub fn has_unexpired_denial(&self, kind: Kind) -> bool {
+        self.timed_kind_denials
+            .get(&kind)
+            .is_some_and(|&expiry| Timestamp::now().as_secs() < expiry)
     }
 
     /// Whether the app currently holds a live remember-grant: a Forever per-kind
@@ -332,7 +371,73 @@ impl PermissionManager {
         self.apps.contains_key(pubkey)
     }
 
+    /// Decide a request without prompting, or say that prompting is needed.
+    ///
+    /// A live refusal wins over a live grant. The two should not coexist, since
+    /// recording either clears the other, but if they ever did, refusing is the
+    /// answer that cannot authorise something the user did not intend.
+    pub fn decide(&self, pubkey: &PublicKey, kind: Kind) -> ApprovalDecision {
+        if let Some(app) = self.apps.get(pubkey) {
+            if !app.duration.is_expired(app.connected_at) && app.has_unexpired_denial(kind) {
+                return ApprovalDecision::Deny;
+            }
+        }
+        if self.requires_prompt_ignoring_denials(pubkey, kind) {
+            ApprovalDecision::Ask
+        } else {
+            ApprovalDecision::Allow
+        }
+    }
+
+    /// Whether the caller must not proceed without further action.
+    ///
+    /// True for both a refusal and an unanswered request, because the only
+    /// answer that permits proceeding silently is an explicit grant. Kept as a
+    /// bool for the existing callers; prefer [`Self::decide`], which
+    /// distinguishes the two and lets a refusal short-circuit the prompt.
+    ///
+    /// Deliberately not `decide(..) == Ask`. That reads better and is unsafe:
+    /// it would return false for a refusal, so a caller writing
+    /// `if !needs_approval { proceed }` would treat a remembered no as a yes.
+    /// A signer must not have an API whose obvious misuse authorises signing.
     pub fn needs_approval(&self, pubkey: &PublicKey, kind: Kind) -> bool {
+        self.decide(pubkey, kind) != ApprovalDecision::Allow
+    }
+
+    /// Record that the user refused `kind` for this app, for `secs`.
+    ///
+    /// Clears any grant for the same kind: a refusal that leaves an existing
+    /// grant standing would be overridden by it the moment the decision is next
+    /// taken, so the user's most recent answer has to be the one that holds.
+    /// Returns whether anything was written, so callers only audit real changes.
+    pub fn deny_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) -> bool {
+        if secs == 0 {
+            return false;
+        }
+        let Some(app) = self.apps.get_mut(pubkey) else {
+            return false;
+        };
+        // Clamp NIP-98 here rather than trusting the caller. The handler
+        // already clamps its own path, but this is a public write API and the
+        // invariant is that a refusal can never be remembered for longer than
+        // an approval could; that has to hold at the point of writing.
+        let secs = if kind == NIP98_HTTP_AUTH {
+            secs.min(NIP98_MAX_REMEMBER_SECS)
+        } else {
+            secs
+        };
+        let expiry = Timestamp::now().as_secs().saturating_add(secs);
+        app.auto_approve_kinds.remove(&kind);
+        app.timed_kind_grants.remove(&kind);
+        app.timed_kind_denials.insert(kind, expiry);
+        true
+    }
+
+    /// Whether a prompt is required, considering grants only.
+    ///
+    /// Private because it answers half the question. A remembered refusal is
+    /// resolved by [`Self::decide`], which consults this for the other half.
+    fn requires_prompt_ignoring_denials(&self, pubkey: &PublicKey, kind: Kind) -> bool {
         // #613: NIP-98 (kind 27235) is opt-in remembered only via an explicit,
         // short, unexpired per-app timed grant written by the approval path. It
         // is never covered by a forever (auto_approve) or global grant: those
@@ -391,6 +496,10 @@ impl PermissionManager {
             app.auto_approve_kinds.insert(kind);
             // A Forever grant supersedes any timed grant for the same kind.
             app.timed_kind_grants.remove(&kind);
+            // ...and any refusal. The decision path refuses ahead of allowing,
+            // so a grant left sitting behind a live refusal would never take
+            // effect and the user would see their approval ignored.
+            app.timed_kind_denials.remove(&kind);
             app.last_used = Timestamp::now();
             // An explicit user remember-decision (vs a client-supplied connect
             // kind scope); gates cross-restart persistence.
@@ -444,6 +553,10 @@ impl PermissionManager {
             // a user can deliberately shrink an over-granted window.
             let expiry = now.saturating_add(secs);
             app.timed_kind_grants.insert(kind, expiry);
+            // Clear any refusal for the same kind. The decision path refuses
+            // ahead of allowing, so a grant left behind a live refusal would
+            // never take effect and the approval would appear to be ignored.
+            app.timed_kind_denials.remove(&kind);
             app.last_used = Timestamp::now();
             // An explicit user remember-decision; gates cross-restart persistence.
             app.explicitly_remembered = true;
@@ -607,6 +720,15 @@ impl PermissionManager {
         // #575: NIP-98 (kind 27235) is never auto-approved.
         kinds.remove(&NIP98_HTTP_AUTH);
         if let Some(app) = self.apps.get_mut(pubkey) {
+            // Clear refusals for the kinds being granted. This is the only
+            // grant path that does not come from a prompt, and once a refusal
+            // stands the prompt never fires, so without this there is no route
+            // from refused back to allowed short of waiting out the window,
+            // restarting, or revoking the app: the broad answer this feature
+            // exists to avoid.
+            for kind in &kinds {
+                app.timed_kind_denials.remove(kind);
+            }
             // A user configuring auto-approve kinds is an explicit remember
             // decision, so gate persistence keeps it (and does not false-drop it
             // on restart). Clearing to empty leaves the flag untouched so a
@@ -1448,5 +1570,155 @@ mod tests {
             .timed_kind_grants
             .contains_key(&Kind::TextNote));
         assert!(pm.needs_approval(&pubkey, Kind::TextNote));
+    }
+
+    #[test]
+    fn a_refusal_decides_the_next_request_without_prompting() {
+        // The point of the change. Before it, a refusal decided one request:
+        // the next identical one prompted again, so a client that retries
+        // turned one "no" into an unbounded stream of prompts.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        assert_eq!(
+            pm.decide(&pubkey, Kind::TextNote),
+            ApprovalDecision::Ask,
+            "nothing on record yet, so it must ask"
+        );
+
+        assert!(pm.deny_kind_for(&pubkey, Kind::TextNote, 3600));
+
+        assert_eq!(
+            pm.decide(&pubkey, Kind::TextNote),
+            ApprovalDecision::Deny,
+            "the refusal must hold without prompting again"
+        );
+        // Scoped to the kind that was refused, not the app. Uses a kind that
+        // genuinely asks: Reaction is auto-approved by default here, so it
+        // would have read as Allow and proven nothing about scoping.
+        assert_eq!(
+            pm.decide(&pubkey, Kind::from(9999u16)),
+            ApprovalDecision::Ask,
+            "refusing one kind must not silently refuse the others"
+        );
+    }
+
+    #[test]
+    fn an_expired_refusal_asks_again() {
+        // A refusal is a pause, not a revocation. If it never expired it would
+        // be a permanent block wearing a duration, and the user would have no
+        // way back other than revoking the app.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        assert!(pm.deny_kind_for(&pubkey, Kind::TextNote, 1));
+        // Rewind the recorded expiry rather than sleeping.
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            app.timed_kind_denials.insert(Kind::TextNote, 1);
+        }
+        assert_eq!(
+            pm.decide(&pubkey, Kind::TextNote),
+            ApprovalDecision::Ask,
+            "an elapsed refusal must stop applying"
+        );
+    }
+
+    #[test]
+    fn approving_clears_a_standing_refusal() {
+        // The decision path refuses ahead of allowing, so a grant written while
+        // a refusal still stood would never take effect: the user would approve
+        // and watch nothing change.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        assert!(pm.deny_kind_for(&pubkey, Kind::TextNote, 3600));
+        assert_eq!(pm.decide(&pubkey, Kind::TextNote), ApprovalDecision::Deny);
+
+        assert!(pm.grant_kind_for(&pubkey, Kind::TextNote, 3600));
+        assert_eq!(
+            pm.decide(&pubkey, Kind::TextNote),
+            ApprovalDecision::Allow,
+            "an explicit approval must override the earlier refusal"
+        );
+
+        // And the same via a forever grant.
+        assert!(pm.deny_kind_for(&pubkey, Kind::Reaction, 3600));
+        assert!(pm.grant_kind_forever(&pubkey, Kind::Reaction));
+        assert_eq!(pm.decide(&pubkey, Kind::Reaction), ApprovalDecision::Allow);
+    }
+
+    #[test]
+    fn a_refusal_wins_over_a_grant_if_both_somehow_stand() {
+        // They should not coexist, since recording either clears the other.
+        // This pins the tie-break anyway: for a signer the answer that cannot
+        // authorise something unintended is the safe one.
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        assert!(pm.grant_kind_for(&pubkey, Kind::TextNote, 3600));
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            let expiry = Timestamp::now().as_secs() + 3600;
+            app.timed_kind_denials.insert(Kind::TextNote, expiry);
+        }
+        assert_eq!(
+            pm.decide(&pubkey, Kind::TextNote),
+            ApprovalDecision::Deny,
+            "refusal must win the tie"
+        );
+    }
+
+    /// The boolean API must not report "no approval needed" for a refusal.
+    ///
+    /// This is the one way remembering a refusal could make things worse than
+    /// not remembering it. A caller writing `if !needs_approval { proceed }` is
+    /// the obvious use of a boolean, so the boolean has to be false only when
+    /// proceeding is actually permitted.
+    #[test]
+    fn needs_approval_never_reports_a_refusal_as_permission_to_proceed() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        // Granted, so proceeding is permitted and the bool is false.
+        assert!(pm.grant_kind_for(&pubkey, Kind::from(9999u16), 3600));
+        assert!(!pm.needs_approval(&pubkey, Kind::from(9999u16)));
+
+        // Refused. The bool must go back to true: a refusal is not permission.
+        assert!(pm.deny_kind_for(&pubkey, Kind::from(9999u16), 3600));
+        assert_eq!(
+            pm.decide(&pubkey, Kind::from(9999u16)),
+            ApprovalDecision::Deny
+        );
+        assert!(
+            pm.needs_approval(&pubkey, Kind::from(9999u16)),
+            "a remembered refusal must never read as permission to proceed"
+        );
+    }
+
+    /// A refusal cannot be remembered for longer than an approval could.
+    #[test]
+    fn a_nip98_refusal_is_clamped_like_a_nip98_approval() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        let before = Timestamp::now().as_secs();
+        assert!(pm.deny_kind_for(&pubkey, NIP98_HTTP_AUTH, 30 * 24 * 3600));
+
+        let expiry = *pm
+            .apps
+            .get(&pubkey)
+            .expect("app")
+            .timed_kind_denials
+            .get(&NIP98_HTTP_AUTH)
+            .expect("denial recorded");
+        assert!(
+            expiry <= before + NIP98_MAX_REMEMBER_SECS + 2,
+            "a month-long NIP-98 refusal must be clamped to the same window an approval gets"
+        );
     }
 }
