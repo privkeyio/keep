@@ -28,48 +28,116 @@ pub struct FileNonceStore {
 
 impl FileNonceStore {
     pub fn new(path: &Path) -> Result<Self> {
+        // The lock and temp siblings are derived by replacing the extension,
+        // so a store named `*.lock` or `*.tmp` derives a sibling equal to
+        // itself. Both writer paths open the lock with `truncate(true)`, so a
+        // `.lock` store would be zeroed on the next record and left holding
+        // only the entry that just arrived: every previously consumed id gone
+        // from disk, and the guard silently empty after the next restart.
+        // Refuse the name rather than let the collision erase the store.
+        let collides = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .is_some_and(|e| e == "lock" || e == "tmp");
+        if collides {
+            return Err(FrostNetError::Session(format!(
+                "Nonce store path {} must not end in .lock or .tmp: those \
+                 extensions collide with the store's own lock and temp files",
+                path.display()
+            )));
+        }
+
         let consumed = Arc::new(RwLock::new(HashSet::new()));
         let insertion_order = Arc::new(RwLock::new(VecDeque::new()));
 
-        if path.exists() {
-            let file = File::open(path)
-                .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
-
-            file.lock_exclusive()
+        {
+            // Lock the same sibling the writers lock, not the store itself,
+            // and take it before checking whether the store exists.
+            //
+            // Reading under a lock on the store while `record` and the rewrite
+            // path lock `<store>.lock` meant the reader and the writers took
+            // locks on different inodes and never contended: this lock excluded
+            // nothing at all. Loading the consumed set could therefore run
+            // against a file being appended to or replaced underneath it, and
+            // the guard would start life having missed entries. Checking
+            // existence outside the lock had the same shape of hole: a store
+            // created between the check and the load would be skipped, and the
+            // guard would start empty with every consumed id reading available.
+            let lock_path = path.with_extension("lock");
+            let lock_file = {
+                let mut opts = OpenOptions::new();
+                opts.create(true).write(true).truncate(false);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                opts.open(&lock_path).map_err(|e| {
+                    FrostNetError::Session(format!("Failed to open nonce lock: {e}"))
+                })?
+            };
+            lock_file
+                .lock_exclusive()
                 .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 
-            let reader = BufReader::new(&file);
-
-            let mut guard = consumed.write();
-            for line in reader.lines() {
-                let line = line.map_err(|e| {
-                    FrostNetError::Session(format!("Failed to read nonce store: {e}"))
-                })?;
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
+            let file = match File::open(path) {
+                Ok(f) => Some(f),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => {
+                    return Err(FrostNetError::Session(format!(
+                        "Failed to open nonce store: {e}"
+                    )))
                 }
+            };
 
-                let bytes = hex::decode(line).map_err(|e| {
-                    FrostNetError::Session(format!("Invalid hex in nonce store: {e}"))
-                })?;
+            if let Some(file) = file {
+                let reader = BufReader::new(&file);
 
-                if bytes.len() != 32 {
-                    warn!(line = %line, "Skipping invalid entry in nonce store");
-                    continue;
+                let mut guard = consumed.write();
+                for line in reader.lines() {
+                    let line = line.map_err(|e| {
+                        FrostNetError::Session(format!("Failed to read nonce store: {e}"))
+                    })?;
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    let bytes = hex::decode(line).map_err(|e| {
+                        FrostNetError::Session(format!("Invalid hex in nonce store: {e}"))
+                    })?;
+
+                    if bytes.len() != 32 {
+                        // Refuse to load rather than skip. A short entry is a
+                        // truncated append, so the record it lost is the most
+                        // recently consumed session, and skipping it silently
+                        // returns that session id to the available set: the exact
+                        // replay this store exists to prevent, produced by the
+                        // recovery path rather than by an attacker. An odd-length
+                        // truncation already fails hard a few lines above, so this
+                        // is the same corruption being answered the same way rather
+                        // than a new failure mode.
+                        return Err(FrostNetError::Session(format!(
+                            "Nonce store entry is {} bytes, expected 32: the store is \
+                         truncated or corrupt and cannot be trusted to prevent reuse",
+                            bytes.len()
+                        )));
+                    }
+
+                    let mut session_id = [0u8; 32];
+                    session_id.copy_from_slice(&bytes);
+                    if guard.insert(session_id) {
+                        insertion_order.write().push_back(session_id);
+                    }
                 }
-
-                let mut session_id = [0u8; 32];
-                session_id.copy_from_slice(&bytes);
-                if guard.insert(session_id) {
-                    insertion_order.write().push_back(session_id);
-                }
+                debug!(count = guard.len(), path = ?path, "Loaded consumed session IDs");
             }
-            debug!(count = guard.len(), path = ?path, "Loaded consumed session IDs");
 
-            FileExt::unlock(&file).map_err(|e| {
-                FrostNetError::Session(format!("Failed to unlock nonce store: {e}"))
-            })?;
+            // `lock_file` is declared before `file`, so it drops last: the lock
+            // is released after the read completes. No explicit unlock, which
+            // is what the error paths above already rely on. Unlocking `file`
+            // here would target a handle that was never locked: a silent no-op
+            // on Unix, and an error on Windows that would fail every load.
         }
 
         Ok(Self {
@@ -296,6 +364,7 @@ impl NonceStore for MemoryNonceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     #[test]
@@ -363,5 +432,133 @@ mod tests {
         store.record(&session_id).unwrap();
 
         assert_eq!(store.count(), 1);
+    }
+
+    /// A truncated entry must refuse to load, not be skipped.
+    ///
+    /// The lost record is the most recently consumed session, because a short
+    /// entry is a partial append. Skipping it silently returned that session id
+    /// to the available set, so the recovery path itself produced the replay
+    /// A store named like its own lock or temp sibling is refused.
+    ///
+    /// Not a style rule: both writer paths open the lock with `truncate(true)`,
+    /// so a `.lock` store is erased by its own first write and the guard comes
+    /// back empty after a restart.
+    #[test]
+    fn a_store_named_like_its_own_lock_is_refused() {
+        let dir = tempdir().unwrap();
+
+        for name in ["nonces.lock", "nonces.tmp", "nonces.LOCK"] {
+            let path = dir.path().join(name);
+            assert!(
+                FileNonceStore::new(&path).is_err(),
+                "{name} derives a sibling equal to itself and must be refused"
+            );
+        }
+
+        assert!(
+            FileNonceStore::new(&dir.path().join("nonces.locked")).is_ok(),
+            "a name that merely starts with the same letters is fine"
+        );
+    }
+
+    /// this store exists to prevent, and the only signal was a warning nobody
+    /// reads after a crash.
+    #[test]
+    fn a_truncated_entry_refuses_to_load() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonces");
+
+        // One good entry, then a short one: an append cut off mid-write that
+        // still happens to decode as hex.
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", hex::encode([7u8; 32]), hex::encode([9u8; 16])),
+        )
+        .unwrap();
+
+        let err = match FileNonceStore::new(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("a store that cannot be trusted must not load"),
+        };
+        assert!(
+            format!("{err}").contains("truncated or corrupt"),
+            "the refusal should say why the store is untrustworthy, got: {err}"
+        );
+    }
+
+    /// The whole point of refusing: a session already consumed must not come
+    /// back as available because the record after it was cut short.
+    #[test]
+    fn a_truncated_store_does_not_resurrect_a_consumed_session() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonces");
+        let consumed = [7u8; 32];
+
+        std::fs::write(
+            &path,
+            format!("{}\n{}\n", hex::encode(consumed), hex::encode([9u8; 16])),
+        )
+        .unwrap();
+
+        // Loading must fail rather than yield a store that answers "available"
+        // for a session id the file says was consumed.
+        assert!(
+            FileNonceStore::new(&path).is_err(),
+            "a store loaded past a truncated entry would report a consumed \
+             session as available"
+        );
+    }
+
+    /// The reader must take the same lock the writers take.
+    ///
+    /// It previously locked the store file while `record` and the rewrite path
+    /// locked a sibling, so the two never contended and the reader's lock
+    /// excluded nothing. Observable without threads: loading creates the lock
+    /// file the writers use.
+    #[test]
+    #[cfg_attr(windows, ignore = "file locking behaves differently on Windows")]
+    fn loading_takes_the_lock_the_writers_take() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nonces");
+        std::fs::write(&path, format!("{}\n", hex::encode([1u8; 32]))).unwrap();
+
+        // Assert the lock is HELD, not merely that the lock file exists: that
+        // file is created by `open`, so an existence check stays green even if
+        // the `lock_exclusive` call is deleted outright.
+        //
+        // flock follows the open file description, so a second handle on the
+        // same path contends even within a single process.
+        let held = {
+            let f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path.with_extension("lock"))
+                .unwrap();
+            f.lock_exclusive().unwrap();
+            f
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let load_path = path.clone();
+        let loader = std::thread::spawn(move || {
+            let result = FileNonceStore::new(&load_path);
+            tx.send(()).unwrap();
+            result
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "loading must block while a writer holds the lock"
+        );
+
+        FileExt::unlock(&held).unwrap();
+
+        let store = loader
+            .join()
+            .unwrap()
+            .expect("loading must succeed once the lock is released");
+        assert!(store.is_consumed(&[1u8; 32]), "the entry must be loaded");
     }
 }
