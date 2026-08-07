@@ -90,10 +90,19 @@ impl From<BunkerRememberDuration> for RememberDuration {
     }
 }
 
-/// Result of an approval prompt as returned by the native UI. `approved=false`
-/// always means reject and `remember` is ignored. `approved=true` plus a non-
-/// `JustThisTime` duration persists a per-(app, kind) grant in the bunker so
-/// subsequent requests within the window auto-approve without re-prompting.
+/// Result of an approval prompt as returned by the native UI.
+///
+/// `remember` is honoured on both answers, not only on approval. With
+/// `approved=true` and a non-`JustThisTime` duration, a per-(app, kind) grant
+/// is persisted and later requests skip the prompt. With `approved=false` and a
+/// duration, the refusal is remembered the same way and later requests are
+/// refused without prompting, which is what stops a client that retries from
+/// re-asking indefinitely.
+///
+/// A native surface must therefore send `JustThisTime` on rejection unless the
+/// user chose a duration for that answer. Passing through a value left over
+/// from an earlier interaction would silently create a block nobody asked for.
+/// Rejecting with `JustThisTime` records nothing.
 #[derive(uniffi::Record, Clone, Copy, Debug)]
 pub struct BunkerApprovalResult {
     pub approved: bool,
