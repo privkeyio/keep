@@ -26,6 +26,18 @@ pub struct SigningAuditEntry {
     pub participant_indices: Vec<u16>,
     pub our_index: u16,
     pub operation: SigningOperation,
+    /// Which peer asked for this signature, by share index.
+    ///
+    /// Set on the entries written while handling an inbound request, where the
+    /// index has been resolved against the signature-verified peer list and is
+    /// therefore an identity rather than a claim. `None` elsewhere in the
+    /// session's lifecycle, and on requests this node initiated itself.
+    ///
+    /// Deliberately not copied onto every entry. The requester is a property of
+    /// the session, every entry already carries the session id, and duplicating
+    /// it would mean threading mutable state through the session layer to
+    /// restate something a join already answers.
+    pub requester: Option<u16>,
     pub hmac: [u8; 32],
 }
 
@@ -63,6 +75,7 @@ impl SigningAuditEntry {
         participant_indices: &[u16],
         our_index: u16,
         operation: &SigningOperation,
+        requester: Option<u16>,
     ) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
 
@@ -75,6 +88,20 @@ impl SigningAuditEntry {
         }
         mac.update(&our_index.to_le_bytes());
         mac.update(&[operation.discriminant()]);
+        // Tagged rather than written only when present. With this field last,
+        // an untagged form is already unambiguous, since an absent requester
+        // contributes no bytes and share index 0 contributes two. The tag makes
+        // that independent of position: these fields are concatenated without
+        // delimiters, so appending anything after an untagged optional would
+        // let "nobody recorded" followed by the next field collide with "peer 0
+        // asked". Paying one byte now avoids a silent reattribution later.
+        match requester {
+            Some(idx) => {
+                mac.update(&[1u8]);
+                mac.update(&idx.to_le_bytes());
+            }
+            None => mac.update(&[0u8]),
+        }
 
         let result = mac.finalize();
         let mut hmac_out = [0u8; 32];
@@ -92,6 +119,7 @@ impl SigningAuditEntry {
             &self.participant_indices,
             self.our_index,
             &self.operation,
+            self.requester,
         );
         bool::from(self.hmac.ct_eq(&expected))
     }
@@ -167,6 +195,10 @@ impl SigningAuditLog {
         matches!(operation, SigningOperation::SignRequestRefused)
     }
 
+    // Same reason as `compute_hmac` above: these are the fields of one audit
+    // record, and grouping them into a struct would add a type whose only
+    // purpose is to satisfy a lint about how they are passed.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_signing_operation(
         &self,
         session_id: [u8; 32],
@@ -175,6 +207,7 @@ impl SigningAuditLog {
         participant_indices: Vec<u16>,
         our_index: u16,
         operation: SigningOperation,
+        requester: Option<u16>,
     ) {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -193,6 +226,7 @@ impl SigningAuditLog {
             &participant_indices,
             our_index,
             &operation,
+            requester,
         );
 
         let entry = SigningAuditEntry {
@@ -203,6 +237,7 @@ impl SigningAuditLog {
             participant_indices: participant_indices.clone(),
             our_index,
             operation: operation.clone(),
+            requester,
             hmac,
         };
 
@@ -306,6 +341,7 @@ mod tests {
             vec![1, 2],
             1,
             SigningOperation::CommitmentSent,
+            None,
         );
 
         // Far past the refusal cap: under a shared queue this would evict the
@@ -318,6 +354,7 @@ mod tests {
                 vec![1, 2],
                 1,
                 SigningOperation::SignRequestRefused,
+                None,
             );
         }
 
@@ -375,6 +412,7 @@ mod tests {
             vec![1, 2, 3],
             1,
             SigningOperation::SignatureCompleted,
+            None,
         );
 
         assert!(log.verify_all());
@@ -396,6 +434,7 @@ mod tests {
             vec![1, 2, 3],
             1,
             SigningOperation::SignatureCompleted,
+            None,
         );
 
         {
@@ -419,11 +458,71 @@ mod tests {
                 vec![1],
                 1,
                 SigningOperation::CommitmentSent,
+                None,
             );
         }
 
         let entries = log.entries();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].session_id[0], 2);
+    }
+
+    /// Reattributing an entry must break its HMAC.
+    ///
+    /// A field the HMAC does not cover is a field anyone with write access can
+    /// change, and "which peer asked for this" is exactly the claim an audit
+    /// log exists to make unforgeable. Storing it without binding it would look
+    /// identical in the API and mean nothing.
+    #[test]
+    fn the_requester_is_covered_by_the_entry_hmac() {
+        let key = [9u8; 32];
+        let log = SigningAuditLog::new(key);
+        log.log_signing_operation(
+            [1u8; 32],
+            b"m",
+            None,
+            vec![1, 2],
+            1,
+            SigningOperation::CommitmentSent,
+            Some(2),
+        );
+
+        let mut entry = log.entries().into_iter().next().expect("one entry");
+        assert!(entry.verify(&key), "as written it verifies");
+
+        entry.requester = Some(3);
+        assert!(
+            !entry.verify(&key),
+            "pointing the entry at a different peer must invalidate it"
+        );
+    }
+
+    /// An absent requester must not be interchangeable with share index 0.
+    ///
+    /// Pins the property rather than the encoding. It holds for the tagged form
+    /// in use and also for an untagged one while this field stays last, so this
+    /// test does not by itself justify the tag; it fails only if the requester
+    /// stops being covered at all. The tag is defence against a later field
+    /// being appended after it, which is a change no test here would catch.
+    #[test]
+    fn an_absent_requester_is_distinct_from_peer_zero() {
+        let key = [9u8; 32];
+        let log = SigningAuditLog::new(key);
+        log.log_signing_operation(
+            [1u8; 32],
+            b"m",
+            None,
+            vec![1],
+            1,
+            SigningOperation::CommitmentSent,
+            None,
+        );
+
+        let mut entry = log.entries().into_iter().next().expect("one entry");
+        entry.requester = Some(0);
+        assert!(
+            !entry.verify(&key),
+            "an unattributed entry must not verify as one attributed to peer 0"
+        );
     }
 }

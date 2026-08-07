@@ -393,7 +393,7 @@ impl KfpNode {
     /// and a refusal that could not be delivered is the one most worth keeping.
     /// That differs from the accept path, which logs after its send because
     /// there the recorded fact is the send itself.
-    fn record_refusal(&self, request: &SignRequestPayload) {
+    fn record_refusal(&self, request: &SignRequestPayload, requester: Option<u16>) {
         self.audit_log.log_signing_operation(
             request.session_id,
             &request.message,
@@ -401,6 +401,7 @@ impl KfpNode {
             request.participants.clone(),
             self.share.metadata.identifier,
             SigningOperation::SignRequestRefused,
+            requester,
         );
     }
 
@@ -526,7 +527,7 @@ impl KfpNode {
                 // fires when a requester's structured body does not produce the
                 // digest it asked us to sign, which is an attempted
                 // cross-domain relabel rather than a configuration saying no.
-                self.record_refusal(&request);
+                self.record_refusal(&request, None);
                 self.send_session_error(
                     &from,
                     "policy_violation",
@@ -549,7 +550,7 @@ impl KfpNode {
             );
             // Covers the kill switch and the desktop approval prompt too: both
             // refuse by returning an error from this same hook.
-            self.record_refusal(&request);
+            self.record_refusal(&request, Some(requester));
             self.send_session_error(
                 &from,
                 "policy_violation",
@@ -806,6 +807,7 @@ impl KfpNode {
             request.participants,
             self.share.metadata.identifier,
             SigningOperation::CommitmentSent,
+            Some(requester),
         );
 
         // With pre-exchange, the full commitment set arrived in this request, so
@@ -931,6 +933,7 @@ impl KfpNode {
                 session_participants,
                 self.share.metadata.identifier,
                 SigningOperation::SignatureCompleted,
+                None,
             );
 
             self.invoke_post_sign_hook(session_id, &sig);
@@ -1041,6 +1044,7 @@ impl KfpNode {
             session_participants,
             self.share.metadata.identifier,
             SigningOperation::SignatureShareSent,
+            None,
         );
 
         Ok(())
@@ -1127,6 +1131,7 @@ impl KfpNode {
             session_participants,
             self.share.metadata.identifier,
             SigningOperation::SignatureReceived,
+            None,
         );
 
         self.invoke_post_sign_hook(&payload.session_id, &payload.signature);
@@ -1451,6 +1456,7 @@ impl KfpNode {
             participants.clone(),
             self.share.metadata.identifier,
             SigningOperation::SignRequestInitiated,
+            None,
         );
 
         // #487 PR3: apply the composite BIP-32 tweak to our own key package
