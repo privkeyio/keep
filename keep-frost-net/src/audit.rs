@@ -36,6 +36,20 @@ pub enum SigningOperation {
     SignatureShareSent,
     SignatureCompleted,
     SignatureReceived,
+    /// A sign request this node refused before taking part.
+    ///
+    /// Every other variant records something that happened. Without this one
+    /// the log answers "what did we sign" but not "what were we asked to sign
+    /// and declined", so a peer probing a co-signer leaves no durable trace:
+    /// the refusal path emits a warning and nothing else, and warnings are not
+    /// evidence a holder still has next week.
+    ///
+    /// Carries no reason. The message a policy returns is a formatted string
+    /// that a custom hook could build from requester-supplied content, and an
+    /// audit log is the wrong place to accept text an adversary influences.
+    /// The session id and message hash already identify which request was
+    /// refused; the reason stays in the log line.
+    SignRequestRefused,
 }
 
 impl SigningAuditEntry {
@@ -84,6 +98,12 @@ impl SigningAuditEntry {
 }
 
 impl SigningOperation {
+    /// Stable wire numbering for the entry HMAC.
+    ///
+    /// These values are covered by the HMAC, so they are append-only: renumber
+    /// one and every entry already written under the old numbering fails
+    /// verification, which reads as tampering rather than as a version skew.
+    /// New operations take the next unused value and nothing else moves.
     fn discriminant(&self) -> u8 {
         match self {
             SigningOperation::SignRequestInitiated => 0,
@@ -91,6 +111,7 @@ impl SigningOperation {
             SigningOperation::SignatureShareSent => 2,
             SigningOperation::SignatureCompleted => 3,
             SigningOperation::SignatureReceived => 4,
+            SigningOperation::SignRequestRefused => 5,
         }
     }
 }
@@ -100,8 +121,22 @@ pub struct SigningAuditLog {
     hmac_key: [u8; 32],
     #[zeroize(skip)]
     entries: Arc<RwLock<VecDeque<SigningAuditEntry>>>,
+    /// Refusals live in their own ring so they cannot evict the entries above.
+    ///
+    /// The two streams have different bounds in practice. Accepted-path entries
+    /// are limited by how many sessions can be open at once, while a refusal
+    /// creates no session, so a peer can trigger one per request indefinitely.
+    /// Sharing a single queue means a flood of refusals walks the whole history
+    /// out of a FIFO, and it does that precisely on the node that has co-signing
+    /// switched off, which is the configuration whose history is worth keeping.
+    /// Recording refusals is only an improvement if it cannot destroy the record
+    /// it was added to strengthen.
+    #[zeroize(skip)]
+    refusals: Arc<RwLock<VecDeque<SigningAuditEntry>>>,
     #[zeroize(skip)]
     max_entries: usize,
+    #[zeroize(skip)]
+    max_refusals: usize,
 }
 
 impl SigningAuditLog {
@@ -109,13 +144,27 @@ impl SigningAuditLog {
         Self {
             hmac_key,
             entries: Arc::new(RwLock::new(VecDeque::new())),
+            refusals: Arc::new(RwLock::new(VecDeque::new())),
             max_entries: 10000,
+            // Enough to show a probe pattern and its shape over time; small
+            // enough that the refusal stream is a bounded annex rather than a
+            // second full-sized log.
+            max_refusals: 1000,
         }
     }
 
     pub fn with_max_entries(mut self, max: usize) -> Self {
         self.max_entries = max;
         self
+    }
+
+    pub fn with_max_refusals(mut self, max: usize) -> Self {
+        self.max_refusals = max;
+        self
+    }
+
+    fn is_refusal(operation: &SigningOperation) -> bool {
+        matches!(operation, SigningOperation::SignRequestRefused)
     }
 
     pub fn log_signing_operation(
@@ -168,28 +217,60 @@ impl SigningAuditLog {
             "Signing audit log entry"
         );
 
-        let mut entries = self.entries.write();
-        if entries.len() >= self.max_entries {
-            entries.pop_front();
+        let (ring, cap) = if Self::is_refusal(&entry.operation) {
+            (&self.refusals, self.max_refusals)
+        } else {
+            (&self.entries, self.max_entries)
+        };
+        let mut ring = ring.write();
+        if ring.len() >= cap {
+            ring.pop_front();
         }
-        entries.push_back(entry);
+        ring.push_back(entry);
     }
 
+    /// Both rings, oldest first.
+    ///
+    /// Merged on the recorded timestamp rather than concatenated, so a caller
+    /// reading the log still sees one chronological account. Splitting the
+    /// storage is a retention decision and should not change what the log reads
+    /// like.
     pub fn entries(&self) -> Vec<SigningAuditEntry> {
-        self.entries.read().iter().cloned().collect()
+        let mut all: Vec<SigningAuditEntry> = self
+            .entries
+            .read()
+            .iter()
+            .chain(self.refusals.read().iter())
+            .cloned()
+            .collect();
+        all.sort_by_key(|e| e.timestamp_ms);
+        all
+    }
+
+    /// Refusals only, oldest first.
+    pub fn refusals(&self) -> Vec<SigningAuditEntry> {
+        self.refusals.read().iter().cloned().collect()
     }
 
     pub fn verify_all(&self) -> bool {
-        self.entries.read().iter().all(|e| e.verify(&self.hmac_key))
-    }
-
-    pub fn get_entries_for_session(&self, session_id: &[u8; 32]) -> Vec<SigningAuditEntry> {
         self.entries
             .read()
             .iter()
+            .chain(self.refusals.read().iter())
+            .all(|e| e.verify(&self.hmac_key))
+    }
+
+    pub fn get_entries_for_session(&self, session_id: &[u8; 32]) -> Vec<SigningAuditEntry> {
+        let mut found: Vec<SigningAuditEntry> = self
+            .entries
+            .read()
+            .iter()
+            .chain(self.refusals.read().iter())
             .filter(|e| &e.session_id == session_id)
             .cloned()
-            .collect()
+            .collect();
+        found.sort_by_key(|e| e.timestamp_ms);
+        found
     }
 }
 
@@ -202,6 +283,81 @@ fn hash_bytes(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flood of refusals must not walk accepted-path history out of the log.
+    ///
+    /// This is the property the separate ring exists for. Refusals create no
+    /// session, so a peer can trigger them without limit, while accepted-path
+    /// entries are bounded by how many sessions can be open. In one shared FIFO
+    /// the unbounded stream evicts the bounded one, and it does that on the
+    /// node that has co-signing switched off, whose history is the history most
+    /// worth having.
+    #[test]
+    fn refusals_cannot_evict_accepted_entries() {
+        let log = SigningAuditLog::new([7u8; 32])
+            .with_max_entries(8)
+            .with_max_refusals(4);
+
+        let kept = [1u8; 32];
+        log.log_signing_operation(
+            kept,
+            b"real",
+            None,
+            vec![1, 2],
+            1,
+            SigningOperation::CommitmentSent,
+        );
+
+        // Far past the refusal cap: under a shared queue this would evict the
+        // entry above several times over.
+        for i in 0..50u8 {
+            log.log_signing_operation(
+                [i; 32],
+                b"probe",
+                None,
+                vec![1, 2],
+                1,
+                SigningOperation::SignRequestRefused,
+            );
+        }
+
+        assert!(
+            log.get_entries_for_session(&kept)
+                .iter()
+                .any(|e| matches!(e.operation, SigningOperation::CommitmentSent)),
+            "the accepted entry must survive a refusal flood"
+        );
+        assert_eq!(
+            log.refusals().len(),
+            4,
+            "refusals stay inside their own bound"
+        );
+        assert!(log.verify_all(), "both rings must remain verifiable");
+    }
+
+    /// Operation discriminants feed the entry HMAC, so a collision would let a
+    /// swapped operation verify. Nothing else pins this: the log writes and
+    /// verifies through the same function, so it agrees with itself either way.
+    #[test]
+    fn operation_discriminants_are_distinct() {
+        let all = [
+            SigningOperation::SignRequestInitiated,
+            SigningOperation::CommitmentSent,
+            SigningOperation::SignatureShareSent,
+            SigningOperation::SignatureCompleted,
+            SigningOperation::SignatureReceived,
+            SigningOperation::SignRequestRefused,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for op in &all {
+            assert!(
+                seen.insert(op.discriminant()),
+                "discriminant {} is used twice; these are covered by the entry HMAC, \
+                 so a duplicate lets one operation verify as another",
+                op.discriminant()
+            );
+        }
+    }
 
     #[test]
     fn test_audit_entry_hmac_verification() {

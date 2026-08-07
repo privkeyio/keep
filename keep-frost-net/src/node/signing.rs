@@ -381,6 +381,29 @@ impl KfpNode {
         Ok(())
     }
 
+    /// Record a refusal of `request` that the requester is being told about.
+    ///
+    /// Both notified refusal paths go through here so they cannot drift into
+    /// recording different things. A warning is not evidence: a holder asking
+    /// later whether anyone sent requests this node declined has nothing to
+    /// consult otherwise.
+    ///
+    /// Called before the notification is sent, deliberately. The fact recorded
+    /// is that we refused, which holds whether or not the peer could be told,
+    /// and a refusal that could not be delivered is the one most worth keeping.
+    /// That differs from the accept path, which logs after its send because
+    /// there the recorded fact is the send itself.
+    fn record_refusal(&self, request: &SignRequestPayload) {
+        self.audit_log.log_signing_operation(
+            request.session_id,
+            &request.message,
+            None,
+            request.participants.clone(),
+            self.share.metadata.identifier,
+            SigningOperation::SignRequestRefused,
+        );
+    }
+
     pub(crate) async fn handle_sign_request(
         &self,
         from: PublicKey,
@@ -499,6 +522,11 @@ impl KfpNode {
                     error = %e,
                     "Sign request refused: structured payload does not match digest"
                 );
+                // Audited with more cause than the policy refusal below: this
+                // fires when a requester's structured body does not produce the
+                // digest it asked us to sign, which is an attempted
+                // cross-domain relabel rather than a configuration saying no.
+                self.record_refusal(&request);
                 self.send_session_error(
                     &from,
                     "policy_violation",
@@ -516,8 +544,12 @@ impl KfpNode {
             // timeout/failover exhaustion, mirroring the stale-nonce path below.
             warn!(
                 session_id = %hex::encode(request.session_id),
+                error = %e,
                 "Sign request refused by pre-sign policy; signaling requester"
             );
+            // Covers the kill switch and the desktop approval prompt too: both
+            // refuse by returning an error from this same hook.
+            self.record_refusal(&request);
             self.send_session_error(
                 &from,
                 "policy_violation",
@@ -1949,6 +1981,41 @@ mod gate_tests {
         let from = Keys::generate().public_key();
         let req = SignRequestPayload::new([1u8; 32], [0xAA; 32], vec![0u8; 32], "test", vec![1]);
         assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
+    /// A refused request leaves a durable record.
+    ///
+    /// Every other audit operation records something that happened, so before
+    /// this the log answered "what did we sign" but not "what were we asked to
+    /// sign and declined". A peer probing a co-signer left only a warning, and
+    /// a warning is not something a holder still has to consult later.
+    #[tokio::test]
+    async fn a_refused_sign_request_is_recorded_in_the_audit_log() {
+        let (node, _relay) = test_node().await;
+        node.set_hooks(std::sync::Arc::new(crate::RefuseRawSignatureHooks));
+
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(crate::peer::Peer::new(peer, 2));
+
+        let session_id = [0x33u8; 32];
+        let group = *node.group_pubkey();
+        let req = SignRequestPayload::new(session_id, group, vec![0u8; 32], "raw", vec![1, 2]);
+        node.handle_sign_request(peer, req)
+            .await
+            .expect("a refusal is reported to the requester, not surfaced as an error here");
+
+        let entries = node.audit_log().get_entries_for_session(&session_id);
+        assert!(
+            entries
+                .iter()
+                .any(|e| matches!(e.operation, SigningOperation::SignRequestRefused)),
+            "the refusal must be recorded; got {:?}",
+            entries.iter().map(|e| &e.operation).collect::<Vec<_>>()
+        );
+        assert!(
+            node.audit_log().verify_all(),
+            "the new operation must be covered by the entry HMAC like every other one"
+        );
     }
 
     /// A sign request whose participant set excludes our own identifier is
