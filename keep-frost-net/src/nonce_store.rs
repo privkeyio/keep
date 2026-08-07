@@ -111,6 +111,14 @@ impl NonceStore for FileNonceStore {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        // Whether this call is creating the store decides whether its directory
+        // entry needs flushing below. Appends to an existing file are covered by
+        // syncing the file itself; the very first record also creates a name,
+        // and a name that never reaches the disk takes the whole store with it,
+        // so every session id reads as unconsumed after the next boot. That is
+        // the first session, not the hundred-thousandth, so it is the case that
+        // matters most.
+        let is_new = !self.path.exists();
         let mut file = opts
             .open(&self.path)
             .map_err(|e| FrostNetError::Session(format!("Failed to open nonce store: {e}")))?;
@@ -118,7 +126,13 @@ impl NonceStore for FileNonceStore {
         let hex_id = hex::encode(session_id);
         let write_result = writeln!(file, "{hex_id}");
         let sync_result = if write_result.is_ok() {
-            file.sync_all()
+            file.sync_all().and_then(|()| {
+                if is_new {
+                    keep_core::fsync_dir(&self.path)
+                } else {
+                    Ok(())
+                }
+            })
         } else {
             Ok(())
         };
