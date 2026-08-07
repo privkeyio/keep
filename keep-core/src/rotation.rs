@@ -73,18 +73,42 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
-#[cfg(not(windows))]
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
-    let dir = File::open(parent)?;
-    dir.sync_all()
-}
-
-#[cfg(windows)]
-fn fsync_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+/// Flushes the directory entry for `path` so a rename into it survives power
+/// loss.
+///
+/// Syncing a freshly written file makes its contents durable; it does not make
+/// the name pointing at them durable. Without this a crash after an atomic
+/// rename can leave the previous file in place, which is the difference between
+/// a store that survives a reboot and one that quietly rolls back.
+///
+/// Takes the file path, not the directory: this exists to pair with the
+/// write-temp-then-rename idiom, and the caller already holds the destination.
+///
+/// On Windows this is a no-op, and the guarantee is therefore absent rather
+/// than provided elsewhere. A directory handle cannot be opened through the
+/// standard library there, and the rename primitive orders its metadata
+/// updates without promising they have reached the disk when it returns.
+pub fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        // `parent` is `Some("")` for a single-component relative path, not
+        // `None`, and opening "" is ENOENT. Treat it as the current directory,
+        // matching the guard the signing path already applies to the same case.
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            Some(_) => Path::new("."),
+            None => {
+                return Err(std::io::Error::other("path has no parent directory"));
+            }
+        };
+        let dir = File::open(parent)?;
+        dir.sync_all()
+    }
 }
 
 fn copy_with_retry(from: &Path, to: &Path) -> std::io::Result<u64> {

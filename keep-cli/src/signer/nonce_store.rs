@@ -155,6 +155,12 @@ impl NonceStore {
         tmp.sync_all().context("Failed to fsync nonce store")?;
         drop(tmp);
         std::fs::rename(&tmp_path, path).context("Failed to replace nonce store")?;
+        // Syncing the temp file above makes its contents durable; it does not
+        // make the name pointing at them durable. Without this a power loss
+        // after the rename can leave the previous store in place, which is a
+        // claimed nonce silently becoming unclaimed: exactly the reboot replay
+        // this store exists to stop, and the case the file sync was added for.
+        keep_core::fsync_dir(path).context("Failed to fsync nonce store directory")?;
         Ok(())
     }
 
@@ -388,6 +394,46 @@ mod tests {
                 .check_and_add_nonce("group", "1234", None)
                 .unwrap(),
             "a reboot must not hand the nonce back"
+        );
+    }
+
+    /// A claim that cannot be made durable must not be reported as made.
+    ///
+    /// I had written that this change was untestable because crash durability
+    /// needs fault injection. That is true of the crash, and it is not true of
+    /// the property that matters here: the caller signs on `Ok(true)`, so a
+    /// directory sync that fails has to fail the claim rather than be swallowed.
+    /// An unreadable directory produces exactly that failure without simulating
+    /// anything, because opening the directory to sync it is what breaks.
+    ///
+    /// Unix only, and skipped as root, where the mode is not enforced.
+    #[cfg(unix)]
+    #[test]
+    fn a_claim_that_cannot_be_synced_is_not_reported_as_claimed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = store(dir.path());
+        // Establish the store while the directory is still readable.
+        assert!(s.check_and_add_nonce("group", "aabb", None).unwrap());
+
+        // Write and search, but not read: the rename still succeeds, opening
+        // the directory to sync it does not.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+        // Root ignores the mode, and so do some filesystems. Check that the
+        // restriction actually took rather than asserting into a setup that
+        // never applied, which would pass whatever the code did.
+        if std::fs::File::open(dir.path()).is_ok() {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let result = s.check_and_add_nonce("group", "ccdd", None);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a claim whose record cannot be made durable must not return success, \
+             or the caller signs against a claim that may not survive a reboot"
         );
     }
 }
