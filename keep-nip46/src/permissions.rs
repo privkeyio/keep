@@ -720,6 +720,15 @@ impl PermissionManager {
         // #575: NIP-98 (kind 27235) is never auto-approved.
         kinds.remove(&NIP98_HTTP_AUTH);
         if let Some(app) = self.apps.get_mut(pubkey) {
+            // Clear refusals for the kinds being granted. This is the only
+            // grant path that does not come from a prompt, and once a refusal
+            // stands the prompt never fires, so without this there is no route
+            // from refused back to allowed short of waiting out the window,
+            // restarting, or revoking the app: the broad answer this feature
+            // exists to avoid.
+            for kind in &kinds {
+                app.timed_kind_denials.remove(kind);
+            }
             // A user configuring auto-approve kinds is an explicit remember
             // decision, so gate persistence keeps it (and does not false-drop it
             // on restart). Clearing to empty leaves the flag untouched so a
