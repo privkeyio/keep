@@ -81,10 +81,20 @@ impl RememberDuration {
     }
 }
 
-/// Result of a per-request approval prompt. `approved == false` always means
-/// reject (with `remember = JustThisTime`). `approved == true` plus a non-
-/// `JustThisTime` duration persists a per-app, per-kind grant so subsequent
-/// requests within the window auto-approve without re-prompting.
+/// Result of a per-request approval prompt.
+///
+/// `remember` applies to whichever answer was given, not only to approval. With
+/// `approved == true` and a non-`JustThisTime` duration, a per-app, per-kind
+/// grant is persisted and subsequent requests within the window skip the
+/// prompt. With `approved == false` and a duration, the refusal is remembered
+/// the same way and subsequent requests are refused without prompting.
+///
+/// Callers must therefore send `JustThisTime` on rejection unless the user
+/// deliberately chose a duration for *that* answer. Forwarding a value left
+/// over from an earlier interaction would create a block the user never asked
+/// for, which is the failure this field's symmetry makes possible. Rejecting
+/// with `JustThisTime` records nothing, which is the safe default and what
+/// `rejected()` and the `From<bool>` conversion both produce.
 #[derive(Debug, Clone, Copy)]
 pub struct ApprovalResult {
     pub approved: bool,
