@@ -29,14 +29,25 @@ pub struct SigningAuditEntry {
     /// Which peer asked for this signature, by share index.
     ///
     /// Set on the entries written while handling an inbound request, where the
-    /// index has been resolved against the signature-verified peer list and is
-    /// therefore an identity rather than a claim. `None` elsewhere in the
-    /// session's lifecycle, and on requests this node initiated itself.
+    /// index has been resolved by looking the event's author up in the admitted
+    /// peer list. `None` on everything else: the mid-round entries, and
+    /// requests this node initiated itself.
     ///
-    /// Deliberately not copied onto every entry. The requester is a property of
-    /// the session, every entry already carries the session id, and duplicating
-    /// it would mean threading mutable state through the session layer to
-    /// restate something a join already answers.
+    /// Attributes the entry it sits on and nothing else. An earlier version of
+    /// this comment said the session id carried attribution to the rest of the
+    /// round; it does not. The session id is derived from the message, the
+    /// threshold and the sorted participant set, none of which mention the
+    /// requester, and participant selection does not depend on who asked, so
+    /// two peers requesting the same digest derive the same session id. A
+    /// duplicate request is also answered from the cached commitment before the
+    /// requester is ever resolved, so a second peer can drive a round whose
+    /// remaining entries would join back to the first. Carrying the requester
+    /// on the session is the fix for that and is filed separately.
+    ///
+    /// The index is as trustworthy as peer admission, which is a weaker
+    /// statement than it sounds: member transport keys are derived from the
+    /// group public key, so this identifies which member slot the request
+    /// arrived under rather than proving who sat in it.
     pub requester: Option<u16>,
     pub hmac: [u8; 32],
 }
@@ -83,18 +94,22 @@ impl SigningAuditEntry {
         mac.update(session_id);
         mac.update(message_hash);
         mac.update(signature_hash);
+        // Length-prefixed. Without this the run is unparseable: every field
+        // after it used to be fixed width, so total length still determined the
+        // split, but adding a variable-width field at the end broke that and
+        // made two different records hash identically. Concretely, participants
+        // [7,9] with our_index 5, operation 1 and requester Some(3) produced the
+        // same bytes as participants [7,9,5] with our_index 257, operation 3 and
+        // no requester.
+        mac.update(&(participant_indices.len() as u16).to_le_bytes());
         for idx in participant_indices {
             mac.update(&idx.to_le_bytes());
         }
         mac.update(&our_index.to_le_bytes());
         mac.update(&[operation.discriminant()]);
-        // Tagged rather than written only when present. With this field last,
-        // an untagged form is already unambiguous, since an absent requester
-        // contributes no bytes and share index 0 contributes two. The tag makes
-        // that independent of position: these fields are concatenated without
-        // delimiters, so appending anything after an untagged optional would
-        // let "nobody recorded" followed by the next field collide with "peer 0
-        // asked". Paying one byte now avoids a silent reattribution later.
+        // Tagged so the field is self-delimiting. On its own this does not make
+        // the preimage injective, which is what the length prefix above is for;
+        // it keeps this field parseable if another is ever appended after it.
         match requester {
             Some(idx) => {
                 mac.update(&[1u8]);
@@ -247,6 +262,7 @@ impl SigningAuditLog {
             signature_hash = %hex::encode(signature_hash),
             participants = ?participant_indices,
             our_index = our_index,
+            requester = ?requester,
             operation = ?operation,
             hmac = %hex::encode(hmac),
             "Signing audit log entry"
@@ -524,5 +540,50 @@ mod tests {
             !entry.verify(&key),
             "an unattributed entry must not verify as one attributed to peer 0"
         );
+    }
+
+    /// Two different records must not hash the same.
+    ///
+    /// The participant run is variable length. Every field after it used to be
+    /// fixed width, so the total length still determined where the run ended;
+    /// adding a variable-width field at the end removed that and made the
+    /// preimage ambiguous. These are the exact values that collided: the bytes
+    /// of two participants plus an index and a one-byte operation are also the
+    /// bytes of three participants plus a larger index and a different
+    /// operation. Without the length prefix one entry verifies as the other
+    /// with no knowledge of the key, which would let a record be rewritten into
+    /// a different one that still passes.
+    #[test]
+    fn distinct_records_do_not_share_an_hmac() {
+        let key = [5u8; 32];
+        let log = SigningAuditLog::new(key);
+        let session = [1u8; 32];
+
+        log.log_signing_operation(
+            session,
+            b"m",
+            None,
+            vec![7, 9],
+            5,
+            SigningOperation::CommitmentSent,
+            Some(3),
+        );
+        log.log_signing_operation(
+            session,
+            b"m",
+            None,
+            vec![7, 9, 5],
+            257,
+            SigningOperation::SignatureCompleted,
+            None,
+        );
+
+        let entries = log.entries();
+        assert_eq!(entries.len(), 2);
+        assert_ne!(
+            entries[0].hmac, entries[1].hmac,
+            "two different records must not produce the same authentication tag"
+        );
+        assert!(log.verify_all());
     }
 }

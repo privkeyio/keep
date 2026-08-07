@@ -527,7 +527,7 @@ impl KfpNode {
                 // fires when a requester's structured body does not produce the
                 // digest it asked us to sign, which is an attempted
                 // cross-domain relabel rather than a configuration saying no.
-                self.record_refusal(&request, None);
+                self.record_refusal(&request, Some(requester));
                 self.send_session_error(
                     &from,
                     "policy_violation",
@@ -2021,6 +2021,54 @@ mod gate_tests {
         assert!(
             node.audit_log().verify_all(),
             "the new operation must be covered by the entry HMAC like every other one"
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| matches!(e.operation, SigningOperation::SignRequestRefused))
+                .and_then(|e| e.requester),
+            Some(2),
+            "the refusal must name the peer that sent it; without this the call \
+             site could pass None and nothing would fail"
+        );
+    }
+
+    /// The structured-payload refusal is attributed too.
+    ///
+    /// It fires when a requester's body does not produce the digest it asked us
+    /// to sign, which is the entry most worth attributing, and it was recorded
+    /// unattributed while the index sat in scope a few lines above.
+    #[tokio::test]
+    async fn a_structured_payload_mismatch_names_the_peer_that_sent_it() {
+        let (node, _relay) = test_node().await;
+
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(crate::peer::Peer::new(peer, 2));
+
+        let session_id = [0x44u8; 32];
+        let group = *node.group_pubkey();
+        // A body that cannot produce the digest being signed.
+        let req = SignRequestPayload::new(
+            session_id,
+            group,
+            vec![0u8; 32],
+            crate::MSG_TYPE_NOSTR_EVENT,
+            vec![1, 2],
+        )
+        .with_structured_payload(b"not a nostr event".to_vec());
+
+        node.handle_sign_request(peer, req)
+            .await
+            .expect("a refusal is reported to the requester, not surfaced here");
+
+        let entries = node.audit_log().get_entries_for_session(&session_id);
+        assert_eq!(
+            entries
+                .iter()
+                .find(|e| matches!(e.operation, SigningOperation::SignRequestRefused))
+                .and_then(|e| e.requester),
+            Some(2),
+            "a relabel attempt must record which peer attempted it"
         );
     }
 
