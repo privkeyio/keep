@@ -155,6 +155,12 @@ impl NonceStore {
         tmp.sync_all().context("Failed to fsync nonce store")?;
         drop(tmp);
         std::fs::rename(&tmp_path, path).context("Failed to replace nonce store")?;
+        // Syncing the temp file above makes its contents durable; it does not
+        // make the name pointing at them durable. Without this a power loss
+        // after the rename can leave the previous store in place, which is a
+        // claimed nonce silently becoming unclaimed: exactly the reboot replay
+        // this store exists to stop, and the case the file sync was added for.
+        keep_core::fsync_dir(path).context("Failed to fsync nonce store directory")?;
         Ok(())
     }
 

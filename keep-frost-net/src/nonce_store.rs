@@ -205,7 +205,12 @@ fn rewrite_nonce_file<'a>(
         }
         file.sync_all()?;
 
-        std::fs::rename(&tmp_path, path)
+        std::fs::rename(&tmp_path, path)?;
+        // The sync above makes the contents durable, not the name pointing at
+        // them. Without this a power loss after the rename can restore the
+        // previous file, which for a nonce store means a consumed nonce reads
+        // as available again on the next boot.
+        keep_core::fsync_dir(path)
     })();
 
     let _ = FileExt::unlock(&lock_file);

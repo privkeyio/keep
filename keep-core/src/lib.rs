@@ -71,6 +71,7 @@ pub(crate) mod rate_limit;
 /// Relay configuration for FROST shares.
 pub mod relay;
 mod rotation;
+pub use rotation::fsync_dir;
 /// Arbitrary-secret records (passwords, API tokens, notes) stored in the vault.
 pub mod secret;
 /// Persistent encrypted storage backend.

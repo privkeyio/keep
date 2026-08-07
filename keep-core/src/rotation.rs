@@ -73,8 +73,18 @@ fn secure_delete(path: &Path) -> std::io::Result<()> {
     fs::remove_file(path)
 }
 
+/// Flushes the directory entry for `path` so a rename into it survives power
+/// loss.
+///
+/// Syncing a freshly written file makes its contents durable; it does not make
+/// the name pointing at them durable. Without this a crash after an atomic
+/// rename can leave the previous file in place, which is the difference between
+/// a store that survives a reboot and one that quietly rolls back.
+///
+/// No-op on Windows, where a directory handle cannot be opened this way and the
+/// rename primitive has its own ordering guarantees.
 #[cfg(not(windows))]
-fn fsync_dir(path: &Path) -> std::io::Result<()> {
+pub fn fsync_dir(path: &Path) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("path has no parent directory"))?;
@@ -83,7 +93,7 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+pub fn fsync_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
