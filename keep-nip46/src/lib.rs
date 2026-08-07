@@ -31,7 +31,9 @@ pub use frost_signer::{FrostSigner, NetworkFrostSigner};
 pub use handler::SignerHandler;
 #[cfg(unix)]
 pub use local_server::{LocalServer, LocalServerConfig};
-pub use permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
+pub use permissions::{
+    AppPermission, ApprovalDecision, Permission, PermissionDuration, PermissionManager,
+};
 pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use server::{PreGrantedApp, Server, ServerConfig};
 pub use types::{ApprovalRequest, LogEvent, ServerCallbacks, NIP98_HTTP_AUTH};

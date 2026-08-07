@@ -18,7 +18,9 @@ use keep_core::keyring::Keyring;
 
 use crate::audit::{AuditAction, AuditEntry, AuditLog};
 use crate::frost_signer::{FrostSigner, NetworkFrostSigner};
-use crate::permissions::{AppPermission, Permission, PermissionDuration, PermissionManager};
+use crate::permissions::{
+    AppPermission, ApprovalDecision, Permission, PermissionDuration, PermissionManager,
+};
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
     ApprovalRequest, ApprovalResult, ConnectAuthorization, HttpAuthDetails, RememberDuration,
@@ -517,13 +519,22 @@ impl SignerHandler {
         self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
             .await?;
 
-        let needs_approval = self
-            .permissions
-            .lock()
-            .await
-            .needs_approval(&app_pubkey, kind);
+        // A refusal the user already gave is consulted before prompting. Without
+        // this, saying no decides one request and nothing more: a client that
+        // retries turns a single refusal into a prompt every retry interval,
+        // and the only way to stop it is revoking the app entirely, which is a
+        // far broader answer than the one the user gave.
+        let decision = self.permissions.lock().await.decide(&app_pubkey, kind);
+        if decision == ApprovalDecision::Deny {
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::UserRejected, app_pubkey)
+                    .with_event_kind(kind)
+                    .with_success(false),
+            );
+            return Err(KeepError::UserRejected);
+        }
 
-        if needs_approval {
+        if decision == ApprovalDecision::Ask {
             let result = self
                 .request_approval(ApprovalRequest {
                     app_pubkey,
@@ -544,6 +555,31 @@ impl SignerHandler {
                 .await;
 
             if !result.approved {
+                // The result already carried a duration; nothing read it on this
+                // branch, so "no, and stop asking for an hour" was
+                // indistinguishable from "no, this once". Recording it is what
+                // makes a refusal hold against a client that retries.
+                //
+                // Only bounded windows are remembered. `Forever` yields no
+                // duration here, and that is the right outcome rather than a
+                // gap: these refusals are in-memory, so a forever refusal would
+                // quietly disappear on the next restart, and promising forever
+                // while delivering until-restart is worse than not offering it.
+                // Revoking the app is the instrument for a permanent no.
+                //
+                // NIP-98 is clamped exactly as an approval is, so a refusal can
+                // never be remembered longer than an approval could.
+                let remember = if kind == NIP98_HTTP_AUTH {
+                    clamp_nip98_remember(result.remember)
+                } else {
+                    result.remember
+                };
+                if let Some(secs) = remember.as_seconds() {
+                    self.permissions
+                        .lock()
+                        .await
+                        .deny_kind_for(&app_pubkey, kind, secs);
+                }
                 self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::UserRejected, app_pubkey)
                         .with_event_kind(kind)
