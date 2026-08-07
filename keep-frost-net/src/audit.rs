@@ -26,6 +26,29 @@ pub struct SigningAuditEntry {
     pub participant_indices: Vec<u16>,
     pub our_index: u16,
     pub operation: SigningOperation,
+    /// Which peer asked for this signature, by share index.
+    ///
+    /// Set on the entries written while handling an inbound request, where the
+    /// index has been resolved by looking the event's author up in the admitted
+    /// peer list. `None` on everything else: the mid-round entries, and
+    /// requests this node initiated itself.
+    ///
+    /// Attributes the entry it sits on and nothing else. An earlier version of
+    /// this comment said the session id carried attribution to the rest of the
+    /// round; it does not. The session id is derived from the message, the
+    /// threshold and the sorted participant set, none of which mention the
+    /// requester, and participant selection does not depend on who asked, so
+    /// two peers requesting the same digest derive the same session id. A
+    /// duplicate request is also answered from the cached commitment before the
+    /// requester is ever resolved, so a second peer can drive a round whose
+    /// remaining entries would join back to the first. Carrying the requester
+    /// on the session is the fix for that and is filed separately.
+    ///
+    /// The index is as trustworthy as peer admission, which is a weaker
+    /// statement than it sounds: member transport keys are derived from the
+    /// group public key, so this identifies which member slot the request
+    /// arrived under rather than proving who sat in it.
+    pub requester: Option<u16>,
     pub hmac: [u8; 32],
 }
 
@@ -63,6 +86,7 @@ impl SigningAuditEntry {
         participant_indices: &[u16],
         our_index: u16,
         operation: &SigningOperation,
+        requester: Option<u16>,
     ) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
 
@@ -70,11 +94,29 @@ impl SigningAuditEntry {
         mac.update(session_id);
         mac.update(message_hash);
         mac.update(signature_hash);
+        // Length-prefixed. Without this the run is unparseable: every field
+        // after it used to be fixed width, so total length still determined the
+        // split, but adding a variable-width field at the end broke that and
+        // made two different records hash identically. Concretely, participants
+        // [7,9] with our_index 5, operation 1 and requester Some(3) produced the
+        // same bytes as participants [7,9,5] with our_index 257, operation 3 and
+        // no requester.
+        mac.update(&(participant_indices.len() as u16).to_le_bytes());
         for idx in participant_indices {
             mac.update(&idx.to_le_bytes());
         }
         mac.update(&our_index.to_le_bytes());
         mac.update(&[operation.discriminant()]);
+        // Tagged so the field is self-delimiting. On its own this does not make
+        // the preimage injective, which is what the length prefix above is for;
+        // it keeps this field parseable if another is ever appended after it.
+        match requester {
+            Some(idx) => {
+                mac.update(&[1u8]);
+                mac.update(&idx.to_le_bytes());
+            }
+            None => mac.update(&[0u8]),
+        }
 
         let result = mac.finalize();
         let mut hmac_out = [0u8; 32];
@@ -92,6 +134,7 @@ impl SigningAuditEntry {
             &self.participant_indices,
             self.our_index,
             &self.operation,
+            self.requester,
         );
         bool::from(self.hmac.ct_eq(&expected))
     }
@@ -167,6 +210,10 @@ impl SigningAuditLog {
         matches!(operation, SigningOperation::SignRequestRefused)
     }
 
+    // Same reason as `compute_hmac` above: these are the fields of one audit
+    // record, and grouping them into a struct would add a type whose only
+    // purpose is to satisfy a lint about how they are passed.
+    #[allow(clippy::too_many_arguments)]
     pub fn log_signing_operation(
         &self,
         session_id: [u8; 32],
@@ -175,6 +222,7 @@ impl SigningAuditLog {
         participant_indices: Vec<u16>,
         our_index: u16,
         operation: SigningOperation,
+        requester: Option<u16>,
     ) {
         let timestamp_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -193,6 +241,7 @@ impl SigningAuditLog {
             &participant_indices,
             our_index,
             &operation,
+            requester,
         );
 
         let entry = SigningAuditEntry {
@@ -203,6 +252,7 @@ impl SigningAuditLog {
             participant_indices: participant_indices.clone(),
             our_index,
             operation: operation.clone(),
+            requester,
             hmac,
         };
 
@@ -212,6 +262,7 @@ impl SigningAuditLog {
             signature_hash = %hex::encode(signature_hash),
             participants = ?participant_indices,
             our_index = our_index,
+            requester = ?requester,
             operation = ?operation,
             hmac = %hex::encode(hmac),
             "Signing audit log entry"
@@ -306,6 +357,7 @@ mod tests {
             vec![1, 2],
             1,
             SigningOperation::CommitmentSent,
+            None,
         );
 
         // Far past the refusal cap: under a shared queue this would evict the
@@ -318,6 +370,7 @@ mod tests {
                 vec![1, 2],
                 1,
                 SigningOperation::SignRequestRefused,
+                None,
             );
         }
 
@@ -375,6 +428,7 @@ mod tests {
             vec![1, 2, 3],
             1,
             SigningOperation::SignatureCompleted,
+            None,
         );
 
         assert!(log.verify_all());
@@ -396,6 +450,7 @@ mod tests {
             vec![1, 2, 3],
             1,
             SigningOperation::SignatureCompleted,
+            None,
         );
 
         {
@@ -419,11 +474,116 @@ mod tests {
                 vec![1],
                 1,
                 SigningOperation::CommitmentSent,
+                None,
             );
         }
 
         let entries = log.entries();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].session_id[0], 2);
+    }
+
+    /// Reattributing an entry must break its HMAC.
+    ///
+    /// A field the HMAC does not cover is a field anyone with write access can
+    /// change, and "which peer asked for this" is exactly the claim an audit
+    /// log exists to make unforgeable. Storing it without binding it would look
+    /// identical in the API and mean nothing.
+    #[test]
+    fn the_requester_is_covered_by_the_entry_hmac() {
+        let key = [9u8; 32];
+        let log = SigningAuditLog::new(key);
+        log.log_signing_operation(
+            [1u8; 32],
+            b"m",
+            None,
+            vec![1, 2],
+            1,
+            SigningOperation::CommitmentSent,
+            Some(2),
+        );
+
+        let mut entry = log.entries().into_iter().next().expect("one entry");
+        assert!(entry.verify(&key), "as written it verifies");
+
+        entry.requester = Some(3);
+        assert!(
+            !entry.verify(&key),
+            "pointing the entry at a different peer must invalidate it"
+        );
+    }
+
+    /// An absent requester must not be interchangeable with share index 0.
+    ///
+    /// Pins the property rather than the encoding. It holds for the tagged form
+    /// in use and also for an untagged one while this field stays last, so this
+    /// test does not by itself justify the tag; it fails only if the requester
+    /// stops being covered at all. The tag is defence against a later field
+    /// being appended after it, which is a change no test here would catch.
+    #[test]
+    fn an_absent_requester_is_distinct_from_peer_zero() {
+        let key = [9u8; 32];
+        let log = SigningAuditLog::new(key);
+        log.log_signing_operation(
+            [1u8; 32],
+            b"m",
+            None,
+            vec![1],
+            1,
+            SigningOperation::CommitmentSent,
+            None,
+        );
+
+        let mut entry = log.entries().into_iter().next().expect("one entry");
+        entry.requester = Some(0);
+        assert!(
+            !entry.verify(&key),
+            "an unattributed entry must not verify as one attributed to peer 0"
+        );
+    }
+
+    /// Two different records must not hash the same.
+    ///
+    /// The participant run is variable length. Every field after it used to be
+    /// fixed width, so the total length still determined where the run ended;
+    /// adding a variable-width field at the end removed that and made the
+    /// preimage ambiguous. These are the exact values that collided: the bytes
+    /// of two participants plus an index and a one-byte operation are also the
+    /// bytes of three participants plus a larger index and a different
+    /// operation. Without the length prefix one entry verifies as the other
+    /// with no knowledge of the key, which would let a record be rewritten into
+    /// a different one that still passes.
+    #[test]
+    fn distinct_records_do_not_share_an_hmac() {
+        let key = [5u8; 32];
+        let log = SigningAuditLog::new(key);
+        let session = [1u8; 32];
+
+        log.log_signing_operation(
+            session,
+            b"m",
+            None,
+            vec![7, 9],
+            5,
+            SigningOperation::CommitmentSent,
+            Some(3),
+        );
+        log.log_signing_operation(
+            session,
+            b"m",
+            None,
+            vec![7, 9, 5],
+            257,
+            SigningOperation::SignatureCompleted,
+            None,
+        );
+
+        let entries = log.entries();
+        assert_eq!(entries.len(), 2);
+        assert_ne!(
+            entries[0].hmac, entries[1].hmac,
+            "two different records must not produce the same authentication tag"
+        );
+        assert!(log.verify_all());
     }
 }
