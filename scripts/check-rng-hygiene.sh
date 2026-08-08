@@ -19,6 +19,13 @@
 #      `unwrap_or_default()` -- which for a `[u8; N]` means all zeros.
 #   3. A seeded, reproducible PRNG (`seed_from_u64`, `from_seed`, `SmallRng`)
 #      standing in for the OS RNG. Fine in tests, never in production.
+#   5. The panicking draw (`crypto::random_bytes`) used where the caller could
+#      have propagated instead. It aborts the process on a health-check failure,
+#      which is fail-closed but ungraceful: uniffi catches the unwind and
+#      surfaces an untyped internal exception, losing the error's identity, and
+#      in a long-running signer it takes down whichever task drew. Prefer
+#      `try_random_bytes`; opt out where the signature genuinely cannot carry a
+#      `Result`.
 #   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
 #      randomness with timing jitter and process context, so its output looks
 #      random even when a source has degraded -- the health check is what makes
@@ -92,11 +99,11 @@ fi
 # One awk per file, and its exit status is checked -- an earlier version piped
 # awk's stderr to /dev/null behind `|| true`, which meant a broken awk reported a
 # clean tree.
-scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole statement
+scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE, $3 = strict (no ?/expect suppression)
   local f rc out
   rc=0
   for f in $SOURCES; do
-    out=$(awk -v pat="$1" -v vpat="${2:-}" -v optout="$OPT_OUT" -v fname="$f" '
+    out=$(awk -v pat="$1" -v vpat="${2:-}" -v strict="${3:-}" -v optout="$OPT_OUT" -v fname="$f" '
       function count(s, ch,   i, n) {
         # Literal character count: gsub()/split() would treat ch as a regex,
         # and "(" alone is not a valid one -- BSD awk aborts on it.
@@ -146,7 +153,9 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
           } else if (inerr && is_exit(c)) {
             seen = 1
           }
-          d += count(L[i], "{") - count(L[i], "}")
+          # Stripped text, not raw: a brace inside a string literal would end the
+          # block early and the exit search would stop before the real handler.
+          d += count(c, "{") - count(c, "}")
           if (i > from && d <= 0) break
         }
         return seen
@@ -167,7 +176,13 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
         # The `?` / expect / unwrap has to belong to THIS call, not to something
         # nested inside its arguments: `let _ = rng(&mut k).map_err(|e| f(n)?);`
         # discards the RNG result while carrying a `?`, and used to pass.
-        if (outer(t) ~ /\?/ || t ~ /\)[ \t]*\.expect\(/ || t ~ /\)[ \t]*\.unwrap\(/) return
+        # Strict rules skip this. The suppression below reads a `?` or an
+        # `.expect(..)` as "the error was handled", which is the right reading
+        # for a call that returns a Result. A panicking draw returns an array,
+        # so a `?` in the same statement belongs to something else entirely and
+        # says nothing about the draw. Without this gate,
+        # `f(crypto::random_bytes::<32>())?` was silently skipped.
+        if (strict == "" && (outer(t) ~ /\?/ || t ~ /\)[ \t]*\.expect\(/ || t ~ /\)[ \t]*\.unwrap\(/)) return
         if (isctrl && block_exits(blockstart)) return
         printf "%s:%d:%s\n", fname, where, t
       }
@@ -226,7 +241,14 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
             else if (line !~ /^#\[/ && line != "") { pending = 0 }
           }
           if (line ~ /^#\[cfg\(test\)\]/) pending = 1
-          depth += count(raw, "{") - count(raw, "}")
+          # Stripped text, not raw. An unbalanced brace inside a string literal
+          # in a test block left `testdepth` armed to end-of-file, so every rule
+          # silently stopped scanning the rest of that file and still reported a
+          # clean tree. `write_store(dir.path(), "{ this is not json")` in
+          # keep-desktop is exactly this shape, harmless only because its test
+          # module ends the file. Fourteen files have production code after a
+          # mid-file test block, so the next one would be a total miss.
+          depth += count(code, "{") - count(code, "}")
           if (testdepth >= 0) {
             if (depth <= testdepth) testdepth = -1
             continue
@@ -269,9 +291,23 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
           if (index(buf, ";") || (ctrl && index(raw, "{"))) { judge(buf, i, i, ctrl) }
           else { instmt = 1; start = i }
         }
+        # A statement still being assembled at end of file was never judged.
+        # `pub fn x() -> T { draw() }` as the last line has no semicolon and no
+        # following `}` line to terminate it, so the buffer was simply dropped
+        # and the call inside it never scanned.
+        if (instmt) judge(buf, start, start, ctrl)
+        # Fail closed if the test-block tracker never disarmed: the brace
+        # accounting lost sync, so an unknown tail of this file went unscanned.
+        # Reporting that clean is the one outcome this guard must never produce.
+        # Goes to stderr so it survives the command substitution the caller reads.
+        if (testdepth >= 0) print "rng-hygiene: brace tracking stuck in " fname > "/dev/stderr"
+        if (testdepth >= 0) print "SCANNER-STUCK"
       }
     ' "$f") || rc=2
-    [ -n "$out" ] && printf '%s\n' "$out"
+    case $out in
+      *SCANNER-STUCK*) rc=2 ;;
+      *) [ -n "$out" ] && printf '%s\n' "$out" ;;
+    esac
   done
   return "$rc"
 }
@@ -349,7 +385,35 @@ else
   fi
 fi
 
+# --------------------------------------------- 5. the panicking draw ---------
+# `random_bytes` is `try_random_bytes().expect(..)`. Panicking on a degraded RNG
+# is the right direction -- it refuses to hand out a key rather than hand out a
+# predictable one -- but it is the blunt version of it. uniffi catches the
+# unwind and reports an untyped internal exception, and in the bunker the panic
+# lands on whichever task drew, so a caller that can return an error should.
+#
+# Single-pattern like rule 3: there is no "handled" spelling of this call, only
+# the fallible sibling or a deliberate opt-out. `crypto::try_random_bytes` does
+# not contain the literal `crypto::random_bytes`, so the fallible form is not
+# matched.
+#
+# The optional `::` is load-bearing. Nearly every call here is a turbofish
+# (`random_bytes::<32>()`), where the next character after the name is a colon,
+# so without it this rule matched only the bare-parenthesis spelling and sailed
+# straight past the sites it exists to find. The left identifier boundary keeps
+# a module merely ending in those names (`not_crypto::random_bytes`) from being
+# reported, and `strict` turns off the shared `?`/`.expect` suppression, which
+# would otherwise excuse the draw because of error handling belonging to another
+# call in the same statement.
+panicking_bad=$(scan_rust '(^|[^A-Za-z0-9_])(crypto|entropy)::random_bytes(::)?[ \t]*[(<]' '' strict) || {
+  fail "the scanner itself failed; refusing to report a clean tree"
+  exit 1
+}
+report "$panicking_bad" "panicking RNG draw where the error could have propagated:" \
+  'use keep_core::crypto::try_random_bytes::<N>()? and let the caller decide' \
+  "or, where the signature cannot carry a Result: // $OPT_OUT - <reason>"
+
 if [ "$status" -eq 0 ]; then
-  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, entropy gate intact on $gate_ok entry points)"
+  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, entropy gate intact on $gate_ok entry points)"
 fi
 exit "$status"

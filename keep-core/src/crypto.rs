@@ -528,7 +528,14 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// Generate cryptographically secure random bytes.
+///
+/// Panics if the RNG health check fails. Prefer [`try_random_bytes`] anywhere a
+/// `Result` can be returned: the panic is fail-closed but blunt. uniffi catches
+/// the unwind and surfaces it as an untyped internal exception, so a caller on
+/// that path loses the error's identity rather than the process, and a
+/// long-running signer takes the panic on whichever task happened to draw.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
+    // rng-hygiene: ok - this is the panicking primitive itself, not a caller
     entropy::random_bytes()
 }
 

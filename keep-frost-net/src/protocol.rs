@@ -1343,6 +1343,12 @@ pub struct PingPayload {
 impl PingPayload {
     pub fn new() -> Self {
         Self {
+            // rng-hygiene: ok - the challenge is never checked. `handle_pong`
+            // binds the payload and drops it; responsiveness is decided by
+            // comparing pong arrival instants, so a degraded challenge changes
+            // nothing here. Adding a fallible `try_new` for the one production
+            // caller is the fix, tracked separately, along with the question of
+            // whether an unverified challenge should exist at all.
             challenge: keep_core::crypto::random_bytes::<32>(),
             timestamp: Timestamp::now().as_secs(),
         }

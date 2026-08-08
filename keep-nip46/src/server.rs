@@ -206,7 +206,7 @@ fn finalize_handler(
     mut handler: SignerHandler,
     config: &ServerConfig,
     relay_urls: &[String],
-) -> (SignerHandler, Option<Zeroizing<String>>) {
+) -> Result<(SignerHandler, Option<Zeroizing<String>>)> {
     handler = handler.with_relay_urls(relay_urls.to_vec());
     if let Some(ref rl_config) = config.rate_limit {
         handler = handler.with_rate_limit(rl_config.clone());
@@ -215,7 +215,7 @@ fn finalize_handler(
         handler = handler.with_kill_switch(ks.clone());
     }
     let bunker_secret = if config.auto_approve && config.expected_secret.is_none() {
-        let secret = hex::encode(keep_core::crypto::random_bytes::<16>());
+        let secret = hex::encode(keep_core::crypto::try_random_bytes::<16>()?);
         warn!("headless mode: bunker secret required for authentication");
         handler = handler.with_expected_secret(secret.clone());
         Some(Zeroizing::new(secret))
@@ -227,7 +227,7 @@ fn finalize_handler(
     } else {
         None
     };
-    (handler, bunker_secret)
+    Ok((handler, bunker_secret))
 }
 
 impl Server {
@@ -369,7 +369,7 @@ impl Server {
         if let Some(frost) = frost_signer {
             handler = handler.with_frost_signer(frost);
         }
-        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
+        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls)?;
 
         Ok(Self::build(
             keys,
@@ -492,7 +492,7 @@ impl Server {
             .with_connect_grant(config.connect_grant)
             .with_connect_auto_approve_kinds(config.connect_auto_approve_kinds.clone())
             .with_transport_pubkey(keys.public_key());
-        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls);
+        let (handler, bunker_secret) = finalize_handler(handler, &config, relay_urls)?;
 
         Ok(Self::build(
             keys,
@@ -921,7 +921,7 @@ mod tests {
         };
 
         let (_handler, bunker_secret) =
-            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]).unwrap();
 
         let secret = bunker_secret.expect("expected_secret should surface as bunker secret");
         assert_eq!(secret.as_str(), "my-secret");
@@ -1202,7 +1202,7 @@ mod tests {
             ..ServerConfig::default()
         };
         let (_h, sec) =
-            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]).unwrap();
         let generated = sec.expect("headless without explicit secret must generate one");
         assert!(
             !generated.is_empty(),
@@ -1220,7 +1220,7 @@ mod tests {
             ..ServerConfig::default()
         };
         let (_h, sec) =
-            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]).unwrap();
         assert!(
             sec.is_none(),
             "interactive mode without explicit secret must NOT generate one"
@@ -1241,7 +1241,7 @@ mod tests {
             ..ServerConfig::default()
         };
         let (_h, sec) =
-            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]);
+            finalize_handler(handler, &config, &["wss://relay.example.com".to_string()]).unwrap();
         assert_eq!(
             sec.expect("explicit secret should surface").as_str(),
             "operator-supplied"
