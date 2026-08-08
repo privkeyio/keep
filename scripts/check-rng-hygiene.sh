@@ -99,11 +99,11 @@ fi
 # One awk per file, and its exit status is checked -- an earlier version piped
 # awk's stderr to /dev/null behind `|| true`, which meant a broken awk reported a
 # clean tree.
-scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole statement
+scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE, $3 = strict (no ?/expect suppression)
   local f rc out
   rc=0
   for f in $SOURCES; do
-    out=$(awk -v pat="$1" -v vpat="${2:-}" -v optout="$OPT_OUT" -v fname="$f" '
+    out=$(awk -v pat="$1" -v vpat="${2:-}" -v strict="${3:-}" -v optout="$OPT_OUT" -v fname="$f" '
       function count(s, ch,   i, n) {
         # Literal character count: gsub()/split() would treat ch as a regex,
         # and "(" alone is not a valid one -- BSD awk aborts on it.
@@ -176,7 +176,13 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
         # The `?` / expect / unwrap has to belong to THIS call, not to something
         # nested inside its arguments: `let _ = rng(&mut k).map_err(|e| f(n)?);`
         # discards the RNG result while carrying a `?`, and used to pass.
-        if (outer(t) ~ /\?/ || t ~ /\)[ \t]*\.expect\(/ || t ~ /\)[ \t]*\.unwrap\(/) return
+        # Strict rules skip this. The suppression below reads a `?` or an
+        # `.expect(..)` as "the error was handled", which is the right reading
+        # for a call that returns a Result. A panicking draw returns an array,
+        # so a `?` in the same statement belongs to something else entirely and
+        # says nothing about the draw. Without this gate,
+        # `f(crypto::random_bytes::<32>())?` was silently skipped.
+        if (strict == "" && (outer(t) ~ /\?/ || t ~ /\)[ \t]*\.expect\(/ || t ~ /\)[ \t]*\.unwrap\(/)) return
         if (isctrl && block_exits(blockstart)) return
         printf "%s:%d:%s\n", fname, where, t
       }
@@ -394,8 +400,12 @@ fi
 # The optional `::` is load-bearing. Nearly every call here is a turbofish
 # (`random_bytes::<32>()`), where the next character after the name is a colon,
 # so without it this rule matched only the bare-parenthesis spelling and sailed
-# straight past the sites it exists to find.
-panicking_bad=$(scan_rust '(crypto|entropy)::random_bytes(::)?[ \t]*[(<]') || {
+# straight past the sites it exists to find. The left identifier boundary keeps
+# a module merely ending in those names (`not_crypto::random_bytes`) from being
+# reported, and `strict` turns off the shared `?`/`.expect` suppression, which
+# would otherwise excuse the draw because of error handling belonging to another
+# call in the same statement.
+panicking_bad=$(scan_rust '(^|[^A-Za-z0-9_])(crypto|entropy)::random_bytes(::)?[ \t]*[(<]' '' strict) || {
   fail "the scanner itself failed; refusing to report a clean tree"
   exit 1
 }

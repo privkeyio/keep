@@ -125,6 +125,12 @@ pub fn f()->[u8;32]{
 }
 ' fail "a brace in a test string must not hide the production code after it"
 
+run_probe $SRC/probe_panicking_outer_q.rs 'fn f()->Result<[u8;32],()>{ let k = g(keep_core::crypto::random_bytes::<32>())?; Ok(k) }
+' fail "a ? belonging to another call must not excuse the draw"
+
+run_probe $SRC/probe_panicking_expect.rs 'fn f()->[u8;32]{ keep_core::crypto::random_bytes::<32>().expect("x") }
+' fail "a trailing .expect must not excuse the draw"
+
 echo "== accepts what it must accept =="
 
 run_probe $SRC/probe_ok.rs 'fn f()->Result<(),getrandom::Error>{ let mut b=[0u8;32]; getrandom::getrandom(&mut b)?; Ok(()) }
@@ -137,6 +143,9 @@ fn f(){ let x=1; let _=x; }
 run_probe $SRC/probe_cfgtest.rs '#[cfg(test)]
 mod t { fn f(){ let mut b=[0u8;32]; getrandom::getrandom(&mut b).ok(); } }
 ' pass "test code is out of scope"
+
+run_probe $SRC/probe_notcrypto.rs 'fn f()->[u8;32]{ let x = not_crypto::random_bytes::<32>(); x }
+' pass "a module merely ending in crypto is a different path"
 
 run_probe $SRC/probe_try.rs 'fn f()->keep_core::Result<[u8;32]>{ Ok(keep_core::crypto::try_random_bytes::<32>()?) }
 ' pass "the fallible draw is not the panicking one"
