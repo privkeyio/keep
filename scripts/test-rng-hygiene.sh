@@ -111,6 +111,20 @@ run_probe $SRC/probe_split2.rs 'fn f(){ let mut b=[0u8;32]; getrandom::getrandom
 run_probe $SRC/probe_seeded.rs 'fn f(){ let r = SmallRng::seed_from_u64(1); let _ = r; }
 ' fail "seeded PRNG in production code"
 
+run_probe $SRC/probe_panicking.rs 'fn f()->[u8;32]{ keep_core::crypto::random_bytes::<32>() }
+' fail "panicking draw where the caller could have propagated"
+
+run_probe $SRC/probe_panicking_turbofish.rs 'fn f()->Result<[u8;32],()>{ let b = keep_core::crypto::random_bytes::<32>(); Ok(b) }
+' fail "turbofish spelling of the panicking draw"
+
+run_probe $SRC/probe_stuck.rs '#[cfg(test)]
+mod t { fn g(){ let s = "unbalanced {"; let _ = s; } }
+
+pub fn f()->[u8;32]{
+    keep_core::crypto::random_bytes::<32>()
+}
+' fail "a brace in a test string must not hide the production code after it"
+
 echo "== accepts what it must accept =="
 
 run_probe $SRC/probe_ok.rs 'fn f()->Result<(),getrandom::Error>{ let mut b=[0u8;32]; getrandom::getrandom(&mut b)?; Ok(()) }
@@ -123,6 +137,15 @@ fn f(){ let x=1; let _=x; }
 run_probe $SRC/probe_cfgtest.rs '#[cfg(test)]
 mod t { fn f(){ let mut b=[0u8;32]; getrandom::getrandom(&mut b).ok(); } }
 ' pass "test code is out of scope"
+
+run_probe $SRC/probe_try.rs 'fn f()->keep_core::Result<[u8;32]>{ Ok(keep_core::crypto::try_random_bytes::<32>()?) }
+' pass "the fallible draw is not the panicking one"
+
+run_probe $SRC/probe_optout.rs 'fn f()->[u8;32]{
+    // rng-hygiene: ok - signature cannot carry a Result
+    keep_core::crypto::random_bytes::<32>()
+}
+' pass "a panicking draw with a stated reason"
 
 echo
 if [ "$fails" -ne 0 ]; then

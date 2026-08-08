@@ -21,8 +21,9 @@
 #      standing in for the OS RNG. Fine in tests, never in production.
 #   5. The panicking draw (`crypto::random_bytes`) used where the caller could
 #      have propagated instead. It aborts the process on a health-check failure,
-#      which is fail-closed but ungraceful: across a uniffi boundary it becomes
-#      an app abort, and in a long-running signer it kills the service. Prefer
+#      which is fail-closed but ungraceful: uniffi catches the unwind and
+#      surfaces an untyped internal exception, losing the error's identity, and
+#      in a long-running signer it takes down whichever task drew. Prefer
 #      `try_random_bytes`; opt out where the signature genuinely cannot carry a
 #      `Result`.
 #   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
@@ -381,9 +382,9 @@ fi
 # --------------------------------------------- 5. the panicking draw ---------
 # `random_bytes` is `try_random_bytes().expect(..)`. Panicking on a degraded RNG
 # is the right direction -- it refuses to hand out a key rather than hand out a
-# predictable one -- but it is the blunt version of it. Across uniffi a panic
-# becomes an app abort, and in the bunker it takes down a running signer, so a
-# caller that can return an error should.
+# predictable one -- but it is the blunt version of it. uniffi catches the
+# unwind and reports an untyped internal exception, and in the bunker the panic
+# lands on whichever task drew, so a caller that can return an error should.
 #
 # Single-pattern like rule 3: there is no "handled" spelling of this call, only
 # the fallible sibling or a deliberate opt-out. `crypto::try_random_bytes` does
