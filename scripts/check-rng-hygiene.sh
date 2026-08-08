@@ -152,7 +152,9 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
           } else if (inerr && is_exit(c)) {
             seen = 1
           }
-          d += count(L[i], "{") - count(L[i], "}")
+          # Stripped text, not raw: a brace inside a string literal would end the
+          # block early and the exit search would stop before the real handler.
+          d += count(c, "{") - count(c, "}")
           if (i > from && d <= 0) break
         }
         return seen
@@ -232,7 +234,14 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
             else if (line !~ /^#\[/ && line != "") { pending = 0 }
           }
           if (line ~ /^#\[cfg\(test\)\]/) pending = 1
-          depth += count(raw, "{") - count(raw, "}")
+          # Stripped text, not raw. An unbalanced brace inside a string literal
+          # in a test block left `testdepth` armed to end-of-file, so every rule
+          # silently stopped scanning the rest of that file and still reported a
+          # clean tree. `write_store(dir.path(), "{ this is not json")` in
+          # keep-desktop is exactly this shape, harmless only because its test
+          # module ends the file. Fourteen files have production code after a
+          # mid-file test block, so the next one would be a total miss.
+          depth += count(code, "{") - count(code, "}")
           if (testdepth >= 0) {
             if (depth <= testdepth) testdepth = -1
             continue
@@ -275,9 +284,18 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
           if (index(buf, ";") || (ctrl && index(raw, "{"))) { judge(buf, i, i, ctrl) }
           else { instmt = 1; start = i }
         }
+        # Fail closed if the test-block tracker never disarmed: the brace
+        # accounting lost sync, so an unknown tail of this file went unscanned.
+        # Reporting that clean is the one outcome this guard must never produce.
+        # Goes to stderr so it survives the command substitution the caller reads.
+        if (testdepth >= 0) print "rng-hygiene: brace tracking stuck in " fname > "/dev/stderr"
+        if (testdepth >= 0) print "SCANNER-STUCK"
       }
     ' "$f") || rc=2
-    [ -n "$out" ] && printf '%s\n' "$out"
+    case $out in
+      *SCANNER-STUCK*) rc=2 ;;
+      *) [ -n "$out" ] && printf '%s\n' "$out" ;;
+    esac
   done
   return "$rc"
 }
