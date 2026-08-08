@@ -236,7 +236,9 @@ impl KfpNode {
             // into a stringly-typed encryption error, and deciding to stop
             // signing on a string match is exactly the guess this refuses to make.
             let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>().map_err(|e| {
-                self.mark_entropy_degraded();
+                if Self::latches_signing(e) {
+                    self.mark_entropy_degraded();
+                }
                 FrostNetError::Session(format!("nonce id: {e}"))
             })?;
             let (nonces, commitment) =
@@ -276,7 +278,16 @@ impl KfpNode {
     /// when a peer is newly discovered after the pool was already replenished,
     /// so it does not have to wait for the next replenish broadcast (which only
     /// carries freshly generated commitments) to enable instant signing.
+    /// Publishes this node's pooled commitments to a peer.
+    ///
+    /// Refuses once latched: the pool can still hold commitments drawn in the
+    /// window before detection, and handing those to a newly discovered peer
+    /// advertises exactly what the replenish gate stops broadcasting.
     pub(crate) async fn send_nonce_pool_to(&self, pubkey: &PublicKey) -> Result<()> {
+        if self.is_entropy_degraded() {
+            return Ok(());
+        }
+
         let available = self.nonce_pool.own_commitments();
         if available.is_empty() {
             return Ok(());
@@ -2223,6 +2234,32 @@ mod gate_tests {
             node.replenish_nonce_pool().await,
             Err(FrostNetError::PolicyViolation(_))
         ));
+    }
+
+    /// A source that could not be read is not a source that answered badly.
+    /// Latching on the former turns a transient fault, an exhausted descriptor
+    /// table or a container with no `/dev`, into an outage only an operator can
+    /// clear. Only the statistical verdict is permanent.
+    #[test]
+    fn only_a_degraded_source_latches_signing() {
+        use keep_core::entropy::EntropyHealthError;
+
+        assert!(KfpNode::latches_signing(EntropyHealthError::Degraded));
+        assert!(!KfpNode::latches_signing(EntropyHealthError::Unavailable));
+    }
+
+    /// A latched node stops handing its pooled commitments to newly discovered
+    /// peers. The pool can still hold nonces drawn in the window before
+    /// detection, and publishing those is what the replenish gate exists to stop.
+    #[tokio::test]
+    async fn nonce_pool_is_not_published_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        assert!(node
+            .send_nonce_pool_to(&Keys::generate().public_key())
+            .await
+            .is_ok());
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.

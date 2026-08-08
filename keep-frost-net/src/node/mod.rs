@@ -1507,6 +1507,16 @@ impl KfpNode {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether this failure should stop the node signing for good.
+    ///
+    /// Only a source that answered badly. A call that could not be completed is
+    /// a different statement, closer to "out of descriptors" than to "the kernel
+    /// is emitting constants", and latching on it turns a transient fault into
+    /// an outage that only an operator can clear.
+    pub(crate) fn latches_signing(e: keep_core::entropy::EntropyHealthError) -> bool {
+        e == keep_core::entropy::EntropyHealthError::Degraded
+    }
+
     /// Latch the degraded flag and alert. Idempotent: only the first observation
     /// emits, so a repeating probe cannot flood the event channel.
     pub(crate) fn mark_entropy_degraded(&self) {
@@ -1536,8 +1546,10 @@ impl KfpNode {
         if self.is_entropy_degraded() {
             return;
         }
-        if keep_core::entropy::check_entropy_health().is_err() {
-            self.mark_entropy_degraded();
+        if let Err(e) = keep_core::entropy::check_entropy_health() {
+            if Self::latches_signing(e) {
+                self.mark_entropy_degraded();
+            }
         }
     }
 
@@ -2300,7 +2312,12 @@ impl KfpNode {
                     // holding a deficit, would go hours between actual checks.
                     // Probing here costs a handful of syscalls per interval.
                     self.probe_entropy_health();
-                    if self.nonce_pool.own_deficit() > 0 {
+                    // Skipped rather than attempted-and-refused once latched.
+                    // The deficit can never close while signing is off, so
+                    // calling in would log the same refusal every interval for
+                    // the life of the process: the flood the alert itself is
+                    // careful to avoid.
+                    if !self.is_entropy_degraded() && self.nonce_pool.own_deficit() > 0 {
                         if let Err(e) = self.replenish_nonce_pool().await {
                             warn!(error = %e, "Failed to replenish nonce pool");
                         }

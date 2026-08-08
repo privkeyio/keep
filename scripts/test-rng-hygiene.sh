@@ -181,7 +181,19 @@ probe_rule6() { # $1 = body, $2 = pass|fail, $3 = description
 probe_rule6 '    rand::rng().fill_bytes(pool);' fail "a thread-local generator is not the OS"
 probe_rule6 '    SmallRng::from_entropy().fill_bytes(pool);' fail "any seeded generator is not the OS"
 probe_rule6 '    // SysRng would go here' fail "naming the OS in a comment is not calling it"
+probe_rule6 '    tracing::debug!("drawing from getrandom");
+    rand::rng().fill_bytes(pool);' fail "naming the OS in a log message is not calling it"
+probe_rule6 '    use rand::rngs::SysRng;
+    rand::rng().fill_bytes(pool);' fail "importing the OS interface is not calling it"
 probe_rule6 '    rand::rngs::SysRng.try_fill_bytes(pool).map_err(|_| E)?;' pass "SysRng is the OS interface"
+probe_rule6 '    rand::rngs::SysRng
+        .try_fill_bytes(pool)
+        .map_err(|_| E)?;' pass "the receiver and the call may be on separate lines"
+probe_rule6 '    #[cfg(test)]
+    {
+        let _ = 1;
+    }
+    rand::rngs::SysRng.try_fill_bytes(pool).map_err(|_| E)?;' pass "a nested block before the draw is not a finding"
 probe_rule6 '    getrandom::fill(pool)?;' pass "getrandom directly is the OS interface"
 
 echo

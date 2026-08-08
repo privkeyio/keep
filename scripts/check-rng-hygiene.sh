@@ -424,15 +424,57 @@ report "$panicking_bad" "panicking RNG draw where the error could have propagate
 # while FROST nonces, drawn from `getrandom` via OsRng, came out identical. The
 # check certified the expansion rather than the source.
 #
-# Structural rather than a grep for the bad call, so replacing it with any other
-# userspace generator is caught too: the sampler must name the OS interface.
+# Inverted rather than a grep for the bad call, so replacing it with any other
+# userspace generator is caught too: the sampler must call the OS interface.
+#
+# What it does not cover, stated so a green run is not read as more than it is:
+# it checks that an OS call appears in the body, not that the value it produces
+# is the one written to `pool`. A dead call alongside a bad draw satisfies it.
+# Closing that needs a parser, and the shape it would catch is deliberate rather
+# than accidental; the regression this exists to stop is someone quietly putting
+# a thread-local generator back, which it does catch.
 if [ -f "$ENTROPY_MODULE" ]; then
+  # Brace-depth scoped, comment- and string-stripped, and a CALL is required:
+  # naming the OS in a log message satisfied an earlier version of this, and
+  # terminating on the first line-initial `}` reported correct code whenever the
+  # body opened any nested block (a `#[cfg]` arm, an early return) before the
+  # draw. Both were verified against fixtures.
   os_src=$(awk '
-    /^[ \t]*fn gather_os_entropy/ { inside = 1; found = 0; next }
-    inside && /^[ \t]*\}/ { print (found ? "OK" : "NOT-OS"); inside = 0 }
+    function strip(s,   p, out, i, c, instr, q) {
+      p = index(s, "//"); if (p > 0) s = substr(s, 1, p - 1)
+      out = ""; instr = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (instr) { if (c == "\\") { i++; continue }
+                     if (c == q) instr = 0
+                     continue }
+        if (c == "\"" || c == "\x27") { instr = 1; q = c; continue }
+        out = out c
+      }
+      return out
+    }
+    function count(s, ch,   i, n) {
+      n = 0
+      for (i = length(s); i > 0; i--) if (substr(s, i, 1) == ch) n++
+      return n
+    }
+    !inside && $0 ~ /(^|[^a-zA-Z0-9_])fn[ \t]+gather_os_entropy[ \t]*\(/ {
+      inside = 1; found = 0; depth = 0; started = 0
+    }
     inside {
-      p = index($0, "//"); if (p > 0) $0 = substr($0, 1, p - 1)
-      if ($0 ~ /SysRng|getrandom/) found = 1
+      code = strip($0)
+      # A call, not a mention: `SysRng.method(` or `getrandom::fill(`.
+      # `SysRng` then end-of-line counts: rustfmt puts the receiver and the
+      # `.try_fill_bytes(..)` on separate lines, so requiring the dot on the
+      # same line rejected the real function. A trailing `;` (a bare `use`)
+      # matches neither branch, so an import still does not count as a call.
+      if (code ~ /SysRng[ \t]*(\.|$)/ || code ~ /getrandom[a-z_:]*[ \t]*\(/) found = 1
+      depth += count(code, "{") - count(code, "}")
+      if (count(code, "{") > 0) started = 1
+      if (started && depth <= 0) {
+        print (found ? "OK" : "NOT-OS"); inside = 0
+      }
+      next
     }
     END { if (inside) print "UNTERMINATED" }
   ' "$ENTROPY_MODULE") || { fail "rule 6 scanner failed on $ENTROPY_MODULE"; exit 1; }

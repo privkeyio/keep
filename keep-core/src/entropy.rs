@@ -31,7 +31,7 @@ fn gather_os_entropy(pool: &mut [u8]) -> Result<(), EntropyHealthError> {
     use rand::TryRng;
     rand::rngs::SysRng
         .try_fill_bytes(pool)
-        .map_err(|_| EntropyHealthError)?;
+        .map_err(|_| EntropyHealthError::Unavailable)?;
     Ok(())
 }
 
@@ -269,16 +269,33 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     try_random_bytes().expect("RNG health check failed: constant or zero output detected")
 }
 
-/// Error returned when RNG health check fails.
-#[derive(Debug, Clone, Copy)]
-pub struct EntropyHealthError;
+/// Why a draw could not be trusted.
+///
+/// The two arms are kept apart because they call for different responses. A
+/// source that answered with constant output is a property of the machine and
+/// will not improve on its own, so a co-signer should stop and stay stopped.
+/// A call that failed to complete is a different statement, closer to "no file
+/// descriptors" than to "the kernel is broken", and treating it as permanent
+/// turns a transient fault into an outage that needs an operator to clear.
+/// They also read differently in a log, which matters when someone is trying to
+/// work out what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyHealthError {
+    /// The source answered, and what it returned failed the health criteria.
+    Degraded,
+    /// The source could not be read at all.
+    Unavailable,
+}
 
 impl std::fmt::Display for EntropyHealthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "RNG health check failed: constant or zero output detected"
-        )
+        match self {
+            Self::Degraded => write!(
+                f,
+                "RNG health check failed: constant or zero output detected"
+            ),
+            Self::Unavailable => write!(f, "RNG unavailable: the OS refused to provide entropy"),
+        }
     }
 }
 
@@ -333,7 +350,7 @@ fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
     // A gate that can only observe the combiner is the same shape as the bug
     // this whole check exists to catch.
     if !samples_look_random(&os_samples()?) {
-        return Err(EntropyHealthError);
+        return Err(EntropyHealthError::Degraded);
     }
 
     // The mixed output is checked too, which catches a broken mixer rather than
@@ -343,7 +360,7 @@ fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
         *block = random_bytes_mixed_internal()?;
     }
     if !samples_look_random(&mixed) {
-        return Err(EntropyHealthError);
+        return Err(EntropyHealthError::Degraded);
     }
 
     Ok(())
