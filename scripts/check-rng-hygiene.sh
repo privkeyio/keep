@@ -284,6 +284,11 @@ scan_rust() { # $1 = call-site ERE, $2 = optional verdict ERE for the whole stat
           if (index(buf, ";") || (ctrl && index(raw, "{"))) { judge(buf, i, i, ctrl) }
           else { instmt = 1; start = i }
         }
+        # A statement still being assembled at end of file was never judged.
+        # `pub fn x() -> T { draw() }` as the last line has no semicolon and no
+        # following `}` line to terminate it, so the buffer was simply dropped
+        # and the call inside it never scanned.
+        if (instmt) judge(buf, start, start, ctrl)
         # Fail closed if the test-block tracker never disarmed: the brace
         # accounting lost sync, so an unknown tail of this file went unscanned.
         # Reporting that clean is the one outcome this guard must never produce.
