@@ -221,7 +221,7 @@ impl KfpNode {
         let key_package = self.share.key_package()?;
         let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
-            let nonce_id: NonceId = keep_core::crypto::random_bytes::<32>();
+            let nonce_id: NonceId = keep_core::crypto::try_random_bytes::<32>()?;
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
             self.nonce_pool.store_own(nonce_id, nonces);

@@ -483,7 +483,7 @@ fn load_or_create_bunker_keys(
     {
         Some(bytes) => bytes,
         None => {
-            let bytes = Zeroizing::new(keep_core::crypto::random_bytes::<32>());
+            let bytes = Zeroizing::new(keep_core::crypto::try_random_bytes::<32>()?);
             stored.transport_secret = Some(hex::encode(&bytes[..]));
             dirty = true;
             bytes
@@ -493,7 +493,7 @@ fn load_or_create_bunker_keys(
     let connect_secret = match stored.connect_secret.as_deref() {
         Some(secret) if !secret.is_empty() => Zeroizing::new(secret.to_owned()),
         _ => {
-            let secret = Zeroizing::new(hex::encode(keep_core::crypto::random_bytes::<16>()));
+            let secret = Zeroizing::new(hex::encode(keep_core::crypto::try_random_bytes::<16>()?));
             stored.connect_secret = Some(secret.as_str().to_owned());
             dirty = true;
             secret

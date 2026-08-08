@@ -115,6 +115,8 @@ impl Nip55NonceStore {
     /// minutes after `now_elapsed_ms` (an `elapsedRealtime` boot-time millis
     /// value). Evicts expired (then oldest) entries when the active set is full.
     pub fn generate(&self, package_name: String, now_elapsed_ms: u64) -> String {
+        // rng-hygiene: ok - uniffi-exported, so returning a Result changes the
+        // generated Kotlin signature and has to land with the Android caller.
         let nonce = hex::encode(keep_core::crypto::random_bytes::<32>());
         let mut nonces = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
         nonces.insert(

@@ -528,7 +528,12 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 /// Generate cryptographically secure random bytes.
+///
+/// Panics if the RNG health check fails. Prefer [`try_random_bytes`] anywhere a
+/// `Result` can be returned: the panic is fail-closed but blunt, and across a
+/// uniffi boundary it aborts the host app rather than surfacing an error.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
+    // rng-hygiene: ok - this is the panicking primitive itself, not a caller
     entropy::random_bytes()
 }
 

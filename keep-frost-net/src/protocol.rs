@@ -1343,6 +1343,10 @@ pub struct PingPayload {
 impl PingPayload {
     pub fn new() -> Self {
         Self {
+            // rng-hygiene: ok - `Default` below delegates here and cannot return
+            // a Result, so making this fallible means removing a public trait
+            // impl. That is an API decision, not a mechanical migration, and the
+            // value is a liveness challenge rather than key material.
             challenge: keep_core::crypto::random_bytes::<32>(),
             timestamp: Timestamp::now().as_secs(),
         }

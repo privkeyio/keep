@@ -19,6 +19,12 @@
 #      `unwrap_or_default()` -- which for a `[u8; N]` means all zeros.
 #   3. A seeded, reproducible PRNG (`seed_from_u64`, `from_seed`, `SmallRng`)
 #      standing in for the OS RNG. Fine in tests, never in production.
+#   5. The panicking draw (`crypto::random_bytes`) used where the caller could
+#      have propagated instead. It aborts the process on a health-check failure,
+#      which is fail-closed but ungraceful: across a uniffi boundary it becomes
+#      an app abort, and in a long-running signer it kills the service. Prefer
+#      `try_random_bytes`; opt out where the signature genuinely cannot carry a
+#      `Result`.
 #   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
 #      randomness with timing jitter and process context, so its output looks
 #      random even when a source has degraded -- the health check is what makes
@@ -349,7 +355,31 @@ else
   fi
 fi
 
+# --------------------------------------------- 5. the panicking draw ---------
+# `random_bytes` is `try_random_bytes().expect(..)`. Panicking on a degraded RNG
+# is the right direction -- it refuses to hand out a key rather than hand out a
+# predictable one -- but it is the blunt version of it. Across uniffi a panic
+# becomes an app abort, and in the bunker it takes down a running signer, so a
+# caller that can return an error should.
+#
+# Single-pattern like rule 3: there is no "handled" spelling of this call, only
+# the fallible sibling or a deliberate opt-out. `crypto::try_random_bytes` does
+# not contain the literal `crypto::random_bytes`, so the fallible form is not
+# matched.
+#
+# The optional `::` is load-bearing. Nearly every call here is a turbofish
+# (`random_bytes::<32>()`), where the next character after the name is a colon,
+# so without it this rule matched only the bare-parenthesis spelling and sailed
+# straight past the sites it exists to find.
+panicking_bad=$(scan_rust '(crypto|entropy)::random_bytes(::)?[ \t]*[(<]') || {
+  fail "the scanner itself failed; refusing to report a clean tree"
+  exit 1
+}
+report "$panicking_bad" "panicking RNG draw where the error could have propagated:" \
+  'use keep_core::crypto::try_random_bytes::<N>()? and let the caller decide' \
+  "or, where the signature cannot carry a Result: // $OPT_OUT - <reason>"
+
 if [ "$status" -eq 0 ]; then
-  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, entropy gate intact on $gate_ok entry points)"
+  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, entropy gate intact on $gate_ok entry points)"
 fi
 exit "$status"

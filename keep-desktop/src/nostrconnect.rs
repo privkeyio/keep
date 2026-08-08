@@ -213,8 +213,14 @@ async fn send_nostrconnect_response(
 ) -> Result<(), String> {
     let keys = Keys::new(server.transport_secret());
 
+    // Fallible rather than panicking: the RNG health check firing means the
+    // source is degraded, and aborting the process is a heavier answer than
+    // failing the one response that needed the id.
+    let response_id =
+        keep_core::crypto::try_random_bytes::<16>().map_err(|e| format!("response id: {e}"))?;
+
     let response = serde_json::json!({
-        "id": hex::encode(keep_core::crypto::random_bytes::<16>()),
+        "id": hex::encode(response_id),
         "result": request.secret,
     });
     let response_json =

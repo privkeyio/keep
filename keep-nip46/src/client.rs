@@ -323,7 +323,7 @@ impl Nip46Client {
         if let Some(ref s) = self.secret {
             params.push(Zeroizing::new(s.as_str().to_string()));
         }
-        let id = new_request_id();
+        let id = new_request_id()?;
         let response = self.request(&id, "connect", params).await?;
         match (response.result.as_deref(), response.error.as_deref()) {
             (Some(_), None) => Ok(()),
@@ -347,7 +347,7 @@ impl Nip46Client {
     ) -> Result<RegisterWalletResponse> {
         validate_register_wallet_args(name, descriptor)?;
 
-        let id = new_request_id();
+        let id = new_request_id()?;
         let mut response = self
             .request_with_timeout(
                 &id,
@@ -405,7 +405,7 @@ impl Nip46Client {
     /// and fall back to user-supplied values rather than aborting wallet
     /// registration.
     pub async fn get_device_info(&self) -> Result<DeviceInfo> {
-        let id = new_request_id();
+        let id = new_request_id()?;
         let response = self
             .request_with_timeout(&id, "get_device_info", Vec::new(), GET_DEVICE_INFO_TIMEOUT)
             .await?;
@@ -500,7 +500,7 @@ impl Nip46Client {
             )));
         }
 
-        let id = new_request_id();
+        let id = new_request_id()?;
         let mut response = self
             .request_with_timeout(
                 &id,
@@ -679,8 +679,8 @@ impl Nip46Client {
     }
 }
 
-fn new_request_id() -> String {
-    hex::encode(keep_core::crypto::random_bytes::<16>())
+fn new_request_id() -> Result<String> {
+    Ok(hex::encode(keep_core::crypto::try_random_bytes::<16>()?))
 }
 
 /// JSON-escape `value` and append the quoted result to `buf`. The intermediate
@@ -822,8 +822,8 @@ mod tests {
 
     #[test]
     fn test_new_request_id_is_unique() {
-        let a = new_request_id();
-        let b = new_request_id();
+        let a = new_request_id().unwrap();
+        let b = new_request_id().unwrap();
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
     }
