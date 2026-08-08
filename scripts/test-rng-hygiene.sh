@@ -156,6 +156,34 @@ run_probe $SRC/probe_optout.rs 'fn f()->[u8;32]{
 }
 ' pass "a panicking draw with a stated reason"
 
+echo "== the health check must sample the OS (rule 6) =="
+
+probe_rule6() { # $1 = body, $2 = pass|fail, $3 = description
+    local body="$1" expect="$2" desc="$3" out rc
+    local fixture="$TMPD/entropy_fixture.rs"
+    printf 'fn gather_os_entropy(pool: &mut [u8]) {\n%s\n}\n' "$body" > "$fixture"
+    out=$(ENTROPY_MODULE="$fixture" "$GUARD" 2>&1); rc=$?
+    if [ "$expect" = fail ]; then
+        if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'does not sample the OS'; then
+            echo "  ok: $desc"
+        else
+            echo "  FAIL: $desc (guard did not report it)"; fails=$((fails + 1))
+        fi
+    else
+        if printf '%s' "$out" | grep -q 'does not sample the OS'; then
+            echo "  FAIL: $desc (guard reported it anyway)"; fails=$((fails + 1))
+        else
+            echo "  ok: $desc"
+        fi
+    fi
+}
+
+probe_rule6 '    rand::rng().fill_bytes(pool);' fail "a thread-local generator is not the OS"
+probe_rule6 '    SmallRng::from_entropy().fill_bytes(pool);' fail "any seeded generator is not the OS"
+probe_rule6 '    // SysRng would go here' fail "naming the OS in a comment is not calling it"
+probe_rule6 '    rand::rngs::SysRng.try_fill_bytes(pool).map_err(|_| E)?;' pass "SysRng is the OS interface"
+probe_rule6 '    getrandom::fill(pool)?;' pass "getrandom directly is the OS interface"
+
 echo
 if [ "$fails" -ne 0 ]; then
     echo "FAIL: $fails case(s) did not behave as required"

@@ -66,7 +66,10 @@ status=0
 fail() { printf '\n\033[31mFAIL\033[0m %s\n' "$1"; status=1; }
 
 OPT_OUT='rng-hygiene: ok'
-ENTROPY_MODULE='keep-core/src/entropy.rs'
+# Overridable so the probe suite can point rules 4 and 6 at a fixture. Those two
+# read a fixed path rather than the scanned file list, so without this they were
+# the only rules that could not be proven to still fail.
+ENTROPY_MODULE="${ENTROPY_MODULE:-keep-core/src/entropy.rs}"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
   printf '\n\033[31mFAIL\033[0m not inside a git work tree; this guard scans tracked files only\n'
@@ -413,7 +416,42 @@ report "$panicking_bad" "panicking RNG draw where the error could have propagate
   'use keep_core::crypto::try_random_bytes::<N>()? and let the caller decide' \
   "or, where the signature cannot carry a Result: // $OPT_OUT - <reason>"
 
+# ------------------------------------ 6. the health check samples the OS -----
+# The check is only worth running if it looks at the source the keys actually
+# come from. `gather_os_entropy` fed it `rand::rng()` for a long time, which is
+# a thread-local ChaCha12 seeded once from the OS: a kernel stuck on a constant
+# was expanded into a keystream that passes every criterion the check applies,
+# while FROST nonces, drawn from `getrandom` via OsRng, came out identical. The
+# check certified the expansion rather than the source.
+#
+# Structural rather than a grep for the bad call, so replacing it with any other
+# userspace generator is caught too: the sampler must name the OS interface.
+if [ -f "$ENTROPY_MODULE" ]; then
+  os_src=$(awk '
+    /^[ \t]*fn gather_os_entropy/ { inside = 1; found = 0; next }
+    inside && /^[ \t]*\}/ { print (found ? "OK" : "NOT-OS"); inside = 0 }
+    inside {
+      p = index($0, "//"); if (p > 0) $0 = substr($0, 1, p - 1)
+      if ($0 ~ /SysRng|getrandom/) found = 1
+    }
+    END { if (inside) print "UNTERMINATED" }
+  ' "$ENTROPY_MODULE") || { fail "rule 6 scanner failed on $ENTROPY_MODULE"; exit 1; }
+  case $os_src in
+    OK) ;;
+    NOT-OS)
+      fail "the entropy health check does not sample the OS:"
+      echo "  gather_os_entropy() in $ENTROPY_MODULE names no OS interface."
+      echo "  → it must draw through SysRng/getrandom. A seeded userspace"
+      echo "    generator expands a degraded source into output that passes"
+      echo "    every check here, which certifies the expansion, not the source." ;;
+    *)
+      fail "rule 6 could not find gather_os_entropy() in $ENTROPY_MODULE"
+      echo "  → the sampler was renamed or moved; update this rule deliberately"
+      echo "    rather than leaving it vacuous." ;;
+  esac
+fi
+
 if [ "$status" -eq 0 ]; then
-  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, entropy gate intact on $gate_ok entry points)"
+  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, health check samples the OS, entropy gate intact on $gate_ok entry points)"
 fi
 exit "$status"
