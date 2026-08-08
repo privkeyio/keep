@@ -158,10 +158,21 @@ run_probe $SRC/probe_optout.rs 'fn f()->[u8;32]{
 
 echo "== the health check must sample the OS (rule 6) =="
 
+# The fixture carries a rule-4-satisfying entry point as well, so a passing case
+# can require the guard to exit 0. Without it every fixture tripped rule 4 for
+# want of a gated entry point, the guard exited non-zero on every probe, and the
+# pass cases could only assert that one particular string was absent -- which
+# stayed true with rule 6 deleted outright.
 probe_rule6() { # $1 = body, $2 = pass|fail, $3 = description
     local body="$1" expect="$2" desc="$3" out rc
     local fixture="$TMPD/entropy_fixture.rs"
-    printf 'fn gather_os_entropy(pool: &mut [u8]) {\n%s\n}\n' "$body" > "$fixture"
+    {
+        printf 'fn gather_os_entropy(pool: &mut [u8]) {\n%s\n}\n' "$body"
+        printf 'pub fn draw() -> Result<(), E> {\n'
+        printf '    ensure_entropy_health()?;\n'
+        printf '    let _ = random_bytes_mixed_internal();\n'
+        printf '    Ok(())\n}\n'
+    } > "$fixture"
     out=$(ENTROPY_MODULE="$fixture" "$GUARD" 2>&1); rc=$?
     if [ "$expect" = fail ]; then
         if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'does not sample the OS'; then
@@ -170,10 +181,12 @@ probe_rule6() { # $1 = body, $2 = pass|fail, $3 = description
             echo "  FAIL: $desc (guard did not report it)"; fails=$((fails + 1))
         fi
     else
-        if printf '%s' "$out" | grep -q 'does not sample the OS'; then
-            echo "  FAIL: $desc (guard reported it anyway)"; fails=$((fails + 1))
-        else
+        if [ "$rc" -eq 0 ]; then
             echo "  ok: $desc"
+        else
+            echo "  FAIL: $desc (guard exited $rc)"
+            printf '%s\n' "$out" | sed 's/^/      /' | head -6
+            fails=$((fails + 1))
         fi
     fi
 }
@@ -194,6 +207,9 @@ probe_rule6 '    #[cfg(test)]
         let _ = 1;
     }
     rand::rngs::SysRng.try_fill_bytes(pool).map_err(|_| E)?;' pass "a nested block before the draw is not a finding"
+probe_rule6 '    let _ = rand::rngs::SysRng
+    ;
+    rand::rng().fill_bytes(pool);' fail "a receiver with no method call is not a draw"
 probe_rule6 '    getrandom::fill(pool)?;' pass "getrandom directly is the OS interface"
 
 echo

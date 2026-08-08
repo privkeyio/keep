@@ -19,6 +19,10 @@
 #      `unwrap_or_default()` -- which for a `[u8; N]` means all zeros.
 #   3. A seeded, reproducible PRNG (`seed_from_u64`, `from_seed`, `SmallRng`)
 #      standing in for the OS RNG. Fine in tests, never in production.
+#   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
+#      randomness with timing jitter and process context, so its output looks
+#      random even when a source has degraded -- the health check is what makes
+#      the degradation visible, and every public entry point must run it.
 #   5. The panicking draw (`crypto::random_bytes`) used where the caller could
 #      have propagated instead. It aborts the process on a health-check failure,
 #      which is fail-closed but ungraceful: uniffi catches the unwind and
@@ -26,10 +30,11 @@
 #      in a long-running signer it takes down whichever task drew. Prefer
 #      `try_random_bytes`; opt out where the signature genuinely cannot carry a
 #      `Result`.
-#   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
-#      randomness with timing jitter and process context, so its output looks
-#      random even when a source has degraded -- the health check is what makes
-#      the degradation visible, and every public entry point must run it.
+#   6. The health check sampling something other than the OS. It read
+#      `rand::rng()`, a thread-local ChaCha12 seeded once from the OS, so a
+#      kernel stuck on a constant was expanded into a keystream that passed
+#      every criterion while the nonces drawn from `getrandom` were identical.
+#      The sampler must call the OS interface.
 #
 # Deliberate non-crypto randomness (backoff jitter, sampling) is allowed with an
 # inline opt-out on the same line, in the comment block directly above, or on any
@@ -52,7 +57,8 @@
 # whether a checked draw is used correctly once generated, nor whether a value
 # reaches the right place. It does not inspect dependencies, so a crate that
 # degrades its own RNG internally is invisible here. Rule 4 checks that the gate
-# is called, not that the health check itself is sound.
+# is called, not that the health check itself is sound, and rule 6 checks that
+# the sampler calls the OS, not that what it returns is what reaches the buffer.
 #
 # Portable to BSD awk and BSD xargs (developers run this on macOS), so: no gawk
 # extensions, and no `xargs -r`.
@@ -459,16 +465,24 @@ if [ -f "$ENTROPY_MODULE" ]; then
       return n
     }
     !inside && $0 ~ /(^|[^a-zA-Z0-9_])fn[ \t]+gather_os_entropy[ \t]*\(/ {
-      inside = 1; found = 0; depth = 0; started = 0
+      inside = 1; found = 0; depth = 0; started = 0; pending = 0
     }
     inside {
       code = strip($0)
       # A call, not a mention: `SysRng.method(` or `getrandom::fill(`.
-      # `SysRng` then end-of-line counts: rustfmt puts the receiver and the
-      # `.try_fill_bytes(..)` on separate lines, so requiring the dot on the
-      # same line rejected the real function. A trailing `;` (a bare `use`)
-      # matches neither branch, so an import still does not count as a call.
-      if (code ~ /SysRng[ \t]*(\.|$)/ || code ~ /getrandom[a-z_:]*[ \t]*\(/) found = 1
+      # A call, not a mention. rustfmt puts the receiver and the
+      # `.try_fill_bytes(..)` on separate lines, so a receiver at end of line is
+      # held pending and counts only once an invoked method follows it. Accepting
+      # it outright let a bare `let _ = SysRng;` stand in for the draw.
+      if (code ~ /SysRng[ \t]*\./ || code ~ /getrandom[a-z_:]*[ \t]*\(/) {
+        found = 1; pending = 0
+      } else if (code ~ /SysRng[ \t]*$/) {
+        pending = 1
+      } else if (pending && code ~ /^[ \t]*\.[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\(/) {
+        found = 1; pending = 0
+      } else if (code ~ /[^ \t]/) {
+        pending = 0
+      }
       depth += count(code, "{") - count(code, "}")
       if (count(code, "{") > 0) started = 1
       if (started && depth <= 0) {
