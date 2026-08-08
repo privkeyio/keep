@@ -218,6 +218,16 @@ impl KfpNode {
             return Ok(());
         }
 
+        // A latched node stops refilling. Otherwise it keeps drawing from the
+        // degraded source and broadcasting the results every interval, which
+        // under a stuck source means publishing the same commitment repeatedly
+        // and advertising the failure to the whole group.
+        if self.is_entropy_degraded() {
+            return Err(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; not replenishing nonces".into(),
+            ));
+        }
+
         let key_package = self.share.key_package()?;
         let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
@@ -2199,6 +2209,20 @@ mod gate_tests {
             Ok(crate::node::KfpNodeEvent::EntropyDegraded)
         ));
         assert!(rx.try_recv().is_err(), "the second mark must not re-alert");
+    }
+
+    /// A latched node stops refilling its pool. Left running it would keep
+    /// drawing from the degraded source and broadcasting the results, which
+    /// under a stuck source publishes the same commitment over and over.
+    #[tokio::test]
+    async fn replenish_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        assert!(matches!(
+            node.replenish_nonce_pool().await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.

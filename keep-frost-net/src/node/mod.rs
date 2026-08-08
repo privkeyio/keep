@@ -2293,15 +2293,17 @@ impl KfpNode {
                     self.spawn_announce();
                 }
                 _ = replenish_interval.tick() => {
+                    // Unconditional, because a draw is not a substitute. The
+                    // gate inside `try_random_bytes` re-runs the real check only
+                    // on a pid change or every few thousand generations, so a
+                    // node under steady signing load, which is the one always
+                    // holding a deficit, would go hours between actual checks.
+                    // Probing here costs a handful of syscalls per interval.
+                    self.probe_entropy_health();
                     if self.nonce_pool.own_deficit() > 0 {
                         if let Err(e) = self.replenish_nonce_pool().await {
                             warn!(error = %e, "Failed to replenish nonce pool");
                         }
-                    } else {
-                        // Drawing already health-checks, so probe only on the
-                        // ticks where nothing was drawn. Either way the source
-                        // is checked once per interval, at roughly constant cost.
-                        self.probe_entropy_health();
                     }
                 }
                 _ = cleanup_interval.tick() => {
