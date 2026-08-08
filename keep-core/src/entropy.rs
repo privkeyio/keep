@@ -3,7 +3,6 @@
 #![allow(unsafe_code)]
 
 use blake2::{Blake2b512, Digest};
-use rand::Rng;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -32,7 +31,8 @@ fn gather_os_entropy(pool: &mut [u8]) -> Result<(), EntropyHealthError> {
     use rand::TryRng;
     rand::rngs::SysRng
         .try_fill_bytes(pool)
-        .map_err(|_| EntropyHealthError)
+        .map_err(|_| EntropyHealthError)?;
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
