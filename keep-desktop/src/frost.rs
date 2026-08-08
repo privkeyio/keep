@@ -748,6 +748,18 @@ fn handle_node_event(
                 ),
             );
         }
+        // The OS RNG failed its health check, so this node has stopped
+        // signing. Surfaced as an error because it is not self-correcting:
+        // it holds until the machine's entropy source is fixed and the node
+        // restarted.
+        KfpNodeEvent::EntropyDegraded => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                "RNG HEALTH CHECK FAILED: co-signing refused on this node".to_string(),
+            );
+        }
         // Threshold-OPRF unlock events are not surfaced in the
         // desktop UI yet (KeepNode appliance flow).
         KfpNodeEvent::OprfEvalRequested { .. }

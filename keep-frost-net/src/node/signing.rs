@@ -218,10 +218,29 @@ impl KfpNode {
             return Ok(());
         }
 
+        // A latched node stops refilling. Otherwise it keeps drawing from the
+        // degraded source and broadcasting the results every interval, which
+        // under a stuck source means publishing the same commitment repeatedly
+        // and advertising the failure to the whole group.
+        if self.is_entropy_degraded() {
+            return Err(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; not replenishing nonces".into(),
+            ));
+        }
+
         let key_package = self.share.key_package()?;
         let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
-            let nonce_id: NonceId = keep_core::crypto::try_random_bytes::<32>()?;
+            // Drawn through the entropy module rather than the crypto wrapper
+            // so the health failure keeps its own type. The wrapper flattens it
+            // into a stringly-typed encryption error, and deciding to stop
+            // signing on a string match is exactly the guess this refuses to make.
+            let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>().map_err(|e| {
+                if Self::latches_signing(e) {
+                    self.mark_entropy_degraded();
+                }
+                FrostNetError::Session(format!("nonce id: {e}"))
+            })?;
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
             self.nonce_pool.store_own(nonce_id, nonces);
@@ -259,7 +278,16 @@ impl KfpNode {
     /// when a peer is newly discovered after the pool was already replenished,
     /// so it does not have to wait for the next replenish broadcast (which only
     /// carries freshly generated commitments) to enable instant signing.
+    /// Publishes this node's pooled commitments to a peer.
+    ///
+    /// Refuses once latched: the pool can still hold commitments drawn in the
+    /// window before detection, and handing those to a newly discovered peer
+    /// advertises exactly what the replenish gate stops broadcasting.
     pub(crate) async fn send_nonce_pool_to(&self, pubkey: &PublicKey) -> Result<()> {
+        if self.is_entropy_degraded() {
+            return Ok(());
+        }
+
         let available = self.nonce_pool.own_commitments();
         if available.is_empty() {
             return Ok(());
@@ -412,6 +440,17 @@ impl KfpNode {
     ) -> Result<()> {
         if request.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        // Fail closed on a degraded RNG. Round 1 draws this node's nonce from
+        // OsRng, which is not health-checked at the point of use, so once the
+        // source is known bad the only safe move is to stop signing: two shares
+        // over one nonce recover the key.
+        if self.is_entropy_degraded() {
+            debug!("Rejecting sign request: OS RNG degraded");
+            return Err(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; co-signing refused".into(),
+            ));
         }
 
         // Fail closed under duress: a verified duress beacon freezes co-signing
@@ -1408,6 +1447,14 @@ impl KfpNode {
         logical_id: [u8; 32],
         attempt: usize,
     ) -> std::result::Result<[u8; 64], SigningRoundError> {
+        // Fatal, not retryable: failover re-samples the participant set, and no
+        // set can be signed for while this node's own nonce source is degraded.
+        if self.is_entropy_degraded() {
+            return Err(SigningRoundError::fatal(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; signing refused".into(),
+            )));
+        }
+
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) = self
@@ -2110,6 +2157,109 @@ mod gate_tests {
             node.handle_sign_request(from, req).await,
             Err(FrostNetError::PolicyViolation(_))
         ));
+    }
+
+    /// A node whose RNG failed its health check refuses to co-sign. Round 1
+    /// draws this node's nonce from `OsRng`, which is not health-checked where
+    /// it is used, so the latch is the only thing standing between a degraded
+    /// source and a signature. Two shares over one nonce recover the key, which
+    /// is why this refuses rather than degrades.
+    #[tokio::test]
+    async fn handle_sign_request_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        let group = *node.group_pubkey();
+        assert!(!node.is_entropy_degraded(), "must start healthy");
+
+        node.mark_entropy_degraded();
+        assert!(node.is_entropy_degraded(), "the latch must hold");
+
+        let from = Keys::generate().public_key();
+        let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    /// The latch also stops this node initiating a round of its own. Refusing
+    /// only inbound requests would leave the path that draws a nonce at
+    /// `signing_round` wide open, which is the same nonce from the same source.
+    #[tokio::test]
+    async fn signing_round_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        let err = node
+            .signing_round(vec![0u8; 32], "test", None, vec![], &[], [0u8; 32], 0)
+            .await
+            .expect_err("a degraded node must not start a round");
+        // A PolicyViolation, specifically. The retry loop above only fails over
+        // on Timeout and InsufficientPeers, so this variant ends the attempt
+        // instead of re-sampling a participant set that cannot help: the
+        // degraded source is local, and every candidate set draws from it.
+        assert!(
+            matches!(err.error, FrostNetError::PolicyViolation(_)),
+            "expected a policy refusal, got {:?}",
+            err.error
+        );
+    }
+
+    /// Latching twice alerts once. The probe runs on a timer, so an unguarded
+    /// mark would emit an event per tick for as long as the node stays up and
+    /// push the rest of the signing history out of any bounded consumer.
+    #[tokio::test]
+    async fn marking_entropy_degraded_twice_alerts_once() {
+        let (node, _relay) = test_node().await;
+        let mut rx = node.subscribe();
+
+        node.mark_entropy_degraded();
+        node.mark_entropy_degraded();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::node::KfpNodeEvent::EntropyDegraded)
+        ));
+        assert!(rx.try_recv().is_err(), "the second mark must not re-alert");
+    }
+
+    /// A latched node stops refilling its pool. Left running it would keep
+    /// drawing from the degraded source and broadcasting the results, which
+    /// under a stuck source publishes the same commitment over and over.
+    #[tokio::test]
+    async fn replenish_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        assert!(matches!(
+            node.replenish_nonce_pool().await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    /// A source that could not be read is not a source that answered badly.
+    /// Latching on the former turns a transient fault, an exhausted descriptor
+    /// table or a container with no `/dev`, into an outage only an operator can
+    /// clear. Only the statistical verdict is permanent.
+    #[test]
+    fn only_a_degraded_source_latches_signing() {
+        use keep_core::entropy::EntropyHealthError;
+
+        assert!(KfpNode::latches_signing(EntropyHealthError::Degraded));
+        assert!(!KfpNode::latches_signing(EntropyHealthError::Unavailable));
+    }
+
+    /// A latched node stops handing its pooled commitments to newly discovered
+    /// peers. The pool can still hold nonces drawn in the window before
+    /// detection, and publishing those is what the replenish gate exists to stop.
+    #[tokio::test]
+    async fn nonce_pool_is_not_published_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        assert!(node
+            .send_nonce_pool_to(&Keys::generate().public_key())
+            .await
+            .is_ok());
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.

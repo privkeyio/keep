@@ -19,6 +19,10 @@
 #      `unwrap_or_default()` -- which for a `[u8; N]` means all zeros.
 #   3. A seeded, reproducible PRNG (`seed_from_u64`, `from_seed`, `SmallRng`)
 #      standing in for the OS RNG. Fine in tests, never in production.
+#   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
+#      randomness with timing jitter and process context, so its output looks
+#      random even when a source has degraded -- the health check is what makes
+#      the degradation visible, and every public entry point must run it.
 #   5. The panicking draw (`crypto::random_bytes`) used where the caller could
 #      have propagated instead. It aborts the process on a health-check failure,
 #      which is fail-closed but ungraceful: uniffi catches the unwind and
@@ -26,10 +30,11 @@
 #      in a long-running signer it takes down whichever task drew. Prefer
 #      `try_random_bytes`; opt out where the signature genuinely cannot carry a
 #      `Result`.
-#   4. keep-core's entropy gate. `random_bytes_mixed_internal()` mixes OS
-#      randomness with timing jitter and process context, so its output looks
-#      random even when a source has degraded -- the health check is what makes
-#      the degradation visible, and every public entry point must run it.
+#   6. The health check sampling something other than the OS. It read
+#      `rand::rng()`, a thread-local ChaCha12 seeded once from the OS, so a
+#      kernel stuck on a constant was expanded into a keystream that passed
+#      every criterion while the nonces drawn from `getrandom` were identical.
+#      The sampler must call the OS interface.
 #
 # Deliberate non-crypto randomness (backoff jitter, sampling) is allowed with an
 # inline opt-out on the same line, in the comment block directly above, or on any
@@ -52,7 +57,8 @@
 # whether a checked draw is used correctly once generated, nor whether a value
 # reaches the right place. It does not inspect dependencies, so a crate that
 # degrades its own RNG internally is invisible here. Rule 4 checks that the gate
-# is called, not that the health check itself is sound.
+# is called, not that the health check itself is sound, and rule 6 checks that
+# the sampler calls the OS, not that what it returns is what reaches the buffer.
 #
 # Portable to BSD awk and BSD xargs (developers run this on macOS), so: no gawk
 # extensions, and no `xargs -r`.
@@ -66,7 +72,10 @@ status=0
 fail() { printf '\n\033[31mFAIL\033[0m %s\n' "$1"; status=1; }
 
 OPT_OUT='rng-hygiene: ok'
-ENTROPY_MODULE='keep-core/src/entropy.rs'
+# Overridable so the probe suite can point rules 4 and 6 at a fixture. Those two
+# read a fixed path rather than the scanned file list, so without this they were
+# the only rules that could not be proven to still fail.
+ENTROPY_MODULE="${ENTROPY_MODULE:-keep-core/src/entropy.rs}"
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
   printf '\n\033[31mFAIL\033[0m not inside a git work tree; this guard scans tracked files only\n'
@@ -413,7 +422,92 @@ report "$panicking_bad" "panicking RNG draw where the error could have propagate
   'use keep_core::crypto::try_random_bytes::<N>()? and let the caller decide' \
   "or, where the signature cannot carry a Result: // $OPT_OUT - <reason>"
 
+# ------------------------------------ 6. the health check samples the OS -----
+# The check is only worth running if it looks at the source the keys actually
+# come from. `gather_os_entropy` fed it `rand::rng()` for a long time, which is
+# a thread-local ChaCha12 seeded once from the OS: a kernel stuck on a constant
+# was expanded into a keystream that passes every criterion the check applies,
+# while FROST nonces, drawn from `getrandom` via OsRng, came out identical. The
+# check certified the expansion rather than the source.
+#
+# Inverted rather than a grep for the bad call, so replacing it with any other
+# userspace generator is caught too: the sampler must call the OS interface.
+#
+# What it does not cover, stated so a green run is not read as more than it is:
+# it checks that an OS call appears in the body, not that the value it produces
+# is the one written to `pool`. A dead call alongside a bad draw satisfies it.
+# Closing that needs a parser, and the shape it would catch is deliberate rather
+# than accidental; the regression this exists to stop is someone quietly putting
+# a thread-local generator back, which it does catch.
+if [ -f "$ENTROPY_MODULE" ]; then
+  # Brace-depth scoped, comment- and string-stripped, and a CALL is required:
+  # naming the OS in a log message satisfied an earlier version of this, and
+  # terminating on the first line-initial `}` reported correct code whenever the
+  # body opened any nested block (a `#[cfg]` arm, an early return) before the
+  # draw. Both were verified against fixtures.
+  os_src=$(awk '
+    function strip(s,   p, out, i, c, instr, q) {
+      p = index(s, "//"); if (p > 0) s = substr(s, 1, p - 1)
+      out = ""; instr = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (instr) { if (c == "\\") { i++; continue }
+                     if (c == q) instr = 0
+                     continue }
+        if (c == "\"" || c == "\x27") { instr = 1; q = c; continue }
+        out = out c
+      }
+      return out
+    }
+    function count(s, ch,   i, n) {
+      n = 0
+      for (i = length(s); i > 0; i--) if (substr(s, i, 1) == ch) n++
+      return n
+    }
+    !inside && $0 ~ /(^|[^a-zA-Z0-9_])fn[ \t]+gather_os_entropy[ \t]*\(/ {
+      inside = 1; found = 0; depth = 0; started = 0; pending = 0
+    }
+    inside {
+      code = strip($0)
+      # A call, not a mention: `SysRng.method(` or `getrandom::fill(`.
+      # A call, not a mention. rustfmt puts the receiver and the
+      # `.try_fill_bytes(..)` on separate lines, so a receiver at end of line is
+      # held pending and counts only once an invoked method follows it. Accepting
+      # it outright let a bare `let _ = SysRng;` stand in for the draw.
+      if (code ~ /SysRng[ \t]*\./ || code ~ /getrandom[a-z_:]*[ \t]*\(/) {
+        found = 1; pending = 0
+      } else if (code ~ /SysRng[ \t]*$/) {
+        pending = 1
+      } else if (pending && code ~ /^[ \t]*\.[a-zA-Z_][a-zA-Z0-9_]*[ \t]*\(/) {
+        found = 1; pending = 0
+      } else if (code ~ /[^ \t]/) {
+        pending = 0
+      }
+      depth += count(code, "{") - count(code, "}")
+      if (count(code, "{") > 0) started = 1
+      if (started && depth <= 0) {
+        print (found ? "OK" : "NOT-OS"); inside = 0
+      }
+      next
+    }
+    END { if (inside) print "UNTERMINATED" }
+  ' "$ENTROPY_MODULE") || { fail "rule 6 scanner failed on $ENTROPY_MODULE"; exit 1; }
+  case $os_src in
+    OK) ;;
+    NOT-OS)
+      fail "the entropy health check does not sample the OS:"
+      echo "  gather_os_entropy() in $ENTROPY_MODULE names no OS interface."
+      echo "  → it must draw through SysRng/getrandom. A seeded userspace"
+      echo "    generator expands a degraded source into output that passes"
+      echo "    every check here, which certifies the expansion, not the source." ;;
+    *)
+      fail "rule 6 could not find gather_os_entropy() in $ENTROPY_MODULE"
+      echo "  → the sampler was renamed or moved; update this rule deliberately"
+      echo "    rather than leaving it vacuous." ;;
+  esac
+fi
+
 if [ "$status" -eq 0 ]; then
-  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, entropy gate intact on $gate_ok entry points)"
+  echo "RNG hygiene: OK (getrandom errors handled, no swallowed failures, no seeded PRNGs, no unpropagated panicking draws, health check samples the OS, entropy gate intact on $gate_ok entry points)"
 fi
 exit "$status"

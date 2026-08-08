@@ -3,7 +3,6 @@
 #![allow(unsafe_code)]
 
 use blake2::{Blake2b512, Digest};
-use rand::Rng;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -17,8 +16,23 @@ fn hash_to_32(hasher: Blake2b512) -> [u8; 32] {
     output
 }
 
-fn gather_os_entropy(pool: &mut [u8]) {
-    rand::rng().fill_bytes(pool);
+/// Fills `pool` straight from the operating system.
+///
+/// `SysRng` is the stateless OS interface: every call is a `getrandom` syscall.
+/// It is deliberately NOT `rand::rng()`, which is a thread-local ChaCha12
+/// seeded once from the OS and reseeded only every 64 KiB. Sampling that
+/// instead measured a userspace stream cipher, so a kernel source stuck on a
+/// constant would be expanded into output that is non-zero, distinct per draw
+/// and far apart pairwise: the health check below would pass while every FROST
+/// nonce, drawn from `OsRng` and thus from `getrandom`, came out identical.
+/// A check that cannot observe the source it is certifying is the same shape as
+/// the bug the whole module exists to catch.
+fn gather_os_entropy(pool: &mut [u8]) -> Result<(), EntropyHealthError> {
+    use rand::TryRng;
+    rand::rngs::SysRng
+        .try_fill_bytes(pool)
+        .map_err(|_| EntropyHealthError::Unavailable)?;
+    Ok(())
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -194,12 +208,12 @@ fn ensure_entropy_health() -> Result<(), EntropyHealthError> {
 /// Returns an error if the RNG health check fails.
 pub fn random_bytes_mixed() -> Result<[u8; 32], EntropyHealthError> {
     ensure_entropy_health()?;
-    Ok(random_bytes_mixed_internal())
+    random_bytes_mixed_internal()
 }
 
-fn random_bytes_mixed_internal() -> [u8; 32] {
+fn random_bytes_mixed_internal() -> Result<[u8; 32], EntropyHealthError> {
     let mut os_pool = [0u8; POOL_SIZE];
-    gather_os_entropy(&mut os_pool);
+    gather_os_entropy(&mut os_pool)?;
 
     let mut rdrand_pool = [0u8; 16];
     let has_rdrand = gather_rdrand(&mut rdrand_pool);
@@ -208,9 +222,9 @@ fn random_bytes_mixed_internal() -> [u8; 32] {
     let context = gather_process_context();
 
     if has_rdrand {
-        mix_entropy(&[&os_pool, &timing, &context, &rdrand_pool])
+        Ok(mix_entropy(&[&os_pool, &timing, &context, &rdrand_pool]))
     } else {
-        mix_entropy(&[&os_pool, &timing, &context])
+        Ok(mix_entropy(&[&os_pool, &timing, &context]))
     }
 }
 
@@ -226,12 +240,12 @@ pub fn try_random_bytes<const N: usize>() -> Result<[u8; N], EntropyHealthError>
     let mut output = [0u8; N];
 
     if N <= 32 {
-        output.copy_from_slice(&random_bytes_mixed_internal()[..N]);
+        output.copy_from_slice(&random_bytes_mixed_internal()?[..N]);
         return Ok(output);
     }
 
     for (counter, chunk) in output.chunks_mut(32).enumerate() {
-        let block = random_bytes_mixed_internal();
+        let block = random_bytes_mixed_internal()?;
         let mut hasher = Blake2b512::new();
         hasher.update(block);
         hasher.update((counter as u64).to_le_bytes());
@@ -255,16 +269,33 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     try_random_bytes().expect("RNG health check failed: constant or zero output detected")
 }
 
-/// Error returned when RNG health check fails.
-#[derive(Debug, Clone, Copy)]
-pub struct EntropyHealthError;
+/// Why a draw could not be trusted.
+///
+/// The two arms are kept apart because they call for different responses. A
+/// source that answered with constant output is a property of the machine and
+/// will not improve on its own, so a co-signer should stop and stay stopped.
+/// A call that failed to complete is a different statement, closer to "no file
+/// descriptors" than to "the kernel is broken", and treating it as permanent
+/// turns a transient fault into an outage that needs an operator to clear.
+/// They also read differently in a log, which matters when someone is trying to
+/// work out what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyHealthError {
+    /// The source answered, and what it returned failed the health criteria.
+    Degraded,
+    /// The source could not be read at all.
+    Unavailable,
+}
 
 impl std::fmt::Display for EntropyHealthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "RNG health check failed: constant or zero output detected"
-        )
+        match self {
+            Self::Degraded => write!(
+                f,
+                "RNG health check failed: constant or zero output detected"
+            ),
+            Self::Unavailable => write!(f, "RNG unavailable: the OS refused to provide entropy"),
+        }
     }
 }
 
@@ -302,12 +333,12 @@ fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
 }
 
 /// Draws three samples straight from the OS RNG, with nothing mixed in.
-fn os_samples() -> [[u8; 32]; 3] {
-    std::array::from_fn(|_| {
-        let mut buf = [0u8; 32];
-        gather_os_entropy(&mut buf);
-        buf
-    })
+fn os_samples() -> Result<[[u8; 32]; 3], EntropyHealthError> {
+    let mut samples = [[0u8; 32]; 3];
+    for sample in &mut samples {
+        gather_os_entropy(sample)?;
+    }
+    Ok(samples)
 }
 
 fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
@@ -318,15 +349,18 @@ fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
     // non-zero and ~128 bits apart even if gather_os_entropy() wrote a constant.
     // A gate that can only observe the combiner is the same shape as the bug
     // this whole check exists to catch.
-    if !samples_look_random(&os_samples()) {
-        return Err(EntropyHealthError);
+    if !samples_look_random(&os_samples()?) {
+        return Err(EntropyHealthError::Degraded);
     }
 
     // The mixed output is checked too, which catches a broken mixer rather than
     // a broken source.
-    let mixed: [[u8; 32]; 3] = std::array::from_fn(|_| random_bytes_mixed_internal());
+    let mut mixed = [[0u8; 32]; 3];
+    for block in &mut mixed {
+        *block = random_bytes_mixed_internal()?;
+    }
     if !samples_look_random(&mixed) {
-        return Err(EntropyHealthError);
+        return Err(EntropyHealthError::Degraded);
     }
 
     Ok(())
@@ -474,8 +508,40 @@ mod tests {
         );
 
         assert!(
-            samples_look_random(&os_samples()),
+            samples_look_random(&os_samples().expect("the OS RNG is available")),
             "a healthy OS RNG passes"
+        );
+    }
+
+    /// Why [`gather_os_entropy`] must call the OS and not a userspace generator.
+    ///
+    /// A constant source is caught. The same constant used as a stream cipher
+    /// key is not: the keystream is non-zero, distinct per draw and far apart
+    /// pairwise, so it sails through every criterion here. That is exactly what
+    /// sampling `rand::rng()` did, since it is a thread-local ChaCha12 seeded
+    /// once from the OS. The check certified the expansion instead of the
+    /// source, and a kernel stuck on a constant would have passed while every
+    /// nonce drawn from `getrandom` came out identical.
+    #[test]
+    fn a_stream_cipher_hides_the_constant_source_it_was_seeded_from() {
+        use chacha20::cipher::{KeyIvInit, StreamCipher};
+
+        let stuck = [[7u8; 32]; 3];
+        assert!(
+            !samples_look_random(&stuck),
+            "the raw constant source must be caught"
+        );
+
+        let mut expanded = [[0u8; 32]; 3];
+        let mut cipher = chacha20::ChaCha20::new(&[7u8; 32].into(), &[0u8; 12].into());
+        for block in &mut expanded {
+            cipher.apply_keystream(block);
+        }
+
+        assert!(
+            samples_look_random(&expanded),
+            "expanding that same constant defeats the check, which is why the \
+             sample must come from the OS rather than from a seeded generator"
         );
     }
 }
