@@ -1292,8 +1292,13 @@ mod tests {
     fn entropy_health_error_maps_to_keep_encryption_error() {
         // The RNG-failure path returns a recoverable error rather than panicking
         // (#685); it surfaces as a crypto/encryption-class KeepError.
-        let err = crate::error::KeepError::from(crate::entropy::EntropyHealthError);
-        assert!(matches!(err, crate::error::KeepError::Encryption(_)));
+        for e in [
+            crate::entropy::EntropyHealthError::Degraded,
+            crate::entropy::EntropyHealthError::Unavailable,
+        ] {
+            let err = crate::error::KeepError::from(e);
+            assert!(matches!(err, crate::error::KeepError::Encryption(_)));
+        }
     }
 
     #[test]
