@@ -221,7 +221,14 @@ impl KfpNode {
         let key_package = self.share.key_package()?;
         let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
-            let nonce_id: NonceId = keep_core::crypto::try_random_bytes::<32>()?;
+            // Drawn through the entropy module rather than the crypto wrapper
+            // so the health failure keeps its own type. The wrapper flattens it
+            // into a stringly-typed encryption error, and deciding to stop
+            // signing on a string match is exactly the guess this refuses to make.
+            let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>().map_err(|e| {
+                self.mark_entropy_degraded();
+                FrostNetError::Session(format!("nonce id: {e}"))
+            })?;
             let (nonces, commitment) =
                 frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
             self.nonce_pool.store_own(nonce_id, nonces);
@@ -412,6 +419,17 @@ impl KfpNode {
     ) -> Result<()> {
         if request.group_pubkey != self.group_pubkey {
             return Ok(());
+        }
+
+        // Fail closed on a degraded RNG. Round 1 draws this node's nonce from
+        // OsRng, which is not health-checked at the point of use, so once the
+        // source is known bad the only safe move is to stop signing: two shares
+        // over one nonce recover the key.
+        if self.is_entropy_degraded() {
+            debug!("Rejecting sign request: OS RNG degraded");
+            return Err(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; co-signing refused".into(),
+            ));
         }
 
         // Fail closed under duress: a verified duress beacon freezes co-signing
@@ -1408,6 +1426,14 @@ impl KfpNode {
         logical_id: [u8; 32],
         attempt: usize,
     ) -> std::result::Result<[u8; 64], SigningRoundError> {
+        // Fatal, not retryable: failover re-samples the participant set, and no
+        // set can be signed for while this node's own nonce source is degraded.
+        if self.is_entropy_degraded() {
+            return Err(SigningRoundError::fatal(FrostNetError::PolicyViolation(
+                "OS RNG health check failed; signing refused".into(),
+            )));
+        }
+
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) = self
@@ -2110,6 +2136,69 @@ mod gate_tests {
             node.handle_sign_request(from, req).await,
             Err(FrostNetError::PolicyViolation(_))
         ));
+    }
+
+    /// A node whose RNG failed its health check refuses to co-sign. Round 1
+    /// draws this node's nonce from `OsRng`, which is not health-checked where
+    /// it is used, so the latch is the only thing standing between a degraded
+    /// source and a signature. Two shares over one nonce recover the key, which
+    /// is why this refuses rather than degrades.
+    #[tokio::test]
+    async fn handle_sign_request_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        let group = *node.group_pubkey();
+        assert!(!node.is_entropy_degraded(), "must start healthy");
+
+        node.mark_entropy_degraded();
+        assert!(node.is_entropy_degraded(), "the latch must hold");
+
+        let from = Keys::generate().public_key();
+        let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
+        assert!(matches!(
+            node.handle_sign_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    /// The latch also stops this node initiating a round of its own. Refusing
+    /// only inbound requests would leave the path that draws a nonce at
+    /// `signing_round` wide open, which is the same nonce from the same source.
+    #[tokio::test]
+    async fn signing_round_refused_when_entropy_degraded() {
+        let (node, _relay) = test_node().await;
+        node.mark_entropy_degraded();
+
+        let err = node
+            .signing_round(vec![0u8; 32], "test", None, vec![], &[], [0u8; 32], 0)
+            .await
+            .expect_err("a degraded node must not start a round");
+        // A PolicyViolation, specifically. The retry loop above only fails over
+        // on Timeout and InsufficientPeers, so this variant ends the attempt
+        // instead of re-sampling a participant set that cannot help: the
+        // degraded source is local, and every candidate set draws from it.
+        assert!(
+            matches!(err.error, FrostNetError::PolicyViolation(_)),
+            "expected a policy refusal, got {:?}",
+            err.error
+        );
+    }
+
+    /// Latching twice alerts once. The probe runs on a timer, so an unguarded
+    /// mark would emit an event per tick for as long as the node stays up and
+    /// push the rest of the signing history out of any bounded consumer.
+    #[tokio::test]
+    async fn marking_entropy_degraded_twice_alerts_once() {
+        let (node, _relay) = test_node().await;
+        let mut rx = node.subscribe();
+
+        node.mark_entropy_degraded();
+        node.mark_entropy_degraded();
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(crate::node::KfpNodeEvent::EntropyDegraded)
+        ));
+        assert!(rx.try_recv().is_err(), "the second mark must not re-alert");
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.

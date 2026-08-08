@@ -803,6 +803,12 @@ pub enum KfpNodeEvent {
     DuressFrozen {
         beacon_pubkey: PublicKey,
     },
+    /// The OS RNG health check failed: three raw samples came back constant,
+    /// repeated, or too close together. Signing is refused from here on. Not
+    /// cleared at runtime, because the condition means the source this node
+    /// draws every nonce from is untrustworthy, and resuming on a later sample
+    /// that happens to look fine is how a reused nonce gets signed.
+    EntropyDegraded,
 }
 
 impl std::fmt::Debug for KfpNodeEvent {
@@ -1016,6 +1022,7 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .debug_struct("DuressFrozen")
                 .field("beacon_pubkey", beacon_pubkey)
                 .finish(),
+            Self::EntropyDegraded => f.write_str("EntropyDegraded"),
         }
     }
 }
@@ -1100,6 +1107,9 @@ pub struct KfpNode {
     /// re-broadcast neither re-alerts nor does redundant unwrap/verify work.
     /// Sticky across reboot via the optional persister + the operator clear.
     duress_freeze: RwLock<Option<DuressFreeze>>,
+    /// Latched once the OS RNG health check fails. Sticky for the life of the
+    /// process: see [`KfpNodeEvent::EntropyDegraded`].
+    entropy_degraded: std::sync::atomic::AtomicBool,
     /// Optional durable sink for the freeze (see [`DuressPersister`]). `None`
     /// means the freeze is in-memory only (lost on restart).
     duress_persister: Option<DuressPersister>,
@@ -1352,6 +1362,7 @@ impl KfpNode {
             tpm_attestation_policy: None,
             duress_beacon_pins: None,
             duress_freeze: RwLock::new(None),
+            entropy_degraded: std::sync::atomic::AtomicBool::new(false),
             duress_persister: None,
             announce_attestor: None,
             announce_task: std::sync::Mutex::new(None),
@@ -1483,6 +1494,51 @@ impl KfpNode {
     /// Whether this holder is currently duress-frozen (refusing OPRF evals).
     pub fn is_duress_frozen(&self) -> bool {
         self.duress_freeze.read().is_some()
+    }
+
+    /// Whether the OS RNG has been observed failing its health check.
+    ///
+    /// Signing refuses while this holds. Nonce reuse from a degraded source
+    /// recovers the signing share outright, so refusing to sign is the only
+    /// answer that keeps the share safe; a node that cannot draw a trustworthy
+    /// nonce has nothing useful left to do with one.
+    pub fn is_entropy_degraded(&self) -> bool {
+        self.entropy_degraded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Latch the degraded flag and alert. Idempotent: only the first observation
+    /// emits, so a repeating probe cannot flood the event channel.
+    pub(crate) fn mark_entropy_degraded(&self) {
+        if self
+            .entropy_degraded
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        error!(
+            "OS RNG HEALTH CHECK FAILED: refusing to sign. Nonces drawn from a \
+             degraded source can be reused, and a reused nonce recovers this \
+             node's signing share."
+        );
+        if self.event_tx.send(KfpNodeEvent::EntropyDegraded).is_err() {
+            warn!("no subscriber for the entropy alert; the signing refusal still holds");
+        }
+    }
+
+    /// Probe the OS RNG directly and latch if it is degraded.
+    ///
+    /// Runs on the tick where the pool needed nothing, so a node whose pool
+    /// stays full still checks its RNG. Without this the only detector was a
+    /// draw, and a draw only happens when there is a deficit: a healthy-looking
+    /// idle node would never notice its source had failed.
+    pub(crate) fn probe_entropy_health(&self) {
+        if self.is_entropy_degraded() {
+            return;
+        }
+        if keep_core::entropy::check_entropy_health().is_err() {
+            self.mark_entropy_degraded();
+        }
     }
 
     /// The active duress freeze, if any (for alerting / persistence).
@@ -2241,6 +2297,11 @@ impl KfpNode {
                         if let Err(e) = self.replenish_nonce_pool().await {
                             warn!(error = %e, "Failed to replenish nonce pool");
                         }
+                    } else {
+                        // Drawing already health-checks, so probe only on the
+                        // ticks where nothing was drawn. Either way the source
+                        // is checked once per interval, at roughly constant cost.
+                        self.probe_entropy_health();
                     }
                 }
                 _ = cleanup_interval.tick() => {
