@@ -1526,10 +1526,20 @@ impl KfpNode {
         {
             return;
         }
+        // Refusing new work is not enough on its own. Detection lags the
+        // degradation by up to one probe interval, so anything already in
+        // flight may be holding nonces drawn inside that window, and a round
+        // that reaches round 2 emits a share over one. Both are torn down here
+        // rather than left to expire.
+        let abandoned = self.sessions.write().abandon_all();
+        self.nonce_pool.clear_own();
+
         error!(
-            "OS RNG HEALTH CHECK FAILED: refusing to sign. Nonces drawn from a \
-             degraded source can be reused, and a reused nonce recovers this \
-             node's signing share."
+            abandoned_sessions = abandoned,
+            "OS RNG HEALTH CHECK FAILED: refusing to sign, abandoning in-flight \
+             sessions and discarding pooled nonces. Nonces drawn from a degraded \
+             source can be reused, and a reused nonce recovers this node's \
+             signing share."
         );
         if self.event_tx.send(KfpNodeEvent::EntropyDegraded).is_err() {
             warn!("no subscriber for the entropy alert; the signing refusal still holds");

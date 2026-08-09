@@ -874,6 +874,15 @@ impl KfpNode {
         from: PublicKey,
         payload: CommitmentPayload,
     ) -> Result<()> {
+        // Gated as well as torn down. `mark_entropy_degraded` abandons active
+        // sessions, so this is normally unreachable, but it makes the property
+        // local: no commitment advances a round to round 2 while the latch
+        // holds, whatever raced with the teardown.
+        if self.is_entropy_degraded() {
+            debug!("Dropping commitment: OS RNG degraded");
+            return Ok(());
+        }
+
         self.verify_peer_share_index(from, payload.share_index)?;
 
         let commitment =
@@ -2260,6 +2269,47 @@ mod gate_tests {
             .send_nonce_pool_to(&Keys::generate().public_key())
             .await
             .is_ok());
+    }
+
+    /// Latching tears down what was already running, not just what arrives next.
+    ///
+    /// Detection lags the degradation by up to one probe interval, so a session
+    /// created before the latch may hold nonces drawn inside that window, and a
+    /// round that reaches round 2 emits a signature share over one. Refusing new
+    /// work while letting those finish would leave the exact shares this exists
+    /// to prevent.
+    #[tokio::test]
+    async fn latching_abandons_in_flight_sessions_and_pooled_nonces() {
+        let (node, _relay) = test_node().await;
+        let participants = vec![1u16, 2u16];
+        let message = vec![0u8; 32];
+
+        {
+            let mut sessions = node.sessions.write();
+            let id = crate::session::derive_session_id(&message, &participants, 2);
+            sessions
+                .create_session(id, message.clone(), 2, participants.clone())
+                .expect("session fixture");
+            assert!(sessions.get_session_mut(&id).is_some());
+        }
+        node.replenish_nonce_pool().await.expect("pool fixture");
+        assert!(
+            node.nonce_pool.own_available() > 0,
+            "the pool must hold nonces before the latch"
+        );
+
+        node.mark_entropy_degraded();
+
+        assert_eq!(
+            node.nonce_pool.own_available(),
+            0,
+            "pooled nonces drawn before detection must be discarded"
+        );
+        let id = crate::session::derive_session_id(&message, &participants, 2);
+        assert!(
+            node.sessions.write().get_session_mut(&id).is_none(),
+            "an in-flight session must be abandoned, not left to expire"
+        );
     }
 
     /// A stale sign request (created_at outside the replay window) is rejected.

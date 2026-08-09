@@ -824,6 +824,17 @@ impl SessionManager {
         self.active_sessions.remove(session_id);
     }
 
+    /// Abandon every active session, returning how many were dropped.
+    ///
+    /// Deliberately not routed through `complete_session`: these rounds did not
+    /// complete, and recording them as completed would enter their ids in the
+    /// replay history and mask a genuine later replay of the same request.
+    pub fn abandon_all(&mut self) -> usize {
+        let count = self.active_sessions.len();
+        self.active_sessions.clear();
+        count
+    }
+
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {
         self.active_sessions.remove(session_id);
 
