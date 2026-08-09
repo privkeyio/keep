@@ -243,6 +243,19 @@ impl NoncePool {
         inner.peer_order.retain(|(idx, _)| *idx != share_index);
     }
 
+    /// Discard every own nonce still held.
+    ///
+    /// For the case where the material itself is suspect rather than stale: a
+    /// nonce drawn from a source later found to be degraded cannot be told
+    /// apart from a sound one, so the whole pool goes. Dropping the secret
+    /// nonces also makes the advertised commitments unusable, since round 2
+    /// cannot run without them.
+    pub fn clear_own(&self) {
+        let mut inner = self.inner.lock();
+        inner.own.clear();
+        inner.own_order.clear();
+    }
+
     /// Reserve one available commitment per requested peer for a signing
     /// request, returning the chosen `nonce_id`s. The commitments are *removed*
     /// from the pool so they cannot be reused.
@@ -297,6 +310,27 @@ mod tests {
         let secret = shares.into_values().next().unwrap();
         let kp = KeyPackage::try_from(secret).unwrap();
         frost_secp256k1_tr::round1::commit(kp.signing_share(), &mut OsRng)
+    }
+
+    /// Discarding own nonces makes the advertised commitments unusable too:
+    /// round 2 cannot run without the secret half, so a commitment already on
+    /// the wire cannot be turned into a share.
+    #[test]
+    fn clearing_own_nonces_leaves_nothing_consumable() {
+        let pool = NoncePool::new();
+        let (nonces, _commitment) = make_pair();
+        pool.store_own([9u8; 32], nonces);
+        assert_eq!(pool.own_available(), 1);
+
+        pool.clear_own();
+
+        assert_eq!(pool.own_available(), 0);
+        assert!(!pool.contains_own(&[9u8; 32]));
+        assert!(
+            pool.consume_own(&[9u8; 32]).is_none(),
+            "a discarded nonce must not be recoverable"
+        );
+        assert!(pool.own_commitments().is_empty());
     }
 
     #[test]

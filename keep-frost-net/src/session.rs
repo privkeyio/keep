@@ -824,6 +824,22 @@ impl SessionManager {
         self.active_sessions.remove(session_id);
     }
 
+    /// Abandon every active session, returning how many were dropped.
+    ///
+    /// Deliberately not routed through `complete_session`. That history is a
+    /// refuse-list, so adding ids would tighten replay detection rather than
+    /// loosen it; the cost is that it is bounded and evicts oldest-first. Up to
+    /// `MAX_ACTIVE_SESSIONS` ids at once would push out that many genuine
+    /// completed ids, which is the way this could actually mask a later replay.
+    /// Nothing is given up by leaving them out: a session that got as far as
+    /// holding nonces already recorded its id in the nonce store, which is
+    /// durable across restarts where this history is not.
+    pub fn abandon_all(&mut self) -> usize {
+        let count = self.active_sessions.len();
+        self.active_sessions.clear();
+        count
+    }
+
     pub fn complete_session(&mut self, session_id: &[u8; 32]) {
         self.active_sessions.remove(session_id);
 
@@ -848,6 +864,11 @@ impl SessionManager {
 
     pub fn active_count(&self) -> usize {
         self.active_sessions.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_len(&self) -> usize {
+        self.completed_sessions.len()
     }
 
     pub fn is_replay(&self, session_id: &[u8; 32]) -> bool {
@@ -1260,5 +1281,35 @@ mod tests {
         let cached = manager.cache_and_remove_session(&session_id).unwrap();
         assert!(cached.is_some());
         assert!(manager.get_session(&session_id).is_none());
+    }
+
+    /// Abandoning is not completing. The distinction is invisible through
+    /// `get_session` alone, since both remove the session, so it is asserted
+    /// through the replay history: rewriting `abandon_all` as a loop over
+    /// `complete_session` would remove the sessions just the same and push that
+    /// many genuine ids out of a bounded, oldest-first history.
+    #[test]
+    fn abandoning_sessions_does_not_enter_them_in_the_replay_history() {
+        let mut manager = SessionManager::new();
+        let message = vec![7u8; 32];
+        let participants = vec![1u16, 2u16];
+        let id = derive_session_id(&message, &participants, 2);
+        manager
+            .create_session(id, message, 2, participants)
+            .unwrap();
+
+        let before = manager.completed_len();
+        assert_eq!(manager.abandon_all(), 1);
+
+        assert!(manager.get_session(&id).is_none(), "the session is gone");
+        assert_eq!(
+            manager.completed_len(),
+            before,
+            "an abandoned round must not be recorded as completed"
+        );
+        assert!(
+            !manager.is_replay(&id),
+            "and must not read back as a replay"
+        );
     }
 }
