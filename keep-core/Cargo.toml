@@ -39,7 +39,7 @@ sha2_010 = { package = "sha2", version = "0.10", optional = true }
 rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"], optional = true }
 # Vetted Shamir/VSS over secp256k1 (Apache-2.0 OR MIT). Used for the t-of-n key split and the
 # in-exponent Lagrange combination of partial evaluations (combine_shares_group).
-vsss-rs = { version = "5", optional = true }
+vsss-rs = { version = "6", optional = true }
 
 bip39 = { workspace = true }
 bitcoin = { workspace = true }
