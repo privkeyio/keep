@@ -237,6 +237,12 @@ impl NoncePool {
     /// peer reports a stale pre-exchanged nonce, so other peers' pooled
     /// commitments are preserved and they need not fall back to interactive
     /// rounds.
+    pub fn clear_peer(&self, share_index: u16) {
+        let mut inner = self.inner.lock();
+        inner.peer.retain(|(idx, _), _| *idx != share_index);
+        inner.peer_order.retain(|(idx, _)| *idx != share_index);
+    }
+
     /// Discard every own nonce still held.
     ///
     /// For the case where the material itself is suspect rather than stale: a
@@ -248,12 +254,6 @@ impl NoncePool {
         let mut inner = self.inner.lock();
         inner.own.clear();
         inner.own_order.clear();
-    }
-
-    pub fn clear_peer(&self, share_index: u16) {
-        let mut inner = self.inner.lock();
-        inner.peer.retain(|(idx, _), _| *idx != share_index);
-        inner.peer_order.retain(|(idx, _)| *idx != share_index);
     }
 
     /// Reserve one available commitment per requested peer for a signing

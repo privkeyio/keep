@@ -996,6 +996,20 @@ impl KfpNode {
     }
 
     pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
+        // The last check before a share exists, and the one that has to be here
+        // rather than only at the entry points.
+        //
+        // Every caller gates on entry, but time passes between that gate and
+        // this call: the requester path draws its nonce and then runs the
+        // pre-sign hook, which on desktop blocks on a human for up to a minute
+        // against a thirty-second probe. The latch can trip inside that window,
+        // the teardown can run, and this would still emit a share over a nonce
+        // drawn before detection. An entry gate cannot cover a wait it precedes.
+        if self.is_entropy_degraded() {
+            debug!("Refusing to produce a signature share: OS RNG degraded");
+            return Ok(());
+        }
+
         let (signing_package, nonces, derivation_path) = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
@@ -1598,6 +1612,17 @@ impl KfpNode {
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
+
+        // Re-checked after the hook, not just before it. The hook can block on a
+        // human, so this is the point where the latch is most likely to have
+        // tripped underneath the round. Returning here leaves the reserved peer
+        // commitments to the still-armed reservation guard instead of building a
+        // session on top of a nonce drawn before detection.
+        if self.is_entropy_degraded() {
+            return Err(SigningRoundError::fatal(FrostNetError::PolicyViolation(
+                "OS RNG health check failed during approval; signing refused".into(),
+            )));
+        }
 
         {
             let mut sessions = self.sessions.write();
@@ -2309,6 +2334,48 @@ mod gate_tests {
         assert!(
             node.sessions.write().get_session_mut(&id).is_none(),
             "an in-flight session must be abandoned, not left to expire"
+        );
+    }
+
+    /// The share chokepoint refuses even when the session survived the teardown.
+    ///
+    /// Entry gates cannot cover the requester path: it draws its nonce, then
+    /// runs the pre-sign hook, which on desktop blocks on a human for up to a
+    /// minute against a thirty-second probe. A latch trip inside that window
+    /// tears down the pool and the sessions, and the round then builds a fresh
+    /// session and reaches this call anyway. Asserted against a session created
+    /// after the latch, which is the state that window produces.
+    #[tokio::test]
+    async fn share_generation_refuses_after_the_latch_even_for_a_live_session() {
+        let (node, _relay) = test_node().await;
+        let participants = vec![1u16, 2u16];
+        let message = vec![0u8; 32];
+        let id = crate::session::derive_session_id(&message, &participants, 2);
+
+        node.mark_entropy_degraded();
+
+        {
+            let mut sessions = node.sessions.write();
+            sessions
+                .create_session(id, message, 2, participants)
+                .expect("session fixture");
+        }
+
+        // Ok, not Err: the refusal is a no-op for the caller, and the property
+        // that matters is that no share was produced. A SessionNotFound error
+        // would mean it got past the gate and failed for an unrelated reason.
+        assert!(
+            node.generate_and_send_share(&id).await.is_ok(),
+            "the refusal must be a clean no-op"
+        );
+        assert!(
+            node.sessions
+                .write()
+                .get_session_mut(&id)
+                .expect("the fixture session is still present")
+                .take_our_nonces()
+                .is_none(),
+            "refusing must not have consumed nonce material"
         );
     }
 
