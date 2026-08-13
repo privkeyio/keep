@@ -1386,6 +1386,16 @@ impl KeepMobile {
         timeout_secs: u64,
         progress: Arc<dyn dkg_net::DkgProgressCallback>,
     ) -> Result<ShareInfo, KeepMobileError> {
+        // Pre-flight the persistence constraints before the multi-round network
+        // run so an invalid name or a full store fails fast, rather than after
+        // peers have already completed a group this device would discard.
+        Self::validate_share_name(&name)?;
+        if self.storage.list_all_shares().len() >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
+            });
+        }
+
         let passphrase = Zeroizing::new(passphrase);
         let timeout = Duration::from_secs(timeout_secs.max(30));
         let result = self.runtime.block_on(dkg_net::run_dkg(

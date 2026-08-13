@@ -159,9 +159,17 @@ impl DkgSession {
                     msg: format!("Failed to serialize round 1 package: {e}"),
                 })?;
 
+        // The crypto layer never reads session_secret; only the transport
+        // (dkg_net) does, and it parses it before this call. Wipe it out of the
+        // config we retain so the secret does not linger in session state for the
+        // lifetime of a run — possibly indefinitely if the run is abandoned.
+        use zeroize::Zeroize;
+        let mut stored_config = config.clone();
+        stored_config.session_secret.zeroize();
+
         let mut state = self.state.write().await;
         *state = DkgState::Initialized {
-            config: config.clone(),
+            config: stored_config,
             our_identifier,
             secret_package: Box::new(secret_package),
         };
