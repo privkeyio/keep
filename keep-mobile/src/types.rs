@@ -84,6 +84,35 @@ pub struct DkgConfig {
     pub participants: u16,
     pub our_index: u16,
     pub relays: Vec<String>,
+    /// Hex-encoded 32-byte bootstrap secret shared out-of-band (the invite) by
+    /// every participant of a single DKG run. It never travels over the relays:
+    /// the public coordination channel and each participant's ephemeral relay
+    /// identity are both derived from it by domain-separated SHA-256, so a relay
+    /// sees only opaque tags and pubkeys. Because knowledge of this secret lets a
+    /// device derive every participant's identity (and thus decrypt round-2
+    /// packages, which carry secret share material), it MUST be transmitted over
+    /// a confidential channel — a scanned QR at setup time, not a relay.
+    pub session_secret: String,
+}
+
+/// Progress of a relay-driven DKG run, surfaced to the native layer so it can
+/// render setup state. Terminal states are `Complete` and `Failed`; errors do
+/// not cross the FFI as exceptions during the run, they arrive here.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum DkgProgressUpdate {
+    /// Establishing the relay connection with the bootstrap identity.
+    Connecting,
+    /// Waiting on peers' round-1 packages. `received` counts distinct peers so
+    /// far (excluding us); `total` is the number of peers expected.
+    Round1 { received: u16, total: u16 },
+    /// Waiting on the round-2 packages addressed to this device.
+    Round2 { received: u16, total: u16 },
+    /// All packages in; running the final key derivation and persisting.
+    Finalizing,
+    /// DKG succeeded; the group is created and the share stored.
+    Complete { group_pubkey: String },
+    /// DKG aborted. `reason` is human-readable and safe to display.
+    Failed { reason: String },
 }
 
 #[derive(uniffi::Record, Clone)]

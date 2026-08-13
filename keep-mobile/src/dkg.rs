@@ -73,7 +73,6 @@ enum DkgState {
         config: DkgConfig,
         our_identifier: Identifier,
         secret_package: Box<dkg::round1::SecretPackage>,
-        round1_package: Box<dkg::round1::Package>,
     },
     Round1Complete {
         config: DkgConfig,
@@ -165,7 +164,6 @@ impl DkgSession {
             config: config.clone(),
             our_identifier,
             secret_package: Box::new(secret_package),
-            round1_package: Box::new(round1_package),
         };
 
         Ok(DkgRound1Package {
@@ -180,18 +178,13 @@ impl DkgSession {
     ) -> Result<Vec<DkgRound2Package>, KeepMobileError> {
         let mut state = self.state.write().await;
 
-        let (config, our_identifier, secret_package, our_round1_package) = match &*state {
+        let (config, our_identifier, secret_package) = match &*state {
             DkgState::Initialized {
                 config,
                 our_identifier,
                 secret_package,
-                round1_package,
-            } => (
-                config.clone(),
-                *our_identifier,
-                (**secret_package).clone(),
-                (**round1_package).clone(),
-            ),
+                ..
+            } => (config.clone(), *our_identifier, (**secret_package).clone()),
             DkgState::NotStarted => {
                 return Err(KeepMobileError::FrostError {
                     msg: "DKG not started".into(),
@@ -220,8 +213,10 @@ impl DkgSession {
             });
         }
 
+        // FROST's part2/part3 take only the OTHER participants' round-1 packages,
+        // never our own, so this map excludes us. It is also reused for part3, so
+        // it must stay others-only there too.
         let mut round1_packages = BTreeMap::new();
-        round1_packages.insert(our_identifier, our_round1_package);
 
         for pkg in &packages {
             validate_package_size(&pkg.package_bytes, pkg.participant_index)?;
@@ -230,6 +225,15 @@ impl DkgSession {
                 config.participants,
                 "Participant index",
             )?;
+
+            if identifier == our_identifier {
+                return Err(KeepMobileError::FrostError {
+                    msg: format!(
+                        "Participant index {} collides with our own",
+                        pkg.participant_index
+                    ),
+                });
+            }
 
             if round1_packages.contains_key(&identifier) {
                 return Err(KeepMobileError::FrostError {
@@ -268,14 +272,17 @@ impl DkgSession {
                             msg: format!("Failed to serialize round 2 package: {e}"),
                         })?;
 
+                // frost-secp256k1-tr serializes an identifier as a 32-byte
+                // big-endian scalar, so the index lives in the LAST two bytes;
+                // the leading bytes must be zero for an in-range participant.
                 let id_bytes = recipient_id.serialize();
-                let recipient_index = if id_bytes.len() >= 2 {
-                    u16::from_le_bytes([id_bytes[0], id_bytes[1]])
-                } else {
+                let len = id_bytes.len();
+                if len < 2 || id_bytes[..len - 2].iter().any(|&b| b != 0) {
                     return Err(KeepMobileError::FrostError {
                         msg: "Invalid recipient identifier serialization".into(),
                     });
-                };
+                }
+                let recipient_index = u16::from_be_bytes([id_bytes[len - 2], id_bytes[len - 1]]);
 
                 Ok(DkgRound2Package {
                     sender_index: config.our_index,
@@ -466,6 +473,7 @@ mod tests {
             participants: 3,
             our_index: 1,
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         let result = session.start(config).await;
@@ -481,6 +489,7 @@ mod tests {
             participants: 2, // Invalid: participants < threshold
             our_index: 1,
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         let result = session.start(config).await;
@@ -496,6 +505,7 @@ mod tests {
             participants: 3,
             our_index: 5, // Invalid: index > participants
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         let result = session.start(config).await;
@@ -511,6 +521,7 @@ mod tests {
             participants: 3,
             our_index: 1,
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         let result = session.start(config).await;
@@ -527,6 +538,7 @@ mod tests {
             participants: 3,
             our_index: 1,
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         session.start(config).await.unwrap();
@@ -545,6 +557,7 @@ mod tests {
             participants: 3,
             our_index: 1,
             relays: vec!["wss://relay.example.com".to_string()],
+            session_secret: "00".repeat(32),
         };
 
         session.start(config.clone()).await.unwrap();

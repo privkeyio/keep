@@ -5,6 +5,7 @@
 
 mod audit;
 mod dkg;
+mod dkg_net;
 mod error;
 mod network;
 mod nip46;
@@ -29,6 +30,7 @@ pub use audit::{
     SigningAuditStorage, SigningDecision, SigningRequestType,
 };
 pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
+pub use dkg_net::DkgProgressCallback;
 pub use error::KeepMobileError;
 pub use nip46::{
     parse_bunker_url, BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent,
@@ -50,8 +52,8 @@ pub use signing_policy::{
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
-    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, KeepLiveState,
-    KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
+    DkgConfig, DkgProgressUpdate, DkgStatus, FrostGenerationResult, GeneratedShareInfo,
+    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
     SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
@@ -1364,6 +1366,39 @@ impl KeepMobile {
 
     pub fn frost_dkg_reset(&self) {
         self.runtime.block_on(self.dkg_session.reset())
+    }
+
+    /// Run a full relay-driven DKG to create a new group on this device, then
+    /// persist the resulting share. Every participant calls this concurrently
+    /// with the same `config.session_secret` and relays but its own
+    /// `config.our_index`; packages are exchanged over the relays (see
+    /// [`dkg_net`]) so no device ever holds the whole key. `progress` receives
+    /// live state; a run that fails resets the session and reports
+    /// [`DkgProgressUpdate::Failed`] before returning the error.
+    ///
+    /// Returns the stored share on success. `timeout_secs` bounds each round
+    /// (floored to 30s to tolerate slow peers and biometric prompts).
+    pub fn frost_run_dkg(
+        &self,
+        config: DkgConfig,
+        name: String,
+        passphrase: String,
+        timeout_secs: u64,
+        progress: Arc<dyn dkg_net::DkgProgressCallback>,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        let passphrase = Zeroizing::new(passphrase);
+        let timeout = Duration::from_secs(timeout_secs.max(30));
+        let result = self.runtime.block_on(dkg_net::run_dkg(
+            &self.dkg_session,
+            config,
+            &name,
+            &passphrase,
+            timeout,
+            progress,
+        ))?;
+        // Persist through the same validated path an imported share takes; the
+        // export is freshly produced above so this is a local decrypt + store.
+        self.import_share(result.share_export, passphrase.to_string(), name)
     }
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
