@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 mod cli;
 mod commands;
