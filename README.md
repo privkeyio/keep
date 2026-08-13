@@ -93,7 +93,7 @@ Minimum Supported Rust Version: **1.89**.
 
 ## Security
 
-Pure Rust. Crates set `#![forbid(unsafe_code)]` wherever the toolchain allows it. Two deny instead: `keep-core`, with two narrow audited exceptions (the `mlock`-backed secret buffers and the RDRAND entropy probe), and `keep-agent-ts`, because the `napi` macro expands to code that `forbid` rejects. Keys are derived with Argon2id, encrypted with XChaCha20-Poly1305, protected in RAM with Ascon-128a, and locked with mlock(2). FROST uses BIP-340 Schnorr signatures. See [`docs/SECURITY.md`](docs/SECURITY.md) for details.
+Pure Rust. Most crates set `#![forbid(unsafe_code)]`. Three deny it instead, each for a specific reason: `keep-core` (the `mlock`-backed secret buffers and the RDRAND entropy probe), `keep-cli` (Windows file-ACL calls), and `keep-agent-ts` (the `napi` macro expands to code that `forbid` rejects). Every unsafe block outside those three is a compile error. Keys are derived with Argon2id, encrypted with XChaCha20-Poly1305, protected in RAM with Ascon-128a, and locked with mlock(2). FROST uses BIP-340 Schnorr signatures. See [`docs/SECURITY.md`](docs/SECURITY.md) for details.
 
 Keep can threshold-sign software releases with a FROST-Ed25519 group (minisign-compatible), so no single maintainer holds the signing key. See [`docs/RELEASE_SIGNING.md`](docs/RELEASE_SIGNING.md).
 
