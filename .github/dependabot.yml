@@ -8,6 +8,15 @@ updates:
       minor-and-patch:
         update-types: ["minor", "patch"]
     open-pull-requests-limit: 5
+    ignore:
+      # vsss-rs 6.x requires elliptic-curve 0.14, but the oprf feature reaches it
+      # through voprf 0.5 -> k256 0.13 -> elliptic-curve 0.13. Bumping vsss-rs alone
+      # puts two elliptic-curve majors in the tree and k256::Scalar stops satisfying
+      # vsss_rs::elliptic_curve::PrimeField. Adopting 6.x needs k256 0.14, which needs
+      # voprf >= 0.6, and voprf has only published 0.6.0-pre.1. Revisit when voprf 0.6
+      # is stable; do not ship a pre-release crate in the LUKS unlock path.
+      - dependency-name: "vsss-rs"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
