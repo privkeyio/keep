@@ -130,8 +130,9 @@ fn parse_secret(hex_secret: &str) -> Result<[u8; 32], KeepMobileError> {
 /// session's crypto state is driven through `session`; transport is a dedicated,
 /// short-lived client keyed by the bootstrap identity (no stored share needed).
 ///
-/// `overall_timeout` bounds the whole run; each round independently must
-/// complete within it or the run fails with [`KeepMobileError::Timeout`].
+/// `overall_timeout` bounds each round independently; a round that does not
+/// collect every peer's package within it fails with
+/// [`KeepMobileError::Timeout`], so a full run may take up to twice it.
 pub async fn run_dkg(
     session: &DkgSession,
     config: DkgConfig,
@@ -186,8 +187,8 @@ async fn run_dkg_inner(
     let client = connect(&our_keys, &config.relays).await?;
     let since = Timestamp::from(Timestamp::now().as_secs().saturating_sub(60));
 
-    // Round 1: broadcast ours, collect peers'.
-    let our_round1_event = round1_event(&our_keys, &channel, our_index, &our_round1.package_bytes)?;
+    // Round 1: broadcast ours, collect peers'. The event is rebuilt each poll so
+    // every republish carries a current timestamp (see `collect_many`).
     let round1_filter = Filter::new()
         .kind(Kind::Custom(DKG_EVENT_KIND))
         .custom_tag(SingleLetterTag::lowercase(Alphabet::D), channel.clone())
@@ -196,7 +197,7 @@ async fn run_dkg_inner(
 
     let round1_packages = collect(
         &client,
-        &our_round1_event,
+        || round1_event(&our_keys, &channel, our_index, &our_round1.package_bytes),
         round1_filter,
         peer_count,
         overall_timeout,
@@ -211,18 +212,23 @@ async fn run_dkg_inner(
 
     let round2_out = session.receive_round1_packages(round1_packages).await?;
 
-    // Round 2: publish one encrypted package per recipient, collect ours.
-    let mut our_round2_events = Vec::with_capacity(round2_out.len());
-    for pkg in &round2_out {
-        let recipient = derive_dkg_keys(&secret, pkg.recipient_index)?.public_key();
-        our_round2_events.push(round2_event(
-            &our_keys,
-            &recipient,
-            &channel,
-            our_index,
-            &pkg.package_bytes,
-        )?);
-    }
+    // Round 2: publish one encrypted package per recipient, collect ours. As in
+    // round 1 the events are rebuilt each poll so republishes stay current.
+    let build_round2_events = || {
+        round2_out
+            .iter()
+            .map(|pkg| {
+                let recipient = derive_dkg_keys(&secret, pkg.recipient_index)?.public_key();
+                round2_event(
+                    &our_keys,
+                    &recipient,
+                    &channel,
+                    our_index,
+                    &pkg.package_bytes,
+                )
+            })
+            .collect::<Result<Vec<Event>, KeepMobileError>>()
+    };
 
     let round2_filter = Filter::new()
         .kind(Kind::Custom(DKG_EVENT_KIND))
@@ -233,7 +239,7 @@ async fn run_dkg_inner(
 
     let round2_packages = collect_many(
         &client,
-        &our_round2_events,
+        build_round2_events,
         round2_filter,
         peer_count,
         overall_timeout,
@@ -403,13 +409,17 @@ fn decode_round2(
 }
 
 /// Poll `filter` until `expected` distinct peers' packages arrive, re-publishing
-/// `ours` each round so late peers are served. `decode` both authenticates an
-/// event and turns it into a `(sender_index, package)`; duplicates by sender are
-/// ignored. Fails with [`KeepMobileError::Timeout`] past `deadline`.
+/// our package each round so late peers are served. `build_ours` is called once
+/// per poll to produce a freshly-timestamped event: relays forward ephemeral
+/// events only to live subscribers and a peer that joins late filters on its own
+/// `since`, so a stale-timestamped copy would never reach it. `decode` both
+/// authenticates an event and turns it into a `(sender_index, package)`;
+/// duplicates by sender are ignored. Fails with [`KeepMobileError::Timeout`] past
+/// `overall_timeout`.
 #[allow(clippy::too_many_arguments)]
 async fn collect<T>(
     client: &Client,
-    ours: &Event,
+    build_ours: impl Fn() -> Result<Event, KeepMobileError>,
     filter: Filter,
     expected: usize,
     overall_timeout: Duration,
@@ -419,7 +429,7 @@ async fn collect<T>(
 ) -> Result<Vec<T>, KeepMobileError> {
     collect_many(
         client,
-        std::slice::from_ref(ours),
+        || build_ours().map(|e| vec![e]),
         filter,
         expected,
         overall_timeout,
@@ -433,7 +443,7 @@ async fn collect<T>(
 #[allow(clippy::too_many_arguments)]
 async fn collect_many<T>(
     client: &Client,
-    ours: &[Event],
+    build_ours: impl Fn() -> Result<Vec<Event>, KeepMobileError>,
     filter: Filter,
     expected: usize,
     overall_timeout: Duration,
@@ -446,8 +456,8 @@ async fn collect_many<T>(
 
     let outcome = tokio::time::timeout(overall_timeout, async {
         loop {
-            for ev in ours {
-                let _ = client.send_event(ev).await;
+            for ev in build_ours()? {
+                let _ = client.send_event(&ev).await;
             }
             if expected == 0 {
                 return Ok(());
