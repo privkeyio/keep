@@ -56,6 +56,10 @@ pub struct DkgRoster {
     pub participants: u8,
     /// 1-indexed participant number -> announced pubkey.
     pub by_index: BTreeMap<u16, PublicKey>,
+    /// The canonical `frost_group_id` this roster hash-binds to (§5). Kept so the
+    /// DKG transcript can fold in the authenticated group id without re-deriving
+    /// it from a possibly-private `d`-tag channel.
+    pub group_id: [u8; 32],
 }
 
 impl DkgRoster {
@@ -105,12 +109,17 @@ pub fn parse_pubkey(s: &str) -> Result<PublicKey> {
     })
 }
 
-/// Decide one peer's group-key confirmation against our own during the DKG
+/// Decide one peer's transcript confirmation against our own during the DKG
 /// equivocation check. `Ok(true)` when it matches and is a newly-counted peer,
 /// `Ok(false)` when that peer was already counted, and `Err` when the peer
-/// reports a DIFFERENT group key, which means the relay handed inconsistent
+/// reports a DIFFERENT transcript, which means the relay handed inconsistent
 /// round1 packages and the DKG must abort rather than persist a split keyset.
 /// Extracted so the equivocation decision is unit-testable without relay I/O.
+///
+/// The confirmed value is the §5 [`dkg_transcript`] hash, not just the group
+/// key: two victims can derive the *same* group key from *different* round-1
+/// sets, and only the transcript (which folds in each round-1 commitment)
+/// detects that equivocation.
 pub fn accept_group_key_confirmation(
     ours: &str,
     sender_index: u16,
@@ -119,11 +128,68 @@ pub fn accept_group_key_confirmation(
 ) -> Result<bool> {
     if theirs.trim() != ours {
         return Err(KeepError::FrostErr(FrostError::dkg(format!(
-            "participant {sender_index} derived a different group key than ours; aborting DKG \
+            "participant {sender_index} derived a different DKG transcript than ours; aborting DKG \
              (the relay may have equivocated round1 packages)"
         ))));
     }
     Ok(already_confirmed.insert(sender_index))
+}
+
+/// Compute the §5 DKG transcript: the confirmed value each participant signs and
+/// compares during the equivocation check. Strictly stronger than comparing the
+/// group key alone — folding in the per-round-1 commitments is what defeats
+/// same-key equivocation, and binding `group_id` folds in the whole
+/// authenticated roster.
+///
+/// ```text
+/// transcript = SHA256(
+///   "keep-frost-dkg-transcript-v1"
+///   ‖ group_id                                   (32)
+///   ‖ threshold_be (2) ‖ participants_be (2)
+///   ‖ for j in 1..=n:  index_be(2) ‖ pk_j (32)          // roster, ordered
+///   ‖ for j in 1..=n:  SHA256(round1_pkg_bytes_j)       // commitment per round-1 pkg
+///   ‖ group_pubkey                               (32)
+/// )
+/// ```
+///
+/// `round1_pkgs_by_index` carries the raw FROST round-1 package bytes (the
+/// `package.serialize()` output, before any hex/JSON framing) for every
+/// participant, ours included. Fails closed if any index in `1..=participants`
+/// is absent from either the roster or the round-1 map, so a transcript can
+/// never be computed over a partial set.
+pub fn dkg_transcript(
+    group_id: &[u8; 32],
+    threshold: u8,
+    participants: u8,
+    roster_by_index: &BTreeMap<u16, PublicKey>,
+    round1_pkgs_by_index: &BTreeMap<u16, Vec<u8>>,
+    group_pubkey: &[u8; 32],
+) -> Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"keep-frost-dkg-transcript-v1");
+    hasher.update(group_id);
+    hasher.update((threshold as u16).to_be_bytes());
+    hasher.update((participants as u16).to_be_bytes());
+    for idx in 1..=participants as u16 {
+        let pk = roster_by_index.get(&idx).ok_or_else(|| {
+            KeepError::FrostErr(FrostError::dkg(format!(
+                "transcript: roster is missing participant index {idx}"
+            )))
+        })?;
+        hasher.update(idx.to_be_bytes());
+        hasher.update(pk.as_bytes());
+    }
+    for idx in 1..=participants as u16 {
+        let pkg = round1_pkgs_by_index.get(&idx).ok_or_else(|| {
+            KeepError::FrostErr(FrostError::dkg(format!(
+                "transcript: missing round-1 package for participant index {idx}"
+            )))
+        })?;
+        hasher.update(Sha256::digest(pkg));
+    }
+    hasher.update(group_pubkey);
+    Ok(hasher.finalize().into())
 }
 
 /// Canonical group_id preimage, the single source of truth for the group
@@ -297,12 +363,8 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
             ))));
         }
     };
-    let recomputed = hex::encode(frost_group_id(
-        &name,
-        threshold,
-        participants,
-        &ordered_npubs,
-    ));
+    let group_id = frost_group_id(&name, threshold, participants, &ordered_npubs);
+    let recomputed = hex::encode(group_id);
     if recomputed != group_id_hex {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
             "group announcement id {recomputed} does not match the queried d-tag {group_id_hex}; \
@@ -314,6 +376,7 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
         threshold,
         participants,
         by_index: roster,
+        group_id,
     })
 }
 
@@ -494,6 +557,15 @@ pub async fn run_software_dkg(
     let our_round1 = session
         .round1()
         .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 1: {e}"))))?;
+    // §5 transcript: retain every participant's raw round-1 package bytes
+    // (ours + peers') so the equivocation confirmation compares the full
+    // transcript, not just the derived group key.
+    let mut round1_pkgs: BTreeMap<u16, Vec<u8>> = BTreeMap::new();
+    round1_pkgs.insert(
+        our_index,
+        hex::decode(&our_round1.package_hex)
+            .map_err(|e| KeepError::Runtime(format!("decode our round1 package: {e}")))?,
+    );
     let round1_content = serde_json::to_string(&our_round1)
         .map_err(|e| KeepError::Runtime(format!("serialize round1: {e}")))?;
     let (kind, d, sender, mode) = base_tags(DKG_KIND_ROUND1);
@@ -551,9 +623,14 @@ pub async fn run_software_dkg(
             if participant_pubkeys.contains_key(&wire.sender_index) {
                 continue;
             }
+            let peer_pkg = match hex::decode(&wire.package_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
             match session.round1_peer(&wire) {
                 Ok(_) => {
                     participant_pubkeys.insert(wire.sender_index, ev.pubkey);
+                    round1_pkgs.insert(wire.sender_index, peer_pkg);
                     round1_done += 1;
                     progress.phase(DkgPhase::Round1 {
                         received: round1_done as u16,
@@ -678,13 +755,24 @@ pub async fn run_software_dkg(
 
     // round1 packages are broadcast through a single relay with no consistency
     // round, so a malicious relay can hand DIFFERENT round1 sets to different
-    // participants, who finalize DIFFERENT group keys. Every participant
-    // broadcasts the group key it derived (authenticated, the relay cannot
-    // forge) and requires all peers to report the SAME key; a divergence or a
-    // peer that never confirms aborts rather than persisting an inconsistent set.
-    let our_group_hex = hex::encode(result.group_pubkey);
+    // participants. Two victims can even derive the SAME group key from
+    // DIFFERENT round1 sets, which a bare group-key compare misses. Every
+    // participant instead broadcasts the §5 transcript it derived
+    // (authenticated, the relay cannot forge) — which folds in each round-1
+    // commitment — and requires all peers to report the SAME transcript; a
+    // divergence or a peer that never confirms aborts rather than persisting an
+    // inconsistent set.
+    let our_transcript = dkg_transcript(
+        &roster.group_id,
+        roster.threshold,
+        roster.participants,
+        &roster.by_index,
+        &round1_pkgs,
+        &result.group_pubkey,
+    )?;
+    let our_transcript_hex = hex::encode(our_transcript);
     let (kind, d, sender, mode) = base_tags(DKG_KIND_CONFIRM);
-    let confirm_event = EventBuilder::new(kind, &our_group_hex)
+    let confirm_event = EventBuilder::new(kind, &our_transcript_hex)
         .tag(d)
         .tag(sender)
         .tag(mode)
@@ -735,7 +823,7 @@ pub async fn run_software_dkg(
                 continue;
             }
             if accept_group_key_confirmation(
-                &our_group_hex,
+                &our_transcript_hex,
                 sender_idx,
                 &ev.content,
                 &mut confirmed_indices,
@@ -791,6 +879,7 @@ mod tests {
             threshold: 2,
             participants: 3,
             by_index,
+            group_id: [0u8; 32],
         };
 
         let ident1 = make_identity_keys(1);
@@ -823,6 +912,7 @@ mod tests {
             threshold: 2,
             participants: 2,
             by_index,
+            group_id: [0u8; 32],
         };
 
         // The pinned pubkey for its own index is accepted.
@@ -1015,6 +1105,7 @@ mod tests {
             threshold: 2,
             participants: 1,
             by_index,
+            group_id: [0u8; 32],
         };
         assert!(roster.expected_pubkey(1).is_ok());
         assert!(roster.expected_pubkey(2).is_err());
@@ -1039,9 +1130,76 @@ mod tests {
     fn group_key_confirmation_aborts_on_divergent_key() {
         let ours = "aabb";
         let mut seen = HashSet::new();
-        // A peer that derived a different group key is an equivocation: abort.
+        // A peer that derived a different transcript is an equivocation: abort.
         assert!(accept_group_key_confirmation(ours, 2, "ccdd", &mut seen).is_err());
         // The divergent peer is not counted as confirmed.
         assert!(seen.is_empty());
+    }
+
+    fn transcript_fixture() -> (
+        [u8; 32],
+        BTreeMap<u16, PublicKey>,
+        BTreeMap<u16, Vec<u8>>,
+        [u8; 32],
+    ) {
+        let (_, pk1) = make_pubkey(1);
+        let (_, pk2) = make_pubkey(2);
+        let mut roster = BTreeMap::new();
+        roster.insert(1, pk1);
+        roster.insert(2, pk2);
+        let mut pkgs = BTreeMap::new();
+        pkgs.insert(1u16, vec![0xaa; 40]);
+        pkgs.insert(2u16, vec![0xbb; 40]);
+        ([7u8; 32], roster, pkgs, [9u8; 32])
+    }
+
+    /// §5: the transcript pins its exact bytes against an independent inline
+    /// reference. If the field order or framing drifts, this fails.
+    #[test]
+    fn dkg_transcript_matches_reference() {
+        let (group_id, roster, pkgs, group_pubkey) = transcript_fixture();
+        let got = dkg_transcript(&group_id, 2, 2, &roster, &pkgs, &group_pubkey).unwrap();
+
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"keep-frost-dkg-transcript-v1");
+            h.update(group_id);
+            h.update(2u16.to_be_bytes());
+            h.update(2u16.to_be_bytes());
+            for idx in 1..=2u16 {
+                h.update(idx.to_be_bytes());
+                h.update(roster.get(&idx).unwrap().as_bytes());
+            }
+            for idx in 1..=2u16 {
+                h.update(Sha256::digest(pkgs.get(&idx).unwrap()));
+            }
+            h.update(group_pubkey);
+            <[u8; 32]>::from(h.finalize())
+        };
+        assert_eq!(got, expected);
+    }
+
+    /// §5: same group key but a DIFFERENT round-1 package changes the transcript.
+    /// This is the same-key equivocation the bare group-key compare missed.
+    #[test]
+    fn dkg_transcript_detects_same_key_round1_divergence() {
+        let (group_id, roster, pkgs, group_pubkey) = transcript_fixture();
+        let base = dkg_transcript(&group_id, 2, 2, &roster, &pkgs, &group_pubkey).unwrap();
+
+        let mut other = pkgs.clone();
+        other.insert(2u16, vec![0xcc; 40]);
+        let divergent = dkg_transcript(&group_id, 2, 2, &roster, &other, &group_pubkey).unwrap();
+        assert_ne!(base, divergent);
+    }
+
+    /// §5: a missing round-1 package for any index fails closed rather than
+    /// hashing over a partial set.
+    #[test]
+    fn dkg_transcript_fails_on_missing_round1_package() {
+        let (group_id, roster, pkgs, group_pubkey) = transcript_fixture();
+        let mut short = pkgs.clone();
+        short.remove(&2);
+        assert!(dkg_transcript(&group_id, 2, 2, &roster, &short, &group_pubkey).is_err());
     }
 }
