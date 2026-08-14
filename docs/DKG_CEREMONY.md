@@ -65,7 +65,7 @@ colluding *invited* participants (that is outside FROST's model).
 
 ## 3. Ceremony overview
 
-```
+```text
 Setup (out of band, per device)     Transport (over relays, all n online)
 ─────────────────────────────       ─────────────────────────────────────
  P0  each device generates a          R1  broadcast round-1 package,
@@ -89,7 +89,7 @@ so this adds a collection step, not a new kind of ceremony.
 
 ### 4.1 Invite (assembled at P0', delivered confidentially)
 
-```
+```rust
 Invite {
   group_name:    String,
   threshold:     u16,
@@ -117,7 +117,7 @@ already cannot do, and costs G1 nothing (private keys are not in it).
 
 ### 4.3 Wire types (`dkg_net.rs`)
 
-```
+```rust
 DkgWire { i: u16, pkg: String }         // unchanged shape; round-1 plaintext,
                                         // round-2 NIP-44-encrypted body
 ConfirmWire { t: [u8; 32] }             // R3: this device's transcript hash
@@ -141,7 +141,7 @@ ConfirmWire { t: [u8; 32] }             // R3: this device's transcript hash
 `R2`, `frost_run_dkg` can no longer be a single call. Proposed (recommended
 option B — keep `sk_j` in Rust):
 
-```
+```rust
 frost_dkg_begin() -> String            // generates (sk_j,pk_j), stores sk_j in
                                         // DkgSession state, returns pk_j hex
 frost_run_dkg(config, name, pass, …)   // pulls sk_j from session state
@@ -205,7 +205,7 @@ derivations (extends the fix already landed in `dkg.rs`).
 
 ## 8. Transcript definition
 
-```
+```text
 transcript = SHA256(
   "keep-frost-dkg-transcript-v2"
   ‖ channel                                  (32)
