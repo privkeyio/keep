@@ -1,24 +1,32 @@
-# DKG Relay Transport — Ceremony Spec (v2.1)
+# DKG Relay Transport — Ceremony Spec (v2.2)
 
-Status: **draft for sign-off.** Supersedes v2. Direction changed after review:
-instead of hardening a second, bespoke mobile DKG, we **extract the DKG
-coordinator that already exists in `keep-cli` into `keep-frost-net` and share it**
-between CLI and mobile. Nothing merges until this is agreed.
+Status: **signed off — implementing.** §3 identity model approved by kwsantiago
+(host-key roster + per-group subkey required, plus C1/C2); Phase 1 (§11) is
+cleared to start. Direction: instead of hardening a second, bespoke mobile DKG, we
+**extract the DKG coordinator that already exists in `keep-cli` into
+`keep-frost-net` and share it** between CLI and mobile.
 
 This is the protocol the entire product rests on: a leaked invite must not be
 catastrophic, and every honest device must agree on the same group key or all
 abort. This version keeps v2's cryptographic conclusions, drops v2's from-scratch
 reimplementation, and adds the ChillDKG properties the review surfaced.
 
+Changelog v2.1 → v2.2 (post-sign-off):
+- **§3 signed off:** host-key roster **keyed by a per-group device subkey
+  (required, not optional)** — the plaintext kind-21101 announcement would
+  otherwise publish an identity/threshold/relay-hint targeting map. `frost_group_id`
+  hashes subkey npubs. Consequences **C1** (subkey retained in the same backup
+  unit) and **C2** (roster relay-publication opt-in, skipped for mobile, via a
+  pluggable `RosterSource`).
+- **Phasing amendment:** the roster→subkey change folds into **Phase 1**, not
+  later (cheaper before any group exists in the wild).
+- Software-DKG UI copy: plain statement, not the CLI's recommend-hardware wording.
+
 Changelog v2 → v2.1:
 - **Extract & unify** (§0) — build on `keep_core::frost::dkg::SoftwareDkgSession`
   + the CLI coordinator, not a new mobile DKG.
-- **Identity = signed host-key roster** (§3), not per-run ephemeral keys — the
-  model the CLI already uses and that ChillDKG recommends for recovery. This is
-  the one remaining design decision needing sign-off.
 - **Confirmation upgraded to CertEq** (§6) — Integrity *and* Conditional
-  Agreement, with a retained transferable success certificate. Fixes the
-  A-persists/B-times-out split neither v2 nor the CLI handles today.
+  Agreement, with a retained transferable success certificate.
 - **MAC dropped**, cancellation in scope, collector deferred (§9).
 - Trust-anchor assumption stated explicitly (§2).
 
@@ -127,31 +135,45 @@ of colluding rostered participants (outside FROST's model).
 
 ---
 
-## 3. Identity model — the one open design decision
+## 3. Identity model — SIGNED OFF
 
-**Recommendation: signed host-key roster (adopt the CLI model).** The extraction
-lands here naturally, it is Blocker-1-safe as shown, and ChillDKG uses long-term
-host keys precisely because they enable the recovery story in §6 (a party that
-lost state can be re-convinced later against a stable identity).
+**Decision (kwsantiago): signed host-key roster, keyed by a per-group device
+subkey — never the user's identity npub.** The roster structure gives the stable
+identity CertEq/recovery need (§6) and is already hardened; the subkey is a
+**requirement of that design, not an optional privacy add-on**.
 
-The invite *is* the signed roster: per-participant **pubkeys** (kwsantiago's
-original call), but the device's **stable identity key**, not a per-run ephemeral.
-ChillDKG cites a joint-security result licensing one keypair for both the event
-Schnorr signature and the ECDH KEM, so a single roster key does both jobs.
+The invite *is* the signed roster: per-participant **pubkeys**, each a device's
+**stable-per-group subkey**. ChillDKG cites a joint-security result licensing one
+keypair for both the event Schnorr signature and the ECDH KEM, so one subkey does
+both jobs. It stays stable within the group (so a stuck party is re-convinced
+against it), rostered, and retained — recovery intact — while never being the
+user's long-term identity.
 
-Tradeoff to decide:
+**Why the subkey is mandatory, not cosmetic.** A kind-21101 announcement is
+published to public relays *in the clear* — `cmd_frost_network_group_create`
+p-tags carry `[npub, relay_hint, index]`, plus explicit `threshold`/`participants`
+tags and a human-readable content string, authored by the coordinator's npub. If
+those p-tags were identity npubs, every group would permanently publish a
+**targeting map**: who co-holds the key, how many are needed, and where each
+connects. Our own threat model prescribes geographic/custodial share separation
+against coercion — which only helps while an attacker cannot enumerate the holders.
+Subkeys mean `frost_group_id` hashes **subkey** npubs, so the group id stops
+leaking identity too.
 
-| | Signed host-key roster (recommended) | Per-run ephemeral (v2) |
-|---|---|---|
-| Recovery / CertEq re-convince | ✅ stable identity to verify against | ✖ forfeited once state is lost |
-| Run separation / replay resistance | needs group-id/run binding (already in `frost_group_id`) | ✅ free (`pset` changes each run) |
-| Cross-group linkability (privacy) | reusing one identity links a device's groups | ✅ unlinkable |
-| Alignment with existing CLI + extraction | ✅ identical | ✖ divergent |
+**Two consequences (build in now):**
 
-If cross-group linkability matters on mobile, mitigate with a **per-group device
-subkey** (a fresh key per group, still long-term *for that group*, rostered and
-retained) — keeps recovery while breaking cross-group correlation. **Need your
-call: host-key roster (recommend), and per-group subkey yes/no.**
+- **C1 — retain the subkey with the share, in the same backup unit.** The subkey
+  proves membership when presenting/verifying a certificate during recovery; a
+  backup that restores the share but not the subkey leaves a party unable to
+  recover. Same encrypted backup, same restore path.
+- **C2 — roster relay-publication becomes opt-in, and is skipped for mobile.**
+  The mobile invite already carries the full pubkey list, and `frost_group_id`
+  hash-binds it, so the roster is a local artifact; publishing it adds nothing and
+  creates the public record above. The CLI keeps a relay path *only* behind a
+  deliberate flag for its discovery case, and it must never carry identity npubs
+  regardless. This makes the **roster source pluggable** (invite-supplied vs
+  relay-fetched) behind one verification path — a `RosterSource` alongside
+  `DkgProgress`/`DkgTransport` (§4).
 
 ---
 
@@ -168,23 +190,34 @@ trait DkgProgress {
                                              // Confirming{…}, Complete, Failed{…}
 }
 
+/// Where the verified roster comes from — invite-supplied (mobile) or
+/// relay-fetched (CLI discovery, opt-in). Both funnel through the SAME
+/// verification (`parse_roster_from_event`/hash-bind), so there is one audited
+/// authentication path regardless of source. Pins per-group SUBKEYS (§3).
+trait RosterSource {
+    async fn load(&self, group_id_hex: &str) -> Result<DkgRoster>;
+}
+
 /// One relay-driven software DKG run. Transport-injected so it is unit-testable
 /// without a live relay (fake transport for CI).
 async fn run_software_dkg(
     session: &mut SoftwareDkgSession,   // keep_core::frost::dkg
     transport: &dyn DkgTransport,       // subscribe/publish/fetch abstraction
-    roster: &DkgRoster,                 // moved out of keep-cli
-    our_keys: &Keys,                    // this device's rostered identity
+    roster: &dyn RosterSource,          // invite-supplied or relay-fetched
+    our_keys: &Keys,                    // this device's per-group subkey
     progress: &dyn DkgProgress,
     cancel: CancellationToken,          // §9
     timeout: Duration,
 ) -> Result<DkgOutcome>;                // share export + success certificate
 ```
 
-Moved verbatim (behavior-preserving in Phase 1): `DkgRoster`,
-`fetch_group_roster`, `parse_roster_from_event`, `frost_group_id`,
-`accept_group_key_confirmation`, the round-1/2/confirm loops, `MAX_DKG_EVENTS_SEEN`.
-Event kinds stay **21101/21102/21103/21107** so CLI and mobile interop on the wire.
+Moved out of keep-cli: `DkgRoster`, `fetch_group_roster`/`parse_roster_from_event`
+(behind `RosterSource`), `frost_group_id`, `accept_group_key_confirmation`, the
+round-1/2/confirm loops, `MAX_DKG_EVENTS_SEEN`. Event kinds stay
+**21101/21102/21103/21107** so CLI and mobile interop on the wire. Per §3+phasing,
+Phase 1 also swaps what the roster/`frost_group_id` pin from identity npubs to
+per-group subkeys — a deliberate one-time format change made while the code is
+already moving, before any group exists in the wild.
 
 ---
 
@@ -311,8 +344,10 @@ CLI keeps its current transport, mobile supplies the hardened one.
 - **Collector variant:** deferred; the §5 transcript binds the full roster, so a
   malicious collector swapping an entry makes every honest transcript diverge →
   CertEq fails. ✅ (door stays open)
-- **Identity model (§3):** host-key roster recommended — **needs sign-off**, incl.
-  per-group-subkey yes/no.
+- **Identity model (§3):** signed host-key roster + **per-group subkey (required)**;
+  `frost_group_id` hashes subkey npubs. ✅ **signed off**
+- **Subkey retained in the backup unit (C1)** and **roster relay-publication
+  opt-in / skipped for mobile (C2), via `RosterSource`.** ✅ signed off
 
 ---
 
@@ -322,18 +357,27 @@ On a phone there is no `--hardware` option, so on-device DKG **is** software DKG
 The CLI warns software DKG "keeps polynomial state in this process's memory for
 the duration of the run" and steers production keysets to hardware
 (`dkg.rs:851-855`). A Keystore-backed phone is a reasonable share holder, so this
-likely does not block the feature — but we should decide deliberately whether the
-mobile UI inherits that warning rather than shipping software DKG as the silent
-default. Its own thread, not a code blocker.
+likely does not block the feature. Direction (kwsantiago): the mobile UI should
+**not** inherit the CLI's wording — that warning is aimed at someone choosing
+between software and `--hardware`, and a phone has no such choice, so a
+recommendation reads as noise. Prefer a plain statement at group-creation time of
+what the device holds during the ceremony. Draft the copy once the ceremony is
+settled. Its own thread, not a code blocker.
 
 ---
 
 ## 11. Implementation phasing
 
-1. **Extract, no behavior change.** Move `DkgRoster`, roster fetch/parse/verify,
-   `frost_group_id`, round coordination, `MAX_DKG_EVENTS_SEEN` into
-   `keep-frost-net` behind `DkgProgress` + `DkgTransport`. keep-cli becomes an
-   adapter; its existing tests (#757/#817/#436/#689) stay green.
+1. **Extract + the roster/subkey change.** Move `DkgRoster`, roster
+   fetch/parse/verify (behind `RosterSource`), `frost_group_id`, round
+   coordination, `MAX_DKG_EVENTS_SEEN` into `keep-frost-net` behind `DkgProgress`
+   + `DkgTransport`. keep-cli becomes an adapter; its tests (#757/#817/#436/#689)
+   stay green. **Fold in §3 now** (kwsantiago's amendment): swap what the roster
+   and `frost_group_id` pin from identity npubs to per-group subkeys, add C1
+   (subkey in the backup unit) and C2 (`RosterSource`, opt-in relay publication) —
+   cheaper as a one-time format change now than migrating a shipped roster later,
+   and nothing has shipped that uses it yet. Update the #757/#817 roster tests to
+   the subkey format (the only intended behavior change in this phase).
 2. **Transcript upgrade** (§5) in the shared coordinator — confirmed value becomes
    the transcript hash, not the group-key string. Both callers benefit.
 3. **CertEq** (§6) — retained transferable certificate + persist-ordering /
