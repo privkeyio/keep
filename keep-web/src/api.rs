@@ -92,7 +92,7 @@ pub async fn shares(State(state): State<AppState>) -> impl IntoResponse {
                 .into_iter()
                 .map(|s| ShareDto {
                     active: active_hex.as_deref() == Some(&hex::encode(s.metadata.group_pubkey)),
-                    name: s.metadata.name,
+                    name: s.metadata.name.clone(),
                     group: keep_core::keys::bytes_to_npub(&s.metadata.group_pubkey),
                     identifier: s.metadata.identifier,
                     threshold: s.metadata.threshold,

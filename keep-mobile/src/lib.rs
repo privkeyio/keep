@@ -2215,7 +2215,7 @@ impl KeepMobile {
                 threshold: share_meta.threshold,
                 total_shares: share_meta.total_shares,
                 group_pubkey: hex::encode(share_meta.group_pubkey),
-                name: share_meta.name,
+                name: share_meta.name.clone(),
                 created_at: share_meta.created_at,
                 last_used: share_meta.last_used,
                 sign_count: share_meta.sign_count,
@@ -3904,7 +3904,7 @@ impl KeepMobile {
 
         Some(StoredShareInfo {
             group_pubkey: key,
-            name: metadata.name,
+            name: metadata.name.clone(),
             share_index: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,

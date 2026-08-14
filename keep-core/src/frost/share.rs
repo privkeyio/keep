@@ -74,6 +74,16 @@ pub struct ShareMetadata {
     pub group_subkey_secret: Option<[u8; 32]>,
 }
 
+impl Drop for ShareMetadata {
+    /// Scrub the retained per-group subkey secret (C1, §3) when this metadata is
+    /// dropped. `ShareMetadata` is `Clone`d on every DKG state transition, so the
+    /// raw subkey would otherwise linger in freed heap; the rest of the struct is
+    /// non-secret and left untouched.
+    fn drop(&mut self) {
+        self.group_subkey_secret.zeroize();
+    }
+}
+
 impl ShareMetadata {
     /// Create new share metadata.
     pub fn new(

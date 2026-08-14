@@ -713,6 +713,19 @@ pub async fn run_software_dkg(
             if !is_software_v1(ev) || u16_tag(ev, "recipient_index") != Some(our_index) {
                 continue;
             }
+            // #674/§7: authenticate on the cleartext `sender_index` tag BEFORE the
+            // NIP-44 ECDH, so an unroster'd flood costs a cheap tag lookup instead
+            // of one ECDH per spam event. The roster is authoritative for who each
+            // index is; the inner `sender_index` is re-checked against this
+            // authenticated tag below so a peer cannot claim a different index
+            // inside the ciphertext than it signed the event as.
+            let sender_idx = match u16_tag(ev, "sender_index") {
+                Some(i) => i,
+                None => continue,
+            };
+            if !roster.authenticates(sender_idx, &ev.pubkey, "round 2 share") {
+                continue;
+            }
             let decrypted = match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
                 // Plaintext carries the peer's secret signing share; scrub it.
                 Ok(d) => Zeroizing::new(d),
@@ -722,9 +735,12 @@ pub async fn run_software_dkg(
                 Ok(w) => w,
                 Err(_) => continue,
             };
-            // #674: the roster is authoritative for who each index is; check the
-            // author directly rather than trusting the round-1 pubkey map.
-            if !roster.authenticates(wire.sender_index, &ev.pubkey, "round 2 share") {
+            if wire.sender_index != sender_idx {
+                tracing::warn!(
+                    tag_index = sender_idx,
+                    wire_index = wire.sender_index,
+                    "Rejecting round 2 share: encrypted sender_index disagrees with the signed tag"
+                );
                 continue;
             }
             match session.receive_share(&wire) {
