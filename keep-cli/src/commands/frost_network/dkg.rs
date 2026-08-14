@@ -8,12 +8,37 @@ use nostr_sdk::prelude::*;
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result};
 use keep_core::Keep;
 use keep_frost_net::dkg::{
-    accept_group_key_confirmation, fetch_group_roster, frost_group_id, require_roster_matches,
-    MAX_DKG_EVENTS_SEEN,
+    fetch_group_roster, frost_group_id, require_roster_matches, run_software_dkg, ClientTransport,
+    DkgPhase, DkgProgress, MAX_DKG_EVENTS_SEEN,
 };
 
 use crate::output::Output;
 use crate::signer::HardwareSigner;
+
+/// Renders the shared coordinator's [`DkgPhase`] updates through the CLI's
+/// `Output`, so the round coordination lives in keep-frost-net while the console
+/// UX stays here.
+struct CliDkgProgress<'a> {
+    out: &'a Output,
+}
+
+impl DkgProgress for CliDkgProgress<'_> {
+    fn phase(&self, phase: DkgPhase) {
+        match phase {
+            DkgPhase::Round1 { received, total } => self.out.info(&format!(
+                "Round 1: {received}/{total} peer packages received"
+            )),
+            DkgPhase::Round2 { received, total } => self
+                .out
+                .info(&format!("Round 2: {received}/{total} peer shares received")),
+            DkgPhase::Finalizing => self.out.info("Finalizing DKG..."),
+            DkgPhase::Confirming { confirmed, total } => self.out.info(&format!(
+                "Confirming group key: {confirmed}/{total} peers agreed"
+            )),
+            DkgPhase::Complete { .. } => {}
+        }
+    }
+}
 
 /// Load an identity keypair from the Keep vault, converted to
 /// `nostr_sdk::Keys` for signing DKG events. Uses the named key when
@@ -510,9 +535,8 @@ fn cmd_frost_network_dkg_software(
     vault_path: &std::path::Path,
     identity_name: Option<&str>,
 ) -> Result<()> {
-    use keep_core::frost::dkg::{SoftwareDkgSession, SoftwareRound1Wire, SoftwareRound2Wire};
+    use keep_core::frost::dkg::SoftwareDkgSession;
     use secrecy::ExposeSecret;
-    use zeroize::Zeroizing;
 
     out.newline();
     out.header("FROST Distributed Key Generation (software)");
@@ -557,18 +581,10 @@ fn cmd_frost_network_dkg_software(
         &identity.public_key().to_bech32().unwrap_or_default(),
     );
 
-    let spinner = out.spinner("Generating DKG round 1 package...");
-    let our_round1 = session
-        .round1()
-        .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 1: {e}"))))?;
-    spinner.finish();
-    out.success("Round 1 package generated");
-    out.newline();
-
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
-    rt.block_on(async {
+    let result = rt.block_on(async {
         let keys = identity.clone();
         let client = Client::new(keys.clone());
         client
@@ -584,10 +600,9 @@ fn cmd_frost_network_dkg_software(
         );
         out.newline();
 
-        // #674: fetch the signed roster and require it to match our CLI
-        // args + identity before we publish our own round1 package. Fail
-        // closed so a wrong --index or a stale --threshold surfaces before
-        // co-signers see any DKG material from us.
+        // #674: fetch the signed roster and require it to match our CLI args +
+        // identity before we emit any DKG material. Fail closed so a wrong
+        // --index or a stale --threshold surfaces before co-signers see us.
         let spinner = out.spinner("Fetching signed group roster...");
         let roster = fetch_group_roster(&client, group).await?;
         spinner.finish();
@@ -598,401 +613,38 @@ fn cmd_frost_network_dkg_software(
         ));
         out.newline();
 
-        let round1_content = serde_json::to_string(&our_round1)
-            .map_err(|e| KeepError::Runtime(format!("serialize round1: {e}")))?;
-
-        let round1_event = EventBuilder::new(Kind::Custom(21102), &round1_content)
-            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
-            .tag(Tag::custom(
-                TagKind::custom("sender_index"),
-                vec![our_index.to_string()],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("dkg_mode"),
-                vec!["software_v1".to_string()],
-            ))
-            .sign_with_keys(&keys)
-            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
-
-        let spinner = out.spinner("Publishing round 1 package...");
-        client
-            .send_event(&round1_event)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
-        spinner.finish();
-
-        let expected_peers = participants - 1;
-        out.info(&format!(
-            "Waiting for {expected_peers} other round 1 packages..."
-        ));
-
-        let filter = Filter::new()
-            .kind(Kind::Custom(21102))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
-
-        // Keyed on the u16 wire index (not a truncated u8) so the map cannot
-        // alias two participants if the index type ever widens past 255.
-        let mut participant_pubkeys: HashMap<u16, PublicKey> = HashMap::new();
-        let timeout = std::time::Duration::from_secs(300);
-        let start = std::time::Instant::now();
-        let mut round1_done = 0u32;
-        // Events already examined this round, so a relay re-serving the same
-        // event (or a permanently-rejected one) is not reprocessed every poll.
-        let mut seen_round1: HashSet<EventId> = HashSet::new();
-
-        while round1_done < expected_peers as u32 {
-            if start.elapsed() > timeout {
-                return Err(KeepError::NetworkErr(NetworkError::timeout(
-                    "waiting for peer round1 packages",
-                )));
-            }
-
-            let events = client
-                .fetch_events(filter.clone(), std::time::Duration::from_secs(5))
-                .await
-                .map_err(|e| KeepError::NetworkErr(NetworkError::request(e.to_string())))?;
-
-            for ev in events.iter() {
-                if ev.pubkey == keys.public_key() {
-                    continue;
-                }
-                if !seen_round1.insert(ev.id) {
-                    continue;
-                }
-                if seen_round1.len() > MAX_DKG_EVENTS_SEEN {
-                    return Err(KeepError::NetworkErr(NetworkError::request(
-                        "too many distinct DKG round1 events; aborting to bound memory".to_string(),
-                    )));
-                }
-                // Software-only wire: skip hardware-format events cleanly.
-                let is_software = ev.tags.iter().any(|t| {
-                    let slice = t.as_slice();
-                    slice.first().map(|s| s.as_str()) == Some("dkg_mode")
-                        && slice.get(1).map(|s| s.as_str()) == Some("software_v1")
-                });
-                if !is_software {
-                    continue;
-                }
-                let wire: SoftwareRound1Wire = match serde_json::from_str(&ev.content) {
-                    Ok(w) => w,
-                    Err(_) => continue,
-                };
-                if wire.sender_index == our_index as u16 {
-                    continue;
-                }
-                // #674: authenticate the sender against the roster BEFORE
-                // touching the state machine so a hostile publisher cannot
-                // race the honest peer for its index or force a spurious
-                // rejection at part2/part3 by feeding malformed data.
-                if !roster.authenticates(wire.sender_index, &ev.pubkey, "round 1 event") {
-                    continue;
-                }
-                if participant_pubkeys.contains_key(&wire.sender_index) {
-                    continue;
-                }
-                match session.round1_peer(&wire) {
-                    Ok(_) => {
-                        participant_pubkeys.insert(wire.sender_index, ev.pubkey);
-                        round1_done += 1;
-                        out.success(&format!(
-                            "Received round 1 package from participant {}",
-                            wire.sender_index
-                        ));
-                    }
-                    Err(e) => {
-                        out.warn(&format!(
-                            "Rejected round 1 package from participant {}: {e}",
-                            wire.sender_index
-                        ));
-                    }
-                }
-            }
-
-            if round1_done < expected_peers as u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-
-        out.newline();
-        out.success("All round 1 packages received");
-
-        let spinner = out.spinner("Generating round 2 shares...");
-        let round2_wires = session
-            .round2()
-            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 2: {e}"))))?;
-        spinner.finish();
-
-        for (recipient_index, wire) in round2_wires {
-            let recipient_pubkey = participant_pubkeys.get(&recipient_index).ok_or_else(|| {
-                KeepError::FrostErr(FrostError::unknown_participant(recipient_index))
-            })?;
-            // Serialized share is secret until nip44 wraps it; scrub the plaintext.
-            let payload = Zeroizing::new(
-                serde_json::to_string(&wire)
-                    .map_err(|e| KeepError::Runtime(format!("serialize round2: {e}")))?,
-            );
-            let encrypted_content = nip44::encrypt(
-                keys.secret_key(),
-                recipient_pubkey,
-                payload.as_str(),
-                nip44::Version::default(),
-            )
-            .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(e.to_string())))?;
-
-            let share_event = EventBuilder::new(Kind::Custom(21103), &encrypted_content)
-                .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
-                .tag(Tag::custom(
-                    TagKind::custom("sender_index"),
-                    vec![our_index.to_string()],
-                ))
-                .tag(Tag::custom(
-                    TagKind::custom("recipient_index"),
-                    vec![recipient_index.to_string()],
-                ))
-                .tag(Tag::custom(
-                    TagKind::custom("dkg_mode"),
-                    vec!["software_v1".to_string()],
-                ))
-                .sign_with_keys(&keys)
-                .map_err(|e| {
-                    KeepError::CryptoErr(CryptoError::invalid_signature(format!(
-                        "share event: {e}"
-                    )))
-                })?;
-
-            client
-                .send_event(&share_event)
-                .await
-                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(format!("share: {e}"))))?;
-
-            out.info(&format!(
-                "Published encrypted round 2 share for participant {recipient_index}"
-            ));
-        }
-
-        out.newline();
-        out.info(&format!(
-            "Waiting for {expected_peers} round 2 shares from peers..."
-        ));
-
-        let share_filter = Filter::new()
-            .kind(Kind::Custom(21103))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
-
-        let start = std::time::Instant::now();
-        let mut round2_done = 0u32;
-        let mut seen_round2: HashSet<EventId> = HashSet::new();
-        while round2_done < expected_peers as u32 {
-            if start.elapsed() > timeout {
-                return Err(KeepError::NetworkErr(NetworkError::timeout(
-                    "waiting for peer round2 shares",
-                )));
-            }
-
-            let events = client
-                .fetch_events(share_filter.clone(), std::time::Duration::from_secs(5))
-                .await
-                .map_err(|e| {
-                    KeepError::NetworkErr(NetworkError::request(format!("fetch shares: {e}")))
-                })?;
-
-            for ev in events.iter() {
-                if ev.pubkey == keys.public_key() {
-                    continue;
-                }
-                if !seen_round2.insert(ev.id) {
-                    continue;
-                }
-                if seen_round2.len() > MAX_DKG_EVENTS_SEEN {
-                    return Err(KeepError::NetworkErr(NetworkError::request(
-                        "too many distinct DKG round2 events; aborting to bound memory".to_string(),
-                    )));
-                }
-                let is_software = ev.tags.iter().any(|t| {
-                    let slice = t.as_slice();
-                    slice.first().map(|s| s.as_str()) == Some("dkg_mode")
-                        && slice.get(1).map(|s| s.as_str()) == Some("software_v1")
-                });
-                if !is_software {
-                    continue;
-                }
-                let recipient_idx_tag = ev.tags.iter().find_map(|t| {
-                    let slice = t.as_slice();
-                    if slice.first().map(|s| s.as_str()) == Some("recipient_index") {
-                        slice.get(1).and_then(|s| s.parse::<u16>().ok())
-                    } else {
-                        None
-                    }
-                });
-                if recipient_idx_tag != Some(our_index as u16) {
-                    continue;
-                }
-                let decrypted = match nip44::decrypt(keys.secret_key(), &ev.pubkey, &ev.content) {
-                    // Plaintext carries the peer's secret signing share; scrub
-                    // it from the heap once this iteration drops it.
-                    Ok(d) => Zeroizing::new(d),
-                    Err(_) => continue,
-                };
-                let wire: SoftwareRound2Wire = match serde_json::from_str(&decrypted) {
-                    Ok(w) => w,
-                    Err(_) => continue,
-                };
-                // #674: the roster is now authoritative for who each index
-                // is. `participant_pubkeys` came from the (already-authed)
-                // round1 pass, but check against the roster directly so a
-                // future refactor cannot re-introduce the pre-#674 gap by
-                // populating that map without an author check.
-                if !roster.authenticates(wire.sender_index, &ev.pubkey, "round 2 share") {
-                    continue;
-                }
-                match session.receive_share(&wire) {
-                    Ok(_) => {
-                        round2_done += 1;
-                        out.success(&format!(
-                            "Received round 2 share from participant {}",
-                            wire.sender_index
-                        ));
-                    }
-                    Err(e) => {
-                        out.warn(&format!(
-                            "Rejected round 2 share from participant {}: {e}",
-                            wire.sender_index
-                        ));
-                    }
-                }
-            }
-            if round2_done < expected_peers as u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-
-        out.newline();
-        let spinner = out.spinner("Finalizing DKG...");
-        let result = session
-            .finalize()
-            .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("finalize: {e}"))))?;
-        spinner.finish();
-
-        // Equivocation check (keep-dcnq): round1 packages are broadcast through a
-        // single relay with no consistency round, so a malicious relay can hand
-        // DIFFERENT round1 sets to different participants, who then finalize
-        // DIFFERENT group keys with nothing in the base protocol to catch it.
-        // Before persisting, every participant broadcasts the group key it derived
-        // (an authenticated event the relay cannot forge) and requires all peers to
-        // report the SAME key. A divergence, or a peer that never confirms, aborts
-        // the DKG instead of storing an inconsistent keyset.
-        let our_group_hex = hex::encode(result.group_pubkey);
-        let confirm_event = EventBuilder::new(Kind::Custom(21107), &our_group_hex)
-            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
-            .tag(Tag::custom(
-                TagKind::custom("sender_index"),
-                vec![our_index.to_string()],
-            ))
-            .tag(Tag::custom(
-                TagKind::custom("dkg_mode"),
-                vec!["software_v1".to_string()],
-            ))
-            .sign_with_keys(&keys)
-            .map_err(|e| {
-                KeepError::CryptoErr(CryptoError::invalid_signature(format!(
-                    "confirm event: {e}"
-                )))
-            })?;
-        client
-            .send_event(&confirm_event)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::publish(format!("confirm: {e}"))))?;
-
-        out.newline();
-        out.info(&format!(
-            "Confirming the group key matches across {expected_peers} peers..."
-        ));
-        let confirm_filter = Filter::new()
-            .kind(Kind::Custom(21107))
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
-        let start = std::time::Instant::now();
-        let mut confirmed_indices: HashSet<u16> = HashSet::new();
-        let mut seen_confirm: HashSet<EventId> = HashSet::new();
-        while (confirmed_indices.len() as u32) < expected_peers as u32 {
-            if start.elapsed() > timeout {
-                return Err(KeepError::NetworkErr(NetworkError::timeout(
-                    "waiting for peer group-key confirmations (possible relay equivocation)",
-                )));
-            }
-            let events = client
-                .fetch_events(confirm_filter.clone(), std::time::Duration::from_secs(5))
-                .await
-                .map_err(|e| {
-                    KeepError::NetworkErr(NetworkError::request(format!("fetch confirm: {e}")))
-                })?;
-            for ev in events.iter() {
-                if ev.pubkey == keys.public_key() {
-                    continue;
-                }
-                if !seen_confirm.insert(ev.id) {
-                    continue;
-                }
-                if seen_confirm.len() > MAX_DKG_EVENTS_SEEN {
-                    return Err(KeepError::NetworkErr(NetworkError::request(
-                        "too many distinct DKG confirm events; aborting to bound memory"
-                            .to_string(),
-                    )));
-                }
-                let is_software = ev.tags.iter().any(|t| {
-                    let slice = t.as_slice();
-                    slice.first().map(|s| s.as_str()) == Some("dkg_mode")
-                        && slice.get(1).map(|s| s.as_str()) == Some("software_v1")
-                });
-                if !is_software {
-                    continue;
-                }
-                let sender_idx = ev.tags.iter().find_map(|t| {
-                    let slice = t.as_slice();
-                    if slice.first().map(|s| s.as_str()) == Some("sender_index") {
-                        slice.get(1).and_then(|s| s.parse::<u16>().ok())
-                    } else {
-                        None
-                    }
-                });
-                let sender_idx = match sender_idx {
-                    Some(i) => i,
-                    None => continue,
-                };
-                if !roster.authenticates(sender_idx, &ev.pubkey, "group-key confirmation") {
-                    continue;
-                }
-                if accept_group_key_confirmation(
-                    &our_group_hex,
-                    sender_idx,
-                    &ev.content,
-                    &mut confirmed_indices,
-                )? {
-                    out.success(&format!(
-                        "Participant {sender_idx} confirmed the same group key"
-                    ));
-                }
-            }
-            if (confirmed_indices.len() as u32) < expected_peers as u32 {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-        }
-
-        let spinner = out.spinner("Storing share in vault...");
-        keep.frost_store_dkg_share(&result, threshold as u16, participants as u16, group)?;
-        spinner.finish();
-
-        out.newline();
-        out.success("DKG Complete!");
-        out.field("Group public key", &hex::encode(result.group_pubkey));
-        out.field("Our index", &result.our_index.to_string());
-        out.newline();
-        out.info("Share stored in vault (software DKG).");
-        out.info(&format!(
-            "Group '{group}' is now ready for threshold signing."
-        ));
-
-        Ok::<_, KeepError>(())
+        // The round coordination (publish/collect for all three rounds, roster
+        // authentication, and the equivocation confirmation) is the shared
+        // implementation in keep-frost-net, driven here with an `Output`-backed
+        // progress sink.
+        let progress = CliDkgProgress { out };
+        let transport = ClientTransport::new(client);
+        run_software_dkg(
+            &mut session,
+            &transport,
+            &keys,
+            &roster,
+            group,
+            our_index as u16,
+            std::time::Duration::from_secs(300),
+            &progress,
+        )
+        .await
     })?;
+
+    let spinner = out.spinner("Storing share in vault...");
+    keep.frost_store_dkg_share(&result, threshold as u16, participants as u16, group)?;
+    spinner.finish();
+
+    out.newline();
+    out.success("DKG Complete!");
+    out.field("Group public key", &hex::encode(result.group_pubkey));
+    out.field("Our index", &result.our_index.to_string());
+    out.newline();
+    out.info("Share stored in vault (software DKG).");
+    out.info(&format!(
+        "Group '{group}' is now ready for threshold signing."
+    ));
 
     Ok(())
 }
