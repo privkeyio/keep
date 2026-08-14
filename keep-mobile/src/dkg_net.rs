@@ -45,6 +45,7 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use keep_core::relay::TIMESTAMP_TWEAK_RANGE;
 
@@ -107,23 +108,26 @@ fn derive_dkg_keys(secret: &[u8; 32], index: u16) -> Result<Keys, KeepMobileErro
     hasher.update(DKG_IDENTITY_DOMAIN);
     hasher.update(secret);
     hasher.update(index.to_be_bytes());
-    let derived: [u8; 32] = hasher.finalize().into();
-    let secret_key = SecretKey::from_slice(&derived).map_err(|e| KeepMobileError::FrostError {
+    let derived: Zeroizing<[u8; 32]> = Zeroizing::new(hasher.finalize().into());
+    let secret_key = SecretKey::from_slice(&*derived).map_err(|e| KeepMobileError::FrostError {
         msg: format!("Failed to derive DKG identity: {e}"),
     })?;
     Ok(Keys::new(secret_key))
 }
 
-fn parse_secret(hex_secret: &str) -> Result<[u8; 32], KeepMobileError> {
-    let bytes = hex::decode(hex_secret).map_err(|_| KeepMobileError::InvalidInput {
-        msg: "session_secret must be hex".into(),
-    })?;
-    bytes
+fn parse_secret(hex_secret: &str) -> Result<Zeroizing<[u8; 32]>, KeepMobileError> {
+    let bytes = Zeroizing::new(hex::decode(hex_secret).map_err(|_| {
+        KeepMobileError::InvalidInput {
+            msg: "session_secret must be hex".into(),
+        }
+    })?);
+    let secret: [u8; 32] = bytes
         .as_slice()
         .try_into()
         .map_err(|_| KeepMobileError::InvalidInput {
             msg: "session_secret must be 32 bytes".into(),
-        })
+        })?;
+    Ok(Zeroizing::new(secret))
 }
 
 /// Run a full relay-driven DKG and return this device's share export. The

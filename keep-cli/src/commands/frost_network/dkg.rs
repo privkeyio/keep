@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nostr_sdk::prelude::*;
+use zeroize::Zeroizing;
 
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result};
 use keep_core::Keep;
@@ -47,15 +48,15 @@ impl DkgProgress for CliDkgProgress<'_> {
 /// of identities. Errors if the group has no enrolled subkey: the participant
 /// must run `keep frost network group-subkey --group <name>` first and hand its
 /// pubkey to the coordinator so it appears in the roster.
-fn load_group_subkey(keep: &Keep, group: &str) -> Result<(Keys, [u8; 32])> {
-    let secret = keep.frost_group_subkey_secret(group)?.ok_or_else(|| {
+fn load_group_subkey(keep: &Keep, group: &str) -> Result<(Keys, Zeroizing<[u8; 32]>)> {
+    let secret = Zeroizing::new(keep.frost_group_subkey_secret(group)?.ok_or_else(|| {
         KeepError::KeyNotFound(format!(
             "no per-group signing subkey enrolled for group {group:?}; run \
              `keep frost network group-subkey --group {group}` first and give the \
              printed pubkey to the coordinator so it appears in the signed roster (§3)"
         ))
-    })?;
-    let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&secret).map_err(|e| {
+    })?);
+    let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&*secret).map_err(|e| {
         KeepError::CryptoErr(CryptoError::invalid_key(format!(
             "stored per-group subkey is not a valid secp256k1 secret: {e}"
         )))
@@ -628,7 +629,7 @@ fn cmd_frost_network_dkg_software(
         threshold as u16,
         participants as u16,
         group,
-        Some(subkey_secret),
+        Some(*subkey_secret),
     )?;
     spinner.finish();
 
