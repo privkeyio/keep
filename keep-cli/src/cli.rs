@@ -856,14 +856,17 @@ pub(crate) enum FrostNetworkCommands {
                     encrypted under the vault key."
         )]
         path: Option<std::path::PathBuf>,
+    },
+    /// Enroll this device's per-group signing subkey (§3) and print its pubkey
+    /// to hand to the coordinator. Run once per group before `dkg`.
+    GroupSubkey {
+        #[arg(short, long, help = "Group name the subkey signs for")]
+        group: String,
         #[arg(
             long,
-            help = "Name of a vault-stored identity key to sign DKG events with \
-                    (#674). Must be the same npub that appears at --index in the \
-                    signed kind-21101 group announcement. Defaults to the vault's \
-                    primary key."
+            help = "Vault path override. Defaults to the global --path / configured vault."
         )]
-        identity: Option<String>,
+        path: Option<std::path::PathBuf>,
     },
     Sign {
         #[arg(short, long)]
@@ -923,8 +926,18 @@ pub(crate) enum FrostNetworkCommands {
         participants: u8,
         #[arg(short, long, help = "Relay URLs (can specify multiple)")]
         relay: Vec<String>,
-        #[arg(long, help = "Participant npubs (can specify multiple)")]
-        participant_npub: Vec<String>,
+        #[arg(
+            long,
+            help = "Participant per-group subkey pubkeys, in index order (§3); each \
+                    printed by `keep frost network group-subkey`. Not identity npubs."
+        )]
+        participant_subkey: Vec<String>,
+        #[arg(
+            long,
+            help = "Publish the roster to the relay for the CLI discovery path (§3 C2). \
+                    Off by default: the roster is a local artifact distributed out of band."
+        )]
+        publish: bool,
     },
     NoncePrecommit {
         #[arg(short, long)]

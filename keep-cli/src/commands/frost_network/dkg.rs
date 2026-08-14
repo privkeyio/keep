@@ -40,32 +40,27 @@ impl DkgProgress for CliDkgProgress<'_> {
     }
 }
 
-/// Load an identity keypair from the Keep vault, converted to
-/// `nostr_sdk::Keys` for signing DKG events. Uses the named key when
-/// `identity_name` is `Some`; otherwise falls back to the vault's primary.
-fn load_identity_keys(keep: &Keep, identity_name: Option<&str>) -> Result<Keys> {
-    let slot = if let Some(name) = identity_name {
-        keep.keyring().get_by_name(name).ok_or_else(|| {
-            KeepError::KeyNotFound(format!(
-                "identity key {name:?} not found in vault; add one with `keep import` or omit --identity to use the primary"
-            ))
-        })?
-    } else {
-        keep.keyring().get_primary().ok_or_else(|| {
-            KeepError::KeyNotFound(
-                "vault has no primary identity key; add one with `keep generate` \
-                 or pass --identity <name>"
-                    .into(),
-            )
-        })?
-    };
-    let kp = slot.to_nostr_keypair()?;
-    let sk = nostr_sdk::secp256k1::SecretKey::from_slice(kp.secret_bytes()).map_err(|e| {
+/// Load this device's per-group DKG signing subkey (§3) from the vault as
+/// `nostr_sdk::Keys`, returned with its raw secret so the caller can retain it
+/// with the finalized share (C1). The subkey — never the identity nsec — is what
+/// the signed roster pins, so the kind-21101 announcement never publishes a map
+/// of identities. Errors if the group has no enrolled subkey: the participant
+/// must run `keep frost network group-subkey --group <name>` first and hand its
+/// pubkey to the coordinator so it appears in the roster.
+fn load_group_subkey(keep: &Keep, group: &str) -> Result<(Keys, [u8; 32])> {
+    let secret = keep.frost_group_subkey_secret(group)?.ok_or_else(|| {
+        KeepError::KeyNotFound(format!(
+            "no per-group signing subkey enrolled for group {group:?}; run \
+             `keep frost network group-subkey --group {group}` first and give the \
+             printed pubkey to the coordinator so it appears in the signed roster (§3)"
+        ))
+    })?;
+    let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&secret).map_err(|e| {
         KeepError::CryptoErr(CryptoError::invalid_key(format!(
-            "identity key is not a valid secp256k1 secret: {e}"
+            "stored per-group subkey is not a valid secp256k1 secret: {e}"
         )))
     })?;
-    Ok(Keys::new(sk.into()))
+    Ok((Keys::new(sk.into()), secret))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -79,15 +74,14 @@ pub fn cmd_frost_network_dkg(
     relay: &str,
     hardware: Option<&str>,
     vault_path: Option<&std::path::Path>,
-    identity_name: Option<&str>,
 ) -> Result<()> {
-    // #674: both paths now require a vault path to load the identity nsec
-    // that signs DKG events. Without authentication a relay writer can DoS
+    // §3/#674: both paths require a vault path to load the per-group signing
+    // subkey that signs DKG events. Without authentication a relay writer can DoS
     // or (with enough participation) join a group as a rogue co-generator.
     let vault_path = vault_path.ok_or_else(|| {
         KeepError::InvalidInput(
-            "keep frost network dkg requires --path <vault> to load an authenticated \
-             identity key for signing DKG events (#674)."
+            "keep frost network dkg requires --path <vault> to load the per-group \
+             signing subkey for DKG events (§3/#674)."
                 .into(),
         )
     })?;
@@ -101,7 +95,6 @@ pub fn cmd_frost_network_dkg(
             relay,
             hw,
             vault_path,
-            identity_name,
         ),
         None => cmd_frost_network_dkg_software(
             out,
@@ -111,7 +104,6 @@ pub fn cmd_frost_network_dkg(
             our_index,
             relay,
             vault_path,
-            identity_name,
         ),
     }
 }
@@ -127,7 +119,6 @@ fn cmd_frost_network_dkg_hardware(
     relay: &str,
     hardware: &str,
     vault_path: &std::path::Path,
-    identity_name: Option<&str>,
 ) -> Result<()> {
     use secrecy::ExposeSecret;
 
@@ -153,19 +144,19 @@ fn cmd_frost_network_dkg_hardware(
         ))));
     }
 
-    // #674: load our identity nsec from the vault BEFORE the hardware is
-    // touched. A stale hardware DKG state (from a prior interrupted run)
-    // is much easier to reset than "we already connected to hardware but
-    // then errored on missing vault identity".
+    // §3/#674: load our per-group signing subkey from the vault BEFORE the
+    // hardware is touched. A stale hardware DKG state (from a prior interrupted
+    // run) is much easier to reset than "we already connected to hardware but
+    // then errored on a missing per-group subkey".
     let spinner = out.spinner("Opening vault...");
     let mut keep = Keep::open(vault_path)?;
     let password = super::get_password("Enter password")?;
     keep.unlock(password.expose_secret())?;
-    let identity = load_identity_keys(&keep, identity_name)?;
+    let (subkey, _subkey_secret) = load_group_subkey(&keep, group)?;
     spinner.finish();
     out.field(
-        "Identity npub",
-        &identity.public_key().to_bech32().unwrap_or_default(),
+        "Subkey npub",
+        &subkey.public_key().to_bech32().unwrap_or_default(),
     );
 
     let spinner = out.spinner("Connecting to hardware...");
@@ -202,7 +193,7 @@ fn cmd_frost_network_dkg_hardware(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
-        let keys = identity.clone();
+        let keys = subkey.clone();
         let client = Client::new(keys.clone());
         client
             .add_relay(relay)
@@ -218,7 +209,7 @@ fn cmd_frost_network_dkg_hardware(
         out.newline();
 
         // #674: fetch the signed roster and require it to match our CLI
-        // args + identity before we emit any DKG material.
+        // args + subkey before we emit any DKG material.
         let spinner = out.spinner("Fetching signed group roster...");
         let roster = fetch_group_roster(&client, group).await?;
         spinner.finish();
@@ -533,7 +524,6 @@ fn cmd_frost_network_dkg_software(
     our_index: u8,
     relay: &str,
     vault_path: &std::path::Path,
-    identity_name: Option<&str>,
 ) -> Result<()> {
     use keep_core::frost::dkg::SoftwareDkgSession;
     use secrecy::ExposeSecret;
@@ -571,21 +561,21 @@ fn cmd_frost_network_dkg_software(
     let mut keep = Keep::open(vault_path)?;
     let password = super::get_password("Enter password")?;
     keep.unlock(password.expose_secret())?;
-    // #674: load our identity nsec here so a wrong --identity fails BEFORE
-    // any DKG state is created; we would otherwise emit our round1 package
-    // under an authenticated key that later intake rejects on mismatch.
-    let identity = load_identity_keys(&keep, identity_name)?;
+    // §3/#674: load our per-group signing subkey here so a group with no enrolled
+    // subkey fails BEFORE any DKG state is created; we would otherwise emit our
+    // round1 package under a key the roster does not pin and later intake rejects.
+    let (subkey, subkey_secret) = load_group_subkey(&keep, group)?;
     spinner.finish();
     out.field(
-        "Identity npub",
-        &identity.public_key().to_bech32().unwrap_or_default(),
+        "Subkey npub",
+        &subkey.public_key().to_bech32().unwrap_or_default(),
     );
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let result = rt.block_on(async {
-        let keys = identity.clone();
+        let keys = subkey.clone();
         let client = Client::new(keys.clone());
         client
             .add_relay(relay)
@@ -601,7 +591,7 @@ fn cmd_frost_network_dkg_software(
         out.newline();
 
         // #674: fetch the signed roster and require it to match our CLI args +
-        // identity before we emit any DKG material. Fail closed so a wrong
+        // subkey before we emit any DKG material. Fail closed so a wrong
         // --index or a stale --threshold surfaces before co-signers see us.
         let spinner = out.spinner("Fetching signed group roster...");
         let roster = fetch_group_roster(&client, group).await?;
@@ -633,7 +623,13 @@ fn cmd_frost_network_dkg_software(
     })?;
 
     let spinner = out.spinner("Storing share in vault...");
-    keep.frost_store_dkg_share(&result, threshold as u16, participants as u16, group)?;
+    keep.frost_store_dkg_share(
+        &result,
+        threshold as u16,
+        participants as u16,
+        group,
+        Some(subkey_secret),
+    )?;
     spinner.finish();
 
     out.newline();
@@ -649,6 +645,19 @@ fn cmd_frost_network_dkg_software(
     Ok(())
 }
 
+/// Assemble the signed kind-21101 roster for a group.
+///
+/// §3: the per-participant pubkeys are each device's **per-group signing
+/// subkey** (printed by `keep frost network group-subkey`), never an identity
+/// npub — the announcement is public, so identity p-tags would publish a
+/// targeting map of who co-holds the key. `frost_group_id` therefore hashes the
+/// subkeys.
+///
+/// C2: relay publication is **opt-in** (`publish`). By default the roster is a
+/// local artifact — the group id and pubkey list are printed for the coordinator
+/// to hand to participants out of band (the same shape mobile carries in its
+/// invite), and nothing is written to a relay. `--publish` opts into the CLI's
+/// relay-discovery path, which each participant's `dkg` then fetches.
 #[tracing::instrument(skip(out))]
 pub fn cmd_frost_network_group_create(
     out: &Output,
@@ -656,7 +665,8 @@ pub fn cmd_frost_network_group_create(
     threshold: u8,
     participants: u8,
     relays: &[String],
-    participant_npubs: &[String],
+    participant_subkeys: &[String],
+    publish: bool,
 ) -> Result<()> {
     out.newline();
     out.header("FROST Group Announcement (Kind 21101)");
@@ -670,15 +680,33 @@ pub fn cmd_frost_network_group_create(
         ))));
     }
 
-    if participant_npubs.len() != participants as usize {
+    if participant_subkeys.len() != participants as usize {
         return Err(KeepError::InvalidInput(format!(
-            "expected {} participant npubs, got {}",
+            "expected {} participant subkeys, got {}",
             participants,
-            participant_npubs.len()
+            participant_subkeys.len()
         )));
     }
 
-    let group_id = frost_group_id(name, threshold, participants, participant_npubs);
+    let group_id = frost_group_id(name, threshold, participants, participant_subkeys);
+
+    // C2: default is a local roster artifact — print the group id and the subkey
+    // list for out-of-band distribution and skip the relay entirely, so a group
+    // never leaves a public record unless the coordinator asks for one.
+    if !publish {
+        out.success("Group roster assembled (local, not published).");
+        out.field("Group ID", &hex::encode(group_id));
+        out.newline();
+        for (i, subkey) in participant_subkeys.iter().enumerate() {
+            out.info(&format!("Participant {}: {}", i + 1, subkey));
+        }
+        out.newline();
+        out.info(
+            "Distribute the group id + subkeys to participants out of band, or re-run with \
+             --publish to announce on the relay for the CLI discovery path.",
+        );
+        return Ok(());
+    }
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -711,11 +739,11 @@ pub fn cmd_frost_network_group_create(
             ),
         ];
 
-        for (i, npub) in participant_npubs.iter().enumerate() {
+        for (i, subkey) in participant_subkeys.iter().enumerate() {
             let relay_hint = relays.first().map(|s| s.as_str()).unwrap_or("");
             tags.push(Tag::custom(
                 TagKind::custom("p"),
-                vec![npub.clone(), relay_hint.to_string(), (i + 1).to_string()],
+                vec![subkey.clone(), relay_hint.to_string(), (i + 1).to_string()],
             ));
         }
 
@@ -751,12 +779,54 @@ pub fn cmd_frost_network_group_create(
         out.field("Group ID", &hex::encode(group_id));
         out.newline();
 
-        for (i, npub) in participant_npubs.iter().enumerate() {
-            out.info(&format!("Participant {}: {}", i + 1, npub));
+        for (i, subkey) in participant_subkeys.iter().enumerate() {
+            out.info(&format!("Participant {}: {}", i + 1, subkey));
         }
 
         Ok::<_, KeepError>(())
     })?;
+
+    Ok(())
+}
+
+/// Enroll this device's per-group DKG signing subkey (§3) and print its pubkey.
+///
+/// Each participant runs this once per group before the coordinator builds the
+/// roster, then hands the printed pubkey to the coordinator so it lands in the
+/// signed kind-21101 announcement (and thus in `frost_group_id`). The secret is
+/// stored in the vault keyed by group name and retained with the finalized share
+/// (C1); `keep frost network dkg` looks it up to sign DKG events. Idempotent:
+/// re-running prints the same subkey rather than minting a divergent one.
+#[tracing::instrument(skip(out))]
+pub fn cmd_frost_network_group_subkey(
+    out: &Output,
+    group: &str,
+    vault_path: &std::path::Path,
+) -> Result<()> {
+    use secrecy::ExposeSecret;
+
+    out.newline();
+    out.header("FROST Per-Group Signing Subkey (§3)");
+    out.field("Group", group);
+    out.field("Vault", &vault_path.display().to_string());
+    out.newline();
+
+    let spinner = out.spinner("Opening vault...");
+    let mut keep = Keep::open(vault_path)?;
+    let password = super::get_password("Enter password")?;
+    keep.unlock(password.expose_secret())?;
+    let pubkey = keep.frost_group_subkey_ensure(group)?;
+    spinner.finish();
+
+    let npub = keep_core::keys::bytes_to_npub(&pubkey);
+    out.success("Subkey ready.");
+    out.field("Subkey npub", &npub);
+    out.field("Subkey pubkey (hex)", &hex::encode(pubkey));
+    out.newline();
+    out.info(
+        "Give this pubkey to the group coordinator so it appears in the signed roster. \
+         The secret stays in this vault and is retained with your share (C1).",
+    );
 
     Ok(())
 }

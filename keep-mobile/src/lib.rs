@@ -2223,6 +2223,7 @@ impl KeepMobile {
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
                 ciphersuite: stored.ciphersuite,
+                group_subkey_secret: share_meta.group_subkey_secret.map(hex::encode),
             });
         }
 
@@ -2477,6 +2478,16 @@ impl KeepMobile {
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
                 did_backup: bs.did_backup,
+                group_subkey_secret: bs
+                    .group_subkey_secret
+                    .as_deref()
+                    .map(|s| {
+                        bytes_to_32(
+                            &decode_hex(s, "group_subkey_secret")?,
+                            "group subkey secret",
+                        )
+                    })
+                    .transpose()?,
             };
 
             let stored = StoredShareData {
@@ -4605,6 +4616,7 @@ mod restore_backup_metadata_tests {
             key_package: hex::encode([1u8; 48]),
             pubkey_package: hex::encode([2u8; 48]),
             ciphersuite: Default::default(),
+            group_subkey_secret: None,
         }
     }
 
