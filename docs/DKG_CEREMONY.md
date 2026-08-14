@@ -367,7 +367,7 @@ before the next.
 | Relay pinning + proxy + RelayOptions + local re-checks | §7, §2 G5 |
 | `session_secret` Debug leak | §8 |
 | decrypt-before-author-check | §7 |
-| persist-after-Complete loss | §6.4, §8 |
+| persist-after-Complete loss | §6, §8 |
 | unconditional reset / start TOCTOU | §8 |
 | websocket leak on early return | §7 cleanup |
 | filters lacking authors/limit; bounded polling | §7, §0.1 |
