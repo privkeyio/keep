@@ -723,6 +723,24 @@ pub async fn run_software_dkg(
         (Kind::Custom(content_kind), d, sender, mode)
     };
 
+    // DKG events (kinds 21101-21107) are ephemeral, so relays never store them:
+    // a peer that subscribes after our one-shot publish would never see it. We
+    // rebuild and resend our outbound event on every poll iteration with a fresh
+    // timestamp (hence a new event id) so relays forward it to late subscribers.
+    let build_signed = |content_kind: u16, content: &str, extra: &[Tag]| -> Result<Event> {
+        let (kind, d, sender, mode) = base_tags(content_kind);
+        let mut builder = EventBuilder::new(kind, content)
+            .tag(d)
+            .tag(sender)
+            .tag(mode);
+        for t in extra {
+            builder = builder.tag(t.clone());
+        }
+        builder
+            .sign_with_keys(keys)
+            .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))
+    };
+
     // --- Round 1: publish our package, collect the other n-1. ---
     let our_round1 = session
         .round1()
@@ -738,14 +756,6 @@ pub async fn run_software_dkg(
     );
     let round1_content = serde_json::to_string(&our_round1)
         .map_err(|e| KeepError::Runtime(format!("serialize round1: {e}")))?;
-    let (kind, d, sender, mode) = base_tags(DKG_KIND_ROUND1);
-    let round1_event = EventBuilder::new(kind, &round1_content)
-        .tag(d)
-        .tag(sender)
-        .tag(mode)
-        .sign_with_keys(keys)
-        .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
-    transport.send_event(&round1_event).await?;
     progress.phase(DkgPhase::Round1 { received: 0, total });
 
     let round1_filter = Filter::new()
@@ -765,6 +775,9 @@ pub async fn run_software_dkg(
                 "waiting for peer round1 packages",
             )));
         }
+        transport
+            .send_event(&build_signed(DKG_KIND_ROUND1, &round1_content, &[])?)
+            .await?;
         let events = transport
             .fetch_events(round1_filter.clone(), Duration::from_secs(5))
             .await?;
@@ -827,6 +840,10 @@ pub async fn run_software_dkg(
         .round2()
         .map_err(|e| KeepError::FrostErr(FrostError::dkg(format!("round 2: {e}"))))?;
     progress.phase(DkgPhase::Round2 { received: 0, total });
+    // Encrypt each recipient's share once; the ciphertext is reused, but the
+    // carrying event is rebuilt with a fresh timestamp on every poll below so
+    // late peers still receive it (ephemeral events are not stored by relays).
+    let mut round2_outbound: Vec<(u16, String)> = Vec::new();
     for (recipient_index, wire) in round2_wires {
         let recipient_pubkey = participant_pubkeys
             .get(&recipient_index)
@@ -843,20 +860,7 @@ pub async fn run_software_dkg(
             nip44::Version::default(),
         )
         .map_err(|e| KeepError::CryptoErr(CryptoError::encryption(e.to_string())))?;
-        let (kind, d, sender, mode) = base_tags(DKG_KIND_ROUND2);
-        let share_event = EventBuilder::new(kind, &encrypted)
-            .tag(d)
-            .tag(sender)
-            .tag(mode)
-            .tag(Tag::custom(
-                TagKind::custom("recipient_index"),
-                vec![recipient_index.to_string()],
-            ))
-            .sign_with_keys(keys)
-            .map_err(|e| {
-                KeepError::CryptoErr(CryptoError::invalid_signature(format!("share event: {e}")))
-            })?;
-        transport.send_event(&share_event).await?;
+        round2_outbound.push((recipient_index, encrypted));
     }
 
     let round2_filter = Filter::new()
@@ -873,6 +877,15 @@ pub async fn run_software_dkg(
             return Err(KeepError::NetworkErr(NetworkError::timeout(
                 "waiting for peer round2 shares",
             )));
+        }
+        for (recipient_index, encrypted) in round2_outbound.iter() {
+            let recipient_tag = Tag::custom(
+                TagKind::custom("recipient_index"),
+                vec![recipient_index.to_string()],
+            );
+            transport
+                .send_event(&build_signed(DKG_KIND_ROUND2, encrypted, &[recipient_tag])?)
+                .await?;
         }
         let events = transport
             .fetch_events(round2_filter.clone(), Duration::from_secs(5))
@@ -963,18 +976,6 @@ pub async fn run_software_dkg(
         &result.group_pubkey,
     )?;
     let our_transcript_hex = hex::encode(our_transcript);
-    let (kind, d, sender, mode) = base_tags(DKG_KIND_CONFIRM);
-    let confirm_event = EventBuilder::new(kind, &our_transcript_hex)
-        .tag(d)
-        .tag(sender)
-        .tag(mode)
-        .sign_with_keys(keys)
-        .map_err(|e| {
-            KeepError::CryptoErr(CryptoError::invalid_signature(format!(
-                "confirm event: {e}"
-            )))
-        })?;
-    transport.send_event(&confirm_event).await?;
     progress.phase(DkgPhase::Confirming {
         confirmed: 0,
         total,
@@ -998,6 +999,9 @@ pub async fn run_software_dkg(
                 "waiting for peer group-key confirmations (possible relay equivocation)",
             )));
         }
+        transport
+            .send_event(&build_signed(DKG_KIND_CONFIRM, &our_transcript_hex, &[])?)
+            .await?;
         let events = transport
             .fetch_events(confirm_filter.clone(), Duration::from_secs(5))
             .await?;
@@ -1044,7 +1048,10 @@ pub async fn run_software_dkg(
     // without the certificate in hand — that ordering is the fix for a device
     // finalizing into a group a timed-out peer never joined.
     let mut confirmations = peer_confirmations;
-    confirmations.insert(our_index, confirm_event);
+    confirmations.insert(
+        our_index,
+        build_signed(DKG_KIND_CONFIRM, &our_transcript_hex, &[])?,
+    );
     let certificate = DkgCertificate {
         transcript: our_transcript,
         confirmations,
@@ -1668,10 +1675,14 @@ mod tests {
             .expect("party 1 -> party 2 round-2 share");
 
         // The intended recipient (party 2) recovers the plaintext share.
-        assert!(nip44::decrypt(keys[1].secret_key(), &keys[0].public_key(), &share.content).is_ok());
+        assert!(
+            nip44::decrypt(keys[1].secret_key(), &keys[0].public_key(), &share.content).is_ok()
+        );
         // A rostered non-recipient (party 3) cannot: the share is encrypted to
         // party 2's key, not readable by all as the pre-fix broadcast was.
-        assert!(nip44::decrypt(keys[2].secret_key(), &keys[0].public_key(), &share.content).is_err());
+        assert!(
+            nip44::decrypt(keys[2].secret_key(), &keys[0].public_key(), &share.content).is_err()
+        );
     }
 
     /// Phase 5(b): an equivocating insider makes two honest peers derive
@@ -1724,7 +1735,10 @@ mod tests {
         .unwrap();
         let forged = EventBuilder::new(Kind::Custom(DKG_KIND_ROUND2), &ciphertext)
             .tag(Tag::custom(TagKind::custom("d"), vec!["g".to_string()]))
-            .tag(Tag::custom(TagKind::custom("sender_index"), vec!["2".to_string()]))
+            .tag(Tag::custom(
+                TagKind::custom("sender_index"),
+                vec!["2".to_string()],
+            ))
             .tag(Tag::custom(
                 TagKind::custom("dkg_mode"),
                 vec![DKG_MODE_SOFTWARE_V1.to_string()],
