@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result};
 use keep_core::Keep;
 use keep_frost_net::dkg::{
-    fetch_group_roster, frost_group_id, require_roster_matches, run_software_dkg, ClientTransport,
-    DkgPhase, DkgProgress, MAX_DKG_EVENTS_SEEN,
+    fetch_group_roster, frost_group_id, parse_pubkey, require_roster_matches, run_software_dkg,
+    ClientTransport, DkgPhase, DkgProgress, MAX_DKG_EVENTS_SEEN,
 };
 
 use crate::output::Output;
@@ -710,6 +710,32 @@ pub fn cmd_frost_network_group_create(
             participant_subkeys.len()
         )));
     }
+
+    // Normalize before hashing. The raw CLI strings may be hex or bech32 and may
+    // differ in case, so two coordinators typing the same roster differently
+    // would derive different group ids and silently fail to find each other.
+    // Parsing also rejects a malformed key here rather than at round 1, and the
+    // duplicate check closes a real attack: repeating one participant's subkey
+    // gives that holder two of the n shares, so a 2-of-3 becomes single-party
+    // spendable by them.
+    let mut normalized: Vec<String> = Vec::with_capacity(participant_subkeys.len());
+    let mut seen: HashSet<PublicKey> = HashSet::new();
+    for (i, raw) in participant_subkeys.iter().enumerate() {
+        let pk = parse_pubkey(raw).map_err(|e| {
+            KeepError::InvalidInput(format!("participant {} subkey is invalid: {e}", i + 1))
+        })?;
+        if !seen.insert(pk) {
+            return Err(KeepError::InvalidInput(format!(
+                "participant {} repeats a subkey already used by an earlier participant; \
+                 every participant must hold a distinct key",
+                i + 1
+            )));
+        }
+        normalized.push(pk.to_bech32().map_err(|e| {
+            KeepError::InvalidInput(format!("participant {} subkey is unencodable: {e}", i + 1))
+        })?);
+    }
+    let participant_subkeys: &[String] = &normalized;
 
     let group_id = frost_group_id(name, threshold, participants, participant_subkeys);
 
