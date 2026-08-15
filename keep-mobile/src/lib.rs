@@ -569,6 +569,10 @@ pub struct KeepMobile {
     /// Cancel flag for the single in-flight `frost_run_dkg`; flipped by
     /// `frost_cancel_dkg` and polled by the shared coordinator (§8/§9).
     dkg_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight guard: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so
+    /// a second concurrent run would reset the first's cancel flag. Rejected while
+    /// set; cleared on every exit path by `DkgInFlightGuard`.
+    dkg_in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime: tokio::runtime::Runtime,
     policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
     velocity: Arc<std::sync::Mutex<VelocityTracker>>,
@@ -732,6 +736,7 @@ impl KeepMobile {
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dkg_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dkg_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime,
             policy,
             velocity,
@@ -1351,6 +1356,31 @@ impl KeepMobile {
         timeout_secs: u64,
         progress: Arc<dyn dkg::DkgProgressCallback>,
     ) -> Result<ShareInfo, KeepMobileError> {
+        // Single-flight: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so a
+        // second concurrent call would reset the active run's cancel flag. Reject
+        // it, and clear the guard on every exit path via Drop.
+        struct DkgInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DkgInFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if self
+            .dkg_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return Err(KeepMobileError::FrostError {
+                msg: "a DKG run is already in progress".into(),
+            });
+        }
+        let _in_flight = DkgInFlightGuard(self.dkg_in_flight.clone());
+
         // Pre-flight the persistence constraints before the multi-round network
         // run so an invalid name or a full store fails fast, rather than after
         // peers have already completed a group this device would discard.
