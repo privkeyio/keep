@@ -844,9 +844,10 @@ pub(crate) enum FrostNetworkCommands {
         relay: Option<String>,
         #[arg(
             long,
-            help = "Hardware signer device path (e.g., /dev/ttyACM0). \
-                    Omit to run software DKG in-process, storing the resulting \
-                    share in the vault (#454)."
+            help = "Hardware signer device path (e.g., /dev/ttyACM0). NOTE: \
+                    hardware DKG is currently unsupported (not yet migrated to the \
+                    hardened coordinator) and will be refused. Omit this flag to run \
+                    software DKG in-process, storing the resulting share in the vault."
         )]
         hardware: Option<String>,
         #[arg(
