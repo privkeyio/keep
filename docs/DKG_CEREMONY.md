@@ -163,9 +163,13 @@ leaking identity too.
 **Two consequences (build in now):**
 
 - **C1 — retain the subkey with the share, in the same backup unit.** The subkey
-  proves membership when presenting/verifying a certificate during recovery; a
-  backup that restores the share but not the subkey leaves a party unable to
-  recover. Same encrypted backup, same restore path.
+  is needed to restore and *use* this device's share — it signs this party's
+  per-group events — so a backup that restores the share but not the subkey leaves
+  a party unable to participate. Certificate verification does **not** use it:
+  `DkgCertificate::verify` checks only the roster and the signed transcript
+  confirmations. If a recovering party must prove it holds the subkey, that is a
+  separate proof-of-possession step, not part of certificate membership. Same
+  encrypted backup, same restore path.
 - **C2 — roster relay-publication becomes opt-in, and is skipped for mobile.**
   The mobile invite already carries the full pubkey list, and `frost_group_id`
   hash-binds it, so the roster is a local artifact; publishing it adds nothing and
@@ -203,11 +207,13 @@ trait RosterSource {
 async fn run_software_dkg(
     session: &mut SoftwareDkgSession,   // keep_core::frost::dkg
     transport: &dyn DkgTransport,       // subscribe/publish/fetch abstraction
-    roster: &dyn RosterSource,          // invite-supplied or relay-fetched
-    our_keys: &Keys,                    // this device's per-group subkey
-    progress: &dyn DkgProgress,
-    cancel: CancellationToken,          // §9
+    keys: &Keys,                        // this device's per-group subkey
+    roster: &DkgRoster,                 // verified roster (invite- or relay-sourced)
+    group: &str,                        // group id hex, used as the relay `d` tag
+    our_index: u16,                     // participant index, checked against roster
     timeout: Duration,
+    cancel: &AtomicBool,                // §9, polled between rounds
+    progress: &dyn DkgProgress,
 ) -> Result<DkgOutcome>;                // share export + success certificate
 ```
 
