@@ -133,6 +133,17 @@ fn build_roster(config: &DkgConfig) -> Result<DkgRoster, KeepMobileError> {
                 "roster pubkey {s:?} for index {idx} is invalid: {e}"
             ))
         })?;
+        // Distinct indices are not enough. An invite is attacker-supplied, and
+        // repeating one key across two indices yields a roster that hash-binds
+        // and authenticates while handing that holder two of the n shares, so a
+        // "2-of-3" becomes spendable by them alone. Checked here, on the
+        // verifying side, because the attacker never runs our group-create path.
+        if by_index.values().any(|existing| existing == &pk) {
+            return Err(frost_err(format!(
+                "roster repeats one pubkey at index {idx}; every participant \
+                 must hold a distinct key"
+            )));
+        }
         ordered_npubs.push(s.clone());
         by_index.insert(idx, pk);
     }

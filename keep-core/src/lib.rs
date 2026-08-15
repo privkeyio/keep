@@ -854,20 +854,18 @@ impl Keep {
             keypair.secret_bytes().to_vec(),
         )?;
         self.store_secret(&record)?;
-        // Read back rather than trusting our own mint. Enrollment is a
-        // read-then-write with no if-absent primitive in the secret store, so a
-        // second enroller racing this one could have written in between. Losing
-        // that race silently would be the dangerous outcome: we would return a
-        // pubkey for a secret the vault no longer holds, publish it in the
-        // roster, and then be unable to sign as that identity. Returning what is
-        // actually persisted keeps the caller and the vault in agreement.
-        match self.frost_group_subkey_secret(group_name)? {
-            Some(mut persisted) => {
-                let keypair = NostrKeypair::from_secret_bytes(&mut persisted)?;
-                Ok(*keypair.public_bytes())
-            }
-            None => Ok(pubkey),
-        }
+        // Deliberately no read-back here. `SecretRecord::new` mints a random
+        // row id, so a racing enroller writes a *second* row under the same
+        // name rather than overwriting this one, and `frost_group_subkey_secret`
+        // then returns whichever row the backend happens to yield first. A
+        // read-back would neither detect nor resolve that, while costing a full
+        // decrypt of every secret in the vault on every enrollment.
+        //
+        // Closing this properly needs a store-if-absent primitive or a
+        // name-derived deterministic record id. `&mut self` plus redb's
+        // exclusive database lock make a concurrent writer hard to reach today,
+        // so this is tracked rather than papered over.
+        Ok(pubkey)
     }
 
     /// Load this device's per-group DKG signing subkey secret (§3), if one was

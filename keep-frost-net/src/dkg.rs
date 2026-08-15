@@ -223,8 +223,19 @@ pub fn frost_group_id(
     hasher.update([participants]);
     hasher.update((ordered_npubs.len() as u32).to_be_bytes());
     for npub in ordered_npubs {
-        hasher.update((npub.len() as u32).to_be_bytes());
-        hasher.update(npub.as_bytes());
+        // Canonicalize here rather than at the call sites. The same key written
+        // as hex and as bech32 must yield the same group id, or a CLI roster and
+        // a mobile roster for one group derive different ids, land on different
+        // `d`-tag channels, and never see each other. Normalizing inside the
+        // hash makes every caller correct by construction. Entries that are not
+        // pubkeys at all are hashed verbatim; that only happens in tests, and
+        // the length prefix keeps the preimage unambiguous either way.
+        let canonical = PublicKey::parse(npub)
+            .ok()
+            .and_then(|pk| pk.to_bech32().ok())
+            .unwrap_or_else(|| npub.clone());
+        hasher.update((canonical.len() as u32).to_be_bytes());
+        hasher.update(canonical.as_bytes());
     }
     hasher.finalize().into()
 }
@@ -319,6 +330,23 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
                 }
             }
             _ => {}
+        }
+    }
+
+    // Distinct indices are not enough: the announcement is attacker-supplied, so
+    // nothing stops one key being listed at two indices. That roster hash-binds
+    // correctly and authenticates fine, but it hands the holder of the repeated
+    // key two of the n shares, which makes a published "2-of-3" spendable by
+    // that party alone. Validating this only where we *create* a group would
+    // leave the check on the wrong side of the trust boundary, since an attacker
+    // publishes the announcement directly rather than running our CLI.
+    let mut distinct: HashSet<PublicKey> = HashSet::new();
+    for (idx, (pk, _)) in by_index.iter() {
+        if !distinct.insert(*pk) {
+            return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+                "group announcement repeats one pubkey at index {idx}; every \
+                 participant must hold a distinct key"
+            ))));
         }
     }
 
@@ -458,10 +486,11 @@ pub fn default_relay_opts() -> RelayOptions {
         .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
-/// Upper bound on live DKG events buffered per run. A DKG channel only ever
-/// carries a few packages per participant; past this the relay is flooding, so
-/// we stop accumulating rather than grow memory for the whole round timeout.
-const MAX_BUFFERED_EVENTS: usize = 4096;
+/// Upper bound on live DKG events buffered for one round. Deliberately not
+/// below [`MAX_DKG_EVENTS_SEEN`]: the coordinator's flood-abort counts events it
+/// has been handed, so a smaller transport cap would swallow the flood silently
+/// and turn a designed abort into a timeout.
+const MAX_BUFFERED_EVENTS: usize = MAX_DKG_EVENTS_SEEN;
 
 /// How long a single wait on the notification stream blocks before the caller
 /// re-checks its deadline and cancellation flag.
@@ -481,8 +510,17 @@ pub struct ClientTransport {
     client: Client,
     /// Created before any subscription so no notification is missed.
     notifications: tokio::sync::Mutex<broadcast::Receiver<RelayPoolNotification>>,
-    /// Live events seen so far, filtered per call. Bounded by [`MAX_BUFFERED_EVENTS`].
+    /// Live events for the round currently being collected, bounded by
+    /// [`MAX_BUFFERED_EVENTS`] and cleared when the round advances.
     seen: std::sync::Mutex<Vec<Event>>,
+    /// The filter `seen` currently holds events for. Rounds are sequential, so a
+    /// different filter means the previous round finished and its buffer is
+    /// dead weight. Without this the buffer never shrinks: peers republish with
+    /// a fresh timestamp (and therefore a fresh event id) on every poll, so
+    /// id-dedup does not collapse them and the cap would eventually be reached,
+    /// after which the transport silently drops the packages the run is waiting
+    /// for.
+    buffered_for: std::sync::Mutex<Option<Filter>>,
     /// Round filters already subscribed, kept open for the transport's life.
     subscribed: tokio::sync::Mutex<Vec<Filter>>,
 }
@@ -494,7 +532,36 @@ impl ClientTransport {
             client,
             notifications,
             seen: std::sync::Mutex::new(Vec::new()),
+            buffered_for: std::sync::Mutex::new(None),
             subscribed: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Buffer one live event for the current round, applying the cap and
+    /// dropping exact repeats. Single insertion point so the cap and the dedupe
+    /// rule cannot drift between the drain path and the blocking-recv path.
+    fn buffer(&self, event: Event) {
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() < MAX_BUFFERED_EVENTS && !seen.iter().any(|e| e.id == event.id) {
+            seen.push(event);
+        }
+    }
+
+    /// Drop the previous round's events when collection moves to a new filter.
+    ///
+    /// Without this the buffer only ever grows: peers rebuild and resend their
+    /// package on every poll with a fresh timestamp, so each repeat is a
+    /// distinct event id that id-dedupe cannot collapse. In a large group that
+    /// reaches the cap on the honest path alone, and a full buffer is worse than
+    /// a slow one because the transport then silently drops the very packages
+    /// the round is waiting on and fails as a timeout blaming absent peers.
+    /// Rounds are strictly sequential, so a filter change means the previous
+    /// round is done and its events are dead weight.
+    fn retarget(&self, filter: &Filter) {
+        let mut current = self.buffered_for.lock().unwrap_or_else(|p| p.into_inner());
+        if current.as_ref() != Some(filter) {
+            self.seen.lock().unwrap_or_else(|p| p.into_inner()).clear();
+            *current = Some(filter.clone());
         }
     }
 
@@ -503,12 +570,7 @@ impl ClientTransport {
         use tokio::sync::broadcast::error::TryRecvError;
         loop {
             match rx.try_recv() {
-                Ok(RelayPoolNotification::Event { event, .. }) => {
-                    let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-                    if seen.len() < MAX_BUFFERED_EVENTS && !seen.iter().any(|e| e.id == event.id) {
-                        seen.push(*event);
-                    }
-                }
+                Ok(RelayPoolNotification::Event { event, .. }) => self.buffer(*event),
                 Ok(_) => continue,
                 // Lagged means the buffer overflowed; keep draining what remains
                 // rather than treating it as end-of-stream.
@@ -633,6 +695,8 @@ impl DkgTransport for ClientTransport {
                 }
             }
 
+            self.retarget(&filter);
+
             let deadline = Instant::now() + timeout;
             loop {
                 {
@@ -651,14 +715,7 @@ impl DkgTransport for ClientTransport {
                 // by a peer wakes us immediately.
                 let mut rx = self.notifications.lock().await;
                 match tokio::time::timeout(remaining.min(POLL_WAKE), rx.recv()).await {
-                    Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
-                        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-                        if seen.len() < MAX_BUFFERED_EVENTS
-                            && !seen.iter().any(|e| e.id == event.id)
-                        {
-                            seen.push(*event);
-                        }
-                    }
+                    Ok(Ok(RelayPoolNotification::Event { event, .. })) => self.buffer(*event),
                     // The pool dropped its sender, so no further event can ever
                     // arrive on this receiver. Returning what we have beats
                     // spinning on an instantly-returning `recv` until the
@@ -1304,12 +1361,31 @@ mod tests {
             h.update([3u8]);
             h.update((npubs.len() as u32).to_be_bytes());
             for n in &npubs {
-                h.update((n.len() as u32).to_be_bytes());
-                h.update(n.as_bytes());
+                // Mirror the canonicalization the hash performs: a pubkey is
+                // hashed in its bech32 form whatever encoding it arrived in.
+                let c = PublicKey::parse(n).unwrap().to_bech32().unwrap();
+                h.update((c.len() as u32).to_be_bytes());
+                h.update(c.as_bytes());
             }
             <[u8; 32]>::from(h.finalize())
         };
         assert_eq!(frost_group_id(name, 2, 3, &npubs), expected);
+    }
+
+    /// A CLI roster written in bech32 and a mobile roster written in hex
+    /// describe the same group, so they must derive the same id. Before
+    /// canonicalization they did not, and the two sides silently landed on
+    /// different `d`-tag channels and never met.
+    #[test]
+    fn group_id_is_independent_of_pubkey_encoding() {
+        let (npub1, pk1) = make_pubkey(1);
+        let (npub2, pk2) = make_pubkey(2);
+        let bech32 = vec![npub1, npub2];
+        let hex = vec![pk1.to_hex(), pk2.to_hex()];
+        assert_eq!(
+            frost_group_id("g", 2, 2, &bech32),
+            frost_group_id("g", 2, 2, &hex)
+        );
     }
 
     /// The v1 preimage concatenated variable-length fields with no delimiter, so
