@@ -7,6 +7,13 @@ name: Verify release signature
 on:
   release:
     types: [published, edited]
+  # Asset uploads (the .minisig) do not reliably fire release events, so allow a
+  # maintainer to re-run verification for a tag after uploading the signature.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify (e.g. v1.2.3)
+        required: true
 
 permissions:
   contents: read
@@ -23,10 +30,18 @@ jobs:
       - name: Download manifest and signature
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: |
-          gh release download "$TAG" --pattern SHA256SUMS --dir . || true
-          gh release download "$TAG" --pattern SHA256SUMS.minisig --dir . || true
+          # List assets once; a failure here (auth/network/API) aborts the step
+          # rather than masquerading as a missing file. Download only present
+          # assets, and let genuine download failures propagate.
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          if grep -qx SHA256SUMS <<<"$assets"; then
+            gh release download "$TAG" --pattern SHA256SUMS --dir .
+          fi
+          if grep -qx SHA256SUMS.minisig <<<"$assets"; then
+            gh release download "$TAG" --pattern SHA256SUMS.minisig --dir .
+          fi
       - name: Verify signature
         run: |
           if [ ! -f release-signing.pub ]; then
