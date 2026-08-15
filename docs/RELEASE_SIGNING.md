@@ -8,11 +8,13 @@ holds the signing key. The output is minisign-compatible, so downstream users
 verify with the stock [`minisign`](https://jedisct1.github.io/minisign/) tool or
 with `keep verify`.
 
-This is a Keep capability you can adopt for your own project. Keep uses it for
-its own releases: they ship `release-signing.pub` alongside the binaries and `SHA256SUMS`
-manifest, and a threshold of maintainers signs the manifest offline and uploads
-`SHA256SUMS.minisig`. A non-blocking `Verify release signature` workflow checks
-the signature once it lands.
+This is a Keep capability you can adopt for your own project. Keep will sign its
+own releases with it: once the signing group is established, releases ship
+`release-signing.pub` alongside the binaries and `SHA256SUMS` manifest, a
+threshold of maintainers signs the manifest offline and uploads
+`SHA256SUMS.minisig`, and a non-blocking `Verify release signature` workflow
+checks the signature once it lands. The release workflows are wired for this
+today; they stay inert until the group public key is generated and committed.
 
 ## Establishing a signing group
 
