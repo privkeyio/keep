@@ -659,8 +659,23 @@ impl DkgTransport for ClientTransport {
                             seen.push(*event);
                         }
                     }
-                    // Timed out waiting, lagged, or a non-event notification:
-                    // loop and re-evaluate against the deadline.
+                    // The pool dropped its sender, so no further event can ever
+                    // arrive on this receiver. Returning what we have beats
+                    // spinning on an instantly-returning `recv` until the
+                    // deadline; the caller retries and surfaces a timeout.
+                    Ok(Err(broadcast::error::RecvError::Closed)) => {
+                        return Ok(self.matching(&filter))
+                    }
+                    // Lagged also returns immediately. We may have missed
+                    // notifications, so yield briefly instead of spinning; the
+                    // next drain picks up whatever is still queued, and peers
+                    // republish each round so a missed package comes back.
+                    Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                        drop(rx);
+                        tokio::time::sleep(POLL_WAKE.min(remaining)).await;
+                    }
+                    // Timed out waiting, or a non-event notification: loop and
+                    // re-evaluate against the deadline.
                     _ => continue,
                 }
             }
