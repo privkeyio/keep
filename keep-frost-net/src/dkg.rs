@@ -1500,4 +1500,282 @@ mod tests {
         short.remove(&2);
         assert!(dkg_transcript(&group_id, 2, 2, &roster, &short, &group_pubkey).is_err());
     }
+
+    // ---- Phase 5: in-memory pipeline over a fake DkgTransport (keep-xaj) ----
+
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    /// A shared in-memory relay for CI: every participant publishes to and reads
+    /// from one event log, so `run_software_dkg` runs to completion without a
+    /// live relay (§4 "transport-injected so it is unit-testable"). Filtering
+    /// reuses nostr's own `match_event`, so the kind/`#d` scoping the coordinator
+    /// relies on behaves as it would on a real relay.
+    #[derive(Clone, Default)]
+    struct MeshBus {
+        events: Arc<StdMutex<Vec<Event>>>,
+    }
+
+    impl MeshBus {
+        /// Seed an event that is not produced by any honest run (e.g. an
+        /// impostor's forged share) so every fetch observes it.
+        fn preload(&self, ev: Event) {
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    /// One participant's view of the shared [`MeshBus`].
+    struct MeshTransport {
+        bus: MeshBus,
+    }
+
+    impl DkgTransport for MeshTransport {
+        fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
+            let event = event.clone();
+            Box::pin(async move {
+                self.bus.events.lock().unwrap().push(event);
+                Ok(())
+            })
+        }
+
+        fn fetch_events(
+            &self,
+            filter: Filter,
+            _timeout: Duration,
+        ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
+            Box::pin(async move {
+                let events = self.bus.events.lock().unwrap();
+                Ok(events
+                    .iter()
+                    .filter(|ev| filter.match_event(ev, MatchEventOptions::new()))
+                    .cloned()
+                    .collect())
+            })
+        }
+    }
+
+    struct NoopProgress;
+    impl DkgProgress for NoopProgress {
+        fn phase(&self, _phase: DkgPhase) {}
+    }
+
+    /// One roster key per 1-indexed participant. The pubkeys are what the roster
+    /// pins, so each running session signs with the key its index expects.
+    fn mesh_keys(participants: u16) -> Vec<Keys> {
+        (1..=participants)
+            .map(|i| make_identity_keys(0x30 + i as u8))
+            .collect()
+    }
+
+    fn mesh_roster(keys: &[Keys], threshold: u8, group_id: [u8; 32]) -> DkgRoster {
+        let mut by_index = BTreeMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            by_index.insert((i + 1) as u16, k.public_key());
+        }
+        DkgRoster {
+            threshold,
+            participants: keys.len() as u8,
+            by_index,
+            group_id,
+        }
+    }
+
+    /// Drive one participant's full `run_software_dkg` over a shared bus.
+    async fn run_party(
+        bus: &MeshBus,
+        keys: &Keys,
+        roster: &DkgRoster,
+        group: &str,
+        our_index: u16,
+        timeout: Duration,
+    ) -> Result<DkgOutcome> {
+        let mut session = SoftwareDkgSession::init(
+            roster.threshold as u16,
+            roster.participants as u16,
+            our_index,
+        )
+        .unwrap();
+        let transport = MeshTransport { bus: bus.clone() };
+        let cancel = AtomicBool::new(false);
+        let progress = NoopProgress;
+        run_software_dkg(
+            &mut session,
+            &transport,
+            keys,
+            roster,
+            group,
+            our_index,
+            timeout,
+            &cancel,
+            &progress,
+        )
+        .await
+    }
+
+    /// A 2-of-2 DKG runs end to end over the fake transport: both parties agree
+    /// on the group key, and each retains a CertEq certificate that verifies
+    /// against the shared roster (§6). This is the pipeline backbone the fault
+    /// cases below perturb.
+    #[tokio::test(start_paused = true)]
+    async fn full_pipeline_two_party_completes_and_certificate_verifies() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x5a; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        let (r1, r2) = tokio::join!(
+            run_party(&bus, &keys[0], &roster, "g", 1, to),
+            run_party(&bus, &keys[1], &roster, "g", 2, to),
+        );
+        let (o1, o2) = (r1.unwrap(), r2.unwrap());
+
+        assert_eq!(o1.result.group_pubkey, o2.result.group_pubkey);
+        assert_eq!(o1.certificate.transcript, o2.certificate.transcript);
+        // Each side collected both signatures over the identical transcript, so
+        // either certificate is transferable to a peer that never confirmed.
+        o1.certificate.verify(&roster).unwrap();
+        o2.certificate.verify(&roster).unwrap();
+        assert_eq!(o1.certificate.confirmations.len(), 2);
+    }
+
+    /// Phase 5(a): a round-2 share is per-recipient encrypted to the recipient's
+    /// roster key (Blocker 1 / §2 G1), so a non-recipient participant cannot
+    /// decrypt it even though the ciphertext is broadcast on the shared topic.
+    #[tokio::test(start_paused = true)]
+    async fn round2_share_is_readable_only_by_its_recipient() {
+        let keys = mesh_keys(3);
+        let roster = mesh_roster(&keys, 2, [0x5b; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        let (r1, r2, r3) = tokio::join!(
+            run_party(&bus, &keys[0], &roster, "g", 1, to),
+            run_party(&bus, &keys[1], &roster, "g", 2, to),
+            run_party(&bus, &keys[2], &roster, "g", 3, to),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        r3.unwrap();
+
+        // Pull party 1's round-2 share addressed to party 2 off the wire.
+        let events = bus.events.lock().unwrap();
+        let share = events
+            .iter()
+            .find(|ev| {
+                ev.kind == Kind::Custom(DKG_KIND_ROUND2)
+                    && ev.pubkey == keys[0].public_key()
+                    && u16_tag(ev, "recipient_index") == Some(2)
+            })
+            .expect("party 1 -> party 2 round-2 share");
+
+        // The intended recipient (party 2) recovers the plaintext share.
+        assert!(nip44::decrypt(keys[1].secret_key(), &keys[0].public_key(), &share.content).is_ok());
+        // A rostered non-recipient (party 3) cannot: the share is encrypted to
+        // party 2's key, not readable by all as the pre-fix broadcast was.
+        assert!(nip44::decrypt(keys[2].secret_key(), &keys[0].public_key(), &share.content).is_err());
+    }
+
+    /// Phase 5(b): an equivocating insider makes two honest peers derive
+    /// divergent §5 transcripts (here via a divergent roster binding, which the
+    /// transcript folds in exactly as it folds each round-1 commitment). The
+    /// full run must abort at the confirmation step rather than finalize into an
+    /// inconsistent group — the equivocation Blocker 2 closes.
+    #[tokio::test(start_paused = true)]
+    async fn divergent_transcript_aborts_the_full_run() {
+        let keys = mesh_keys(2);
+        // Same pinned pubkeys (so author checks pass and the rounds complete)
+        // but a divergent binding, so the two confirmations sign different
+        // transcripts — the same divergence a same-key round-1 equivocation
+        // produces downstream.
+        let roster_a = mesh_roster(&keys, 2, [0x11; 32]);
+        let roster_b = mesh_roster(&keys, 2, [0x22; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        let (r1, r2) = tokio::join!(
+            run_party(&bus, &keys[0], &roster_a, "g", 1, to),
+            run_party(&bus, &keys[1], &roster_b, "g", 2, to),
+        );
+        // Neither side may believe it finalized a live group the other joined.
+        assert!(r1.is_err(), "party 1 must abort on a divergent transcript");
+        assert!(r2.is_err(), "party 2 must abort on a divergent transcript");
+    }
+
+    /// Phase 5(c): a round-2 event authored by a key that is not on the roster
+    /// is rejected on the cheap `sender_index`/author check before any NIP-44
+    /// ECDH (§7 "author check before decrypt"), so a flooded impostor cannot
+    /// derail the run. The honest 2-of-2 still completes on the genuine share.
+    #[tokio::test(start_paused = true)]
+    async fn non_roster_round2_author_is_rejected_before_decrypt() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x5c; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        // An off-roster key forges a round-2 share to party 1, claiming to be
+        // participant 2. The ciphertext is validly addressed to party 1, so only
+        // the roster author gate — not a decrypt failure — can reject it.
+        let impostor = make_identity_keys(0x99);
+        let ciphertext = nip44::encrypt(
+            impostor.secret_key(),
+            &keys[0].public_key(),
+            "{\"software_dkg_version\":1,\"sender_index\":2,\"package_hex\":\"00\"}",
+            nip44::Version::default(),
+        )
+        .unwrap();
+        let forged = EventBuilder::new(Kind::Custom(DKG_KIND_ROUND2), &ciphertext)
+            .tag(Tag::custom(TagKind::custom("d"), vec!["g".to_string()]))
+            .tag(Tag::custom(TagKind::custom("sender_index"), vec!["2".to_string()]))
+            .tag(Tag::custom(
+                TagKind::custom("dkg_mode"),
+                vec![DKG_MODE_SOFTWARE_V1.to_string()],
+            ))
+            .tag(Tag::custom(
+                TagKind::custom("recipient_index"),
+                vec!["1".to_string()],
+            ))
+            .sign_with_keys(&impostor)
+            .unwrap();
+        bus.preload(forged);
+
+        let (r1, r2) = tokio::join!(
+            run_party(&bus, &keys[0], &roster, "g", 1, to),
+            run_party(&bus, &keys[1], &roster, "g", 2, to),
+        );
+        let (o1, o2) = (r1.unwrap(), r2.unwrap());
+        // The forged share was ignored; the run finalized on the honest one.
+        assert_eq!(o1.result.group_pubkey, o2.result.group_pubkey);
+    }
+
+    /// Phase 5(d): the CertEq certificate a finalized device retains is
+    /// transferable (§6 Conditional Agreement) — a peer that missed the live
+    /// confirmation verifies it against the roster it already holds and accepts
+    /// the group, trusting the signatures rather than the presenter. A partial
+    /// presentation (a dropped confirmation) is refused.
+    #[tokio::test(start_paused = true)]
+    async fn certificate_convinces_a_peer_that_missed_confirmation() {
+        let keys = mesh_keys(3);
+        let roster = mesh_roster(&keys, 2, [0x5d; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        let (r1, r2, r3) = tokio::join!(
+            run_party(&bus, &keys[0], &roster, "g", 1, to),
+            run_party(&bus, &keys[1], &roster, "g", 2, to),
+            run_party(&bus, &keys[2], &roster, "g", 3, to),
+        );
+        let cert = r1.unwrap().certificate;
+        r2.unwrap();
+        r3.unwrap();
+
+        // A peer holding only the (identical) roster finalizes from the
+        // presented certificate without having collected any confirmation live.
+        cert.verify(&roster).unwrap();
+        assert_eq!(cert.confirmations.len(), 3);
+
+        // A certificate missing a signature is not Conditional Agreement and is
+        // refused, so a presenter cannot pass off partial CertEq.
+        let mut partial = cert.clone();
+        partial.confirmations.remove(&3);
+        assert!(partial.verify(&roster).is_err());
+    }
 }
