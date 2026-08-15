@@ -8,6 +8,25 @@ updates:
       minor-and-patch:
         update-types: ["minor", "patch"]
     open-pull-requests-limit: 5
+    ignore:
+      # vsss-rs 6.x requires elliptic-curve 0.14, but the oprf feature reaches it
+      # through voprf 0.5 -> k256 0.13 -> elliptic-curve 0.13. Bumping vsss-rs alone
+      # puts two elliptic-curve majors in the tree and k256::Scalar stops satisfying
+      # vsss_rs::elliptic_curve::PrimeField. Adopting 6.x needs k256 0.14, which needs
+      # voprf >= 0.6, and voprf has only published 0.6.0-pre.1. Revisit when voprf 0.6
+      # is stable; do not ship a pre-release crate in the LUKS unlock path.
+      - dependency-name: "vsss-rs"
+        update-types: ["version-update:semver-major"]
+      # nostr-sdk 0.45 removed every per-NIP feature flag (nip03, nip04, nip06,
+      # nip44, nip47, nip49, nip57, nip59, nip96, nip98, all-nips) and reworked the
+      # API surface. Bumping it is a migration, not an update: a scoped attempt on
+      # 0.45.1 produced 236 compile errors, concentrated in keep-frost-net and
+      # keep-agent (TagKind, nip44::encrypt/decrypt, EventBuilder::sign_with_keys,
+      # Timestamp::tweaked, RelayPoolNotification). Dependabot cannot resolve it at
+      # all today because the workspace requests the removed nip04 feature, so the
+      # weekly cargo job fails on it. Tracked separately; unpin when that lands.
+      - dependency-name: "nostr-sdk"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
