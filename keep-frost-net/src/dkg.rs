@@ -19,6 +19,8 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use tokio::sync::broadcast;
+
 use nostr_sdk::prelude::*;
 use zeroize::Zeroizing;
 
@@ -209,12 +211,19 @@ pub fn frost_group_id(
     ordered_npubs: &[String],
 ) -> [u8; 32] {
     use sha2::{Digest, Sha256};
+    // Every variable-length field is length-prefixed so the preimage is
+    // unambiguous. Plain concatenation let a name absorb the start of the first
+    // pubkey: ("ab", ["c"]) and ("a", ["bc"]) produced identical group ids, so
+    // two different groups could share an id and therefore a roster binding.
     let mut hasher = Sha256::new();
-    hasher.update(b"frost-group-id-v1");
+    hasher.update(b"frost-group-id-v2");
+    hasher.update((name.len() as u32).to_be_bytes());
     hasher.update(name.as_bytes());
     hasher.update([threshold]);
     hasher.update([participants]);
+    hasher.update((ordered_npubs.len() as u32).to_be_bytes());
     for npub in ordered_npubs {
+        hasher.update((npub.len() as u32).to_be_bytes());
         hasher.update(npub.as_bytes());
     }
     hasher.finalize().into()
@@ -449,15 +458,76 @@ pub fn default_relay_opts() -> RelayOptions {
         .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
+/// Upper bound on live DKG events buffered per run. A DKG channel only ever
+/// carries a few packages per participant; past this the relay is flooding, so
+/// we stop accumulating rather than grow memory for the whole round timeout.
+const MAX_BUFFERED_EVENTS: usize = 4096;
+
+/// How long a single wait on the notification stream blocks before the caller
+/// re-checks its deadline and cancellation flag.
+const POLL_WAKE: Duration = Duration::from_millis(500);
+
 /// A [`DkgTransport`] over a live `nostr_sdk::Client`. The caller connects the
 /// client (and applies any relay hardening) before wrapping it.
+///
+/// DKG kinds are ephemeral (NIP-01 20000-29999), so relays broadcast them to
+/// *live* subscribers and never store them. A REQ issued after a peer published
+/// therefore returns EOSE with nothing, which is why this cannot be built on
+/// `Client::fetch_events`: that exits on EOSE and would only ever see a peer by
+/// racing a republish into the instant its subscription happened to be open.
+/// Instead we hold a subscription open per round filter and accumulate from the
+/// notification stream, the same shape the signing path uses.
 pub struct ClientTransport {
     client: Client,
+    /// Created before any subscription so no notification is missed.
+    notifications: tokio::sync::Mutex<broadcast::Receiver<RelayPoolNotification>>,
+    /// Live events seen so far, filtered per call. Bounded by [`MAX_BUFFERED_EVENTS`].
+    seen: std::sync::Mutex<Vec<Event>>,
+    /// Round filters already subscribed, kept open for the transport's life.
+    subscribed: tokio::sync::Mutex<Vec<Filter>>,
 }
 
 impl ClientTransport {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        let notifications = tokio::sync::Mutex::new(client.notifications());
+        Self {
+            client,
+            notifications,
+            seen: std::sync::Mutex::new(Vec::new()),
+            subscribed: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Move every notification currently queued into `seen`. Never blocks.
+    fn drain_pending(&self, rx: &mut broadcast::Receiver<RelayPoolNotification>) {
+        use tokio::sync::broadcast::error::TryRecvError;
+        loop {
+            match rx.try_recv() {
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+                    if seen.len() < MAX_BUFFERED_EVENTS && !seen.iter().any(|e| e.id == event.id) {
+                        seen.push(*event);
+                    }
+                }
+                Ok(_) => continue,
+                // Lagged means the buffer overflowed; keep draining what remains
+                // rather than treating it as end-of-stream.
+                Err(TryRecvError::Lagged(_)) => continue,
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return,
+            }
+        }
+    }
+
+    /// Events buffered so far that satisfy `filter`.
+    fn matching(&self, filter: &Filter) -> Vec<Event> {
+        let opts = MatchEventOptions::new();
+        self.seen
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|e| filter.match_event(e, opts))
+            .cloned()
+            .collect()
     }
 
     /// Build a hardened client over `relays` and wrap it for the DKG coordinator
@@ -519,7 +589,7 @@ impl ClientTransport {
             )));
         }
 
-        Ok(Self { client })
+        Ok(Self::new(client))
     }
 
     /// Tear down the relay connections. Call on every exit path of a DKG run
@@ -540,17 +610,60 @@ impl DkgTransport for ClientTransport {
         })
     }
 
+    /// Return every event seen so far matching `filter`, waiting up to `timeout`
+    /// for at least one if none have arrived. Opens a durable subscription for
+    /// `filter` on first use and leaves it open, because the DKG kinds are
+    /// ephemeral and a relay only ever delivers them to a subscriber that is
+    /// already listening.
     fn fetch_events(
         &self,
         filter: Filter,
         timeout: Duration,
     ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
         Box::pin(async move {
-            self.client
-                .fetch_events(filter, timeout)
-                .await
-                .map(|evs| evs.into_iter().collect())
-                .map_err(|e| KeepError::NetworkErr(NetworkError::request(e.to_string())))
+            {
+                let mut subscribed = self.subscribed.lock().await;
+                if !subscribed.iter().any(|f| f == &filter) {
+                    // `None` opts: no auto-close, so it stays open across polls.
+                    self.client
+                        .subscribe(filter.clone(), None)
+                        .await
+                        .map_err(|e| KeepError::NetworkErr(NetworkError::request(e.to_string())))?;
+                    subscribed.push(filter.clone());
+                }
+            }
+
+            let deadline = Instant::now() + timeout;
+            loop {
+                {
+                    let mut rx = self.notifications.lock().await;
+                    self.drain_pending(&mut rx);
+                }
+                let matched = self.matching(&filter);
+                if !matched.is_empty() {
+                    return Ok(matched);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(Vec::new());
+                }
+                // Wait for the next notification rather than spinning; a publish
+                // by a peer wakes us immediately.
+                let mut rx = self.notifications.lock().await;
+                match tokio::time::timeout(remaining.min(POLL_WAKE), rx.recv()).await {
+                    Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
+                        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+                        if seen.len() < MAX_BUFFERED_EVENTS
+                            && !seen.iter().any(|e| e.id == event.id)
+                        {
+                            seen.push(*event);
+                        }
+                    }
+                    // Timed out waiting, lagged, or a non-event notification:
+                    // loop and re-evaluate against the deadline.
+                    _ => continue,
+                }
+            }
         })
     }
 }
@@ -1169,16 +1282,33 @@ mod tests {
         let expected = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
-            h.update(b"frost-group-id-v1");
+            h.update(b"frost-group-id-v2");
+            h.update((name.len() as u32).to_be_bytes());
             h.update(name.as_bytes());
             h.update([2u8]);
             h.update([3u8]);
+            h.update((npubs.len() as u32).to_be_bytes());
             for n in &npubs {
+                h.update((n.len() as u32).to_be_bytes());
                 h.update(n.as_bytes());
             }
             <[u8; 32]>::from(h.finalize())
         };
         assert_eq!(frost_group_id(name, 2, 3, &npubs), expected);
+    }
+
+    /// The v1 preimage concatenated variable-length fields with no delimiter, so
+    /// a name could absorb the head of the first pubkey and two different groups
+    /// could share an id (and therefore a roster binding). Length prefixes make
+    /// the preimage unambiguous.
+    #[test]
+    fn group_id_is_unambiguous_across_field_boundaries() {
+        let a = frost_group_id("ab", 2, 2, &["c".to_string(), "d".to_string()]);
+        let b = frost_group_id("a", 2, 2, &["bc".to_string(), "d".to_string()]);
+        assert_ne!(
+            a, b,
+            "a name must not be able to absorb the start of the first pubkey"
+        );
     }
 
     /// Order of npubs matters for the hash (index order): swapping two
@@ -1363,12 +1493,15 @@ mod tests {
         assert!(seen.is_empty());
     }
 
-    fn transcript_fixture() -> (
+    /// `(group_id, roster_by_index, round1_pkgs_by_index, group_pubkey)`.
+    type TranscriptFixture = (
         [u8; 32],
         BTreeMap<u16, PublicKey>,
         BTreeMap<u16, Vec<u8>>,
         [u8; 32],
-    ) {
+    );
+
+    fn transcript_fixture() -> TranscriptFixture {
         let (_, pk1) = make_pubkey(1);
         let (_, pk2) = make_pubkey(2);
         let mut roster = BTreeMap::new();
