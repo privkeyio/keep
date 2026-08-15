@@ -1503,6 +1503,28 @@ mod tests {
         assert!(parse_roster_from_event(&ev, &group_id).is_err());
     }
 
+    /// One key listed at two distinct indices must be refused. Such a roster
+    /// hash-binds correctly and authenticates, but it hands the holder of the
+    /// repeated key two of the n shares, making a published "2-of-3" spendable
+    /// by that party alone. The announcement is attacker-supplied, so this has
+    /// to be enforced here on the verifying side, not only where we mint a
+    /// group.
+    #[test]
+    fn parse_roster_rejects_one_pubkey_at_two_indices() {
+        let (n1, _) = make_pubkey(1);
+        // Both participants are the same key, at indices 1 and 2.
+        let npubs = vec![n1.clone(), n1];
+        let group_id = hex::encode(frost_group_id("g", 2, 2, &npubs));
+        let ev = build_announcement("g", 2, 2, &npubs, Some(&group_id));
+
+        let err = parse_roster_from_event(&ev, &group_id)
+            .expect_err("a roster repeating one pubkey must be rejected");
+        assert!(
+            err.to_string().contains("distinct key"),
+            "unexpected error: {err}"
+        );
+    }
+
     /// #674: too few p-tags for the claimed `participants` (a short roster) is
     /// refused by the count check.
     #[test]

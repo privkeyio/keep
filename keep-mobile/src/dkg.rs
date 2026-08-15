@@ -311,6 +311,47 @@ mod tests {
         assert_eq!(*roster.expected_pubkey(2).unwrap(), ks[1].public_key());
     }
 
+    /// An invite listing one key at two indices must be refused. It would
+    /// otherwise hash-bind and authenticate while giving that holder two of the
+    /// n shares, so a "2-of-3" becomes spendable by them alone. The invite is
+    /// attacker-supplied, so the check belongs here rather than only in the
+    /// group-create path.
+    #[test]
+    fn build_roster_rejects_one_pubkey_at_two_indices() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let mut roster = roster_of(&ks);
+        // Index 2 now repeats index 1's key.
+        roster[1].pubkey = ks[0].public_key().to_hex();
+
+        let err = build_roster(&config_with(2, 3, 1, roster))
+            .expect_err("an invite repeating one pubkey must be rejected");
+        assert!(
+            format!("{err:?}").contains("distinct key"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A hex invite and a bech32 invite describe the same group, so they must
+    /// derive the same id; otherwise a mobile participant and a CLI participant
+    /// land on different channels and never meet.
+    #[test]
+    fn build_roster_group_id_is_independent_of_pubkey_encoding() {
+        let ks = [subkey(1), subkey(2)];
+        let hex = roster_of(&ks);
+        let bech32: Vec<DkgParticipant> = ks
+            .iter()
+            .enumerate()
+            .map(|(i, k)| DkgParticipant {
+                index: (i + 1) as u16,
+                pubkey: k.public_key().to_bech32().unwrap(),
+            })
+            .collect();
+
+        let a = build_roster(&config_with(2, 2, 1, hex)).unwrap();
+        let b = build_roster(&config_with(2, 2, 1, bech32)).unwrap();
+        assert_eq!(a.group_id, b.group_id);
+    }
+
     #[test]
     fn build_roster_derives_the_same_group_id_regardless_of_entry_order() {
         let ks = [subkey(1), subkey(2), subkey(3)];
