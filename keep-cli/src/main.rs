@@ -430,14 +430,13 @@ fn dispatch_frost_network(
             relay,
             hardware,
             path: dkg_path,
-            identity,
         } => {
             let relay = relay.as_deref().unwrap_or(default_relay);
             // Software DKG needs a vault; honor an explicit --path override but
             // otherwise fall back to the globally resolved vault path like every
             // other frost command, instead of erroring on a missing --path.
-            // #674: identity authentication also loads an nsec from the vault,
-            // so BOTH hardware and software paths now require a vault.
+            // §3/#674: the per-group signing subkey is loaded from the vault, so
+            // BOTH hardware and software paths require a vault.
             let vault_path = dkg_path.as_deref().or(Some(path));
             commands::frost_network::cmd_frost_network_dkg(
                 out,
@@ -448,8 +447,14 @@ fn dispatch_frost_network(
                 relay,
                 hardware.as_deref(),
                 vault_path,
-                identity.as_deref(),
             )
+        }
+        FrostNetworkCommands::GroupSubkey {
+            group,
+            path: subkey_path,
+        } => {
+            let vault_path = subkey_path.as_deref().unwrap_or(path);
+            commands::frost_network::cmd_frost_network_group_subkey(out, &group, vault_path)
         }
         FrostNetworkCommands::Sign {
             group,
@@ -500,7 +505,8 @@ fn dispatch_frost_network(
             threshold,
             participants,
             relay,
-            participant_npub,
+            participant_subkey,
+            publish,
         } => {
             let relay = if relay.is_empty() {
                 vec![default_relay.to_string()]
@@ -513,7 +519,8 @@ fn dispatch_frost_network(
                 threshold,
                 participants,
                 &relay,
-                &participant_npub,
+                &participant_subkey,
+                publish,
             )
         }
         FrostNetworkCommands::NoncePrecommit {

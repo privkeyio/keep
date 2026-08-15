@@ -64,6 +64,24 @@ pub struct ShareMetadata {
     /// Whether this share has been backed up.
     #[serde(default)]
     pub did_backup: bool,
+    /// C1 (§3): this device's per-group signing subkey secret, retained in the
+    /// same backup unit as the share. The subkey — never the identity nsec — is
+    /// what the signed roster pins and what authenticates this party's DKG and
+    /// recovery/certificate messages, so a restore that recovers the share but
+    /// not the subkey cannot prove membership. `None` for shares created before
+    /// the roster→subkey change (they authenticated on the identity key).
+    #[serde(default)]
+    pub group_subkey_secret: Option<[u8; 32]>,
+}
+
+impl Drop for ShareMetadata {
+    /// Scrub the retained per-group subkey secret (C1, §3) when this metadata is
+    /// dropped. `ShareMetadata` is `Clone`d on every DKG state transition, so the
+    /// raw subkey would otherwise linger in freed heap; the rest of the struct is
+    /// non-secret and left untouched.
+    fn drop(&mut self) {
+        self.group_subkey_secret.zeroize();
+    }
 }
 
 impl ShareMetadata {
@@ -85,7 +103,14 @@ impl ShareMetadata {
             last_used: None,
             sign_count: 0,
             did_backup: false,
+            group_subkey_secret: None,
         }
+    }
+
+    /// Attach the per-group signing subkey secret (C1, §3), consumed builder-style.
+    pub fn with_group_subkey_secret(mut self, subkey_secret: [u8; 32]) -> Self {
+        self.group_subkey_secret = Some(subkey_secret);
+        self
     }
 
     /// Record usage timestamp.

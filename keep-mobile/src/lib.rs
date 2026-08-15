@@ -28,7 +28,7 @@ pub use audit::{
     AuditEntry, AuditEventType, AuditLog, AuditStorage, SigningAuditEntry, SigningAuditLog,
     SigningAuditStorage, SigningDecision, SigningRequestType,
 };
-pub use dkg::{DkgResult, DkgRound1Package, DkgRound2Package, DkgSession};
+pub use dkg::{DkgProgressCallback, DkgResult};
 pub use error::KeepMobileError;
 pub use nip46::{
     parse_bunker_url, BunkerApprovalRequest, BunkerCallbacks, BunkerHandler, BunkerLogEvent,
@@ -50,8 +50,8 @@ pub use signing_policy::{
 pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
-    DkgConfig, DkgStatus, FrostGenerationResult, GeneratedShareInfo, KeepLiveState,
-    KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
+    DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult, GeneratedShareInfo,
+    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
     SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
@@ -560,7 +560,19 @@ pub struct KeepMobile {
     node_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
-    dkg_session: DkgSession,
+    /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
+    /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
+    /// consumes them. Keyed by group name. Retained after a run so the subkey
+    /// stays available with the share (C1); a process restart mid-ceremony just
+    /// re-runs `frost_dkg_begin`.
+    dkg_subkeys: Arc<std::sync::Mutex<HashMap<String, Zeroizing<[u8; 32]>>>>,
+    /// Cancel flag for the single in-flight `frost_run_dkg`; flipped by
+    /// `frost_cancel_dkg` and polled by the shared coordinator (§8/§9).
+    dkg_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Single-flight guard: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so
+    /// a second concurrent run would reset the first's cancel flag. Rejected while
+    /// set; cleared on every exit path by `DkgInFlightGuard`.
+    dkg_in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime: tokio::runtime::Runtime,
     policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
     velocity: Arc<std::sync::Mutex<VelocityTracker>>,
@@ -722,7 +734,9 @@ impl KeepMobile {
             node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
-            dkg_session: DkgSession::new(),
+            dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dkg_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dkg_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime,
             policy,
             velocity,
@@ -1291,79 +1305,173 @@ impl KeepMobile {
         Self::build_generation_result(&shares, &passphrase)
     }
 
-    pub fn frost_start_dkg(&self, config: DkgConfig) -> Result<Vec<u8>, KeepMobileError> {
-        self.runtime.block_on(async {
-            let round1_pkg = self.dkg_session.start(config).await?;
-            Ok(round1_pkg.package_bytes)
-        })
-    }
-
-    pub fn frost_dkg_round1_packages(
-        &self,
-        packages: Vec<Vec<u8>>,
-        participant_indices: Vec<u16>,
-    ) -> Result<Vec<DkgRound2Package>, KeepMobileError> {
-        if packages.len() != participant_indices.len() {
+    /// FFI split, option B (§8): mint (or re-mint) this device's per-group DKG
+    /// signing subkey and return only its pubkey hex. The secret stays in Rust,
+    /// held in memory keyed by `group_name`, and never crosses the Kotlin
+    /// boundary. Each participant runs this, exchanges the printed pubkeys out of
+    /// band, and the coordinator assembles them into the `DkgConfig` roster that
+    /// `frost_run_dkg` consumes. Re-running before `frost_run_dkg` replaces the
+    /// pending subkey for that group.
+    pub fn frost_dkg_begin(&self, group_name: String) -> Result<String, KeepMobileError> {
+        if group_name.is_empty() || group_name.chars().count() > MAX_SHARE_NAME_LENGTH {
             return Err(KeepMobileError::FrostError {
-                msg: "Packages and indices must have same length".into(),
+                msg: format!("group name must be 1..={MAX_SHARE_NAME_LENGTH} characters"),
             });
         }
-
-        let round1_packages: Vec<DkgRound1Package> = packages
-            .into_iter()
-            .zip(participant_indices)
-            .map(|(pkg, idx)| DkgRound1Package {
-                participant_index: idx,
-                package_bytes: pkg,
-            })
-            .collect();
-
-        self.runtime.block_on(async {
-            self.dkg_session
-                .receive_round1_packages(round1_packages)
-                .await
-        })
+        let keys = nostr_sdk::Keys::generate();
+        let secret = Zeroizing::new(keys.secret_key().secret_bytes());
+        self.dkg_subkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(group_name, secret);
+        Ok(keys.public_key().to_hex())
     }
 
-    pub fn frost_dkg_round2_packages(
+    /// Signal a cancel to an in-flight `frost_run_dkg`. The coordinator polls this
+    /// between relay fetches (§8/§9) and aborts the run promptly with a cancelled
+    /// error, tearing down the transport cleanly, instead of leaving a live
+    /// session for a `reset` to corrupt.
+    pub fn frost_cancel_dkg(&self) {
+        self.dkg_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Run a full relay-driven DKG to create a new group on this device, then
+    /// persist the resulting share. Every participant calls this concurrently
+    /// with the same invite roster (`config.roster`) and relays but its own
+    /// `config.our_index`; the crypto rounds and roster-authenticated coordination
+    /// run in the shared `keep_frost_net::run_software_dkg` (see [`dkg`]) so no
+    /// device ever holds the whole key and mobile/CLI cannot drift. `progress`
+    /// receives live state; a run that fails reports [`DkgProgressUpdate::Failed`]
+    /// before returning the error, and `Complete` fires only after the share is
+    /// persisted (§6/§8).
+    ///
+    /// Returns the stored share on success. `timeout_secs` bounds each round
+    /// (floored to 30s to tolerate slow peers and biometric prompts).
+    pub fn frost_run_dkg(
         &self,
-        packages: Vec<Vec<u8>>,
-        sender_indices: Vec<u16>,
+        config: DkgConfig,
         name: String,
         passphrase: String,
-    ) -> Result<String, KeepMobileError> {
-        let passphrase = Zeroizing::new(passphrase);
-        if packages.len() != sender_indices.len() {
+        timeout_secs: u64,
+        progress: Arc<dyn dkg::DkgProgressCallback>,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        // Single-flight: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so a
+        // second concurrent call would reset the active run's cancel flag. Reject
+        // it, and clear the guard on every exit path via Drop.
+        struct DkgInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DkgInFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        if self
+            .dkg_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::Acquire,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
             return Err(KeepMobileError::FrostError {
-                msg: "Packages and indices must have same length".into(),
+                msg: "a DKG run is already in progress".into(),
+            });
+        }
+        let _in_flight = DkgInFlightGuard(self.dkg_in_flight.clone());
+
+        // Pre-flight the persistence constraints before the multi-round network
+        // run so an invalid name or a full store fails fast, rather than after
+        // peers have already completed a group this device would discard.
+        Self::validate_share_name(&name)?;
+        if self.storage.list_all_shares().len() >= MAX_STORED_SHARES {
+            return Err(KeepMobileError::StorageError {
+                msg: "Maximum number of shares reached".into(),
             });
         }
 
-        self.runtime.block_on(async {
-            let round2_packages: Vec<DkgRound2Package> = packages
-                .into_iter()
-                .zip(sender_indices)
-                .map(|(pkg, idx)| DkgRound2Package {
-                    sender_index: idx,
-                    recipient_index: 0,
-                    package_bytes: pkg,
-                })
-                .collect();
+        // Load this device's pending subkey (from `frost_dkg_begin`) and rebuild
+        // its keypair. Fail before any network I/O if the two-call sequence was
+        // skipped.
+        let subkey = {
+            let map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
+            let secret = map.get(&config.group_name).cloned().ok_or_else(|| {
+                KeepMobileError::FrostError {
+                    msg: "call frost_dkg_begin for this group before frost_run_dkg".into(),
+                }
+            })?;
+            let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&*secret).map_err(|e| {
+                KeepMobileError::FrostError {
+                    msg: format!("stored DKG subkey is invalid: {e}"),
+                }
+            })?;
+            nostr_sdk::Keys::new(sk.into())
+        };
 
-            let result = self
-                .dkg_session
-                .receive_round2_packages(round2_packages, &name, &passphrase)
-                .await?;
-            Ok(result.share_export)
-        })
-    }
+        // Verify + pin each relay's TLS cert before connecting (§7), holding the
+        // cert-pin lock only for that brief read-modify-write, not the whole run.
+        let relays = {
+            let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
+            self.runtime
+                .block_on(self.verify_and_pin_relays(&config.relays))?
+        };
 
-    pub fn frost_dkg_status(&self) -> DkgStatus {
-        self.runtime.block_on(self.dkg_session.status())
-    }
+        // Route through the configured loopback SOCKS proxy when enabled (§7),
+        // mirroring the signing path's proxy.
+        let stored_proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+        let proxy = if stored_proxy.enabled {
+            Some(parse_loopback_proxy("127.0.0.1", stored_proxy.port)?)
+        } else {
+            None
+        };
 
-    pub fn frost_dkg_reset(&self) {
-        self.runtime.block_on(self.dkg_session.reset())
+        // Fresh cancel flag for this run; `frost_cancel_dkg` flips it.
+        self.dkg_cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+
+        let passphrase = Zeroizing::new(passphrase);
+        let timeout = Duration::from_secs(timeout_secs.max(30));
+        let outcome = self.runtime.block_on(dkg::run_dkg(
+            &subkey,
+            &config,
+            &relays,
+            proxy,
+            &name,
+            &passphrase,
+            timeout,
+            &self.dkg_cancel,
+            progress.clone(),
+        ));
+
+        match outcome {
+            // §6/§8: persist first, and surface `Complete` only once the share is
+            // stored. A storage failure here still emits `Failed` and never
+            // `Complete`, so the group never looks ready without a stored share.
+            Ok(result) => {
+                match self.import_share(result.share_export, passphrase.to_string(), name) {
+                    Ok(info) => {
+                        progress.on_progress(DkgProgressUpdate::Complete {
+                            group_pubkey: result.group_pubkey,
+                        });
+                        Ok(info)
+                    }
+                    Err(e) => {
+                        progress.on_progress(DkgProgressUpdate::Failed {
+                            reason: e.to_string(),
+                        });
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                progress.on_progress(DkgProgressUpdate::Failed {
+                    reason: e.to_string(),
+                });
+                Err(e)
+            }
+        }
     }
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
@@ -2170,7 +2278,7 @@ impl KeepMobile {
                 threshold: share_meta.threshold,
                 total_shares: share_meta.total_shares,
                 group_pubkey: hex::encode(share_meta.group_pubkey),
-                name: share_meta.name,
+                name: share_meta.name.clone(),
                 created_at: share_meta.created_at,
                 last_used: share_meta.last_used,
                 sign_count: share_meta.sign_count,
@@ -2178,6 +2286,7 @@ impl KeepMobile {
                 key_package: hex::encode(&stored.key_package_bytes),
                 pubkey_package: hex::encode(&stored.pubkey_package_bytes),
                 ciphersuite: stored.ciphersuite,
+                group_subkey_secret: share_meta.group_subkey_secret.map(hex::encode),
             });
         }
 
@@ -2432,6 +2541,16 @@ impl KeepMobile {
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
                 did_backup: bs.did_backup,
+                group_subkey_secret: bs
+                    .group_subkey_secret
+                    .as_deref()
+                    .map(|s| {
+                        bytes_to_32(
+                            &decode_hex(s, "group_subkey_secret")?,
+                            "group subkey secret",
+                        )
+                    })
+                    .transpose()?,
             };
 
             let stored = StoredShareData {
@@ -3848,7 +3967,7 @@ impl KeepMobile {
 
         Some(StoredShareInfo {
             group_pubkey: key,
-            name: metadata.name,
+            name: metadata.name.clone(),
             share_index: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
@@ -4560,6 +4679,7 @@ mod restore_backup_metadata_tests {
             key_package: hex::encode([1u8; 48]),
             pubkey_package: hex::encode([2u8; 48]),
             ciphersuite: Default::default(),
+            group_subkey_secret: None,
         }
     }
 

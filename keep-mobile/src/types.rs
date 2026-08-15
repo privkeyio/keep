@@ -68,22 +68,72 @@ pub struct FrostGenerationResult {
     pub shares: Vec<GeneratedShareInfo>,
 }
 
-#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
-pub enum DkgStatus {
-    NotStarted,
-    Round1,
-    Round2,
-    Complete,
-    Failed { reason: String },
+/// One entry of the invite-supplied DKG roster: a participant's 1-indexed
+/// position and the hex (or npub) pubkey of its per-group signing subkey, as
+/// printed by `frost_dkg_begin` on that device and collected out of band.
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct DkgParticipant {
+    pub index: u16,
+    pub pubkey: String,
 }
 
-#[derive(uniffi::Record, Clone, Debug)]
+#[derive(uniffi::Record, Clone)]
 pub struct DkgConfig {
     pub group_name: String,
     pub threshold: u16,
     pub participants: u16,
     pub our_index: u16,
     pub relays: Vec<String>,
+    /// The invite-supplied roster: every participant's index and per-group
+    /// subkey pubkey. This funnels through the same `frost_group_id`/roster
+    /// verification the CLI uses (§4), so there is one authenticated identity
+    /// path regardless of whether the roster was invite-supplied (mobile) or
+    /// relay-fetched (CLI). The `d`-tag channel is the `frost_group_id` hex, so
+    /// a mobile run and a CLI run of the same group interop on the wire.
+    pub roster: Vec<DkgParticipant>,
+}
+
+/// Hand-written so a `toString()` across the UniFFI boundary cannot dump the
+/// full roster; the ceremony parameters are shown, the participant keys summarized
+/// by count (§8).
+impl std::fmt::Debug for DkgConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DkgConfig")
+            .field("group_name", &self.group_name)
+            .field("threshold", &self.threshold)
+            .field("participants", &self.participants)
+            .field("our_index", &self.our_index)
+            .field("relays", &self.relays)
+            .field(
+                "roster",
+                &format_args!("[{} participants]", self.roster.len()),
+            )
+            .finish()
+    }
+}
+
+/// Progress of a relay-driven DKG run, surfaced to the native layer so it can
+/// render setup state. Terminal states are `Complete` and `Failed`; errors do
+/// not cross the FFI as exceptions during the run, they arrive here.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq)]
+pub enum DkgProgressUpdate {
+    /// Establishing the relay connection with the bootstrap identity.
+    Connecting,
+    /// Waiting on peers' round-1 packages. `received` counts distinct peers so
+    /// far (excluding us); `total` is the number of peers expected.
+    Round1 { received: u16, total: u16 },
+    /// Waiting on the round-2 packages addressed to this device.
+    Round2 { received: u16, total: u16 },
+    /// All packages in; running the final key derivation.
+    Finalizing,
+    /// Broadcasting/collecting the transcript confirmation (CertEq, §6).
+    /// `confirmed` counts distinct peers that signed the identical transcript.
+    Confirming { confirmed: u16, total: u16 },
+    /// DKG succeeded, the CertEq certificate is complete, and the share is
+    /// stored. Never fired before the certificate is in hand (§6/§8).
+    Complete { group_pubkey: String },
+    /// DKG aborted. `reason` is human-readable and safe to display.
+    Failed { reason: String },
 }
 
 #[derive(uniffi::Record, Clone)]
