@@ -1,9 +1,9 @@
 name: Verify release signature
 
-# Non-blocking: surfaces whether a maintainer has uploaded a valid
-# SHA256SUMS.minisig for the release. Signing happens offline (a threshold of
-# maintainers), so this only verifies; it never signs. See
-# docs/RELEASE_SIGNING.md.
+# Surfaces whether a maintainer has uploaded a valid SHA256SUMS.minisig for the
+# release. Non-blocking on missing files (clean notice, green); fails only on an
+# invalid signature. Signing happens offline (a threshold of maintainers), so
+# this only verifies; it never signs. See docs/RELEASE_SIGNING.md.
 on:
   release:
     types: [published, edited]
@@ -35,6 +35,10 @@ jobs:
           fi
           if [ ! -f SHA256SUMS.minisig ]; then
             echo "::notice::SHA256SUMS.minisig not uploaded yet; signature pending"
+            exit 0
+          fi
+          if [ ! -f SHA256SUMS ]; then
+            echo "::notice::SHA256SUMS not uploaded yet; nothing to verify"
             exit 0
           fi
           minisign -V -p release-signing.pub -m SHA256SUMS
