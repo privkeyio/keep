@@ -856,10 +856,11 @@ impl Keep {
         self.store_secret(&record)?;
         // Deliberately no read-back here. `SecretRecord::new` mints a random
         // row id, so a racing enroller writes a *second* row under the same
-        // name rather than overwriting this one, and `frost_group_subkey_secret`
-        // then returns whichever row the backend happens to yield first. A
-        // read-back would neither detect nor resolve that, while costing a full
-        // decrypt of every secret in the vault on every enrollment.
+        // name rather than overwriting this one. A read-back would resolve which
+        // row later reads resolve to (`list_secrets` is a deterministic
+        // key-ordered scan), but it would not remove the duplicate row and would
+        // not close the window against a writer arriving after it, while costing
+        // a full decrypt of every secret in the vault on every enrollment.
         //
         // Closing this properly needs a store-if-absent primitive or a
         // name-derived deterministic record id. `&mut self` plus redb's

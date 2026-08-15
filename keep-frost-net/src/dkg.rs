@@ -196,8 +196,19 @@ pub fn dkg_transcript(
 }
 
 /// Canonical group_id preimage, the single source of truth for the group
-/// identifier: `sha256("frost-group-id-v1" || name || [threshold] ||
-/// [participants] || each raw pubkey string in 1..=participants order)`.
+/// identifier:
+///
+/// ```text
+/// sha256("frost-group-id-v3"
+///        || len(name) || name
+///        || [threshold] || [participants]
+///        || len(pubkeys)
+///        || for each pubkey in 1..=participants order: len(bech32) || bech32)
+/// ```
+///
+/// Every variable-length field is length-prefixed so the preimage is
+/// unambiguous, and each pubkey is canonicalized to bech32 so the same roster
+/// written in hex and in bech32 yields one id.
 ///
 /// Both `cmd_frost_network_group_create` (which mints the id) and roster
 /// verification (which re-derives it to hash-bind an announcement to its
@@ -216,7 +227,7 @@ pub fn frost_group_id(
     // pubkey: ("ab", ["c"]) and ("a", ["bc"]) produced identical group ids, so
     // two different groups could share an id and therefore a roster binding.
     let mut hasher = Sha256::new();
-    hasher.update(b"frost-group-id-v2");
+    hasher.update(b"frost-group-id-v3");
     hasher.update((name.len() as u32).to_be_bytes());
     hasher.update(name.as_bytes());
     hasher.update([threshold]);
@@ -360,6 +371,18 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
             "group announcement is missing a `participants` tag".to_string(),
         ))
     })?;
+    // Enforce the threshold shape here rather than trusting callers. This is a
+    // `pub` function fed an attacker-supplied announcement, and a roster
+    // claiming threshold 1 (single-party spendable) or threshold > participants
+    // (unsatisfiable) has no legitimate use. Both callers happen to pre-validate
+    // today; that is exactly the argument for not leaving the invariant on the
+    // far side of the trust boundary.
+    if threshold < 2 || threshold > participants {
+        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+            "group announcement claims threshold {threshold} of {participants}; \
+             must satisfy 2 <= threshold <= participants"
+        ))));
+    }
     if by_index.len() != participants as usize {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
             "group announcement carries {} p-tags but claims {} participants",
@@ -486,21 +509,44 @@ pub fn default_relay_opts() -> RelayOptions {
         .max_avg_latency(Some(Duration::from_secs(3)))
 }
 
-/// Upper bound on live DKG events buffered for one round. Deliberately not
-/// below [`MAX_DKG_EVENTS_SEEN`]: the coordinator's flood-abort counts events it
-/// has been handed, so a smaller transport cap would swallow the flood silently
-/// and turn a designed abort into a timeout.
-const MAX_BUFFERED_EVENTS: usize = MAX_DKG_EVENTS_SEEN;
+/// Upper bound on live DKG events buffered for one round.
+///
+/// Strictly greater than [`MAX_DKG_EVENTS_SEEN`], not equal to it. The
+/// coordinator aborts on `seen_round.len() > MAX_DKG_EVENTS_SEEN`, counting only
+/// events this transport handed it, so a cap at or below that bound makes the
+/// abort unsatisfiable: the transport would go quietly deaf and the round would
+/// fail as a timeout blaming absent peers instead of reporting the flood. The
+/// headroom also covers our own echoed events, which the coordinator discards
+/// before counting.
+const MAX_BUFFERED_EVENTS: usize = MAX_DKG_EVENTS_SEEN * 2;
+
+/// Enforced at compile time, not by a test: the two were briefly equal, which
+/// made the coordinator's `len() > MAX_DKG_EVENTS_SEEN` abort unsatisfiable and
+/// turned a reported flood into a silent timeout.
+const _: () = assert!(MAX_BUFFERED_EVENTS > MAX_DKG_EVENTS_SEEN);
+
+/// Approximate retained size of a buffered event: content plus every tag value.
+/// Tags are the part the content-only accounting missed, and the pinned SDK
+/// allows up to 2000 of them per event.
+fn event_size(e: &Event) -> usize {
+    e.content.len()
+        + e.tags
+            .iter()
+            .map(|t| t.as_slice().iter().map(String::len).sum::<usize>())
+            .sum::<usize>()
+}
 
 /// How long a single wait on the notification stream blocks before the caller
 /// re-checks its deadline and cancellation flag.
 const POLL_WAKE: Duration = Duration::from_millis(500);
 
-/// Total buffered event content per round, in bytes. The count cap alone does
-/// not bound memory: the pinned SDK sets no per-event size limit, so the only
-/// ceiling is the 5 MB websocket frame, and a few thousand maximal events would
-/// be tens of gigabytes. A DKG package is a few KB, so this is generous for the
-/// honest path while keeping a hostile relay from exhausting a phone.
+/// Total buffered event size per round, in bytes, counting tags as well as
+/// content. The count cap alone does not bound memory: the pinned SDK sets no
+/// per-event size limit (only a 5 MB websocket frame and 2000 tags), so a few
+/// thousand maximal events would be tens of gigabytes. Content alone is not
+/// enough either, because that budget can be spent entirely on tags. A DKG
+/// package is a few KB, so this is generous for the honest path while keeping a
+/// hostile relay from exhausting a phone.
 const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
 
 /// A [`DkgTransport`] over a live `nostr_sdk::Client`. The caller connects the
@@ -547,13 +593,20 @@ impl ClientTransport {
     /// Buffer one live event for the current round, applying the cap and
     /// dropping exact repeats. Single insertion point so the cap and the dedupe
     /// rule cannot drift between the drain path and the blocking-recv path.
-    fn buffer(&self, event: Event) {
+    fn buffer(&self, filter: &Filter, event: Event) {
+        // Only buffer what the round actually asked for. Subscriptions from
+        // earlier rounds are never closed, so without this the kind-21102 and
+        // kind-21103 streams keep arriving during confirm and spend the single
+        // shared cap on events no one will read, starving the round in progress.
+        if !filter.match_event(&event, MatchEventOptions::new()) {
+            return;
+        }
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
         if seen.len() >= MAX_BUFFERED_EVENTS || seen.iter().any(|e| e.id == event.id) {
             return;
         }
-        let used: usize = seen.iter().map(|e| e.content.len()).sum();
-        if used.saturating_add(event.content.len()) > MAX_BUFFERED_BYTES {
+        let used: usize = seen.iter().map(event_size).sum();
+        if used.saturating_add(event_size(&event)) > MAX_BUFFERED_BYTES {
             return;
         }
         seen.push(event);
@@ -578,11 +631,11 @@ impl ClientTransport {
     }
 
     /// Move every notification currently queued into `seen`. Never blocks.
-    fn drain_pending(&self, rx: &mut broadcast::Receiver<RelayPoolNotification>) {
+    fn drain_pending(&self, filter: &Filter, rx: &mut broadcast::Receiver<RelayPoolNotification>) {
         use tokio::sync::broadcast::error::TryRecvError;
         loop {
             match rx.try_recv() {
-                Ok(RelayPoolNotification::Event { event, .. }) => self.buffer(*event),
+                Ok(RelayPoolNotification::Event { event, .. }) => self.buffer(filter, *event),
                 Ok(_) => continue,
                 // Lagged means the buffer overflowed; keep draining what remains
                 // rather than treating it as end-of-stream.
@@ -713,7 +766,7 @@ impl DkgTransport for ClientTransport {
             loop {
                 {
                     let mut rx = self.notifications.lock().await;
-                    self.drain_pending(&mut rx);
+                    self.drain_pending(&filter, &mut rx);
                 }
                 let matched = self.matching(&filter);
                 if !matched.is_empty() {
@@ -727,7 +780,9 @@ impl DkgTransport for ClientTransport {
                 // by a peer wakes us immediately.
                 let mut rx = self.notifications.lock().await;
                 match tokio::time::timeout(remaining.min(POLL_WAKE), rx.recv()).await {
-                    Ok(Ok(RelayPoolNotification::Event { event, .. })) => self.buffer(*event),
+                    Ok(Ok(RelayPoolNotification::Event { event, .. })) => {
+                        self.buffer(&filter, *event)
+                    }
                     // The pool dropped its sender, so no further event can ever
                     // arrive on this receiver. Returning what we have beats
                     // spinning on an instantly-returning `recv` until the
@@ -1366,7 +1421,7 @@ mod tests {
         let expected = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
-            h.update(b"frost-group-id-v2");
+            h.update(b"frost-group-id-v3");
             h.update((name.len() as u32).to_be_bytes());
             h.update(name.as_bytes());
             h.update([2u8]);
@@ -1390,13 +1445,96 @@ mod tests {
     /// different `d`-tag channels and never met.
     #[test]
     fn group_id_is_independent_of_pubkey_encoding() {
-        let (npub1, pk1) = make_pubkey(1);
-        let (npub2, pk2) = make_pubkey(2);
-        let bech32 = vec![npub1, npub2];
+        let (_, pk1) = make_pubkey(1);
+        let (_, pk2) = make_pubkey(2);
+        // `make_pubkey` hands back hex, so bech32 has to be produced explicitly
+        // here; comparing hex against hex would pass without canonicalization
+        // and prove nothing.
         let hex = vec![pk1.to_hex(), pk2.to_hex()];
+        let bech32 = vec![pk1.to_bech32().unwrap(), pk2.to_bech32().unwrap()];
+        assert_ne!(hex, bech32, "fixture must actually differ in encoding");
         assert_eq!(
             frost_group_id("g", 2, 2, &bech32),
             frost_group_id("g", 2, 2, &hex)
+        );
+    }
+
+    fn ev_of_kind(kind: u16, seed: u8, d: &str) -> Event {
+        let keys = make_identity_keys(seed);
+        EventBuilder::new(Kind::Custom(kind), "x")
+            .tag(Tag::custom(TagKind::custom("d"), vec![d.to_string()]))
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+
+    /// Events for another round must not consume this round's budget. Earlier
+    /// subscriptions are never closed, so kind-21102 traffic keeps arriving
+    /// during round 2; buffering it would starve the round in progress.
+    #[test]
+    fn buffer_rejects_events_outside_the_current_filter() {
+        let t = ClientTransport::new(Client::new(make_identity_keys(9)));
+        let filter = Filter::new()
+            .kind(Kind::Custom(DKG_KIND_ROUND2))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), "chan");
+
+        t.buffer(&filter, ev_of_kind(DKG_KIND_ROUND1, 1, "chan"));
+        assert!(t.matching(&filter).is_empty(), "wrong kind was buffered");
+
+        t.buffer(&filter, ev_of_kind(DKG_KIND_ROUND2, 2, "other-chan"));
+        assert!(t.matching(&filter).is_empty(), "wrong channel was buffered");
+
+        let good = ev_of_kind(DKG_KIND_ROUND2, 3, "chan");
+        t.buffer(&filter, good.clone());
+        assert_eq!(t.matching(&filter).len(), 1, "matching event was dropped");
+
+        // Exact repeats collapse.
+        t.buffer(&filter, good);
+        assert_eq!(t.matching(&filter).len(), 1, "duplicate id was buffered");
+    }
+
+    /// Moving to the next round drops the previous round's events. Without this
+    /// the buffer only grows: peers republish with a fresh timestamp each poll,
+    /// so id-dedup cannot collapse the repeats.
+    #[test]
+    fn retarget_clears_the_previous_round() {
+        let t = ClientTransport::new(Client::new(make_identity_keys(10)));
+        let r1 = Filter::new()
+            .kind(Kind::Custom(DKG_KIND_ROUND1))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), "chan");
+        let r2 = Filter::new()
+            .kind(Kind::Custom(DKG_KIND_ROUND2))
+            .custom_tag(SingleLetterTag::lowercase(Alphabet::D), "chan");
+
+        t.retarget(&r1);
+        t.buffer(&r1, ev_of_kind(DKG_KIND_ROUND1, 1, "chan"));
+        assert_eq!(t.matching(&r1).len(), 1);
+
+        t.retarget(&r2);
+        assert!(
+            t.seen.lock().unwrap().is_empty(),
+            "round 1 events survived into round 2"
+        );
+
+        // Re-targeting the same filter must NOT clear, or every poll would
+        // discard what the round has collected so far.
+        t.buffer(&r2, ev_of_kind(DKG_KIND_ROUND2, 2, "chan"));
+        t.retarget(&r2);
+        assert_eq!(t.matching(&r2).len(), 1, "same-filter retarget cleared");
+    }
+
+    /// A frozen vector over fixed inputs. The neighbouring reference test
+    /// recomputes the preimage with the same rules as the implementation, so it
+    /// silently follows any future change; this one does not. If it fails, the
+    /// group id wire format changed and the domain tag must be bumped, because
+    /// every published roster binds to this hash.
+    #[test]
+    fn frost_group_id_is_frozen() {
+        let (n1, _) = make_pubkey(1);
+        let (n2, _) = make_pubkey(2);
+        assert_eq!(
+            hex::encode(frost_group_id("frozen", 2, 2, &[n1, n2])),
+            "4c476c3803a7c6b8669849756961f5832deb99075a38b6c20aa2d232aba90885",
+            "group id preimage changed; bump the domain tag and update this vector"
         );
     }
 

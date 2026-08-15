@@ -47,8 +47,9 @@ the same problems PR #963's `dkg_net.rs` set out to, and does so correctly:
 - **Author binding on intake** — round 1 (kind 21102) and round 2 (kind 21103)
   both reject any event whose author ≠ the roster npub for the claimed
   `sender_index` (`DkgRoster::authenticates:53`).
-- **Group-id hash binding** — `frost_group_id:116` =
-  `sha256("frost-group-id-v1" ‖ name ‖ threshold ‖ participants ‖ ordered npubs)`,
+- **Group-id hash binding** — `frost_group_id` =
+  `sha256("frost-group-id-v3" ‖ len(name) ‖ name ‖ threshold ‖ participants ‖
+  len(n) ‖ for each: len(bech32) ‖ bech32)`, length-prefixed and encoding-canonical,
   shared between the code that mints the id and the code that verifies a roster
   so they cannot drift; stops a relay writer republishing a rogue kind-21101
   under the same `d` tag.
