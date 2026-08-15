@@ -8,13 +8,27 @@ holds the signing key. The output is minisign-compatible, so downstream users
 verify with the stock [`minisign`](https://jedisct1.github.io/minisign/) tool or
 with `keep verify`.
 
-This is a Keep capability you can adopt for your own project. Keep will sign its
-own releases with it: once the signing group is established, releases ship
-`release-signing.pub` alongside the binaries and `SHA256SUMS` manifest, a
-threshold of maintainers signs the manifest offline and uploads
-`SHA256SUMS.minisig`, and a non-blocking `Verify release signature` workflow
-checks the signature once it lands. The release workflows are wired for this
-today; they stay inert until the group public key is generated and committed.
+This is a Keep capability you can adopt for your own project.
+
+**Keep's own releases are not signed this way yet.** The workflows are wired for
+it but dormant: no signing group exists, `release-signing.pub` is not in this
+repository, and the `Verify release signature` check reports NOT VERIFIED on
+every release. Do not expect a `SHA256SUMS.minisig` on current releases, and do
+not treat that check's green tick as evidence of anything until activation.
+
+Once the group is established, releases will ship `release-signing.pub`
+alongside the binaries and the `SHA256SUMS` manifest, a threshold of maintainers
+will sign the manifest offline and upload `SHA256SUMS.minisig`, and the workflow
+will verify both the signature and that every published artifact matches its
+signed digest.
+
+### Where the trust anchor lives
+
+`release-signing.pub` is attached to releases for convenience only. Anyone who
+can publish a release can attach a public key to it, so verifying a release
+against a key downloaded from that same release proves nothing on its own. The
+anchor is the copy committed in this repository; fetch it from a source you
+already trust, pin it, and reuse it across releases.
 
 ## Establishing a signing group
 
