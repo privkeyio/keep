@@ -128,8 +128,11 @@ fn build_roster(config: &DkgConfig) -> Result<DkgRoster, KeepMobileError> {
         let s = by_str
             .get(&idx)
             .ok_or_else(|| frost_err(format!("roster is missing participant index {idx}")))?;
-        let pk = PublicKey::parse(s)
-            .map_err(|e| frost_err(format!("roster pubkey {s:?} for index {idx} is invalid: {e}")))?;
+        let pk = PublicKey::parse(s).map_err(|e| {
+            frost_err(format!(
+                "roster pubkey {s:?} for index {idx} is invalid: {e}"
+            ))
+        })?;
         ordered_npubs.push(s.clone());
         by_index.insert(idx, pk);
     }
@@ -158,7 +161,8 @@ fn export_share(
         result.group_pubkey,
         name.to_string(),
     );
-    let share_package = SharePackage::new(metadata, &result.key_package, &result.public_key_package)?;
+    let share_package =
+        SharePackage::new(metadata, &result.key_package, &result.public_key_package)?;
     let passphrase = Zeroizing::new(passphrase.to_string());
     let export = ShareExport::from_share(&share_package, &passphrase)?;
     Ok(export.to_bech32()?)
@@ -207,9 +211,8 @@ pub async fn run_dkg(
 
     progress.on_progress(DkgProgressUpdate::Connecting);
 
-    let mut session =
-        SoftwareDkgSession::init(config.threshold, config.participants, our_index)
-            .map_err(|e| frost_err(format!("init DKG: {e}")))?;
+    let mut session = SoftwareDkgSession::init(config.threshold, config.participants, our_index)
+        .map_err(|e| frost_err(format!("init DKG: {e}")))?;
 
     let transport = ClientTransport::connect_hardened(subkey, relays, proxy).await?;
 
@@ -251,7 +254,12 @@ mod tests {
         Keys::new(sk.into())
     }
 
-    fn config_with(threshold: u16, participants: u16, our_index: u16, roster: Vec<DkgParticipant>) -> DkgConfig {
+    fn config_with(
+        threshold: u16,
+        participants: u16,
+        our_index: u16,
+        roster: Vec<DkgParticipant>,
+    ) -> DkgConfig {
         DkgConfig {
             group_name: "test".into(),
             threshold,

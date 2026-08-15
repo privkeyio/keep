@@ -2962,7 +2962,6 @@ impl KfpNode {
     }
 }
 
-
 /// Derives a member's transport keypair from public group data. The derivation
 /// is deterministic in `(group_pubkey, identifier)`, both public, so every
 /// member can compute every other member's transport pubkey without discovery.

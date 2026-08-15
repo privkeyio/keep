@@ -104,7 +104,10 @@ impl std::fmt::Debug for DkgConfig {
             .field("participants", &self.participants)
             .field("our_index", &self.our_index)
             .field("relays", &self.relays)
-            .field("roster", &format_args!("[{} participants]", self.roster.len()))
+            .field(
+                "roster",
+                &format_args!("[{} participants]", self.roster.len()),
+            )
             .finish()
     }
 }

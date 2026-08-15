@@ -1327,7 +1327,8 @@ impl KeepMobile {
     /// error, tearing down the transport cleanly, instead of leaving a live
     /// session for a `reset` to corrupt.
     pub fn frost_cancel_dkg(&self) {
-        self.dkg_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.dkg_cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Run a full relay-driven DKG to create a new group on this device, then
@@ -1381,10 +1382,7 @@ impl KeepMobile {
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
         let relays = {
-            let _cert = self
-                .cert_pin_lock
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
             self.runtime
                 .block_on(self.verify_and_pin_relays(&config.relays))?
         };
@@ -1421,21 +1419,22 @@ impl KeepMobile {
             // §6/§8: persist first, and surface `Complete` only once the share is
             // stored. A storage failure here still emits `Failed` and never
             // `Complete`, so the group never looks ready without a stored share.
-            Ok(result) => match self.import_share(result.share_export, passphrase.to_string(), name)
-            {
-                Ok(info) => {
-                    progress.on_progress(DkgProgressUpdate::Complete {
-                        group_pubkey: result.group_pubkey,
-                    });
-                    Ok(info)
+            Ok(result) => {
+                match self.import_share(result.share_export, passphrase.to_string(), name) {
+                    Ok(info) => {
+                        progress.on_progress(DkgProgressUpdate::Complete {
+                            group_pubkey: result.group_pubkey,
+                        });
+                        Ok(info)
+                    }
+                    Err(e) => {
+                        progress.on_progress(DkgProgressUpdate::Failed {
+                            reason: e.to_string(),
+                        });
+                        Err(e)
+                    }
                 }
-                Err(e) => {
-                    progress.on_progress(DkgProgressUpdate::Failed {
-                        reason: e.to_string(),
-                    });
-                    Err(e)
-                }
-            },
+            }
             Err(e) => {
                 progress.on_progress(DkgProgressUpdate::Failed {
                     reason: e.to_string(),
@@ -1444,7 +1443,6 @@ impl KeepMobile {
             }
         }
     }
-
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
         const MAX_BUNDLE_HEX_LEN: usize = 8192;

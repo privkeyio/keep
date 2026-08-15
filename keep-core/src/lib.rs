@@ -2795,8 +2795,14 @@ mod tests {
         let mut keep = test_keep(&path);
 
         let subkey = [9u8; 32];
-        keep.frost_store_dkg_share(&result, threshold, participants, "retain-group", Some(subkey))
-            .unwrap();
+        keep.frost_store_dkg_share(
+            &result,
+            threshold,
+            participants,
+            "retain-group",
+            Some(subkey),
+        )
+        .unwrap();
 
         let shares = keep.frost_list_shares().unwrap();
         let stored = shares
