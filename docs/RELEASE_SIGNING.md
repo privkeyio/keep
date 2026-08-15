@@ -22,7 +22,7 @@ will sign the manifest offline and upload `SHA256SUMS.minisig`, and the workflow
 will verify both the signature and that every published artifact matches its
 signed digest.
 
-### Where the trust anchor lives
+## Where the trust anchor lives
 
 `release-signing.pub` is attached to releases for convenience only. Anyone who
 can publish a release can attach a public key to it, so verifying a release

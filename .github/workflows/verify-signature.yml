@@ -83,8 +83,21 @@ jobs:
           # untouched and its signature still checks out. Comparing the assets
           # against the signed digests is what makes the green tick mean the
           # published binaries are the ones the maintainers signed.
-          cd covered
-          sha256sum -c ../SHA256SUMS
-          cd ..
-          summary "**Release signing: verified.** Signature valid and all published artifacts match the signed digests."
+          (cd covered && sha256sum -c ../SHA256SUMS)
+          # `sha256sum -c` only checks names the manifest lists, so it ignores an
+          # asset added after signing. That asset would be unsigned but sit on the
+          # release looking official. Require the two name sets to match exactly:
+          # anything published but unsigned, or signed but missing, fails here.
+          awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort > /tmp/signed.txt
+          (cd covered && ls -1) | sort > /tmp/published.txt
+          if ! diff -u /tmp/signed.txt /tmp/published.txt > /tmp/setdiff.txt; then
+            echo "::error::Published assets do not match the signed manifest"
+            cat /tmp/setdiff.txt
+            summary "**Release signing: MISMATCH.** Published assets differ from the signed manifest."
+            summary '```'
+            cat /tmp/setdiff.txt >> "$GITHUB_STEP_SUMMARY"
+            summary '```'
+            exit 1
+          fi
+          summary "**Release signing: verified.** Signature valid, every published artifact matches its signed digest, and no unsigned assets are present."
 
