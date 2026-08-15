@@ -1,0 +1,103 @@
+name: Verify release signature
+
+# Surfaces whether a maintainer has uploaded a valid SHA256SUMS.minisig for the
+# release. Non-blocking on missing files (clean notice, green); fails only on an
+# invalid signature. Signing happens offline (a threshold of maintainers), so
+# this only verifies; it never signs. See docs/RELEASE_SIGNING.md.
+on:
+  release:
+    types: [published, edited]
+  # Asset uploads (the .minisig) do not reliably fire release events, so allow a
+  # maintainer to re-run verification for a tag after uploading the signature.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to verify (e.g. v1.2.3)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download manifest and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          # List assets once; a failure here (auth/network/API) aborts the step
+          # rather than masquerading as a missing file. Download only present
+          # assets, and let genuine download failures propagate.
+          assets=$(gh release view "$TAG" --json assets --jq '.assets[].name')
+          if grep -qx SHA256SUMS <<<"$assets"; then
+            gh release download "$TAG" --pattern SHA256SUMS --dir .
+          fi
+          if grep -qx SHA256SUMS.minisig <<<"$assets"; then
+            gh release download "$TAG" --pattern SHA256SUMS.minisig --dir .
+          fi
+          # Also pull the artifacts the manifest covers. Verifying the signature
+          # alone only proves a threshold signed *some* manifest; without the
+          # binaries we cannot tell whether the published assets are the ones it
+          # describes. Everything except the manifest, its signature and the
+          # public key is a covered artifact.
+          mkdir -p covered
+          while IFS= read -r name; do
+            case "$name" in
+              SHA256SUMS|SHA256SUMS.minisig|release-signing.pub) continue ;;
+            esac
+            gh release download "$TAG" --pattern "$name" --dir covered
+          done <<<"$assets"
+      # Warnings, not notices, for the pending states. A notice is invisible
+      # unless you open the run, so an unsigned release would show the same bare
+      # green tick as a fully verified one under a check called "Verify release
+      # signature". The step summary states which of the three outcomes applies
+      # so the distinction survives a glance at the checks list.
+      - name: Verify signature
+        run: |
+          summary() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+          if [ ! -f release-signing.pub ]; then
+            echo "::warning::NOT VERIFIED: release signing is wired but not activated (no release-signing.pub)"
+            summary "**Release signing: not activated.** No \`release-signing.pub\` in the repo, so nothing was verified."
+            exit 0
+          fi
+          if [ ! -f SHA256SUMS ]; then
+            echo "::warning::NOT VERIFIED: SHA256SUMS is missing from the release"
+            summary "**Release signing: no manifest.** \`SHA256SUMS\` is not attached to this release."
+            exit 0
+          fi
+          if [ ! -f SHA256SUMS.minisig ]; then
+            echo "::warning::NOT VERIFIED: signature pending (no SHA256SUMS.minisig uploaded yet)"
+            summary "**Release signing: signature pending.** \`SHA256SUMS\` is present but unsigned."
+            exit 0
+          fi
+          minisign -V -p release-signing.pub -m SHA256SUMS
+          # The signature covers the manifest, not the files. Without this an
+          # artifact swapped after signing verifies green: the manifest is
+          # untouched and its signature still checks out. Comparing the assets
+          # against the signed digests is what makes the green tick mean the
+          # published binaries are the ones the maintainers signed.
+          (cd covered && sha256sum -c ../SHA256SUMS)
+          # `sha256sum -c` only checks names the manifest lists, so it ignores an
+          # asset added after signing. That asset would be unsigned but sit on the
+          # release looking official. Require the two name sets to match exactly:
+          # anything published but unsigned, or signed but missing, fails here.
+          awk '{ sub(/^\*/, "", $2); print $2 }' SHA256SUMS | sort > /tmp/signed.txt
+          (cd covered && ls -1) | sort > /tmp/published.txt
+          if ! diff -u /tmp/signed.txt /tmp/published.txt > /tmp/setdiff.txt; then
+            echo "::error::Published assets do not match the signed manifest"
+            cat /tmp/setdiff.txt
+            summary "**Release signing: MISMATCH.** Published assets differ from the signed manifest."
+            summary '```'
+            cat /tmp/setdiff.txt >> "$GITHUB_STEP_SUMMARY"
+            summary '```'
+            exit 1
+          fi
+          summary "**Release signing: verified.** Signature valid, every published artifact matches its signed digest, and no unsigned assets are present."
+
