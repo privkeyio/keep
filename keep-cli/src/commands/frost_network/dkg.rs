@@ -87,16 +87,19 @@ pub fn cmd_frost_network_dkg(
         )
     })?;
     match hardware {
-        Some(hw) => cmd_frost_network_dkg_hardware(
-            out,
-            group,
-            threshold,
-            participants,
-            our_index,
-            relay,
-            hw,
-            vault_path,
-        ),
+        // The hardware path predates the shared coordinator and has not been
+        // migrated: it has no equivocation-confirmation round (a malicious relay
+        // can equivocate round-1 packages), no relay certificate pinning or
+        // proxy, and decrypts round-2 events before authenticating the sender.
+        // Refuse to run it rather than generate a key over an unhardened transport
+        // until it is ported to run_software_dkg. See cmd_frost_network_dkg_hardware.
+        Some(_) => Err(KeepError::InvalidInput(
+            "hardware DKG over relays is not yet supported: the hardware path has \
+             not been migrated to the hardened DKG coordinator (no equivocation \
+             confirmation, no relay pinning). Use the software DKG path (omit \
+             --hardware) to create a group for now."
+                .into(),
+        )),
         None => cmd_frost_network_dkg_software(
             out,
             group,
@@ -109,6 +112,9 @@ pub fn cmd_frost_network_dkg(
     }
 }
 
+// Retained for the pending migration to the hardened shared coordinator; the
+// dispatcher above refuses to invoke it until then (unhardened transport).
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(out))]
 fn cmd_frost_network_dkg_hardware(
