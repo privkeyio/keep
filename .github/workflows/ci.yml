@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Include ready_for_review so a draft->ready transition re-runs CI. The
+    # build/lint jobs are gated on `draft != true`; without this trigger their
+    # required checks stay skipped after undrafting and block the PR forever.
+    types: [opened, synchronize, reopened, ready_for_review]
 
 # Least privilege: no job in this workflow writes to the repo, but every job runs
 # third-party actions (cargo-deny, setup-android, taiki-e/install-action, rust-cache).
