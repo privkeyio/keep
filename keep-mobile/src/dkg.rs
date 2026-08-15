@@ -153,14 +153,19 @@ fn export_share(
     config: &DkgConfig,
     name: &str,
     passphrase: &str,
+    subkey_secret: [u8; 32],
 ) -> Result<String, KeepMobileError> {
+    // C1/§3: persist the per-group signing subkey alongside the share, matching
+    // the CLI path (frost_store_dkg_share). Without it a restored share cannot
+    // sign this party's per-group events.
     let metadata = ShareMetadata::new(
         result.our_index,
         config.threshold,
         config.participants,
         result.group_pubkey,
         name.to_string(),
-    );
+    )
+    .with_group_subkey_secret(subkey_secret);
     let share_package =
         SharePackage::new(metadata, &result.key_package, &result.public_key_package)?;
     let passphrase = Zeroizing::new(passphrase.to_string());
@@ -237,7 +242,13 @@ pub async fn run_dkg(
     transport.disconnect().await;
     let outcome = outcome?;
 
-    let share_export = export_share(&outcome.result, config, name, passphrase)?;
+    let share_export = export_share(
+        &outcome.result,
+        config,
+        name,
+        passphrase,
+        subkey.secret_key().secret_bytes(),
+    )?;
     Ok(DkgResult {
         group_pubkey: hex::encode(outcome.result.group_pubkey),
         share_export,
