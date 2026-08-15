@@ -496,7 +496,7 @@ impl ClientTransport {
         }
         client.connect().await;
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let connected = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let any_connected = client
                     .relays()
@@ -509,10 +509,15 @@ impl ClientTransport {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
-        .await
-        .map_err(|_| {
-            KeepError::NetworkErr(NetworkError::timeout("waiting for relay connection"))
-        })?;
+        .await;
+        if connected.is_err() {
+            // The client has no Drop cleanup, so tear down the websocket tasks
+            // spawned by connect() before returning rather than leaking them.
+            client.disconnect().await;
+            return Err(KeepError::NetworkErr(NetworkError::timeout(
+                "waiting for relay connection",
+            )));
+        }
 
         Ok(Self { client })
     }
