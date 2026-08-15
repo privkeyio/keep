@@ -496,6 +496,13 @@ const MAX_BUFFERED_EVENTS: usize = MAX_DKG_EVENTS_SEEN;
 /// re-checks its deadline and cancellation flag.
 const POLL_WAKE: Duration = Duration::from_millis(500);
 
+/// Total buffered event content per round, in bytes. The count cap alone does
+/// not bound memory: the pinned SDK sets no per-event size limit, so the only
+/// ceiling is the 5 MB websocket frame, and a few thousand maximal events would
+/// be tens of gigabytes. A DKG package is a few KB, so this is generous for the
+/// honest path while keeping a hostile relay from exhausting a phone.
+const MAX_BUFFERED_BYTES: usize = 16 * 1024 * 1024;
+
 /// A [`DkgTransport`] over a live `nostr_sdk::Client`. The caller connects the
 /// client (and applies any relay hardening) before wrapping it.
 ///
@@ -542,9 +549,14 @@ impl ClientTransport {
     /// rule cannot drift between the drain path and the blocking-recv path.
     fn buffer(&self, event: Event) {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.len() < MAX_BUFFERED_EVENTS && !seen.iter().any(|e| e.id == event.id) {
-            seen.push(event);
+        if seen.len() >= MAX_BUFFERED_EVENTS || seen.iter().any(|e| e.id == event.id) {
+            return;
         }
+        let used: usize = seen.iter().map(|e| e.content.len()).sum();
+        if used.saturating_add(event.content.len()) > MAX_BUFFERED_BYTES {
+            return;
+        }
+        seen.push(event);
     }
 
     /// Drop the previous round's events when collection moves to a new filter.
