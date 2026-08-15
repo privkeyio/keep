@@ -114,6 +114,11 @@ pub struct BackupShare {
     #[serde(default)]
     #[zeroize(skip)]
     pub ciphersuite: crate::frost::Ciphersuite,
+    /// C1 (§3): hex-encoded per-group signing subkey secret, carried in the same
+    /// backup unit as the share so a restore can prove group membership. Absent
+    /// for shares predating the roster→subkey change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_subkey_secret: Option<String>,
 }
 
 /// Configuration stored in a backup file.
@@ -397,6 +402,7 @@ pub fn create_backup(keep: &Keep, passphrase: &str) -> Result<Vec<u8>> {
             key_package: hex::encode(decrypted.key_package_bytes()),
             pubkey_package: hex::encode(&share.pubkey_package),
             ciphersuite: share.ciphersuite,
+            group_subkey_secret: share.metadata.group_subkey_secret.map(hex::encode),
         });
     }
 
@@ -613,6 +619,11 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
             last_used: bs.last_used,
             sign_count: bs.sign_count,
             did_backup: bs.did_backup,
+            group_subkey_secret: bs
+                .group_subkey_secret
+                .as_deref()
+                .map(|s| decode_hex_32(s, "group subkey secret"))
+                .transpose()?,
         };
         let package =
             crate::frost::SharePackage::from_bytes(metadata, key_package_bytes, pubkey_package);

@@ -100,6 +100,13 @@ use crate::storage::Storage;
 pub use crate::storage::{ReplicatedApply, StatePublisher};
 pub use crate::wallet::{DeviceRegistration, WalletDescriptor};
 
+/// Vault secret-store name for a group's per-group DKG signing subkey (§3). The
+/// reserved prefix namespaces these off the user's own secret entries so a
+/// lookup by group name can never collide with a hand-created secret.
+fn frost_group_subkey_name(group_name: &str) -> String {
+    format!("frost-group-subkey:{group_name}")
+}
+
 /// The main Keep type for encrypted key management.
 pub struct Keep {
     storage: Storage,
@@ -823,16 +830,81 @@ impl Keep {
         Ok(())
     }
 
+    /// Generate (if absent) and persist this device's per-group DKG signing
+    /// subkey (§3), keyed by `group_name` in the vault secret store, and return
+    /// its x-only public key for the coordinator's kind-31101 roster. The subkey
+    /// — never the identity nsec — is what the roster pins and what signs this
+    /// party's DKG events, so the announcement never publishes a targeting map of
+    /// identities. Idempotent: a second call for the same group returns the
+    /// already-enrolled subkey rather than minting a divergent one, so a retried
+    /// enrollment cannot desync the pubkey a coordinator may already have pinned.
+    pub fn frost_group_subkey_ensure(&mut self, group_name: &str) -> Result<[u8; 32]> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        if let Some(mut secret) = self.frost_group_subkey_secret(group_name)? {
+            let keypair = NostrKeypair::from_secret_bytes(&mut secret)?;
+            return Ok(*keypair.public_bytes());
+        }
+        let keypair = NostrKeypair::generate()?;
+        let pubkey = *keypair.public_bytes();
+        let record = crate::secret::SecretRecord::new(
+            frost_group_subkey_name(group_name),
+            crate::secret::SecretKind::Generic,
+            keypair.secret_bytes().to_vec(),
+        )?;
+        self.store_secret(&record)?;
+        // Deliberately no read-back here. `SecretRecord::new` mints a random
+        // row id, so a racing enroller writes a *second* row under the same
+        // name rather than overwriting this one. A read-back would resolve which
+        // row later reads resolve to (`list_secrets` is a deterministic
+        // key-ordered scan), but it would not remove the duplicate row and would
+        // not close the window against a writer arriving after it, while costing
+        // a full decrypt of every secret in the vault on every enrollment.
+        //
+        // Closing this properly needs a store-if-absent primitive or a
+        // name-derived deterministic record id. `&mut self` plus redb's
+        // exclusive database lock make a concurrent writer hard to reach today,
+        // so this is tracked rather than papered over.
+        Ok(pubkey)
+    }
+
+    /// Load this device's per-group DKG signing subkey secret (§3), if one was
+    /// enrolled via [`Keep::frost_group_subkey_ensure`]. `Ok(None)` when the
+    /// group has no subkey yet (the caller must enroll one before running DKG).
+    pub fn frost_group_subkey_secret(&self, group_name: &str) -> Result<Option<[u8; 32]>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let wanted = frost_group_subkey_name(group_name);
+        for record in self.list_secrets()? {
+            if record.name == wanted {
+                let secret: [u8; 32] = record.value.as_slice().try_into().map_err(|_| {
+                    KeepError::CryptoErr(crate::error::CryptoError::invalid_key(
+                        "stored per-group subkey is not 32 bytes".to_string(),
+                    ))
+                })?;
+                return Ok(Some(secret));
+            }
+        }
+        Ok(None)
+    }
+
     /// Persist a share produced by [`frost::dkg::SoftwareDkgSession::finalize`]
     /// (#454). Wraps the finalized `KeyPackage` + `PublicKeyPackage` into a
     /// [`SharePackage`] with fresh metadata, encrypts under the vault's data
     /// key, stores it, and writes a `FrostShareImport` audit entry.
+    ///
+    /// `group_subkey_secret` is this device's per-group signing subkey (§3), kept
+    /// with the share so recovery can prove membership (C1); pass `None` only for
+    /// legacy shares that authenticated on the identity key.
     pub fn frost_store_dkg_share(
         &mut self,
         result: &crate::frost::dkg::SoftwareDkgResult,
         threshold: u16,
         total_shares: u16,
         name: &str,
+        group_subkey_secret: Option<[u8; 32]>,
     ) -> Result<()> {
         if !self.is_unlocked() {
             return Err(KeepError::Locked);
@@ -847,13 +919,16 @@ impl Keep {
             ));
         }
 
-        let metadata = crate::frost::ShareMetadata::new(
+        let mut metadata = crate::frost::ShareMetadata::new(
             result.our_index,
             threshold,
             total_shares,
             result.group_pubkey,
             name.to_string(),
         );
+        if let Some(subkey_secret) = group_subkey_secret {
+            metadata = metadata.with_group_subkey_secret(subkey_secret);
+        }
         let share = crate::frost::SharePackage::new(
             metadata,
             &result.key_package,
@@ -2636,7 +2711,7 @@ mod tests {
         let mut keep = test_keep(&path);
 
         for r in &results {
-            keep.frost_store_dkg_share(r, threshold, participants, "dkg-group")
+            keep.frost_store_dkg_share(r, threshold, participants, "dkg-group", None)
                 .unwrap();
         }
 
@@ -2661,8 +2736,91 @@ mod tests {
         // A locked vault refuses to store.
         keep.lock();
         assert!(matches!(
-            keep.frost_store_dkg_share(&results[0], threshold, participants, "dkg-group"),
+            keep.frost_store_dkg_share(&results[0], threshold, participants, "dkg-group", None),
             Err(KeepError::Locked)
         ));
+    }
+
+    #[test]
+    fn frost_group_subkey_is_enrolled_idempotently_and_retrievable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        // No subkey until enrolled.
+        assert_eq!(keep.frost_group_subkey_secret("alpha").unwrap(), None);
+
+        // Enrolling mints a subkey whose secret is retrievable and whose pubkey
+        // is derivable from it.
+        let pubkey = keep.frost_group_subkey_ensure("alpha").unwrap();
+        let mut secret = keep.frost_group_subkey_secret("alpha").unwrap().unwrap();
+        let derived = crate::keys::NostrKeypair::from_secret_bytes(&mut secret).unwrap();
+        assert_eq!(*derived.public_bytes(), pubkey);
+
+        // Idempotent: a second enroll returns the same subkey, not a new one.
+        assert_eq!(keep.frost_group_subkey_ensure("alpha").unwrap(), pubkey);
+
+        // Distinct groups get distinct subkeys.
+        let other = keep.frost_group_subkey_ensure("beta").unwrap();
+        assert_ne!(other, pubkey);
+
+        // A locked vault refuses both operations.
+        keep.lock();
+        assert!(matches!(
+            keep.frost_group_subkey_ensure("alpha"),
+            Err(KeepError::Locked)
+        ));
+        assert!(matches!(
+            keep.frost_group_subkey_secret("alpha"),
+            Err(KeepError::Locked)
+        ));
+    }
+
+    #[test]
+    fn frost_store_dkg_share_retains_group_subkey_secret() {
+        let (threshold, participants) = (2u16, 2u16);
+        let mut sessions: Vec<_> = (1..=participants)
+            .map(|i| frost::dkg::SoftwareDkgSession::init(threshold, participants, i).unwrap())
+            .collect();
+
+        let round1_wires: Vec<_> = sessions.iter_mut().map(|s| s.round1().unwrap()).collect();
+        for (i, session) in sessions.iter_mut().enumerate() {
+            for (j, wire) in round1_wires.iter().enumerate() {
+                if i != j {
+                    session.round1_peer(wire).unwrap();
+                }
+            }
+        }
+        let mut per_session_round2: Vec<Vec<(u16, frost::dkg::SoftwareRound2Wire)>> =
+            sessions.iter_mut().map(|s| s.round2().unwrap()).collect();
+        for wires in per_session_round2.drain(..) {
+            for (recipient_index, wire) in wires {
+                sessions[(recipient_index - 1) as usize]
+                    .receive_share(&wire)
+                    .unwrap();
+            }
+        }
+        let result = sessions[0].finalize().unwrap();
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+
+        let subkey = [9u8; 32];
+        keep.frost_store_dkg_share(
+            &result,
+            threshold,
+            participants,
+            "retain-group",
+            Some(subkey),
+        )
+        .unwrap();
+
+        let shares = keep.frost_list_shares().unwrap();
+        let stored = shares
+            .iter()
+            .find(|s| s.metadata.name == "retain-group")
+            .unwrap();
+        assert_eq!(stored.metadata.group_subkey_secret, Some(subkey));
     }
 }

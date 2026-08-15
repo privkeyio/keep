@@ -62,6 +62,7 @@ mod audit;
 mod cert_pin;
 mod descriptor_session;
 mod descriptor_session_store;
+pub mod dkg;
 mod ecdh;
 mod enroll_session;
 mod error;

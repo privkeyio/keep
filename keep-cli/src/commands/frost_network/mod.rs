@@ -24,7 +24,9 @@ mod duress;
 mod hardware;
 
 pub use attestation::cmd_frost_network_attestation_provision;
-pub use dkg::{cmd_frost_network_dkg, cmd_frost_network_group_create};
+pub use dkg::{
+    cmd_frost_network_dkg, cmd_frost_network_group_create, cmd_frost_network_group_subkey,
+};
 pub use duress::{
     cmd_frost_network_duress_clear, cmd_frost_network_duress_provision,
     DEFAULT_DURESS_CLEAR_DELAY_SECS,
