@@ -854,7 +854,20 @@ impl Keep {
             keypair.secret_bytes().to_vec(),
         )?;
         self.store_secret(&record)?;
-        Ok(pubkey)
+        // Read back rather than trusting our own mint. Enrollment is a
+        // read-then-write with no if-absent primitive in the secret store, so a
+        // second enroller racing this one could have written in between. Losing
+        // that race silently would be the dangerous outcome: we would return a
+        // pubkey for a secret the vault no longer holds, publish it in the
+        // roster, and then be unable to sign as that identity. Returning what is
+        // actually persisted keeps the caller and the vault in agreement.
+        match self.frost_group_subkey_secret(group_name)? {
+            Some(mut persisted) => {
+                let keypair = NostrKeypair::from_secret_bytes(&mut persisted)?;
+                Ok(*keypair.public_bytes())
+            }
+            None => Ok(pubkey),
+        }
     }
 
     /// Load this device's per-group DKG signing subkey secret (§3), if one was
