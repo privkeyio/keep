@@ -1,0 +1,40 @@
+name: Verify release signature
+
+# Non-blocking: surfaces whether a maintainer has uploaded a valid
+# SHA256SUMS.minisig for the release. Signing happens offline (a threshold of
+# maintainers), so this only verifies; it never signs. See
+# docs/RELEASE_SIGNING.md.
+on:
+  release:
+    types: [published, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Download manifest and signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release download "$TAG" --pattern SHA256SUMS --dir . || true
+          gh release download "$TAG" --pattern SHA256SUMS.minisig --dir . || true
+      - name: Verify signature
+        run: |
+          if [ ! -f release-signing.pub ]; then
+            echo "::notice::release-signing.pub not committed yet; skipping verification"
+            exit 0
+          fi
+          if [ ! -f SHA256SUMS.minisig ]; then
+            echo "::notice::SHA256SUMS.minisig not uploaded yet; signature pending"
+            exit 0
+          fi
+          minisign -V -p release-signing.pub -m SHA256SUMS
