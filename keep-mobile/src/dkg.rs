@@ -1,583 +1,318 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+//! Mobile adapter for the shared DKG coordinator.
+//!
+//! keep-mobile no longer carries its own FROST driver or relay coordination: the
+//! crypto rounds and the roster-authenticated publish/collect/confirm loops live
+//! in [`keep_frost_net::dkg::run_software_dkg`], shared with the CLI so the two
+//! cannot drift (`docs/DKG_CEREMONY.md` §4). This module only:
+//!
+//! - builds the authenticated [`DkgRoster`] from the invite-supplied config,
+//! - wires a hardened [`ClientTransport`] (§7: pinned relays supplied by the
+//!   caller, the configured SOCKS proxy, reconnect/ping/ban-on-mismatch relay
+//!   options, and a disconnect on every exit path),
+//! - adapts the coordinator's [`DkgPhase`] to the FFI [`DkgProgressUpdate`], and
+//! - turns the finalized share into an encrypted bech32 export the caller stores.
 
-use frost_secp256k1_tr::keys::dkg;
-use frost_secp256k1_tr::Identifier;
-use tokio::sync::RwLock;
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::Duration;
+
+use nostr_sdk::prelude::*;
+use zeroize::Zeroizing;
+
+use keep_core::frost::dkg::SoftwareDkgSession;
+use keep_core::frost::{ShareExport, ShareMetadata, SharePackage};
+use keep_frost_net::dkg::{
+    frost_group_id, run_software_dkg, ClientTransport, DkgPhase, DkgProgress, DkgRoster,
+};
 
 use crate::error::KeepMobileError;
 use crate::network::validate_relay_url;
-use crate::types::{DkgConfig, DkgStatus};
+use crate::types::{DkgConfig, DkgProgressUpdate};
 
-const MAX_DKG_PARTICIPANTS: u16 = 255;
-const MAX_SHARE_NAME_LENGTH: usize = 64;
-const MAX_PACKAGE_SIZE: usize = 16 * 1024;
-
-fn validate_participant_index(
-    index: u16,
-    participants: u16,
-    label: &str,
-) -> Result<Identifier, KeepMobileError> {
-    if index < 1 || index > participants {
-        return Err(KeepMobileError::FrostError {
-            msg: format!("{label} {index} out of range (1-{participants})"),
-        });
-    }
-    Identifier::try_from(index).map_err(|e| KeepMobileError::FrostError {
-        msg: format!("Invalid {}: {}", label.to_lowercase(), e),
-    })
+/// Reports DKG progress to the native layer. Implemented on the foreign side
+/// (Kotlin) so setup UI can render live state without polling. Called from the
+/// runtime thread; implementations must be non-blocking.
+#[uniffi::export(with_foreign)]
+pub trait DkgProgressCallback: Send + Sync {
+    fn on_progress(&self, update: DkgProgressUpdate);
 }
 
-fn validate_package_size(bytes: &[u8], sender: u16) -> Result<(), KeepMobileError> {
-    if bytes.len() > MAX_PACKAGE_SIZE {
-        return Err(KeepMobileError::FrostError {
-            msg: format!("Package from {sender} exceeds maximum size"),
-        });
-    }
-    Ok(())
-}
-
-fn validate_share_name(name: &str) -> Result<(), KeepMobileError> {
-    if name.chars().count() > MAX_SHARE_NAME_LENGTH {
-        return Err(KeepMobileError::InvalidShare {
-            msg: format!("Share name exceeds maximum length of {MAX_SHARE_NAME_LENGTH} characters"),
-        });
-    }
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct DkgRound1Package {
-    pub participant_index: u16,
-    pub package_bytes: Vec<u8>,
-}
-
-#[derive(Clone, uniffi::Record)]
-pub struct DkgRound2Package {
-    pub sender_index: u16,
-    pub recipient_index: u16,
-    pub package_bytes: Vec<u8>,
-}
-
+/// What a finalized mobile DKG hands back: the hex group pubkey and this device's
+/// encrypted bech32 share export, ready to persist through the normal import path.
 pub struct DkgResult {
     pub group_pubkey: String,
     pub share_export: String,
 }
 
-enum DkgState {
-    NotStarted,
-    Initialized {
-        config: DkgConfig,
-        our_identifier: Identifier,
-        secret_package: Box<dkg::round1::SecretPackage>,
-    },
-    Round1Complete {
-        config: DkgConfig,
-        secret_package: Box<dkg::round2::SecretPackage>,
-        round1_packages: BTreeMap<Identifier, dkg::round1::Package>,
-    },
-    Complete,
-    Failed {
-        reason: String,
-    },
+fn frost_err(msg: impl Into<String>) -> KeepMobileError {
+    KeepMobileError::FrostError { msg: msg.into() }
 }
 
-pub struct DkgSession {
-    state: Arc<RwLock<DkgState>>,
+/// Bridges the shared coordinator's [`DkgPhase`] to the FFI [`DkgProgressUpdate`].
+/// `Complete` is intentionally NOT forwarded here: the caller fires it only after
+/// the share is persisted, so the group never surfaces as ready before storage
+/// succeeds (§6/§8).
+struct CallbackProgress {
+    cb: Arc<dyn DkgProgressCallback>,
 }
 
-impl DkgSession {
-    pub fn new() -> Self {
-        Self {
-            state: Arc::new(RwLock::new(DkgState::NotStarted)),
-        }
-    }
-
-    pub async fn start(&self, config: DkgConfig) -> Result<DkgRound1Package, KeepMobileError> {
-        {
-            let state = self.state.read().await;
-            match &*state {
-                DkgState::Initialized { .. } | DkgState::Round1Complete { .. } => {
-                    return Err(KeepMobileError::FrostError {
-                        msg: "DKG session already in progress".into(),
-                    });
-                }
-                _ => {}
+impl DkgProgress for CallbackProgress {
+    fn phase(&self, phase: DkgPhase) {
+        let update = match phase {
+            DkgPhase::Round1 { received, total } => DkgProgressUpdate::Round1 { received, total },
+            DkgPhase::Round2 { received, total } => DkgProgressUpdate::Round2 { received, total },
+            DkgPhase::Finalizing => DkgProgressUpdate::Finalizing,
+            DkgPhase::Confirming { confirmed, total } => {
+                DkgProgressUpdate::Confirming { confirmed, total }
             }
-        }
-
-        for relay in &config.relays {
-            validate_relay_url(relay)?;
-        }
-
-        if config.threshold < 2 {
-            return Err(KeepMobileError::FrostError {
-                msg: "Threshold must be at least 2".into(),
-            });
-        }
-
-        if config.participants < config.threshold {
-            return Err(KeepMobileError::FrostError {
-                msg: "Participants must be >= threshold".into(),
-            });
-        }
-
-        if config.participants > MAX_DKG_PARTICIPANTS {
-            return Err(KeepMobileError::FrostError {
-                msg: format!("Maximum {MAX_DKG_PARTICIPANTS} participants supported"),
-            });
-        }
-
-        if config.our_index < 1 || config.our_index > config.participants {
-            return Err(KeepMobileError::FrostError {
-                msg: format!("Our index must be between 1 and {}", config.participants),
-            });
-        }
-
-        let our_identifier =
-            Identifier::try_from(config.our_index).map_err(|e| KeepMobileError::FrostError {
-                msg: format!("Invalid identifier: {e}"),
-            })?;
-
-        let (secret_package, round1_package) = dkg::part1(
-            our_identifier,
-            config.participants,
-            config.threshold,
-            frost_secp256k1_tr::rand_core::OsRng,
-        )
-        .map_err(|e| KeepMobileError::FrostError {
-            msg: format!("DKG round 1 failed: {e}"),
-        })?;
-
-        let package_bytes =
-            round1_package
-                .serialize()
-                .map_err(|e| KeepMobileError::Serialization {
-                    msg: format!("Failed to serialize round 1 package: {e}"),
-                })?;
-
-        // The crypto layer never reads session_secret; only the transport
-        // (dkg_net) does, and it parses it before this call. Wipe it out of the
-        // config we retain so the secret does not linger in session state for the
-        // lifetime of a run — possibly indefinitely if the run is abandoned.
-        use zeroize::Zeroize;
-        let mut stored_config = config.clone();
-        stored_config.session_secret.zeroize();
-
-        let mut state = self.state.write().await;
-        *state = DkgState::Initialized {
-            config: stored_config,
-            our_identifier,
-            secret_package: Box::new(secret_package),
+            DkgPhase::Complete { .. } => return,
         };
-
-        Ok(DkgRound1Package {
-            participant_index: config.our_index,
-            package_bytes,
-        })
-    }
-
-    pub async fn receive_round1_packages(
-        &self,
-        packages: Vec<DkgRound1Package>,
-    ) -> Result<Vec<DkgRound2Package>, KeepMobileError> {
-        let mut state = self.state.write().await;
-
-        let (config, our_identifier, secret_package) = match &*state {
-            DkgState::Initialized {
-                config,
-                our_identifier,
-                secret_package,
-                ..
-            } => (config.clone(), *our_identifier, (**secret_package).clone()),
-            DkgState::NotStarted => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "DKG not started".into(),
-                })
-            }
-            DkgState::Failed { reason } => {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!("DKG failed: {reason}"),
-                })
-            }
-            _ => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "Invalid DKG state for round 1 packages".into(),
-                })
-            }
-        };
-
-        let expected_count = (config.participants - 1) as usize;
-        if packages.len() != expected_count {
-            return Err(KeepMobileError::FrostError {
-                msg: format!(
-                    "Expected {} round 1 packages, got {}",
-                    expected_count,
-                    packages.len()
-                ),
-            });
-        }
-
-        // FROST's part2/part3 take only the OTHER participants' round-1 packages,
-        // never our own, so this map excludes us. It is also reused for part3, so
-        // it must stay others-only there too.
-        let mut round1_packages = BTreeMap::new();
-
-        for pkg in &packages {
-            validate_package_size(&pkg.package_bytes, pkg.participant_index)?;
-            let identifier = validate_participant_index(
-                pkg.participant_index,
-                config.participants,
-                "Participant index",
-            )?;
-
-            if identifier == our_identifier {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!(
-                        "Participant index {} collides with our own",
-                        pkg.participant_index
-                    ),
-                });
-            }
-
-            if round1_packages.contains_key(&identifier) {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!("Duplicate participant index: {}", pkg.participant_index),
-                });
-            }
-
-            let package = dkg::round1::Package::deserialize(&pkg.package_bytes).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!(
-                        "Invalid round 1 package from {}: {}",
-                        pkg.participant_index, e
-                    ),
-                }
-            })?;
-
-            round1_packages.insert(identifier, package);
-        }
-
-        let (round2_secret, round2_packages) = dkg::part2(secret_package.clone(), &round1_packages)
-            .map_err(|e| {
-                *state = DkgState::Failed {
-                    reason: format!("DKG round 2 failed: {e}"),
-                };
-                KeepMobileError::FrostError {
-                    msg: format!("DKG round 2 failed: {e}"),
-                }
-            })?;
-
-        let result_packages: Result<Vec<DkgRound2Package>, KeepMobileError> = round2_packages
-            .iter()
-            .map(|(recipient_id, pkg)| {
-                let package_bytes =
-                    pkg.serialize()
-                        .map_err(|e| KeepMobileError::Serialization {
-                            msg: format!("Failed to serialize round 2 package: {e}"),
-                        })?;
-
-                // frost-secp256k1-tr serializes an identifier as a 32-byte
-                // big-endian scalar, so the index lives in the LAST two bytes;
-                // the leading bytes must be zero for an in-range participant.
-                let id_bytes = recipient_id.serialize();
-                let len = id_bytes.len();
-                if len < 2 || id_bytes[..len - 2].iter().any(|&b| b != 0) {
-                    return Err(KeepMobileError::FrostError {
-                        msg: "Invalid recipient identifier serialization".into(),
-                    });
-                }
-                let recipient_index = u16::from_be_bytes([id_bytes[len - 2], id_bytes[len - 1]]);
-
-                Ok(DkgRound2Package {
-                    sender_index: config.our_index,
-                    recipient_index,
-                    package_bytes,
-                })
-            })
-            .collect();
-
-        let result = result_packages?;
-
-        *state = DkgState::Round1Complete {
-            config,
-            secret_package: Box::new(round2_secret),
-            round1_packages,
-        };
-
-        Ok(result)
-    }
-
-    pub async fn receive_round2_packages(
-        &self,
-        packages: Vec<DkgRound2Package>,
-        name: &str,
-        passphrase: &str,
-    ) -> Result<DkgResult, KeepMobileError> {
-        use keep_core::frost::{ShareExport, ShareMetadata, SharePackage};
-        use zeroize::Zeroizing;
-
-        validate_share_name(name)?;
-
-        let mut state = self.state.write().await;
-
-        let (config, secret_package, round1_packages) = match &*state {
-            DkgState::Round1Complete {
-                config,
-                secret_package,
-                round1_packages,
-                ..
-            } => (
-                config.clone(),
-                (**secret_package).clone(),
-                round1_packages.clone(),
-            ),
-            DkgState::NotStarted => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "DKG not started".into(),
-                })
-            }
-            DkgState::Failed { reason } => {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!("DKG failed: {reason}"),
-                })
-            }
-            _ => {
-                return Err(KeepMobileError::FrostError {
-                    msg: "Invalid DKG state for round 2 packages".into(),
-                })
-            }
-        };
-
-        let expected_count = (config.participants - 1) as usize;
-        if packages.len() != expected_count {
-            return Err(KeepMobileError::FrostError {
-                msg: format!(
-                    "Expected {} round 2 packages, got {}",
-                    expected_count,
-                    packages.len()
-                ),
-            });
-        }
-
-        let mut round2_packages = BTreeMap::new();
-        for pkg in &packages {
-            validate_package_size(&pkg.package_bytes, pkg.sender_index)?;
-            let sender_id =
-                validate_participant_index(pkg.sender_index, config.participants, "Sender index")?;
-
-            if round2_packages.contains_key(&sender_id) {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!("Duplicate sender index: {}", pkg.sender_index),
-                });
-            }
-
-            let package = dkg::round2::Package::deserialize(&pkg.package_bytes).map_err(|e| {
-                KeepMobileError::FrostError {
-                    msg: format!("Invalid round 2 package from {}: {}", pkg.sender_index, e),
-                }
-            })?;
-
-            round2_packages.insert(sender_id, package);
-        }
-
-        let (key_package, pubkey_package) =
-            dkg::part3(&secret_package, &round1_packages, &round2_packages).map_err(|e| {
-                *state = DkgState::Failed {
-                    reason: format!("DKG finalization failed: {e}"),
-                };
-                KeepMobileError::FrostError {
-                    msg: format!("DKG finalization failed: {e}"),
-                }
-            })?;
-
-        let verifying_key = pubkey_package.verifying_key();
-        let serialized = verifying_key
-            .serialize()
-            .map_err(|e| KeepMobileError::FrostError {
-                msg: format!("Failed to serialize verifying key: {e}"),
-            })?;
-        let vk_bytes = serialized.as_slice();
-
-        let group_pubkey: [u8; 32] = match vk_bytes.len() {
-            33 => vk_bytes[1..33]
-                .try_into()
-                .map_err(|_| KeepMobileError::FrostError {
-                    msg: "Failed to extract group pubkey from verifying key".into(),
-                })?,
-            len => {
-                return Err(KeepMobileError::FrostError {
-                    msg: format!("Invalid group pubkey length: {len}"),
-                })
-            }
-        };
-
-        let metadata = ShareMetadata::new(
-            config.our_index,
-            config.threshold,
-            config.participants,
-            group_pubkey,
-            name.to_string(),
-        );
-
-        let share_package = SharePackage::new(metadata, &key_package, &pubkey_package)?;
-
-        let passphrase = Zeroizing::new(passphrase.to_string());
-        let export = ShareExport::from_share(&share_package, &passphrase)?;
-        let share_export = export.to_bech32()?;
-
-        *state = DkgState::Complete;
-
-        Ok(DkgResult {
-            group_pubkey: hex::encode(group_pubkey),
-            share_export,
-        })
-    }
-
-    pub async fn status(&self) -> DkgStatus {
-        let state = self.state.read().await;
-        match &*state {
-            DkgState::NotStarted => DkgStatus::NotStarted,
-            DkgState::Initialized { .. } => DkgStatus::Round1,
-            DkgState::Round1Complete { .. } => DkgStatus::Round2,
-            DkgState::Complete => DkgStatus::Complete,
-            DkgState::Failed { reason } => DkgStatus::Failed {
-                reason: reason.clone(),
-            },
-        }
-    }
-
-    pub async fn reset(&self) {
-        let mut state = self.state.write().await;
-        *state = DkgState::NotStarted;
+        self.cb.on_progress(update);
     }
 }
 
-impl Default for DkgSession {
-    fn default() -> Self {
-        Self::new()
+fn to_u8(v: u16, label: &str) -> Result<u8, KeepMobileError> {
+    u8::try_from(v).map_err(|_| frost_err(format!("{label} must be 1..=255, got {v}")))
+}
+
+/// Build the authenticated [`DkgRoster`] from the invite-supplied config: parse
+/// each participant's per-group subkey pubkey, order strictly by index, and
+/// derive the canonical `frost_group_id` over the ordered subkey strings — the
+/// same identity path the CLI's `parse_roster_from_event` produces (§4), so a
+/// mobile run and a CLI run of the same group agree on the roster and the
+/// `d`-tag channel. Fails closed on a bad `(t, n)`, a duplicate/holed index, or
+/// an unparseable pubkey.
+fn build_roster(config: &DkgConfig) -> Result<DkgRoster, KeepMobileError> {
+    let threshold = to_u8(config.threshold, "threshold")?;
+    let participants = to_u8(config.participants, "participants")?;
+    if threshold < 2 {
+        return Err(frost_err("threshold must be at least 2"));
     }
+    if participants < threshold {
+        return Err(frost_err("participants must be >= threshold"));
+    }
+    if config.our_index < 1 || config.our_index > config.participants {
+        return Err(frost_err(format!(
+            "our index must be between 1 and {}",
+            config.participants
+        )));
+    }
+    if config.roster.len() != participants as usize {
+        return Err(frost_err(format!(
+            "roster carries {} entries but config claims {participants} participants",
+            config.roster.len()
+        )));
+    }
+
+    // Index -> raw pubkey string; reject duplicate or out-of-range indices.
+    let mut by_str: BTreeMap<u16, String> = BTreeMap::new();
+    for p in &config.roster {
+        if p.index < 1 || p.index > config.participants {
+            return Err(frost_err(format!("roster index {} out of range", p.index)));
+        }
+        if by_str.insert(p.index, p.pubkey.clone()).is_some() {
+            return Err(frost_err(format!("duplicate roster index {}", p.index)));
+        }
+    }
+
+    // Require indices exactly 1..=participants (no holes) and impose index order
+    // on the strings fed to the group_id hash.
+    let mut ordered_npubs: Vec<String> = Vec::with_capacity(participants as usize);
+    let mut by_index: BTreeMap<u16, PublicKey> = BTreeMap::new();
+    for idx in 1..=participants as u16 {
+        let s = by_str
+            .get(&idx)
+            .ok_or_else(|| frost_err(format!("roster is missing participant index {idx}")))?;
+        let pk = PublicKey::parse(s)
+            .map_err(|e| frost_err(format!("roster pubkey {s:?} for index {idx} is invalid: {e}")))?;
+        ordered_npubs.push(s.clone());
+        by_index.insert(idx, pk);
+    }
+
+    let group_id = frost_group_id(&config.group_name, threshold, participants, &ordered_npubs);
+    Ok(DkgRoster {
+        threshold,
+        participants,
+        by_index,
+        group_id,
+    })
+}
+
+/// Encode the finalized share as an encrypted bech32 export, mirroring what the
+/// hardware/import paths persist (the caller stores it through `import_share`).
+fn export_share(
+    result: &keep_core::frost::dkg::SoftwareDkgResult,
+    config: &DkgConfig,
+    name: &str,
+    passphrase: &str,
+) -> Result<String, KeepMobileError> {
+    let metadata = ShareMetadata::new(
+        result.our_index,
+        config.threshold,
+        config.participants,
+        result.group_pubkey,
+        name.to_string(),
+    );
+    let share_package = SharePackage::new(metadata, &result.key_package, &result.public_key_package)?;
+    let passphrase = Zeroizing::new(passphrase.to_string());
+    let export = ShareExport::from_share(&share_package, &passphrase)?;
+    Ok(export.to_bech32()?)
+}
+
+/// Run a full relay-driven software DKG through the shared coordinator and return
+/// this device's share export.
+///
+/// `subkey` is this device's per-group signing subkey (minted by
+/// `frost_dkg_begin`); it MUST be the key the roster pins for `config.our_index`.
+/// `relays` are the already TLS-verified/pinned relays (the caller's
+/// `verify_and_pin_relays` output); `proxy` is the configured loopback SOCKS
+/// proxy, if any. `cancel` is polled by the coordinator so a UI cancel aborts the
+/// run promptly. The transport is disconnected on every exit path (§7).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_dkg(
+    subkey: &Keys,
+    config: &DkgConfig,
+    relays: &[String],
+    proxy: Option<SocketAddr>,
+    name: &str,
+    passphrase: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    progress: Arc<dyn DkgProgressCallback>,
+) -> Result<DkgResult, KeepMobileError> {
+    for relay in relays {
+        validate_relay_url(relay)?;
+    }
+
+    let roster = build_roster(config)?;
+    let our_index = config.our_index;
+
+    // The subkey minted in `frost_dkg_begin` must be the one the roster pins for
+    // our index, or every event we publish would be rejected by peers as
+    // author-mismatched. Fail before touching the network.
+    let expected = roster
+        .expected_pubkey(our_index)
+        .map_err(|e| frost_err(e.to_string()))?;
+    if subkey.public_key() != *expected {
+        return Err(frost_err(
+            "this device's DKG subkey does not match the roster entry for our index; \
+             re-run frost_dkg_begin and rebuild the roster",
+        ));
+    }
+
+    progress.on_progress(DkgProgressUpdate::Connecting);
+
+    let mut session =
+        SoftwareDkgSession::init(config.threshold, config.participants, our_index)
+            .map_err(|e| frost_err(format!("init DKG: {e}")))?;
+
+    let transport = ClientTransport::connect_hardened(subkey, relays, proxy).await?;
+
+    let sink = CallbackProgress {
+        cb: progress.clone(),
+    };
+    let group = hex::encode(roster.group_id);
+    let outcome = run_software_dkg(
+        &mut session,
+        &transport,
+        subkey,
+        &roster,
+        &group,
+        our_index,
+        timeout,
+        cancel,
+        &sink,
+    )
+    .await;
+    // Disconnect guard: the client has no Drop cleanup, so tear it down whether
+    // the run succeeded, errored, or was cancelled (§7).
+    transport.disconnect().await;
+    let outcome = outcome?;
+
+    let share_export = export_share(&outcome.result, config, name, passphrase)?;
+    Ok(DkgResult {
+        group_pubkey: hex::encode(outcome.result.group_pubkey),
+        share_export,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::DkgParticipant;
 
-    #[tokio::test]
-    async fn test_dkg_session_initial_status() {
-        let session = DkgSession::new();
-        assert_eq!(session.status().await, DkgStatus::NotStarted);
+    fn subkey(seed: u8) -> Keys {
+        let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap();
+        Keys::new(sk.into())
     }
 
-    #[tokio::test]
-    async fn test_dkg_start_invalid_threshold() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 1, // Invalid: must be >= 2
-            participants: 3,
-            our_index: 1,
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        let result = session.start(config).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_dkg_start_invalid_participants() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 3,
-            participants: 2, // Invalid: participants < threshold
-            our_index: 1,
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        let result = session.start(config).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_dkg_start_invalid_index() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 2,
-            participants: 3,
-            our_index: 5, // Invalid: index > participants
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        let result = session.start(config).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_dkg_start_success() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 2,
-            participants: 3,
-            our_index: 1,
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        let result = session.start(config).await;
-        assert!(result.is_ok());
-        assert_eq!(session.status().await, DkgStatus::Round1);
-    }
-
-    #[tokio::test]
-    async fn test_dkg_reset() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 2,
-            participants: 3,
-            our_index: 1,
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        session.start(config).await.unwrap();
-        assert_eq!(session.status().await, DkgStatus::Round1);
-
-        session.reset().await;
-        assert_eq!(session.status().await, DkgStatus::NotStarted);
-    }
-
-    #[tokio::test]
-    async fn test_dkg_start_rejects_in_progress() {
-        let session = DkgSession::new();
-        let config = DkgConfig {
-            group_name: "test".to_string(),
-            threshold: 2,
-            participants: 3,
-            our_index: 1,
-            relays: vec!["wss://relay.example.com".to_string()],
-            session_secret: "00".repeat(32),
-        };
-
-        session.start(config.clone()).await.unwrap();
-        assert_eq!(session.status().await, DkgStatus::Round1);
-
-        let result = session.start(config).await;
-        assert!(result.is_err());
-        match result {
-            Err(KeepMobileError::FrostError { msg }) => {
-                assert!(msg.contains("already in progress"));
-            }
-            _ => panic!("Expected FrostError with 'already in progress' message"),
+    fn config_with(threshold: u16, participants: u16, our_index: u16, roster: Vec<DkgParticipant>) -> DkgConfig {
+        DkgConfig {
+            group_name: "test".into(),
+            threshold,
+            participants,
+            our_index,
+            relays: vec!["wss://relay.example.com".into()],
+            roster,
         }
+    }
+
+    fn roster_of(keys: &[Keys]) -> Vec<DkgParticipant> {
+        keys.iter()
+            .enumerate()
+            .map(|(i, k)| DkgParticipant {
+                index: (i + 1) as u16,
+                pubkey: k.public_key().to_hex(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_roster_accepts_a_consistent_invite() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let roster = build_roster(&config_with(2, 3, 1, roster_of(&ks))).unwrap();
+        assert_eq!(roster.threshold, 2);
+        assert_eq!(roster.participants, 3);
+        assert_eq!(*roster.expected_pubkey(2).unwrap(), ks[1].public_key());
+    }
+
+    #[test]
+    fn build_roster_derives_the_same_group_id_regardless_of_entry_order() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let mut shuffled = roster_of(&ks);
+        shuffled.reverse();
+        let a = build_roster(&config_with(2, 3, 1, roster_of(&ks))).unwrap();
+        let b = build_roster(&config_with(2, 3, 1, shuffled)).unwrap();
+        assert_eq!(a.group_id, b.group_id);
+    }
+
+    #[test]
+    fn build_roster_rejects_bad_shapes() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        // threshold < 2
+        assert!(build_roster(&config_with(1, 3, 1, roster_of(&ks))).is_err());
+        // participants < threshold
+        assert!(build_roster(&config_with(3, 2, 1, roster_of(&ks[..2]))).is_err());
+        // our_index out of range
+        assert!(build_roster(&config_with(2, 3, 9, roster_of(&ks))).is_err());
+        // roster length mismatch
+        assert!(build_roster(&config_with(2, 3, 1, roster_of(&ks[..2]))).is_err());
+        // duplicate index
+        let mut dup = roster_of(&ks);
+        dup[2].index = 1;
+        assert!(build_roster(&config_with(2, 3, 1, dup)).is_err());
+        // hole (index 4 instead of 3)
+        let mut hole = roster_of(&ks);
+        hole[2].index = 4;
+        assert!(build_roster(&config_with(2, 3, 1, hole)).is_err());
+        // unparseable pubkey
+        let mut bad = roster_of(&ks);
+        bad[1].pubkey = "not-a-key".into();
+        assert!(build_roster(&config_with(2, 3, 1, bad)).is_err());
     }
 }

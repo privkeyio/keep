@@ -16,6 +16,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use nostr_sdk::prelude::*;
@@ -434,6 +435,20 @@ pub trait DkgTransport {
     ) -> DkgBoxFuture<'_, Result<Vec<Event>>>;
 }
 
+/// Relay options matching the signing path (`node/mod.rs`): reconnect + ping so a
+/// phone that drops off Tor recovers, `ban_relay_on_mismatch` so a relay that
+/// swaps its advertised info is dropped, and a bounded average latency. The DKG
+/// transport and the live signing node share this so the two never drift.
+pub fn default_relay_opts() -> RelayOptions {
+    RelayOptions::default()
+        .reconnect(true)
+        .ping(true)
+        .retry_interval(Duration::from_secs(10))
+        .adjust_retry_interval(true)
+        .ban_relay_on_mismatch(true)
+        .max_avg_latency(Some(Duration::from_secs(3)))
+}
+
 /// A [`DkgTransport`] over a live `nostr_sdk::Client`. The caller connects the
 /// client (and applies any relay hardening) before wrapping it.
 pub struct ClientTransport {
@@ -443,6 +458,69 @@ pub struct ClientTransport {
 impl ClientTransport {
     pub fn new(client: Client) -> Self {
         Self { client }
+    }
+
+    /// Build a hardened client over `relays` and wrap it for the DKG coordinator
+    /// (§7). Routes through the configured loopback SOCKS `proxy` when set and
+    /// applies [`default_relay_opts`] (the same reconnect/ping/ban-on-mismatch
+    /// profile the signing node uses), then connects and waits (bounded) for at
+    /// least one relay to reach `Connected`.
+    ///
+    /// The caller pre-verifies and pins each relay's TLS certificate before this
+    /// (keep-mobile's `verify_and_pin_relays`); this only opens the connections.
+    /// The caller MUST [`disconnect`](Self::disconnect) on every exit path — the
+    /// nostr `Client`/`RelayPool` have no `Drop` cleanup, so an early return that
+    /// skips it leaks the websocket.
+    pub async fn connect_hardened(
+        keys: &Keys,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<Self> {
+        let client = match proxy {
+            Some(addr) => {
+                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
+                let opts = ClientOptions::new().connection(connection);
+                Client::builder().signer(keys.clone()).opts(opts).build()
+            }
+            None => Client::new(keys.clone()),
+        };
+
+        for relay in relays {
+            client
+                .pool()
+                .add_relay(relay, default_relay_opts())
+                .await
+                .map_err(|e| {
+                    KeepError::NetworkErr(NetworkError::relay(format!("add relay {relay}: {e}")))
+                })?;
+        }
+        client.connect().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let any_connected = client
+                    .relays()
+                    .await
+                    .values()
+                    .any(|r| matches!(r.status(), RelayStatus::Connected));
+                if any_connected {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            KeepError::NetworkErr(NetworkError::timeout("waiting for relay connection"))
+        })?;
+
+        Ok(Self { client })
+    }
+
+    /// Tear down the relay connections. Call on every exit path of a DKG run
+    /// (success, error, cancel) since the client has no `Drop` cleanup (§7).
+    pub async fn disconnect(&self) {
+        self.client.disconnect().await;
     }
 }
 
@@ -495,6 +573,91 @@ pub trait DkgProgress {
     fn phase(&self, phase: DkgPhase);
 }
 
+/// A CertEq success certificate (§6): all `n` participant signatures over the
+/// identical §5 transcript, retained so a device that finalized can later
+/// convince a peer that timed out to finalize too (Conditional Agreement).
+///
+/// Each confirmation is a signed kind-21107 event whose author is the
+/// roster-pinned key for its index and whose content is the transcript hex, so
+/// the set is **transferable**: a timed-out peer verifies every signature
+/// against its own roster and finalizes, trusting the certificate rather than
+/// the presenter. Success is *collecting* this whole set, not merely observing
+/// agreement and moving on — the gap that let device A believe it was in a live
+/// group device B never joined.
+#[derive(Clone, Debug)]
+pub struct DkgCertificate {
+    /// The §5 transcript every confirmation signs over.
+    pub transcript: [u8; 32],
+    /// 1-indexed participant -> its signed kind-21107 confirmation event, this
+    /// device's own included, so the certificate carries all `n` signatures.
+    pub confirmations: BTreeMap<u16, Event>,
+}
+
+impl DkgCertificate {
+    /// Hex of the transcript every confirmation must sign over.
+    pub fn transcript_hex(&self) -> String {
+        hex::encode(self.transcript)
+    }
+
+    /// Verify this is a complete CertEq certificate for `roster` (§6): exactly
+    /// one confirmation per rostered index `1..=participants`, each a validly
+    /// signed kind-21107 event authored by that index's roster-pinned key and
+    /// carrying this certificate's transcript hex. This is the check a
+    /// timed-out peer runs when a finalized device presents the certificate
+    /// later, so it trusts the roster and the signatures — never the presenter.
+    pub fn verify(&self, roster: &DkgRoster) -> Result<()> {
+        let want = self.transcript_hex();
+        if self.confirmations.len() != roster.participants as usize {
+            return Err(KeepError::FrostErr(FrostError::dkg(format!(
+                "certificate carries {} confirmations but the roster has {} participants",
+                self.confirmations.len(),
+                roster.participants
+            ))));
+        }
+        for idx in 1..=roster.participants as u16 {
+            let ev = self.confirmations.get(&idx).ok_or_else(|| {
+                KeepError::FrostErr(FrostError::dkg(format!(
+                    "certificate is missing the confirmation for participant index {idx}"
+                )))
+            })?;
+            let expected = roster.expected_pubkey(idx)?;
+            if ev.pubkey != *expected {
+                return Err(KeepError::FrostErr(FrostError::dkg(format!(
+                    "certificate confirmation for index {idx} is authored by {} not the \
+                     roster-pinned key {expected}",
+                    ev.pubkey
+                ))));
+            }
+            if ev.kind != Kind::Custom(DKG_KIND_CONFIRM) {
+                return Err(KeepError::FrostErr(FrostError::dkg(format!(
+                    "certificate confirmation for index {idx} is kind {} not the confirm kind",
+                    ev.kind
+                ))));
+            }
+            if ev.content.trim() != want {
+                return Err(KeepError::FrostErr(FrostError::dkg(format!(
+                    "certificate confirmation for index {idx} signs a different transcript than \
+                     the certificate's"
+                ))));
+            }
+            ev.verify().map_err(|e| {
+                KeepError::CryptoErr(CryptoError::invalid_signature(format!(
+                    "certificate confirmation for index {idx}: {e}"
+                )))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// What a finalized software DKG hands back: the finalized share plus the
+/// retained CertEq certificate (§6). The caller persists the share and keeps the
+/// certificate to re-convince any peer that timed out during confirmation.
+pub struct DkgOutcome {
+    pub result: SoftwareDkgResult,
+    pub certificate: DkgCertificate,
+}
+
 /// True when `ev` carries the `dkg_mode=software_v1` tag.
 fn is_software_v1(ev: &Event) -> bool {
     ev.tags.iter().any(|t| {
@@ -528,6 +691,11 @@ fn u16_tag(ev: &Event, key: &str) -> Option<u16> {
 /// `our_index`); it signs every event and performs the round-2 NIP-44 ECDH.
 /// `group` is the `d`-tag channel. Each round independently must complete within
 /// `timeout` or the run fails with a timeout error.
+///
+/// `cancel` is polled between relay fetches; a caller that flips it (the mobile
+/// UI's cancel button) aborts the run promptly with a cancelled error instead of
+/// waiting out the round timeout, so a live session is torn down cleanly rather
+/// than left for a `reset` to corrupt (§8/§9).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_software_dkg(
     session: &mut SoftwareDkgSession,
@@ -537,8 +705,10 @@ pub async fn run_software_dkg(
     group: &str,
     our_index: u16,
     timeout: Duration,
+    cancel: &AtomicBool,
     progress: &dyn DkgProgress,
-) -> Result<SoftwareDkgResult> {
+) -> Result<DkgOutcome> {
+    let cancelled = || KeepError::Runtime("DKG cancelled by caller".to_string());
     let our_pubkey = keys.public_key();
     let expected_peers = (roster.participants as u32).saturating_sub(1);
     let total = expected_peers as u16;
@@ -587,6 +757,9 @@ pub async fn run_software_dkg(
     let mut seen_round1: HashSet<EventId> = HashSet::new();
     let start = Instant::now();
     while round1_done < expected_peers {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
                 "waiting for peer round1 packages",
@@ -693,6 +866,9 @@ pub async fn run_software_dkg(
     let mut seen_round2: HashSet<EventId> = HashSet::new();
     let start = Instant::now();
     while round2_done < expected_peers {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
                 "waiting for peer round2 shares",
@@ -808,9 +984,15 @@ pub async fn run_software_dkg(
         .kind(Kind::Custom(DKG_KIND_CONFIRM))
         .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
     let mut confirmed_indices: HashSet<u16> = HashSet::new();
+    // §6: retain each peer's signed confirmation, not just the fact it agreed,
+    // so the finalized certificate is transferable to a peer that times out.
+    let mut peer_confirmations: BTreeMap<u16, Event> = BTreeMap::new();
     let mut seen_confirm: HashSet<EventId> = HashSet::new();
     let start = Instant::now();
     while (confirmed_indices.len() as u32) < expected_peers {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(cancelled());
+        }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
                 "waiting for peer group-key confirmations (possible relay equivocation)",
@@ -844,6 +1026,7 @@ pub async fn run_software_dkg(
                 &ev.content,
                 &mut confirmed_indices,
             )? {
+                peer_confirmations.insert(sender_idx, ev.clone());
                 progress.phase(DkgPhase::Confirming {
                     confirmed: confirmed_indices.len() as u16,
                     total,
@@ -855,10 +1038,26 @@ pub async fn run_software_dkg(
         }
     }
 
+    // §6/CertEq: success is holding all `n` signatures over the identical
+    // transcript, so fold our own confirmation in and verify the assembled
+    // certificate before signalling Complete. Never surface the group as ready
+    // without the certificate in hand — that ordering is the fix for a device
+    // finalizing into a group a timed-out peer never joined.
+    let mut confirmations = peer_confirmations;
+    confirmations.insert(our_index, confirm_event);
+    let certificate = DkgCertificate {
+        transcript: our_transcript,
+        confirmations,
+    };
+    certificate.verify(roster)?;
+
     progress.phase(DkgPhase::Complete {
         group_pubkey: result.group_pubkey,
     });
-    Ok(result)
+    Ok(DkgOutcome {
+        result,
+        certificate,
+    })
 }
 
 #[cfg(test)]
@@ -1207,6 +1406,89 @@ mod tests {
         other.insert(2u16, vec![0xcc; 40]);
         let divergent = dkg_transcript(&group_id, 2, 2, &roster, &other, &group_pubkey).unwrap();
         assert_ne!(base, divergent);
+    }
+
+    /// Build a 2-of-2 roster and a matching certificate whose two confirmations
+    /// are signed by the roster-pinned keys over `transcript`. Returned with the
+    /// roster so tests can tamper with individual confirmations.
+    fn cert_fixture(transcript: [u8; 32]) -> (DkgRoster, DkgCertificate) {
+        let k1 = make_identity_keys(1);
+        let k2 = make_identity_keys(2);
+        let mut by_index = BTreeMap::new();
+        by_index.insert(1u16, k1.public_key());
+        by_index.insert(2u16, k2.public_key());
+        let roster = DkgRoster {
+            threshold: 2,
+            participants: 2,
+            by_index,
+            group_id: [0u8; 32],
+        };
+        let hex = hex::encode(transcript);
+        let sign = |keys: &Keys| {
+            EventBuilder::new(Kind::Custom(DKG_KIND_CONFIRM), &hex)
+                .sign_with_keys(keys)
+                .unwrap()
+        };
+        let mut confirmations = BTreeMap::new();
+        confirmations.insert(1u16, sign(&k1));
+        confirmations.insert(2u16, sign(&k2));
+        (
+            roster,
+            DkgCertificate {
+                transcript,
+                confirmations,
+            },
+        )
+    }
+
+    /// §6: a certificate carrying all n roster-signed confirmations over the
+    /// same transcript verifies — the transferable success case.
+    #[test]
+    fn certificate_verifies_full_roster_agreement() {
+        let (roster, cert) = cert_fixture([0x11; 32]);
+        cert.verify(&roster).unwrap();
+    }
+
+    /// §6: a missing confirmation (a peer that never signed) is not a complete
+    /// certificate, so verification fails rather than presenting partial CertEq.
+    #[test]
+    fn certificate_rejects_missing_confirmation() {
+        let (roster, mut cert) = cert_fixture([0x22; 32]);
+        cert.confirmations.remove(&2);
+        assert!(cert.verify(&roster).is_err());
+    }
+
+    /// §6: a confirmation signed by a key that is not the roster-pinned one for
+    /// its index is rejected — a presenter cannot forge agreement from a
+    /// non-member (or from the wrong member) to convince a timed-out peer.
+    #[test]
+    fn certificate_rejects_wrong_author() {
+        let transcript = [0x33; 32];
+        let (roster, mut cert) = cert_fixture(transcript);
+        // Re-sign index 2's confirmation with a non-rostered key.
+        let rogue = make_identity_keys(9);
+        cert.confirmations.insert(
+            2,
+            EventBuilder::new(Kind::Custom(DKG_KIND_CONFIRM), hex::encode(transcript))
+                .sign_with_keys(&rogue)
+                .unwrap(),
+        );
+        assert!(cert.verify(&roster).is_err());
+    }
+
+    /// §6: a confirmation over a DIFFERENT transcript than the certificate's is
+    /// rejected — the whole point is all n signed the *identical* transcript.
+    #[test]
+    fn certificate_rejects_divergent_transcript() {
+        let (roster, mut cert) = cert_fixture([0x44; 32]);
+        let k2 = make_identity_keys(2);
+        cert.confirmations.insert(
+            2,
+            EventBuilder::new(Kind::Custom(DKG_KIND_CONFIRM), hex::encode([0xaa; 32]))
+                .sign_with_keys(&k2)
+                .unwrap(),
+        );
+        assert!(cert.verify(&roster).is_err());
     }
 
     /// §5: a missing round-1 package for any index fails closed rather than

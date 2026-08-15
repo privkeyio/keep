@@ -575,7 +575,7 @@ fn cmd_frost_network_dkg_software(
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
-    let result = rt.block_on(async {
+    let outcome = rt.block_on(async {
         let keys = subkey.clone();
         let client = Client::new(keys.clone());
         client
@@ -610,6 +610,10 @@ fn cmd_frost_network_dkg_software(
         // progress sink.
         let progress = CliDkgProgress { out };
         let transport = ClientTransport::new(client);
+        // The CLI runs the DKG to completion in the foreground with no cancel
+        // button, so it hands the coordinator a flag it never sets; mobile flips
+        // its own flag from the UI (§8/§9).
+        let cancel = std::sync::atomic::AtomicBool::new(false);
         run_software_dkg(
             &mut session,
             &transport,
@@ -618,14 +622,19 @@ fn cmd_frost_network_dkg_software(
             group,
             our_index as u16,
             std::time::Duration::from_secs(300),
+            &cancel,
             &progress,
         )
         .await
     })?;
 
+    // §6: the coordinator only returns once it holds the complete CertEq
+    // certificate (all n signatures over the transcript), so reaching here means
+    // the group is genuinely agreed — persist the share after, never before.
+    let result = &outcome.result;
     let spinner = out.spinner("Storing share in vault...");
     keep.frost_store_dkg_share(
-        &result,
+        result,
         threshold as u16,
         participants as u16,
         group,
@@ -637,6 +646,13 @@ fn cmd_frost_network_dkg_software(
     out.success("DKG Complete!");
     out.field("Group public key", &hex::encode(result.group_pubkey));
     out.field("Our index", &result.our_index.to_string());
+    out.field(
+        "Confirmation certificate",
+        &format!(
+            "{} signatures retained",
+            outcome.certificate.confirmations.len()
+        ),
+    );
     out.newline();
     out.info("Share stored in vault (software DKG).");
     out.info(&format!(

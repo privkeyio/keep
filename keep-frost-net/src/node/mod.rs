@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
+use crate::dkg::default_relay_opts;
 use keep_core::frost::SharePackage;
 use keep_core::relay::{
     validate_relay_url, validate_relay_url_allow_internal, ALLOW_INTERNAL_HOSTS,
@@ -2961,15 +2962,6 @@ impl KfpNode {
     }
 }
 
-fn default_relay_opts() -> RelayOptions {
-    RelayOptions::default()
-        .reconnect(true)
-        .ping(true)
-        .retry_interval(Duration::from_secs(10))
-        .adjust_retry_interval(true)
-        .ban_relay_on_mismatch(true)
-        .max_avg_latency(Some(Duration::from_secs(3)))
-}
 
 /// Derives a member's transport keypair from public group data. The derivation
 /// is deterministic in `(group_pubkey, identifier)`, both public, so every
