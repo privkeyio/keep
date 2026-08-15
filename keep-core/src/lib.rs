@@ -832,7 +832,7 @@ impl Keep {
 
     /// Generate (if absent) and persist this device's per-group DKG signing
     /// subkey (§3), keyed by `group_name` in the vault secret store, and return
-    /// its x-only public key for the coordinator's kind-21101 roster. The subkey
+    /// its x-only public key for the coordinator's kind-31101 roster. The subkey
     /// — never the identity nsec — is what the roster pins and what signs this
     /// party's DKG events, so the announcement never publishes a targeting map of
     /// identities. Idempotent: a second call for the same group returns the

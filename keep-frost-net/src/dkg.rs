@@ -4,7 +4,7 @@
 //! Shared DKG coordination primitives, extracted from `keep-cli` so the CLI and
 //! keep-mobile drive one audited implementation instead of two (see
 //! `docs/DKG_CEREMONY.md`). This module currently holds the roster/authentication
-//! layer — the signed kind-21101 group announcement, the `index → pubkey` roster
+//! layer — the signed kind-31101 group announcement, the `index → pubkey` roster
 //! it pins, the author-binding intake gate, the canonical `frost_group_id`, and
 //! the equivocation-confirmation decision. The round-1/2/confirm coordination
 //! loops move here in later phases.
@@ -36,7 +36,14 @@ use keep_core::frost::dkg::{
 pub const MAX_DKG_EVENTS_SEEN: usize = 8192;
 
 /// Signed group announcement (identity/roster). Public relay data.
-pub const DKG_KIND_ANNOUNCE: u16 = 21101;
+/// Group announcement kind. **Addressable** (NIP-01 30000-39999), not
+/// ephemeral: relays persist the newest event per `(author, kind, d)`, which is
+/// exactly the semantics a roster wants and what makes `fetch_group_roster`
+/// possible at all. The round kinds below are deliberately ephemeral because
+/// they are live coordination traffic, but an announcement that no one can
+/// retrieve later is useless, and 21101 was in the ephemeral range so relays
+/// dropped it the moment it was forwarded.
+pub const DKG_KIND_ANNOUNCE: u16 = 31101;
 /// Round-1 package broadcast (public FROST commitment + PoK).
 pub const DKG_KIND_ROUND1: u16 = 21102;
 /// Round-2 share, NIP-44-encrypted per recipient to the recipient's roster key.

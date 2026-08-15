@@ -10,7 +10,7 @@ use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result}
 use keep_core::Keep;
 use keep_frost_net::dkg::{
     fetch_group_roster, frost_group_id, parse_pubkey, require_roster_matches, run_software_dkg,
-    ClientTransport, DkgPhase, DkgProgress, MAX_DKG_EVENTS_SEEN,
+    ClientTransport, DkgPhase, DkgProgress, DKG_KIND_ANNOUNCE, MAX_DKG_EVENTS_SEEN,
 };
 
 use crate::output::Output;
@@ -44,7 +44,7 @@ impl DkgProgress for CliDkgProgress<'_> {
 /// Load this device's per-group DKG signing subkey (§3) from the vault as
 /// `nostr_sdk::Keys`, returned with its raw secret so the caller can retain it
 /// with the finalized share (C1). The subkey — never the identity nsec — is what
-/// the signed roster pins, so the kind-21101 announcement never publishes a map
+/// the signed roster pins, so the kind-31101 announcement never publishes a map
 /// of identities. Errors if the group has no enrolled subkey: the participant
 /// must run `keep frost network group-subkey --group <name>` first and hand its
 /// pubkey to the coordinator so it appears in the roster.
@@ -668,7 +668,7 @@ fn cmd_frost_network_dkg_software(
     Ok(())
 }
 
-/// Assemble the signed kind-21101 roster for a group.
+/// Assemble the signed kind-31101 roster for a group.
 ///
 /// §3: the per-participant pubkeys are each device's **per-group signing
 /// subkey** (printed by `keep frost network group-subkey`), never an identity
@@ -692,7 +692,7 @@ pub fn cmd_frost_network_group_create(
     publish: bool,
 ) -> Result<()> {
     out.newline();
-    out.header("FROST Group Announcement (Kind 21101)");
+    out.header("FROST Group Announcement (Kind 31101)");
     out.field("Name", name);
     out.field("Threshold", &format!("{threshold}-of-{participants}"));
     out.newline();
@@ -806,7 +806,7 @@ pub fn cmd_frost_network_group_create(
         })
         .to_string();
 
-        let mut builder = EventBuilder::new(Kind::Custom(21101), &content);
+        let mut builder = EventBuilder::new(Kind::Custom(DKG_KIND_ANNOUNCE), &content);
         for tag in tags {
             builder = builder.tag(tag);
         }
@@ -842,7 +842,7 @@ pub fn cmd_frost_network_group_create(
 ///
 /// Each participant runs this once per group before the coordinator builds the
 /// roster, then hands the printed pubkey to the coordinator so it lands in the
-/// signed kind-21101 announcement (and thus in `frost_group_id`). The secret is
+/// signed kind-31101 announcement (and thus in `frost_group_id`). The secret is
 /// stored in the vault keyed by group name and retained with the finalized share
 /// (C1); `keep frost network dkg` looks it up to sign DKG events. Idempotent:
 /// re-running prints the same subkey rather than minting a divergent one.
