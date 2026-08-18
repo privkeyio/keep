@@ -47,7 +47,7 @@ pub use signing_policy::{
     SignPolicySelection, SigningAuthLevel, SigningRateLimiter, SigningRequestContext,
     SigningRiskAssessment, SigningRiskFactor, UsageStats,
 };
-pub use storage::{SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
+pub use storage::{PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
     DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult, GeneratedShareInfo,
@@ -320,6 +320,7 @@ const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const STRICT_PIN_CONFIG_STORAGE_KEY: &str = "__keep_strict_pin_config_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
 const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
+const DKG_PENDING_SHARE_KEY: &str = "__keep_dkg_pending_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -1344,7 +1345,7 @@ impl KeepMobile {
     /// device ever holds the whole key and mobile/CLI cannot drift. `progress`
     /// receives live state; a run that fails reports [`DkgProgressUpdate::Failed`]
     /// before returning the error, and `Complete` fires only after the share is
-    /// persisted (§6/§8).
+    /// persisted (§6).
     ///
     /// Returns the stored share on success. `timeout_secs` bounds each round
     /// (floored to 30s to tolerate slow peers and biometric prompts).
@@ -1388,6 +1389,17 @@ impl KeepMobile {
         if self.storage.list_all_shares().len() >= MAX_STORED_SHARES {
             return Err(KeepMobileError::StorageError {
                 msg: "Maximum number of shares reached".into(),
+            });
+        }
+
+        // The pending stash is a single global slot, so a run that completed
+        // here would overwrite an earlier unrecovered stash and lose that share
+        // for good. Refuse to start until the prior share is recovered; fail
+        // closed on a load error so a corrupt stash is never silently clobbered.
+        if persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?.is_some() {
+            return Err(KeepMobileError::StorageError {
+                msg: "a completed DKG share is pending recovery; recover it before starting a new run"
+                    .into(),
             });
         }
 
@@ -1446,18 +1458,52 @@ impl KeepMobile {
         ));
 
         match outcome {
-            // §6/§8: persist first, and surface `Complete` only once the share is
+            // §6: persist first, and surface `Complete` only once the share is
             // stored. A storage failure here still emits `Failed` and never
             // `Complete`, so the group never looks ready without a stored share.
             Ok(result) => {
+                // Stash the finalized (passphrase-encrypted) share export durably
+                // before import so a storage failure here doesn't silently drop a
+                // share the peers already treat as live. NOTE: this is only a
+                // partial step toward §8's "keep `share_export` recoverable" — on
+                // the DKG path the ceremony passphrase is ephemeral, so
+                // `recover_dkg_share` can't decrypt this stash and `import_share`
+                // below is its only real chance to land. The durable copy lets
+                // `pending_dkg_share`/`discard_pending_dkg_share` surface and clear
+                // it; true recoverability is deferred to the auth-gated-alias fix
+                // (keep-6ik). If the stash write itself fails there's nothing more
+                // we can do, but the import below still gets its chance.
+                let pending = persistence::PendingDkgShare {
+                    share_export: result.share_export.clone(),
+                    name: name.clone(),
+                    group_pubkey_hex: result.group_pubkey.clone(),
+                };
+                if let Err(e) = persistence::persist_pending_dkg_share(
+                    &self.storage,
+                    DKG_PENDING_SHARE_KEY,
+                    &pending,
+                ) {
+                    tracing::warn!("failed to stash pending DKG share before import: {e}");
+                }
+
                 match self.import_share(result.share_export, passphrase.to_string(), name) {
                     Ok(info) => {
+                        // Import confirmed; clear the stash (best-effort — a stale
+                        // stash is recovered idempotently, never lost).
+                        if let Err(e) = persistence::delete_pending_dkg_share(
+                            &self.storage,
+                            DKG_PENDING_SHARE_KEY,
+                        ) {
+                            tracing::warn!("failed to clear pending DKG share after import: {e}");
+                        }
                         progress.on_progress(DkgProgressUpdate::Complete {
                             group_pubkey: result.group_pubkey,
                         });
                         Ok(info)
                     }
                     Err(e) => {
+                        // Stash retained: `recover_dkg_share` can finish the
+                        // import on next launch. Never emit `Complete`.
                         progress.on_progress(DkgProgressUpdate::Failed {
                             reason: e.to_string(),
                         });
@@ -1472,6 +1518,55 @@ impl KeepMobile {
                 Err(e)
             }
         }
+    }
+
+    /// A DKG share whose ceremony completed but whose import into share storage
+    /// was never confirmed. Present after a storage failure during
+    /// `frost_run_dkg`. Recovering it via `recover_dkg_share` needs the ceremony
+    /// passphrase, which the manual-import path has but the DKG path does not
+    /// (it is ephemeral); when it is unavailable the app clears the stash with
+    /// `discard_pending_dkg_share`. `Ok(None)` when nothing is pending; a load
+    /// error is surfaced rather than masked as `None` so a corrupt or
+    /// momentarily-unreadable stash can't make a live share look absent — the
+    /// exact loss this feature exists to prevent — letting the app retry.
+    pub fn pending_dkg_share(&self) -> Result<Option<PendingShareInfo>, KeepMobileError> {
+        Ok(
+            persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?.map(
+                |pending| PendingShareInfo {
+                    name: pending.name,
+                    group_pubkey: pending.group_pubkey_hex,
+                },
+            ),
+        )
+    }
+
+    /// Finish importing a share stashed by `frost_run_dkg` after its ceremony
+    /// completed but its import failed. Re-runs the import with the supplied
+    /// passphrase (which decrypts `share_export` and so cannot be persisted) and
+    /// clears the stash on success. Errors if nothing is pending.
+    pub fn recover_dkg_share(&self, passphrase: String) -> Result<ShareInfo, KeepMobileError> {
+        let pending = persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "no pending DKG share to recover".into(),
+            })?;
+
+        let info = self.import_share(pending.share_export, passphrase, pending.name)?;
+
+        if let Err(e) = persistence::delete_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)
+        {
+            tracing::warn!("failed to clear pending DKG share after recovery: {e}");
+        }
+        Ok(info)
+    }
+
+    /// Abandon a pending DKG share, re-enabling `frost_run_dkg`. The pending
+    /// guard is fail-closed, so a stash that can't be recovered — its ceremony
+    /// passphrase is gone, or the record is corrupt — would otherwise refuse
+    /// every future run for good. This is the deliberate escape hatch: it
+    /// discards the share permanently, so callers must gate it behind an
+    /// explicit user confirmation. Idempotent; succeeds when nothing is pending.
+    pub fn discard_pending_dkg_share(&self) -> Result<(), KeepMobileError> {
+        persistence::delete_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)
     }
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
@@ -5102,5 +5197,296 @@ mod baseline_presign_policy_tests {
                 message,
             ))
             .expect("a pre-approved request with an ordinary label must still pass");
+    }
+}
+
+#[cfg(test)]
+mod dkg_pending_share_tests {
+    use super::*;
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    /// Secure storage that can be told to fail writes for real share records
+    /// (any key not using the reserved `__keep_` namespace), modelling the
+    /// full-store / encrypted-write failure that drops a completed DKG share.
+    #[derive(Default)]
+    struct FailingShareStorage {
+        data: StdMutex<HashMap<String, Vec<u8>>>,
+        active: StdMutex<Option<String>>,
+        fail_shares: AtomicBool,
+    }
+
+    impl SecureStorage for FailingShareStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            Err(KeepMobileError::StorageNotFound)
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            if !key.starts_with("__keep_") && self.fail_shares.load(Ordering::Relaxed) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "simulated full store".into(),
+                });
+            }
+            self.data.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            self.data
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            Vec::new()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.data.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            self.active.lock().unwrap().clone()
+        }
+        fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
+            *self.active.lock().unwrap() = key;
+            Ok(())
+        }
+    }
+
+    /// Build a valid passphrase-encrypted share export string, as a completed
+    /// DKG would hand to `import_share`.
+    fn share_export(passphrase: &str, name: &str) -> String {
+        let key_bytes = Zeroizing::new(hex::decode("07".repeat(32)).unwrap());
+        let (key_package, pubkey_package, vk_bytes) =
+            KeepMobile::build_nsec_packages(&key_bytes).unwrap();
+        let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
+        let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, name.into());
+        let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
+        ShareExport::from_share(&share, passphrase)
+            .unwrap()
+            .to_json()
+            .unwrap()
+    }
+
+    // A storage failure during the post-ceremony import must leave the finalized
+    // share export durably stashed (never silently dropped), and a later
+    // `recover_dkg_share` must complete the import and clear the stash.
+    #[test]
+    fn stash_survives_import_failure_and_recovers() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        let passphrase = "correct horse battery staple";
+        let name = "ceremony-share";
+        let export = share_export(passphrase, name);
+
+        // Reproduce `frost_run_dkg`'s post-ceremony path: stash first, then let
+        // the import fail the way a full store would.
+        storage.fail_shares.store(true, Ordering::Relaxed);
+        persistence::persist_pending_dkg_share(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SHARE_KEY,
+            &persistence::PendingDkgShare {
+                share_export: export.clone(),
+                name: name.into(),
+                group_pubkey_hex: "deadbeef".into(),
+            },
+        )
+        .unwrap();
+        let import = mobile.import_share(export, passphrase.into(), name.into());
+        assert!(
+            import.is_err(),
+            "import must fail under the simulated full store"
+        );
+
+        // The share is not lost: it is surfaced as pending for recovery.
+        let pending = mobile
+            .pending_dkg_share()
+            .expect("loading the stash must not error")
+            .expect("a failed import must leave a recoverable stash");
+        assert_eq!(pending.name, name);
+        assert_eq!(pending.group_pubkey, "deadbeef");
+
+        // Storage recovers; finishing the import stores the share and clears the
+        // stash so it is not replayed.
+        storage.fail_shares.store(false, Ordering::Relaxed);
+        let info = mobile
+            .recover_dkg_share(passphrase.into())
+            .expect("recovery must complete the import once storage is healthy");
+        assert_eq!(info.name, name);
+        assert!(
+            mobile.pending_dkg_share().unwrap().is_none(),
+            "a completed recovery must clear the stash"
+        );
+        assert!(
+            mobile.get_active_share().is_some(),
+            "the recovered share must be stored and active"
+        );
+    }
+
+    // A wrong passphrase must not clear the stash: the share stays recoverable.
+    #[test]
+    fn failed_recovery_retains_stash() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        let export = share_export("right-pass", "share");
+        persistence::persist_pending_dkg_share(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SHARE_KEY,
+            &persistence::PendingDkgShare {
+                share_export: export,
+                name: "share".into(),
+                group_pubkey_hex: "abc123".into(),
+            },
+        )
+        .unwrap();
+
+        assert!(mobile.recover_dkg_share("wrong-pass".into()).is_err());
+        assert!(
+            mobile.pending_dkg_share().unwrap().is_some(),
+            "a failed recovery must keep the share recoverable"
+        );
+    }
+
+    // With nothing stashed, recovery reports there is nothing to do.
+    #[test]
+    fn recover_without_pending_share_errors() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage).unwrap();
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
+        assert!(mobile.recover_dkg_share("pass".into()).is_err());
+    }
+
+    // A new DKG run must refuse to start while an earlier share is still pending
+    // recovery, so its completion can't overwrite the single-slot stash and lose
+    // the earlier share. The reject happens in pre-flight, before any network I/O.
+    #[test]
+    fn run_dkg_rejected_while_share_pending_recovery() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        persistence::persist_pending_dkg_share(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SHARE_KEY,
+            &persistence::PendingDkgShare {
+                share_export: share_export("pass", "prior"),
+                name: "prior".into(),
+                group_pubkey_hex: "abc123".into(),
+            },
+        )
+        .unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        let config = DkgConfig {
+            group_name: "new-group".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.example".into()],
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "new-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("a new run must be refused while a share is pending recovery");
+        assert!(
+            matches!(err, KeepMobileError::StorageError { .. }),
+            "expected a storage error, got {err:?}"
+        );
+
+        // The prior stash is untouched and still recoverable.
+        assert!(mobile.pending_dkg_share().unwrap().is_some());
+    }
+
+    // A corrupt stash must surface as an error, not be masked as "nothing
+    // pending" — otherwise a live share would look absent and never recover.
+    #[test]
+    fn unreadable_stash_surfaces_as_error() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        storage
+            .store_share_by_key(
+                DKG_PENDING_SHARE_KEY.into(),
+                b"not valid json".to_vec(),
+                ShareMetadataInfo {
+                    name: "dkg_pending".into(),
+                    identifier: 0,
+                    threshold: 0,
+                    total_shares: 0,
+                    group_pubkey: Vec::new(),
+                    did_backup: false,
+                },
+            )
+            .unwrap();
+
+        assert!(
+            mobile.pending_dkg_share().is_err(),
+            "a corrupt stash must not be reported as nothing pending"
+        );
+    }
+
+    // An unrecoverable stash (its ceremony passphrase is gone, or it is corrupt)
+    // must not brick group creation for good: discarding it clears the stash and
+    // lets the pending guard pass again. Discard is also idempotent.
+    #[test]
+    fn discard_clears_unrecoverable_stash() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        // Nothing pending: discard is a no-op that still succeeds.
+        mobile.discard_pending_dkg_share().unwrap();
+
+        // A corrupt stash refuses new runs (guard fails closed on load error) and
+        // cannot be recovered; without discard the device is stuck here.
+        storage
+            .store_share_by_key(
+                DKG_PENDING_SHARE_KEY.into(),
+                b"not valid json".to_vec(),
+                ShareMetadataInfo {
+                    name: "dkg_pending".into(),
+                    identifier: 0,
+                    threshold: 0,
+                    total_shares: 0,
+                    group_pubkey: Vec::new(),
+                    did_backup: false,
+                },
+            )
+            .unwrap();
+        assert!(mobile.pending_dkg_share().is_err());
+
+        mobile.discard_pending_dkg_share().unwrap();
+
+        // Stash gone: the guard reports nothing pending, so a new run is unblocked.
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
     }
 }
