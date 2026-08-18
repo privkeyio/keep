@@ -1392,6 +1392,17 @@ impl KeepMobile {
             });
         }
 
+        // The pending stash is a single global slot, so a run that completed
+        // here would overwrite an earlier unrecovered stash and lose that share
+        // for good. Refuse to start until the prior share is recovered; fail
+        // closed on a load error so a corrupt stash is never silently clobbered.
+        if persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?.is_some() {
+            return Err(KeepMobileError::StorageError {
+                msg: "a completed DKG share is pending recovery; recover it before starting a new run"
+                    .into(),
+            });
+        }
+
         // Load this device's pending subkey (from `frost_dkg_begin`) and rebuild
         // its keypair. Fail before any network I/O if the two-call sequence was
         // skipped.
@@ -5347,6 +5358,56 @@ mod dkg_pending_share_tests {
         let mobile = KeepMobile::new(storage).unwrap();
         assert!(mobile.pending_dkg_share().unwrap().is_none());
         assert!(mobile.recover_dkg_share("pass".into()).is_err());
+    }
+
+    // A new DKG run must refuse to start while an earlier share is still pending
+    // recovery, so its completion can't overwrite the single-slot stash and lose
+    // the earlier share. The reject happens in pre-flight, before any network I/O.
+    #[test]
+    fn run_dkg_rejected_while_share_pending_recovery() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        persistence::persist_pending_dkg_share(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SHARE_KEY,
+            &persistence::PendingDkgShare {
+                share_export: share_export("pass", "prior"),
+                name: "prior".into(),
+                group_pubkey_hex: "abc123".into(),
+            },
+        )
+        .unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        let config = DkgConfig {
+            group_name: "new-group".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.example".into()],
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "new-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("a new run must be refused while a share is pending recovery");
+        assert!(
+            matches!(err, KeepMobileError::StorageError { .. }),
+            "expected a storage error, got {err:?}"
+        );
+
+        // The prior stash is untouched and still recoverable.
+        assert!(mobile.pending_dkg_share().unwrap().is_some());
     }
 
     // A corrupt stash must surface as an error, not be masked as "nothing
