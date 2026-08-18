@@ -1345,7 +1345,7 @@ impl KeepMobile {
     /// device ever holds the whole key and mobile/CLI cannot drift. `progress`
     /// receives live state; a run that fails reports [`DkgProgressUpdate::Failed`]
     /// before returning the error, and `Complete` fires only after the share is
-    /// persisted (§6/§8).
+    /// persisted (§6).
     ///
     /// Returns the stored share on success. `timeout_secs` bounds each round
     /// (floored to 30s to tolerate slow peers and biometric prompts).
@@ -1458,16 +1458,21 @@ impl KeepMobile {
         ));
 
         match outcome {
-            // §6/§8: persist first, and surface `Complete` only once the share is
+            // §6: persist first, and surface `Complete` only once the share is
             // stored. A storage failure here still emits `Failed` and never
             // `Complete`, so the group never looks ready without a stored share.
             Ok(result) => {
-                // §8: stash the finalized (passphrase-encrypted) share export
-                // durably before import so a storage failure here doesn't
-                // silently drop a share the peers already treat as live. If the
-                // stash write itself fails there's nothing more we can do, but
-                // the import below still gets its chance; recovery is only lost
-                // when both writes fail.
+                // Stash the finalized (passphrase-encrypted) share export durably
+                // before import so a storage failure here doesn't silently drop a
+                // share the peers already treat as live. NOTE: this is only a
+                // partial step toward §8's "keep `share_export` recoverable" — on
+                // the DKG path the ceremony passphrase is ephemeral, so
+                // `recover_dkg_share` can't decrypt this stash and `import_share`
+                // below is its only real chance to land. The durable copy lets
+                // `pending_dkg_share`/`discard_pending_dkg_share` surface and clear
+                // it; true recoverability is deferred to the auth-gated-alias fix
+                // (keep-6ik). If the stash write itself fails there's nothing more
+                // we can do, but the import below still gets its chance.
                 let pending = persistence::PendingDkgShare {
                     share_export: result.share_export.clone(),
                     name: name.clone(),
@@ -1516,9 +1521,11 @@ impl KeepMobile {
     }
 
     /// A DKG share whose ceremony completed but whose import into share storage
-    /// was never confirmed (§8). Present after a storage failure during
-    /// `frost_run_dkg`; the app prompts for the passphrase and calls
-    /// `recover_dkg_share` to finish. `Ok(None)` when nothing is pending; a load
+    /// was never confirmed. Present after a storage failure during
+    /// `frost_run_dkg`. Recovering it via `recover_dkg_share` needs the ceremony
+    /// passphrase, which the manual-import path has but the DKG path does not
+    /// (it is ephemeral); when it is unavailable the app clears the stash with
+    /// `discard_pending_dkg_share`. `Ok(None)` when nothing is pending; a load
     /// error is surfaced rather than masked as `None` so a corrupt or
     /// momentarily-unreadable stash can't make a live share look absent — the
     /// exact loss this feature exists to prevent — letting the app retry.
