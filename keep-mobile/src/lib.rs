@@ -1552,6 +1552,16 @@ impl KeepMobile {
         Ok(info)
     }
 
+    /// Abandon a pending DKG share, re-enabling `frost_run_dkg`. The pending
+    /// guard is fail-closed, so a stash that can't be recovered — its ceremony
+    /// passphrase is gone, or the record is corrupt — would otherwise refuse
+    /// every future run for good. This is the deliberate escape hatch: it
+    /// discards the share permanently, so callers must gate it behind an
+    /// explicit user confirmation. Idempotent; succeeds when nothing is pending.
+    pub fn discard_pending_dkg_share(&self) -> Result<(), KeepMobileError> {
+        persistence::delete_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)
+    }
+
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
         const MAX_BUNDLE_HEX_LEN: usize = 8192;
         if bundle_hex.len() > MAX_BUNDLE_HEX_LEN {
@@ -5436,5 +5446,40 @@ mod dkg_pending_share_tests {
             mobile.pending_dkg_share().is_err(),
             "a corrupt stash must not be reported as nothing pending"
         );
+    }
+
+    // An unrecoverable stash (its ceremony passphrase is gone, or it is corrupt)
+    // must not brick group creation for good: discarding it clears the stash and
+    // lets the pending guard pass again. Discard is also idempotent.
+    #[test]
+    fn discard_clears_unrecoverable_stash() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        // Nothing pending: discard is a no-op that still succeeds.
+        mobile.discard_pending_dkg_share().unwrap();
+
+        // A corrupt stash refuses new runs (guard fails closed on load error) and
+        // cannot be recovered; without discard the device is stuck here.
+        storage
+            .store_share_by_key(
+                DKG_PENDING_SHARE_KEY.into(),
+                b"not valid json".to_vec(),
+                ShareMetadataInfo {
+                    name: "dkg_pending".into(),
+                    identifier: 0,
+                    threshold: 0,
+                    total_shares: 0,
+                    group_pubkey: Vec::new(),
+                    did_backup: false,
+                },
+            )
+            .unwrap();
+        assert!(mobile.pending_dkg_share().is_err());
+
+        mobile.discard_pending_dkg_share().unwrap();
+
+        // Stash gone: the guard reports nothing pending, so a new run is unblocked.
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
     }
 }
