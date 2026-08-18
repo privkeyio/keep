@@ -22,6 +22,15 @@ pub struct ShareInfo {
     pub group_pubkey: String,
 }
 
+/// A DKG share that completed its ceremony but whose import has not yet been
+/// confirmed persisted. Surfaced after relaunch so the app can prompt for the
+/// passphrase and finish the import via `recover_dkg_share`.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct PendingShareInfo {
+    pub name: String,
+    pub group_pubkey: String,
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct StoredShareInfo {
     pub group_pubkey: String,
