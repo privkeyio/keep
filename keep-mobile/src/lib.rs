@@ -827,40 +827,6 @@ impl KeepMobile {
         self.store_share_package(&share)
     }
 
-    /// Import a completed DKG share, retrying a bounded number of times while the
-    /// ceremony passphrase is still live. The DKG passphrase is ephemeral (the
-    /// app generates it per run and wipes it), so `recover_dkg_share` cannot
-    /// finish an import that failed once the run returns; a transient storage
-    /// error must therefore be absorbed here or the share is only discardable.
-    /// The import is keyed by group pubkey, so a retry after a partial write
-    /// overwrites rather than duplicates. A persistent failure exhausts the
-    /// attempts and falls through to the retained stash unchanged.
-    fn import_share_retrying(
-        &self,
-        share_export: &str,
-        passphrase: &str,
-        name: &str,
-    ) -> Result<ShareInfo, KeepMobileError> {
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut attempt = 1;
-        loop {
-            match self.import_share(
-                share_export.to_string(),
-                passphrase.to_string(),
-                name.to_string(),
-            ) {
-                Ok(info) => return Ok(info),
-                Err(e) if attempt < MAX_ATTEMPTS => {
-                    tracing::warn!(
-                        "import of completed DKG share failed (attempt {attempt}/{MAX_ATTEMPTS}), retrying: {e}"
-                    );
-                    attempt += 1;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
     pub fn import_nsec(&self, nsec: Vec<u8>, name: String) -> Result<ShareInfo, KeepMobileError> {
         use nostr_sdk::prelude::{FromBech32, SecretKey};
         // Accept the nsec as wipeable bytes (a Kotlin ByteArray) rather than an
@@ -1515,12 +1481,7 @@ impl KeepMobile {
                     tracing::warn!("failed to stash pending DKG share before import: {e}");
                 }
 
-                // Retry the import in-process while the passphrase is still live:
-                // it is ephemeral, so `recover_dkg_share` can't finish an import
-                // that failed after the run returns. This absorbs a transient
-                // storage error; a persistent one still falls through to the
-                // stash below.
-                match self.import_share_retrying(&result.share_export, &passphrase, &name) {
+                match self.import_share(result.share_export, passphrase.to_string(), name) {
                     Ok(info) => {
                         // Import confirmed; clear the stash (best-effort — a stale
                         // stash is recovered idempotently, never lost).
@@ -5237,20 +5198,17 @@ mod dkg_pending_share_tests {
     use super::*;
     use crate::storage::{SecureStorage, ShareMetadataInfo};
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex as StdMutex;
 
     /// Secure storage that can be told to fail writes for real share records
     /// (any key not using the reserved `__keep_` namespace), modelling the
     /// full-store / encrypted-write failure that drops a completed DKG share.
-    /// `fail_shares` fails every real-share write (a persistent failure);
-    /// `fail_next_share_writes` fails only the next N (a transient one).
     #[derive(Default)]
     struct FailingShareStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
         active: StdMutex<Option<String>>,
         fail_shares: AtomicBool,
-        fail_next_share_writes: AtomicU32,
     }
 
     impl SecureStorage for FailingShareStorage {
@@ -5275,20 +5233,10 @@ mod dkg_pending_share_tests {
             data: Vec<u8>,
             _: ShareMetadataInfo,
         ) -> Result<(), KeepMobileError> {
-            if !key.starts_with("__keep_") {
-                if self.fail_shares.load(Ordering::Relaxed) {
-                    return Err(KeepMobileError::StorageError {
-                        msg: "simulated full store".into(),
-                    });
-                }
-                let remaining = self.fail_next_share_writes.load(Ordering::Relaxed);
-                if remaining > 0 {
-                    self.fail_next_share_writes
-                        .store(remaining - 1, Ordering::Relaxed);
-                    return Err(KeepMobileError::StorageError {
-                        msg: "simulated transient store failure".into(),
-                    });
-                }
+            if !key.starts_with("__keep_") && self.fail_shares.load(Ordering::Relaxed) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "simulated full store".into(),
+                });
             }
             self.data.lock().unwrap().insert(key, data);
             Ok(())
@@ -5533,44 +5481,5 @@ mod dkg_pending_share_tests {
 
         // Stash gone: the guard reports nothing pending, so a new run is unblocked.
         assert!(mobile.pending_dkg_share().unwrap().is_none());
-    }
-
-    // A transient storage failure during the post-ceremony import must be
-    // absorbed in-process (the passphrase is still live), so a completed DKG
-    // share imports without needing the unreachable recovery path. A share that
-    // fails fewer times than the retry budget still lands.
-    #[test]
-    fn import_retry_absorbs_transient_storage_failure() {
-        let storage = Arc::new(FailingShareStorage::default());
-        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
-
-        let passphrase = "correct horse battery staple";
-        let name = "ceremony-share";
-        let export = share_export(passphrase, name);
-
-        // Fail the first two share writes, then succeed — within the 3-attempt
-        // budget.
-        storage.fail_next_share_writes.store(2, Ordering::Relaxed);
-        let info = mobile
-            .import_share_retrying(&export, passphrase, name)
-            .expect("a transient failure inside the retry budget must still import");
-        assert_eq!(info.name, name);
-        assert!(mobile.get_active_share().is_some());
-    }
-
-    // A persistent storage failure exhausts the retries and surfaces the error,
-    // leaving recovery to the retained stash rather than looping forever.
-    #[test]
-    fn import_retry_gives_up_on_persistent_failure() {
-        let storage = Arc::new(FailingShareStorage::default());
-        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
-
-        let passphrase = "correct horse battery staple";
-        let export = share_export(passphrase, "share");
-
-        storage.fail_shares.store(true, Ordering::Relaxed);
-        assert!(mobile
-            .import_share_retrying(&export, passphrase, "share")
-            .is_err());
     }
 }
