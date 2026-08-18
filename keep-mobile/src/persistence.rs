@@ -753,51 +753,119 @@ pub(crate) fn persist_kill_switch(
     storage.store_share_by_key(key.into(), data, storage_metadata("kill_switch"))
 }
 
-/// A DKG share that finished the ceremony but whose import into share storage
-/// has not yet been confirmed. `share_export` is the passphrase-encrypted
-/// portable share, so the stash carries no plaintext key material. Persisted
-/// before import so a storage failure doesn't silently drop a share the peers
-/// already treat as live (§8), and recovered via `recover_dkg_share`.
+/// The current DKG stash schema. Bumped when the wire shape of the marker or
+/// secret changes so a reader can branch on format instead of guessing.
+pub(crate) const DKG_STASH_SCHEMA_VERSION: u8 = 1;
+
+/// The non-sensitive half of a pending DKG stash: enough to answer "is a share
+/// waiting to be recovered, and how?" without touching the auth-gated secret.
+/// Lives under the `__keep_` metadata namespace so `pending_dkg_share` and the
+/// `frost_run_dkg` pre-flight can read it with no biometric prompt. Every added
+/// field carries `#[serde(default)]` so widening the schema can never turn an
+/// older marker into a fail-closed brick.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct PendingDkgShare {
-    pub(crate) share_export: String,
+pub(crate) struct PendingDkgMarker {
+    #[serde(default)]
+    pub(crate) schema_version: u8,
     pub(crate) name: String,
     pub(crate) group_pubkey_hex: String,
+    /// `true` for the on-device DKG path: the ceremony passphrase is ephemeral,
+    /// so the secret's at-rest protection is bound to the device vault
+    /// (auth-gated Keystore alias) and the passphrase is stashed inside it —
+    /// recovery needs only a vault unlock. `false` for the manual QR-import path,
+    /// where the user knows the passphrase and supplies it to `recover_dkg_share`.
+    #[serde(default)]
+    pub(crate) vault_protected: bool,
 }
 
-pub(crate) fn persist_pending_dkg_share(
+/// The sensitive half of a pending DKG stash: the passphrase-encrypted share
+/// export and, for the vault-protected DKG path, the ephemeral ceremony
+/// passphrase needed to decrypt it. Stored under a dedicated key the platform
+/// routes to an auth-gated (`requireUserAuth`) alias, so at rest it is not
+/// app-uid-readable and loading it costs a vault unlock. Read only by
+/// `recover_dkg_share`.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PendingDkgSecret {
+    #[serde(default)]
+    pub(crate) schema_version: u8,
+    pub(crate) share_export: String,
+    /// The ephemeral ceremony passphrase, present only for the vault-protected
+    /// DKG path. Absent for QR import, where the user supplies it. Never leaves
+    /// the auth-gated blob.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vault_passphrase: Option<String>,
+}
+
+pub(crate) fn persist_pending_dkg_marker(
     storage: &Arc<dyn SecureStorage>,
     key: &str,
-    pending: &PendingDkgShare,
+    marker: &PendingDkgMarker,
 ) -> Result<(), KeepMobileError> {
-    let data = serde_json::to_vec(pending).map_err(|e| KeepMobileError::StorageError {
-        msg: format!("failed to serialize pending DKG share: {e}"),
+    let data = serde_json::to_vec(marker).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize pending DKG marker: {e}"),
     })?;
     storage.store_share_by_key(key.into(), data, storage_metadata("dkg_pending"))
 }
 
-pub(crate) fn load_pending_dkg_share(
+pub(crate) fn load_pending_dkg_marker(
     storage: &Arc<dyn SecureStorage>,
     key: &str,
-) -> Result<Option<PendingDkgShare>, KeepMobileError> {
+) -> Result<Option<PendingDkgMarker>, KeepMobileError> {
     match storage.load_share_by_key(key.into()) {
         Ok(data) => {
-            let pending =
+            let marker =
                 serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-                    msg: format!("failed to deserialize pending DKG share: {e}"),
+                    msg: format!("failed to deserialize pending DKG marker: {e}"),
                 })?;
-            Ok(Some(pending))
+            Ok(Some(marker))
         }
         Err(KeepMobileError::StorageNotFound) => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-pub(crate) fn delete_pending_dkg_share(
+pub(crate) fn persist_pending_dkg_secret(
     storage: &Arc<dyn SecureStorage>,
     key: &str,
+    secret: &PendingDkgSecret,
 ) -> Result<(), KeepMobileError> {
-    match storage.delete_share_by_key(key.into()) {
+    let data = serde_json::to_vec(secret).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize pending DKG secret: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("dkg_secret"))
+}
+
+pub(crate) fn load_pending_dkg_secret(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<Option<PendingDkgSecret>, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => {
+            let secret =
+                serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+                    msg: format!("failed to deserialize pending DKG secret: {e}"),
+                })?;
+            Ok(Some(secret))
+        }
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn delete_pending_dkg_stash(
+    storage: &Arc<dyn SecureStorage>,
+    marker_key: &str,
+    secret_key: &str,
+) -> Result<(), KeepMobileError> {
+    // Delete the secret first: the marker is what gates "is anything pending?",
+    // so an orphaned secret (marker gone, secret left) is the safe failure — it
+    // is invisible and overwritten by the next run — whereas an orphaned marker
+    // would refuse new runs while pointing at a secret that is already gone.
+    match storage.delete_share_by_key(secret_key.into()) {
+        Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
+        Err(e) => return Err(e),
+    }
+    match storage.delete_share_by_key(marker_key.into()) {
         Ok(()) | Err(KeepMobileError::StorageNotFound) => Ok(()),
         Err(e) => Err(e),
     }

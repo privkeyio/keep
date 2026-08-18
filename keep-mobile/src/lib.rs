@@ -320,7 +320,13 @@ const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const STRICT_PIN_CONFIG_STORAGE_KEY: &str = "__keep_strict_pin_config_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
 const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
-const DKG_PENDING_SHARE_KEY: &str = "__keep_dkg_pending_v1";
+/// Non-sensitive pending-DKG marker (name/group/protection). Under the `__keep_`
+/// metadata namespace so it reads without a vault unlock.
+const DKG_PENDING_MARKER_KEY: &str = "__keep_dkg_pending_v1";
+/// Sensitive pending-DKG secret (share export + ephemeral passphrase). The
+/// platform routes this reserved key to a dedicated auth-gated (`requireUserAuth`)
+/// alias, so it is not app-uid-readable at rest and loading it costs a vault unlock.
+const DKG_PENDING_SECRET_KEY: &str = "__keep_dkg_secret_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(uniffi::Record)]
@@ -1396,7 +1402,7 @@ impl KeepMobile {
         // here would overwrite an earlier unrecovered stash and lose that share
         // for good. Refuse to start until the prior share is recovered; fail
         // closed on a load error so a corrupt stash is never silently clobbered.
-        if persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?.is_some() {
+        if persistence::load_pending_dkg_marker(&self.storage, DKG_PENDING_MARKER_KEY)?.is_some() {
             return Err(KeepMobileError::StorageError {
                 msg: "a completed DKG share is pending recovery; recover it before starting a new run"
                     .into(),
@@ -1462,39 +1468,53 @@ impl KeepMobile {
             // stored. A storage failure here still emits `Failed` and never
             // `Complete`, so the group never looks ready without a stored share.
             Ok(result) => {
-                // Stash the finalized (passphrase-encrypted) share export durably
-                // before import so a storage failure here doesn't silently drop a
-                // share the peers already treat as live. NOTE: this is only a
-                // partial step toward §8's "keep `share_export` recoverable" — on
-                // the DKG path the ceremony passphrase is ephemeral, so
-                // `recover_dkg_share` can't decrypt this stash and `import_share`
-                // below is its only real chance to land. The durable copy lets
-                // `pending_dkg_share`/`discard_pending_dkg_share` surface and clear
-                // it; true recoverability is deferred to the auth-gated-alias fix
-                // (keep-6ik). If the stash write itself fails there's nothing more
-                // we can do, but the import below still gets its chance.
-                let pending = persistence::PendingDkgShare {
+                // Stash the finalized share durably before import so a storage
+                // failure here doesn't silently drop a share the peers already
+                // treat as live, AND make it recoverable (§8): the ceremony
+                // passphrase is ephemeral, so it is stashed inside the auth-gated
+                // secret and the blob's at-rest protection is bound to the device
+                // vault, not the passphrase. `recover_dkg_share` then needs only a
+                // vault unlock. Write the auth-gated secret first, then the
+                // non-sensitive marker: the marker is what gates recovery, so a
+                // half-write that leaves a secret without a marker is the safe
+                // failure (invisible, overwritten by the next run) rather than a
+                // marker pointing at a secret that never landed. Best-effort — if
+                // the stash write fails the import below still gets its chance.
+                let secret = persistence::PendingDkgSecret {
+                    schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
                     share_export: result.share_export.clone(),
+                    vault_passphrase: Some(passphrase.to_string()),
+                };
+                let marker = persistence::PendingDkgMarker {
+                    schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
                     name: name.clone(),
                     group_pubkey_hex: result.group_pubkey.clone(),
+                    vault_protected: true,
                 };
-                if let Err(e) = persistence::persist_pending_dkg_share(
+                if let Err(e) = persistence::persist_pending_dkg_secret(
                     &self.storage,
-                    DKG_PENDING_SHARE_KEY,
-                    &pending,
+                    DKG_PENDING_SECRET_KEY,
+                    &secret,
                 ) {
-                    tracing::warn!("failed to stash pending DKG share before import: {e}");
+                    tracing::warn!("failed to stash pending DKG secret before import: {e}");
+                } else if let Err(e) = persistence::persist_pending_dkg_marker(
+                    &self.storage,
+                    DKG_PENDING_MARKER_KEY,
+                    &marker,
+                ) {
+                    tracing::warn!("failed to stash pending DKG marker before import: {e}");
                 }
 
                 match self.import_share(result.share_export, passphrase.to_string(), name) {
                     Ok(info) => {
                         // Import confirmed; clear the stash (best-effort — a stale
                         // stash is recovered idempotently, never lost).
-                        if let Err(e) = persistence::delete_pending_dkg_share(
+                        if let Err(e) = persistence::delete_pending_dkg_stash(
                             &self.storage,
-                            DKG_PENDING_SHARE_KEY,
+                            DKG_PENDING_MARKER_KEY,
+                            DKG_PENDING_SECRET_KEY,
                         ) {
-                            tracing::warn!("failed to clear pending DKG share after import: {e}");
+                            tracing::warn!("failed to clear pending DKG stash after import: {e}");
                         }
                         progress.on_progress(DkgProgressUpdate::Complete {
                             group_pubkey: result.group_pubkey,
@@ -1531,42 +1551,72 @@ impl KeepMobile {
     /// exact loss this feature exists to prevent — letting the app retry.
     pub fn pending_dkg_share(&self) -> Result<Option<PendingShareInfo>, KeepMobileError> {
         Ok(
-            persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?.map(
-                |pending| PendingShareInfo {
-                    name: pending.name,
-                    group_pubkey: pending.group_pubkey_hex,
+            persistence::load_pending_dkg_marker(&self.storage, DKG_PENDING_MARKER_KEY)?.map(
+                |marker| PendingShareInfo {
+                    name: marker.name,
+                    group_pubkey: marker.group_pubkey_hex,
+                    vault_protected: marker.vault_protected,
                 },
             ),
         )
     }
 
     /// Finish importing a share stashed by `frost_run_dkg` after its ceremony
-    /// completed but its import failed. Re-runs the import with the supplied
-    /// passphrase (which decrypts `share_export` and so cannot be persisted) and
-    /// clears the stash on success. Errors if nothing is pending.
-    pub fn recover_dkg_share(&self, passphrase: String) -> Result<ShareInfo, KeepMobileError> {
-        let pending = persistence::load_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)?
+    /// completed but its import failed. Loading the secret costs a vault unlock
+    /// on the DKG path (its alias is auth-gated). For a vault-protected stash the
+    /// ephemeral ceremony passphrase rides inside the secret, so `passphrase` is
+    /// ignored and recovery needs only that unlock; for a passphrase-protected
+    /// stash (manual QR import) the caller must supply the passphrase they know.
+    /// Clears the stash on success. Errors if nothing is pending.
+    pub fn recover_dkg_share(
+        &self,
+        passphrase: Option<String>,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        let marker = persistence::load_pending_dkg_marker(&self.storage, DKG_PENDING_MARKER_KEY)?
             .ok_or_else(|| KeepMobileError::StorageError {
                 msg: "no pending DKG share to recover".into(),
             })?;
+        let secret = persistence::load_pending_dkg_secret(&self.storage, DKG_PENDING_SECRET_KEY)?
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "pending DKG marker has no matching secret to recover".into(),
+            })?;
 
-        let info = self.import_share(pending.share_export, passphrase, pending.name)?;
+        let passphrase = if marker.vault_protected {
+            secret
+                .vault_passphrase
+                .ok_or_else(|| KeepMobileError::StorageError {
+                    msg: "vault-protected stash is missing its ceremony passphrase".into(),
+                })?
+        } else {
+            passphrase.ok_or_else(|| KeepMobileError::StorageError {
+                msg: "a passphrase is required to recover this share".into(),
+            })?
+        };
 
-        if let Err(e) = persistence::delete_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)
-        {
-            tracing::warn!("failed to clear pending DKG share after recovery: {e}");
+        let info = self.import_share(secret.share_export, passphrase, marker.name)?;
+
+        if let Err(e) = persistence::delete_pending_dkg_stash(
+            &self.storage,
+            DKG_PENDING_MARKER_KEY,
+            DKG_PENDING_SECRET_KEY,
+        ) {
+            tracing::warn!("failed to clear pending DKG stash after recovery: {e}");
         }
         Ok(info)
     }
 
     /// Abandon a pending DKG share, re-enabling `frost_run_dkg`. The pending
-    /// guard is fail-closed, so a stash that can't be recovered — its ceremony
-    /// passphrase is gone, or the record is corrupt — would otherwise refuse
-    /// every future run for good. This is the deliberate escape hatch: it
-    /// discards the share permanently, so callers must gate it behind an
-    /// explicit user confirmation. Idempotent; succeeds when nothing is pending.
+    /// guard is fail-closed, so a stash that can't be recovered — its record is
+    /// corrupt, or the vault can't be unlocked — would otherwise refuse every
+    /// future run for good. This is the deliberate escape hatch: it discards the
+    /// share permanently, so callers must gate it behind an explicit user
+    /// confirmation. Idempotent; succeeds when nothing is pending.
     pub fn discard_pending_dkg_share(&self) -> Result<(), KeepMobileError> {
-        persistence::delete_pending_dkg_share(&self.storage, DKG_PENDING_SHARE_KEY)
+        persistence::delete_pending_dkg_stash(
+            &self.storage,
+            DKG_PENDING_MARKER_KEY,
+            DKG_PENDING_SECRET_KEY,
+        )
     }
 
     pub fn import_policy(&self, bundle_hex: String) -> Result<PolicyInfo, KeepMobileError> {
@@ -5287,6 +5337,86 @@ mod dkg_pending_share_tests {
             .unwrap()
     }
 
+    /// Stash a share the manual-QR way: the user knows the passphrase, so the
+    /// secret carries none and the marker records `vault_protected = false`.
+    fn stash_passphrase_protected(
+        storage: &Arc<dyn SecureStorage>,
+        export: &str,
+        name: &str,
+        group: &str,
+    ) {
+        persistence::persist_pending_dkg_secret(
+            storage,
+            DKG_PENDING_SECRET_KEY,
+            &persistence::PendingDkgSecret {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                share_export: export.into(),
+                vault_passphrase: None,
+            },
+        )
+        .unwrap();
+        persistence::persist_pending_dkg_marker(
+            storage,
+            DKG_PENDING_MARKER_KEY,
+            &persistence::PendingDkgMarker {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                name: name.into(),
+                group_pubkey_hex: group.into(),
+                vault_protected: false,
+            },
+        )
+        .unwrap();
+    }
+
+    // The DKG path stashes its ephemeral passphrase inside the auth-gated secret
+    // and marks the stash vault-protected. Recovery must then complete from the
+    // vault alone — `recover_dkg_share(None)` — with no user-supplied passphrase,
+    // which is the whole point of keep-6ik (the ceremony passphrase is never
+    // shown or stored anywhere the user could re-enter it).
+    #[test]
+    fn vault_protected_stash_recovers_without_a_supplied_passphrase() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        let passphrase = "f00dbabe".repeat(8); // stand-in for the 256-bit ceremony secret
+        let name = "vault-share";
+        let export = share_export(&passphrase, name);
+
+        persistence::persist_pending_dkg_secret(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SECRET_KEY,
+            &persistence::PendingDkgSecret {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                share_export: export,
+                vault_passphrase: Some(passphrase),
+            },
+        )
+        .unwrap();
+        persistence::persist_pending_dkg_marker(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_MARKER_KEY,
+            &persistence::PendingDkgMarker {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                name: name.into(),
+                group_pubkey_hex: "cafe".into(),
+                vault_protected: true,
+            },
+        )
+        .unwrap();
+
+        // The marker surfaces the protection mode without a vault unlock.
+        let pending = mobile.pending_dkg_share().unwrap().unwrap();
+        assert!(pending.vault_protected);
+
+        // No passphrase supplied: recovery draws it from the vault-decrypted secret.
+        let info = mobile
+            .recover_dkg_share(None)
+            .expect("vault-protected recovery must not need a supplied passphrase");
+        assert_eq!(info.name, name);
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
+        assert!(mobile.get_active_share().is_some());
+    }
+
     // A storage failure during the post-ceremony import must leave the finalized
     // share export durably stashed (never silently dropped), and a later
     // `recover_dkg_share` must complete the import and clear the stash.
@@ -5302,16 +5432,12 @@ mod dkg_pending_share_tests {
         // Reproduce `frost_run_dkg`'s post-ceremony path: stash first, then let
         // the import fail the way a full store would.
         storage.fail_shares.store(true, Ordering::Relaxed);
-        persistence::persist_pending_dkg_share(
+        stash_passphrase_protected(
             &(storage.clone() as Arc<dyn SecureStorage>),
-            DKG_PENDING_SHARE_KEY,
-            &persistence::PendingDkgShare {
-                share_export: export.clone(),
-                name: name.into(),
-                group_pubkey_hex: "deadbeef".into(),
-            },
-        )
-        .unwrap();
+            &export,
+            name,
+            "deadbeef",
+        );
         let import = mobile.import_share(export, passphrase.into(), name.into());
         assert!(
             import.is_err(),
@@ -5330,7 +5456,7 @@ mod dkg_pending_share_tests {
         // stash so it is not replayed.
         storage.fail_shares.store(false, Ordering::Relaxed);
         let info = mobile
-            .recover_dkg_share(passphrase.into())
+            .recover_dkg_share(Some(passphrase.into()))
             .expect("recovery must complete the import once storage is healthy");
         assert_eq!(info.name, name);
         assert!(
@@ -5350,18 +5476,16 @@ mod dkg_pending_share_tests {
         let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
 
         let export = share_export("right-pass", "share");
-        persistence::persist_pending_dkg_share(
+        stash_passphrase_protected(
             &(storage.clone() as Arc<dyn SecureStorage>),
-            DKG_PENDING_SHARE_KEY,
-            &persistence::PendingDkgShare {
-                share_export: export,
-                name: "share".into(),
-                group_pubkey_hex: "abc123".into(),
-            },
-        )
-        .unwrap();
+            &export,
+            "share",
+            "abc123",
+        );
 
-        assert!(mobile.recover_dkg_share("wrong-pass".into()).is_err());
+        assert!(mobile
+            .recover_dkg_share(Some("wrong-pass".into()))
+            .is_err());
         assert!(
             mobile.pending_dkg_share().unwrap().is_some(),
             "a failed recovery must keep the share recoverable"
@@ -5374,7 +5498,7 @@ mod dkg_pending_share_tests {
         let storage: Arc<dyn SecureStorage> = Arc::new(FailingShareStorage::default());
         let mobile = KeepMobile::new(storage).unwrap();
         assert!(mobile.pending_dkg_share().unwrap().is_none());
-        assert!(mobile.recover_dkg_share("pass".into()).is_err());
+        assert!(mobile.recover_dkg_share(Some("pass".into())).is_err());
     }
 
     // A new DKG run must refuse to start while an earlier share is still pending
@@ -5385,16 +5509,12 @@ mod dkg_pending_share_tests {
         let storage = Arc::new(FailingShareStorage::default());
         let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
 
-        persistence::persist_pending_dkg_share(
+        stash_passphrase_protected(
             &(storage.clone() as Arc<dyn SecureStorage>),
-            DKG_PENDING_SHARE_KEY,
-            &persistence::PendingDkgShare {
-                share_export: share_export("pass", "prior"),
-                name: "prior".into(),
-                group_pubkey_hex: "abc123".into(),
-            },
-        )
-        .unwrap();
+            &share_export("pass", "prior"),
+            "prior",
+            "abc123",
+        );
 
         struct NoopProgress;
         impl dkg::DkgProgressCallback for NoopProgress {
@@ -5436,7 +5556,7 @@ mod dkg_pending_share_tests {
 
         storage
             .store_share_by_key(
-                DKG_PENDING_SHARE_KEY.into(),
+                DKG_PENDING_MARKER_KEY.into(),
                 b"not valid json".to_vec(),
                 ShareMetadataInfo {
                     name: "dkg_pending".into(),
@@ -5470,7 +5590,7 @@ mod dkg_pending_share_tests {
         // cannot be recovered; without discard the device is stuck here.
         storage
             .store_share_by_key(
-                DKG_PENDING_SHARE_KEY.into(),
+                DKG_PENDING_MARKER_KEY.into(),
                 b"not valid json".to_vec(),
                 ShareMetadataInfo {
                     name: "dkg_pending".into(),
