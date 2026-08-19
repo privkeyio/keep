@@ -29,6 +29,10 @@ pub struct ShareInfo {
 pub struct PendingShareInfo {
     pub name: String,
     pub group_pubkey: String,
+    /// `true` when recovery needs only a device-vault unlock (the DKG path stashed
+    /// its ephemeral passphrase); `false` when the caller must supply the
+    /// passphrase (manual QR import). Lets the UI pick the right recovery prompt.
+    pub vault_protected: bool,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
