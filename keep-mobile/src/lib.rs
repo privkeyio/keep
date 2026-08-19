@@ -1482,8 +1482,8 @@ impl KeepMobile {
                 // the stash write fails the import below still gets its chance.
                 let secret = persistence::PendingDkgSecret {
                     schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
-                    share_export: result.share_export.clone(),
-                    vault_passphrase: Some(passphrase.to_string()),
+                    share_export: Zeroizing::new(result.share_export.clone()),
+                    vault_passphrase: Some(passphrase.clone()),
                 };
                 let marker = persistence::PendingDkgMarker {
                     schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
@@ -1574,12 +1574,12 @@ impl KeepMobile {
     ) -> Result<ShareInfo, KeepMobileError> {
         let marker = persistence::load_pending_dkg_marker(&self.storage, DKG_PENDING_MARKER_KEY)?
             .ok_or_else(|| KeepMobileError::StorageError {
-                msg: "no pending DKG share to recover".into(),
-            })?;
+            msg: "no pending DKG share to recover".into(),
+        })?;
         let secret = persistence::load_pending_dkg_secret(&self.storage, DKG_PENDING_SECRET_KEY)?
             .ok_or_else(|| KeepMobileError::StorageError {
-                msg: "pending DKG marker has no matching secret to recover".into(),
-            })?;
+            msg: "pending DKG marker has no matching secret to recover".into(),
+        })?;
 
         let passphrase = if marker.vault_protected {
             secret
@@ -1588,12 +1588,16 @@ impl KeepMobile {
                     msg: "vault-protected stash is missing its ceremony passphrase".into(),
                 })?
         } else {
-            passphrase.ok_or_else(|| KeepMobileError::StorageError {
+            Zeroizing::new(passphrase.ok_or_else(|| KeepMobileError::StorageError {
                 msg: "a passphrase is required to recover this share".into(),
-            })?
+            })?)
         };
 
-        let info = self.import_share(secret.share_export, passphrase, marker.name)?;
+        let info = self.import_share(
+            secret.share_export.to_string(),
+            passphrase.to_string(),
+            marker.name,
+        )?;
 
         if let Err(e) = persistence::delete_pending_dkg_stash(
             &self.storage,
@@ -5350,7 +5354,7 @@ mod dkg_pending_share_tests {
             DKG_PENDING_SECRET_KEY,
             &persistence::PendingDkgSecret {
                 schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
-                share_export: export.into(),
+                share_export: Zeroizing::new(export.into()),
                 vault_passphrase: None,
             },
         )
@@ -5387,8 +5391,8 @@ mod dkg_pending_share_tests {
             DKG_PENDING_SECRET_KEY,
             &persistence::PendingDkgSecret {
                 schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
-                share_export: export,
-                vault_passphrase: Some(passphrase),
+                share_export: Zeroizing::new(export),
+                vault_passphrase: Some(Zeroizing::new(passphrase)),
             },
         )
         .unwrap();
@@ -5483,9 +5487,7 @@ mod dkg_pending_share_tests {
             "abc123",
         );
 
-        assert!(mobile
-            .recover_dkg_share(Some("wrong-pass".into()))
-            .is_err());
+        assert!(mobile.recover_dkg_share(Some("wrong-pass".into())).is_err());
         assert!(
             mobile.pending_dkg_share().unwrap().is_some(),
             "a failed recovery must keep the share recoverable"

@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_PUBKEY_LEN};
@@ -788,12 +789,12 @@ pub(crate) struct PendingDkgMarker {
 pub(crate) struct PendingDkgSecret {
     #[serde(default)]
     pub(crate) schema_version: u8,
-    pub(crate) share_export: String,
+    pub(crate) share_export: Zeroizing<String>,
     /// The ephemeral ceremony passphrase, present only for the vault-protected
     /// DKG path. Absent for QR import, where the user supplies it. Never leaves
     /// the auth-gated blob.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) vault_passphrase: Option<String>,
+    pub(crate) vault_passphrase: Option<Zeroizing<String>>,
 }
 
 pub(crate) fn persist_pending_dkg_marker(
@@ -829,10 +830,15 @@ pub(crate) fn persist_pending_dkg_secret(
     key: &str,
     secret: &PendingDkgSecret,
 ) -> Result<(), KeepMobileError> {
-    let data = serde_json::to_vec(secret).map_err(|e| KeepMobileError::StorageError {
-        msg: format!("failed to serialize pending DKG secret: {e}"),
-    })?;
-    storage.store_share_by_key(key.into(), data, storage_metadata("dkg_secret"))
+    // The serialized blob holds the plaintext share export and ceremony
+    // passphrase; scrub the local copy once storage has taken its own.
+    let data =
+        Zeroizing::new(
+            serde_json::to_vec(secret).map_err(|e| KeepMobileError::StorageError {
+                msg: format!("failed to serialize pending DKG secret: {e}"),
+            })?,
+        );
+    storage.store_share_by_key(key.into(), data.to_vec(), storage_metadata("dkg_secret"))
 }
 
 pub(crate) fn load_pending_dkg_secret(
@@ -841,6 +847,8 @@ pub(crate) fn load_pending_dkg_secret(
 ) -> Result<Option<PendingDkgSecret>, KeepMobileError> {
     match storage.load_share_by_key(key.into()) {
         Ok(data) => {
+            // The loaded blob is plaintext secret material; scrub it after parse.
+            let data = Zeroizing::new(data);
             let secret =
                 serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
                     msg: format!("failed to deserialize pending DKG secret: {e}"),
