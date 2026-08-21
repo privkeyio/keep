@@ -32,7 +32,7 @@ use keep_frost_net::dkg::{
 
 use crate::error::KeepMobileError;
 use crate::network::validate_relay_url;
-use crate::types::{DkgConfig, DkgProgressUpdate};
+use crate::types::{DkgConfig, DkgParticipant, DkgProgressUpdate, RosterVerification};
 
 /// Reports DKG progress to the native layer. Implemented on the foreign side
 /// (Kotlin) so setup UI can render live state without polling. Called from the
@@ -157,6 +157,100 @@ fn build_roster(config: &DkgConfig) -> Result<DkgRoster, KeepMobileError> {
     })
 }
 
+/// Render a `frost_group_id` as a short, human-comparable fingerprint: the first
+/// eight bytes as uppercase hex in four space-separated pairs of bytes. Every
+/// device that derives the same `frost_group_id` (same name, threshold, and
+/// index-ordered members) renders the same string, so participants can read it
+/// aloud out of band; a coordinator who slips an extra key into one device's
+/// roster yields a different id there and the mismatch is visible.
+fn group_id_fingerprint(group_id: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(19);
+    for (i, b) in group_id[..8].iter().enumerate() {
+        if i > 0 && i % 2 == 0 {
+            out.push(' ');
+        }
+        out.push_str(&format!("{b:02X}"));
+    }
+    out
+}
+
+/// Assemble the coordinator's roster: index 1 is the coordinator, each collected
+/// joiner subkey takes index i+2 in scan order. This is the roster-assembly
+/// policy (§4) — kept in Rust rather than the UI so there is one place that
+/// decides how indices map to keys. Every key is parsed and de-duplicated here so
+/// a malformed or repeated subkey is refused before it reaches the wire; the
+/// assembled roster is still validated by [`build_roster`] before the run.
+pub(crate) fn assemble_roster(
+    coordinator_pubkey: &str,
+    joiner_pubkeys: &[String],
+) -> Result<Vec<DkgParticipant>, KeepMobileError> {
+    // FROST indices are u8, so cap the count before the u16 cast below can wrap
+    // (65536 -> index 0). Fail closed here rather than leak a bad index downstream.
+    if joiner_pubkeys.len() + 1 > u8::MAX as usize {
+        return Err(frost_err(format!(
+            "roster carries {} participants but at most {} are allowed",
+            joiner_pubkeys.len() + 1,
+            u8::MAX
+        )));
+    }
+    let mut entries = Vec::with_capacity(joiner_pubkeys.len() + 1);
+    let mut seen: Vec<PublicKey> = Vec::new();
+    for (i, pk) in std::iter::once(coordinator_pubkey)
+        .chain(joiner_pubkeys.iter().map(String::as_str))
+        .enumerate()
+    {
+        let parsed = PublicKey::parse(pk)
+            .map_err(|e| frost_err(format!("roster pubkey {pk:?} is invalid: {e}")))?;
+        if seen.contains(&parsed) {
+            return Err(frost_err(
+                "roster repeats one pubkey; every participant must hold a distinct key",
+            ));
+        }
+        seen.push(parsed);
+        entries.push(DkgParticipant {
+            index: (i + 1) as u16,
+            pubkey: pk.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+/// Validate a finalized roster the same way [`run_dkg`] does — index range and
+/// uniqueness, duplicate-pubkey rejection, threshold/participant bounds — resolve
+/// the verifying device's index by matching `our_pubkey`, and return a
+/// human-comparable fingerprint of the canonical `frost_group_id`. This is the
+/// single authenticated identity path for the setup UI: the fingerprint the user
+/// reads aloud and the `d`-tag channel the run lands on are the same digest, so
+/// the two cannot drift the way a UI-side recomputation did.
+pub(crate) fn verify_roster(
+    group_name: &str,
+    threshold: u16,
+    participants: u16,
+    roster: &[DkgParticipant],
+    our_pubkey: &str,
+) -> Result<RosterVerification, KeepMobileError> {
+    let our = PublicKey::parse(our_pubkey)
+        .map_err(|e| frost_err(format!("this device's pubkey is invalid: {e}")))?;
+    let our_index = roster
+        .iter()
+        .find(|p| PublicKey::parse(&p.pubkey).ok().as_ref() == Some(&our))
+        .map(|p| p.index)
+        .ok_or_else(|| frost_err("this device is not in the roster"))?;
+    let config = DkgConfig {
+        group_name: group_name.to_string(),
+        threshold,
+        participants,
+        our_index,
+        relays: Vec::new(),
+        roster: roster.to_vec(),
+    };
+    let built = build_roster(&config)?;
+    Ok(RosterVerification {
+        fingerprint: group_id_fingerprint(&built.group_id),
+        our_index,
+    })
+}
+
 /// Encode the finalized share as an encrypted bech32 export, mirroring what the
 /// hardware/import paths persist (the caller stores it through `import_share`).
 fn export_share(
@@ -276,6 +370,18 @@ mod tests {
         Keys::new(sk.into())
     }
 
+    /// Distinct key for any `n`, unlike `subkey` whose u8 seed tops out at 255
+    /// usable values (seed 0 is an invalid secret key). Needed to build a roster
+    /// of 256 all-distinct participants, the only way to reach the u8 cap without
+    /// duplicate rejection firing first.
+    fn subkey_n(n: u16) -> Keys {
+        let mut b = [1u8; 32];
+        b[0] = (n & 0xff) as u8;
+        b[1] = (n >> 8) as u8;
+        let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&b).unwrap();
+        Keys::new(sk.into())
+    }
+
     fn config_with(
         threshold: u16,
         participants: u16,
@@ -385,5 +491,75 @@ mod tests {
         let mut bad = roster_of(&ks);
         bad[1].pubkey = "not-a-key".into();
         assert!(build_roster(&config_with(2, 3, 1, bad)).is_err());
+    }
+
+    #[test]
+    fn assemble_roster_numbers_coordinator_first_then_joiners() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let joiners = vec![ks[1].public_key().to_hex(), ks[2].public_key().to_hex()];
+        let roster = assemble_roster(&ks[0].public_key().to_hex(), &joiners).unwrap();
+        assert_eq!(roster, roster_of(&ks));
+    }
+
+    #[test]
+    fn assemble_roster_rejects_duplicate_and_invalid_keys() {
+        let ks = [subkey(1), subkey(2)];
+        // coordinator repeated as a joiner
+        assert!(
+            assemble_roster(&ks[0].public_key().to_hex(), &[ks[0].public_key().to_hex()]).is_err()
+        );
+        // unparseable joiner key
+        assert!(assemble_roster(&ks[0].public_key().to_hex(), &["nope".into()]).is_err());
+    }
+
+    #[test]
+    fn assemble_roster_rejects_more_than_u8_participants() {
+        // 255 distinct joiners + coordinator = 256 participants overflows the u8
+        // index. The keys must be distinct so the cap is what rejects the roster,
+        // not duplicate detection firing first.
+        let joiners: Vec<String> = (0..u8::MAX as u16)
+            .map(|i| subkey_n(i).public_key().to_hex())
+            .collect();
+        assert_eq!(joiners.len(), u8::MAX as usize);
+        assert!(assemble_roster(&subkey_n(1000).public_key().to_hex(), &joiners).is_err());
+    }
+
+    #[test]
+    fn verify_roster_resolves_our_index_and_matches_group_id() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let roster = roster_of(&ks);
+        let v = verify_roster("test", 2, 3, &roster, &ks[2].public_key().to_hex()).unwrap();
+        assert_eq!(v.our_index, 3);
+        let group_id = build_roster(&config_with(2, 3, 1, roster.clone()))
+            .unwrap()
+            .group_id;
+        assert_eq!(v.fingerprint, group_id_fingerprint(&group_id));
+        // bech32 pubkey must resolve to the same index as the hex form
+        let bech = ks[1].public_key().to_bech32().unwrap();
+        assert_eq!(
+            verify_roster("test", 2, 3, &roster, &bech)
+                .unwrap()
+                .our_index,
+            2
+        );
+    }
+
+    #[test]
+    fn verify_roster_rejects_outsider_and_bad_roster() {
+        let ks = [subkey(1), subkey(2), subkey(3)];
+        let roster = roster_of(&ks);
+        // a device whose key is not in the roster
+        assert!(verify_roster("test", 2, 3, &roster, &subkey(9).public_key().to_hex()).is_err());
+        // duplicate pubkey across two indices is rejected by build_roster
+        let mut dup = roster.clone();
+        dup[2].pubkey = ks[0].public_key().to_hex();
+        assert!(verify_roster("test", 2, 3, &dup, &ks[0].public_key().to_hex()).is_err());
+    }
+
+    #[test]
+    fn group_id_fingerprint_is_four_uppercase_hex_pairs() {
+        let mut id = [0u8; 32];
+        id[..8].copy_from_slice(&[0xAB, 0x12, 0xEF, 0x00, 0x9C, 0x34, 0x7D, 0x5E]);
+        assert_eq!(group_id_fingerprint(&id), "AB12 EF00 9C34 7D5E");
     }
 }
