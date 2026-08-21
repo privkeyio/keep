@@ -77,6 +77,16 @@ pub struct DkgParticipant {
     pub pubkey: String,
 }
 
+/// Result of validating a finalized roster in Rust (`frost_verify_roster`): the
+/// human-comparable fingerprint of the canonical `frost_group_id` that every
+/// participant reads aloud out of band, and the verifying device's index within
+/// the roster (resolved by matching its own subkey pubkey).
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct RosterVerification {
+    pub fingerprint: String,
+    pub our_index: u16,
+}
+
 #[derive(uniffi::Record, Clone)]
 pub struct DkgConfig {
     pub group_name: String,

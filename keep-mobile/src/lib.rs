@@ -51,8 +51,8 @@ pub use storage::{PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo,
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
     DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult, GeneratedShareInfo,
-    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, SignRequest,
-    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
+    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig,
+    RosterVerification, SignRequest, SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
 };
 
 #[uniffi::export]
@@ -73,6 +73,36 @@ pub fn truncate_str(s: String, prefix_len: u32, suffix_len: u32) -> String {
 #[uniffi::export]
 pub fn is_hex_64(value: String) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Assemble the coordinator's DKG roster in Rust: index 1 is the coordinator,
+/// each collected joiner subkey takes index i+2 in scan order (§4). Rejects a
+/// malformed or duplicated subkey before it reaches the wire. The roster-assembly
+/// policy lives here, not in the setup UI, so there is one authority on how
+/// indices map to keys.
+#[uniffi::export]
+pub fn frost_assemble_roster(
+    coordinator_pubkey: String,
+    joiner_pubkeys: Vec<String>,
+) -> Result<Vec<DkgParticipant>, KeepMobileError> {
+    dkg::assemble_roster(&coordinator_pubkey, &joiner_pubkeys)
+}
+
+/// Validate a finalized roster with the same checks `frost_run_dkg` applies
+/// (index range/uniqueness, duplicate-pubkey rejection, threshold/participant
+/// bounds), resolve this device's index by matching `our_pubkey`, and return a
+/// human-comparable fingerprint of the canonical `frost_group_id`. The setup UI
+/// renders this fingerprint instead of recomputing its own digest, so the value
+/// read aloud out of band cannot drift from the id the run actually uses.
+#[uniffi::export]
+pub fn frost_verify_roster(
+    group_name: String,
+    threshold: u16,
+    participants: u16,
+    roster: Vec<DkgParticipant>,
+    our_pubkey: String,
+) -> Result<RosterVerification, KeepMobileError> {
+    dkg::verify_roster(&group_name, threshold, participants, &roster, &our_pubkey)
 }
 
 #[uniffi::export]
