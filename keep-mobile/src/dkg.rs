@@ -493,11 +493,9 @@ mod tests {
     fn assemble_roster_rejects_duplicate_and_invalid_keys() {
         let ks = [subkey(1), subkey(2)];
         // coordinator repeated as a joiner
-        assert!(assemble_roster(
-            &ks[0].public_key().to_hex(),
-            &[ks[0].public_key().to_hex()]
-        )
-        .is_err());
+        assert!(
+            assemble_roster(&ks[0].public_key().to_hex(), &[ks[0].public_key().to_hex()]).is_err()
+        );
         // unparseable joiner key
         assert!(assemble_roster(&ks[0].public_key().to_hex(), &["nope".into()]).is_err());
     }
@@ -515,12 +513,18 @@ mod tests {
         let roster = roster_of(&ks);
         let v = verify_roster("test", 2, 3, &roster, &ks[2].public_key().to_hex()).unwrap();
         assert_eq!(v.our_index, 3);
-        let group_id =
-            build_roster(&config_with(2, 3, 1, roster.clone())).unwrap().group_id;
+        let group_id = build_roster(&config_with(2, 3, 1, roster.clone()))
+            .unwrap()
+            .group_id;
         assert_eq!(v.fingerprint, group_id_fingerprint(&group_id));
         // bech32 pubkey must resolve to the same index as the hex form
         let bech = ks[1].public_key().to_bech32().unwrap();
-        assert_eq!(verify_roster("test", 2, 3, &roster, &bech).unwrap().our_index, 2);
+        assert_eq!(
+            verify_roster("test", 2, 3, &roster, &bech)
+                .unwrap()
+                .our_index,
+            2
+        );
     }
 
     #[test]
