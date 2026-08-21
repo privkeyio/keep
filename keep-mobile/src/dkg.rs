@@ -370,6 +370,18 @@ mod tests {
         Keys::new(sk.into())
     }
 
+    /// Distinct key for any `n`, unlike `subkey` whose u8 seed tops out at 255
+    /// usable values (seed 0 is an invalid secret key). Needed to build a roster
+    /// of 256 all-distinct participants, the only way to reach the u8 cap without
+    /// duplicate rejection firing first.
+    fn subkey_n(n: u16) -> Keys {
+        let mut b = [1u8; 32];
+        b[0] = (n & 0xff) as u8;
+        b[1] = (n >> 8) as u8;
+        let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&b).unwrap();
+        Keys::new(sk.into())
+    }
+
     fn config_with(
         threshold: u16,
         participants: u16,
@@ -502,9 +514,14 @@ mod tests {
 
     #[test]
     fn assemble_roster_rejects_more_than_u8_participants() {
-        // 255 joiners + coordinator = 256 participants overflows the u8 index.
-        let joiners = vec![subkey(1).public_key().to_hex(); u8::MAX as usize];
-        assert!(assemble_roster(&subkey(2).public_key().to_hex(), &joiners).is_err());
+        // 255 distinct joiners + coordinator = 256 participants overflows the u8
+        // index. The keys must be distinct so the cap is what rejects the roster,
+        // not duplicate detection firing first.
+        let joiners: Vec<String> = (0..u8::MAX as u16)
+            .map(|i| subkey_n(i).public_key().to_hex())
+            .collect();
+        assert_eq!(joiners.len(), u8::MAX as usize);
+        assert!(assemble_roster(&subkey_n(1000).public_key().to_hex(), &joiners).is_err());
     }
 
     #[test]
