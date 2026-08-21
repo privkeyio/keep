@@ -184,6 +184,15 @@ pub(crate) fn assemble_roster(
     coordinator_pubkey: &str,
     joiner_pubkeys: &[String],
 ) -> Result<Vec<DkgParticipant>, KeepMobileError> {
+    // FROST indices are u8, so cap the count before the u16 cast below can wrap
+    // (65536 -> index 0). Fail closed here rather than leak a bad index downstream.
+    if joiner_pubkeys.len() + 1 > u8::MAX as usize {
+        return Err(frost_err(format!(
+            "roster carries {} participants but at most {} are allowed",
+            joiner_pubkeys.len() + 1,
+            u8::MAX
+        )));
+    }
     let mut entries = Vec::with_capacity(joiner_pubkeys.len() + 1);
     let mut seen: Vec<PublicKey> = Vec::new();
     for (i, pk) in std::iter::once(coordinator_pubkey)
@@ -491,6 +500,13 @@ mod tests {
         .is_err());
         // unparseable joiner key
         assert!(assemble_roster(&ks[0].public_key().to_hex(), &["nope".into()]).is_err());
+    }
+
+    #[test]
+    fn assemble_roster_rejects_more_than_u8_participants() {
+        // 255 joiners + coordinator = 256 participants overflows the u8 index.
+        let joiners = vec![subkey(1).public_key().to_hex(); u8::MAX as usize];
+        assert!(assemble_roster(&subkey(2).public_key().to_hex(), &joiners).is_err());
     }
 
     #[test]
