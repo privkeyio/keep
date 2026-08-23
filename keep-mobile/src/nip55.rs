@@ -30,7 +30,7 @@ const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
 // alone is not a sufficient DoS guard.
 const MAX_REQUESTS_PER_WINDOW: u32 = 60;
 const MAX_BACKOFF: Duration = Duration::from_secs(300);
-const MAX_BATCH_SIZE: usize = 20;
+pub(crate) const MAX_BATCH_SIZE: usize = 20;
 const MAX_RATE_LIMIT_ENTRIES: usize = 1000;
 const MAX_PERMISSIONS_COUNT: usize = 32;
 const MAX_PERMISSIONS_JSON_BYTES: usize = 8 * 1024;
