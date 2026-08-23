@@ -145,6 +145,11 @@ pub fn backup_min_passphrase_length() -> u32 {
 }
 
 #[uniffi::export]
+pub fn nip55_max_batch_size() -> u32 {
+    nip55::MAX_BATCH_SIZE as u32
+}
+
+#[uniffi::export]
 pub fn recover_nsec(
     share_data: Vec<String>,
     passphrases: Vec<String>,
