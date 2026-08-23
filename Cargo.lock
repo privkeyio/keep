@@ -4625,7 +4625,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_core 0.6.4",
  "redb 2.6.3",
- "redb 4.1.0",
+ "redb 4.2.0",
  "scrypt 0.12.0",
  "secrecy",
  "serde",
@@ -4701,7 +4701,7 @@ dependencies = [
  "p384",
  "postcard",
  "rand_core 0.10.1",
- "redb 4.1.0",
+ "redb 4.2.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4735,7 +4735,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rand 0.10.2",
- "redb 4.1.0",
+ "redb 4.2.0",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -7588,9 +7588,9 @@ dependencies = [
 
 [[package]]
 name = "redb"
-version = "4.1.0"
+version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e925444704b5f17d32bf42f5b6e2df050bceebc3dcd6e71cc73dafe8092e839"
+checksum = "de6c3b63e007e90ce536ec2ae4690826136a20ec8dbbbb400daef1bb999d2e36"
 dependencies = [
  "libc",
 ]
@@ -9888,9 +9888,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.24.0"
+version = "1.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
 dependencies = [
  "atomic",
  "getrandom 0.4.3",
