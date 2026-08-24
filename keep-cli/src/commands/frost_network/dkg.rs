@@ -663,19 +663,26 @@ fn cmd_frost_network_dkg_software(
     // under the vault password the operator just entered. Best-effort: if the
     // stash cannot be written the store below still gets its chance.
     let stashed = {
+        // The subkey secret is intentionally omitted: `ShareExport` has no field
+        // for it, so recovery via `keep frost import` relies on the enrolled
+        // per-group subkey secret still living in the vault's subkey store. It
+        // does — this failure drops only the share row, never the enrollment.
         let metadata = ShareMetadata::new(
             result.our_index,
             threshold as u16,
             participants as u16,
             result.group_pubkey,
             group.to_string(),
-        )
-        .with_group_subkey_secret(*subkey_secret);
+        );
+        // Stash as JSON, not the size-limited bech32 form: a file has no length
+        // bound, and JSON carries the full public-key package so a recovered
+        // share matches what the vault store would have persisted rather than
+        // degrading to a single-entry package. `keep frost import` reads both.
         let built = SharePackage::new(metadata, &result.key_package, &result.public_key_package)
             .and_then(|pkg| ShareExport::from_share(&pkg, password.expose_secret()))
-            .and_then(|export| export.to_bech32());
+            .and_then(|export| export.to_json());
         match built {
-            Ok(bech32) => match write_dkg_recovery_stash(&recovery_path, &bech32) {
+            Ok(export_json) => match write_dkg_recovery_stash(&recovery_path, &export_json) {
                 Ok(()) => true,
                 Err(e) => {
                     out.warn(&format!("could not write DKG recovery stash: {e}"));
@@ -755,7 +762,7 @@ fn cmd_frost_network_dkg_software(
 ///
 /// §8: once the ceremony holds its CertEq certificate every peer treats the
 /// group as live, so a persist failure must not lose this device's share. The
-/// finalized export is written here — the same passphrase-encrypted bech32 form
+/// finalized export is written here — the same passphrase-encrypted JSON export
 /// `keep frost import` reads — before the vault store is attempted, and removed
 /// only once the store confirms. The group name is hex-encoded so any valid
 /// (1..=64-char) d-tag maps to a unique, filesystem-safe sibling of the vault.
@@ -771,7 +778,7 @@ fn dkg_recovery_stash_path(vault_path: &std::path::Path, group: &str) -> std::pa
 
 /// Durably write the pre-store share stash owner-only, refusing to overwrite an
 /// existing one so a stale unrecovered share is never silently clobbered.
-fn write_dkg_recovery_stash(path: &std::path::Path, export_bech32: &str) -> Result<()> {
+fn write_dkg_recovery_stash(path: &std::path::Path, export_json: &str) -> Result<()> {
     let io_err = |e: std::io::Error| {
         KeepError::StorageErr(keep_core::error::StorageError::io(format!(
             "write DKG recovery stash: {e}"
@@ -787,8 +794,17 @@ fn write_dkg_recovery_stash(path: &std::path::Path, export_bech32: &str) -> Resu
             .mode(0o600)
             .open(path)
             .map_err(io_err)?;
-        file.write_all(export_bech32.as_bytes()).map_err(io_err)?;
+        file.write_all(export_json.as_bytes()).map_err(io_err)?;
         file.sync_all().map_err(io_err)?;
+        // fsync the parent directory too: the file contents are durable above,
+        // but the new dirent may not survive a crash in the write→store window
+        // this stash exists to close. Best-effort — a missing/unopenable parent
+        // only weakens durability, it does not invalidate the written share.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
     }
     #[cfg(not(unix))]
     {
@@ -798,7 +814,7 @@ fn write_dkg_recovery_stash(path: &std::path::Path, export_bech32: &str) -> Resu
                 "recovery stash already exists",
             )));
         }
-        std::fs::write(path, export_bech32.as_bytes()).map_err(io_err)?;
+        std::fs::write(path, export_json.as_bytes()).map_err(io_err)?;
     }
     Ok(())
 }
