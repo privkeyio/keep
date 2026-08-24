@@ -533,6 +533,7 @@ fn cmd_frost_network_dkg_software(
     vault_path: &std::path::Path,
 ) -> Result<()> {
     use keep_core::frost::dkg::SoftwareDkgSession;
+    use keep_core::frost::{ShareExport, ShareMetadata, SharePackage};
     use secrecy::ExposeSecret;
 
     out.newline();
@@ -561,6 +562,29 @@ fn cmd_frost_network_dkg_software(
     if group.is_empty() || group.chars().count() > 64 {
         return Err(KeepError::FrostErr(FrostError::invalid_config(
             "group name must be 1..=64 characters".to_string(),
+        )));
+    }
+
+    // §8: the pre-store stash is a single per-group slot. A fresh run derives a
+    // fresh subkey, so completing one while an earlier share is still pending
+    // recovery would clobber it. Refuse to start until the prior share is
+    // imported — before opening the vault or prompting for a password so a
+    // blocked operator learns early, without entering credentials first.
+    let recovery_path = dkg_recovery_stash_path(vault_path, group);
+    let stash_present = recovery_path.try_exists().map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "check DKG recovery stash {}: {e}",
+            recovery_path.display()
+        )))
+    })?;
+    if stash_present {
+        return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
+            format!(
+                "a completed DKG share for group '{group}' is pending recovery at {p}; \
+                 import it with `keep frost import < {p}` (then delete it), or if already \
+                 imported delete it with `rm {p}`, before starting a new run",
+                p = recovery_path.display()
+            ),
         )));
     }
 
@@ -638,15 +662,103 @@ fn cmd_frost_network_dkg_software(
     // certificate (all n signatures over the transcript), so reaching here means
     // the group is genuinely agreed — persist the share after, never before.
     let result = &outcome.result;
+
+    // §8: the ceremony now holds its CertEq certificate, so every peer treats
+    // the group as live. Stash the finalized share durably before the vault
+    // store so a persist failure here (full disk, encrypted-write error) does
+    // not silently drop a share the peers already rely on. The stash is the
+    // same passphrase-encrypted export `keep frost import` reads, encrypted
+    // under the vault password the operator just entered. Best-effort: if the
+    // stash cannot be written the store below still gets its chance.
+    let stashed = {
+        // The subkey secret is intentionally omitted: `ShareExport` has no field
+        // for it, so recovery via `keep frost import` relies on the enrolled
+        // per-group subkey secret still living in the vault's subkey store. It
+        // does — this failure drops only the share row, never the enrollment.
+        let metadata = ShareMetadata::new(
+            result.our_index,
+            threshold as u16,
+            participants as u16,
+            result.group_pubkey,
+            group.to_string(),
+        );
+        // Stash as JSON, not the size-limited bech32 form: a file has no length
+        // bound, and JSON carries the full public-key package so a recovered
+        // share matches what the vault store would have persisted rather than
+        // degrading to a single-entry package. `keep frost import` reads both.
+        let built = SharePackage::new(metadata, &result.key_package, &result.public_key_package)
+            .and_then(|pkg| ShareExport::from_share(&pkg, password.expose_secret()))
+            .and_then(|export| export.to_json());
+        match built {
+            Ok(export_json) => match write_dkg_recovery_stash(&recovery_path, &export_json) {
+                Ok(()) => true,
+                Err(e) => {
+                    out.warn(&format!("could not write DKG recovery stash: {e}"));
+                    false
+                }
+            },
+            Err(e) => {
+                out.warn(&format!("could not build DKG recovery stash: {e}"));
+                false
+            }
+        }
+    };
+
     let spinner = out.spinner("Storing share in vault...");
-    keep.frost_store_dkg_share(
+    match keep.frost_store_dkg_share(
         result,
         threshold as u16,
         participants as u16,
         group,
         Some(*subkey_secret),
-    )?;
-    spinner.finish();
+    ) {
+        Ok(()) => spinner.finish(),
+        Err(e) => {
+            spinner.finish();
+            // §8: never lose the share. It survives in the durable stash; tell
+            // the operator how to finish the import rather than returning as if
+            // the ceremony never happened.
+            out.newline();
+            if stashed {
+                out.warn(
+                    "Storing the share in the vault failed, but the completed share was saved.",
+                );
+                out.field("Recovery file", &recovery_path.display().to_string());
+                out.info(&format!(
+                    "Finish the import with: keep frost import < {}",
+                    recovery_path.display()
+                ));
+                out.info("Use the vault password as the share passphrase when prompted.");
+                out.info(&format!(
+                    "Then delete the recovery file, or the next run for '{group}' will \
+                     refuse to start: rm {}",
+                    recovery_path.display()
+                ));
+            } else {
+                // The stash write also failed earlier (only a warning was
+                // emitted then), so there is no durable copy: the share is lost.
+                // Say so plainly rather than returning the store error as if the
+                // ceremony could simply be retried.
+                out.warn(
+                    "Storing the share in the vault failed and no recovery file could be \
+                     written — this device's share is lost and the DKG must be rerun.",
+                );
+            }
+            return Err(e);
+        }
+    }
+
+    // Store confirmed; the share is safe in the vault. Clear the stash
+    // (best-effort — a stale stash only blocks the next run for this group, it
+    // never costs a share).
+    if stashed {
+        if let Err(e) = std::fs::remove_file(&recovery_path) {
+            out.warn(&format!(
+                "share stored, but could not remove DKG recovery stash {}: {e}",
+                recovery_path.display()
+            ));
+        }
+    }
 
     out.newline();
     out.success("DKG Complete!");
@@ -665,6 +777,70 @@ fn cmd_frost_network_dkg_software(
         "Group '{group}' is now ready for threshold signing."
     ));
 
+    Ok(())
+}
+
+/// Path of the durable pre-store stash for a completed software-DKG share.
+///
+/// §8: once the ceremony holds its CertEq certificate every peer treats the
+/// group as live, so a persist failure must not lose this device's share. The
+/// finalized export is written here — the same passphrase-encrypted JSON export
+/// `keep frost import` reads — before the vault store is attempted, and removed
+/// only once the store confirms. The group name is hex-encoded so any valid
+/// (1..=64-char) d-tag maps to a unique, filesystem-safe sibling of the vault.
+fn dkg_recovery_stash_path(vault_path: &std::path::Path, group: &str) -> std::path::PathBuf {
+    let parent = vault_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    parent.join(format!(
+        "keep-dkg-pending.{}.share",
+        hex::encode(group.as_bytes())
+    ))
+}
+
+/// Durably write the pre-store share stash owner-only, refusing to overwrite an
+/// existing one so a stale unrecovered share is never silently clobbered.
+fn write_dkg_recovery_stash(path: &std::path::Path, export_json: &str) -> Result<()> {
+    let io_err = |e: std::io::Error| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "write DKG recovery stash: {e}"
+        )))
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(io_err)?;
+        file.write_all(export_json.as_bytes()).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+        // fsync the parent directory too: the file contents are durable above,
+        // but the new dirent may not survive a crash in the write→store window
+        // this stash exists to close. Best-effort — a missing/unopenable parent
+        // only weakens durability, it does not invalidate the written share.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Write as _;
+        // create_new fails closed with AlreadyExists, so a stale unrecovered
+        // stash is refused atomically rather than via a racy exists() check.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(io_err)?;
+        file.write_all(export_json.as_bytes()).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
+    }
     Ok(())
 }
 
@@ -878,4 +1054,53 @@ pub fn cmd_frost_network_group_subkey(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod recovery_stash_tests {
+    use super::{dkg_recovery_stash_path, write_dkg_recovery_stash};
+    use std::path::Path;
+
+    #[test]
+    fn stash_path_is_deterministic_and_per_group() {
+        let vault = Path::new("/tmp/keep/vault.db");
+        let a = dkg_recovery_stash_path(vault, "team-alpha");
+        let b = dkg_recovery_stash_path(vault, "team-alpha");
+        let c = dkg_recovery_stash_path(vault, "team-beta");
+        assert_eq!(a, b, "same group must map to the same stash path");
+        assert_ne!(a, c, "different groups must not collide");
+        assert_eq!(a.parent(), Some(Path::new("/tmp/keep")));
+    }
+
+    #[test]
+    fn stash_path_survives_awkward_group_names() {
+        // A d-tag with path separators/spaces must not escape the vault dir.
+        let vault = Path::new("/tmp/keep/vault.db");
+        let path = dkg_recovery_stash_path(vault, "../../etc/passwd danger");
+        assert_eq!(path.parent(), Some(Path::new("/tmp/keep")));
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert!(!name.contains('/') && !name.contains(' '));
+    }
+
+    #[test]
+    fn write_refuses_to_clobber_an_existing_stash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.share");
+        write_dkg_recovery_stash(&path, "export-one").unwrap();
+        // A second, fresh-subkey run must never overwrite an unrecovered share.
+        let err = write_dkg_recovery_stash(&path, "export-two").unwrap_err();
+        assert!(err.to_string().contains("DKG recovery stash"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "export-one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pending.share");
+        write_dkg_recovery_stash(&path, "export").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }
