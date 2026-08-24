@@ -1401,6 +1401,19 @@ impl KeepMobile {
         }
     }
 
+    /// Discard the pending DKG subkey minted by `frost_dkg_begin` for
+    /// `group_name` without running the ceremony. A begin that is never followed
+    /// by `frost_run_dkg` (the user toggles Start/Join, or the ceremony is
+    /// abandoned) would otherwise leave its minted subkey secret stashed for the
+    /// process lifetime; the client calls this on abandonment to zeroize and drop
+    /// it. Idempotent: a group with no pending subkey is a no-op.
+    pub fn frost_dkg_discard(&self, group_name: String) {
+        self.dkg_subkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&group_name);
+    }
+
     /// Run a full relay-driven DKG to create a new group on this device, then
     /// persist the resulting share. Every participant calls this concurrently
     /// with the same invite roster (`config.roster`) and relays but its own
@@ -1477,8 +1490,11 @@ impl KeepMobile {
         }
 
         // Load this device's pending subkey (from `frost_dkg_begin`) and rebuild
-        // its keypair. Fail before any network I/O if the two-call sequence was
-        // skipped.
+        // its keypair. Clone (don't consume) here so a preflight failure below
+        // — relay TLS pinning or proxy setup — leaves the subkey stashed for a
+        // cheap retry rather than forcing a re-mint (and a fresh roster across
+        // every participant). Fail before any network I/O if the two-call
+        // sequence was skipped.
         let subkey = {
             let map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
             let secret = map.get(&config.group_name).cloned().ok_or_else(|| {
@@ -1511,6 +1527,17 @@ impl KeepMobile {
         } else {
             None
         };
+
+        // Preflight has passed and the ceremony is about to start, so consume the
+        // subkey now: it is single-use for this run — a completed or failed
+        // *ceremony* must not leave it stashed for the process lifetime (a retry
+        // re-mints via `frost_dkg_begin`). A concurrent `frost_dkg_discard` that
+        // raced the preflight above simply makes this a no-op; we proceed with the
+        // keypair already cloned.
+        self.dkg_subkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&config.group_name);
 
         // Mint this run's identity and a fresh cancel flag, then register it so
         // `frost_cancel_dkg(run_id)` targets only this run. The id reaches the UI
@@ -5595,6 +5622,74 @@ mod dkg_pending_share_tests {
         // With no active run, a cancel is a harmless no-op.
         *mobile.dkg_active.lock().unwrap() = None;
         mobile.frost_cancel_dkg(2);
+    }
+
+    // `frost_dkg_begin` stashes a per-group subkey secret; an abandoned begin
+    // (never followed by `frost_run_dkg`) must be discardable so it can't
+    // accumulate for the process lifetime (GH #970).
+    #[test]
+    fn discard_drops_pending_dkg_subkey() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+        mobile.frost_dkg_begin("group-b".into()).unwrap();
+        assert_eq!(mobile.dkg_subkeys.lock().unwrap().len(), 2);
+
+        // Discarding one abandoned begin drops only that group's subkey.
+        mobile.frost_dkg_discard("group-a".into());
+        let map = mobile.dkg_subkeys.lock().unwrap();
+        assert!(!map.contains_key("group-a"));
+        assert!(map.contains_key("group-b"));
+        drop(map);
+
+        // Discarding a group with no pending subkey is a harmless no-op.
+        mobile.frost_dkg_discard("group-a".into());
+        assert_eq!(mobile.dkg_subkeys.lock().unwrap().len(), 1);
+    }
+
+    // A preflight failure in `frost_run_dkg` (here: no relay clears TLS pinning,
+    // failing before the ceremony starts) must leave the pending subkey stashed
+    // so the run can be retried without re-minting — which would otherwise force
+    // a fresh roster across every participant.
+    #[test]
+    fn run_dkg_preflight_failure_retains_pending_subkey() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+
+        // Empty relay set: nothing passes TLS pinning, so `frost_run_dkg` fails
+        // in preflight, before any ceremony network I/O.
+        let config = DkgConfig {
+            group_name: "group-a".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: Vec::new(),
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "group-a-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("a run with no verifiable relay must fail in preflight");
+        assert!(
+            matches!(err, KeepMobileError::NetworkError { .. }),
+            "expected a network/transport error, got {err:?}"
+        );
+
+        // The subkey survives the failed preflight, so a retry needs no re-mint.
+        assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.
