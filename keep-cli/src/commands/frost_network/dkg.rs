@@ -565,6 +565,29 @@ fn cmd_frost_network_dkg_software(
         )));
     }
 
+    // §8: the pre-store stash is a single per-group slot. A fresh run derives a
+    // fresh subkey, so completing one while an earlier share is still pending
+    // recovery would clobber it. Refuse to start until the prior share is
+    // imported — before opening the vault or prompting for a password so a
+    // blocked operator learns early, without entering credentials first.
+    let recovery_path = dkg_recovery_stash_path(vault_path, group);
+    let stash_present = recovery_path.try_exists().map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "check DKG recovery stash {}: {e}",
+            recovery_path.display()
+        )))
+    })?;
+    if stash_present {
+        return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
+            format!(
+                "a completed DKG share for group '{group}' is pending recovery at {p}; \
+                 import it with `keep frost import < {p}` (then delete it), or if already \
+                 imported delete it with `rm {p}`, before starting a new run",
+                p = recovery_path.display()
+            ),
+        )));
+    }
+
     let spinner = out.spinner("Opening vault...");
     let mut keep = Keep::open(vault_path)?;
     let password = super::get_password("Enter password")?;
@@ -578,27 +601,6 @@ fn cmd_frost_network_dkg_software(
         "Subkey npub",
         &subkey.public_key().to_bech32().unwrap_or_default(),
     );
-
-    // §8: the pre-store stash is a single per-group slot. A fresh run derives a
-    // fresh subkey, so completing one while an earlier share is still pending
-    // recovery would clobber it. Refuse to start until the prior share is
-    // imported, and fail before any network round so the operator learns early.
-    let recovery_path = dkg_recovery_stash_path(vault_path, group);
-    let stash_present = recovery_path.try_exists().map_err(|e| {
-        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-            "check DKG recovery stash {}: {e}",
-            recovery_path.display()
-        )))
-    })?;
-    if stash_present {
-        return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
-            format!(
-                "a completed DKG share for group '{group}' is pending recovery at {}; \
-                 import it with `keep frost import` before starting a new run",
-                recovery_path.display()
-            ),
-        )));
-    }
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -716,8 +718,8 @@ fn cmd_frost_network_dkg_software(
             // §8: never lose the share. It survives in the durable stash; tell
             // the operator how to finish the import rather than returning as if
             // the ceremony never happened.
+            out.newline();
             if stashed {
-                out.newline();
                 out.warn(
                     "Storing the share in the vault failed, but the completed share was saved.",
                 );
@@ -727,6 +729,20 @@ fn cmd_frost_network_dkg_software(
                     recovery_path.display()
                 ));
                 out.info("Use the vault password as the share passphrase when prompted.");
+                out.info(&format!(
+                    "Then delete the recovery file, or the next run for '{group}' will \
+                     refuse to start: rm {}",
+                    recovery_path.display()
+                ));
+            } else {
+                // The stash write also failed earlier (only a warning was
+                // emitted then), so there is no durable copy: the share is lost.
+                // Say so plainly rather than returning the store error as if the
+                // ceremony could simply be retried.
+                out.warn(
+                    "Storing the share in the vault failed and no recovery file could be \
+                     written — this device's share is lost and the DKG must be rerun.",
+                );
             }
             return Err(e);
         }
