@@ -1490,17 +1490,18 @@ impl KeepMobile {
         }
 
         // Load this device's pending subkey (from `frost_dkg_begin`) and rebuild
-        // its keypair. Fail before any network I/O if the two-call sequence was
-        // skipped. Consume it here: the subkey is single-use for this run, so a
-        // completed or failed run must not leave it stashed for the process
-        // lifetime (a retry re-mints via `frost_dkg_begin`).
+        // its keypair. Clone (don't consume) here so a preflight failure below
+        // — relay TLS pinning or proxy setup — leaves the subkey stashed for a
+        // cheap retry rather than forcing a re-mint (and a fresh roster across
+        // every participant). Fail before any network I/O if the two-call
+        // sequence was skipped.
         let subkey = {
-            let mut map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
-            let secret =
-                map.remove(&config.group_name)
-                    .ok_or_else(|| KeepMobileError::FrostError {
-                        msg: "call frost_dkg_begin for this group before frost_run_dkg".into(),
-                    })?;
+            let map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
+            let secret = map.get(&config.group_name).cloned().ok_or_else(|| {
+                KeepMobileError::FrostError {
+                    msg: "call frost_dkg_begin for this group before frost_run_dkg".into(),
+                }
+            })?;
             let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&*secret).map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("stored DKG subkey is invalid: {e}"),
@@ -1526,6 +1527,17 @@ impl KeepMobile {
         } else {
             None
         };
+
+        // Preflight has passed and the ceremony is about to start, so consume the
+        // subkey now: it is single-use for this run — a completed or failed
+        // *ceremony* must not leave it stashed for the process lifetime (a retry
+        // re-mints via `frost_dkg_begin`). A concurrent `frost_dkg_discard` that
+        // raced the preflight above simply makes this a no-op; we proceed with the
+        // keypair already cloned.
+        self.dkg_subkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&config.group_name);
 
         // Mint this run's identity and a fresh cancel flag, then register it so
         // `frost_cancel_dkg(run_id)` targets only this run. The id reaches the UI
@@ -5634,6 +5646,50 @@ mod dkg_pending_share_tests {
         // Discarding a group with no pending subkey is a harmless no-op.
         mobile.frost_dkg_discard("group-a".into());
         assert_eq!(mobile.dkg_subkeys.lock().unwrap().len(), 1);
+    }
+
+    // A preflight failure in `frost_run_dkg` (here: no relay clears TLS pinning,
+    // failing before the ceremony starts) must leave the pending subkey stashed
+    // so the run can be retried without re-minting — which would otherwise force
+    // a fresh roster across every participant.
+    #[test]
+    fn run_dkg_preflight_failure_retains_pending_subkey() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+
+        // Empty relay set: nothing passes TLS pinning, so `frost_run_dkg` fails
+        // in preflight, before any ceremony network I/O.
+        let config = DkgConfig {
+            group_name: "group-a".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: Vec::new(),
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "group-a-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("a run with no verifiable relay must fail in preflight");
+        assert!(
+            matches!(err, KeepMobileError::NetworkError { .. }),
+            "expected a network/transport error, got {err:?}"
+        );
+
+        // The subkey survives the failed preflight, so a retry needs no re-mint.
+        assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.
