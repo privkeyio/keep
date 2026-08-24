@@ -1401,6 +1401,19 @@ impl KeepMobile {
         }
     }
 
+    /// Discard the pending DKG subkey minted by `frost_dkg_begin` for
+    /// `group_name` without running the ceremony. A begin that is never followed
+    /// by `frost_run_dkg` (the user toggles Start/Join, or the ceremony is
+    /// abandoned) would otherwise leave its minted subkey secret stashed for the
+    /// process lifetime; the client calls this on abandonment to zeroize and drop
+    /// it. Idempotent: a group with no pending subkey is a no-op.
+    pub fn frost_dkg_discard(&self, group_name: String) {
+        self.dkg_subkeys
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&group_name);
+    }
+
     /// Run a full relay-driven DKG to create a new group on this device, then
     /// persist the resulting share. Every participant calls this concurrently
     /// with the same invite roster (`config.roster`) and relays but its own
@@ -1478,14 +1491,16 @@ impl KeepMobile {
 
         // Load this device's pending subkey (from `frost_dkg_begin`) and rebuild
         // its keypair. Fail before any network I/O if the two-call sequence was
-        // skipped.
+        // skipped. Consume it here: the subkey is single-use for this run, so a
+        // completed or failed run must not leave it stashed for the process
+        // lifetime (a retry re-mints via `frost_dkg_begin`).
         let subkey = {
-            let map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
-            let secret = map.get(&config.group_name).cloned().ok_or_else(|| {
-                KeepMobileError::FrostError {
-                    msg: "call frost_dkg_begin for this group before frost_run_dkg".into(),
-                }
-            })?;
+            let mut map = self.dkg_subkeys.lock().unwrap_or_else(|p| p.into_inner());
+            let secret =
+                map.remove(&config.group_name)
+                    .ok_or_else(|| KeepMobileError::FrostError {
+                        msg: "call frost_dkg_begin for this group before frost_run_dkg".into(),
+                    })?;
             let sk = nostr_sdk::secp256k1::SecretKey::from_slice(&*secret).map_err(|e| {
                 KeepMobileError::FrostError {
                     msg: format!("stored DKG subkey is invalid: {e}"),
@@ -5595,6 +5610,30 @@ mod dkg_pending_share_tests {
         // With no active run, a cancel is a harmless no-op.
         *mobile.dkg_active.lock().unwrap() = None;
         mobile.frost_cancel_dkg(2);
+    }
+
+    // `frost_dkg_begin` stashes a per-group subkey secret; an abandoned begin
+    // (never followed by `frost_run_dkg`) must be discardable so it can't
+    // accumulate for the process lifetime (GH #970).
+    #[test]
+    fn discard_drops_pending_dkg_subkey() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+        mobile.frost_dkg_begin("group-b".into()).unwrap();
+        assert_eq!(mobile.dkg_subkeys.lock().unwrap().len(), 2);
+
+        // Discarding one abandoned begin drops only that group's subkey.
+        mobile.frost_dkg_discard("group-a".into());
+        let map = mobile.dkg_subkeys.lock().unwrap();
+        assert!(!map.contains_key("group-a"));
+        assert!(map.contains_key("group-b"));
+        drop(map);
+
+        // Discarding a group with no pending subkey is a harmless no-op.
+        mobile.frost_dkg_discard("group-a".into());
+        assert_eq!(mobile.dkg_subkeys.lock().unwrap().len(), 1);
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.
