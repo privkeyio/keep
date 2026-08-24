@@ -584,7 +584,13 @@ fn cmd_frost_network_dkg_software(
     // recovery would clobber it. Refuse to start until the prior share is
     // imported, and fail before any network round so the operator learns early.
     let recovery_path = dkg_recovery_stash_path(vault_path, group);
-    if recovery_path.exists() {
+    let stash_present = recovery_path.try_exists().map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "check DKG recovery stash {}: {e}",
+            recovery_path.display()
+        )))
+    })?;
+    if stash_present {
         return Err(KeepError::StorageErr(keep_core::error::StorageError::io(
             format!(
                 "a completed DKG share for group '{group}' is pending recovery at {}; \
@@ -808,13 +814,16 @@ fn write_dkg_recovery_stash(path: &std::path::Path, export_json: &str) -> Result
     }
     #[cfg(not(unix))]
     {
-        if path.exists() {
-            return Err(io_err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "recovery stash already exists",
-            )));
-        }
-        std::fs::write(path, export_json.as_bytes()).map_err(io_err)?;
+        use std::io::Write as _;
+        // create_new fails closed with AlreadyExists, so a stale unrecovered
+        // stash is refused atomically rather than via a racy exists() check.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(io_err)?;
+        file.write_all(export_json.as_bytes()).map_err(io_err)?;
+        file.sync_all().map_err(io_err)?;
     }
     Ok(())
 }
