@@ -592,6 +592,14 @@ impl SigningHooks for MobileSigningHooks {
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 }
 
+/// Identity of the single in-flight `frost_run_dkg`: its run id and the cancel
+/// flag the coordinator polls. Registered in `KeepMobile::dkg_active` for the
+/// run's lifetime so `frost_cancel_dkg` can target it by id.
+struct DkgActiveRun {
+    id: u64,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
 #[derive(uniffi::Object)]
 pub struct KeepMobile {
     pub(crate) node: Arc<RwLock<Option<Arc<KfpNode>>>>,
@@ -608,11 +616,18 @@ pub struct KeepMobile {
     /// stays available with the share (C1); a process restart mid-ceremony just
     /// re-runs `frost_dkg_begin`.
     dkg_subkeys: Arc<std::sync::Mutex<HashMap<String, Zeroizing<[u8; 32]>>>>,
-    /// Cancel flag for the single in-flight `frost_run_dkg`; flipped by
-    /// `frost_cancel_dkg` and polled by the shared coordinator (§8/§9).
-    dkg_cancel: Arc<std::sync::atomic::AtomicBool>,
-    /// Single-flight guard: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so
-    /// a second concurrent run would reset the first's cancel flag. Rejected while
+    /// Identity + cancel flag for the single in-flight `frost_run_dkg`. Each run
+    /// mints a fresh id (from `dkg_run_seq`) and its own cancel flag, registered
+    /// here for its lifetime and cleared on every exit path by `DkgInFlightGuard`.
+    /// `frost_cancel_dkg(run_id)` flips the flag only when `run_id` matches the
+    /// active run, so a cancel issued for a run that has since finished cannot
+    /// abort the next run (§8: no wiping a concurrent run).
+    dkg_active: Arc<std::sync::Mutex<Option<DkgActiveRun>>>,
+    /// Monotonic allocator for `dkg_active` run ids; the run id also reaches the
+    /// UI via `DkgProgressUpdate::Started` so it can target its cancel.
+    dkg_run_seq: Arc<std::sync::atomic::AtomicU64>,
+    /// Single-flight guard: `frost_run_dkg` shares `dkg_active`/`dkg_subkeys`, so
+    /// a second concurrent run would clobber the first's identity. Rejected while
     /// set; cleared on every exit path by `DkgInFlightGuard`.
     dkg_in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime: tokio::runtime::Runtime,
@@ -777,7 +792,8 @@ impl KeepMobile {
             storage,
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            dkg_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            dkg_active: Arc::new(std::sync::Mutex::new(None)),
+            dkg_run_seq: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dkg_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             runtime,
             policy,
@@ -1369,13 +1385,21 @@ impl KeepMobile {
         Ok(keys.public_key().to_hex())
     }
 
-    /// Signal a cancel to an in-flight `frost_run_dkg`. The coordinator polls this
-    /// between relay fetches (§8/§9) and aborts the run promptly with a cancelled
-    /// error, tearing down the transport cleanly, instead of leaving a live
-    /// session for a `reset` to corrupt.
-    pub fn frost_cancel_dkg(&self) {
-        self.dkg_cancel
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+    /// Signal a cancel to the in-flight `frost_run_dkg` identified by `run_id`
+    /// (the id delivered via `DkgProgressUpdate::Started`). The coordinator polls
+    /// the run's flag between relay fetches (§8/§9) and aborts promptly with a
+    /// cancelled error, tearing down the transport cleanly, instead of leaving a
+    /// live session for a `reset` to corrupt. A `run_id` that does not match the
+    /// active run is ignored, so a cancel issued for a run that has since finished
+    /// cannot abort a later run (§8: no wiping a concurrent run).
+    pub fn frost_cancel_dkg(&self, run_id: u64) {
+        let active = self.dkg_active.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(run) = active.as_ref() {
+            if run.id == run_id {
+                run.cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Run a full relay-driven DKG to create a new group on this device, then
@@ -1398,13 +1422,19 @@ impl KeepMobile {
         timeout_secs: u64,
         progress: Arc<dyn dkg::DkgProgressCallback>,
     ) -> Result<ShareInfo, KeepMobileError> {
-        // Single-flight: `frost_run_dkg` shares `dkg_cancel`/`dkg_subkeys`, so a
-        // second concurrent call would reset the active run's cancel flag. Reject
-        // it, and clear the guard on every exit path via Drop.
-        struct DkgInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+        // Single-flight: `frost_run_dkg` shares `dkg_active`/`dkg_subkeys`, so a
+        // second concurrent call would clobber the active run's identity. Reject
+        // it, and on every exit path deregister the active run before releasing
+        // the flag so a next run cannot observe a stale identity.
+        struct DkgInFlightGuard {
+            in_flight: Arc<std::sync::atomic::AtomicBool>,
+            active: Arc<std::sync::Mutex<Option<DkgActiveRun>>>,
+        }
         impl Drop for DkgInFlightGuard {
             fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
+                *self.active.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                self.in_flight
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
         }
         if self
@@ -1421,7 +1451,10 @@ impl KeepMobile {
                 msg: "a DKG run is already in progress".into(),
             });
         }
-        let _in_flight = DkgInFlightGuard(self.dkg_in_flight.clone());
+        let _in_flight = DkgInFlightGuard {
+            in_flight: self.dkg_in_flight.clone(),
+            active: self.dkg_active.clone(),
+        };
 
         // Pre-flight the persistence constraints before the multi-round network
         // run so an invalid name or a full store fails fast, rather than after
@@ -1480,9 +1513,19 @@ impl KeepMobile {
             None
         };
 
-        // Fresh cancel flag for this run; `frost_cancel_dkg` flips it.
-        self.dkg_cancel
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Mint this run's identity and a fresh cancel flag, then register it so
+        // `frost_cancel_dkg(run_id)` targets only this run. The id reaches the UI
+        // via `Started` so it can issue a matching cancel.
+        let run_id = self
+            .dkg_run_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *self.dkg_active.lock().unwrap_or_else(|p| p.into_inner()) = Some(DkgActiveRun {
+            id: run_id,
+            cancel: cancel.clone(),
+        });
+        progress.on_progress(DkgProgressUpdate::Started { run_id });
 
         let passphrase = Zeroizing::new(passphrase);
         let timeout = Duration::from_secs(timeout_secs.max(30));
@@ -1494,7 +1537,7 @@ impl KeepMobile {
             &name,
             &passphrase,
             timeout,
-            &self.dkg_cancel,
+            &cancel,
             progress.clone(),
         ));
 
@@ -5506,6 +5549,53 @@ mod dkg_pending_share_tests {
             mobile.get_active_share().is_some(),
             "the recovered share must be stored and active"
         );
+    }
+
+    // `frost_cancel_dkg` must target a run by id: a stale id for a run that has
+    // since finished must not flip a later run's cancel flag (§8, GH #969).
+    #[test]
+    fn cancel_targets_run_by_id() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        // Register run 1 the way `frost_run_dkg` does.
+        let cancel1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *mobile.dkg_active.lock().unwrap() = Some(DkgActiveRun {
+            id: 1,
+            cancel: cancel1.clone(),
+        });
+
+        // A cancel for a different (already-finished) run is ignored.
+        mobile.frost_cancel_dkg(2);
+        assert!(
+            !cancel1.load(std::sync::atomic::Ordering::Relaxed),
+            "a mismatched run id must not cancel the active run"
+        );
+
+        // A cancel for the active run flips its flag.
+        mobile.frost_cancel_dkg(1);
+        assert!(
+            cancel1.load(std::sync::atomic::Ordering::Relaxed),
+            "the matching run id must cancel the active run"
+        );
+
+        // Simulate run 1 finishing (guard deregisters) and run 2 starting fresh.
+        let cancel2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *mobile.dkg_active.lock().unwrap() = Some(DkgActiveRun {
+            id: 2,
+            cancel: cancel2.clone(),
+        });
+
+        // The stale cancel for run 1 must not touch run 2.
+        mobile.frost_cancel_dkg(1);
+        assert!(
+            !cancel2.load(std::sync::atomic::Ordering::Relaxed),
+            "a cancel for a finished run must not abort the next run"
+        );
+
+        // With no active run, a cancel is a harmless no-op.
+        *mobile.dkg_active.lock().unwrap() = None;
+        mobile.frost_cancel_dkg(2);
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.
