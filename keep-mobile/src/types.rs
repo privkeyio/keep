@@ -127,6 +127,10 @@ impl std::fmt::Debug for DkgConfig {
 /// not cross the FFI as exceptions during the run, they arrive here.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq)]
 pub enum DkgProgressUpdate {
+    /// First event of a run, carrying the id that identifies it. Pass this id to
+    /// `frost_cancel_dkg` to cancel this specific run; a stale id targeting a run
+    /// that has since finished is ignored, so it cannot abort a later run.
+    Started { run_id: u64 },
     /// Establishing the relay connection with the bootstrap identity.
     Connecting,
     /// Waiting on peers' round-1 packages. `received` counts distinct peers so
