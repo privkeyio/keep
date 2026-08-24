@@ -1396,8 +1396,7 @@ impl KeepMobile {
         let active = self.dkg_active.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(run) = active.as_ref() {
             if run.id == run_id {
-                run.cancel
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                run.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
