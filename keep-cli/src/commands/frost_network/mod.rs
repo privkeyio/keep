@@ -1352,14 +1352,18 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::rename(&tmp, path)
         .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
     // fsync the containing directory so the new directory entry is durable across a crash; a
-    // rename only persists once the parent directory's metadata is synced.
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    std::fs::File::open(parent)
-        .and_then(|dir| dir.sync_all())
-        .map_err(|e| KeepError::Runtime(format!("sync dir {}: {e}", parent.display())))?;
+    // rename only persists once the parent directory's metadata is synced. Windows cannot open a
+    // directory as a file to sync it, and its rename is not deferred the same way.
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| KeepError::Runtime(format!("sync dir {}: {e}", parent.display())))?;
+    }
     Ok(())
 }
 
