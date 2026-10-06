@@ -4799,6 +4799,119 @@ async fn test_share_without_verifying_set_learns_it_and_signs() {
     assert_eq!(signature.len(), 64);
 }
 
+/// A share without the set learns it from one member's announce, which relays
+/// the proofs of members the learner never hears from itself.
+#[tokio::test]
+async fn test_share_without_verifying_set_learns_it_from_relayed_proofs() {
+    use keep_core::frost::ShareExport;
+    use std::sync::Arc;
+
+    let group_relay = MockRelay::run().await.expect("relay");
+    let group_relay = group_relay.url().await.to_string();
+    let learner_relay = MockRelay::run().await.expect("relay");
+    let learner_relay = learner_relay.url().await.to_string();
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
+    let (mut shares, _pkg) = dealer.generate("test-relayed-proofs").unwrap();
+    let full_set = shares[0].pubkey_package().unwrap();
+
+    let mut export = ShareExport::from_share(&shares.remove(0), "pass").unwrap();
+    export.encrypted_pubkey_package = None;
+    export.pubkey_nonce = None;
+    export.encrypted_verifying_shares = None;
+    export.verifying_shares_nonce = None;
+    let stripped = export.to_share("pass", "stripped").unwrap();
+
+    let mut handles = Vec::new();
+    let mut bridge = KfpNode::new(
+        shares.remove(0),
+        vec![group_relay.clone(), learner_relay.clone()],
+    )
+    .await
+    .unwrap();
+    let bridge_shutdown = bridge.take_shutdown_handle();
+    let bridge = Arc::new(bridge);
+    let bridge_handle = tokio::spawn({
+        let node = bridge.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    for share in shares {
+        let mut node = KfpNode::new(share, vec![group_relay.clone()])
+            .await
+            .unwrap();
+        let shutdown = node.take_shutdown_handle();
+        let handle = tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+        handles.push((shutdown, handle));
+    }
+    let bridged = timeout(Duration::from_secs(30), async {
+        while bridge.bound_peer_transport_keys().len() < 2 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    let mut learner = KfpNode::new(stripped, vec![learner_relay.clone()])
+        .await
+        .unwrap();
+    let mut rx = learner.subscribe();
+    let learner_shutdown = learner.take_shutdown_handle();
+    let learner = Arc::new(learner);
+    let learner_handle = tokio::spawn({
+        let node = learner.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    let learned = timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(keep_frost_net::KfpNodeEvent::VerifyingSharesLearned {
+                verifying_shares,
+                ..
+            }) = rx.recv().await
+            {
+                return verifying_shares;
+            }
+        }
+    })
+    .await;
+    let admitted = timeout(Duration::from_secs(30), async {
+        while learner.bound_peer_transport_keys().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let bound: Vec<u16> = learner
+        .bound_peer_transport_keys()
+        .iter()
+        .map(|(i, _)| *i)
+        .collect();
+
+    graceful_shutdown(learner_shutdown, learner_handle).await;
+    graceful_shutdown(bridge_shutdown, bridge_handle).await;
+    for (shutdown, handle) in handles {
+        graceful_shutdown(shutdown, handle).await;
+    }
+
+    bridged.expect("the bridging member must bind the others first");
+    let learned = learned.expect("the set must be learned from relayed proofs");
+    assert_eq!(learned.len(), 4);
+    for (index, bytes) in &learned {
+        let id = frost_secp256k1_tr::Identifier::try_from(*index).unwrap();
+        assert_eq!(
+            full_set.verifying_shares()[&id]
+                .serialize()
+                .unwrap()
+                .as_slice(),
+            bytes.as_slice()
+        );
+    }
+    admitted.expect("the bridging member must be admitted once learned");
+    assert_eq!(bound, vec![2], "only the bridging member is reachable");
+}
+
 /// A round with two or more co-signers and no pre-exchanged nonces completes:
 /// co-signers send their commitments to each other, not only to the requester.
 #[tokio::test]

@@ -128,6 +128,62 @@ impl LearnedVerifyingShares {
         self.complete.as_ref()
     }
 
+    /// Completes the set from the member proofs a node that knows it relays in
+    /// its announce (whose own proof the caller has checked). Accepted only when
+    /// every other member's point is proven and the whole set checks out
+    /// against the group key and this share, the same bar the search applies.
+    /// Nothing is kept from an announce that fails, so forged ones cannot
+    /// displace anything; each costs at most one proof check per member.
+    pub(crate) fn offer(
+        &mut self,
+        share: &SharePackage,
+        own_share: [u8; 33],
+        author: PublicKey,
+        payload: &AnnouncePayload,
+    ) -> Option<Learning> {
+        if self.complete.is_some() || payload.member_proofs.is_empty() {
+            return None;
+        }
+        let own = share.metadata.identifier;
+        let mut set = BTreeMap::from([
+            (own, own_share),
+            (payload.share_index, payload.verifying_share),
+        ]);
+        for proof in &payload.member_proofs {
+            if *set
+                .entry(proof.share_index)
+                .or_insert(proof.verifying_share)
+                != proof.verifying_share
+            {
+                return None;
+            }
+        }
+        complete_verifying_shares(share, &set).ok()?;
+        for proof in &payload.member_proofs {
+            if proof.share_index != own && proof.share_index != payload.share_index {
+                crate::proof::verify_proof(
+                    &proof.verifying_share,
+                    &proof.proof_signature,
+                    &payload.group_pubkey,
+                    proof.share_index,
+                    &proof.transport_pubkey,
+                    proof.timestamp,
+                )
+                .ok()?;
+            }
+        }
+        let held = self
+            .candidates
+            .iter()
+            .flat_map(|(i, list)| list.iter().map(move |c| (i, c)))
+            .filter(|(i, c)| c.author != author && set.get(i) == Some(&c.point))
+            .filter_map(|(_, c)| c.payload.clone().map(|p| (c.author, p)))
+            .collect();
+        self.candidates.clear();
+        self.complete = Some(set.clone());
+        Some(Learning::Completed { set, held })
+    }
+
     /// Records a proven announce and checks whether the recorded candidates now
     /// contain the group's whole set for `share`.
     pub(crate) fn record(
@@ -151,17 +207,28 @@ impl LearnedVerifyingShares {
         }
         self.authors
             .retain(|_, (_, last, _)| now.saturating_duration_since(*last) < CANDIDATE_TTL);
-        // A full table only makes room by dropping authors that are not
-        // established, so a flood of new keys cannot reset members' history.
+        // A full table makes room by dropping an author that is not
+        // established, so a flood of new keys cannot reset members' history,
+        // or else an established one that holds no candidate, so identities
+        // kept established without a slot cannot keep new members out.
         if !self.authors.contains_key(&author) && self.authors.len() >= MAX_TRACKED_AUTHORS {
-            if let Some(oldest) = self
-                .authors
-                .iter()
-                .filter(|(a, _)| !established(&self.authors, a))
-                .min_by_key(|(_, (_, last, _))| *last)
-                .map(|(a, _)| *a)
+            let holders: std::collections::HashSet<PublicKey> = self
+                .candidates
+                .values()
+                .flatten()
+                .map(|c| c.author)
+                .collect();
+            let oldest = |keep: &dyn Fn(&PublicKey) -> bool| {
+                self.authors
+                    .iter()
+                    .filter(|(a, _)| keep(a))
+                    .min_by_key(|(_, (_, last, _))| *last)
+                    .map(|(a, _)| *a)
+            };
+            if let Some(evicted) = oldest(&|a| !established(&self.authors, a))
+                .or_else(|| oldest(&|a| !holders.contains(a)))
             {
-                self.authors.remove(&oldest);
+                self.authors.remove(&evicted);
             }
         }
         let was_established = established(&self.authors, &author);
@@ -177,9 +244,14 @@ impl LearnedVerifyingShares {
         // A newly established author changes which candidates can be evicted
         // and whether a failed search means this share is stale, so recheck.
         self.dirty |= newcomer_established && !was_established;
-        let held_payload = (serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len())
+        // Relayed proofs are not needed to admit the member later.
+        let held_payload = AnnouncePayload {
+            member_proofs: Vec::new(),
+            ..payload.clone()
+        };
+        let held_payload = (serde_json::to_vec(&held_payload).map_or(usize::MAX, |b| b.len())
             <= MAX_HELD_PAYLOAD)
-            .then(|| payload.clone());
+            .then_some(held_payload);
         let capacity = capacity(share.metadata.threshold, share.metadata.total_shares);
         let authors = &self.authors;
         let forced = self.forced_evictions.get(&index).copied();
@@ -830,5 +902,182 @@ mod tests {
         );
         assert!(!learned.take_author_search(authors[0], now + EXEMPT_SEARCH_SPACING));
         assert!(learned.take_author_search(authors[1], now + EXEMPT_SEARCH_SPACING));
+    }
+
+    fn proof_of(share: &SharePackage, transport: [u8; 32]) -> crate::protocol::MemberProof {
+        let index = share.metadata.identifier;
+        let verifying_share: [u8; 33] = share
+            .key_package()
+            .unwrap()
+            .verifying_share()
+            .serialize()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let signing_share: [u8; 32] = share
+            .key_package()
+            .unwrap()
+            .signing_share()
+            .serialize()
+            .try_into()
+            .unwrap();
+        crate::protocol::MemberProof {
+            share_index: index,
+            verifying_share,
+            transport_pubkey: transport,
+            timestamp: 7,
+            proof_signature: crate::proof::sign_proof(
+                &signing_share,
+                &share.metadata.group_pubkey,
+                index,
+                &verifying_share,
+                &transport,
+                7,
+            )
+            .unwrap(),
+        }
+    }
+
+    /// Member 1's share, its own verifying share, and the proofs of members
+    /// 2 to 5 of a 3-of-5 group.
+    fn relayed() -> (SharePackage, [u8; 33], Vec<crate::protocol::MemberProof>) {
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap())
+            .generate("relay")
+            .unwrap();
+        let proofs: Vec<_> = shares
+            .iter()
+            .map(|s| proof_of(s, Keys::generate().public_key().to_bytes()))
+            .collect();
+        let own = proofs[0].verifying_share;
+        let share = shares.into_iter().next().unwrap();
+        (share, own, proofs[1..].to_vec())
+    }
+
+    fn announce_with(
+        share: &SharePackage,
+        outer: &crate::protocol::MemberProof,
+        relayed: Vec<crate::protocol::MemberProof>,
+    ) -> AnnouncePayload {
+        let mut payload = AnnouncePayload::new(
+            share.metadata.group_pubkey,
+            outer.share_index,
+            outer.verifying_share,
+            outer.proof_signature,
+            outer.timestamp,
+        );
+        payload.member_proofs = relayed;
+        payload
+    }
+
+    #[test]
+    fn relayed_proofs_complete_the_set() {
+        let (share, own, proofs) = relayed();
+        let mut learned = LearnedVerifyingShares::default();
+        let payload = announce_with(&share, &proofs[0], proofs[1..].to_vec());
+        let Some(Learning::Completed { set, .. }) =
+            learned.offer(&share, own, Keys::generate().public_key(), &payload)
+        else {
+            panic!("a fully proven set completes");
+        };
+        let real = verifying_share_map(&share.pubkey_package().unwrap(), 5).unwrap();
+        assert_eq!(set, real);
+        assert_eq!(learned.complete(), Some(&real));
+    }
+
+    #[test]
+    fn relayed_proofs_must_cover_and_prove_every_member() {
+        let (share, own, proofs) = relayed();
+        let mut learned = LearnedVerifyingShares::default();
+        let author = Keys::generate().public_key();
+        let missing = announce_with(&share, &proofs[0], proofs[1..3].to_vec());
+        assert!(learned.offer(&share, own, author, &missing).is_none());
+        let mut bad_signature = proofs[1..].to_vec();
+        bad_signature[1].proof_signature[0] ^= 1;
+        let bad = announce_with(&share, &proofs[0], bad_signature);
+        assert!(learned.offer(&share, own, author, &bad).is_none());
+        let mut rebound = proofs[1..].to_vec();
+        rebound[0].transport_pubkey = Keys::generate().public_key().to_bytes();
+        let rebound = announce_with(&share, &proofs[0], rebound);
+        assert!(learned.offer(&share, own, author, &rebound).is_none());
+        let mut conflicting = proofs[1..].to_vec();
+        conflicting.push(proofs[1].clone());
+        conflicting[3].verifying_share = proofs[2].verifying_share;
+        let conflicting = announce_with(&share, &proofs[0], conflicting);
+        assert!(learned.offer(&share, own, author, &conflicting).is_none());
+        assert!(learned.complete().is_none());
+        assert!(learned.candidates.is_empty() && learned.authors.is_empty());
+    }
+
+    #[test]
+    fn a_forged_consistent_set_is_rejected() {
+        use k256::elliptic_curve::sec1::ToEncodedPoint;
+        let (share, own, _) = relayed();
+        let context = VerifyingSetContext::new(&share).unwrap();
+        let forger = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let mut point = [0u8; 33];
+        point[0] = 0x02;
+        point[1..].copy_from_slice(&forger.verifying_key().to_bytes());
+        let basis = verifying_share_point(&point).unwrap();
+        let mut set = BTreeMap::from([(1, own), (2, point)]);
+        let mut relayed = Vec::new();
+        for target in 3..=5u16 {
+            let prediction = context.prediction(&[2], target).unwrap();
+            let predicted: [u8; 33] = (prediction.constant + basis * prediction.weights[0])
+                .to_affine()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap();
+            set.insert(target, predicted);
+            relayed.push(crate::protocol::MemberProof {
+                share_index: target,
+                verifying_share: predicted,
+                transport_pubkey: [3u8; 32],
+                timestamp: 7,
+                proof_signature: [5u8; 64],
+            });
+        }
+        assert!(
+            complete_verifying_shares(&share, &set).is_ok(),
+            "the forged set fits the group key"
+        );
+        let outer = crate::protocol::MemberProof {
+            share_index: 2,
+            verifying_share: point,
+            transport_pubkey: [3u8; 32],
+            timestamp: 7,
+            proof_signature: [0u8; 64],
+        };
+        let mut learned = LearnedVerifyingShares::default();
+        let payload = announce_with(&share, &outer, relayed);
+        assert!(learned
+            .offer(&share, own, Keys::generate().public_key(), &payload)
+            .is_none());
+        assert!(learned.complete().is_none());
+    }
+
+    #[test]
+    fn a_full_table_of_established_authors_without_slots_admits_members() {
+        let g = group();
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        let later = start + ESTABLISHED_AFTER;
+        for _ in 0..MAX_TRACKED_AUTHORS {
+            learned
+                .authors
+                .insert(Keys::generate().public_key(), (start, later, None));
+        }
+        let member = Keys::generate().public_key();
+        record(&mut learned, &g, member, 2, g.real[&2], later);
+        record(
+            &mut learned,
+            &g,
+            member,
+            2,
+            g.real[&2],
+            later + ESTABLISHED_AFTER,
+        );
+        assert!(established(&learned.authors, &member));
+        assert!(learned.authors.len() <= MAX_TRACKED_AUTHORS);
     }
 }

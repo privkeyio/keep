@@ -14,7 +14,7 @@ pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 pub use transport::CosignTransport;
 pub(crate) use transport::NostrTransport;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -1135,6 +1135,9 @@ pub struct KfpNode {
         >,
     >,
     learned_verifying_shares: RwLock<learning::LearnedVerifyingShares>,
+    /// The latest proof of each admitted member, relayed in this node's
+    /// announces so members whose share lacks the set can learn it.
+    member_proofs: RwLock<BTreeMap<u16, MemberProof>>,
     pub(crate) hooks: RwLock<Arc<dyn SigningHooks>>,
     pub(crate) event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -1266,6 +1269,7 @@ struct AnnounceJob {
     verifying_share: [u8; 33],
     attestor: Option<Arc<dyn AnnounceAttestor>>,
     rendezvous: Vec<PublicKey>,
+    member_proofs: Vec<MemberProof>,
 }
 
 impl KfpNode {
@@ -1407,6 +1411,7 @@ impl KfpNode {
             version_mismatch_reported: RwLock::new(HashSet::new()),
             early_commitments: RwLock::new(HashMap::new()),
             learned_verifying_shares: RwLock::new(learning::LearnedVerifyingShares::default()),
+            member_proofs: RwLock::new(BTreeMap::new()),
             hooks: RwLock::new(Arc::new(NoOpHooks)),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
@@ -1935,14 +1940,18 @@ impl KfpNode {
             .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
         let context = keep_core::frost::VerifyingSetContext::new(&self.share)?;
         let mut learned = self.learned_verifying_shares.write();
-        match learned.record(
-            &self.share,
-            &context,
-            own_share,
-            *pubkey,
-            payload,
-            std::time::Instant::now(),
-        ) {
+        let outcome = match learned.offer(&self.share, own_share, *pubkey, payload) {
+            Some(completed) => completed,
+            None => learned.record(
+                &self.share,
+                &context,
+                own_share,
+                *pubkey,
+                payload,
+                std::time::Instant::now(),
+            ),
+        };
+        match outcome {
             learning::Learning::Known => Ok((
                 learned
                     .complete()
@@ -2269,6 +2278,7 @@ impl KfpNode {
             verifying_share,
             attestor: self.announce_attestor.clone(),
             rendezvous,
+            member_proofs: self.relayed_member_proofs(),
         })
     }
 
@@ -2311,12 +2321,22 @@ impl KfpNode {
             timestamp,
             tpm_attestation,
             &job.rendezvous,
+            job.member_proofs,
         )?;
 
         job.transport.send_event(&event).await?;
 
         info!(share_index = job.share_index, "Announced presence");
         Ok(())
+    }
+
+    /// Admitted members' proofs to relay, or none in a group too large for one
+    /// announce to carry them.
+    fn relayed_member_proofs(&self) -> Vec<MemberProof> {
+        if usize::from(self.share.metadata.total_shares) > MAX_MEMBER_PROOFS {
+            return Vec::new();
+        }
+        self.member_proofs.read().values().cloned().collect()
     }
 
     /// Send one announce, awaiting completion. Used at startup so a quote failure
@@ -2946,6 +2966,17 @@ impl KfpNode {
             )));
         }
 
+        self.member_proofs.write().insert(
+            payload.share_index,
+            MemberProof {
+                share_index: payload.share_index,
+                verifying_share: payload.verifying_share,
+                transport_pubkey: *pubkey.as_bytes(),
+                timestamp: payload.timestamp,
+                proof_signature: payload.proof_signature,
+            },
+        );
+
         let mut peer = Peer::new(pubkey, payload.share_index)
             .with_capabilities(payload.capabilities)
             .with_verifying_share(payload.verifying_share);
@@ -3447,6 +3478,7 @@ mod tests {
             name: None,
             attestation: None,
             tpm_attestation: None,
+            member_proofs: Vec::new(),
         };
 
         let result = node.handle_announce(from, payload).await;
@@ -3601,6 +3633,7 @@ mod tests {
             name: None,
             attestation: None,
             tpm_attestation: None,
+            member_proofs: Vec::new(),
         }
     }
 
@@ -3750,6 +3783,7 @@ mod tests {
             Timestamp::now().as_secs(),
             None,
             &[],
+            Vec::new(),
         )
         .unwrap();
         node.handle_event(&event).await.unwrap();
@@ -4282,6 +4316,7 @@ mod tests {
             name: None,
             attestation: None,
             tpm_attestation: None,
+            member_proofs: Vec::new(),
         };
         us.handle_announce(them.keys.public_key(), payload)
             .await
@@ -4352,6 +4387,7 @@ mod tests {
             Timestamp::now().as_secs(),
             None,
             &job.rendezvous,
+            Vec::new(),
         )
         .unwrap();
         let tagged: HashSet<PublicKey> = event.tags.public_keys().copied().collect();
@@ -4524,6 +4560,7 @@ mod tests {
             name: None,
             attestation: None,
             tpm_attestation: None,
+            member_proofs: Vec::new(),
         };
         let event = EventBuilder::new(
             Kind::Custom(KFP_EVENT_KIND),

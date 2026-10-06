@@ -22,6 +22,7 @@ impl KfpEventBuilder {
         timestamp: u64,
         tpm_attestation: Option<TpmQuoteEvidence>,
         rendezvous: &[PublicKey],
+        member_proofs: Vec<MemberProof>,
     ) -> Result<Event> {
         let proof_signature = proof::sign_proof(
             signing_share,
@@ -45,6 +46,7 @@ impl KfpEventBuilder {
         if let Some(ev) = tpm_attestation {
             payload = payload.with_tpm_attestation(ev);
         }
+        payload.member_proofs = member_proofs;
 
         let msg = KfpMessage::Announce(payload);
         let content = msg.to_json()?;
@@ -702,6 +704,7 @@ mod tests {
             Timestamp::now().as_secs(),
             None,
             &[],
+            Vec::new(),
         )
         .unwrap();
 
@@ -763,6 +766,7 @@ mod tests {
             Timestamp::now().as_secs(),
             Some(evidence.clone()),
             &[],
+            Vec::new(),
         )
         .unwrap();
 
