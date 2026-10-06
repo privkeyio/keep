@@ -2126,6 +2126,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn duress_emit_without_recorded_recipients_is_refused_before_unlock() {
         let dir = tempfile::tempdir().unwrap();
