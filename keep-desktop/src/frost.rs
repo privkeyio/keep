@@ -741,6 +741,7 @@ fn handle_node_event(
             push_frost_event(
                 frost_events,
                 FrostNodeMsg::VerifyingSharesLearned {
+                    group_pubkey: *node.group_pubkey(),
                     share_index,
                     verifying_shares,
                 },
@@ -1405,21 +1406,21 @@ impl App {
                 });
             }
             FrostNodeMsg::VerifyingSharesLearned {
+                group_pubkey,
                 share_index,
                 verifying_shares,
-            } => {
-                if let Some(group_pubkey) = self.get_frost_node().map(|n| *n.group_pubkey()) {
-                    if let Some(keep) = lock_keep(&self.keep).as_mut() {
-                        if let Err(e) = keep.frost_store_verifying_shares(
-                            &group_pubkey,
-                            share_index,
-                            &verifying_shares,
-                        ) {
-                            tracing::error!(error = %e, "Failed to store learned verifying shares");
-                        }
+            } => match lock_keep(&self.keep).as_mut() {
+                Some(keep) => {
+                    if let Err(e) = keep.frost_store_verifying_shares(
+                        &group_pubkey,
+                        share_index,
+                        &verifying_shares,
+                    ) {
+                        tracing::error!(error = %e, "Failed to store learned verifying shares");
                     }
                 }
-            }
+                None => tracing::warn!("Vault locked; learned verifying shares were not stored"),
+            },
             FrostNodeMsg::DescriptorComplete {
                 session_id,
                 external_descriptor,

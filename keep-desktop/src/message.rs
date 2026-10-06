@@ -261,6 +261,7 @@ pub enum Message {
 pub enum FrostNodeMsg {
     PeerUpdate(Vec<PeerEntry>),
     VerifyingSharesLearned {
+        group_pubkey: [u8; 32],
         share_index: u16,
         verifying_shares: std::collections::BTreeMap<u16, [u8; 33]>,
     },
