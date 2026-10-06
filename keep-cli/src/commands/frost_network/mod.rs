@@ -1317,7 +1317,8 @@ fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
     (1..=total).filter(|&j| j != box_id).collect()
 }
 
-/// Write secret `bytes` to `path` atomically with mode 0600; the caller owns zeroizing `bytes`.
+/// Write secret `bytes` to `path` atomically, readable only by its owner (mode 0600 on Unix, an
+/// owner-only protected DACL on Windows); the caller owns zeroizing `bytes`.
 /// The bytes go to a fresh sibling temp file opened with `create_new` (O_CREAT|O_EXCL, which refuses
 /// to follow or clobber a symlink and forces the 0600 mode on a guaranteed-new file), are fsync'd,
 /// then `rename`d into place, after which the parent directory is fsync'd so the new name is durable
@@ -1332,24 +1333,27 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     // Clear any stale temp from a crashed run; create_new below still fails closed if an attacker
     // races to recreate it, so this never writes through someone else's file.
     let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    // 0600 at creation is the Unix appliance's protection; the mode bit is Unix-only, so gate it
-    // (create_new still gives O_EXCL everywhere). This feature targets the NixOS boot gate.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&tmp)
+    #[cfg(windows)]
+    let mut f = crate::panic_windows::create_new_owner_only(&tmp)
         .map_err(|e| KeepError::Runtime(format!("create {}: {e}", tmp.display())))?;
+    #[cfg(not(windows))]
+    let mut f = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        opts.open(&tmp)
+            .map_err(|e| KeepError::Runtime(format!("create {}: {e}", tmp.display())))?
+    };
     f.write_all(bytes)
         .map_err(|e| KeepError::Runtime(format!("write {}: {e}", tmp.display())))?;
     f.sync_all()
         .map_err(|e| KeepError::Runtime(format!("sync {}: {e}", tmp.display())))?;
     drop(f);
-    // Windows cannot open a directory to fsync it, so the move itself is written through.
+    // Windows has no directory fsync for std to call, so the move is written through instead.
     #[cfg(windows)]
     crate::panic_windows::replace_file_durably(&tmp, path)
         .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
@@ -1936,17 +1940,12 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     fn temp_path_for(path: &Path) -> std::path::PathBuf {
         let mut s = path.as_os_str().to_owned();
         s.push(".tmp");
         std::path::PathBuf::from(s)
     }
 
-    // `write_secret_file` fsyncs the containing directory, which requires opening
-    // it as a file handle; that errors on Windows, so this appliance-only writer is
-    // exercised on Unix only (matching `write_secret_file_is_owner_only`).
-    #[cfg(unix)]
     #[test]
     fn write_secret_file_round_trips_and_leaves_no_temp() {
         let dir = tempfile::tempdir().unwrap();
@@ -1978,7 +1977,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn write_secret_file_writes_empty_and_binary_payloads() {
         let dir = tempfile::tempdir().unwrap();
@@ -1995,7 +1993,6 @@ mod tests {
     // A crash between temp-create and rename can leave a stale `.tmp` behind.
     // The next write must clear it (create_new would otherwise fail closed) and
     // produce the correct content, so a crashed run cannot wedge the writer.
-    #[cfg(unix)]
     #[test]
     fn write_secret_file_clears_stale_temp_from_crashed_run() {
         let dir = tempfile::tempdir().unwrap();
