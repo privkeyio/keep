@@ -17,11 +17,39 @@ use nostr_sdk::prelude::PublicKey;
 use crate::protocol::AnnouncePayload;
 
 /// Most proven points kept per member index. Anyone can prove a point they
-/// made up, so each index keeps several; when full, a newcomer replaces a
-/// random one, so a member that keeps announcing gets back in.
+/// made up, so each index keeps several. When full, a newcomer can only
+/// replace a candidate that is not older than it, and a newcomer that has not
+/// kept announcing can only replace another such one, so a flood of fresh
+/// identities cannot push out members that keep announcing.
 const MAX_CANDIDATES: usize = 64;
 /// Most proven points kept across all indices.
-const MAX_TOTAL_CANDIDATES: usize = 512;
+const MAX_TOTAL_CANDIDATES: usize = 1024;
+/// Learning needs at least this many candidates per index to withstand
+/// forged announces; groups that would get fewer cannot learn.
+pub(crate) const MIN_LEARNING_CAPACITY: usize = 4;
+/// An author counts as established once it has kept announcing this long.
+const ESTABLISHED_AFTER: Duration = Duration::from_secs(15);
+/// Most authors whose announce history is tracked.
+const MAX_TRACKED_AUTHORS: usize = 4096;
+/// Authors first seen within this long of each other count as the same age,
+/// so members that announce just after forgers when learning starts can still
+/// displace them; later identities cannot displace earlier ones.
+const AGE_SLACK: Duration = Duration::from_secs(20);
+/// An established author's announce may search once per this interval even
+/// when the shared search budget is spent, so a flood cannot starve members.
+const AUTHOR_SEARCH_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Per author: first and last announce, and its last budget-exempt search.
+type AuthorSeen = (Instant, Instant, Option<Instant>);
+
+fn established(
+    authors: &std::collections::HashMap<PublicKey, AuthorSeen>,
+    author: &PublicKey,
+) -> bool {
+    authors
+        .get(author)
+        .is_some_and(|(first, last, _)| last.saturating_duration_since(*first) >= ESTABLISHED_AFTER)
+}
 /// Announces larger than this are not kept for replay; their member is
 /// admitted at its next announce instead.
 const MAX_HELD_PAYLOAD: usize = 4096;
@@ -40,7 +68,7 @@ const SEARCH_INTERVAL: Duration = Duration::from_secs(2);
 /// Candidates kept per index: the search enumerates the candidates of
 /// threshold - 2 indices, so their product must stay within
 /// `MAX_COMBINATIONS`, and all indices together within `MAX_TOTAL_CANDIDATES`.
-fn capacity(threshold: u16, total: u16) -> usize {
+pub(crate) fn capacity(threshold: u16, total: u16) -> usize {
     let basis = u32::from(threshold.saturating_sub(2));
     let mut per_index = MAX_CANDIDATES;
     while per_index > 1
@@ -66,6 +94,7 @@ struct Candidate {
 #[derive(Default)]
 pub(crate) struct LearnedVerifyingShares {
     candidates: BTreeMap<u16, Vec<Candidate>>,
+    authors: std::collections::HashMap<PublicKey, AuthorSeen>,
     complete: Option<BTreeMap<u16, [u8; 33]>>,
     last_reciprocal: Option<Instant>,
     search_budget: Option<(u32, Instant)>,
@@ -113,10 +142,31 @@ impl LearnedVerifyingShares {
         for list in self.candidates.values_mut() {
             list.retain(|c| now.saturating_duration_since(c.last_seen) < CANDIDATE_TTL);
         }
+        self.authors
+            .retain(|_, (_, last, _)| now.saturating_duration_since(*last) < CANDIDATE_TTL);
+        if !self.authors.contains_key(&author) && self.authors.len() >= MAX_TRACKED_AUTHORS {
+            if let Some(oldest) = self
+                .authors
+                .iter()
+                .min_by_key(|(_, (_, last, _))| *last)
+                .map(|(a, _)| *a)
+            {
+                self.authors.remove(&oldest);
+            }
+        }
+        let was_established = established(&self.authors, &author);
+        let author_since = self.authors.entry(author).or_insert((now, now, None));
+        author_since.1 = now;
+        let author_first = author_since.0;
+        let newcomer_established = established(&self.authors, &author);
+        // A newly established author changes which candidates can be evicted
+        // and whether a failed search means this share is stale, so recheck.
+        self.dirty |= newcomer_established && !was_established;
         let held_payload = (serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len())
             <= MAX_HELD_PAYLOAD)
             .then(|| payload.clone());
         let capacity = capacity(share.metadata.threshold, share.metadata.total_shares);
+        let authors = &self.authors;
         let list = self.candidates.entry(index).or_default();
         let mut new_author = false;
         let mut changed = false;
@@ -130,19 +180,35 @@ impl LearnedVerifyingShares {
             existing.payload = held_payload;
             existing.last_seen = now;
         } else {
-            if list.len() >= capacity {
-                let evicted = ::rand::rng().random_range(0..list.len());
-                list.swap_remove(evicted);
+            let mut room = list.len() < capacity;
+            if !room {
+                let replaceable: Vec<usize> = list
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        let first = authors.get(&c.author).map_or(c.first_seen, |(f, _, _)| *f);
+                        first + AGE_SLACK >= author_first
+                            && (newcomer_established || !established(authors, &c.author))
+                    })
+                    .map(|(k, _)| k)
+                    .collect();
+                if !replaceable.is_empty() {
+                    let evicted = replaceable[::rand::rng().random_range(0..replaceable.len())];
+                    list.swap_remove(evicted);
+                    room = true;
+                }
             }
-            new_author = true;
-            list.push(Candidate {
-                author,
-                point: payload.verifying_share,
-                element,
-                payload: held_payload,
-                first_seen: now,
-                last_seen: now,
-            });
+            if room {
+                new_author = true;
+                list.push(Candidate {
+                    author,
+                    point: payload.verifying_share,
+                    element,
+                    payload: held_payload,
+                    first_seen: now,
+                    last_seen: now,
+                });
+            }
         }
         list.sort_by_key(|c| c.first_seen);
 
@@ -163,14 +229,19 @@ impl LearnedVerifyingShares {
             .iter()
             .any(|i| self.candidates.get(i).is_none_or(|l| l.is_empty()))
             || !self.dirty
-            || !self.take_search_budget(now)
+            || !(self.take_search_budget(now) || self.take_author_search(author, now))
         {
             return Learning::Pending { reciprocate };
         }
         self.dirty = false;
 
         let Some(picks) = self.search(context, &others) else {
-            if !self.mismatch_reported {
+            let settled = others.iter().all(|i| {
+                self.candidates[i]
+                    .iter()
+                    .any(|c| established(&self.authors, &c.author))
+            });
+            if settled && !self.mismatch_reported {
                 self.mismatch_reported = true;
                 tracing::warn!(
                     "Every member has announced but no combination of their verifying shares fits this share; if this share was refreshed, import the refreshed share"
@@ -195,6 +266,19 @@ impl LearnedVerifyingShares {
         self.candidates.clear();
         self.complete = Some(set.clone());
         Learning::Completed { set, held }
+    }
+
+    fn take_author_search(&mut self, author: PublicKey, now: Instant) -> bool {
+        let Some((first, last, exempt)) = self.authors.get_mut(&author) else {
+            return false;
+        };
+        if last.saturating_duration_since(*first) < ESTABLISHED_AFTER
+            || exempt.is_some_and(|t| now.saturating_duration_since(t) < AUTHOR_SEARCH_INTERVAL)
+        {
+            return false;
+        }
+        *exempt = Some(now);
+        true
     }
 
     fn take_search_budget(&mut self, now: Instant) -> bool {
@@ -479,20 +563,19 @@ mod tests {
         let g = group();
         let other = group();
         let mut learned = LearnedVerifyingShares::default();
-        let now = Instant::now();
-        for i in 2..=5u16 {
-            let outcome = record(
-                &mut learned,
-                &g,
-                Keys::generate().public_key(),
-                i,
-                other.real[&i],
-                now,
-            );
-            assert!(matches!(outcome, Learning::Pending { .. }));
+        let start = Instant::now();
+        let authors: Vec<PublicKey> = (0..4).map(|_| Keys::generate().public_key()).collect();
+        for now in [start, start + ESTABLISHED_AFTER + SEARCH_INTERVAL] {
+            for (i, author) in (2..=5u16).zip(&authors) {
+                let outcome = record(&mut learned, &g, *author, i, other.real[&i], now);
+                assert!(matches!(outcome, Learning::Pending { .. }));
+            }
         }
         assert!(learned.complete().is_none());
-        assert!(learned.mismatch_reported);
+        assert!(
+            learned.mismatch_reported,
+            "established members that never fit are reported"
+        );
     }
 
     #[test]
@@ -590,5 +673,44 @@ mod tests {
             "worst-case search took {:?}",
             timer.elapsed()
         );
+    }
+
+    #[test]
+    fn a_flood_of_fresh_identities_does_not_stall_learning() {
+        for (threshold, total) in [(3u16, 5u16), (7, 9)] {
+            let g = group_of(threshold, total);
+            let mut learned = LearnedVerifyingShares::default();
+            let start = Instant::now();
+            let members: BTreeMap<u16, PublicKey> = (2..=total)
+                .map(|i| (i, Keys::generate().public_key()))
+                .collect();
+            let mut completed = None;
+            'run: for second in 0..400u64 {
+                let now = start + Duration::from_secs(second);
+                for index in 2..=total {
+                    for _ in 0..4 {
+                        record(
+                            &mut learned,
+                            &g,
+                            Keys::generate().public_key(),
+                            index,
+                            forged_point(),
+                            now,
+                        );
+                    }
+                }
+                if second % 20 == 0 {
+                    for (&index, &member) in &members {
+                        if let Learning::Completed { set, .. } =
+                            record(&mut learned, &g, member, index, g.real[&index], now)
+                        {
+                            completed = Some(set);
+                            break 'run;
+                        }
+                    }
+                }
+            }
+            assert_eq!(completed, Some(g.real.clone()), "{threshold}-of-{total}");
+        }
     }
 }

@@ -1315,6 +1315,7 @@ impl KfpNode {
             })?;
         }
 
+        require_learnable_verifying_shares(&share)?;
         let keys = derive_keys_from_share(&share)?;
         let transport = Arc::new(
             NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts()).await?,
@@ -1441,6 +1442,7 @@ impl KfpNode {
         nonce_store: Option<Arc<dyn NonceStore>>,
         session_timeout: Option<Duration>,
     ) -> Result<Self> {
+        require_learnable_verifying_shares(&share)?;
         let keys = derive_keys_from_share(&share)?;
         Self::assemble(share, keys, transport, nonce_store, session_timeout)
     }
@@ -3247,6 +3249,24 @@ fn derive_two_of_n_verifying_share(
         .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))
 }
 
+/// A share without the group's verifying shares learns them from the members'
+/// announces, which needs room for several candidates per member; groups too
+/// large for that cannot learn and need the share imported again.
+fn require_learnable_verifying_shares(share: &SharePackage) -> Result<()> {
+    let threshold = *share.key_package()?.min_signers();
+    let known = share.pubkey_package()?.verifying_shares().len();
+    let total = share.metadata.total_shares;
+    if threshold > 2
+        && known < usize::from(total)
+        && learning::capacity(threshold, total) < learning::MIN_LEARNING_CAPACITY
+    {
+        return Err(FrostNetError::Protocol(
+            "This share was imported without the group's verifying shares; import it again from a current export of the same share".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Derives this member's transport keypair from its signing share, so only the
 /// share holder can read traffic addressed to it or author traffic as it. A
 /// refresh changes the share and with it the transport key; peers learn the new
@@ -4618,5 +4638,32 @@ mod tests {
             })
         ));
         assert!(rx.try_recv().is_err(), "each index is reported once");
+    }
+
+    #[tokio::test]
+    async fn a_share_too_large_to_learn_its_set_refuses_to_start() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await.to_string();
+        let result = KfpNode::new(
+            single_entry(&dealer_shares(8, 9)[0]),
+            vec![relay_url.clone()],
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(FrostNetError::Protocol(msg)) if msg.contains("import it again")),
+            "expected a re-import refusal"
+        );
+        KfpNode::new(
+            single_entry(&dealer_shares(7, 9)[0]),
+            vec![relay_url.clone()],
+        )
+        .await
+        .unwrap();
+        KfpNode::new(dealer_shares(8, 9).remove(0), vec![relay_url])
+            .await
+            .unwrap();
     }
 }
