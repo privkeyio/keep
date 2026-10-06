@@ -378,7 +378,9 @@ pub fn cmd_frost_network_serve(
                         share_index,
                         version,
                     }) => {
-                        tracing::warn!(
+                        // Logged as an error so it shows at the default log
+                        // level: that member cannot sign with the group.
+                        tracing::error!(
                             share_index,
                             version,
                             "peer runs another protocol version; every member must run v{}",
