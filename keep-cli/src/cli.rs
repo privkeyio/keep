@@ -825,8 +825,17 @@ pub(crate) enum FrostNetworkCommands {
         expected_pcr: Vec<String>,
     },
     Dkg {
-        #[arg(short, long, help = "Group name for the new keyset")]
+        #[arg(
+            short,
+            long,
+            help = "Group name this device enrolled its subkey under (`group-subkey --group`)"
+        )]
         group: String,
+        #[arg(
+            long,
+            help = "Group id printed by `keep frost network group-create` (64 hex characters)"
+        )]
+        group_id: String,
         #[arg(
             short,
             long,

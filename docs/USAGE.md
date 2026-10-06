@@ -431,33 +431,24 @@ Generate threshold keys without any single party knowing the full private key. E
 The trusted dealer approach (`keep frost generate`) generates the full private key on a single machine. If that machine is compromised during generation, all funds are at risk. Distributed DKG ensures the complete key is never computed: each participant generates their share from independent entropy, so no single device ever holds enough information to reconstruct the key.
 
 ```bash
-# Participant 1 (on first device)
-keep frost network dkg \
-  --group mygroup \
-  --threshold 2 \
-  --participants 3 \
-  --index 1 \
-  --relay wss://bucket.coracle.social \
-  --hardware /dev/ttyACM0
+# 1. Every participant, on its own device: enroll a per-group signing subkey
+#    and send the printed hex pubkey to the coordinator.
+keep frost network group-subkey --group mygroup
 
-# Participant 2 (on second device, run simultaneously)
-keep frost network dkg \
-  --group mygroup \
-  --threshold 2 \
-  --participants 3 \
-  --index 2 \
-  --relay wss://bucket.coracle.social \
-  --hardware /dev/ttyACM0
+# 2. Coordinator: publish the signed roster, listing the subkeys in index order.
+#    Send the printed Group ID to every participant.
+keep frost network group-create --name mygroup --threshold 2 --participants 3 \
+  --participant-subkey <hex of participant 1> \
+  --participant-subkey <hex of participant 2> \
+  --participant-subkey <hex of participant 3> \
+  --relay wss://relay.example --publish
 
-# Participant 3 (on third device, run simultaneously)
-keep frost network dkg \
-  --group mygroup \
-  --threshold 2 \
-  --participants 3 \
-  --index 3 \
-  --relay wss://bucket.coracle.social \
-  --hardware /dev/ttyACM0
+# 3. Every participant, at the same time, with its own index:
+keep frost network dkg --group mygroup --group-id <Group ID> \
+  --threshold 2 --participants 3 --index 1 --relay wss://relay.example
 ```
+
+`--group` is the name the participant used with `group-subkey`; `--group-id` pins the coordinator's roster: it is a hash over the group name, threshold and every participant's subkey, so a roster with any other contents is refused. Use a relay that stores kind 31101 events. Hardware DKG over relays is not supported yet.
 
 All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
 

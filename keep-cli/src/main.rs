@@ -424,6 +424,7 @@ fn dispatch_frost_network(
         }
         FrostNetworkCommands::Dkg {
             group,
+            group_id,
             threshold,
             participants,
             index,
@@ -441,6 +442,7 @@ fn dispatch_frost_network(
             commands::frost_network::cmd_frost_network_dkg(
                 out,
                 &group,
+                &group_id,
                 threshold,
                 participants,
                 index,

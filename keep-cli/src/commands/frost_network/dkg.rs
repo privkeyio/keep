@@ -69,6 +69,7 @@ fn load_group_subkey(keep: &Keep, group: &str) -> Result<(Keys, Zeroizing<[u8; 3
 pub fn cmd_frost_network_dkg(
     out: &Output,
     group: &str,
+    group_id: &str,
     threshold: u8,
     participants: u8,
     our_index: u8,
@@ -103,6 +104,7 @@ pub fn cmd_frost_network_dkg(
         None => cmd_frost_network_dkg_software(
             out,
             group,
+            group_id,
             threshold,
             participants,
             our_index,
@@ -526,6 +528,7 @@ fn cmd_frost_network_dkg_hardware(
 fn cmd_frost_network_dkg_software(
     out: &Output,
     group: &str,
+    group_id: &str,
     threshold: u8,
     participants: u8,
     our_index: u8,
@@ -539,6 +542,7 @@ fn cmd_frost_network_dkg_software(
     out.newline();
     out.header("FROST Distributed Key Generation (software)");
     out.field("Group", group);
+    out.field("Group ID", group_id);
     out.field("Threshold", &format!("{threshold}-of-{participants}"));
     out.field("Our index", &our_index.to_string());
     out.field("Relay", relay);
@@ -555,15 +559,27 @@ fn cmd_frost_network_dkg_software(
         SoftwareDkgSession::init(threshold as u16, participants as u16, our_index as u16)
             .map_err(|e| KeepError::FrostErr(FrostError::invalid_config(e.to_string())))?;
 
-    // `group` is stored as the share name at finalize and used verbatim as the
-    // relay `d` tag every peer filters on, so validate it as-is (no trim, which
-    // would diverge from what is published) rather than failing after every
-    // network round only for the store to reject it.
+    // `group` names this device's subkey and is stored as the share name at
+    // finalize, so validate it as-is rather than failing after every network
+    // round only for the store to reject it.
     if group.is_empty() || group.chars().count() > 64 {
         return Err(KeepError::FrostErr(FrostError::invalid_config(
             "group name must be 1..=64 characters".to_string(),
         )));
     }
+    // The coordinator's group id pins the signed roster (#674) and is the `d`
+    // tag every participant's DKG events carry, as on mobile.
+    let group_id_hex = hex::decode(group_id)
+        .ok()
+        .filter(|b| b.len() == 32)
+        .map(hex::encode)
+        .ok_or_else(|| {
+            KeepError::InvalidInput(
+                "--group-id must be the 64-hex-character group id printed by \
+                 `keep frost network group-create`"
+                    .into(),
+            )
+        })?;
 
     // §8: the pre-store stash is a single per-group slot. A fresh run derives a
     // fresh subkey, so completing one while an earlier share is still pending
@@ -625,7 +641,7 @@ fn cmd_frost_network_dkg_software(
         // subkey before we emit any DKG material. Fail closed so a wrong
         // --index or a stale --threshold surfaces before co-signers see us.
         let spinner = out.spinner("Fetching signed group roster...");
-        let roster = fetch_group_roster(&client, group).await?;
+        let roster = fetch_group_roster(&client, &group_id_hex).await?;
         spinner.finish();
         require_roster_matches(&roster, &keys, threshold, participants, our_index)?;
         out.success(&format!(
@@ -649,7 +665,7 @@ fn cmd_frost_network_dkg_software(
             &transport,
             &keys,
             &roster,
-            group,
+            &group_id_hex,
             our_index as u16,
             std::time::Duration::from_secs(300),
             &cancel,
@@ -1007,6 +1023,14 @@ pub fn cmd_frost_network_group_create(
         for (i, subkey) in participant_subkeys.iter().enumerate() {
             out.info(&format!("Participant {}: {}", i + 1, subkey));
         }
+        out.newline();
+        out.info(&format!(
+            "Each participant now runs: keep frost network dkg --group <their group-subkey name> \
+             --group-id {} --threshold {threshold} --participants {participants} --index <n> \
+             --relay {}",
+            hex::encode(group_id),
+            relays.first().map(String::as_str).unwrap_or("<relay>")
+        ));
 
         Ok::<_, KeepError>(())
     })?;
