@@ -557,6 +557,25 @@ fn test_frost_sign_signature_verifies_against_group_pubkey() {
         "`frost sign` output MUST verify against the group pubkey \
          via BIP-340 schnorr",
     );
+
+    let sig_hex = hex::encode(sig_bytes);
+    let verify = |message: &str| {
+        KeepCmd::new(&bin)
+            .args([
+                "frost",
+                "verify",
+                "--group",
+                &hex::encode(group_pubkey),
+                "--message",
+                message,
+                "--signature",
+                &sig_hex,
+            ])
+            .run()
+    };
+    assert_success(&verify(&msg_hex));
+    let other: [u8; 32] = sha2::Sha256::digest(b"another payload").into();
+    assert!(!verify(&hex::encode(other)).status.success());
 }
 
 #[test]

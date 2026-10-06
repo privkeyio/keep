@@ -814,9 +814,11 @@ pub fn cmd_frost_verify(out: &Output, message_hex: &str, group: &str, sig_hex: &
         )));
     }
 
-    // frost-secp256k1-tr uses the 32-byte BIP-340 x-only encoding directly,
-    // not a SEC1-compressed 33-byte buffer.
-    let vk = frost::VerifyingKey::deserialize(&group_pubkey)
+    // The group key is BIP-340 x-only; frost-secp256k1-tr deserializes a
+    // SEC1-compressed point, and an x-only key is the even-y one.
+    let mut compressed = [0x02u8; 33];
+    compressed[1..].copy_from_slice(&group_pubkey);
+    let vk = frost::VerifyingKey::deserialize(&compressed)
         .map_err(|e| KeepError::Frost(format!("Invalid group pubkey: {e}")))?;
 
     let signature = frost::Signature::deserialize(&sig_bytes)
