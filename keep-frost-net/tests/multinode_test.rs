@@ -4569,3 +4569,68 @@ async fn test_duress_beacon_to_learned_transport_key_freezes_peer_over_relay() {
     graceful_shutdown(shutdown2, receiver_handle).await;
     assert!(frozen.is_ok(), "the receiver must freeze on the beacon");
 }
+
+/// Two nodes discover each other and complete a 2-of-3 signature over a real
+/// relay, which exercises the `#p` subscriptions the mock relay cannot vouch
+/// for. Run with `KEEP_E2E_RELAY=wss://... cargo test ... -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a real relay in KEEP_E2E_RELAY"]
+async fn test_signing_over_real_relay() {
+    keep_frost_net::install_default_crypto_provider();
+    let relay = std::env::var("KEEP_E2E_RELAY").expect("KEEP_E2E_RELAY");
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-real-relay").unwrap();
+    let mut node1 = KfpNode::new(shares.remove(0), vec![relay.clone()])
+        .await
+        .expect("node 1");
+    let mut node2 = KfpNode::new(shares.remove(0), vec![relay])
+        .await
+        .expect("node 2");
+    let group = *node2.group_pubkey();
+    let mut rx2 = node2.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let node2 = std::sync::Arc::new(node2);
+    let node1_handle = tokio::spawn(async move {
+        let _ = node1.run().await;
+    });
+    let node2_handle = tokio::spawn({
+        let node = node2.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+
+    let discovered = timeout(Duration::from_secs(60), async {
+        loop {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index: 1, .. }) =
+                rx2.recv().await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    let signed = match discovered {
+        Ok(()) => Some(
+            timeout(
+                Duration::from_secs(90),
+                node2.request_signature(b"real relay".to_vec(), "raw"),
+            )
+            .await,
+        ),
+        Err(_) => None,
+    };
+
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+
+    let signature = signed
+        .expect("peer discovery over the relay timed out")
+        .expect("signing timed out")
+        .expect("signing failed");
+    let key = k256::schnorr::VerifyingKey::from_bytes(&group).expect("group key");
+    let signature = k256::schnorr::Signature::try_from(signature.as_slice()).expect("signature");
+    key.verify_raw(b"real relay", &signature)
+        .expect("the signature must verify under the group key");
+}
