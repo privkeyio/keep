@@ -796,8 +796,19 @@ impl KfpNode {
                         session.add_commitment(*share_index, *c)?;
                     }
                 }
+                let early = self
+                    .early_commitments
+                    .write()
+                    .remove(&request.session_id)
+                    .map(|(_, held)| held)
+                    .unwrap_or_default();
+                for (share_index, c) in early {
+                    if let Err(e) = session.add_commitment(share_index, c) {
+                        debug!(share_index, error = %e, "Skipping held commitment");
+                    }
+                }
 
-                let proceed = used_pre_exchange && session.has_all_commitments();
+                let proceed = session.has_all_commitments();
 
                 sessions.record_nonce_consumption(&request.session_id)?;
 
@@ -831,11 +842,40 @@ impl KfpNode {
             commit_bytes,
         );
 
-        let event = KfpEventBuilder::commitment(&self.keys, &from, payload)?;
-        self.transport.send_event(&event).await?;
+        // Every participant needs every commitment before it can produce its
+        // share, so co-signers also send theirs to each other, not only to the
+        // requester (which would otherwise leave rounds of three or more stuck
+        // without pre-exchanged nonces).
+        let mut recipients = vec![from];
+        {
+            let peers = self.peers.read();
+            for &idx in &request.participants {
+                if idx == self.share.metadata.identifier || idx == requester {
+                    continue;
+                }
+                if let Some(peer) = peers.get_peer(idx) {
+                    if self.can_send_to_index(idx) {
+                        recipients.push(peer.pubkey);
+                    }
+                }
+            }
+        }
+        for (n, recipient) in recipients.iter().enumerate() {
+            let event = KfpEventBuilder::commitment(&self.keys, recipient, payload.clone())?;
+            match self.transport.send_event(&event).await {
+                Ok(_) => {}
+                // The requester must have it; another co-signer can still get it
+                // through its own sign request path, so keep the round going.
+                Err(e) if n > 0 => {
+                    warn!(error = %e, "Failed to send commitment to a co-signer");
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         debug!(
             session_id = %hex::encode(request.session_id),
+            recipients = recipients.len(),
             "Sent commitment"
         );
 
@@ -849,12 +889,13 @@ impl KfpNode {
             Some(requester),
         );
 
-        // With pre-exchange, the full commitment set arrived in this request, so
-        // we can move straight to round 2 without waiting for commitment events.
+        // The full commitment set is already here (pre-exchanged in the request,
+        // or held from participants whose commitments arrived first), so move
+        // straight to round 2 without waiting for commitment events.
         if proceed_to_round2 {
             info!(
                 session_id = %hex::encode(request.session_id),
-                "Instant-signing: full commitment set pre-exchanged, proceeding to round 2"
+                "Full commitment set present, proceeding to round 2"
             );
             // The own nonce was already consumed (single-use) and used to
             // compute the signature share, which may have been partially sent.
@@ -867,6 +908,49 @@ impl KfpNode {
         }
 
         Ok(())
+    }
+
+    /// Keep a commitment from an admitted participant whose session this node
+    /// has not created yet, for [`Self::handle_sign_request`] to apply. Bounded
+    /// in sessions, entries per session and age.
+    fn hold_early_commitment(
+        &self,
+        session_id: [u8; 32],
+        share_index: u16,
+        commitment: frost_secp256k1_tr::round1::SigningCommitments,
+    ) {
+        const MAX_SESSIONS: usize = 64;
+        const MAX_SESSIONS_PER_SENDER: usize = 4;
+        const MAX_AGE: Duration = Duration::from_secs(120);
+        let max_entries = usize::from(self.share.metadata.total_shares);
+        let mut held = self.early_commitments.write();
+        held.retain(|_, (since, _)| since.elapsed() < MAX_AGE);
+        let from_sender = held
+            .iter()
+            .filter(|(id, (_, entries))| {
+                **id != session_id && entries.iter().any(|(i, _)| *i == share_index)
+            })
+            .count();
+        if from_sender >= MAX_SESSIONS_PER_SENDER
+            || (!held.contains_key(&session_id) && held.len() >= MAX_SESSIONS)
+        {
+            debug!(
+                session_id = %hex::encode(session_id),
+                "Dropping commitment for an unknown session: too many pending"
+            );
+            return;
+        }
+        let (_, entries) = held
+            .entry(session_id)
+            .or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+        if entries.len() < max_entries && entries.iter().all(|(i, _)| *i != share_index) {
+            entries.push((share_index, commitment));
+            debug!(
+                session_id = %hex::encode(session_id),
+                share_index,
+                "Holding commitment until its sign request arrives"
+            );
+        }
     }
 
     pub(crate) async fn handle_commitment(
@@ -894,10 +978,7 @@ impl KfpNode {
             let session = match sessions.get_session_mut(&payload.session_id) {
                 Some(s) => s,
                 None => {
-                    debug!(
-                        session_id = %hex::encode(payload.session_id),
-                        "No session for commitment"
-                    );
+                    self.hold_early_commitment(payload.session_id, payload.share_index, commitment);
                     return Ok(());
                 }
             };
@@ -2425,6 +2506,65 @@ mod gate_tests {
             node.handle_sign_request(from, req).await,
             Err(FrostNetError::PolicyViolation(_))
         ));
+    }
+
+    /// A co-signer's commitment that arrives before the sign request is held
+    /// and applied when the session is created, so the round proceeds.
+    #[tokio::test]
+    async fn commitment_before_its_sign_request_is_applied() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let (mut shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
+            .generate("early-commitment")
+            .unwrap();
+        let node = KfpNode::new(shares.remove(0), vec![relay]).await.unwrap();
+        let requester_share = shares.remove(0);
+        let from = Keys::generate().public_key();
+        node.test_inject_peer(crate::peer::Peer::new(from, 2));
+
+        let message = vec![7u8; 32];
+        let session_id = crate::session::derive_session_id(&message, &[1, 2], 2);
+        let (_nonces, commitment) = frost_secp256k1_tr::round1::commit(
+            requester_share.key_package().unwrap().signing_share(),
+            &mut frost_secp256k1_tr::rand_core::OsRng,
+        );
+        let early = CommitmentPayload::new(session_id, 2, commitment.serialize().unwrap());
+        node.handle_commitment(from, early).await.unwrap();
+        assert!(node.early_commitments.read().contains_key(&session_id));
+
+        let request =
+            SignRequestPayload::new(session_id, *node.group_pubkey(), message, "raw", vec![1, 2]);
+        node.handle_sign_request(from, request).await.unwrap();
+        assert!(!node.early_commitments.read().contains_key(&session_id));
+        let sessions = node.sessions.read();
+        let session = sessions.get_session(&session_id).expect("session");
+        assert!(session.has_all_commitments());
+        assert!(
+            matches!(
+                session.state(),
+                crate::session::SessionState::AwaitingShares
+            ),
+            "round 2 must have started"
+        );
+    }
+
+    /// One participant cannot fill the held-commitment buffer for everyone.
+    #[tokio::test]
+    async fn held_commitments_are_capped_per_sender() {
+        let (node, _relay) = test_node().await;
+        let (_, commitment) = frost_secp256k1_tr::round1::commit(
+            node.share.key_package().unwrap().signing_share(),
+            &mut frost_secp256k1_tr::rand_core::OsRng,
+        );
+        for i in 0..10u8 {
+            node.hold_early_commitment([i; 32], 2, commitment);
+        }
+        assert_eq!(node.early_commitments.read().len(), 4);
+        node.hold_early_commitment([99u8; 32], 3, commitment);
+        assert_eq!(node.early_commitments.read().len(), 5);
     }
 
     /// A nonce commitment from a peer whose share index is not announced is

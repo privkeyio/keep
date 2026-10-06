@@ -131,9 +131,7 @@ pub fn cmd_frost_network_serve(
                 return Err(KeepError::invalid_input(
                     "no duress beacon recipients are recorded yet; serve with \
                      --duress-recipients-file and without the beacon flags until the other \
-                     members have announced. Members admitted on proof of their share alone \
-                     (a share imported without the group's verifying shares, threshold 3 or \
-                     more) are never recorded",
+                     members have announced",
                 ));
             }
             let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
@@ -207,6 +205,18 @@ pub fn cmd_frost_network_serve(
     let threshold = share.metadata.threshold;
     let share_index = share.metadata.identifier;
     let total_shares = share.metadata.total_shares;
+    // A refreshed share has a new verifying share; recipients recorded under
+    // the old one point at rotated keys and are dropped before serving.
+    let own_verifying_share = hex::encode(
+        share
+            .key_package()?
+            .verifying_share()
+            .serialize()
+            .map_err(|e| KeepError::Frost(format!("serialize verifying share: {e}")))?,
+    );
+    if let Some(p) = duress_recipients_file {
+        duress::record_recipients(p, &group_pubkey, &own_verifying_share, &[])?;
+    }
 
     out.newline();
     out.header("FROST Network Node");
@@ -346,6 +356,7 @@ pub fn cmd_frost_network_serve(
         let mut event_rx = node.subscribe();
         let event_node = node.clone();
         let event_keep = keep.clone();
+        let _learned_store = store_learned_verifying_shares(&node, keep.clone());
         let event_seal_path = oprf_seal_path;
         let event_recipients_path = duress_recipients_path;
         let event_task = tokio::spawn(async move {
@@ -363,13 +374,30 @@ pub fn cmd_frost_network_serve(
                             "PSBT signature requested but `frost network serve` does not yet implement signer contribution; the initiator will time out."
                         );
                     }
+                    Ok(keep_frost_net::KfpNodeEvent::PeerVersionMismatch {
+                        share_index,
+                        version,
+                    }) => {
+                        tracing::warn!(
+                            share_index,
+                            version,
+                            "peer runs another protocol version; every member must run v{}",
+                            keep_frost_net::KFP_VERSION
+                        );
+                    }
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
                         tracing::info!(share_index, name = name_str, "peer discovered");
                         if let Some(path) = event_recipients_path.clone() {
                             let peers = event_node.bound_peer_transport_keys();
+                            let own = own_verifying_share.clone();
                             let recorded = tokio::task::spawn_blocking(move || {
-                                duress::record_recipients(&path, &group_pubkey, &peers)
+                                duress::record_recipients(
+                                    &path,
+                                    &group_pubkey,
+                                    &own,
+                                    &peers,
+                                )
                             })
                             .await;
                             match recorded {
@@ -634,7 +662,10 @@ pub fn cmd_frost_network_serve(
                             }
                         }
                     }
-                    Err(_) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "node events dropped while busy");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
                 }
             }
@@ -724,6 +755,10 @@ pub fn cmd_frost_network_peers(
         spinner.finish();
 
         let status = node.peer_status();
+        if let Some(learned) = node.learned_verifying_shares() {
+            keep.frost_store_verifying_shares(&group_pubkey, node.share_index(), &learned)?;
+            out.info("Stored every member's verifying share with this share.");
+        }
 
         if status.is_empty() {
             out.info("No peers discovered yet (waited up to 25s; announce interval is 20s).");
@@ -1365,6 +1400,48 @@ fn probe_duress_state(out: &Output, path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Stores the verifying-share set a node learns from its members (when the
+/// share was kept without it) with the share in the vault, as soon as the node
+/// reports it, so later starts bind every member at once.
+pub(crate) fn store_learned_verifying_shares(
+    node: &keep_frost_net::KfpNode,
+    keep: Arc<Mutex<Keep>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut events = node.subscribe();
+    let group_pubkey = *node.group_pubkey();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(keep_frost_net::KfpNodeEvent::VerifyingSharesLearned {
+                    share_index,
+                    verifying_shares,
+                }) => {
+                    let keep = keep.clone();
+                    let stored = tokio::task::spawn_blocking(move || {
+                        keep.lock()
+                            .map_err(|_| KeepError::Runtime("keep mutex poisoned".into()))?
+                            .frost_store_verifying_shares(
+                                &group_pubkey,
+                                share_index,
+                                &verifying_shares,
+                            )
+                    })
+                    .await;
+                    match stored {
+                        Ok(Ok(())) => tracing::info!("stored every member's verifying share"),
+                        Ok(Err(e)) => {
+                            error!(error = %e, "failed to store learned verifying shares")
+                        }
+                        Err(e) => error!(error = %e, "verifying-share store task failed"),
+                    }
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 /// Reconstruct a LUKS key from a threshold-OPRF quorum and write the 32 raw key

@@ -260,6 +260,11 @@ pub enum Message {
 #[derive(Clone)]
 pub enum FrostNodeMsg {
     PeerUpdate(Vec<PeerEntry>),
+    VerifyingSharesLearned {
+        group_pubkey: [u8; 32],
+        share_index: u16,
+        verifying_shares: std::collections::BTreeMap<u16, [u8; 33]>,
+    },
     NewSignRequest(PendingSignRequest),
     SignRequestRemoved(String),
     StatusChanged(ConnectionStatus),
@@ -331,6 +336,10 @@ impl fmt::Debug for FrostNodeMsg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::PeerUpdate(peers) => f.debug_tuple("PeerUpdate").field(&peers.len()).finish(),
+            Self::VerifyingSharesLearned { share_index, .. } => f
+                .debug_struct("VerifyingSharesLearned")
+                .field("share_index", share_index)
+                .finish(),
             Self::NewSignRequest(_) => f.write_str("NewSignRequest"),
             Self::SignRequestRemoved(id) => f.debug_tuple("SignRequestRemoved").field(id).finish(),
             Self::StatusChanged(s) => f.debug_tuple("StatusChanged").field(s).finish(),

@@ -367,6 +367,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut node = None;
     let mut active_identifier = None;
+    let (learned_tx, mut learned_rx) = tokio::sync::mpsc::unbounded_channel();
+    let learned_group = resolved_group
+        .as_ref()
+        .map(|(group_pubkey, _)| *group_pubkey);
     let bunker_info = if let Some((group_pubkey, group_npub)) = resolved_group {
         match keep.frost_get_share(&group_pubkey) {
             Ok(share) => {
@@ -387,6 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         enabled: signing_enabled.clone(),
                         bunker_secret: state::load_or_create_bunker_secret(&vault_path)?,
                         transport_key: state::load_or_create_transport_key(&vault_path)?,
+                        learned_verifying_shares: learned_tx,
                     },
                     events.clone(),
                     approvals.clone(),
@@ -424,6 +429,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         BunkerInfo::setup()
     };
     let keep = Arc::new(Mutex::new(keep));
+    if let Some(group_pubkey) = learned_group {
+        let keep = keep.clone();
+        tokio::spawn(async move {
+            while let Some((share_index, verifying_shares)) = learned_rx.recv().await {
+                if let Err(e) = keep.lock().await.frost_store_verifying_shares(
+                    &group_pubkey,
+                    share_index,
+                    &verifying_shares,
+                ) {
+                    tracing::error!(error = %e, "failed to store learned verifying shares");
+                }
+            }
+        });
+    }
 
     // keep-state replication over the mesh relay (opt-in via KEEP_STATE_RELAY, e.g. the on-box wisp).
     // The active publishes each vault-state write under a shared cluster identity; a standby consumes

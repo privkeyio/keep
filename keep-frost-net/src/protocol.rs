@@ -20,6 +20,8 @@ pub const MAX_PARTICIPANTS: usize = 255;
 /// scalar followed by a 33-byte compressed point (`keep_core::oprf::threshold`).
 pub const OPRF_PARTIAL_LEN: usize = 65;
 pub const MAX_NAME_LENGTH: usize = 256;
+/// Most members' proofs one announce relays; a node in a larger group sends none.
+pub const MAX_MEMBER_PROOFS: usize = 32;
 /// Upper bound on a marshaled `TPMS_ATTEST` carried in a TPM quote evidence. A
 /// real quote is well under 256 bytes; the cap rejects oversized blobs before
 /// any parsing work.
@@ -294,6 +296,9 @@ fn validate_announce(p: &AnnouncePayload) -> Result<(), &'static str> {
     }
     if p.capabilities.len() > MAX_CAPABILITIES {
         return Err("Too many capabilities");
+    }
+    if p.member_proofs.len() > MAX_MEMBER_PROOFS {
+        return Err("Too many member proofs");
     }
     for cap in &p.capabilities {
         if cap.len() > MAX_CAPABILITY_LENGTH {
@@ -896,6 +901,25 @@ pub struct AnnouncePayload {
     pub attestation: Option<EnclaveAttestation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tpm_attestation: Option<TpmQuoteEvidence>,
+    /// Other members' announce proofs, relayed by a node that knows the group's
+    /// verifying shares, so a member whose share lacks them can learn the whole
+    /// set from this one announce.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub member_proofs: Vec<MemberProof>,
+}
+
+/// One member's announce proof as that member published it: a signature by its
+/// verifying share over the group, its index and its transport key.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct MemberProof {
+    pub share_index: u16,
+    #[serde(with = "hex_bytes_33")]
+    pub verifying_share: [u8; 33],
+    #[serde(with = "hex_bytes")]
+    pub transport_pubkey: [u8; 32],
+    pub timestamp: u64,
+    #[serde(with = "hex_bytes_64")]
+    pub proof_signature: [u8; 64],
 }
 
 /// TPM 2.0 quote attestation evidence, the parallel to [`EnclaveAttestation`]
@@ -980,6 +1004,7 @@ impl AnnouncePayload {
             name: None,
             attestation: None,
             tpm_attestation: None,
+            member_proofs: Vec::new(),
         }
     }
 

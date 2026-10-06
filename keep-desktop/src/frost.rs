@@ -734,6 +734,33 @@ fn handle_node_event(
         ev @ (KfpNodeEvent::PsbtFinalized { .. } | KfpNodeEvent::PsbtAborted { .. }) => {
             handle_psbt_status_node_event(ev, now_secs, frost_events);
         }
+        KfpNodeEvent::VerifyingSharesLearned {
+            share_index,
+            verifying_shares,
+        } => {
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::VerifyingSharesLearned {
+                    group_pubkey: *node.group_pubkey(),
+                    share_index,
+                    verifying_shares,
+                },
+            );
+        }
+        KfpNodeEvent::PeerVersionMismatch {
+            share_index,
+            version,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!(
+                    "Peer #{share_index} runs protocol v{version}; every member must run v{}",
+                    keep_frost_net::KFP_VERSION
+                ),
+            );
+        }
         // A verified duress beacon froze this node: surface it
         // prominently (co-signing and OPRF evals are now refused).
         KfpNodeEvent::DuressFrozen { beacon_pubkey } => {
@@ -1378,6 +1405,22 @@ impl App {
                     });
                 });
             }
+            FrostNodeMsg::VerifyingSharesLearned {
+                group_pubkey,
+                share_index,
+                verifying_shares,
+            } => match lock_keep(&self.keep).as_mut() {
+                Some(keep) => {
+                    if let Err(e) = keep.frost_store_verifying_shares(
+                        &group_pubkey,
+                        share_index,
+                        &verifying_shares,
+                    ) {
+                        tracing::error!(error = %e, "Failed to store learned verifying shares");
+                    }
+                }
+                None => tracing::warn!("Vault locked; learned verifying shares were not stored"),
+            },
             FrostNodeMsg::DescriptorComplete {
                 session_id,
                 external_descriptor,

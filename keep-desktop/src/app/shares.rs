@@ -62,7 +62,7 @@ impl App {
                                         .frost_export_share(&group_pubkey, identifier, &passphrase)
                                         .map_err(|e| e.to_string())?;
                                     let bech32 = export
-                                        .to_bech32()
+                                        .to_text()
                                         .map(Zeroizing::new)
                                         .map_err(|e| e.to_string())?;
                                     Ok((bech32, passphrase))
@@ -569,10 +569,7 @@ impl App {
                         let export = keep
                             .frost_export_share(&share.group_pubkey, share.identifier, &passphrase)
                             .map_err(friendly_err)?;
-                        let bech32 = export
-                            .to_bech32()
-                            .map(Zeroizing::new)
-                            .map_err(friendly_err)?;
+                        let bech32 = export.to_text().map(Zeroizing::new).map_err(friendly_err)?;
                         let frames: Vec<Zeroizing<String>> = export
                             .to_animated_frames(600)
                             .map_err(friendly_err)?

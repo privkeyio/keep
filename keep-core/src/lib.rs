@@ -1007,6 +1007,33 @@ impl Keep {
         Ok(metadata)
     }
 
+    /// Store the full verifying-share set for a share that was imported
+    /// without it, once [`frost::complete_verifying_shares`] accepts the set.
+    /// A share that already holds a complete set is left unchanged.
+    pub fn frost_store_verifying_shares(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        identifier: u16,
+        verifying_shares: &std::collections::BTreeMap<u16, [u8; 33]>,
+    ) -> Result<()> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let data_key = self.get_data_key()?;
+        let stored = self.find_stored_share(
+            group_pubkey,
+            identifier,
+            Some(crate::frost::Ciphersuite::Secp256k1Tr),
+        )?;
+        let share = stored.decrypt(&data_key)?;
+        let Some(package) = frost::completed_pubkey_package(&share, verifying_shares)? else {
+            return Ok(());
+        };
+        let updated = SharePackage::new(share.metadata.clone(), &share.key_package()?, &package)?;
+        self.storage
+            .store_share(&StoredShare::encrypt(&updated, &data_key)?)
+    }
+
     /// Delete a FROST share.
     pub fn frost_delete_share(&mut self, group_pubkey: &[u8; 32], identifier: u16) -> Result<()> {
         self.storage.delete_share(group_pubkey, identifier)?;
@@ -2822,5 +2849,54 @@ mod tests {
             .find(|s| s.metadata.name == "retain-group")
             .unwrap();
         assert_eq!(stored.metadata.group_subkey_secret, Some(subkey));
+    }
+
+    #[test]
+    fn learned_verifying_shares_complete_an_imported_share() {
+        let src_dir = tempdir().unwrap();
+        let mut src = test_keep(&src_dir.path().join("keep"));
+        let shares = src.frost_generate(3, 5, "learned").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let full = shares[0].pubkey_package().unwrap();
+        let set = frost::verifying_share_map(&full, 5).unwrap();
+
+        let mut export = src
+            .frost_export_share(&group_pubkey, 1, "transfer-pass")
+            .unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+        export.encrypted_verifying_shares = None;
+        export.verifying_shares_nonce = None;
+
+        let dst_dir = tempdir().unwrap();
+        let mut dst = test_keep(&dst_dir.path().join("keep"));
+        dst.frost_import_share(&export, "transfer-pass", "imported")
+            .unwrap();
+        let single = dst.frost_get_share_by_index(&group_pubkey, 1).unwrap();
+        assert_eq!(single.pubkey_package().unwrap().verifying_shares().len(), 1);
+
+        let mut forged = set.clone();
+        forged.insert(4, set[&5]);
+        assert!(dst
+            .frost_store_verifying_shares(&group_pubkey, 1, &forged)
+            .is_err());
+        assert_eq!(
+            dst.frost_get_share_by_index(&group_pubkey, 1)
+                .unwrap()
+                .pubkey_package()
+                .unwrap()
+                .verifying_shares()
+                .len(),
+            1
+        );
+
+        dst.frost_store_verifying_shares(&group_pubkey, 1, &set)
+            .unwrap();
+        let completed = dst.frost_get_share_by_index(&group_pubkey, 1).unwrap();
+        assert_eq!(
+            completed.pubkey_package().unwrap().verifying_shares(),
+            full.verifying_shares()
+        );
+        assert_eq!(completed.key_package_bytes(), single.key_package_bytes());
     }
 }

@@ -678,6 +678,53 @@ struct PendingContribution {
     created_at: std::time::Instant,
 }
 
+/// Store the verifying-share set a node learned from its members' announces
+/// with the share it was learned for, after checking it against the share
+/// (`complete_verifying_shares`), so later starts bind every member at once.
+/// The running node keeps going; only the stored public-key package changes.
+fn store_learned_verifying_shares(
+    storage: &dyn SecureStorage,
+    group_pubkey: &[u8; 32],
+    share_index: u16,
+    verifying_shares: &std::collections::BTreeMap<u16, [u8; 33]>,
+) -> Result<(), KeepMobileError> {
+    let invalid = |msg: String| KeepMobileError::InvalidShare { msg };
+    let key = hex::encode(group_pubkey);
+    let data = storage.load_share_by_key(key.clone())?;
+    let mut stored: StoredShareData =
+        serde_json::from_slice(&data).map_err(|e| invalid(e.to_string()))?;
+    let metadata: ShareMetadata =
+        serde_json::from_str(&stored.metadata_json).map_err(|e| invalid(e.to_string()))?;
+    if metadata.identifier != share_index || metadata.group_pubkey != *group_pubkey {
+        return Err(invalid(
+            "learned verifying shares are for another share".into(),
+        ));
+    }
+    let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(&stored.key_package_bytes)
+        .map_err(|e| invalid(format!("Invalid key package: {e}")))?;
+    let pubkey_package =
+        frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
+            .map_err(|e| invalid(format!("Invalid pubkey package: {e}")))?;
+    let share = SharePackage::new(metadata.clone(), &key_package, &pubkey_package)
+        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+    let Some(complete) = keep_core::frost::completed_pubkey_package(&share, verifying_shares)
+        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+    else {
+        return Ok(());
+    };
+    stored.pubkey_package_bytes = complete
+        .serialize()
+        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+    let info = storage
+        .list_all_shares()
+        .into_iter()
+        .find(|m| m.group_pubkey == group_pubkey.to_vec() && m.identifier == share_index)
+        .unwrap_or_else(|| (&metadata).into());
+    let serialized = serde_json::to_vec(&stored)
+        .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
+    storage.store_share_by_key(key, serialized, info)
+}
+
 struct DescriptorContext {
     callbacks: Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
     storage: Arc<dyn SecureStorage>,
@@ -1069,7 +1116,7 @@ impl KeepMobile {
         let export = ShareExport::from_share(&share, &passphrase)
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
         export
-            .to_bech32()
+            .to_text()
             .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })
     }
 
@@ -3669,7 +3716,7 @@ impl KeepMobile {
 
         for share in shares {
             let export = ShareExport::from_share(share, passphrase)?;
-            let export_data = export.to_bech32()?;
+            let export_data = export.to_text()?;
 
             share_infos.push(GeneratedShareInfo {
                 share_index: share.metadata.identifier,
@@ -3938,6 +3985,30 @@ impl KeepMobile {
                         Ok(KfpNodeEvent::PeerDiscovered { .. })
                         | Ok(KfpNodeEvent::PeerOffline { .. }) => {
                             state.push(&connection_status).await;
+                        }
+                        Ok(KfpNodeEvent::VerifyingSharesLearned {
+                            share_index,
+                            verifying_shares,
+                        }) => {
+                            if let Err(e) = store_learned_verifying_shares(
+                                desc.storage.as_ref(),
+                                desc.node.group_pubkey(),
+                                share_index,
+                                &verifying_shares,
+                            ) {
+                                tracing::error!("Failed to store learned verifying shares: {e}");
+                            }
+                        }
+                        Ok(KfpNodeEvent::PeerVersionMismatch {
+                            share_index,
+                            version,
+                        }) => {
+                            tracing::warn!(
+                                share_index,
+                                version,
+                                "peer runs another protocol version; every member must run v{}",
+                                keep_frost_net::KFP_VERSION
+                            );
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -4392,6 +4463,49 @@ mod import_teardown_tests {
             storage.get_active_share_key().as_deref(),
             Some(info.group_pubkey.as_str())
         );
+    }
+
+    #[test]
+    fn learned_verifying_shares_complete_a_stored_share() {
+        use keep_core::frost::{ThresholdConfig, TrustedDealer};
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap())
+            .generate("learned")
+            .unwrap();
+        let full = shares[0].pubkey_package().unwrap();
+        let set = keep_core::frost::verifying_share_map(&full, 5).unwrap();
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+        export.encrypted_verifying_shares = None;
+        export.verifying_shares_nonce = None;
+        mobile
+            .import_share(export.to_json().unwrap(), "pass".into(), "learned".into())
+            .unwrap();
+        let group = *shares[0].group_pubkey();
+        assert_eq!(
+            mobile
+                .load_share_package()
+                .unwrap()
+                .pubkey_package()
+                .unwrap()
+                .verifying_shares()
+                .len(),
+            1
+        );
+
+        let mut forged = set.clone();
+        forged.insert(3, set[&4]);
+        assert!(store_learned_verifying_shares(storage.as_ref(), &group, 1, &forged).is_err());
+        store_learned_verifying_shares(storage.as_ref(), &group, 1, &set).unwrap();
+        let completed = mobile.load_share_package().unwrap();
+        assert_eq!(
+            completed.pubkey_package().unwrap().verifying_shares(),
+            full.verifying_shares()
+        );
+        assert_eq!(completed.metadata.name, "learned");
     }
 
     // A corrupt active-share record must degrade gracefully to `None` without
