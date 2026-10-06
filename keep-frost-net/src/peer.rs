@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use nostr_sdk::PublicKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::protocol::AnnouncedXpub;
@@ -179,6 +179,7 @@ pub struct PeerManager {
     peers: HashMap<u16, Peer>,
     our_share_index: u16,
     offline_threshold: Duration,
+    contested: HashSet<u16>,
 }
 
 impl PeerManager {
@@ -191,7 +192,18 @@ impl PeerManager {
             // minute (issue #412). A peer that drops mid-round is still caught
             // by the signing-round timeout and failover exclusion.
             offline_threshold: peer_announce_interval().saturating_mul(2),
+            contested: HashSet::new(),
         }
+    }
+
+    /// Drops the peer at `share_index` and refuses the index from then on.
+    pub fn contest(&mut self, share_index: u16) {
+        self.peers.remove(&share_index);
+        self.contested.insert(share_index);
+    }
+
+    pub fn is_contested(&self, share_index: u16) -> bool {
+        self.contested.contains(&share_index)
     }
 
     pub fn with_offline_threshold(mut self, threshold: Duration) -> Self {

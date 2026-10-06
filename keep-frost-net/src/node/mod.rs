@@ -2724,17 +2724,30 @@ impl KfpNode {
             }
         };
 
-        // Without a canonical share the index cannot be checked, so the first
-        // verifying share admitted for it is kept until restart; an announce for
-        // the same index with another share is refused rather than replacing it.
+        // Without a canonical share the index cannot be checked. Once two
+        // different shares are proven for it, neither can be told apart from the
+        // real one, so the index is dropped and refused until restart.
         if proof_only {
-            if let Some(existing) = self.peers.read().get_peer(payload.share_index) {
-                if existing.verifying_share != Some(payload.verifying_share) {
-                    return Err(FrostNetError::UntrustedPeer(format!(
-                        "Announced verifying share for index {} differs from the one already admitted for it",
-                        payload.share_index
-                    )));
-                }
+            let mut peers = self.peers.write();
+            if peers.is_contested(payload.share_index) {
+                return Err(FrostNetError::UntrustedPeer(format!(
+                    "Index {} is refused: different shares were announced for it",
+                    payload.share_index
+                )));
+            }
+            let conflicting = peers
+                .get_peer(payload.share_index)
+                .is_some_and(|existing| existing.verifying_share != Some(payload.verifying_share));
+            if conflicting {
+                peers.contest(payload.share_index);
+                warn!(
+                    share_index = payload.share_index,
+                    "Different shares were announced for this index; refusing it until restart"
+                );
+                return Err(FrostNetError::UntrustedPeer(format!(
+                    "Index {} is refused: different shares were announced for it",
+                    payload.share_index
+                )));
             }
         }
 
@@ -3950,7 +3963,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proof_only_announce_cannot_replace_an_admitted_share() {
+    async fn canonical_member_can_reannounce_under_a_new_key() {
+        let (node, shares) = member_test_node(false).await;
+        for _ in 0..2 {
+            let from = Keys::generate().public_key();
+            node.handle_announce(
+                from,
+                announce_payload(
+                    &node.group_pubkey,
+                    2,
+                    share_secrets(&shares[0]),
+                    KFP_VERSION,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(node.peers.read().get_peer(2).map(|p| p.pubkey), Some(from));
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_proof_only_shares_refuse_the_index() {
         let (node, _) = node_for(dealer_shares(3, 5), true).await;
         let first = Keys::generate().public_key();
         let admitted = random_share();
@@ -3969,18 +4002,27 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(&result, Err(FrostNetError::UntrustedPeer(msg)) if msg.contains("differs from the one already admitted")),
-            "expected the replacement to be refused, got {result:?}"
+            matches!(&result, Err(FrostNetError::UntrustedPeer(msg)) if msg.contains("different shares were announced")),
+            "expected the index to be refused, got {result:?}"
         );
-        assert_eq!(node.peers.read().get_peer(2).map(|p| p.pubkey), Some(first));
+        assert!(node.peers.read().get_peer(2).is_none());
 
-        let moved = Keys::generate().public_key();
+        let again = node
+            .handle_announce(
+                first,
+                announce_payload(&node.group_pubkey, 2, admitted, KFP_VERSION),
+            )
+            .await;
+        assert!(again.is_err(), "a contested index stays refused");
+        assert!(node.peers.read().get_peer(2).is_none());
+
+        let from = Keys::generate().public_key();
         node.handle_announce(
-            moved,
-            announce_payload(&node.group_pubkey, 2, admitted, KFP_VERSION),
+            from,
+            announce_payload(&node.group_pubkey, 3, random_share(), KFP_VERSION),
         )
         .await
         .unwrap();
-        assert_eq!(node.peers.read().get_peer(2).map(|p| p.pubkey), Some(moved));
+        assert!(node.peers.read().get_peer(3).is_some());
     }
 }
