@@ -563,7 +563,7 @@ mod tests {
         let group = [9u8; 32];
         let share_index: u16 = 2;
         let timestamp: u64 = 1_700_000_000;
-        let nonce = derive_announce_attestation_nonce(&group, share_index, timestamp);
+        let nonce = derive_announce_attestation_nonce(&group, share_index, &[7u8; 32], timestamp);
 
         let ev = quoter.quote(&nonce).expect("produce quote");
         assert_eq!(ev.signature.len(), 64, "signature must be r||s");
@@ -585,7 +585,8 @@ mod tests {
 
         // A different announce (one tick later) must fail: the qualifyingData no
         // longer matches, so a captured quote cannot be replayed across announces.
-        let other = derive_announce_attestation_nonce(&group, share_index, timestamp + 1);
+        let other =
+            derive_announce_attestation_nonce(&group, share_index, &[7u8; 32], timestamp + 1);
         assert!(
             matches!(
                 appraise_tpm_quote(share_index, &ev, &pol, &other),
@@ -622,7 +623,7 @@ mod tests {
         let group = [4u8; 32];
         let share_index: u16 = 3;
         let timestamp: u64 = 1_700_000_500;
-        let nonce = derive_announce_attestation_nonce(&group, share_index, timestamp);
+        let nonce = derive_announce_attestation_nonce(&group, share_index, &[7u8; 32], timestamp);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let ev = rt

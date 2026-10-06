@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 pub const KFP_EVENT_KIND: u16 = 24242;
-pub const KFP_VERSION: u8 = 1;
+pub const KFP_VERSION: u8 = 2;
 pub const DEFAULT_REPLAY_WINDOW_SECS: u64 = 300;
 
 pub const MAX_MESSAGE_SIZE: usize = 65536;

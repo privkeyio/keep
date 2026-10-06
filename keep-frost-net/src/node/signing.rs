@@ -254,7 +254,7 @@ impl KfpNode {
             .read()
             .get_online_peers()
             .iter()
-            .filter(|p| self.can_send_to(&p.pubkey))
+            .filter(|p| self.can_send_to_index(p.share_index))
             .map(|p| p.pubkey)
             .collect();
 
@@ -1222,7 +1222,10 @@ impl KfpNode {
             peers
                 .get_signing_peers()
                 .into_iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .map(|p| (p.share_index, p.pubkey, p.last_pong))
                 .collect()
         };
@@ -2415,7 +2418,8 @@ mod gate_tests {
         let (node, _relay) = test_node().await;
         let from = Keys::generate().public_key();
         let group = *node.group_pubkey();
-        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        node.test_inject_peer(crate::peer::Peer::new(from, 2));
+        node.set_peer_policy(PeerPolicy::new(2).allow_receive(false));
         let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
         assert!(matches!(
             node.handle_sign_request(from, req).await,

@@ -21,12 +21,14 @@ impl KfpEventBuilder {
         name: Option<&str>,
         timestamp: u64,
         tpm_attestation: Option<TpmQuoteEvidence>,
+        rendezvous: &[PublicKey],
     ) -> Result<Event> {
         let proof_signature = proof::sign_proof(
             signing_share,
             group_pubkey,
             share_index,
             verifying_share,
+            keys.public_key().as_bytes(),
             timestamp,
         )?;
 
@@ -54,6 +56,7 @@ impl KfpEventBuilder {
                 [hex::encode(group_pubkey)],
             ))
             .tag(Tag::custom(TagKind::custom("t"), ["announce"]))
+            .tags(rendezvous.iter().copied().map(Tag::public_key))
             .sign_with_keys(keys)
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
@@ -88,22 +91,20 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
-    /// Build one gift-wrapped duress beacon per group member (transport pubkeys
-    /// derived from `group_pubkey` + `total_shares`), so a coerced holder can
-    /// broadcast the beacon metadata-privately to every holder. All wraps carry the
-    /// same `nonce` (one logical beacon) but each is a distinct `kind:1059` to a
-    /// distinct recipient under its own ephemeral key. The caller publishes the
-    /// returned wraps. A coerced holder cannot read its group's size once locked,
-    /// so `total_shares` is supplied out of band (the serve `--group-total`).
+    /// Build one gift-wrapped duress beacon per recipient transport pubkey, so a
+    /// coerced holder can broadcast the beacon metadata-privately to every other
+    /// holder. All wraps carry the same `nonce` (one logical beacon) but each is a
+    /// distinct `kind:1059` to a distinct recipient under its own ephemeral key.
+    /// The caller publishes the returned wraps. A coerced holder cannot read its
+    /// share once locked, so the recipients are recorded while it is unlocked.
     pub async fn duress_beacon_broadcast(
         beacon_keys: &Keys,
         group_pubkey: &[u8; 32],
-        total_shares: u16,
+        recipients: &[PublicKey],
         nonce: &[u8; 32],
     ) -> Result<Vec<Event>> {
-        let recipients = crate::node::group_member_pubkeys(group_pubkey, total_shares);
         let mut wraps = Vec::with_capacity(recipients.len());
-        for recipient in &recipients {
+        for recipient in recipients {
             wraps.push(Self::duress_beacon(beacon_keys, group_pubkey, nonce, recipient).await?);
         }
         Ok(wraps)
@@ -700,6 +701,7 @@ mod tests {
             Some("test"),
             Timestamp::now().as_secs(),
             None,
+            &[],
         )
         .unwrap();
 
@@ -718,6 +720,7 @@ mod tests {
                 &payload.proof_signature,
                 &payload.group_pubkey,
                 payload.share_index,
+                event.pubkey.as_bytes(),
                 payload.timestamp,
             )
             .expect("proof verification should succeed");
@@ -759,6 +762,7 @@ mod tests {
             None,
             Timestamp::now().as_secs(),
             Some(evidence.clone()),
+            &[],
         )
         .unwrap();
 

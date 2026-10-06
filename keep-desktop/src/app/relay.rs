@@ -70,28 +70,18 @@ impl App {
                 Task::none()
             }
             relay::Event::SetPeerPolicy {
-                pubkey_hex,
+                share_index,
                 allow_send,
                 allow_receive,
             } => {
-                match nostr_sdk::PublicKey::from_hex(&pubkey_hex) {
-                    Ok(pubkey) => {
-                        if let Some(node) = self.get_frost_node() {
-                            use keep_frost_net::PeerPolicy;
-                            node.set_peer_policy(
-                                PeerPolicy::new(pubkey)
-                                    .allow_send(allow_send)
-                                    .allow_receive(allow_receive),
-                            );
-                        }
-                        self.save_peer_policy(&pubkey_hex, allow_send, allow_receive);
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            pubkey_hex, %e, "Failed to parse peer pubkey for policy"
-                        );
-                    }
+                if let Some(node) = self.get_frost_node() {
+                    node.set_peer_policy(
+                        keep_frost_net::PeerPolicy::new(share_index)
+                            .allow_send(allow_send)
+                            .allow_receive(allow_receive),
+                    );
                 }
+                self.save_peer_policy(share_index, allow_send, allow_receive);
                 Task::none()
             }
         }

@@ -198,7 +198,7 @@ mod tests {
         let group = [7u8; 32];
         let share_index: u16 = 2;
         let timestamp: u64 = 1_700_000_000;
-        let nonce = derive_announce_attestation_nonce(&group, share_index, timestamp);
+        let nonce = derive_announce_attestation_nonce(&group, share_index, &[7u8; 32], timestamp);
 
         let sk = p256::ecdsa::SigningKey::from_slice(&[0x42u8; 32]).unwrap();
         let ak_sec1 = sk
@@ -230,7 +230,8 @@ mod tests {
         // The same quote appraised against a DIFFERENT announce (one tick later) fails: the
         // qualifyingData no longer matches the derived nonce, so the quote cannot be replayed
         // across announces.
-        let other = derive_announce_attestation_nonce(&group, share_index, timestamp + 1);
+        let other =
+            derive_announce_attestation_nonce(&group, share_index, &[7u8; 32], timestamp + 1);
         assert!(matches!(
             appraise_tpm_quote(share_index, &ev, &pol, &other),
             AttestationStatus::Failed(_)

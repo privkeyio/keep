@@ -8,12 +8,15 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{FrostNetError, Result};
 
-const PROOF_DOMAIN_TAG: &[u8] = b"keep-frost-announce-proof-v1";
+/// The proof covers the transport pubkey that authors the announce, so a valid
+/// announce cannot be republished under another key to claim the same index.
+const PROOF_DOMAIN_TAG: &[u8] = b"keep-frost-announce-proof-v2";
 
 pub fn compute_proof_message(
     group_pubkey: &[u8; 32],
     share_index: u16,
     verifying_share: &[u8; 33],
+    transport_pubkey: &[u8; 32],
     timestamp: u64,
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -21,6 +24,7 @@ pub fn compute_proof_message(
     hasher.update(group_pubkey);
     hasher.update(share_index.to_be_bytes());
     hasher.update(verifying_share);
+    hasher.update(transport_pubkey);
     hasher.update(timestamp.to_be_bytes());
     hasher.finalize().into()
 }
@@ -30,9 +34,16 @@ pub fn sign_proof(
     group_pubkey: &[u8; 32],
     share_index: u16,
     verifying_share: &[u8; 33],
+    transport_pubkey: &[u8; 32],
     timestamp: u64,
 ) -> Result<[u8; 64]> {
-    let message = compute_proof_message(group_pubkey, share_index, verifying_share, timestamp);
+    let message = compute_proof_message(
+        group_pubkey,
+        share_index,
+        verifying_share,
+        transport_pubkey,
+        timestamp,
+    );
     let signing_key = SigningKey::from_bytes(signing_share_bytes)
         .map_err(|e| FrostNetError::Crypto(format!("Invalid signing share: {e}")))?;
     let signature = signing_key.sign(&message);
@@ -44,6 +55,7 @@ pub fn verify_proof(
     proof_signature: &[u8; 64],
     group_pubkey: &[u8; 32],
     share_index: u16,
+    transport_pubkey: &[u8; 32],
     timestamp: u64,
 ) -> Result<()> {
     let prefix = verifying_share[0];
@@ -53,7 +65,13 @@ pub fn verify_proof(
         )));
     }
 
-    let message = compute_proof_message(group_pubkey, share_index, verifying_share, timestamp);
+    let message = compute_proof_message(
+        group_pubkey,
+        share_index,
+        verifying_share,
+        transport_pubkey,
+        timestamp,
+    );
     let x_only: [u8; 32] = verifying_share[1..33]
         .try_into()
         .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
@@ -69,6 +87,8 @@ pub fn verify_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const AUTHOR: [u8; 32] = [9u8; 32];
 
     fn to_compressed_pubkey(verifying_key: &VerifyingKey) -> [u8; 33] {
         let mut compressed = [0u8; 33];
@@ -96,6 +116,7 @@ mod tests {
             &group_pubkey,
             share_index,
             &verifying_share,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
@@ -105,6 +126,7 @@ mod tests {
             &signature,
             &group_pubkey,
             share_index,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
@@ -129,6 +151,7 @@ mod tests {
             &group_pubkey,
             share_index,
             &verifying_share,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
@@ -142,6 +165,7 @@ mod tests {
             &signature,
             &group_pubkey,
             share_index,
+            &AUTHOR,
             timestamp,
         );
         assert!(result.is_err());
@@ -166,11 +190,19 @@ mod tests {
             &group_pubkey,
             share_index,
             &verifying_share,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
 
-        let result = verify_proof(&verifying_share, &signature, &group_pubkey, 2u16, timestamp);
+        let result = verify_proof(
+            &verifying_share,
+            &signature,
+            &group_pubkey,
+            2u16,
+            &AUTHOR,
+            timestamp,
+        );
         assert!(result.is_err());
     }
 
@@ -195,6 +227,7 @@ mod tests {
             &group_pubkey,
             share_index,
             &verifying_share,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
@@ -204,6 +237,7 @@ mod tests {
             &signature,
             &group_pubkey,
             share_index,
+            &AUTHOR,
             timestamp,
         )
         .unwrap();
@@ -219,8 +253,46 @@ mod tests {
         verifying_share[1..33].copy_from_slice(&verifying_key.to_bytes());
 
         let group_pubkey = [1u8; 32];
-        let result = verify_proof(&verifying_share, &[0u8; 64], &group_pubkey, 1, 0);
+        let result = verify_proof(&verifying_share, &[0u8; 64], &group_pubkey, 1, &AUTHOR, 0);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("prefix"));
+    }
+
+    #[test]
+    fn test_proof_fails_for_another_author() {
+        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let verifying_share = to_compressed_pubkey(signing_key.verifying_key());
+        let signing_share: [u8; 32] = signing_key.to_bytes().into();
+        let group_pubkey = [1u8; 32];
+        let timestamp = 1234567890u64;
+
+        let signature = sign_proof(
+            &signing_share,
+            &group_pubkey,
+            1,
+            &verifying_share,
+            &AUTHOR,
+            timestamp,
+        )
+        .unwrap();
+
+        verify_proof(
+            &verifying_share,
+            &signature,
+            &group_pubkey,
+            1,
+            &AUTHOR,
+            timestamp,
+        )
+        .unwrap();
+        assert!(verify_proof(
+            &verifying_share,
+            &signature,
+            &group_pubkey,
+            1,
+            &[8u8; 32],
+            timestamp,
+        )
+        .is_err());
     }
 }

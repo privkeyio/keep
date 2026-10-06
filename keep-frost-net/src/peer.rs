@@ -76,8 +76,8 @@ pub struct Peer {
     pub recovery_xpubs: Vec<AnnouncedXpub>,
     /// Admitted on proof of its share alone, because this node could not check
     /// the index against a canonical verifying share (a share imported from a
-    /// bech32 export in a group with a threshold of 3 or more). Recorded only;
-    /// nothing restricts such a peer yet.
+    /// bech32 export in a group with a threshold of 3 or more). Such a peer is
+    /// never recorded as a duress-beacon recipient.
     pub admitted_by_proof_only: bool,
 }
 

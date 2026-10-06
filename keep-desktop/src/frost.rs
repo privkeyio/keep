@@ -364,7 +364,18 @@ pub(crate) async fn setup_frost_node(
             .as_ref()
             .ok_or_else(|| String::from("Keep not available while loading peer policies"))?;
         match keep.get_relay_config(&share_entry.group_pubkey) {
-            Ok(Some(config)) => config.peer_policies,
+            Ok(Some(mut config)) => {
+                if keep_frost_net::migrate_kfp_v1_peer_policies(
+                    &mut config,
+                    share_entry.total_shares,
+                )
+                .map_err(|e| format!("Failed to migrate peer policies: {e}"))?
+                {
+                    keep.store_relay_config(&config)
+                        .map_err(|e| format!("Failed to save migrated peer policies: {e}"))?;
+                }
+                config.peer_policies
+            }
             Ok(None) => {
                 tracing::debug!("No peer policies stored for this share");
                 Vec::new()
@@ -375,22 +386,11 @@ pub(crate) async fn setup_frost_node(
         }
     };
     for entry in &peer_policies {
-        match nostr_sdk::PublicKey::from_hex(&entry.pubkey_hex) {
-            Ok(pubkey) => {
-                node.set_peer_policy(
-                    keep_frost_net::PeerPolicy::new(pubkey)
-                        .allow_send(entry.allow_send)
-                        .allow_receive(entry.allow_receive),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    pubkey_hex = %entry.pubkey_hex,
-                    %e,
-                    "Skipping invalid peer policy from vault"
-                );
-            }
-        }
+        node.set_peer_policy(
+            keep_frost_net::PeerPolicy::new(entry.share_index)
+                .allow_send(entry.allow_send)
+                .allow_receive(entry.allow_receive),
+        );
     }
 
     let (request_tx, request_rx) = mpsc::channel(32);
@@ -574,13 +574,12 @@ fn push_log(
 fn build_peer_entries(node: &KfpNode) -> Vec<PeerEntry> {
     node.peer_status()
         .into_iter()
-        .map(|(share_index, status, name, pubkey)| {
-            let policy = node.get_peer_policy(&pubkey);
+        .map(|(share_index, status, name, _)| {
+            let policy = node.get_peer_policy(share_index);
             PeerEntry {
                 share_index,
                 name,
                 online: status == PeerStatus::Online,
-                pubkey_hex: pubkey.to_hex(),
                 allow_send: policy.as_ref().is_none_or(|p| p.allow_send),
                 allow_receive: policy.as_ref().is_none_or(|p| p.allow_receive),
             }

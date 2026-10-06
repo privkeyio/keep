@@ -743,17 +743,15 @@ pub(crate) enum FrostNetworkCommands {
         /// --duress-beacon-pubkey.
         #[arg(long, value_name = "HEX", requires = "duress_beacon_pubkey")]
         duress_beacon_salt: Option<String>,
-        /// Coercion resistance: the group's total share count (e.g. 3 for a 2-of-3).
-        /// The duress beacon is gift-wrapped (NIP-59, metadata-private) to every
-        /// group member, so the emitter needs the member count up front , a coerced
-        /// holder never unlocks the vault to read it. Public group data (not a
-        /// secret); required with --duress-beacon-pubkey.
-        #[arg(
-            long = "group-total",
-            value_name = "N",
-            requires = "duress_beacon_pubkey"
-        )]
-        duress_group_total: Option<u16>,
+        /// Coercion resistance: file holding the other members' transport keys,
+        /// which the duress beacon is gift-wrapped to (NIP-59, metadata-private).
+        /// A coerced holder never unlocks the share those keys derive from, so
+        /// every genuine start records each member whose announce is bound to the
+        /// group, and a duress start reads them back. Required with
+        /// --duress-beacon-pubkey, which is refused until at least one member is
+        /// recorded; pass this flag alone first. Keep it beside --duress-state-file.
+        #[arg(long, value_name = "FILE")]
+        duress_recipients_file: Option<PathBuf>,
         /// Coercion resistance: a group holder's duress-beacon npub to TRUST.
         /// Repeatable. Receiving a verified beacon signed by any pinned key freezes
         /// this node: it refuses co-signing and OPRF evaluations (fail-closed) until
@@ -1256,11 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn frost_serve_accepts_group_total_flag() {
-        // Regression: the duress emit path requires `--group-total`, and the field
-        // name would otherwise derive `--duress-group-total`, which mismatches the
-        // docs, the error strings, and the nixosTest. Assert the flag parses and
-        // binds, so a rename can never silently break the coerced-holder emit.
+    fn frost_serve_accepts_duress_recipients_file_flag() {
         let cli = Cli::try_parse_from([
             "keep",
             "frost",
@@ -1272,10 +1266,10 @@ mod tests {
             "npub1beacon",
             "--duress-beacon-salt",
             "00",
-            "--group-total",
-            "3",
+            "--duress-recipients-file",
+            "/var/lib/keep/duress.recipients",
         ])
-        .expect("parse serve with --group-total");
+        .expect("parse serve with --duress-recipients-file");
 
         let Commands::Frost { command } = cli.command else {
             panic!("expected frost command");
@@ -1284,12 +1278,16 @@ mod tests {
             panic!("expected frost network command");
         };
         let FrostNetworkCommands::Serve {
-            duress_group_total, ..
+            duress_recipients_file,
+            ..
         } = command
         else {
             panic!("expected frost network serve command");
         };
-        assert_eq!(duress_group_total, Some(3));
+        assert_eq!(
+            duress_recipients_file,
+            Some(PathBuf::from("/var/lib/keep/duress.recipients"))
+        );
     }
 
     #[test]

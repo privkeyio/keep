@@ -11,7 +11,11 @@ use std::os::unix::fs::PermissionsExt;
 use crate::descriptor_session::{DescriptorSessionStore, PersistedDescriptorSession};
 use crate::error::{FrostNetError, Result};
 
-const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descriptor_sessions");
+const TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descriptor_sessions_v2");
+
+/// Sessions recorded under KFP v1 name their participants by v1 transport keys,
+/// which no v2 peer signs with, so they can never progress and are dropped.
+const KFP_V1_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("descriptor_sessions");
 
 pub struct FileDescriptorSessionStore {
     db: Database,
@@ -33,6 +37,11 @@ impl FileDescriptorSessionStore {
         let txn = db.begin_write().map_err(|e| {
             FrostNetError::Session(format!("Failed to begin write for table creation: {e}"))
         })?;
+        if txn.delete_table(KFP_V1_TABLE).map_err(|e| {
+            FrostNetError::Session(format!("Failed to drop KFP v1 sessions table: {e}"))
+        })? {
+            warn!(path = ?path, "Dropped descriptor sessions recorded under KFP v1");
+        }
         txn.open_table(TABLE)
             .map_err(|e| FrostNetError::Session(format!("Failed to create sessions table: {e}")))?;
         txn.commit()
@@ -209,6 +218,27 @@ mod tests {
             finalize_timeout_secs: 300,
             ack_phase_timeout_secs: 300,
         }
+    }
+
+    #[test]
+    fn kfp_v1_sessions_are_dropped_on_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sessions.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut table = txn.open_table(KFP_V1_TABLE).unwrap();
+                let json = serde_json::to_vec(&test_persisted_session([1u8; 32])).unwrap();
+                table.insert([1u8; 32].as_slice(), json.as_slice()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let store = FileDescriptorSessionStore::new(&path).unwrap();
+        assert!(store.load_all(100).unwrap().is_empty());
+        let txn = store.db.begin_read().unwrap();
+        assert!(txn.open_table(KFP_V1_TABLE).is_err());
     }
 
     #[test]

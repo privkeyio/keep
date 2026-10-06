@@ -95,7 +95,6 @@ pub struct PeerEntry {
     pub share_index: u16,
     pub name: Option<String>,
     pub online: bool,
-    pub pubkey_hex: String,
     pub allow_send: bool,
     pub allow_receive: bool,
 }

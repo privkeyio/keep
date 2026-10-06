@@ -495,6 +495,114 @@ pub(crate) fn read_persisted_freeze(path: &Path) -> Result<Option<DuressFreeze>>
     }
 }
 
+/// Transport keys of the other members, recorded by an unlocked serve so a
+/// locked (coerced) start can address the beacon without the share. Transport
+/// keys derive from each member's share, so they are learned from announces
+/// whose share was bound to the group, and rewritten when a refresh changes one.
+#[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
+struct DuressRecipients {
+    group: String,
+    recipients: std::collections::BTreeMap<u16, String>,
+}
+
+/// Far above any group's recipients file; a larger file is refused unread.
+const MAX_RECIPIENTS_FILE_BYTES: u64 = 1 << 20;
+
+fn load_recipients(path: &Path, group_pubkey: &[u8; 32]) -> Result<DuressRecipients> {
+    use std::io::Read;
+    validate_state_dir_perms(path)?;
+    let group = hex::encode(group_pubkey);
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take(MAX_RECIPIENTS_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+    });
+    match read {
+        Ok(n) if n as u64 > MAX_RECIPIENTS_FILE_BYTES => {
+            return Err(KeepError::invalid_input(format!(
+                "duress recipients file {} is too large",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DuressRecipients {
+                group,
+                ..Default::default()
+            })
+        }
+        Err(e) => {
+            return Err(KeepError::runtime(format!(
+                "read duress recipients file {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let recorded: DuressRecipients = serde_json::from_slice(&bytes).map_err(|e| {
+        KeepError::invalid_input(format!(
+            "duress recipients file {} is unparseable: {e}",
+            path.display()
+        ))
+    })?;
+    if recorded.recipients.contains_key(&0) {
+        return Err(KeepError::invalid_input(format!(
+            "duress recipients file {} holds share index 0",
+            path.display()
+        )));
+    }
+    if recorded.group != group {
+        return Err(KeepError::invalid_input(format!(
+            "duress recipients file {} belongs to another group",
+            path.display()
+        )));
+    }
+    Ok(recorded)
+}
+
+/// The recorded beacon recipients for `group_pubkey`. An absent file is an
+/// empty list; a corrupt one, or one recorded for another group, is an error so
+/// a misconfiguration surfaces before the password prompt.
+pub(crate) fn read_recipients(path: &Path, group_pubkey: &[u8; 32]) -> Result<Vec<PublicKey>> {
+    load_recipients(path, group_pubkey)?
+        .recipients
+        .values()
+        .map(|hex_key| {
+            PublicKey::from_hex(hex_key)
+                .and_then(|pk| pk.xonly().map(|_| pk))
+                .map_err(|e| {
+                    KeepError::invalid_input(format!(
+                        "duress recipients file {} holds an invalid key: {e}",
+                        path.display()
+                    ))
+                })
+        })
+        .collect()
+}
+
+/// Merge `peers` into the recipients file, rewriting it only when an entry is
+/// new or changed. Returns the number of recorded recipients.
+pub(crate) fn record_recipients(
+    path: &Path,
+    group_pubkey: &[u8; 32],
+    peers: &[(u16, PublicKey)],
+) -> Result<usize> {
+    let mut recorded = load_recipients(path, group_pubkey)?;
+    let mut changed = false;
+    for (index, pubkey) in peers {
+        let hex_key = pubkey.to_hex();
+        if recorded.recipients.get(index) != Some(&hex_key) {
+            recorded.recipients.insert(*index, hex_key);
+            changed = true;
+        }
+    }
+    if changed {
+        let bytes = serde_json::to_vec(&recorded)
+            .map_err(|e| KeepError::runtime(format!("serialize duress recipients: {e}")))?;
+        super::write_secret_file(path, &bytes)?;
+    }
+    Ok(recorded.recipients.len())
+}
+
 /// The duress serve path: fail CLOSED (never unlock the vault or load the OPRF
 /// share, so this holder answers no evaluations and the box drops below
 /// threshold), best-effort publish ONE signed duress beacon, then stay resident
@@ -517,7 +625,7 @@ pub(crate) async fn run_duress_serve(
     out: &Output,
     beacon: &Keys,
     group_pubkey: &[u8; 32],
-    total_shares: u16,
+    recipients: &[PublicKey],
     relay: &str,
 ) -> Result<()> {
     let group_npub = keep_core::keys::bytes_to_npub(group_pubkey);
@@ -542,7 +650,7 @@ pub(crate) async fn run_duress_serve(
     let client = Client::new(Keys::generate());
     if client.add_relay(relay).await.is_ok() {
         client.connect().await;
-        // Broadcast the beacon (one NIP-59 gift wrap per group member) and
+        // Broadcast the beacon (one NIP-59 gift wrap per recorded recipient) and
         // re-broadcast on an interval with a fresh nonce, not once: a one-shot
         // alert would miss any holder briefly offline, reconnecting, or slow to
         // subscribe. Holders freeze on the first wrap they verify and short-circuit
@@ -569,7 +677,7 @@ pub(crate) async fn run_duress_serve(
                 continue;
             }
             let broadcast_ok =
-                match broadcast_beacon(&client, beacon, group_pubkey, total_shares).await {
+                match broadcast_beacon(&client, beacon, group_pubkey, recipients).await {
                     Ok(ok) => ok,
                     Err(e) => {
                         debug!(error = %e, "beacon broadcast build failed");
@@ -595,7 +703,7 @@ pub(crate) async fn run_duress_serve(
     }
 }
 
-/// Build a fresh-nonce gift-wrapped beacon for every group member and publish each
+/// Build a fresh-nonce gift-wrapped beacon for every recorded recipient and publish each
 /// to `client`. Returns whether AT LEAST ONE wrap was accepted by the relay (relay
 /// in `output.success`) , which proves NIP-42 auth completed and the relay is
 /// delivering, so the caller can stop fast-retrying. Keying the relax on "any
@@ -607,13 +715,13 @@ async fn broadcast_beacon(
     client: &Client,
     beacon: &Keys,
     group_pubkey: &[u8; 32],
-    total_shares: u16,
+    recipients: &[PublicKey],
 ) -> Result<bool> {
     let nonce: [u8; 32] = keep_core::entropy::try_random_bytes()?;
     let wraps = keep_frost_net::KfpEventBuilder::duress_beacon_broadcast(
         beacon,
         group_pubkey,
-        total_shares,
+        recipients,
         &nonce,
     )
     .await
@@ -900,5 +1008,89 @@ mod tests {
                 .unwrap()
                 .public_key()
         );
+    }
+
+    #[test]
+    fn recipients_are_recorded_and_read_back() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        let group = [3u8; 32];
+        assert!(read_recipients(&path, &group).unwrap().is_empty());
+
+        let two = Keys::generate().public_key();
+        let three = Keys::generate().public_key();
+        assert_eq!(record_recipients(&path, &group, &[(2, two)]).unwrap(), 1);
+        assert_eq!(
+            record_recipients(&path, &group, &[(2, two), (3, three)]).unwrap(),
+            2
+        );
+        assert_eq!(read_recipients(&path, &group).unwrap(), vec![two, three]);
+
+        let refreshed = Keys::generate().public_key();
+        assert_eq!(
+            record_recipients(&path, &group, &[(2, refreshed)]).unwrap(),
+            2
+        );
+        assert_eq!(
+            read_recipients(&path, &group).unwrap(),
+            vec![refreshed, three]
+        );
+    }
+
+    #[test]
+    fn recipients_for_another_group_are_refused() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        record_recipients(&path, &[3u8; 32], &[(2, Keys::generate().public_key())]).unwrap();
+        assert!(read_recipients(&path, &[4u8; 32]).is_err());
+        assert!(record_recipients(&path, &[4u8; 32], &[]).is_err());
+    }
+
+    #[test]
+    fn corrupt_recipients_file_is_refused() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        let group = [3u8; 32];
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(read_recipients(&path, &group).is_err());
+
+        let off_curve = DuressRecipients {
+            group: hex::encode(group),
+            recipients: [(2u16, "00".repeat(32))].into_iter().collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&off_curve).unwrap()).unwrap();
+        assert!(read_recipients(&path, &group).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recipients_in_a_writable_directory_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o777),
+        )
+        .unwrap();
+        let path = dir.path().join("duress.recipients");
+        assert!(read_recipients(&path, &[3u8; 32]).is_err());
+    }
+
+    #[test]
+    fn oversized_or_index_zero_recipients_are_refused() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        let group = [3u8; 32];
+        let zero = DuressRecipients {
+            group: hex::encode(group),
+            recipients: [(0u16, Keys::generate().public_key().to_hex())]
+                .into_iter()
+                .collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&zero).unwrap()).unwrap();
+        assert!(read_recipients(&path, &group).is_err());
+
+        std::fs::write(&path, vec![b' '; MAX_RECIPIENTS_FILE_BYTES as usize + 1]).unwrap();
+        let err = read_recipients(&path, &group).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
     }
 }

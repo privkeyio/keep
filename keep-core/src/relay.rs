@@ -87,9 +87,23 @@ pub struct StoredBunkerPermission {
 }
 
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
+/// Keyed by the peer's share index, so it survives a change of the peer's
+/// transport key (a share refresh rotates it).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerPolicyEntry {
-    /// Nostr public key as hex string.
+    /// The peer's share index.
+    pub share_index: u16,
+    /// Whether to allow sending messages to this peer.
+    pub allow_send: bool,
+    /// Whether to allow receiving messages from this peer.
+    pub allow_receive: bool,
+}
+
+/// A policy recorded under KFP v1, keyed by the peer's v1 transport key. Read
+/// so it can be mapped to a share index; never written.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KfpV1PeerPolicyEntry {
+    /// The peer's v1 transport key as hex.
     pub pubkey_hex: String,
     /// Whether to allow sending messages to this peer.
     pub allow_send: bool,
@@ -110,8 +124,15 @@ pub struct RelayConfig {
     #[serde(default)]
     pub bunker_relays: Vec<String>,
     /// Per-peer send/receive policies.
-    #[serde(default)]
+    #[serde(default, rename = "share_peer_policies")]
     pub peer_policies: Vec<PeerPolicyEntry>,
+    /// Policies recorded under KFP v1, pending migration to `peer_policies`.
+    #[serde(
+        default,
+        rename = "peer_policies",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub kfp_v1_peer_policies: Vec<KfpV1PeerPolicyEntry>,
     /// Persisted bunker client permission grants.
     #[serde(default)]
     pub bunker_permissions: Vec<StoredBunkerPermission>,
@@ -131,6 +152,7 @@ impl RelayConfig {
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
+            kfp_v1_peer_policies: Vec::new(),
             bunker_permissions: Vec::new(),
             auto_approve_kinds: Vec::new(),
         }
@@ -149,6 +171,7 @@ impl RelayConfig {
             profile_relays: Vec::new(),
             bunker_relays: Vec::new(),
             peer_policies: Vec::new(),
+            kfp_v1_peer_policies: Vec::new(),
             bunker_permissions: Vec::new(),
             auto_approve_kinds: Vec::new(),
         }
@@ -173,15 +196,34 @@ impl RelayConfig {
             Ok(normalized)
         };
 
-        let mut peer_policies = Vec::with_capacity(self.peer_policies.len());
+        let mut peer_policies: Vec<PeerPolicyEntry> = Vec::with_capacity(self.peer_policies.len());
         for p in self.peer_policies {
+            if p.share_index == 0 {
+                return Err(KeepError::InvalidInput(
+                    "Invalid peer policy share index: 0".into(),
+                ));
+            }
+            // Two entries for one index keep the stricter setting of each flag.
+            match peer_policies
+                .iter_mut()
+                .find(|q| q.share_index == p.share_index)
+            {
+                Some(q) => {
+                    q.allow_send &= p.allow_send;
+                    q.allow_receive &= p.allow_receive;
+                }
+                None => peer_policies.push(p),
+            }
+        }
+        let mut kfp_v1_peer_policies = Vec::with_capacity(self.kfp_v1_peer_policies.len());
+        for p in self.kfp_v1_peer_policies {
             if p.pubkey_hex.len() != 64 || !p.pubkey_hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Err(KeepError::InvalidInput(format!(
                     "Invalid peer policy pubkey: {}",
                     p.pubkey_hex
                 )));
             }
-            peer_policies.push(PeerPolicyEntry {
+            kfp_v1_peer_policies.push(KfpV1PeerPolicyEntry {
                 pubkey_hex: p.pubkey_hex.to_ascii_lowercase(),
                 allow_send: p.allow_send,
                 allow_receive: p.allow_receive,
@@ -248,6 +290,7 @@ impl RelayConfig {
             profile_relays: normalize_relays(self.profile_relays, "profile")?,
             bunker_relays: normalize_relays(self.bunker_relays, "bunker")?,
             peer_policies,
+            kfp_v1_peer_policies,
             bunker_permissions,
             auto_approve_kinds,
         })

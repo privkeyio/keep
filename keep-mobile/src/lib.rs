@@ -2384,6 +2384,7 @@ impl KeepMobile {
             profile_relays: normalize_relays(config.profile_relays, "profile")?,
             bunker_relays: normalize_relays(config.bunker_relays, "bunker")?,
             peer_policies: existing.peer_policies,
+            kfp_v1_peer_policies: existing.kfp_v1_peer_policies,
             bunker_permissions: existing.bunker_permissions,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
@@ -2669,6 +2670,7 @@ impl KeepMobile {
                     profile_relays: stored.profile_relays,
                     bunker_relays: stored.bunker_relays,
                     peer_policies: stored.peer_policies,
+                    kfp_v1_peer_policies: stored.kfp_v1_peer_policies,
                     bunker_permissions: stored.bunker_permissions,
                     auto_approve_kinds: Vec::new(),
                 });
@@ -2908,6 +2910,7 @@ impl KeepMobile {
                 profile_relays: rc.profile_relays.clone(),
                 bunker_relays: rc.bunker_relays.clone(),
                 peer_policies: rc.peer_policies.clone(),
+                kfp_v1_peer_policies: rc.kfp_v1_peer_policies.clone(),
                 bunker_permissions: rc.bunker_permissions.clone(),
             };
             prepared_relays.push((group_hex, stored_relay));

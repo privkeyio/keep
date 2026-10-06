@@ -2938,6 +2938,51 @@ mod tests {
     }
 
     #[test]
+    fn relay_config_reads_kfp_v1_peer_policies_for_migration() {
+        let json = format!(
+            r#"{{"group_pubkey":[1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"frost_relays":[],"profile_relays":[],"peer_policies":[{{"pubkey_hex":"{}","allow_send":false,"allow_receive":true}}]}}"#,
+            "AB".repeat(32)
+        );
+        let config: RelayConfig = serde_json::from_str(&json).unwrap();
+        assert!(config.peer_policies.is_empty());
+        assert_eq!(config.kfp_v1_peer_policies.len(), 1);
+
+        let config = config.normalize().unwrap();
+        assert_eq!(config.kfp_v1_peer_policies[0].pubkey_hex, "ab".repeat(32));
+
+        let mut migrated = config;
+        migrated.kfp_v1_peer_policies.clear();
+        let written = serde_json::to_value(&migrated).unwrap();
+        assert!(written.get("peer_policies").is_none());
+        assert!(written.get("share_peer_policies").is_some());
+    }
+
+    #[test]
+    fn relay_config_normalize_keeps_one_policy_per_share_index() {
+        use crate::relay::PeerPolicyEntry;
+
+        let mut config = RelayConfig::new([2u8; 32]);
+        for allow_send in [false, true] {
+            config.peer_policies.push(PeerPolicyEntry {
+                share_index: 3,
+                allow_send,
+                allow_receive: true,
+            });
+        }
+        let config = config.normalize().unwrap();
+        assert_eq!(config.peer_policies.len(), 1);
+        assert!(!config.peer_policies[0].allow_send);
+
+        let mut zero = RelayConfig::new([2u8; 32]);
+        zero.peer_policies.push(PeerPolicyEntry {
+            share_index: 0,
+            allow_send: true,
+            allow_receive: true,
+        });
+        assert!(zero.normalize().is_err());
+    }
+
+    #[test]
     fn relay_config_peer_policies_roundtrip() {
         use crate::relay::PeerPolicyEntry;
 
@@ -2947,7 +2992,7 @@ mod tests {
 
         let mut config = RelayConfig::new([2u8; 32]);
         config.peer_policies.push(PeerPolicyEntry {
-            pubkey_hex: "ab".repeat(32),
+            share_index: 2,
             allow_send: false,
             allow_receive: true,
         });
@@ -2955,7 +3000,7 @@ mod tests {
 
         let loaded = storage.get_relay_config(&[2u8; 32]).unwrap().unwrap();
         assert_eq!(loaded.peer_policies.len(), 1);
-        assert_eq!(loaded.peer_policies[0].pubkey_hex, "ab".repeat(32));
+        assert_eq!(loaded.peer_policies[0].share_index, 2);
         assert!(!loaded.peer_policies[0].allow_send);
         assert!(loaded.peer_policies[0].allow_receive);
     }
