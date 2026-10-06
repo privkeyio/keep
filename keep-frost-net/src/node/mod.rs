@@ -4025,4 +4025,47 @@ mod tests {
         .unwrap();
         assert!(node.peers.read().get_peer(3).is_some());
     }
+
+    #[tokio::test]
+    async fn refreshed_member_announce_is_admitted() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay_url = mock.url().await.to_string();
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
+            .generate("refresh-announce")
+            .unwrap();
+        let (mut refreshed, _) = keep_core::frost::refresh_shares(&shares).unwrap();
+        let theirs = refreshed.remove(1);
+        let ours = refreshed.remove(0);
+        let us = KfpNode::new(ours, vec![relay_url.clone()]).await.unwrap();
+        let them = KfpNode::new(theirs, vec![relay_url]).await.unwrap();
+
+        let job = them.announce_job().unwrap();
+        let timestamp = Timestamp::now().as_secs();
+        let proof_signature = crate::proof::sign_proof(
+            &job.signing_share,
+            &job.group_pubkey,
+            job.share_index,
+            &job.verifying_share,
+            timestamp,
+        )
+        .unwrap();
+        let payload = AnnouncePayload {
+            version: KFP_VERSION,
+            group_pubkey: job.group_pubkey,
+            share_index: job.share_index,
+            verifying_share: job.verifying_share,
+            proof_signature,
+            timestamp,
+            capabilities: vec![],
+            name: None,
+            attestation: None,
+            tpm_attestation: None,
+        };
+        us.handle_announce(them.keys.public_key(), payload)
+            .await
+            .expect("a refreshed member's announce must be admitted");
+    }
 }

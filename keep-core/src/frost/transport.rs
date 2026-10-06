@@ -76,7 +76,15 @@ impl ShareExport {
         let salt: [u8; 32] = crypto::try_random_bytes()?;
         let key = crypto::derive_key(passphrase.as_bytes(), &salt, crypto::Argon2Params::DEFAULT)?;
 
-        let key_bytes = share.key_package_bytes().to_vec();
+        // A secp256k1 share refreshed before its stored bytes were normalized
+        // would otherwise export its stale verifying share.
+        let key_bytes = match ciphersuite {
+            Ciphersuite::Secp256k1Tr => share
+                .key_package()?
+                .serialize()
+                .map_err(|e| KeepError::Frost(format!("Failed to serialize key package: {e}")))?,
+            Ciphersuite::Ed25519 => share.key_package_bytes().to_vec(),
+        };
 
         let encrypted = crypto::encrypt_with_aad(&key_bytes, ciphersuite.aad(), &key)?;
 
@@ -158,6 +166,7 @@ impl ShareExport {
         match self.ciphersuite {
             Ciphersuite::Secp256k1Tr => {
                 let key_package = frost_secp256k1_tr::keys::KeyPackage::deserialize(&key_bytes)
+                    .map(|kp| super::share::with_consistent_verifying_share(&kp))
                     .map_err(|e| {
                         KeepError::Frost(format!("Failed to deserialize key package: {e}"))
                     })?;
@@ -508,6 +517,72 @@ impl ShareExport {
 mod tests {
     use super::*;
     use crate::frost::{ThresholdConfig, TrustedDealer};
+
+    #[test]
+    fn export_of_a_stale_stored_share_carries_a_consistent_key_package() {
+        let stored = crate::frost::share::stale_refreshed_share();
+        let export = ShareExport::from_share(&stored, "pass").unwrap();
+        let salt: [u8; 32] = hex::decode(&export.salt).unwrap().try_into().unwrap();
+        let key = crypto::derive_key(b"pass", &salt, crypto::Argon2Params::DEFAULT).unwrap();
+        let mut nonce = [0u8; 24];
+        nonce.copy_from_slice(&hex::decode(&export.nonce).unwrap());
+        let encrypted = crypto::EncryptedData {
+            ciphertext: hex::decode(&export.encrypted_share).unwrap(),
+            nonce,
+        };
+        let plain =
+            crypto::decrypt_with_aad(&encrypted, Ciphersuite::Secp256k1Tr.aad(), &key).unwrap();
+        let kp =
+            frost_secp256k1_tr::keys::KeyPackage::deserialize(&plain.as_slice().unwrap()).unwrap();
+        assert_eq!(
+            *kp.verifying_share(),
+            frost_secp256k1_tr::keys::VerifyingShare::from(*kp.signing_share()),
+            "the export must not carry the stale verifying share"
+        );
+    }
+
+    #[test]
+    fn old_export_with_a_stale_key_package_imports_with_its_full_pubkey_package() {
+        let stored = crate::frost::share::stale_refreshed_share();
+        let mut export = ShareExport::from_share(&stored, "pass").unwrap();
+        // An export written before the fix carried the stale stored bytes.
+        let salt: [u8; 32] = hex::decode(&export.salt).unwrap().try_into().unwrap();
+        let key = crypto::derive_key(b"pass", &salt, crypto::Argon2Params::DEFAULT).unwrap();
+        let stale = crypto::encrypt_with_aad(
+            stored.key_package_bytes(),
+            Ciphersuite::Secp256k1Tr.aad(),
+            &key,
+        )
+        .unwrap();
+        export.encrypted_share = hex::encode(&stale.ciphertext);
+        export.nonce = hex::encode(stale.nonce);
+        let restored = ShareExport::from_json(&export.to_json().unwrap())
+            .unwrap()
+            .to_share("pass", "restored")
+            .unwrap();
+        assert_eq!(
+            restored.pubkey_package().unwrap().verifying_shares().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn refreshed_share_keeps_its_full_pubkey_package_through_export() {
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
+            .generate("refresh")
+            .unwrap();
+        let (refreshed, _) = crate::frost::refresh_shares(&shares).unwrap();
+        let export = ShareExport::from_share(&refreshed[0], "pass").unwrap();
+        let restored = ShareExport::from_json(&export.to_json().unwrap())
+            .unwrap()
+            .to_share("pass", "restored")
+            .unwrap();
+        assert_eq!(
+            restored.pubkey_package().unwrap().verifying_shares().len(),
+            3,
+            "the full verifying-share set must survive, not fall back to one entry"
+        );
+    }
 
     #[test]
     fn test_share_export_roundtrip() {
