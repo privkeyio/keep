@@ -57,8 +57,10 @@ mod memory_transport {
     use nostr_sdk::prelude::*;
     use tokio::sync::broadcast;
 
-    use crate::error::Result;
+    use crate::error::{FrostNetError, Result};
     use crate::node::CosignTransport;
+
+    type RefusalRule = Box<dyn Fn(&Event) -> bool + Send + Sync>;
 
     struct MemoryPeer {
         sender: broadcast::Sender<RelayPoolNotification>,
@@ -98,6 +100,7 @@ mod memory_transport {
             Arc::new(MemoryTransport {
                 bus: self.clone(),
                 me,
+                refuse: Mutex::new(None),
             })
         }
     }
@@ -106,6 +109,19 @@ mod memory_transport {
     pub struct MemoryTransport {
         bus: MemoryBus,
         me: Arc<Mutex<MemoryPeer>>,
+        refuse: Mutex<Option<RefusalRule>>,
+    }
+
+    impl MemoryTransport {
+        /// Fail every send of an event matching `rule`, as a relay refusing it
+        /// would, until [`MemoryTransport::accept_all`] is called.
+        pub fn refuse_if(&self, rule: impl Fn(&Event) -> bool + Send + Sync + 'static) {
+            *self.refuse.lock().unwrap() = Some(Box::new(rule));
+        }
+
+        pub fn accept_all(&self) {
+            *self.refuse.lock().unwrap() = None;
+        }
     }
 
     fn dummy_relay_url() -> RelayUrl {
@@ -122,6 +138,17 @@ mod memory_transport {
             event: &'a Event,
         ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
             Box::pin(async move {
+                if self
+                    .refuse
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|r| r(event))
+                {
+                    return Err(FrostNetError::Transport(
+                        "no relay accepted the event (refused in test)".into(),
+                    ));
+                }
                 self.bus.log.lock().unwrap().push(event.clone());
 
                 let peers = self.bus.peers.lock().unwrap().clone();

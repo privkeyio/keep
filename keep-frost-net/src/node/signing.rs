@@ -1173,9 +1173,24 @@ impl KfpNode {
             .map(|p| p.pubkey)
             .collect();
 
-        for pubkey in peer_pubkeys {
-            let event = KfpEventBuilder::signature_share(&self.keys, &pubkey, payload.clone())?;
-            self.transport.send_event(&event).await?;
+        // Our nonces are spent, so a failure for one participant must not keep
+        // the share from the others.
+        let mut last_err = None;
+        let mut sent = 0usize;
+        for pubkey in &peer_pubkeys {
+            let event = KfpEventBuilder::signature_share(&self.keys, pubkey, payload.clone())?;
+            match self.transport.send_event(&event).await {
+                Ok(()) => sent += 1,
+                Err(e) => {
+                    warn!(peer = %pubkey, error = %e, "Failed to send signature share");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if sent == 0 {
+            if let Some(e) = last_err {
+                return Err(e);
+            }
         }
 
         debug!(session_id = %hex::encode(session_id), "Sent signature share");

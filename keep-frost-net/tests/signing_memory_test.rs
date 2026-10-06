@@ -115,3 +115,116 @@ async fn signing_completes_and_verifies_over_memory_transport() {
     secp.verify_schnorr(&sig, &msg, &group_xonly)
         .expect("aggregated FROST signature must verify under the group public key");
 }
+
+fn tagged(event: &nostr_sdk::Event, kind: &str) -> bool {
+    event.tags.iter().any(|t| {
+        t.as_slice().first().map(String::as_str) == Some("t")
+            && t.as_slice().get(1).map(String::as_str) == Some(kind)
+    })
+}
+
+/// A cosigner whose signature share is refused for one participant still
+/// delivers it to the others, so the requester aggregates.
+#[tokio::test]
+async fn a_share_refused_for_one_cosigner_still_reaches_the_requester() {
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 3).unwrap());
+    let (shares, pubkey_pkg) = dealer.generate("mem-refuse").unwrap();
+
+    let bus = MemoryBus::new();
+    let transports: Vec<_> = (0..3).map(|_| bus.transport()).collect();
+    let mut nodes: Vec<KfpNode> = shares
+        .into_iter()
+        .zip(&transports)
+        .map(|(share, t)| {
+            KfpNode::with_transport(share, t.clone() as Arc<dyn CosignTransport>, None, None)
+                .unwrap()
+        })
+        .collect();
+    let blocked = nodes[1].pubkey();
+    transports[0].refuse_if(move |ev| {
+        tagged(ev, "signature_share") && ev.tags.public_keys().any(|p| *p == blocked)
+    });
+
+    let mut rx = nodes[2].subscribe();
+    let shutdowns: Vec<_> = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+    let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+    let handles: Vec<_> = nodes.iter().map(|n| spawn_run(Arc::clone(n))).collect();
+
+    let discovered = timeout(Duration::from_secs(30), async {
+        let mut peers = 0u32;
+        while peers < 2 {
+            if let Ok(KfpNodeEvent::PeerDiscovered { .. }) = rx.recv().await {
+                peers += 1;
+            }
+        }
+    })
+    .await;
+    assert!(
+        discovered.is_ok(),
+        "the requester must discover both cosigners"
+    );
+
+    let digest = [7u8; 32];
+    let sign_result = timeout(
+        Duration::from_secs(30),
+        nodes[2].request_signature(digest.to_vec(), "raw"),
+    )
+    .await;
+
+    for tx in shutdowns.into_iter().flatten() {
+        let _ = tx.try_send(());
+    }
+    for h in handles {
+        let _ = timeout(Duration::from_secs(2), h).await;
+    }
+
+    let signature = sign_result
+        .expect("request_signature timed out")
+        .expect("request_signature failed");
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let vk = pubkey_pkg.verifying_key().serialize().unwrap();
+    let group_xonly = bitcoin::secp256k1::XOnlyPublicKey::from_slice(&vk[1..33]).unwrap();
+    let msg = bitcoin::secp256k1::Message::from_digest(digest);
+    let sig = bitcoin::secp256k1::schnorr::Signature::from_slice(&signature).unwrap();
+    secp.verify_schnorr(&sig, &msg, &group_xonly)
+        .expect("aggregated signature must verify");
+}
+
+/// A refused first announce leaves the node running; the periodic announce
+/// retries it.
+#[tokio::test]
+async fn a_refused_first_announce_does_not_stop_the_node() {
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _) = dealer.generate("mem-announce").unwrap();
+    let bus = MemoryBus::new();
+    let transport = bus.transport();
+    transport.refuse_if(|ev| tagged(ev, "announce"));
+    let mut node = KfpNode::with_transport(
+        shares.remove(0),
+        transport.clone() as Arc<dyn CosignTransport>,
+        None,
+        None,
+    )
+    .unwrap();
+    let shutdown = node.take_shutdown_handle();
+    let node = Arc::new(node);
+    let handle = tokio::spawn({
+        let node = Arc::clone(&node);
+        async move { node.run().await }
+    });
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !handle.is_finished(),
+        "run() must keep going after a refused announce: {:?}",
+        if handle.is_finished() {
+            Some(handle.await)
+        } else {
+            None
+        }
+    );
+    if let Some(tx) = shutdown {
+        let _ = tx.try_send(());
+    }
+    let _ = timeout(Duration::from_secs(2), handle).await;
+}
