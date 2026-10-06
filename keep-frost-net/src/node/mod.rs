@@ -3006,7 +3006,7 @@ impl KfpNode {
 /// own share and the group verifying key. Shares lie on the line
 /// `V(x) = Y + x*A` (`Y` the group key), so `A = (V(own) - Y) / own` and
 /// `V(index) = Y + index*A`. This holds for dealer, DKG and refreshed output
-/// alike: the taproot tweak and even-Y normalisation apply to the group key and
+/// alike: the taproot tweak and even-Y normalization apply to the group key and
 /// every share together, and a refresh adds a zero-constant polynomial.
 ///
 /// `V(own)` is computed from our signing share rather than read from the key
