@@ -736,11 +736,13 @@ impl ClientTransport {
 impl DkgTransport for ClientTransport {
     fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.client
+            let output = self
+                .client
                 .send_event(event)
                 .await
-                .map(|_| ())
-                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))
+                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
+            crate::node::require_accepted(&output)
+                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e)))
         })
     }
 

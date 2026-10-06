@@ -12,7 +12,7 @@ mod transport;
 pub use psbt::PsbtSessionSnapshot;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 pub use transport::CosignTransport;
-pub(crate) use transport::NostrTransport;
+pub(crate) use transport::{require_accepted, NostrTransport};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
