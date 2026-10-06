@@ -498,10 +498,14 @@ pub(crate) fn read_persisted_freeze(path: &Path) -> Result<Option<DuressFreeze>>
 /// Transport keys of the other members, recorded by an unlocked serve so a
 /// locked (coerced) start can address the beacon without the share. Transport
 /// keys derive from each member's share, so they are learned from announces
-/// whose share was bound to the group, and rewritten when a refresh changes one.
+/// whose share was bound to the group. A refresh rotates every member's key; the
+/// recorded keys are dropped when this holder's own verifying share no longer
+/// matches the one they were recorded under.
 #[derive(serde::Serialize, serde::Deserialize, Default, PartialEq, Debug)]
 struct DuressRecipients {
     group: String,
+    #[serde(default)]
+    own_verifying_share: String,
     recipients: std::collections::BTreeMap<u16, String>,
 }
 
@@ -580,14 +584,22 @@ pub(crate) fn read_recipients(path: &Path, group_pubkey: &[u8; 32]) -> Result<Ve
 }
 
 /// Merge `peers` into the recipients file, rewriting it only when an entry is
-/// new or changed. Returns the number of recorded recipients.
+/// new or changed. Entries recorded under another `own_verifying_share` (hex)
+/// predate a refresh and are dropped first. Returns the number of recorded
+/// recipients.
 pub(crate) fn record_recipients(
     path: &Path,
     group_pubkey: &[u8; 32],
+    own_verifying_share: &str,
     peers: &[(u16, PublicKey)],
 ) -> Result<usize> {
     let mut recorded = load_recipients(path, group_pubkey)?;
     let mut changed = false;
+    if recorded.own_verifying_share != own_verifying_share {
+        recorded.recipients.clear();
+        recorded.own_verifying_share = own_verifying_share.to_string();
+        changed = true;
+    }
     for (index, pubkey) in peers {
         let hex_key = pubkey.to_hex();
         if recorded.recipients.get(index) != Some(&hex_key) {
@@ -1019,16 +1031,19 @@ mod tests {
 
         let two = Keys::generate().public_key();
         let three = Keys::generate().public_key();
-        assert_eq!(record_recipients(&path, &group, &[(2, two)]).unwrap(), 1);
         assert_eq!(
-            record_recipients(&path, &group, &[(2, two), (3, three)]).unwrap(),
+            record_recipients(&path, &group, "own", &[(2, two)]).unwrap(),
+            1
+        );
+        assert_eq!(
+            record_recipients(&path, &group, "own", &[(2, two), (3, three)]).unwrap(),
             2
         );
         assert_eq!(read_recipients(&path, &group).unwrap(), vec![two, three]);
 
         let refreshed = Keys::generate().public_key();
         assert_eq!(
-            record_recipients(&path, &group, &[(2, refreshed)]).unwrap(),
+            record_recipients(&path, &group, "own", &[(2, refreshed)]).unwrap(),
             2
         );
         assert_eq!(
@@ -1041,9 +1056,15 @@ mod tests {
     fn recipients_for_another_group_are_refused() {
         let dir = secure_state_tempdir();
         let path = dir.path().join("duress.recipients");
-        record_recipients(&path, &[3u8; 32], &[(2, Keys::generate().public_key())]).unwrap();
+        record_recipients(
+            &path,
+            &[3u8; 32],
+            "own",
+            &[(2, Keys::generate().public_key())],
+        )
+        .unwrap();
         assert!(read_recipients(&path, &[4u8; 32]).is_err());
-        assert!(record_recipients(&path, &[4u8; 32], &[]).is_err());
+        assert!(record_recipients(&path, &[4u8; 32], "own", &[]).is_err());
     }
 
     #[test]
@@ -1056,6 +1077,7 @@ mod tests {
 
         let off_curve = DuressRecipients {
             group: hex::encode(group),
+            own_verifying_share: String::new(),
             recipients: [(2u16, "00".repeat(32))].into_iter().collect(),
         };
         std::fs::write(&path, serde_json::to_vec(&off_curve).unwrap()).unwrap();
@@ -1082,6 +1104,7 @@ mod tests {
         let group = [3u8; 32];
         let zero = DuressRecipients {
             group: hex::encode(group),
+            own_verifying_share: String::new(),
             recipients: [(0u16, Keys::generate().public_key().to_hex())]
                 .into_iter()
                 .collect(),
@@ -1092,5 +1115,18 @@ mod tests {
         std::fs::write(&path, vec![b' '; MAX_RECIPIENTS_FILE_BYTES as usize + 1]).unwrap();
         let err = read_recipients(&path, &group).unwrap_err().to_string();
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn recipients_recorded_before_a_refresh_are_dropped() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        let group = [3u8; 32];
+        let peer = Keys::generate().public_key();
+        record_recipients(&path, &group, "before", &[(2, peer)]).unwrap();
+        assert_eq!(read_recipients(&path, &group).unwrap(), vec![peer]);
+
+        assert_eq!(record_recipients(&path, &group, "after", &[]).unwrap(), 0);
+        assert!(read_recipients(&path, &group).unwrap().is_empty());
     }
 }

@@ -734,6 +734,20 @@ fn handle_node_event(
         ev @ (KfpNodeEvent::PsbtFinalized { .. } | KfpNodeEvent::PsbtAborted { .. }) => {
             handle_psbt_status_node_event(ev, now_secs, frost_events);
         }
+        KfpNodeEvent::PeerVersionMismatch {
+            share_index,
+            version,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!(
+                    "Peer #{share_index} runs protocol v{version}; every member must run v{}",
+                    keep_frost_net::KFP_VERSION
+                ),
+            );
+        }
         // A verified duress beacon froze this node: surface it
         // prominently (co-signing and OPRF evals are now refused).
         KfpNodeEvent::DuressFrozen { beacon_pubkey } => {

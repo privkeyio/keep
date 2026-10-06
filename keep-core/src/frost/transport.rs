@@ -19,6 +19,15 @@ const MAX_ASSEMBLED_SIZE: usize = 64 * 1024;
 /// never be confused or swapped.
 const PUBKEY_PACKAGE_AAD: &[u8] = b"keep-share-pubkey-package";
 
+/// Domain of the AEAD associated data for the compact verifying-share list.
+const VERIFYING_SHARES_AAD: &[u8] = b"keep-share-verifying-shares";
+
+/// First byte of the binary bech32 payload; a JSON payload starts with `{`.
+const COMPACT_VERSION: u8 = 2;
+
+/// Size of one compressed secp256k1 verifying share.
+const VERIFYING_SHARE_LEN: usize = 33;
+
 /// An encrypted share export for backup and transfer.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ShareExport {
@@ -59,6 +68,17 @@ pub struct ShareExport {
     /// `nonce` (never reuse a key+nonce pair).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pubkey_nonce: Option<String>,
+    /// Every member's verifying share in index order (33 bytes each for
+    /// indices 1..=total), encrypted under the share key with associated data
+    /// binding the group key, threshold and total, hex. Compact enough for the
+    /// bech32 form, so every import can bind each member to its canonical
+    /// verifying share. Absent for Ed25519 shares and for shares stored without
+    /// the full set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_verifying_shares: Option<String>,
+    /// Fresh nonce (hex) for [`Self::encrypted_verifying_shares`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifying_shares_nonce: Option<String>,
 }
 
 impl ShareExport {
@@ -96,6 +116,23 @@ impl ShareExport {
         let encrypted_pubkey =
             crypto::encrypt_with_aad(share.pubkey_package_bytes(), PUBKEY_PACKAGE_AAD, &key)?;
 
+        let verifying_shares = match ciphersuite {
+            Ciphersuite::Secp256k1Tr => ordered_verifying_shares(share)?,
+            Ciphersuite::Ed25519 => None,
+        };
+        let encrypted_verifying_shares = match verifying_shares {
+            Some(list) => Some(crypto::encrypt_with_aad(
+                &list,
+                &verifying_shares_aad(
+                    &share.metadata.group_pubkey,
+                    share.metadata.threshold,
+                    share.metadata.total_shares,
+                ),
+                &key,
+            )?),
+            None => None,
+        };
+
         Ok(Self {
             version: 1,
             threshold: share.metadata.threshold,
@@ -108,6 +145,10 @@ impl ShareExport {
             ciphersuite,
             encrypted_pubkey_package: Some(hex::encode(&encrypted_pubkey.ciphertext)),
             pubkey_nonce: Some(hex::encode(encrypted_pubkey.nonce)),
+            encrypted_verifying_shares: encrypted_verifying_shares
+                .as_ref()
+                .map(|e| hex::encode(&e.ciphertext)),
+            verifying_shares_nonce: encrypted_verifying_shares.map(|e| hex::encode(e.nonce)),
         })
     }
 
@@ -176,7 +217,12 @@ impl ShareExport {
                 // secret recovery is never gated on this optional field.
                 let pubkey_package = match self.recover_full_pubkey_package(&key, &key_package) {
                     Some(pkg) => pkg,
-                    None => derive_pubkey_package(&key_package)?,
+                    None => {
+                        match self.recover_verifying_shares(&key, &key_package, &group_pubkey)? {
+                            Some(pkg) => pkg,
+                            None => derive_pubkey_package(&key_package)?,
+                        }
+                    }
                 };
                 SharePackage::new(metadata, &key_package, &pubkey_package)
             }
@@ -217,6 +263,57 @@ impl ShareExport {
         }
     }
 
+    /// Decrypt and check the compact verifying-share list. `None` when the
+    /// export carries none (written before the field existed, or Ed25519); an
+    /// error when it is present but fails authentication or does not anchor to
+    /// the decrypted key package, so a damaged list is never silently dropped.
+    fn recover_verifying_shares(
+        &self,
+        key: &crypto::SecretKey,
+        key_package: &frost_secp256k1_tr::keys::KeyPackage,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Option<frost_secp256k1_tr::keys::PublicKeyPackage>> {
+        use frost_secp256k1_tr::keys::{PublicKeyPackage, VerifyingShare};
+        use frost_secp256k1_tr::Identifier;
+
+        let (Some(ciphertext_hex), Some(nonce_hex)) = (
+            self.encrypted_verifying_shares.as_ref(),
+            self.verifying_shares_nonce.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let invalid = || KeepError::Frost("Invalid verifying shares in share export".into());
+        let ciphertext = hex::decode(ciphertext_hex).map_err(|_| invalid())?;
+        let nonce: [u8; 24] = hex::decode(nonce_hex)
+            .map_err(|_| invalid())?
+            .try_into()
+            .map_err(|_| invalid())?;
+        let decrypted = crypto::decrypt_with_aad(
+            &crypto::EncryptedData { ciphertext, nonce },
+            &verifying_shares_aad(group_pubkey, self.threshold, self.total),
+            key,
+        )
+        .map_err(|_| invalid())?;
+        let list = decrypted.as_slice()?;
+        if list.len() != usize::from(self.total) * VERIFYING_SHARE_LEN {
+            return Err(invalid());
+        }
+        let mut shares = std::collections::BTreeMap::new();
+        for (i, bytes) in (1..=self.total).zip(list.chunks_exact(VERIFYING_SHARE_LEN)) {
+            let id = Identifier::try_from(i).map_err(|_| invalid())?;
+            let share = VerifyingShare::deserialize(bytes).map_err(|_| invalid())?;
+            shares.insert(id, share);
+        }
+        if shares.get(key_package.identifier()) != Some(key_package.verifying_share()) {
+            return Err(invalid());
+        }
+        Ok(Some(PublicKeyPackage::new(
+            shares,
+            *key_package.verifying_key(),
+            Some(*key_package.min_signers()),
+        )))
+    }
+
     /// Serialize to JSON.
     ///
     /// # Errors
@@ -249,28 +346,57 @@ impl ShareExport {
 
     /// Encode as a bech32 string with `kshare` prefix.
     ///
-    /// The optional full public-key package is **stripped** here: `Bech32m`'s
-    /// checksum bounds the payload (~639 bytes) and the package would overflow a
-    /// single string. It rides the JSON / animated-frame exports instead, and a
-    /// bech32 import simply falls back to the single-entry package. Secret
-    /// material is unaffected.
+    /// Uses a compact binary payload that carries the verifying-share list but
+    /// not the full public-key package (which rides the JSON / animated-frame
+    /// exports). A group too large for one bech32 string is refused with a
+    /// pointer to those forms rather than silently dropping the list.
     pub fn to_bech32(&self) -> Result<String> {
-        let compact = if self.encrypted_pubkey_package.is_some() || self.pubkey_nonce.is_some() {
-            let mut c = self.clone();
-            c.encrypted_pubkey_package = None;
-            c.pubkey_nonce = None;
-            std::borrow::Cow::Owned(c)
-        } else {
-            std::borrow::Cow::Borrowed(self)
+        let invalid = || KeepError::Frost("Invalid share export".into());
+        let decode_fixed = |hex_str: &str, len: usize| -> Result<Vec<u8>> {
+            let bytes = hex::decode(hex_str).map_err(|_| invalid())?;
+            if bytes.len() != len {
+                return Err(invalid());
+            }
+            Ok(bytes)
         };
-        let json = compact.to_json()?;
+        let encrypted_share = hex::decode(&self.encrypted_share).map_err(|_| invalid())?;
+        let mut out = vec![
+            COMPACT_VERSION,
+            match self.ciphersuite {
+                Ciphersuite::Secp256k1Tr => 0,
+                Ciphersuite::Ed25519 => 1,
+            },
+        ];
+        out.extend_from_slice(&self.threshold.to_be_bytes());
+        out.extend_from_slice(&self.total.to_be_bytes());
+        out.extend_from_slice(&self.identifier.to_be_bytes());
+        out.extend(decode_fixed(&self.group_pubkey, 32)?);
+        out.extend(decode_fixed(&self.salt, 32)?);
+        out.extend(decode_fixed(&self.nonce, 24)?);
+        push_with_len(&mut out, &encrypted_share)?;
+        match (
+            &self.encrypted_verifying_shares,
+            &self.verifying_shares_nonce,
+        ) {
+            (Some(ciphertext), Some(nonce)) => {
+                out.push(1);
+                out.extend(decode_fixed(nonce, 24)?);
+                push_with_len(&mut out, &hex::decode(ciphertext).map_err(|_| invalid())?)?;
+            }
+            _ => out.push(0),
+        }
         let hrp =
             Hrp::parse(SHARE_HRP).map_err(|e| KeepError::Frost(format!("Invalid HRP: {e}")))?;
-        bech32::encode::<Bech32m>(hrp, json.as_bytes())
-            .map_err(|e| KeepError::Frost(format!("Bech32 encoding failed: {e}")))
+        bech32::encode::<Bech32m>(hrp, &out).map_err(|_| {
+            KeepError::Frost(format!(
+                "A {}-member share does not fit one bech32 string; use the JSON or animated export",
+                self.total
+            ))
+        })
     }
 
-    /// Decode from a bech32 string.
+    /// Decode from a bech32 string: the compact binary payload, or the JSON
+    /// payload of earlier exports.
     pub fn from_bech32(encoded: &str) -> Result<Self> {
         let (hrp, data) = bech32::decode(encoded)
             .map_err(|e| KeepError::Frost(format!("Bech32 decoding failed: {e}")))?;
@@ -283,11 +409,123 @@ impl ShareExport {
             )));
         }
 
+        if data.first() == Some(&COMPACT_VERSION) {
+            return Self::from_compact(&data);
+        }
+
         let json = String::from_utf8(data)
             .map_err(|_| KeepError::Frost("Invalid UTF-8 in share".into()))?;
 
         Self::from_json(&json)
     }
+
+    fn from_compact(data: &[u8]) -> Result<Self> {
+        let mut r = CompactReader { data, pos: 1 };
+        let ciphersuite = match r.take(1)?[0] {
+            0 => Ciphersuite::Secp256k1Tr,
+            1 => Ciphersuite::Ed25519,
+            _ => return Err(KeepError::Frost("Invalid share export".into())),
+        };
+        let threshold = r.u16()?;
+        let total = r.u16()?;
+        let identifier = r.u16()?;
+        let group_pubkey = hex::encode(r.take(32)?);
+        let salt = hex::encode(r.take(32)?);
+        let nonce = hex::encode(r.take(24)?);
+        let encrypted_share = hex::encode(r.with_len()?);
+        let (encrypted_verifying_shares, verifying_shares_nonce) = match r.take(1)?[0] {
+            0 => (None, None),
+            1 => {
+                let nonce = hex::encode(r.take(24)?);
+                (Some(hex::encode(r.with_len()?)), Some(nonce))
+            }
+            _ => return Err(KeepError::Frost("Invalid share export".into())),
+        };
+        if r.pos != data.len() {
+            return Err(KeepError::Frost("Invalid share export".into()));
+        }
+        Ok(Self {
+            version: 1,
+            threshold,
+            total,
+            identifier,
+            group_pubkey,
+            encrypted_share,
+            nonce,
+            salt,
+            ciphersuite,
+            encrypted_pubkey_package: None,
+            pubkey_nonce: None,
+            encrypted_verifying_shares,
+            verifying_shares_nonce,
+        })
+    }
+}
+
+fn push_with_len(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    let len =
+        u16::try_from(bytes.len()).map_err(|_| KeepError::Frost("Invalid share export".into()))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+struct CompactReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> CompactReader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&end| end <= self.data.len())
+            .ok_or_else(|| KeepError::Frost("Invalid share export".into()))?;
+        let bytes = &self.data[self.pos..end];
+        self.pos = end;
+        Ok(bytes)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        let b = self.take(2)?;
+        Ok(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn with_len(&mut self) -> Result<&'a [u8]> {
+        let len = usize::from(self.u16()?);
+        self.take(len)
+    }
+}
+
+/// Every member's verifying share in index order, or `None` when the stored
+/// package lacks any of them.
+fn ordered_verifying_shares(share: &SharePackage) -> Result<Option<Vec<u8>>> {
+    use frost_secp256k1_tr::Identifier;
+
+    let package = share.pubkey_package()?;
+    let mut list =
+        Vec::with_capacity(usize::from(share.metadata.total_shares) * VERIFYING_SHARE_LEN);
+    for i in 1..=share.metadata.total_shares {
+        let id = Identifier::try_from(i)
+            .map_err(|e| KeepError::Frost(format!("Invalid identifier {i}: {e}")))?;
+        let Some(vs) = package.verifying_shares().get(&id) else {
+            return Ok(None);
+        };
+        let bytes = vs
+            .serialize()
+            .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying share: {e}")))?;
+        list.extend_from_slice(&bytes);
+    }
+    Ok(Some(list))
+}
+
+fn verifying_shares_aad(group_pubkey: &[u8; 32], threshold: u16, total: u16) -> Vec<u8> {
+    let mut aad = VERIFYING_SHARES_AAD.to_vec();
+    aad.extend_from_slice(group_pubkey);
+    aad.extend_from_slice(&threshold.to_be_bytes());
+    aad.extend_from_slice(&total.to_be_bytes());
+    aad
 }
 
 #[cfg(feature = "ed25519")]
@@ -639,23 +877,105 @@ mod tests {
         );
     }
 
+    fn bech32_import(threshold: u16, total: u16) -> (SharePackage, SharePackage) {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(threshold, total).unwrap());
+        let (mut shares, _) = dealer.generate("test").unwrap();
+        let original = shares.remove(0);
+        let export = ShareExport::from_share(&original, "pass").unwrap();
+        let imported = ShareExport::parse(&export.to_bech32().unwrap())
+            .unwrap()
+            .to_share("pass", "imported")
+            .unwrap();
+        (original, imported)
+    }
+
     #[test]
-    fn bech32_strips_package_and_import_falls_back() {
-        // The size-limited bech32 form omits the package; import falls back to a
-        // single-entry package but still recovers the secret unchanged.
+    fn bech32_import_carries_every_verifying_share() {
+        for (threshold, total) in [(2, 3), (3, 5), (5, 10)] {
+            let (original, imported) = bech32_import(threshold, total);
+            let expected = original.pubkey_package().unwrap();
+            let got = imported.pubkey_package().unwrap();
+            assert_eq!(got.verifying_shares(), expected.verifying_shares());
+            assert_eq!(got.verifying_key(), expected.verifying_key());
+            assert_eq!(
+                imported.key_package_bytes(),
+                original.key_package_bytes(),
+                "{threshold}-of-{total}"
+            );
+        }
+    }
+
+    #[test]
+    fn bech32_refuses_a_group_too_large_for_one_string() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 11).unwrap());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        let err = export.to_bech32().unwrap_err().to_string();
+        assert!(err.contains("use the JSON or animated export"), "{err}");
+    }
+
+    #[test]
+    fn tampered_verifying_shares_fail_the_import() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+        let mut ciphertext =
+            hex::decode(export.encrypted_verifying_shares.as_ref().unwrap()).unwrap();
+        ciphertext[0] ^= 1;
+        export.encrypted_verifying_shares = Some(hex::encode(&ciphertext));
+        assert!(export.to_share("pass", "imported").is_err());
+
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+        export.total = 6;
+        assert!(export.to_share("pass", "imported").is_err());
+    }
+
+    #[test]
+    fn json_bech32_from_earlier_exports_still_imports() {
         let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
         let (shares, _) = dealer.generate("test").unwrap();
-
-        let export = ShareExport::from_share(&shares[0], "pass").unwrap();
-        let decoded = ShareExport::from_bech32(&export.to_bech32().unwrap()).unwrap();
-        assert!(decoded.encrypted_pubkey_package.is_none());
-
-        let imported = decoded.to_share("pass", "imported").unwrap();
+        let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
+        export.encrypted_pubkey_package = None;
+        export.pubkey_nonce = None;
+        export.encrypted_verifying_shares = None;
+        export.verifying_shares_nonce = None;
+        let legacy = bech32::encode::<Bech32m>(
+            Hrp::parse(SHARE_HRP).unwrap(),
+            export.to_json().unwrap().as_bytes(),
+        )
+        .unwrap();
+        let imported = ShareExport::parse(&legacy)
+            .unwrap()
+            .to_share("pass", "imported")
+            .unwrap();
         assert_eq!(
             imported.pubkey_package().unwrap().verifying_shares().len(),
             1
         );
-        assert_eq!(imported.metadata.identifier, shares[0].metadata.identifier);
+        assert_eq!(imported.key_package_bytes(), shares[0].key_package_bytes());
+    }
+
+    #[test]
+    fn truncated_compact_payload_is_refused() {
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let encoded = ShareExport::from_share(&shares[0], "pass")
+            .unwrap()
+            .to_bech32()
+            .unwrap();
+        let (hrp, data) = bech32::decode(&encoded).unwrap();
+        for cut in [1, 10, data.len() - 1] {
+            let short = bech32::encode::<Bech32m>(hrp, &data[..cut]).unwrap();
+            assert!(ShareExport::from_bech32(&short).is_err(), "cut at {cut}");
+        }
+        let mut long = data.clone();
+        long.push(0);
+        let long = bech32::encode::<Bech32m>(hrp, &long).unwrap();
+        assert!(ShareExport::from_bech32(&long).is_err());
     }
 
     #[test]
@@ -668,6 +988,8 @@ mod tests {
         let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
         export.encrypted_pubkey_package = None;
         export.pubkey_nonce = None;
+        export.encrypted_verifying_shares = None;
+        export.verifying_shares_nonce = None;
 
         let imported = export.to_share("pass", "imported").unwrap();
         assert_eq!(
@@ -689,6 +1011,15 @@ mod tests {
         ct[0] ^= 0xff;
         export.encrypted_pubkey_package = Some(hex::encode(&ct));
 
+        let imported = export.to_share("pass", "imported").unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares(),
+            shares[0].pubkey_package().unwrap().verifying_shares(),
+            "the authenticated verifying-share list replaces the damaged package"
+        );
+
+        export.encrypted_verifying_shares = None;
+        export.verifying_shares_nonce = None;
         let imported = export.to_share("pass", "imported").unwrap();
         assert_eq!(
             imported.pubkey_package().unwrap().verifying_shares().len(),

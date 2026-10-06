@@ -211,6 +211,18 @@ fn node_event_to_log(ev: &KfpNodeEvent) -> Option<Event> {
             success: false,
             detail: Some(format!("share {share_index}")),
         }),
+        KfpNodeEvent::PeerVersionMismatch {
+            share_index,
+            version,
+        } => Some(Event::Log {
+            app: "frost".into(),
+            action: "peer protocol mismatch".into(),
+            success: false,
+            detail: Some(format!(
+                "share {share_index} runs v{version}; every member must run v{}",
+                keep_frost_net::KFP_VERSION
+            )),
+        }),
         _ => None,
     }
 }

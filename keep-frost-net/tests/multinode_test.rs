@@ -4634,3 +4634,61 @@ async fn test_signing_over_real_relay() {
     key.verify_raw(b"real relay", &signature)
         .expect("the signature must verify under the group key");
 }
+
+/// A 3-of-5 share moved through the bech32 export binds every peer: the node
+/// starts, and a real member's announce is admitted against the canonical
+/// verifying share carried in the string.
+#[tokio::test]
+async fn test_bech32_imported_share_binds_peers_above_two_of_n() {
+    use keep_core::frost::ShareExport;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap());
+    let (mut shares, _pkg) = dealer.generate("test-bech32-import").unwrap();
+    let encoded = ShareExport::from_share(&shares.remove(0), "pass")
+        .unwrap()
+        .to_bech32()
+        .unwrap();
+    let imported = ShareExport::parse(&encoded)
+        .unwrap()
+        .to_share("pass", "imported")
+        .unwrap();
+
+    let mut node1 = KfpNode::new(imported, vec![relay.clone()])
+        .await
+        .expect("imported node starts");
+    let mut node2 = KfpNode::new(shares.remove(0), vec![relay])
+        .await
+        .expect("node 2");
+    let node2_key = node2.pubkey();
+    let mut rx1 = node1.subscribe();
+    let shutdown1 = node1.take_shutdown_handle();
+    let shutdown2 = node2.take_shutdown_handle();
+    let node1 = std::sync::Arc::new(node1);
+    let node1_handle = tokio::spawn({
+        let node = node1.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    let node2_handle = tokio::spawn(async move {
+        let _ = node2.run().await;
+    });
+
+    let discovered = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index: 2, .. }) =
+                rx1.recv().await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    let bound = node1.bound_peer_transport_keys();
+    graceful_shutdown(shutdown1, node1_handle).await;
+    graceful_shutdown(shutdown2, node2_handle).await;
+    assert!(discovered.is_ok(), "the imported node must admit member 2");
+    assert_eq!(bound, vec![(2, node2_key)]);
+}

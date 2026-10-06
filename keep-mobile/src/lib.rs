@@ -3939,6 +3939,17 @@ impl KeepMobile {
                         | Ok(KfpNodeEvent::PeerOffline { .. }) => {
                             state.push(&connection_status).await;
                         }
+                        Ok(KfpNodeEvent::PeerVersionMismatch {
+                            share_index,
+                            version,
+                        }) => {
+                            tracing::warn!(
+                                share_index,
+                                version,
+                                "peer runs another protocol version; every member must run v{}",
+                                keep_frost_net::KFP_VERSION
+                            );
+                        }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             state.push(&connection_status).await;
