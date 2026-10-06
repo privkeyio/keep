@@ -51,7 +51,7 @@ pub const DKG_KIND_ROUND2: u16 = 21103;
 /// Group-key / transcript confirmation (equivocation check).
 pub const DKG_KIND_CONFIRM: u16 = 21107;
 
-/// (index -> pubkey) roster fetched from a signed kind-21101 group
+/// (index -> pubkey) roster fetched from a signed kind-31101 group
 /// announcement, used to authenticate DKG participants (#674).
 ///
 /// Every DKG event is signed with the participant's per-group subkey (the one
@@ -220,7 +220,7 @@ pub fn dkg_transcript(
 /// Both `cmd_frost_network_group_create` (which mints the id) and roster
 /// verification (which re-derives it to hash-bind an announcement to its
 /// queried `d` tag) MUST call this so the two can never drift: a relay writer
-/// who republishes a rogue kind-21101 with the same `d` tag but different
+/// who republishes a rogue kind-31101 with the same `d` tag but different
 /// p-tags cannot fake a preimage under sha256.
 pub fn frost_group_id(
     name: &str,
@@ -258,10 +258,10 @@ pub fn frost_group_id(
     hasher.finalize().into()
 }
 
-/// Fetch the kind-21101 group announcement(s) for `group_id_hex` and return
+/// Fetch the kind-31101 group announcement(s) for `group_id_hex` and return
 /// the first one that authenticates into a valid roster.
 ///
-/// #674: a relay writer can publish decoy kind-21101 events under the same
+/// #674: a relay writer can publish decoy kind-31101 events under the same
 /// `d` tag (an attacker-chosen, self-signed `created_at` lets them appear
 /// newest). We therefore try candidates newest-first and return the first
 /// that fully validates via `parse_roster_from_event`, *skipping* any that
@@ -297,7 +297,7 @@ pub async fn fetch_group_roster(client: &Client, group_id_hex: &str) -> Result<D
     }))
 }
 
-/// Parse and fully validate one kind-21101 announcement into an authenticated
+/// Parse and fully validate one kind-31101 announcement into an authenticated
 /// roster, requiring its tags to hash-bind to `group_id_hex`. Returns `Err`
 /// (so `fetch_group_roster` can skip to the next candidate) on any anomaly:
 /// a missing/duplicate/holed p-tag, a missing `threshold`/`participants` tag,
@@ -413,7 +413,7 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
 
     // #674: recompute the group_id hash from the announcement's own fields and
     // require it to match the queried `d` tag. This is the strong bind that
-    // prevents a relay writer from swapping in a rogue kind-21101 with the same
+    // prevents a relay writer from swapping in a rogue kind-31101 with the same
     // `d` tag but different p-tags (a preimage attack under sha256, infeasible).
     let name = match serde_json::from_str::<serde_json::Value>(&ev.content) {
         Ok(v) => v
@@ -1570,7 +1570,7 @@ mod tests {
         assert_ne!(id_ab, id_ba);
     }
 
-    /// Build a kind-21101 announcement mirroring `cmd_frost_network_group_create`'s
+    /// Build a kind-31101 announcement mirroring `cmd_frost_network_group_create`'s
     /// tag layout, signed by an arbitrary key (the roster binds on the hash,
     /// not on who signed the announcement). `d_tag_override` lets a test forge
     /// the `d` tag while leaving the p-tags honest.
