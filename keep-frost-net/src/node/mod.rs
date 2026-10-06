@@ -2724,6 +2724,20 @@ impl KfpNode {
             }
         };
 
+        // Without a canonical share the index cannot be checked, so the first
+        // verifying share admitted for it is kept until restart; an announce for
+        // the same index with another share is refused rather than replacing it.
+        if proof_only {
+            if let Some(existing) = self.peers.read().get_peer(payload.share_index) {
+                if existing.verifying_share != Some(payload.verifying_share) {
+                    return Err(FrostNetError::UntrustedPeer(format!(
+                        "Announced verifying share for index {} differs from the one already admitted for it",
+                        payload.share_index
+                    )));
+                }
+            }
+        }
+
         // The attestation blobs sit outside `proof_signature`; their integrity rests on the
         // fail-closed admission below (AK pin plus nonce bound to the signed share_index/timestamp),
         // so unsigned or swapped evidence cannot be admitted.
@@ -3933,5 +3947,40 @@ mod tests {
         let hooks = NoOpHooks;
         let session = raw_session();
         hooks.pre_sign(&session).unwrap();
+    }
+
+    #[tokio::test]
+    async fn proof_only_announce_cannot_replace_an_admitted_share() {
+        let (node, _) = node_for(dealer_shares(3, 5), true).await;
+        let first = Keys::generate().public_key();
+        let admitted = random_share();
+        node.handle_announce(
+            first,
+            announce_payload(&node.group_pubkey, 2, admitted, KFP_VERSION),
+        )
+        .await
+        .unwrap();
+
+        let other = Keys::generate().public_key();
+        let result = node
+            .handle_announce(
+                other,
+                announce_payload(&node.group_pubkey, 2, random_share(), KFP_VERSION),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(FrostNetError::UntrustedPeer(msg)) if msg.contains("differs from the one already admitted")),
+            "expected the replacement to be refused, got {result:?}"
+        );
+        assert_eq!(node.peers.read().get_peer(2).map(|p| p.pubkey), Some(first));
+
+        let moved = Keys::generate().public_key();
+        node.handle_announce(
+            moved,
+            announce_payload(&node.group_pubkey, 2, admitted, KFP_VERSION),
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.peers.read().get_peer(2).map(|p| p.pubkey), Some(moved));
     }
 }
