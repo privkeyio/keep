@@ -61,6 +61,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 anyhow = "1.0"
 
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+uuid = { version = "1.23", features = ["v4", "serde"], optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -70,9 +73,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
-
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
-uuid = { version = "1.23", features = ["v4", "serde"], optional = true }
 
 [features]
 default = []

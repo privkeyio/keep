@@ -304,7 +304,7 @@ keep frost network serve --group npub1... --relay wss://bucket.coracle.social
 keep frost network peers --group npub1...
 
 # Device 1: Request signature
-keep frost network sign --group npub1... --message "hello"
+keep frost network sign --group npub1... --message <hex>
 
 # Device 1: Sign nostr event
 keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"

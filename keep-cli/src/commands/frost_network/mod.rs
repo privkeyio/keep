@@ -806,6 +806,25 @@ pub fn cmd_frost_network_sign(
     threshold: Option<u16>,
     participants: Option<u16>,
 ) -> Result<()> {
+    let message_bytes =
+        hex::decode(message).map_err(|_| KeepError::InvalidInput("invalid message hex".into()))?;
+
+    #[cfg(feature = "warden")]
+    if let Some(url) = warden_url {
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
+        rt.block_on(super::frost::check_warden_policy(
+            out, url, group_npub, message,
+        ))?;
+    }
+
+    #[cfg(not(feature = "warden"))]
+    if warden_url.is_some() {
+        return Err(KeepError::NotImplemented(
+            "Warden support not compiled. Rebuild with --features warden".into(),
+        ));
+    }
+
     if let Some(device) = hardware {
         let (threshold, participants) = match (threshold, participants) {
             (Some(t), Some(p)) => (t, p),
@@ -839,22 +858,6 @@ pub fn cmd_frost_network_sign(
             threshold,
             participants,
         );
-    }
-
-    #[cfg(feature = "warden")]
-    if let Some(url) = warden_url {
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| KeepError::Runtime(format!("tokio: {}", e)))?;
-        rt.block_on(super::frost::check_warden_policy(
-            out, url, group_npub, message,
-        ))?;
-    }
-
-    #[cfg(not(feature = "warden"))]
-    if warden_url.is_some() {
-        return Err(KeepError::NotImplemented(
-            "Warden support not compiled. Rebuild with --features warden".into(),
-        ));
     }
 
     let mut keep = Keep::open(path)?;
@@ -893,7 +896,7 @@ pub fn cmd_frost_network_sign(
         out,
         share,
         relay,
-        message.as_bytes().to_vec(),
+        message_bytes,
         "raw",
         None,
     ))?;
