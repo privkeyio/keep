@@ -500,7 +500,9 @@ fn check_metadata_matches(
     Ok(())
 }
 
-/// Every member in the recovered package must be one of indices 1..=total.
+/// Every member in the recovered package must be one of indices 1..=total,
+/// and a package holding more than this share's own entry must hold all of
+/// them, so a `total` edited in the export cannot pass.
 fn check_member_indices(
     package: &frost_secp256k1_tr::keys::PublicKeyPackage,
     total: u16,
@@ -508,10 +510,9 @@ fn check_member_indices(
     let members: Vec<frost_secp256k1_tr::Identifier> = (1..=total)
         .filter_map(|i| frost_secp256k1_tr::Identifier::try_from(i).ok())
         .collect();
-    if package
-        .verifying_shares()
-        .keys()
-        .all(|id| members.contains(id))
+    let entries = package.verifying_shares();
+    if entries.keys().all(|id| members.contains(id))
+        && (entries.len() == 1 || entries.len() == members.len())
     {
         Ok(())
     } else {

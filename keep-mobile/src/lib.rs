@@ -705,13 +705,13 @@ fn store_learned_verifying_shares(
     let pubkey_package =
         frost_secp256k1_tr::keys::PublicKeyPackage::deserialize(&stored.pubkey_package_bytes)
             .map_err(|e| invalid(format!("Invalid pubkey package: {e}")))?;
-    if pubkey_package.verifying_shares().len() == usize::from(metadata.total_shares) {
-        return Ok(());
-    }
     let share = SharePackage::new(metadata.clone(), &key_package, &pubkey_package)
         .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
-    let complete = keep_core::frost::complete_verifying_shares(&share, verifying_shares)
-        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
+    let Some(complete) = keep_core::frost::completed_pubkey_package(&share, verifying_shares)
+        .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+    else {
+        return Ok(());
+    };
     stored.pubkey_package_bytes = complete
         .serialize()
         .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?;
@@ -4475,13 +4475,7 @@ mod import_teardown_tests {
             .generate("learned")
             .unwrap();
         let full = shares[0].pubkey_package().unwrap();
-        let set: std::collections::BTreeMap<u16, [u8; 33]> = (1..=5u16)
-            .map(|i| {
-                let vs =
-                    full.verifying_shares()[&frost_secp256k1_tr::Identifier::try_from(i).unwrap()];
-                (i, vs.serialize().unwrap().try_into().unwrap())
-            })
-            .collect();
+        let set = keep_core::frost::verifying_share_map(&full, 5).unwrap();
         let mut export = ShareExport::from_share(&shares[0], "pass").unwrap();
         export.encrypted_pubkey_package = None;
         export.pubkey_nonce = None;

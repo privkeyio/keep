@@ -1026,12 +1026,9 @@ impl Keep {
             Some(crate::frost::Ciphersuite::Secp256k1Tr),
         )?;
         let share = stored.decrypt(&data_key)?;
-        if share.pubkey_package()?.verifying_shares().len()
-            == usize::from(share.metadata.total_shares)
-        {
+        let Some(package) = frost::completed_pubkey_package(&share, verifying_shares)? else {
             return Ok(());
-        }
-        let package = frost::complete_verifying_shares(&share, verifying_shares)?;
+        };
         let updated = SharePackage::new(share.metadata.clone(), &share.key_package()?, &package)?;
         self.storage
             .store_share(&StoredShare::encrypt(&updated, &data_key)?)
@@ -2861,13 +2858,7 @@ mod tests {
         let shares = src.frost_generate(3, 5, "learned").unwrap();
         let group_pubkey = *shares[0].group_pubkey();
         let full = shares[0].pubkey_package().unwrap();
-        let set: std::collections::BTreeMap<u16, [u8; 33]> = (1..=5u16)
-            .map(|i| {
-                let vs =
-                    full.verifying_shares()[&frost_secp256k1_tr::Identifier::try_from(i).unwrap()];
-                (i, vs.serialize().unwrap().try_into().unwrap())
-            })
-            .collect();
+        let set = frost::verifying_share_map(&full, 5).unwrap();
 
         let mut export = src
             .frost_export_share(&group_pubkey, 1, "transfer-pass")

@@ -3,6 +3,7 @@
 mod descriptor;
 mod ecdh;
 mod enroll;
+mod learning;
 mod oprf;
 mod psbt;
 mod signing;
@@ -1133,7 +1134,7 @@ pub struct KfpNode {
             ),
         >,
     >,
-    learned_verifying_shares: RwLock<LearnedVerifyingShares>,
+    learned_verifying_shares: RwLock<learning::LearnedVerifyingShares>,
     pub(crate) hooks: RwLock<Arc<dyn SigningHooks>>,
     pub(crate) event_tx: broadcast::Sender<KfpNodeEvent>,
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -1404,7 +1405,7 @@ impl KfpNode {
             policies: Arc::new(RwLock::new(HashMap::new())),
             version_mismatch_reported: RwLock::new(HashSet::new()),
             early_commitments: RwLock::new(HashMap::new()),
-            learned_verifying_shares: RwLock::new(LearnedVerifyingShares::default()),
+            learned_verifying_shares: RwLock::new(learning::LearnedVerifyingShares::default()),
             hooks: RwLock::new(Arc::new(NoOpHooks)),
             event_tx,
             shutdown_tx: Some(shutdown_tx),
@@ -1906,32 +1907,19 @@ impl KfpNode {
             .collect()
     }
 
-    /// The canonical verifying share for `index` from the set learned off
-    /// members' announces, recording `announced` (already proven by its holder)
-    /// until every member has announced. The set is accepted only once
+    /// The canonical verifying share for `payload`'s index from the set learned
+    /// off members' announces, recording the announce (already proven by its
+    /// author) until the set is complete. The set is accepted only once
     /// [`keep_core::frost::complete_verifying_shares`] checks it against the
-    /// group key and this share; until then no peer is admitted.
+    /// group key and this share; until then no peer is admitted. Also returns
+    /// the held-back announces to admit when the set has just completed, and
+    /// whether to announce in reply.
     #[allow(clippy::type_complexity)]
     fn learn_verifying_share(
         &self,
         pubkey: &PublicKey,
         payload: &AnnouncePayload,
     ) -> Result<(Option<[u8; 33]>, Vec<(PublicKey, AnnouncePayload)>, bool)> {
-        let index = payload.share_index;
-        let mut learned = self.learned_verifying_shares.write();
-        if let Some(complete) = &learned.complete {
-            return Ok((complete.get(&index).copied(), Vec::new(), false));
-        }
-        learned.announced.insert(index, payload.verifying_share);
-        let first_seen = learned
-            .held
-            .insert(index, (*pubkey, payload.clone()))
-            .is_none_or(|(previous, _)| previous != *pubkey);
-        let own = self.share.metadata.identifier;
-        let total = usize::from(self.share.metadata.total_shares);
-        if learned.announced.len() + 1 < total {
-            return Ok((None, Vec::new(), first_seen));
-        }
         let own_share: [u8; 33] = self
             .share
             .key_package()?
@@ -1943,30 +1931,37 @@ impl KfpNode {
             .as_slice()
             .try_into()
             .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
-        let mut set = learned.announced.clone();
-        set.insert(own, own_share);
-        if let Err(e) = keep_core::frost::complete_verifying_shares(&self.share, &set) {
-            warn!(error = %e, "Announced verifying shares do not form the group's set yet");
-            return Ok((None, Vec::new(), first_seen));
+        let mut learned = self.learned_verifying_shares.write();
+        match learned.record(
+            &self.share,
+            own_share,
+            *pubkey,
+            payload,
+            std::time::Instant::now(),
+        ) {
+            learning::Learning::Known => Ok((
+                learned
+                    .complete()
+                    .and_then(|set| set.get(&payload.share_index).copied()),
+                Vec::new(),
+                false,
+            )),
+            learning::Learning::Pending { reciprocate } => Ok((None, Vec::new(), reciprocate)),
+            learning::Learning::Completed { set, held } => {
+                info!("Learned every member's verifying share from their announces");
+                let _ = self.event_tx.send(KfpNodeEvent::VerifyingSharesLearned {
+                    share_index: self.share.metadata.identifier,
+                    verifying_shares: set.clone(),
+                });
+                Ok((set.get(&payload.share_index).copied(), held, false))
+            }
         }
-        info!("Learned every member's verifying share from their announces");
-        learned.complete = Some(set.clone());
-        let replay = std::mem::take(&mut learned.held)
-            .into_iter()
-            .filter(|(i, _)| *i != index)
-            .map(|(_, held)| held)
-            .collect();
-        let _ = self.event_tx.send(KfpNodeEvent::VerifyingSharesLearned {
-            share_index: own,
-            verifying_shares: set.clone(),
-        });
-        Ok((set.get(&index).copied(), replay, false))
     }
 
     /// The verifying-share set learned from members' announces, once complete,
     /// for an application to store with a share that lacked it.
     pub fn learned_verifying_shares(&self) -> Option<std::collections::BTreeMap<u16, [u8; 33]>> {
-        self.learned_verifying_shares.read().complete.clone()
+        self.learned_verifying_shares.read().complete().cloned()
     }
 
     /// Transport keys of the admitted peers, each bound to the group's
@@ -2815,7 +2810,8 @@ impl KfpNode {
         }
 
         let total_shares = self.share.metadata.total_shares;
-        if payload.share_index > total_shares
+        if payload.share_index == 0
+            || payload.share_index > total_shares
             || payload.share_index == self.share.metadata.identifier
         {
             return Err(FrostNetError::UntrustedPeer(format!(
@@ -2824,10 +2820,11 @@ impl KfpNode {
             )));
         }
         if payload.version != KFP_VERSION {
-            // Another version's proof cannot be checked here, so the claim is
-            // unverified. A v1 claim must at least come from that index's v1
-            // key, and each index is reported once to bound what a sender can
-            // make the node emit.
+            // Another version's proof cannot be checked here and v1 keys are
+            // derivable from the group key, so the claim is unauthenticated: it
+            // is a hint only. A v1 claim must come from that index's v1 key, and
+            // each index is reported once to bound what a sender can make the
+            // node emit.
             let plausible = payload.version != 1
                 || kfp_v1_transport_pubkey(&self.group_pubkey, payload.share_index)
                     .is_ok_and(|v1| v1 == pubkey);
@@ -3246,15 +3243,6 @@ fn derive_two_of_n_verifying_share(
         .as_slice()
         .try_into()
         .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))
-}
-
-/// Verifying shares gathered from members' announces by a node whose share
-/// was stored without the group's full set (threshold above 2).
-#[derive(Default)]
-struct LearnedVerifyingShares {
-    announced: std::collections::BTreeMap<u16, [u8; 33]>,
-    held: std::collections::BTreeMap<u16, (PublicKey, AnnouncePayload)>,
-    complete: Option<std::collections::BTreeMap<u16, [u8; 33]>>,
 }
 
 /// Derives this member's transport keypair from its signing share, so only the

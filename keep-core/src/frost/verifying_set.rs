@@ -17,9 +17,12 @@ use crate::error::{KeepError, Result};
 /// every index, includes `share`'s own verifying share, and all of them lie on
 /// one polynomial of degree threshold - 1 whose value at 0 is the group key.
 ///
-/// Members prove their own shares when they announce, and a forged entry would
-/// need a share whose secret depends on the group secret, so a set that passes
-/// can only be the group's real one.
+/// Members prove their own shares when they announce. Outsiders cannot make a
+/// passing set: every point beyond the threshold is fixed by the polynomial, so
+/// a forged one needs a secret that depends on the group secret. Enough
+/// colluding members (n - t + 2 or more) can agree on another consistent set;
+/// that never exposes a key or allows a forgery, and n - t + 1 members can
+/// already block signing by refusing.
 pub fn complete_verifying_shares(
     share: &SharePackage,
     verifying_shares: &BTreeMap<u16, [u8; 33]>,
@@ -79,6 +82,86 @@ pub fn complete_verifying_shares(
     ))
 }
 
+/// The verifying shares of every member of `share`'s group that `basis`
+/// determines: `basis` holds threshold - 2 other members' verifying shares,
+/// which with the group key and `share`'s own fix the polynomial. Indices in
+/// `basis` and `share`'s own are not returned.
+pub fn predict_verifying_shares(
+    share: &SharePackage,
+    basis: &BTreeMap<u16, [u8; 33]>,
+) -> Result<BTreeMap<u16, [u8; 33]>> {
+    let invalid = |why: &str| KeepError::Frost(format!("Cannot predict verifying shares: {why}"));
+    let key_package = share.key_package()?;
+    let threshold = *key_package.min_signers();
+    let own = share.metadata.identifier;
+    if threshold < 2 || basis.len() + 2 != usize::from(threshold) || basis.contains_key(&own) {
+        return Err(invalid("the basis must hold threshold - 2 other members"));
+    }
+    let mut points: Vec<(Scalar, ProjectivePoint)> = vec![
+        (Scalar::ZERO, key_package.verifying_key().to_element()),
+        (x(own), key_package.verifying_share().to_element()),
+    ];
+    for (&index, bytes) in basis {
+        if index == 0 || index > share.metadata.total_shares {
+            return Err(invalid("index out of range"));
+        }
+        let vs = VerifyingShare::deserialize(bytes).map_err(|_| invalid("bad point"))?;
+        points.push((x(index), vs.to_element()));
+    }
+    let mut predicted = BTreeMap::new();
+    for index in 1..=share.metadata.total_shares {
+        if index == own || basis.contains_key(&index) {
+            continue;
+        }
+        let point = VerifyingShare::new(interpolate(&points, x(index))?)
+            .serialize()
+            .map_err(|_| invalid("bad point"))?;
+        predicted.insert(
+            index,
+            point
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid("bad point"))?,
+        );
+    }
+    Ok(predicted)
+}
+
+/// Every member's verifying share in `package` by index, for indices 1..=total.
+pub fn verifying_share_map(
+    package: &PublicKeyPackage,
+    total: u16,
+) -> Result<BTreeMap<u16, [u8; 33]>> {
+    let mut map = BTreeMap::new();
+    for (index, vs) in (1..=total).filter_map(|i| {
+        let id = Identifier::try_from(i).ok()?;
+        package.verifying_shares().get(&id).map(|vs| (i, vs))
+    }) {
+        let bytes = vs
+            .serialize()
+            .map_err(|e| KeepError::Frost(format!("Failed to serialize verifying share: {e}")))?;
+        let bytes: [u8; 33] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| KeepError::Frost("Invalid verifying share length".into()))?;
+        map.insert(index, bytes);
+    }
+    Ok(map)
+}
+
+/// The package `share` should store once `verifying_shares` is accepted, or
+/// `None` when `share` already holds every member's verifying share.
+pub fn completed_pubkey_package(
+    share: &SharePackage,
+    verifying_shares: &BTreeMap<u16, [u8; 33]>,
+) -> Result<Option<PublicKeyPackage>> {
+    if share.pubkey_package()?.verifying_shares().len() == usize::from(share.metadata.total_shares)
+    {
+        return Ok(None);
+    }
+    complete_verifying_shares(share, verifying_shares).map(Some)
+}
+
 fn x(index: u16) -> Scalar {
     Scalar::from(u64::from(index))
 }
@@ -107,13 +190,11 @@ mod tests {
     use crate::frost::{ThresholdConfig, TrustedDealer};
 
     fn full_set(share: &SharePackage) -> BTreeMap<u16, [u8; 33]> {
-        let package = share.pubkey_package().unwrap();
-        (1..=share.metadata.total_shares)
-            .map(|i| {
-                let vs = package.verifying_shares()[&Identifier::try_from(i).unwrap()];
-                (i, vs.serialize().unwrap().try_into().unwrap())
-            })
-            .collect()
+        verifying_share_map(
+            &share.pubkey_package().unwrap(),
+            share.metadata.total_shares,
+        )
+        .unwrap()
     }
 
     fn groups() -> Vec<Vec<SharePackage>> {
@@ -177,5 +258,23 @@ mod tests {
 
         let other = &groups()[2];
         assert!(complete_verifying_shares(&shares[0], &full_set(&other[0])).is_err());
+    }
+
+    #[test]
+    fn predictions_from_real_members_match_the_set() {
+        for shares in groups() {
+            let set = full_set(&shares[0]);
+            let threshold = shares[0].metadata.threshold;
+            let basis: BTreeMap<u16, [u8; 33]> = set
+                .iter()
+                .filter(|(i, _)| **i != 1)
+                .take(usize::from(threshold) - 2)
+                .map(|(i, v)| (*i, *v))
+                .collect();
+            let predicted = predict_verifying_shares(&shares[0], &basis).unwrap();
+            for (index, point) in predicted {
+                assert_eq!(set[&index], point);
+            }
+        }
     }
 }
