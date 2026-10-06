@@ -74,6 +74,11 @@ pub struct Peer {
     /// instead of being honored indefinitely on credit.
     pub last_attested: Option<Instant>,
     pub recovery_xpubs: Vec<AnnouncedXpub>,
+    /// Admitted on proof of its share alone, because this node could not check
+    /// the index against a canonical verifying share (a share imported from a
+    /// bech32 export in a group with a threshold of 3 or more). Recorded only;
+    /// nothing restricts such a peer yet.
+    pub admitted_by_proof_only: bool,
 }
 
 impl Peer {
@@ -91,7 +96,13 @@ impl Peer {
             attestation_status: AttestationStatus::NotProvided,
             last_attested: None,
             recovery_xpubs: Vec::new(),
+            admitted_by_proof_only: false,
         }
+    }
+
+    pub fn with_proof_only_admission(mut self, proof_only: bool) -> Self {
+        self.admitted_by_proof_only = proof_only;
+        self
     }
 
     pub fn with_attestation_status(mut self, status: AttestationStatus) -> Self {
