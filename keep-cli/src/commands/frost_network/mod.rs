@@ -804,6 +804,8 @@ pub fn cmd_frost_network_sign(
     threshold: Option<u16>,
     participants: Option<u16>,
 ) -> Result<()> {
+    let message_bytes =
+        hex::decode(message).map_err(|_| KeepError::InvalidInput("invalid message hex".into()))?;
     if let Some(device) = hardware {
         let (threshold, participants) = match (threshold, participants) {
             (Some(t), Some(p)) => (t, p),
@@ -891,7 +893,7 @@ pub fn cmd_frost_network_sign(
         out,
         share,
         relay,
-        message.as_bytes().to_vec(),
+        message_bytes,
         "raw",
         None,
     ))?;

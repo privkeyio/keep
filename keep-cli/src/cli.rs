@@ -870,7 +870,7 @@ pub(crate) enum FrostNetworkCommands {
     Sign {
         #[arg(short, long)]
         group: String,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Message hex (the bytes that get signed)")]
         message: String,
         #[arg(short, long)]
         relay: Option<String>,

@@ -591,6 +591,38 @@ fn test_frost_sign_rejects_malformed_message_hex() {
 }
 
 #[test]
+fn test_frost_network_sign_rejects_malformed_message_hex() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("bad-hex-network-vault");
+
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+
+    // Decoded before the vault, the group or the relay is touched.
+    let output = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "network",
+            "sign",
+            "--group",
+            "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqmhxue69uhkummn",
+            "--message",
+            "hello",
+            "--relay",
+            "wss://relay.invalid",
+        ])
+        .run();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "invalid message hex"),
+        "text must be refused as hex, got:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn test_frost_sign_rejects_unknown_group() {
     let bin = require_binary!();
     let dir = TempDir::new().unwrap();
