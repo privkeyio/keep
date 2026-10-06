@@ -143,6 +143,22 @@ pub struct SharePackage {
     pubkey_package_bytes: Vec<u8>,
 }
 
+/// Return `key_package` with its verifying share recomputed from its signing
+/// share. frost-core's `refresh_share` replaces the signing share but keeps the
+/// old verifying share, and that stale value would otherwise be announced,
+/// exported, and used to anchor the group's verifying shares. A verifying share
+/// is by definition the public point of the signing share, so this is always
+/// correct and a no-op for a consistent package.
+pub fn with_consistent_verifying_share(key_package: &KeyPackage) -> KeyPackage {
+    KeyPackage::new(
+        *key_package.identifier(),
+        *key_package.signing_share(),
+        frost_secp256k1_tr::keys::VerifyingShare::from(*key_package.signing_share()),
+        *key_package.verifying_key(),
+        *key_package.min_signers(),
+    )
+}
+
 impl SharePackage {
     /// Create a new share package from FROST key packages.
     pub fn new(
@@ -150,7 +166,7 @@ impl SharePackage {
         key_package: &KeyPackage,
         pubkey_package: &PublicKeyPackage,
     ) -> Result<Self> {
-        let key_package_bytes = key_package
+        let key_package_bytes = with_consistent_verifying_share(key_package)
             .serialize()
             .map_err(|e| KeepError::Frost(format!("Failed to serialize key package: {e}")))?;
 
@@ -192,7 +208,10 @@ impl SharePackage {
 
     /// Deserialize and return the key package.
     pub fn key_package(&self) -> Result<KeyPackage> {
+        // Shares refreshed before this was normalized at construction may still
+        // be stored with a stale verifying share.
         KeyPackage::deserialize(&self.key_package_bytes)
+            .map(|kp| with_consistent_verifying_share(&kp))
             .map_err(|e| KeepError::Frost(format!("Failed to deserialize key package: {e}")))
     }
 
@@ -283,11 +302,66 @@ impl StoredShare {
     }
 }
 
+/// Share 1 of a refreshed 2-of-3 group as a share refreshed before
+/// [`with_consistent_verifying_share`] existed is stored: the new signing share
+/// with the old verifying share.
+#[cfg(test)]
+pub(crate) fn stale_refreshed_share() -> SharePackage {
+    use crate::frost::{refresh_shares, ThresholdConfig, TrustedDealer};
+    let (shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
+        .generate("refresh")
+        .unwrap();
+    let (refreshed, _) = refresh_shares(&shares).unwrap();
+    let old = shares[0].key_package().unwrap();
+    let new = refreshed[0].key_package().unwrap();
+    let stale = KeyPackage::new(
+        *new.identifier(),
+        *new.signing_share(),
+        *old.verifying_share(),
+        *new.verifying_key(),
+        *new.min_signers(),
+    );
+    SharePackage::from_bytes(
+        refreshed[0].metadata.clone(),
+        stale.serialize().unwrap(),
+        refreshed[0].pubkey_package_bytes().to_vec(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::crypto::SecretKey;
     use serde::{Deserialize, Serialize};
+
+    fn consistent(kp: &KeyPackage) -> bool {
+        *kp.verifying_share() == frost_secp256k1_tr::keys::VerifyingShare::from(*kp.signing_share())
+    }
+
+    #[test]
+    fn refreshed_shares_store_a_consistent_verifying_share() {
+        use crate::frost::{refresh_shares, ThresholdConfig, TrustedDealer};
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
+            .generate("refresh")
+            .unwrap();
+        let (refreshed, _) = refresh_shares(&shares).unwrap();
+        for share in &refreshed {
+            let stored = KeyPackage::deserialize(share.key_package_bytes()).unwrap();
+            assert!(
+                consistent(&stored),
+                "stored key package must match its secret"
+            );
+            assert!(consistent(&share.key_package().unwrap()));
+        }
+    }
+
+    #[test]
+    fn stale_stored_key_package_loads_consistent() {
+        let stored = stale_refreshed_share();
+        let raw = KeyPackage::deserialize(stored.key_package_bytes()).unwrap();
+        assert!(!consistent(&raw), "precondition: stored bytes are stale");
+        assert!(consistent(&stored.key_package().unwrap()));
+    }
 
     fn sample_metadata() -> ShareMetadata {
         ShareMetadata::new(1, 2, 3, [7u8; 32], "test".into())
