@@ -275,7 +275,7 @@ fn export_share(
         SharePackage::new(metadata, &result.key_package, &result.public_key_package)?;
     let passphrase = Zeroizing::new(passphrase.to_string());
     let export = ShareExport::from_share(&share_package, &passphrase)?;
-    Ok(export.to_bech32()?)
+    Ok(export.to_text()?)
 }
 
 /// Run a full relay-driven software DKG through the shared coordinator and return

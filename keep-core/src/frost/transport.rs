@@ -58,10 +58,10 @@ pub struct ShareExport {
     /// share), hex. Lets an imported holder enforce the canonical verifying-share
     /// binding for co-signers instead of only its own share. Optional and
     /// separately authenticated (own AAD + fresh nonce, same passphrase key):
-    /// absent in exports written before this field existed, stripped from the
-    /// size-limited [`Self::to_bech32`] form, and import falls back to a
-    /// single-entry package on absence, tampering, or mismatch. Secret recovery
-    /// never depends on it, and `version` stays `1` so older clients ignore it.
+    /// absent in exports written before this field existed and left out of the
+    /// size-limited [`Self::to_bech32`] form (which carries the compact
+    /// verifying-share list instead); import falls back on absence, tampering,
+    /// or mismatch. `version` stays `1` so older clients ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_pubkey_package: Option<String>,
     /// Fresh nonce (hex) for [`Self::encrypted_pubkey_package`]; distinct from
@@ -111,8 +111,8 @@ impl ShareExport {
         // Also carry the full public-key package. It is public data, but it is
         // encrypted-and-authenticated (distinct AAD + its own fresh nonce, same
         // key) so an importer can trust it as the canonical verifying-share map
-        // rather than only its own single entry. Never gates secret recovery, and
-        // is stripped from the size-limited bech32 form.
+        // rather than only its own single entry. Left out of the size-limited
+        // bech32 form, which carries the compact verifying-share list instead.
         let encrypted_pubkey =
             crypto::encrypt_with_aad(share.pubkey_package_bytes(), PUBKEY_PACKAGE_AAD, &key)?;
 
@@ -211,10 +211,10 @@ impl ShareExport {
                     .map_err(|e| {
                         KeepError::Frost(format!("Failed to deserialize key package: {e}"))
                     })?;
-                // Prefer the exported full public-key package (enables the canonical
-                // verifying-share binding for co-signers). Fall back to a single-entry
-                // package on absence, decrypt/deserialize failure, or anchor mismatch;
-                // secret recovery is never gated on this optional field.
+                check_metadata_matches(self, &key_package, &group_pubkey)?;
+                // Prefer the exported full public-key package, then the compact
+                // verifying-share list; both let an imported holder bind every
+                // member. Without either, a single-entry package remains.
                 let pubkey_package = match self.recover_full_pubkey_package(&key, &key_package) {
                     Some(pkg) => pkg,
                     None => {
@@ -224,6 +224,7 @@ impl ShareExport {
                         }
                     }
                 };
+                check_member_indices(&pubkey_package, self.total)?;
                 SharePackage::new(metadata, &key_package, &pubkey_package)
             }
             Ciphersuite::Ed25519 => import_ed25519_share(metadata, &key_bytes),
@@ -351,6 +352,12 @@ impl ShareExport {
     /// exports). A group too large for one bech32 string is refused with a
     /// pointer to those forms rather than silently dropping the list.
     pub fn to_bech32(&self) -> Result<String> {
+        if self.version != 1 {
+            return Err(KeepError::Frost(format!(
+                "Unsupported version: {}",
+                self.version
+            )));
+        }
         let invalid = || KeepError::Frost("Invalid share export".into());
         let decode_fixed = |hex_str: &str, len: usize| -> Result<Vec<u8>> {
             let bytes = hex::decode(hex_str).map_err(|_| invalid())?;
@@ -393,6 +400,13 @@ impl ShareExport {
                 self.total
             ))
         })
+    }
+
+    /// The shortest text form: bech32 when the share fits one string, JSON
+    /// (which also carries the full public-key package) otherwise. Both parse
+    /// with [`Self::parse`].
+    pub fn to_text(&self) -> Result<String> {
+        self.to_bech32().or_else(|_| self.to_json())
     }
 
     /// Decode from a bech32 string: the compact binary payload, or the JSON
@@ -462,6 +476,51 @@ impl ShareExport {
     }
 }
 
+/// The export's identifier, threshold and group key sit outside the share's
+/// authenticated ciphertext, so they must agree with the decrypted key package.
+fn check_metadata_matches(
+    export: &ShareExport,
+    key_package: &frost_secp256k1_tr::keys::KeyPackage,
+    group_pubkey: &[u8; 32],
+) -> Result<()> {
+    let mismatch = || KeepError::Frost("Share export metadata does not match the share".into());
+    let identifier =
+        frost_secp256k1_tr::Identifier::try_from(export.identifier).map_err(|_| mismatch())?;
+    let verifying_key = key_package
+        .verifying_key()
+        .serialize()
+        .map_err(|_| mismatch())?;
+    if *key_package.identifier() != identifier
+        || *key_package.min_signers() != export.threshold
+        || export.threshold > export.total
+        || verifying_key.get(1..33) != Some(group_pubkey.as_slice())
+    {
+        return Err(mismatch());
+    }
+    Ok(())
+}
+
+/// Every member in the recovered package must be one of indices 1..=total.
+fn check_member_indices(
+    package: &frost_secp256k1_tr::keys::PublicKeyPackage,
+    total: u16,
+) -> Result<()> {
+    let members: Vec<frost_secp256k1_tr::Identifier> = (1..=total)
+        .filter_map(|i| frost_secp256k1_tr::Identifier::try_from(i).ok())
+        .collect();
+    if package
+        .verifying_shares()
+        .keys()
+        .all(|id| members.contains(id))
+    {
+        Ok(())
+    } else {
+        Err(KeepError::Frost(
+            "Share export metadata does not match the share".into(),
+        ))
+    }
+}
+
 fn push_with_len(out: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let len =
         u16::try_from(bytes.len()).map_err(|_| KeepError::Frost("Invalid share export".into()))?;
@@ -504,6 +563,12 @@ fn ordered_verifying_shares(share: &SharePackage) -> Result<Option<Vec<u8>>> {
     use frost_secp256k1_tr::Identifier;
 
     let package = share.pubkey_package()?;
+    let key_package = share.key_package()?;
+    if package.verifying_shares().get(key_package.identifier())
+        != Some(key_package.verifying_share())
+    {
+        return Ok(None);
+    }
     let mut list =
         Vec::with_capacity(usize::from(share.metadata.total_shares) * VERIFYING_SHARE_LEN);
     for i in 1..=share.metadata.total_shares {
@@ -1175,5 +1240,67 @@ mod tests {
         msg.session_id = "cc".repeat(32);
         let bytes = msg.session_id_bytes().expect("32-byte hex must parse");
         assert_eq!(bytes, [0xCCu8; 32]);
+    }
+
+    #[test]
+    fn large_group_text_export_falls_back_to_json_and_imports() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(3, 15).unwrap());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let text = ShareExport::from_share(&shares[0], "pass")
+            .unwrap()
+            .to_text()
+            .unwrap();
+        assert!(text.starts_with('{'));
+        let imported = ShareExport::parse(&text)
+            .unwrap()
+            .to_share("pass", "imported")
+            .unwrap();
+        assert_eq!(
+            imported.pubkey_package().unwrap().verifying_shares().len(),
+            15
+        );
+    }
+
+    #[test]
+    fn export_metadata_must_match_the_key_package() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let export = ShareExport::from_share(&shares[0], "pass").unwrap();
+
+        let mut wrong_id = export.clone();
+        wrong_id.identifier = 2;
+        assert!(wrong_id.to_share("pass", "x").is_err());
+
+        let mut wrong_threshold = export.clone();
+        wrong_threshold.threshold = 2;
+        wrong_threshold.encrypted_verifying_shares = None;
+        wrong_threshold.verifying_shares_nonce = None;
+        assert!(wrong_threshold.to_share("pass", "x").is_err());
+
+        let mut wrong_group = export.clone();
+        wrong_group.group_pubkey = hex::encode([9u8; 32]);
+        wrong_group.encrypted_verifying_shares = None;
+        wrong_group.verifying_shares_nonce = None;
+        assert!(wrong_group.to_share("pass", "x").is_err());
+
+        let mut small_total = export.clone();
+        small_total.total = 4;
+        small_total.encrypted_verifying_shares = None;
+        small_total.verifying_shares_nonce = None;
+        assert!(small_total.to_share("pass", "x").is_err());
+
+        export.to_share("pass", "x").unwrap();
+    }
+
+    #[test]
+    fn largest_group_text_export_stays_under_the_mobile_import_limit() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 255).unwrap());
+        let (shares, _) = dealer.generate("test").unwrap();
+        let text = ShareExport::from_share(&shares[0], "pass")
+            .unwrap()
+            .to_text()
+            .unwrap();
+        // keep-mobile refuses imports above 64 KiB.
+        assert!(text.len() < 64 * 1024, "{} bytes", text.len());
     }
 }

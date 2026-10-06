@@ -15,6 +15,7 @@ mod refresh;
 mod share;
 mod signing;
 mod transport;
+mod verifying_set;
 
 #[cfg(feature = "ed25519")]
 pub mod ed25519;
@@ -26,3 +27,4 @@ pub use refresh::refresh_shares;
 pub use share::{Ciphersuite, ShareMetadata, SharePackage, StoredShare};
 pub use signing::{sign_with_local_shares, SessionState, SigningSession};
 pub use transport::{FrostMessage, FrostMessageType, ShareExport};
+pub use verifying_set::complete_verifying_shares;

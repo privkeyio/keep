@@ -734,6 +734,18 @@ fn handle_node_event(
         ev @ (KfpNodeEvent::PsbtFinalized { .. } | KfpNodeEvent::PsbtAborted { .. }) => {
             handle_psbt_status_node_event(ev, now_secs, frost_events);
         }
+        KfpNodeEvent::VerifyingSharesLearned {
+            share_index,
+            verifying_shares,
+        } => {
+            push_frost_event(
+                frost_events,
+                FrostNodeMsg::VerifyingSharesLearned {
+                    share_index,
+                    verifying_shares,
+                },
+            );
+        }
         KfpNodeEvent::PeerVersionMismatch {
             share_index,
             version,
@@ -1391,6 +1403,22 @@ impl App {
                         expected: expected_acks,
                     });
                 });
+            }
+            FrostNodeMsg::VerifyingSharesLearned {
+                share_index,
+                verifying_shares,
+            } => {
+                if let Some(group_pubkey) = self.get_frost_node().map(|n| *n.group_pubkey()) {
+                    if let Some(keep) = lock_keep(&self.keep).as_mut() {
+                        if let Err(e) = keep.frost_store_verifying_shares(
+                            &group_pubkey,
+                            share_index,
+                            &verifying_shares,
+                        ) {
+                            tracing::error!(error = %e, "Failed to store learned verifying shares");
+                        }
+                    }
+                }
             }
             FrostNodeMsg::DescriptorComplete {
                 session_id,

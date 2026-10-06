@@ -120,6 +120,10 @@ pub fn cmd_serve(
                 .await
                 .map_err(|e| KeepError::Frost(e.to_string()))?;
 
+            let _learned_store = crate::commands::frost_network::store_learned_verifying_shares(
+                &node,
+                std::sync::Arc::new(std::sync::Mutex::new(keep)),
+            );
             let node = std::sync::Arc::new(node);
             let node_for_task = node.clone();
             let _node_handle = tokio::spawn(async move {

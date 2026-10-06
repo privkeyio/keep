@@ -4692,3 +4692,252 @@ async fn test_bech32_imported_share_binds_peers_above_two_of_n() {
     assert!(discovered.is_ok(), "the imported node must admit member 2");
     assert_eq!(bound, vec![(2, node2_key)]);
 }
+
+/// A threshold-3 share stored without the other members' verifying shares
+/// learns the set from their announces, admits them once it checks out, signs,
+/// and reports the set so it can be stored with the share.
+#[tokio::test]
+async fn test_share_without_verifying_set_learns_it_and_signs() {
+    use keep_core::frost::ShareExport;
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
+    let (mut shares, _pkg) = dealer.generate("test-learn-set").unwrap();
+    let full_set = shares[0].pubkey_package().unwrap();
+
+    let mut export = ShareExport::from_share(&shares.remove(0), "pass").unwrap();
+    export.encrypted_pubkey_package = None;
+    export.pubkey_nonce = None;
+    export.encrypted_verifying_shares = None;
+    export.verifying_shares_nonce = None;
+    let stripped = export.to_share("pass", "stripped").unwrap();
+    assert_eq!(
+        stripped.pubkey_package().unwrap().verifying_shares().len(),
+        1
+    );
+
+    let mut learner = KfpNode::new(stripped, vec![relay.clone()])
+        .await
+        .expect("a share without the set still starts");
+    let mut rx = learner.subscribe();
+    let mut handles = Vec::new();
+    let learner_shutdown = learner.take_shutdown_handle();
+    let learner = Arc::new(learner);
+    let learner_handle = tokio::spawn({
+        let node = learner.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    for share in shares {
+        let mut node = KfpNode::new(share, vec![relay.clone()]).await.unwrap();
+        let shutdown = node.take_shutdown_handle();
+        let handle = tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+        handles.push((shutdown, handle));
+    }
+
+    let learned = timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(keep_frost_net::KfpNodeEvent::VerifyingSharesLearned {
+                verifying_shares,
+                ..
+            }) = rx.recv().await
+            {
+                return verifying_shares;
+            }
+        }
+    })
+    .await;
+    let admitted = timeout(Duration::from_secs(30), async {
+        while learner.bound_peer_transport_keys().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let signature = if admitted.is_ok() {
+        Some(
+            timeout(
+                Duration::from_secs(60),
+                learner.request_signature(b"learned".to_vec(), "raw"),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    graceful_shutdown(learner_shutdown, learner_handle).await;
+    for (shutdown, handle) in handles {
+        graceful_shutdown(shutdown, handle).await;
+    }
+
+    let learned = learned.expect("the set must be learned");
+    assert_eq!(learned.len(), 4);
+    for (index, bytes) in &learned {
+        let id = frost_secp256k1_tr::Identifier::try_from(*index).unwrap();
+        assert_eq!(
+            full_set.verifying_shares()[&id]
+                .serialize()
+                .unwrap()
+                .as_slice(),
+            bytes.as_slice()
+        );
+    }
+    assert_eq!(learner.learned_verifying_shares(), Some(learned));
+    assert!(
+        admitted.is_ok(),
+        "every member must be admitted once learned"
+    );
+    let signature = signature
+        .expect("admitted")
+        .expect("signing timed out")
+        .expect("signing failed");
+    assert_eq!(signature.len(), 64);
+}
+
+/// A round with two or more co-signers and no pre-exchanged nonces completes:
+/// co-signers send their commitments to each other, not only to the requester.
+#[tokio::test]
+async fn test_three_signers_without_pre_exchanged_nonces() {
+    use std::sync::Arc;
+
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
+    let (mut shares, _pkg) = dealer.generate("interactive").unwrap();
+    let mut initiator = KfpNode::new(shares.remove(0), vec![relay.clone()])
+        .await
+        .unwrap();
+    let initiator_shutdown = initiator.take_shutdown_handle();
+    let initiator = Arc::new(initiator);
+    let initiator_handle = tokio::spawn({
+        let node = initiator.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    let mut handles = Vec::new();
+    for share in shares {
+        let mut node = KfpNode::new(share, vec![relay.clone()]).await.unwrap();
+        let shutdown = node.take_shutdown_handle();
+        let handle = tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+        handles.push((shutdown, handle));
+    }
+    let discovered = timeout(Duration::from_secs(30), async {
+        while initiator.bound_peer_transport_keys().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    let mut signatures = Vec::new();
+    if discovered.is_ok() {
+        for round in 0..3u8 {
+            initiator.test_clear_peer_nonce_pools();
+            signatures.push(
+                timeout(
+                    Duration::from_secs(60),
+                    initiator.request_signature(vec![round], "raw"),
+                )
+                .await,
+            );
+        }
+    }
+
+    graceful_shutdown(initiator_shutdown, initiator_handle).await;
+    for (shutdown, handle) in handles {
+        graceful_shutdown(shutdown, handle).await;
+    }
+    assert!(discovered.is_ok(), "peers must be discovered");
+    for signature in signatures {
+        let signature = signature.expect("round timed out").expect("round failed");
+        assert_eq!(signature.len(), 64);
+    }
+}
+
+/// Over a real relay: a 3-of-4 member stored without the verifying-share set
+/// learns it, then signs with and without pre-exchanged nonces. Run with
+/// `KEEP_E2E_RELAY=wss://... cargo test ... -- --ignored`.
+#[tokio::test]
+#[ignore = "needs a real relay in KEEP_E2E_RELAY"]
+async fn test_learning_and_interactive_signing_over_real_relay() {
+    use keep_core::frost::ShareExport;
+    use std::sync::Arc;
+
+    keep_frost_net::install_default_crypto_provider();
+    let relay = std::env::var("KEEP_E2E_RELAY").expect("KEEP_E2E_RELAY");
+    let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
+    let (mut shares, _pkg) = dealer.generate("real-relay-learn").unwrap();
+    let group = *shares[0].group_pubkey();
+    let mut export = ShareExport::from_share(&shares.remove(0), "pass").unwrap();
+    export.encrypted_pubkey_package = None;
+    export.pubkey_nonce = None;
+    export.encrypted_verifying_shares = None;
+    export.verifying_shares_nonce = None;
+    let stripped = export.to_share("pass", "stripped").unwrap();
+
+    let mut learner = KfpNode::new(stripped, vec![relay.clone()]).await.unwrap();
+    let learner_shutdown = learner.take_shutdown_handle();
+    let learner = Arc::new(learner);
+    let learner_handle = tokio::spawn({
+        let node = learner.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    let mut handles = Vec::new();
+    for share in shares {
+        let mut node = KfpNode::new(share, vec![relay.clone()]).await.unwrap();
+        let shutdown = node.take_shutdown_handle();
+        let handle = tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+        handles.push((shutdown, handle));
+    }
+
+    let admitted = timeout(Duration::from_secs(90), async {
+        while learner.bound_peer_transport_keys().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    let mut signatures = Vec::new();
+    if admitted.is_ok() {
+        for (round, clear_pool) in [(0u8, false), (1, true)] {
+            if clear_pool {
+                learner.test_clear_peer_nonce_pools();
+            }
+            signatures.push((
+                round,
+                timeout(
+                    Duration::from_secs(90),
+                    learner.request_signature(vec![round], "raw"),
+                )
+                .await,
+            ));
+        }
+    }
+
+    graceful_shutdown(learner_shutdown, learner_handle).await;
+    for (shutdown, handle) in handles {
+        graceful_shutdown(shutdown, handle).await;
+    }
+    assert!(
+        admitted.is_ok(),
+        "every member must be admitted after learning"
+    );
+    assert!(learner.learned_verifying_shares().is_some());
+    let key = k256::schnorr::VerifyingKey::from_bytes(&group).unwrap();
+    for (round, signature) in signatures {
+        let signature = signature.expect("round timed out").expect("round failed");
+        let signature = k256::schnorr::Signature::try_from(signature.as_slice()).unwrap();
+        key.verify_raw(&[round], &signature)
+            .expect("the signature must verify under the group key");
+    }
+}

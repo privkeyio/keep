@@ -241,6 +241,10 @@ pub struct NetworkConfig {
     /// Persisted transport key = the bunker URL's pubkey identity. Stable so the
     /// URL doesn't change across restarts and saved client connections survive.
     pub transport_key: [u8; 32],
+    /// Receives the verifying-share set the node learns from its members when
+    /// the share was stored without it, so the caller can store it in the vault.
+    pub learned_verifying_shares:
+        tokio::sync::mpsc::UnboundedSender<(u16, std::collections::BTreeMap<u16, [u8; 33]>)>,
 }
 
 /// What `spawn_network_frost` reports back once the co-signer is up.
@@ -289,9 +293,16 @@ pub fn spawn_network_frost(
             // feed so the UI reflects who is online, not just signing rounds.
             let mut node_events = node.subscribe();
             let events_for_feed = events.clone();
+            let learned_tx = cfg.learned_verifying_shares.clone();
             tokio::spawn(async move {
                 loop {
                     match node_events.recv().await {
+                        Ok(KfpNodeEvent::VerifyingSharesLearned {
+                            share_index,
+                            verifying_shares,
+                        }) => {
+                            let _ = learned_tx.send((share_index, verifying_shares));
+                        }
                         Ok(ev) => {
                             if let Some(log) = node_event_to_log(&ev) {
                                 let _ = events_for_feed.send(log);

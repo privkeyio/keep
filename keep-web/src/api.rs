@@ -226,10 +226,10 @@ pub async fn export_share(
     };
     let mut keep = state.keep.lock().await;
     match keep.frost_export_share(&group, body.identifier, &body.passphrase) {
-        Ok(export) => match export.to_bech32() {
+        Ok(export) => match export.to_text() {
             Ok(s) => Json(ExportResponse { export: s }).into_response(),
             Err(e) => {
-                tracing::error!(error = %e, "share export to_bech32 failed");
+                tracing::error!(error = %e, "share export encoding failed");
                 (StatusCode::INTERNAL_SERVER_ERROR, "failed to encode export").into_response()
             }
         },
