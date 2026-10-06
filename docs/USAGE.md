@@ -448,7 +448,7 @@ keep frost network dkg --group mygroup --group-id <Group ID> \
   --threshold 2 --participants 3 --index 1 --relay wss://relay.example
 ```
 
-`--group` is the name the participant used with `group-subkey`; `--group-id` pins the coordinator's roster, so a roster published by anyone else is refused. Use a relay that stores kind 31101 events. Hardware DKG over relays is not supported yet.
+`--group` is the name the participant used with `group-subkey`; `--group-id` pins the coordinator's roster: it is a hash over the group name, threshold and every participant's subkey, so a roster with any other contents is refused. Use a relay that stores kind 31101 events. Hardware DKG over relays is not supported yet.
 
 All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
 

@@ -1026,8 +1026,10 @@ pub fn cmd_frost_network_group_create(
         out.newline();
         out.info(&format!(
             "Each participant now runs: keep frost network dkg --group <their group-subkey name> \
-             --group-id {} --threshold {threshold} --participants {participants} --index <n>",
-            hex::encode(group_id)
+             --group-id {} --threshold {threshold} --participants {participants} --index <n> \
+             --relay {}",
+            hex::encode(group_id),
+            relays.first().map(String::as_str).unwrap_or("<relay>")
         ));
 
         Ok::<_, KeepError>(())
