@@ -131,7 +131,9 @@ pub fn cmd_frost_network_serve(
                 return Err(KeepError::invalid_input(
                     "no duress beacon recipients are recorded yet; serve with \
                      --duress-recipients-file and without the beacon flags until the other \
-                     members have announced",
+                     members have announced. Members admitted on proof of their share alone \
+                     (a share imported without the group's verifying shares, threshold 3 or \
+                     more) are never recorded",
                 ));
             }
             let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
