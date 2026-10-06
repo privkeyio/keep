@@ -1885,7 +1885,7 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_send_to(&p.pubkey))
+                .filter(|p| self.can_send_to_index(p.share_index))
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -2020,12 +2020,26 @@ impl KfpNode {
         *self.hooks.write() = hooks;
     }
 
+    /// Takes the peers lock, so it must not be called while holding it; use
+    /// the `_index` variants with a peer already in hand.
     pub(crate) fn can_send_to(&self, pubkey: &PublicKey) -> bool {
         self.policy_for(pubkey).is_none_or(|p| p.allow_send)
     }
 
+    /// Takes the peers lock, so it must not be called while holding it; use
+    /// the `_index` variants with a peer already in hand.
     pub(crate) fn can_receive_from(&self, pubkey: &PublicKey) -> bool {
         self.policy_for(pubkey).is_none_or(|p| p.allow_receive)
+    }
+
+    pub(crate) fn can_send_to_index(&self, share_index: u16) -> bool {
+        self.get_peer_policy(share_index)
+            .is_none_or(|p| p.allow_send)
+    }
+
+    pub(crate) fn can_receive_from_index(&self, share_index: u16) -> bool {
+        self.get_peer_policy(share_index)
+            .is_none_or(|p| p.allow_receive)
     }
 
     pub(crate) fn invoke_post_sign_hook(&self, session_id: &[u8; 32], signature: &[u8; 64]) {
@@ -2065,7 +2079,10 @@ impl KfpNode {
                 .get_signing_peers()
                 .into_iter()
                 .filter(|p| !exclude.contains(&p.share_index))
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .collect();
 
             if eligible_peers.len() + 1 < threshold {
@@ -3135,8 +3152,9 @@ fn kfp_v1_transport_pubkey(group_pubkey: &[u8; 32], identifier: u16) -> Result<P
 }
 
 /// Moves peer policies recorded under KFP v1, keyed by v1 transport keys, onto
-/// share indices. An index that already has a policy keeps it; an entry that is
-/// no member's v1 key is dropped. Returns whether `config` changed.
+/// share indices. Where an index already has a policy, each flag keeps the
+/// stricter setting; an entry that is no member's v1 key is dropped. Returns
+/// whether `config` changed.
 pub fn migrate_kfp_v1_peer_policies(
     config: &mut keep_core::RelayConfig,
     total_shares: u16,
@@ -3159,16 +3177,20 @@ pub fn migrate_kfp_v1_peer_policies(
             );
             continue;
         };
-        if config
+        match config
             .peer_policies
-            .iter()
-            .all(|p| p.share_index != share_index)
+            .iter_mut()
+            .find(|p| p.share_index == share_index)
         {
-            config.peer_policies.push(keep_core::PeerPolicyEntry {
+            Some(p) => {
+                p.allow_send &= entry.allow_send;
+                p.allow_receive &= entry.allow_receive;
+            }
+            None => config.peer_policies.push(keep_core::PeerPolicyEntry {
                 share_index,
                 allow_send: entry.allow_send,
                 allow_receive: entry.allow_receive,
-            });
+            }),
         }
     }
     Ok(true)
@@ -4352,6 +4374,6 @@ mod tests {
             .map(|p| (p.share_index, p.allow_send))
             .collect();
         migrated.sort_unstable();
-        assert_eq!(migrated, vec![(2, false), (3, true)]);
+        assert_eq!(migrated, vec![(2, false), (3, false)]);
     }
 }

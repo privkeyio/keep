@@ -203,8 +203,17 @@ impl RelayConfig {
                     "Invalid peer policy share index: 0".into(),
                 ));
             }
-            peer_policies.retain(|q| q.share_index != p.share_index);
-            peer_policies.push(p);
+            // Two entries for one index keep the stricter setting of each flag.
+            match peer_policies
+                .iter_mut()
+                .find(|q| q.share_index == p.share_index)
+            {
+                Some(q) => {
+                    q.allow_send &= p.allow_send;
+                    q.allow_receive &= p.allow_receive;
+                }
+                None => peer_policies.push(p),
+            }
         }
         let mut kfp_v1_peer_policies = Vec::with_capacity(self.kfp_v1_peer_policies.len());
         for p in self.kfp_v1_peer_policies {

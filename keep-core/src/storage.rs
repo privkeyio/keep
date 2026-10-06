@@ -2962,7 +2962,7 @@ mod tests {
         use crate::relay::PeerPolicyEntry;
 
         let mut config = RelayConfig::new([2u8; 32]);
-        for allow_send in [true, false] {
+        for allow_send in [false, true] {
             config.peer_policies.push(PeerPolicyEntry {
                 share_index: 3,
                 allow_send,

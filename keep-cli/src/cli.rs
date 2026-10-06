@@ -748,8 +748,9 @@ pub(crate) enum FrostNetworkCommands {
         /// A coerced holder never unlocks the share those keys derive from, so
         /// every genuine start records each member whose announce is bound to the
         /// group, and a duress start reads them back. Required with
-        /// --duress-beacon-pubkey; keep it beside --duress-state-file.
-        #[arg(long, value_name = "FILE", requires = "duress_beacon_pubkey")]
+        /// --duress-beacon-pubkey, which is refused until at least one member is
+        /// recorded; pass this flag alone first. Keep it beside --duress-state-file.
+        #[arg(long, value_name = "FILE")]
         duress_recipients_file: Option<PathBuf>,
         /// Coercion resistance: a group holder's duress-beacon npub to TRUST.
         /// Repeatable. Receiving a verified beacon signed by any pinned key freezes

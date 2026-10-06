@@ -505,11 +505,26 @@ struct DuressRecipients {
     recipients: std::collections::BTreeMap<u16, String>,
 }
 
+/// Far above any group's recipients file; a larger file is refused unread.
+const MAX_RECIPIENTS_FILE_BYTES: u64 = 1 << 20;
+
 fn load_recipients(path: &Path, group_pubkey: &[u8; 32]) -> Result<DuressRecipients> {
+    use std::io::Read;
     validate_state_dir_perms(path)?;
     let group = hex::encode(group_pubkey);
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|f| {
+        f.take(MAX_RECIPIENTS_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+    });
+    match read {
+        Ok(n) if n as u64 > MAX_RECIPIENTS_FILE_BYTES => {
+            return Err(KeepError::invalid_input(format!(
+                "duress recipients file {} is too large",
+                path.display()
+            )))
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DuressRecipients {
                 group,
@@ -529,6 +544,12 @@ fn load_recipients(path: &Path, group_pubkey: &[u8; 32]) -> Result<DuressRecipie
             path.display()
         ))
     })?;
+    if recorded.recipients.contains_key(&0) {
+        return Err(KeepError::invalid_input(format!(
+            "duress recipients file {} holds share index 0",
+            path.display()
+        )));
+    }
     if recorded.group != group {
         return Err(KeepError::invalid_input(format!(
             "duress recipients file {} belongs to another group",
@@ -1052,5 +1073,24 @@ mod tests {
         .unwrap();
         let path = dir.path().join("duress.recipients");
         assert!(read_recipients(&path, &[3u8; 32]).is_err());
+    }
+
+    #[test]
+    fn oversized_or_index_zero_recipients_are_refused() {
+        let dir = secure_state_tempdir();
+        let path = dir.path().join("duress.recipients");
+        let group = [3u8; 32];
+        let zero = DuressRecipients {
+            group: hex::encode(group),
+            recipients: [(0u16, Keys::generate().public_key().to_hex())]
+                .into_iter()
+                .collect(),
+        };
+        std::fs::write(&path, serde_json::to_vec(&zero).unwrap()).unwrap();
+        assert!(read_recipients(&path, &group).is_err());
+
+        std::fs::write(&path, vec![b' '; MAX_RECIPIENTS_FILE_BYTES as usize + 1]).unwrap();
+        let err = read_recipients(&path, &group).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
     }
 }

@@ -102,7 +102,10 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -417,7 +420,10 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .map(|p| p.share_index)
                 .filter(|idx| *idx != our_index && expected_contributors.contains(idx))
                 .collect()
@@ -472,7 +478,10 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .map(|p| p.pubkey)
                 .collect()
         };
@@ -813,7 +822,10 @@ impl KfpNode {
             peers
                 .get_online_peers()
                 .iter()
-                .filter(|p| self.can_send_to(&p.pubkey) && self.can_receive_from(&p.pubkey))
+                .filter(|p| {
+                    self.can_send_to_index(p.share_index)
+                        && self.can_receive_from_index(p.share_index)
+                })
                 .map(|p| p.pubkey)
                 .collect()
         };

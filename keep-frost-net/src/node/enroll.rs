@@ -100,7 +100,7 @@ impl KfpNode {
                         "OPRF enrollment target share {target_index} not announced"
                     ))
                 })?;
-                if !self.can_send_to(&peer.pubkey) {
+                if !self.can_send_to_index(peer.share_index) {
                     return Err(FrostNetError::PolicyViolation(format!(
                         "Policy denies sending OPRF enrollment to share {target_index}"
                     )));

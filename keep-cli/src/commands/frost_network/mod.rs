@@ -107,21 +107,34 @@ pub fn cmd_frost_network_serve(
     // on a partial or malformed config) so a misconfiguration surfaces BEFORE the
     // operator is prompted for a password, never after. Both flags must be set
     // together (clap also enforces this).
+    // The beacon is gift-wrapped to the other members' transport keys, which
+    // derive from their shares, so a coerced holder (who never unlocks) needs
+    // them recorded by earlier genuine starts. Read them here, before the
+    // password prompt, so a missing flag, corrupt file or empty list never
+    // surfaces only after the operator has typed the duress word.
+    let recorded_recipients = match duress_recipients_file {
+        Some(p) => Some(duress::read_recipients(
+            p,
+            &keep_core::keys::npub_to_bytes(group_npub)?,
+        )?),
+        None => None,
+    };
     let duress_cfg = match (duress_beacon_pubkey, duress_beacon_salt) {
         (Some(npub), Some(salt_hex)) => {
-            // The beacon is gift-wrapped to the other members' transport keys,
-            // which derive from their shares, so a coerced holder (who never
-            // unlocks) needs them recorded. Read them here, before the password
-            // prompt, so a missing flag or corrupt file never surfaces only after
-            // the operator has typed the duress word.
-            let recipients_file = duress_recipients_file.ok_or_else(|| {
+            let recipients = recorded_recipients.clone().ok_or_else(|| {
                 KeepError::invalid_input(
                     "--duress-recipients-file is required with --duress-beacon-pubkey/--duress-beacon-salt",
                 )
             })?;
+            // An empty list would let a duress start alert no one (fail-open).
+            if recipients.is_empty() {
+                return Err(KeepError::invalid_input(
+                    "no duress beacon recipients are recorded yet; serve with \
+                     --duress-recipients-file and without the beacon flags until the other \
+                     members have announced",
+                ));
+            }
             let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
-            let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
-            let recipients = duress::read_recipients(recipients_file, &group_pubkey)?;
             Some((pubkey, salt, recipients))
         }
         (None, None) => None,
@@ -160,7 +173,6 @@ pub fn cmd_frost_network_serve(
     // resident. To keep a coerced start wall-clock- and screen-indistinguishable
     // from a genuine one, mirror the normal path's "Unlocking vault..." spinner
     // and spend an equal-cost KDF (the vault's own params) before diverging.
-    let recipients_on_unlock = duress_cfg.as_ref().map(|(_, _, r)| r.len());
     if let Some((beacon_pubkey, salt, recipients)) = duress_cfg {
         if let Some(beacon) = duress::match_duress(password.expose_secret(), &salt, &beacon_pubkey)?
         {
@@ -226,9 +238,7 @@ pub fn cmd_frost_network_serve(
     let oprf_seal_path = oprf_share_file.map(|p| p.to_path_buf());
     // Owned so the async event loop can move the persister closure that writes it.
     let duress_state_path = duress_state_file.map(|p| p.to_path_buf());
-    let duress_recipients_path = recipients_on_unlock
-        .and(duress_recipients_file)
-        .map(|p| p.to_path_buf());
+    let duress_recipients_path = duress_recipients_file.map(|p| p.to_path_buf());
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -278,18 +288,12 @@ pub fn cmd_frost_network_serve(
                 "FROZEN (persisted; co-signing + OPRF refused until operator clear)",
             );
         }
-        if let Some(recorded) = recipients_on_unlock {
-            let others = usize::from(total_shares.saturating_sub(1));
-            out.field(
-                "Duress recipients",
-                &format!("{recorded} of {others} recorded"),
+        if let Some(recorded) = &recorded_recipients {
+            debug!(
+                recorded = recorded.len(),
+                others = total_shares.saturating_sub(1),
+                "duress beacon recipients recorded"
             );
-            if recorded < others {
-                out.warn(
-                    "a duress beacon reaches only the members recorded so far; each member is \
-                     recorded the first time this node sees its announce",
-                );
-            }
         }
         if refuse_raw_sign || require_structured_sign || oprf_auto_approve {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
@@ -360,13 +364,16 @@ pub fn cmd_frost_network_serve(
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
                         tracing::info!(share_index, name = name_str, "peer discovered");
-                        if let Some(path) = &event_recipients_path {
-                            if let Err(e) = duress::record_recipients(
-                                path,
-                                &group_pubkey,
-                                &event_node.bound_peer_transport_keys(),
-                            ) {
-                                error!(error = %e, path = %path.display(), "failed to record duress recipients");
+                        if let Some(path) = event_recipients_path.clone() {
+                            let peers = event_node.bound_peer_transport_keys();
+                            let recorded = tokio::task::spawn_blocking(move || {
+                                duress::record_recipients(&path, &group_pubkey, &peers)
+                            })
+                            .await;
+                            match recorded {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(e)) => error!(error = %e, "failed to record duress recipients"),
+                                Err(e) => error!(error = %e, "duress recipients task failed"),
                             }
                         }
                     }
@@ -2115,5 +2122,46 @@ mod tests {
         while !abort_handle.is_finished() {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[test]
+    fn duress_emit_without_recorded_recipients_is_refused_before_unlock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let group = keep_core::keys::bytes_to_npub(&[7u8; 32]);
+        let beacon = Keys::generate().public_key().to_bech32().unwrap();
+        let salt = "00".repeat(32);
+        let recipients = dir.path().join("duress.recipients");
+        let serve = |recipients: Option<&Path>| {
+            cmd_frost_network_serve(
+                &Output::new(),
+                &dir.path().join("no-vault"),
+                &group,
+                "wss://relay.example",
+                None,
+                false,
+                false,
+                false,
+                None,
+                true,
+                None,
+                None,
+                false,
+                None,
+                Some(&beacon),
+                Some(&salt),
+                &[],
+                None,
+                recipients,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(serve(None).contains("--duress-recipients-file is required"));
+        assert!(serve(Some(&recipients)).contains("no duress beacon recipients are recorded"));
     }
 }
