@@ -35,9 +35,11 @@ const MAX_TRACKED_AUTHORS: usize = 4096;
 /// so members that announce just after forgers when learning starts can still
 /// displace them; later identities cannot displace earlier ones.
 const AGE_SLACK: Duration = Duration::from_secs(20);
-/// An established author's announce may search once per this interval even
-/// when the shared search budget is spent, so a flood cannot starve members.
+/// An established author holding a candidate may search once per this
+/// interval even when the shared search budget is spent, so a flood cannot
+/// starve members; such searches run at most once per `EXEMPT_SEARCH_SPACING`.
 const AUTHOR_SEARCH_INTERVAL: Duration = Duration::from_secs(20);
+const EXEMPT_SEARCH_SPACING: Duration = Duration::from_secs(1);
 
 /// Per author: first and last announce, and its last budget-exempt search.
 type AuthorSeen = (Instant, Instant, Option<Instant>);
@@ -98,6 +100,11 @@ pub(crate) struct LearnedVerifyingShares {
     complete: Option<BTreeMap<u16, [u8; 33]>>,
     last_reciprocal: Option<Instant>,
     search_budget: Option<(u32, Instant)>,
+    last_exempt_search: Option<Instant>,
+    /// Per index, the last time an established newcomer displaced a candidate
+    /// regardless of age; limited so forgers cannot churn a member out faster
+    /// than it re-announces.
+    forced_evictions: BTreeMap<u16, Instant>,
     dirty: bool,
     mismatch_reported: bool,
 }
@@ -144,10 +151,13 @@ impl LearnedVerifyingShares {
         }
         self.authors
             .retain(|_, (_, last, _)| now.saturating_duration_since(*last) < CANDIDATE_TTL);
+        // A full table only makes room by dropping authors that are not
+        // established, so a flood of new keys cannot reset members' history.
         if !self.authors.contains_key(&author) && self.authors.len() >= MAX_TRACKED_AUTHORS {
             if let Some(oldest) = self
                 .authors
                 .iter()
+                .filter(|(a, _)| !established(&self.authors, a))
                 .min_by_key(|(_, (_, last, _))| *last)
                 .map(|(a, _)| *a)
             {
@@ -155,9 +165,14 @@ impl LearnedVerifyingShares {
             }
         }
         let was_established = established(&self.authors, &author);
-        let author_since = self.authors.entry(author).or_insert((now, now, None));
-        author_since.1 = now;
-        let author_first = author_since.0;
+        let author_first =
+            if self.authors.contains_key(&author) || self.authors.len() < MAX_TRACKED_AUTHORS {
+                let author_since = self.authors.entry(author).or_insert((now, now, None));
+                author_since.1 = now;
+                author_since.0
+            } else {
+                now
+            };
         let newcomer_established = established(&self.authors, &author);
         // A newly established author changes which candidates can be evicted
         // and whether a failed search means this share is stale, so recheck.
@@ -167,6 +182,8 @@ impl LearnedVerifyingShares {
             .then(|| payload.clone());
         let capacity = capacity(share.metadata.threshold, share.metadata.total_shares);
         let authors = &self.authors;
+        let forced = self.forced_evictions.get(&index).copied();
+        let mut forced_now = false;
         let list = self.candidates.entry(index).or_default();
         let mut new_author = false;
         let mut changed = false;
@@ -182,7 +199,7 @@ impl LearnedVerifyingShares {
         } else {
             let mut room = list.len() < capacity;
             if !room {
-                let replaceable: Vec<usize> = list
+                let mut replaceable: Vec<usize> = list
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| {
@@ -192,6 +209,16 @@ impl LearnedVerifyingShares {
                     })
                     .map(|(k, _)| k)
                     .collect();
+                // An established newcomer may displace any candidate, once per
+                // index per `ESTABLISHED_AFTER`, so a member that arrives after
+                // long-lived forgers still gets in.
+                if replaceable.is_empty()
+                    && newcomer_established
+                    && forced.is_none_or(|t| now.saturating_duration_since(t) >= ESTABLISHED_AFTER)
+                {
+                    replaceable = (0..list.len()).collect();
+                    forced_now = true;
+                }
                 if !replaceable.is_empty() {
                     let evicted = replaceable[::rand::rng().random_range(0..replaceable.len())];
                     list.swap_remove(evicted);
@@ -211,6 +238,12 @@ impl LearnedVerifyingShares {
             }
         }
         list.sort_by_key(|c| c.first_seen);
+        let holds_slot = list.iter().any(|c| {
+            c.author == author && now.saturating_duration_since(c.first_seen) >= ESTABLISHED_AFTER
+        });
+        if forced_now && new_author {
+            self.forced_evictions.insert(index, now);
+        }
 
         let reciprocate = new_author
             && self
@@ -229,7 +262,8 @@ impl LearnedVerifyingShares {
             .iter()
             .any(|i| self.candidates.get(i).is_none_or(|l| l.is_empty()))
             || !self.dirty
-            || !(self.take_search_budget(now) || self.take_author_search(author, now))
+            || !(self.take_search_budget(now)
+                || (holds_slot && !changed && self.take_author_search(author, now)))
         {
             return Learning::Pending { reciprocate };
         }
@@ -274,10 +308,14 @@ impl LearnedVerifyingShares {
         };
         if last.saturating_duration_since(*first) < ESTABLISHED_AFTER
             || exempt.is_some_and(|t| now.saturating_duration_since(t) < AUTHOR_SEARCH_INTERVAL)
+            || self
+                .last_exempt_search
+                .is_some_and(|t| now.saturating_duration_since(t) < EXEMPT_SEARCH_SPACING)
         {
             return false;
         }
         *exempt = Some(now);
+        self.last_exempt_search = Some(now);
         true
     }
 
@@ -701,16 +739,96 @@ mod tests {
                 }
                 if second % 20 == 0 {
                     for (&index, &member) in &members {
-                        if let Learning::Completed { set, .. } =
-                            record(&mut learned, &g, member, index, g.real[&index], now)
-                        {
-                            completed = Some(set);
-                            break 'run;
-                        }
+                        record(&mut learned, &g, member, index, g.real[&index], now);
                     }
+                }
+                // Whichever announce triggers the successful search completes it.
+                if let Some(set) = learned.complete() {
+                    completed = Some(set.clone());
+                    break 'run;
                 }
             }
             assert_eq!(completed, Some(g.real.clone()), "{threshold}-of-{total}");
         }
+    }
+
+    #[test]
+    fn a_member_arriving_after_long_lived_forgers_gets_in() {
+        let g = group_of(7, 9);
+        let cap = capacity(7, 9);
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        let forgers: Vec<(u16, PublicKey, [u8; 33])> = (2..=9u16)
+            .flat_map(|i| (0..cap).map(move |_| (i, Keys::generate().public_key(), forged_point())))
+            .collect();
+        let members: BTreeMap<u16, PublicKey> = (2..=9)
+            .map(|i| (i, Keys::generate().public_key()))
+            .collect();
+        let mut completed = None;
+        'run: for second in (0..1800u64).step_by(5) {
+            let now = start + Duration::from_secs(second);
+            if second % 30 == 0 {
+                for (index, forger, point) in &forgers {
+                    record(&mut learned, &g, *forger, *index, *point, now);
+                }
+            }
+            // Members only come online a minute in, then announce every 20 s.
+            if second >= 60 && second % 20 == 0 {
+                for (&index, &member) in &members {
+                    if let Learning::Completed { set, .. } =
+                        record(&mut learned, &g, member, index, g.real[&index], now)
+                    {
+                        completed = Some(set);
+                        break 'run;
+                    }
+                }
+            }
+        }
+        assert_eq!(completed, Some(g.real.clone()));
+    }
+
+    #[test]
+    fn a_full_author_table_keeps_established_members() {
+        let g = group();
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        let member = Keys::generate().public_key();
+        record(&mut learned, &g, member, 2, g.real[&2], start);
+        let later = start + ESTABLISHED_AFTER;
+        record(&mut learned, &g, member, 2, g.real[&2], later);
+        assert!(established(&learned.authors, &member));
+        for _ in 0..(MAX_TRACKED_AUTHORS + 100) {
+            record(
+                &mut learned,
+                &g,
+                Keys::generate().public_key(),
+                3,
+                forged_point(),
+                later,
+            );
+        }
+        assert!(learned.authors.len() <= MAX_TRACKED_AUTHORS);
+        assert!(established(&learned.authors, &member));
+    }
+
+    #[test]
+    fn exempt_searches_need_an_unchanged_held_point_and_are_spaced() {
+        let g = group();
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        let authors: Vec<PublicKey> = (0..4).map(|_| Keys::generate().public_key()).collect();
+        for now in [start, start + ESTABLISHED_AFTER] {
+            for (i, author) in (2..=5u16).zip(&authors) {
+                record(&mut learned, &g, *author, i, forged_point(), now);
+            }
+        }
+        let now = start + ESTABLISHED_AFTER + SEARCH_INTERVAL;
+        assert!(learned.take_author_search(authors[0], now));
+        assert!(
+            !learned.take_author_search(authors[1], now),
+            "spaced globally"
+        );
+        assert!(!learned.take_author_search(authors[0], now + EXEMPT_SEARCH_SPACING));
+        assert!(learned.take_author_search(authors[1], now + EXEMPT_SEARCH_SPACING));
     }
 }

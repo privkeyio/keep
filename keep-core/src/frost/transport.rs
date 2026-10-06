@@ -22,7 +22,8 @@ const PUBKEY_PACKAGE_AAD: &[u8] = b"keep-share-pubkey-package";
 /// Domain of the AEAD associated data for the compact verifying-share list.
 const VERIFYING_SHARES_AAD: &[u8] = b"keep-share-verifying-shares";
 
-/// First byte of the binary bech32 payload; a JSON payload starts with `{`.
+/// First byte of the binary bech32 payload; a JSON payload starts with an
+/// opening brace instead.
 const COMPACT_VERSION: u8 = 2;
 
 /// Size of one compressed secp256k1 verifying share.
@@ -1253,7 +1254,7 @@ mod tests {
             .unwrap()
             .to_text()
             .unwrap();
-        assert!(text.starts_with('{'));
+        assert!(text.starts_with("{"));
         let imported = ShareExport::parse(&text)
             .unwrap()
             .to_share("pass", "imported")
