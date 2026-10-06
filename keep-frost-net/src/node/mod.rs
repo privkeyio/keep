@@ -1931,9 +1931,11 @@ impl KfpNode {
             .as_slice()
             .try_into()
             .map_err(|_| FrostNetError::Crypto("Invalid verifying share length".into()))?;
+        let context = keep_core::frost::VerifyingSetContext::new(&self.share)?;
         let mut learned = self.learned_verifying_shares.write();
         match learned.record(
             &self.share,
+            &context,
             own_share,
             *pubkey,
             payload,

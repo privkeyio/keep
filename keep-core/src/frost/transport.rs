@@ -502,7 +502,9 @@ fn check_metadata_matches(
 
 /// Every member in the recovered package must be one of indices 1..=total,
 /// and a package holding more than this share's own entry must hold all of
-/// them, so a `total` edited in the export cannot pass.
+/// them, so a `total` edited in the export cannot pass. An export from before
+/// the verifying-share list carries no authenticated `total`; its share learns
+/// the set from the members' announces, which a wrong `total` only stalls.
 fn check_member_indices(
     package: &frost_secp256k1_tr::keys::PublicKeyPackage,
     total: u16,

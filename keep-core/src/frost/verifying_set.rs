@@ -82,49 +82,90 @@ pub fn complete_verifying_shares(
     ))
 }
 
-/// The verifying shares of every member of `share`'s group that `basis`
-/// determines: `basis` holds threshold - 2 other members' verifying shares,
-/// which with the group key and `share`'s own fix the polynomial. Indices in
-/// `basis` and `share`'s own are not returned.
-pub fn predict_verifying_shares(
-    share: &SharePackage,
-    basis: &BTreeMap<u16, [u8; 33]>,
-) -> Result<BTreeMap<u16, [u8; 33]>> {
-    let invalid = |why: &str| KeepError::Frost(format!("Cannot predict verifying shares: {why}"));
-    let key_package = share.key_package()?;
-    let threshold = *key_package.min_signers();
-    let own = share.metadata.identifier;
-    if threshold < 2 || basis.len() + 2 != usize::from(threshold) || basis.contains_key(&own) {
-        return Err(invalid("the basis must hold threshold - 2 other members"));
+/// What predicting other members' verifying shares needs from a share,
+/// detached from it.
+#[derive(Clone)]
+pub struct VerifyingSetContext {
+    group: ProjectivePoint,
+    own: (Scalar, ProjectivePoint),
+    own_index: u16,
+    threshold: u16,
+    total: u16,
+}
+
+/// How member `target`'s verifying share follows from a fixed set of basis
+/// members: the share is `constant + sum(weights[k] * basis[k])`.
+pub struct Prediction {
+    /// The group key's and this share's own contribution.
+    pub constant: ProjectivePoint,
+    /// One weight per basis member, in the order the basis was given.
+    pub weights: Vec<Scalar>,
+}
+
+impl VerifyingSetContext {
+    /// Captures what predictions need from `share`.
+    pub fn new(share: &SharePackage) -> Result<Self> {
+        let key_package = share.key_package()?;
+        Ok(Self {
+            group: key_package.verifying_key().to_element(),
+            own: (
+                x(share.metadata.identifier),
+                key_package.verifying_share().to_element(),
+            ),
+            own_index: share.metadata.identifier,
+            threshold: *key_package.min_signers(),
+            total: share.metadata.total_shares,
+        })
     }
-    let mut points: Vec<(Scalar, ProjectivePoint)> = vec![
-        (Scalar::ZERO, key_package.verifying_key().to_element()),
-        (x(own), key_package.verifying_share().to_element()),
-    ];
-    for (&index, bytes) in basis {
-        if index == 0 || index > share.metadata.total_shares {
-            return Err(invalid("index out of range"));
+
+    /// The share's threshold.
+    pub fn threshold(&self) -> u16 {
+        self.threshold
+    }
+
+    /// How member `target`'s verifying share follows from `basis_indices`:
+    /// threshold - 2 other members which, with the group key and this share's
+    /// own, fix the polynomial. `None` if the basis is unusable.
+    pub fn prediction(&self, basis_indices: &[u16], target: u16) -> Option<Prediction> {
+        if self.threshold < 2
+            || basis_indices.len() + 2 != usize::from(self.threshold)
+            || target == 0
+            || target > self.total
+            || target == self.own_index
+            || basis_indices.contains(&target)
+        {
+            return None;
         }
-        let vs = VerifyingShare::deserialize(bytes).map_err(|_| invalid("bad point"))?;
-        points.push((x(index), vs.to_element()));
-    }
-    let mut predicted = BTreeMap::new();
-    for index in 1..=share.metadata.total_shares {
-        if index == own || basis.contains_key(&index) {
-            continue;
+        let mut xs = vec![Scalar::ZERO, self.own.0];
+        for &i in basis_indices {
+            if i == 0 || i > self.total || i == self.own_index {
+                return None;
+            }
+            xs.push(x(i));
         }
-        let point = VerifyingShare::new(interpolate(&points, x(index))?)
-            .serialize()
-            .map_err(|_| invalid("bad point"))?;
-        predicted.insert(
-            index,
-            point
-                .as_slice()
-                .try_into()
-                .map_err(|_| invalid("bad point"))?,
-        );
+        let at = x(target);
+        let mut weights = Vec::with_capacity(xs.len());
+        for (k, xk) in xs.iter().enumerate() {
+            let mut num = Scalar::ONE;
+            let mut den = Scalar::ONE;
+            for (m, xm) in xs.iter().enumerate() {
+                if m != k {
+                    num *= at - xm;
+                    den *= *xk - xm;
+                }
+            }
+            weights.push(num * Option::<Scalar>::from(den.invert())?);
+        }
+        Some(Prediction {
+            constant: self.group * weights[0] + self.own.1 * weights[1],
+            weights: weights.split_off(2),
+        })
     }
-    Ok(predicted)
+}
+
+/// A verifying share as a curve point.
+pub fn verifying_share_point(bytes: &[u8; 33]) -> Option<ProjectivePoint> {
+    Some(VerifyingShare::deserialize(bytes).ok()?.to_element())
 }
 
 /// Every member's verifying share in `package` by index, for indices 1..=total.
@@ -264,16 +305,26 @@ mod tests {
     fn predictions_from_real_members_match_the_set() {
         for shares in groups() {
             let set = full_set(&shares[0]);
-            let threshold = shares[0].metadata.threshold;
-            let basis: BTreeMap<u16, [u8; 33]> = set
-                .iter()
-                .filter(|(i, _)| **i != 1)
-                .take(usize::from(threshold) - 2)
-                .map(|(i, v)| (*i, *v))
+            let context = VerifyingSetContext::new(&shares[0]).unwrap();
+            let threshold = usize::from(shares[0].metadata.threshold);
+            let basis: Vec<u16> = set
+                .keys()
+                .copied()
+                .filter(|i| *i != 1)
+                .take(threshold - 2)
                 .collect();
-            let predicted = predict_verifying_shares(&shares[0], &basis).unwrap();
-            for (index, point) in predicted {
-                assert_eq!(set[&index], point);
+            for (index, point) in &set {
+                if *index == 1 || basis.contains(index) {
+                    continue;
+                }
+                let prediction = context.prediction(&basis, *index).unwrap();
+                let predicted = basis
+                    .iter()
+                    .zip(&prediction.weights)
+                    .fold(prediction.constant, |acc, (i, w)| {
+                        acc + verifying_share_point(&set[i]).unwrap() * w
+                    });
+                assert_eq!(Some(predicted), verifying_share_point(point));
             }
         }
     }

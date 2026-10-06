@@ -28,6 +28,6 @@ pub use share::{Ciphersuite, ShareMetadata, SharePackage, StoredShare};
 pub use signing::{sign_with_local_shares, SessionState, SigningSession};
 pub use transport::{FrostMessage, FrostMessageType, ShareExport};
 pub use verifying_set::{
-    complete_verifying_shares, completed_pubkey_package, predict_verifying_shares,
-    verifying_share_map,
+    complete_verifying_shares, completed_pubkey_package, verifying_share_map,
+    verifying_share_point, Prediction, VerifyingSetContext,
 };

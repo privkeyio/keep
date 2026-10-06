@@ -7,43 +7,58 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use keep_core::frost::{complete_verifying_shares, predict_verifying_shares, SharePackage};
+use ::rand::RngExt;
+use k256::ProjectivePoint;
+use keep_core::frost::{
+    complete_verifying_shares, verifying_share_point, SharePackage, VerifyingSetContext,
+};
 use nostr_sdk::prelude::PublicKey;
 
 use crate::protocol::AnnouncePayload;
 
 /// Most proven points kept per member index. Anyone can prove a point they
-/// made up, so each index keeps several, oldest first, and the search picks the
-/// ones that fit; a later forger cannot push out a member already recorded.
+/// made up, so each index keeps several; when full, a newcomer replaces a
+/// random one, so a member that keeps announcing gets back in.
 const MAX_CANDIDATES: usize = 64;
-/// A candidate whose author stops announcing is dropped after this long, so a
-/// forger has to keep announcing to hold a slot.
+/// Most proven points kept across all indices.
+const MAX_TOTAL_CANDIDATES: usize = 512;
+/// Announces larger than this are not kept for replay; their member is
+/// admitted at its next announce instead.
+const MAX_HELD_PAYLOAD: usize = 4096;
+/// A candidate whose author stops announcing is dropped after this long.
 const CANDIDATE_TTL: Duration = Duration::from_secs(90);
-/// Upper bound on basis combinations tried per check; with a threshold above
-/// 3 it lowers the per-index capacity so the search stays within it.
-const MAX_COMBINATIONS: usize = 4096;
-
-/// Candidates kept per index for `threshold`: the search enumerates the
-/// candidates of threshold - 2 indices, so their product stays bounded.
-fn capacity(threshold: u16) -> usize {
-    if threshold <= 3 {
-        return MAX_CANDIDATES;
-    }
-    let per_index = (MAX_COMBINATIONS as f64).powf(1.0 / f64::from(threshold - 2));
-    (per_index.floor() as usize).clamp(2, MAX_CANDIDATES)
-}
+/// Most basis combinations a search can try; per-index capacity keeps every
+/// search within it.
+const MAX_COMBINATIONS: usize = 1024;
 /// Minimum spacing of the announces this node sends in reply while learning.
 const RECIPROCAL_INTERVAL: Duration = Duration::from_secs(20);
-/// Set searches allowed in a burst, then one per `SEARCH_INTERVAL`, so a flood
-/// of forged announces costs the node a bounded amount of work; changes made
+/// Searches allowed in a burst, then one per `SEARCH_INTERVAL`; changes made
 /// while out of budget are searched on the next announce once it refills.
 const SEARCH_BURST: u32 = 8;
 const SEARCH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Candidates kept per index: the search enumerates the candidates of
+/// threshold - 2 indices, so their product must stay within
+/// `MAX_COMBINATIONS`, and all indices together within `MAX_TOTAL_CANDIDATES`.
+fn capacity(threshold: u16, total: u16) -> usize {
+    let basis = u32::from(threshold.saturating_sub(2));
+    let mut per_index = MAX_CANDIDATES;
+    while per_index > 1
+        && per_index
+            .checked_pow(basis)
+            .is_none_or(|c| c > MAX_COMBINATIONS)
+    {
+        per_index -= 1;
+    }
+    let others = usize::from(total.saturating_sub(1)).max(1);
+    per_index.min((MAX_TOTAL_CANDIDATES / others).max(1))
+}
+
 struct Candidate {
     author: PublicKey,
     point: [u8; 33],
-    payload: AnnouncePayload,
+    element: ProjectivePoint,
+    payload: Option<AnnouncePayload>,
     first_seen: Instant,
     last_seen: Instant,
 }
@@ -62,7 +77,7 @@ pub(crate) enum Learning {
     /// The set is not complete yet; `reciprocate` asks the node to announce so
     /// members that have not seen it yet can admit it.
     Pending { reciprocate: bool },
-    /// The set was just completed. `held` are the other members' announces to
+    /// The set was just completed. `held` are other members' announces to
     /// admit now.
     Completed {
         set: BTreeMap<u16, [u8; 33]>,
@@ -82,6 +97,7 @@ impl LearnedVerifyingShares {
     pub(crate) fn record(
         &mut self,
         share: &SharePackage,
+        context: &VerifyingSetContext,
         own_share: [u8; 33],
         author: PublicKey,
         payload: &AnnouncePayload,
@@ -90,35 +106,43 @@ impl LearnedVerifyingShares {
         if self.complete.is_some() {
             return Learning::Known;
         }
+        let Some(element) = verifying_share_point(&payload.verifying_share) else {
+            return Learning::Pending { reciprocate: false };
+        };
         let index = payload.share_index;
         for list in self.candidates.values_mut() {
             list.retain(|c| now.saturating_duration_since(c.last_seen) < CANDIDATE_TTL);
         }
+        let held_payload = (serde_json::to_vec(payload).map_or(usize::MAX, |b| b.len())
+            <= MAX_HELD_PAYLOAD)
+            .then(|| payload.clone());
+        let capacity = capacity(share.metadata.threshold, share.metadata.total_shares);
         let list = self.candidates.entry(index).or_default();
         let mut new_author = false;
         let mut changed = false;
-        let room = list.len() < capacity(share.metadata.threshold);
-        match list.iter_mut().find(|c| c.author == author) {
-            Some(existing) => {
-                if existing.point != payload.verifying_share {
-                    changed = true;
-                    existing.point = payload.verifying_share;
-                    existing.first_seen = now;
-                }
-                existing.payload = payload.clone();
-                existing.last_seen = now;
+        if let Some(existing) = list.iter_mut().find(|c| c.author == author) {
+            if existing.point != payload.verifying_share {
+                existing.point = payload.verifying_share;
+                existing.element = element;
+                existing.first_seen = now;
+                changed = true;
             }
-            None if room => {
-                new_author = true;
-                list.push(Candidate {
-                    author,
-                    point: payload.verifying_share,
-                    payload: payload.clone(),
-                    first_seen: now,
-                    last_seen: now,
-                });
+            existing.payload = held_payload;
+            existing.last_seen = now;
+        } else {
+            if list.len() >= capacity {
+                let evicted = ::rand::rng().random_range(0..list.len());
+                list.swap_remove(evicted);
             }
-            None => {}
+            new_author = true;
+            list.push(Candidate {
+                author,
+                point: payload.verifying_share,
+                element,
+                payload: held_payload,
+                first_seen: now,
+                last_seen: now,
+            });
         }
         list.sort_by_key(|c| c.first_seen);
 
@@ -134,47 +158,43 @@ impl LearnedVerifyingShares {
         let others: Vec<u16> = (1..=share.metadata.total_shares)
             .filter(|&i| i != own)
             .collect();
+        self.dirty |= new_author || changed;
         if others
             .iter()
             .any(|i| self.candidates.get(i).is_none_or(|l| l.is_empty()))
+            || !self.dirty
+            || !self.take_search_budget(now)
         {
             return Learning::Pending { reciprocate };
         }
+        self.dirty = false;
 
-        self.dirty |= new_author || changed;
-        if !self.dirty || !self.take_search_budget(now) {
+        let Some(picks) = self.search(context, &others) else {
+            if !self.mismatch_reported {
+                self.mismatch_reported = true;
+                tracing::warn!(
+                    "Every member has announced but no combination of their verifying shares fits this share; if this share was refreshed, import the refreshed share"
+                );
+            }
+            return Learning::Pending { reciprocate };
+        };
+        let mut set: BTreeMap<u16, [u8; 33]> = picks
+            .iter()
+            .map(|(&i, &k)| (i, self.candidates[&i][k].point))
+            .collect();
+        set.insert(own, own_share);
+        if complete_verifying_shares(share, &set).is_err() {
             return Learning::Pending { reciprocate };
         }
-        self.dirty = false;
-        match self.search(share, own_share, &others) {
-            Some(picks) => {
-                let mut set: BTreeMap<u16, [u8; 33]> = picks
-                    .iter()
-                    .map(|(&i, &k)| (i, self.candidates[&i][k].point))
-                    .collect();
-                set.insert(own, own_share);
-                let held = picks
-                    .iter()
-                    .filter(|(&i, _)| i != index)
-                    .map(|(&i, &k)| {
-                        let c = &self.candidates[&i][k];
-                        (c.author, c.payload.clone())
-                    })
-                    .collect();
-                self.candidates.clear();
-                self.complete = Some(set.clone());
-                Learning::Completed { set, held }
-            }
-            None => {
-                if !self.mismatch_reported {
-                    self.mismatch_reported = true;
-                    tracing::warn!(
-                        "Every member has announced but no combination of their verifying shares fits this share; if this share was refreshed, import the refreshed share"
-                    );
-                }
-                Learning::Pending { reciprocate }
-            }
-        }
+        let held = picks
+            .iter()
+            .map(|(&i, &k)| (i, &self.candidates[&i][k]))
+            .filter(|(i, c)| !(*i == index && c.author == author))
+            .filter_map(|(_, c)| c.payload.clone().map(|p| (c.author, p)))
+            .collect();
+        self.candidates.clear();
+        self.complete = Some(set.clone());
+        Learning::Completed { set, held }
     }
 
     fn take_search_budget(&mut self, now: Instant) -> bool {
@@ -193,35 +213,59 @@ impl LearnedVerifyingShares {
         true
     }
 
-    /// The candidate position chosen for each index in `others` such that the
-    /// set passes [`complete_verifying_shares`]. Enumerates the candidates of
-    /// the threshold - 2 indices with the fewest, predicts every other member's
-    /// point from them, and looks each prediction up among its candidates.
+    /// The candidate position chosen for each index in `others`. Enumerates
+    /// the candidates of the threshold - 2 indices with the fewest; for each
+    /// combination, predicts the other members' points one at a time (weighted
+    /// basis points are computed once per target) and stops at the first
+    /// prediction no candidate matches.
     fn search(
         &self,
-        share: &SharePackage,
-        own_share: [u8; 33],
+        context: &VerifyingSetContext,
         others: &[u16],
     ) -> Option<BTreeMap<u16, usize>> {
-        let basis_len = usize::from(share.metadata.threshold).checked_sub(2)?;
+        let basis_len = usize::from(context.threshold()).checked_sub(2)?;
         let mut by_count = others.to_vec();
         by_count.sort_by_key(|i| self.candidates[i].len());
-        let basis_indices = &by_count[..basis_len];
-        let radix: Vec<usize> = basis_indices
-            .iter()
-            .map(|i| self.candidates[i].len())
-            .collect();
+        let (basis, targets) = by_count.split_at(basis_len);
+        let radix: Vec<usize> = basis.iter().map(|i| self.candidates[i].len()).collect();
+        if radix.iter().product::<usize>() > MAX_COMBINATIONS {
+            return None;
+        }
+
+        // Per target: its constant and, per basis index, each candidate's
+        // weighted point; built on first use.
+        let mut weighted: Vec<Option<(ProjectivePoint, Vec<Vec<ProjectivePoint>>)>> =
+            vec![None; targets.len()];
         let mut digits = vec![0usize; basis_len];
-        for _ in 0..MAX_COMBINATIONS {
-            let basis: BTreeMap<u16, [u8; 33]> = basis_indices
-                .iter()
-                .zip(&digits)
-                .map(|(&i, &k)| (i, self.candidates[&i][k].point))
-                .collect();
-            if let Some(picks) =
-                self.match_prediction(share, own_share, &basis, basis_indices, &digits)
-            {
-                return Some(picks);
+        loop {
+            let mut picks = Vec::with_capacity(targets.len());
+            for (t, &target) in targets.iter().enumerate() {
+                if weighted[t].is_none() {
+                    let prediction = context.prediction(basis, target)?;
+                    let per_basis = basis
+                        .iter()
+                        .zip(&prediction.weights)
+                        .map(|(i, w)| self.candidates[i].iter().map(|c| c.element * w).collect())
+                        .collect();
+                    weighted[t] = Some((prediction.constant, per_basis));
+                }
+                let (constant, per_basis) = weighted[t].as_ref()?;
+                let predicted = per_basis
+                    .iter()
+                    .zip(&digits)
+                    .fold(*constant, |acc, (cands, &d)| acc + cands[d]);
+                match self.candidates[&target]
+                    .iter()
+                    .position(|c| c.element == predicted)
+                {
+                    Some(k) => picks.push((target, k)),
+                    None => break,
+                }
+            }
+            if picks.len() == targets.len() {
+                let mut chosen: BTreeMap<u16, usize> = picks.into_iter().collect();
+                chosen.extend(basis.iter().copied().zip(digits.iter().copied()));
+                return Some(chosen);
             }
             let mut d = 0;
             loop {
@@ -236,38 +280,6 @@ impl LearnedVerifyingShares {
                 d += 1;
             }
         }
-        None
-    }
-
-    fn match_prediction(
-        &self,
-        share: &SharePackage,
-        own_share: [u8; 33],
-        basis: &BTreeMap<u16, [u8; 33]>,
-        basis_indices: &[u16],
-        digits: &[usize],
-    ) -> Option<BTreeMap<u16, usize>> {
-        let predicted = predict_verifying_shares(share, basis).ok()?;
-        let mut picks: BTreeMap<u16, usize> = basis_indices
-            .iter()
-            .copied()
-            .zip(digits.iter().copied())
-            .collect();
-        for (index, point) in &predicted {
-            let k = self
-                .candidates
-                .get(index)?
-                .iter()
-                .position(|c| c.point == *point)?;
-            picks.insert(*index, k);
-        }
-        let mut set: BTreeMap<u16, [u8; 33]> = picks
-            .iter()
-            .map(|(&i, &k)| (i, self.candidates[&i][k].point))
-            .collect();
-        set.insert(share.metadata.identifier, own_share);
-        complete_verifying_shares(share, &set).ok()?;
-        Some(picks)
     }
 }
 
@@ -292,18 +304,25 @@ mod tests {
 
     struct Group {
         share: SharePackage,
+        context: VerifyingSetContext,
         real: BTreeMap<u16, [u8; 33]>,
     }
 
-    fn group() -> Group {
-        let (shares, _) = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap())
+    fn group_of(threshold: u16, total: u16) -> Group {
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::new(threshold, total).unwrap())
             .generate("learn")
             .unwrap();
-        let real = verifying_share_map(&shares[0].pubkey_package().unwrap(), 5).unwrap();
+        let real = verifying_share_map(&shares[0].pubkey_package().unwrap(), total).unwrap();
+        let share = shares.into_iter().next().unwrap();
         Group {
-            share: shares.into_iter().next().unwrap(),
+            context: VerifyingSetContext::new(&share).unwrap(),
+            share,
             real,
         }
+    }
+
+    fn group() -> Group {
+        group_of(3, 5)
     }
 
     fn record(
@@ -314,7 +333,14 @@ mod tests {
         point: [u8; 33],
         now: Instant,
     ) -> Learning {
-        learned.record(&g.share, g.real[&1], author, &payload(index, point), now)
+        learned.record(
+            &g.share,
+            &g.context,
+            g.real[&g.share.metadata.identifier],
+            author,
+            &payload(index, point),
+            now,
+        )
     }
 
     #[test]
@@ -346,8 +372,6 @@ mod tests {
                 Learning::Pending { .. }
             ));
         }
-        // The next announce after the search interval finds the set, though
-        // every slot still holds forgeries.
         let later = start + SEARCH_INTERVAL * 5;
         let Learning::Completed { set, held } =
             record(&mut learned, &g, members[&2], 2, g.real[&2], later)
@@ -363,13 +387,53 @@ mod tests {
     }
 
     #[test]
-    fn a_full_slot_keeps_its_oldest_candidates_until_they_expire() {
+    fn full_slots_of_earlier_forgeries_do_not_lock_members_out() {
         let g = group();
+        let cap = capacity(3, 5);
         let mut learned = LearnedVerifyingShares::default();
         let start = Instant::now();
-        let member = Keys::generate().public_key();
-        record(&mut learned, &g, member, 2, g.real[&2], start);
-        for _ in 0..10 {
+        let forgers: Vec<(u16, PublicKey)> = (2..=5u16)
+            .flat_map(|i| (0..cap).map(move |_| (i, Keys::generate().public_key())))
+            .collect();
+        let points: BTreeMap<PublicKey, [u8; 33]> =
+            forgers.iter().map(|(_, a)| (*a, forged_point())).collect();
+        let members: BTreeMap<u16, PublicKey> = (2..=5)
+            .map(|i| (i, Keys::generate().public_key()))
+            .collect();
+        // Forgers fill every slot first and keep re-announcing; members keep
+        // announcing too, every 20 s.
+        let mut completed = None;
+        for round in 0..60u32 {
+            let now = start + Duration::from_secs(u64::from(round) * 20);
+            for (index, forger) in &forgers {
+                record(&mut learned, &g, *forger, *index, points[forger], now);
+            }
+            for (&index, &member) in &members {
+                if let Learning::Completed { set, .. } = record(
+                    &mut learned,
+                    &g,
+                    member,
+                    index,
+                    g.real[&index],
+                    now + SEARCH_INTERVAL * 8,
+                ) {
+                    completed = Some(set);
+                }
+            }
+            if completed.is_some() {
+                break;
+            }
+        }
+        assert_eq!(completed, Some(g.real.clone()));
+    }
+
+    #[test]
+    fn a_full_slot_takes_a_newcomer_and_expires_silent_candidates() {
+        let g = group();
+        let cap = capacity(3, 5);
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        for _ in 0..(cap * 2) {
             record(
                 &mut learned,
                 &g,
@@ -379,8 +443,10 @@ mod tests {
                 start,
             );
         }
+        assert_eq!(learned.candidates[&2].len(), cap);
+        let member = Keys::generate().public_key();
+        record(&mut learned, &g, member, 2, g.real[&2], start);
         assert!(learned.candidates[&2].iter().any(|c| c.author == member));
-        assert_eq!(learned.candidates[&2].len(), 11);
 
         let later = start + CANDIDATE_TTL + Duration::from_secs(1);
         record(&mut learned, &g, member, 2, g.real[&2], later);
@@ -430,56 +496,41 @@ mod tests {
     }
 
     #[test]
-    fn capacity_keeps_the_search_bounded() {
-        for threshold in 2..=20u16 {
-            let per_index = capacity(threshold);
-            assert!(per_index >= 2);
-            let combos = (per_index as f64).powi(i32::from(threshold.saturating_sub(2)));
-            assert!(
-                combos <= MAX_COMBINATIONS as f64 || per_index == 2 || threshold <= 3,
-                "threshold {threshold}"
-            );
+    fn capacity_keeps_every_search_complete() {
+        for total in [3u16, 5, 20, 255] {
+            for threshold in 2..=total.min(40) {
+                let per_index = capacity(threshold, total);
+                assert!(per_index >= 1);
+                let combos = per_index
+                    .checked_pow(u32::from(threshold.saturating_sub(2)))
+                    .unwrap();
+                assert!(combos <= MAX_COMBINATIONS, "{threshold}-of-{total}");
+                assert!(
+                    per_index * usize::from(total - 1)
+                        <= MAX_TOTAL_CANDIDATES.max(usize::from(total - 1))
+                );
+            }
         }
     }
 
     #[test]
-    fn forgeries_recorded_first_do_not_block_the_real_set() {
-        let g = group();
+    fn a_high_threshold_group_learns_its_set() {
+        let g = group_of(16, 18);
         let mut learned = LearnedVerifyingShares::default();
         let now = Instant::now();
-        for index in 2..=5u16 {
-            for _ in 0..(capacity(3) - 1) {
-                record(
-                    &mut learned,
-                    &g,
-                    Keys::generate().public_key(),
-                    index,
-                    forged_point(),
-                    now,
-                );
-            }
-        }
-        for index in 2..5u16 {
-            let outcome = record(
+        let mut outcome = None;
+        for i in 2..=18u16 {
+            outcome = Some(record(
                 &mut learned,
                 &g,
                 Keys::generate().public_key(),
-                index,
-                g.real[&index],
+                i,
+                g.real[&i],
                 now,
-            );
-            assert!(matches!(outcome, Learning::Pending { .. }));
+            ));
         }
-        let outcome = record(
-            &mut learned,
-            &g,
-            Keys::generate().public_key(),
-            5,
-            g.real[&5],
-            now + SEARCH_INTERVAL,
-        );
-        let Learning::Completed { set, .. } = outcome else {
-            panic!("the real set must be found among the forgeries");
+        let Some(Learning::Completed { set, .. }) = outcome else {
+            panic!("a 16-of-18 set must be learned");
         };
         assert_eq!(set, g.real);
     }
@@ -499,9 +550,7 @@ mod tests {
                 now,
             );
         }
-        let mut searched = 0;
         for _ in 0..40 {
-            let before = learned.search_budget.map(|(t, _)| t);
             record(
                 &mut learned,
                 &g,
@@ -510,12 +559,36 @@ mod tests {
                 forged_point(),
                 now,
             );
-            if learned.search_budget.map(|(t, _)| t) != before {
-                searched += 1;
-            }
         }
-        assert!(searched < usize::try_from(SEARCH_BURST).unwrap());
         assert!(!learned.take_search_budget(now));
         assert!(learned.take_search_budget(now + SEARCH_INTERVAL));
+    }
+
+    #[test]
+    fn a_worst_case_search_is_fast() {
+        let g = group_of(4, 20);
+        let mut learned = LearnedVerifyingShares::default();
+        let start = Instant::now();
+        let cap = capacity(4, 20);
+        for i in 2..=20u16 {
+            for _ in 0..cap {
+                record(
+                    &mut learned,
+                    &g,
+                    Keys::generate().public_key(),
+                    i,
+                    forged_point(),
+                    start,
+                );
+            }
+        }
+        let others: Vec<u16> = (2..=20).collect();
+        let timer = Instant::now();
+        assert!(learned.search(&g.context, &others).is_none());
+        assert!(
+            timer.elapsed() < Duration::from_secs(5),
+            "worst-case search took {:?}",
+            timer.elapsed()
+        );
     }
 }
