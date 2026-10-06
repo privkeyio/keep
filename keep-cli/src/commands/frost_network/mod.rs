@@ -1349,13 +1349,16 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     f.sync_all()
         .map_err(|e| KeepError::Runtime(format!("sync {}: {e}", tmp.display())))?;
     drop(f);
-    std::fs::rename(&tmp, path)
+    // Windows cannot open a directory to fsync it, so the move itself is written through.
+    #[cfg(windows)]
+    crate::panic_windows::replace_file_durably(&tmp, path)
         .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
-    // fsync the containing directory so the new directory entry is durable across a crash; a
-    // rename only persists once the parent directory's metadata is synced. Windows cannot open a
-    // directory as a file to sync it, and its rename is not deferred the same way.
-    #[cfg(unix)]
+    #[cfg(not(windows))]
     {
+        std::fs::rename(&tmp, path)
+            .map_err(|e| KeepError::Runtime(format!("rename to {}: {e}", path.display())))?;
+        // fsync the containing directory so the new directory entry is durable across a crash; a
+        // rename only persists once the parent directory's metadata is synced.
         let parent = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),

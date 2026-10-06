@@ -132,3 +132,26 @@ unsafe fn write_file_owner_only_impl(path: &Path, content: &str) -> std::io::Res
     let mut file = File::from_raw_handle(file_handle as *mut _);
     file.write_all(content.as_bytes())
 }
+
+/// Replace `to` with `from` and return only once the move has been written to
+/// disk (`MOVEFILE_WRITE_THROUGH`), the Windows counterpart of rename followed by
+/// a directory fsync.
+pub fn replace_file_durably(from: &Path, to: &Path) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let wide = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both arguments are NUL-terminated UTF-16 strings that outlive the call.
+    let moved = unsafe {
+        MoveFileExW(
+            from.as_ptr(),
+            to.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
