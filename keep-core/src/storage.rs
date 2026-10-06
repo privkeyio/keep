@@ -1774,46 +1774,99 @@ fn parse_versioned_descriptor_key(
 /// always secp256k1.
 const SHARE_FORMAT_MAGIC: &[u8; 4] = b"KSH1";
 const SHARE_FORMAT_V1: u8 = 1;
+/// Adds `ShareMetadata::group_subkey_secret`.
+const SHARE_FORMAT_V2: u8 = 2;
+
+/// `ShareMetadata` as stored in unprefixed and v1 blobs, before
+/// `group_subkey_secret` existed. bincode is positional, so those blobs are read
+/// through this frozen copy, never through the current struct.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ShareMetadataV1 {
+    identifier: u16,
+    threshold: u16,
+    total_shares: u16,
+    group_pubkey: [u8; 32],
+    name: String,
+    created_at: i64,
+    last_used: Option<i64>,
+    sign_count: u64,
+    did_backup: bool,
+}
+
+impl From<ShareMetadataV1> for crate::frost::ShareMetadata {
+    fn from(v1: ShareMetadataV1) -> Self {
+        Self {
+            identifier: v1.identifier,
+            threshold: v1.threshold,
+            total_shares: v1.total_shares,
+            group_pubkey: v1.group_pubkey,
+            name: v1.name,
+            created_at: v1.created_at,
+            last_used: v1.last_used,
+            sign_count: v1.sign_count,
+            did_backup: v1.did_backup,
+            group_subkey_secret: None,
+        }
+    }
+}
 
 /// Serialize a `StoredShare` with the explicit version prefix.
 pub(crate) fn serialize_stored_share(share: &StoredShare) -> Result<Vec<u8>> {
     let body = bincode_options().serialize(share)?;
     let mut out = Vec::with_capacity(SHARE_FORMAT_MAGIC.len() + 1 + body.len());
     out.extend_from_slice(SHARE_FORMAT_MAGIC);
-    out.push(SHARE_FORMAT_V1);
+    out.push(SHARE_FORMAT_V2);
     out.extend_from_slice(&body);
     Ok(out)
 }
 
 /// Deserialize a `StoredShare`, dispatching on the explicit version prefix.
 ///
-/// A blob carrying the `KSH1` magic is parsed strictly as the current
-/// `StoredShare` layout (ciphersuite tag included). A blob without the magic is
-/// pre-versioning data: it is parsed as the legacy three-field layout and the
-/// tag defaults to `Secp256k1Tr`. This is parse-don't-guess: the prefix names
+/// A blob carrying the `KSH1` magic is parsed strictly as the layout its
+/// version byte names: v1 is the layout before `group_subkey_secret`, v2 the
+/// current one. A blob without the magic is pre-versioning data: it is parsed as
+/// the legacy three-field layout and the tag defaults to `Secp256k1Tr`. This is parse-don't-guess: the prefix names
 /// the layout instead of inferring it from a failed deserialization. The
 /// ciphersuite tag stays bound in the AEAD AAD, so a misclassification (e.g. an
 /// adversarially prefixed legacy blob) still fails closed at the MAC rather
 /// than yielding a wrong key.
 pub(crate) fn deserialize_stored_share(bytes: &[u8]) -> Result<StoredShare> {
-    if let Some([SHARE_FORMAT_V1, body @ ..]) = bytes.strip_prefix(SHARE_FORMAT_MAGIC.as_slice()) {
-        return Ok(bincode_options().deserialize::<StoredShare>(body)?);
+    match bytes.strip_prefix(SHARE_FORMAT_MAGIC.as_slice()) {
+        Some([SHARE_FORMAT_V2, body @ ..]) => {
+            Ok(bincode_options().deserialize::<StoredShare>(body)?)
+        }
+        Some([SHARE_FORMAT_V1, body @ ..]) => {
+            #[derive(serde::Deserialize)]
+            struct StoredShareV1 {
+                metadata: ShareMetadataV1,
+                encrypted_key_package: Vec<u8>,
+                pubkey_package: Vec<u8>,
+                ciphersuite: crate::frost::Ciphersuite,
+            }
+            let v1: StoredShareV1 = bincode_options().deserialize(body)?;
+            Ok(StoredShare {
+                metadata: v1.metadata.into(),
+                encrypted_key_package: v1.encrypted_key_package,
+                pubkey_package: v1.pubkey_package,
+                ciphersuite: v1.ciphersuite,
+            })
+        }
+        _ => {
+            #[derive(serde::Deserialize)]
+            struct LegacyStoredShare {
+                metadata: ShareMetadataV1,
+                encrypted_key_package: Vec<u8>,
+                pubkey_package: Vec<u8>,
+            }
+            let legacy: LegacyStoredShare = bincode_options().deserialize(bytes)?;
+            Ok(StoredShare {
+                metadata: legacy.metadata.into(),
+                encrypted_key_package: legacy.encrypted_key_package,
+                pubkey_package: legacy.pubkey_package,
+                ciphersuite: crate::frost::Ciphersuite::Secp256k1Tr,
+            })
+        }
     }
-
-    #[derive(serde::Deserialize)]
-    struct LegacyStoredShare {
-        metadata: crate::frost::ShareMetadata,
-        encrypted_key_package: Vec<u8>,
-        pubkey_package: Vec<u8>,
-    }
-
-    let legacy: LegacyStoredShare = bincode_options().deserialize(bytes)?;
-    Ok(StoredShare {
-        metadata: legacy.metadata,
-        encrypted_key_package: legacy.encrypted_key_package,
-        pubkey_package: legacy.pubkey_package,
-        ciphersuite: crate::frost::Ciphersuite::Secp256k1Tr,
-    })
 }
 
 pub(crate) fn share_id(group_pubkey: &[u8; 32], identifier: u16) -> [u8; 32] {
@@ -1834,19 +1887,79 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn metadata_v1(identifier: u16, name: &str) -> ShareMetadataV1 {
+        ShareMetadataV1 {
+            identifier,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: [3u8; 32],
+            name: name.into(),
+            created_at: 1_700_000_000,
+            last_used: Some(1_700_000_100),
+            sign_count: 4,
+            did_backup: true,
+        }
+    }
+
+    #[test]
+    fn test_v1_stored_share_blob_loads_without_a_subkey() {
+        #[derive(serde::Serialize)]
+        struct StoredShareV1 {
+            metadata: ShareMetadataV1,
+            encrypted_key_package: Vec<u8>,
+            pubkey_package: Vec<u8>,
+            ciphersuite: crate::frost::Ciphersuite,
+        }
+
+        let v1 = StoredShareV1 {
+            metadata: metadata_v1(2, "v1"),
+            encrypted_key_package: vec![5u8; 60],
+            pubkey_package: vec![6u8; 33],
+            ciphersuite: crate::frost::Ciphersuite::Ed25519,
+        };
+        let mut blob = SHARE_FORMAT_MAGIC.to_vec();
+        blob.push(SHARE_FORMAT_V1);
+        blob.extend(bincode_options().serialize(&v1).unwrap());
+
+        let loaded = deserialize_stored_share(&blob).unwrap();
+        assert_eq!(loaded.metadata.identifier, 2);
+        assert_eq!(loaded.metadata.name, "v1");
+        assert_eq!(loaded.metadata.last_used, Some(1_700_000_100));
+        assert_eq!(loaded.metadata.sign_count, 4);
+        assert!(loaded.metadata.did_backup);
+        assert_eq!(loaded.metadata.group_subkey_secret, None);
+        assert_eq!(loaded.encrypted_key_package, vec![5u8; 60]);
+        assert_eq!(loaded.pubkey_package, vec![6u8; 33]);
+        assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Ed25519);
+    }
+
+    #[test]
+    fn test_subkey_secret_roundtrips_in_the_current_layout() {
+        let share = StoredShare {
+            metadata: crate::frost::ShareMetadata::new(3, 2, 3, [4u8; 32], "dkg".into())
+                .with_group_subkey_secret([9u8; 32]),
+            encrypted_key_package: vec![7u8; 50],
+            pubkey_package: vec![8u8; 33],
+            ciphersuite: crate::frost::Ciphersuite::Secp256k1Tr,
+        };
+        let loaded = deserialize_stored_share(&serialize_stored_share(&share).unwrap()).unwrap();
+        assert_eq!(loaded.metadata.group_subkey_secret, Some([9u8; 32]));
+        assert_eq!(loaded.encrypted_key_package, vec![7u8; 50]);
+    }
+
     #[test]
     fn test_legacy_stored_share_blob_loads_as_secp256k1() {
         use bincode::Options;
 
         #[derive(serde::Serialize)]
         struct LegacyStoredShare {
-            metadata: crate::frost::ShareMetadata,
+            metadata: ShareMetadataV1,
             encrypted_key_package: Vec<u8>,
             pubkey_package: Vec<u8>,
         }
 
         let legacy = LegacyStoredShare {
-            metadata: crate::frost::ShareMetadata::new(1, 2, 3, [3u8; 32], "old".into()),
+            metadata: metadata_v1(1, "old"),
             encrypted_key_package: vec![1u8; 64],
             pubkey_package: vec![2u8; 33],
         };
@@ -1881,7 +1994,7 @@ mod tests {
 
         let blob = serialize_stored_share(&share).unwrap();
         assert!(blob.starts_with(SHARE_FORMAT_MAGIC));
-        assert_eq!(blob[SHARE_FORMAT_MAGIC.len()], SHARE_FORMAT_V1);
+        assert_eq!(blob[SHARE_FORMAT_MAGIC.len()], SHARE_FORMAT_V2);
 
         let loaded = deserialize_stored_share(&blob).unwrap();
         assert_eq!(loaded.ciphersuite, crate::frost::Ciphersuite::Ed25519);
@@ -1913,13 +2026,13 @@ mod tests {
 
         #[derive(serde::Serialize)]
         struct LegacyStoredShare {
-            metadata: crate::frost::ShareMetadata,
+            metadata: ShareMetadataV1,
             encrypted_key_package: Vec<u8>,
             pubkey_package: Vec<u8>,
         }
 
         let legacy = LegacyStoredShare {
-            metadata: crate::frost::ShareMetadata::new(9, 2, 3, [1u8; 32], "legacy".into()),
+            metadata: metadata_v1(9, "legacy"),
             encrypted_key_package: vec![3u8; 48],
             pubkey_package: vec![4u8; 33],
         };
