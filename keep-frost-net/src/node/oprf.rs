@@ -678,7 +678,8 @@ mod tests {
         let (mut node, _relay) = test_node().await;
         node.set_oprf_key_share(oprf_share());
         let from = Keys::generate().public_key();
-        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        node.test_inject_peer(crate::peer::Peer::new(from, 2));
+        node.set_peer_policy(PeerPolicy::new(2).allow_receive(false));
         // Fresh created_at passes the replay gate; policy denial trips next.
         let group = *node.group_pubkey();
         assert!(matches!(

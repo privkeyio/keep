@@ -59,7 +59,7 @@ pub enum Event {
     ApproveSignRequest(String),
     RejectSignRequest(String),
     SetPeerPolicy {
-        pubkey_hex: String,
+        share_index: u16,
         allow_send: bool,
         allow_receive: bool,
     },
@@ -140,7 +140,7 @@ impl State {
                 let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
                 peer.allow_send = !peer.allow_send;
                 Some(Event::SetPeerPolicy {
-                    pubkey_hex: peer.pubkey_hex.clone(),
+                    share_index: idx,
                     allow_send: peer.allow_send,
                     allow_receive: peer.allow_receive,
                 })
@@ -149,7 +149,7 @@ impl State {
                 let peer = self.peers.iter_mut().find(|p| p.share_index == idx)?;
                 peer.allow_receive = !peer.allow_receive;
                 Some(Event::SetPeerPolicy {
-                    pubkey_hex: peer.pubkey_hex.clone(),
+                    share_index: idx,
                     allow_send: peer.allow_send,
                     allow_receive: peer.allow_receive,
                 })

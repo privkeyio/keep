@@ -115,9 +115,9 @@ pub use event::{verify_unwrapped_duress_beacon, KfpEventBuilder};
 #[cfg(feature = "testing")]
 pub use node::CosignTransport;
 pub use node::{
-    DescriptorLookupUnavailable, DuressFreeze, DuressPersister, HealthCheckResult,
-    KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck, PeerPolicy,
-    PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawAndRequireStructuredHooks,
+    migrate_kfp_v1_peer_policies, DescriptorLookupUnavailable, DuressFreeze, DuressPersister,
+    HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck,
+    PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawAndRequireStructuredHooks,
     RefuseRawSignatureHooks, RequireStructuredPayloadHooks, ServeHooks, SessionInfo, SigningHooks,
     SuccessorLookup,
 };

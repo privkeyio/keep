@@ -224,19 +224,18 @@ impl App {
         self.update_relay_config(|config| config.frost_relays = urls);
     }
 
-    pub(super) fn save_peer_policy(&self, pubkey_hex: &str, allow_send: bool, allow_receive: bool) {
-        let hex = pubkey_hex.to_string();
+    pub(super) fn save_peer_policy(&self, share_index: u16, allow_send: bool, allow_receive: bool) {
         self.update_relay_config(|config| {
             if let Some(existing) = config
                 .peer_policies
                 .iter_mut()
-                .find(|p| p.pubkey_hex == hex)
+                .find(|p| p.share_index == share_index)
             {
                 existing.allow_send = allow_send;
                 existing.allow_receive = allow_receive;
             } else {
                 config.peer_policies.push(keep_core::PeerPolicyEntry {
-                    pubkey_hex: hex,
+                    share_index,
                     allow_send,
                     allow_receive,
                 });

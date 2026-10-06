@@ -375,6 +375,7 @@ fn capture_policy_from_announces(
             &payload.proof_signature,
             &payload.group_pubkey,
             payload.share_index,
+            event.pubkey.as_bytes(),
             payload.timestamp,
         )
         .is_err()
@@ -420,6 +421,7 @@ fn capture_policy_from_announces(
         let nonce = keep_frost_net::derive_announce_attestation_nonce(
             &payload.group_pubkey,
             payload.share_index,
+            event.pubkey.as_bytes(),
             payload.timestamp,
         );
         if keep_frost_net::tpm_quote::verify_quote(
@@ -831,6 +833,11 @@ mod tests {
         ]
     }
 
+    // The transport key every test announce is authored by.
+    fn author() -> nostr_sdk::Keys {
+        nostr_sdk::Keys::new(nostr_sdk::SecretKey::from_slice(&[5u8; 32]).unwrap())
+    }
+
     // A valid proof-of-share for the announce fields, so capture's verify_proof
     // gate (matching the runtime admission path) accepts the announce.
     fn signed_share(group: &[u8; 32], index: u16, timestamp: u64) -> ([u8; 33], [u8; 64]) {
@@ -845,6 +852,7 @@ mod tests {
             group,
             index,
             &verifying_share,
+            author().public_key().as_bytes(),
             timestamp,
         )
         .expect("sign proof");
@@ -917,13 +925,13 @@ mod tests {
         proof: ([u8; 33], [u8; 64]),
     ) -> nostr_sdk::Event {
         use keep_frost_net::{AnnouncePayload, KfpMessage, KFP_EVENT_KIND};
-        use nostr_sdk::{EventBuilder, Keys, Kind};
+        use nostr_sdk::{EventBuilder, Kind};
 
         let payload = AnnouncePayload::new(*group, index, proof.0, proof.1, timestamp)
             .with_tpm_attestation(evidence);
         let content = KfpMessage::Announce(payload).to_json().unwrap();
         EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
-            .sign_with_keys(&Keys::generate())
+            .sign_with_keys(&author())
             .unwrap()
     }
 
@@ -946,7 +954,12 @@ mod tests {
         pcr_values: Vec<String>,
         proof: ([u8; 33], [u8; 64]),
     ) -> nostr_sdk::Event {
-        let nonce = keep_frost_net::derive_announce_attestation_nonce(group, index, timestamp);
+        let nonce = keep_frost_net::derive_announce_attestation_nonce(
+            group,
+            index,
+            author().public_key().as_bytes(),
+            timestamp,
+        );
         let selection = hex::decode(selection_hex).unwrap();
         let ev = evidence(&nonce, &selection, pcr_values);
         announce_event(group, index, timestamp, ev, proof)
@@ -1215,8 +1228,12 @@ mod tests {
         // nothing is captured.
         let group = [7u8; 32];
         let selection = hex::decode(SELECTION).unwrap();
-        let wrong_nonce =
-            keep_frost_net::derive_announce_attestation_nonce(&group, 2, 1_700_000_999);
+        let wrong_nonce = keep_frost_net::derive_announce_attestation_nonce(
+            &group,
+            2,
+            author().public_key().as_bytes(),
+            1_700_000_999,
+        );
         let ev = evidence(&wrong_nonce, &selection, default_pcrs());
         let event = announce_event(
             &group,
@@ -1237,10 +1254,20 @@ mod tests {
         // seed the baseline; a later valid peer is still captured.
         let group = [7u8; 32];
         let selection = hex::decode(SELECTION).unwrap();
-        let nonce2 = keep_frost_net::derive_announce_attestation_nonce(&group, 2, 1_700_000_000);
+        let nonce2 = keep_frost_net::derive_announce_attestation_nonce(
+            &group,
+            2,
+            author().public_key().as_bytes(),
+            1_700_000_000,
+        );
         let mut bad = evidence(&nonce2, &selection, default_pcrs());
         bad.ak_sec1 = vec![0u8; 10]; // not a 65-byte SEC1 point
-        let nonce3 = keep_frost_net::derive_announce_attestation_nonce(&group, 3, 1_700_000_000);
+        let nonce3 = keep_frost_net::derive_announce_attestation_nonce(
+            &group,
+            3,
+            author().public_key().as_bytes(),
+            1_700_000_000,
+        );
         let good = evidence(&nonce3, &selection, default_pcrs());
         let events = vec![
             announce_event(

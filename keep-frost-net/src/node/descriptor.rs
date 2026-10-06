@@ -1519,7 +1519,8 @@ mod gate_tests {
                 async fn rejects_denied_peer() {
                     let (node, _relay) = test_node().await;
                     let from = Keys::generate().public_key();
-                    node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+                    node.test_inject_peer(crate::peer::Peer::new(from, 2));
+                    node.set_peer_policy(PeerPolicy::new(2).allow_receive(false));
                     let payload = ($build)(*node.group_pubkey());
                     assert!(matches!(
                         node.$handler(from, payload).await,

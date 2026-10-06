@@ -121,6 +121,7 @@ async fn test_frost_protocol_message_flow() {
     let group_pubkey = [1u8; 32];
     let share_index = 1u16;
     let timestamp = chrono::Utc::now().timestamp() as u64;
+    let author = [7u8; 32];
 
     // Create real proof signature
     let proof_signature = keep_frost_net::proof::sign_proof(
@@ -128,6 +129,7 @@ async fn test_frost_protocol_message_flow() {
         &group_pubkey,
         share_index,
         &verifying_share,
+        &author,
         timestamp,
     )
     .expect("Failed to sign proof");
@@ -157,6 +159,7 @@ async fn test_frost_protocol_message_flow() {
             &payload.proof_signature,
             &payload.group_pubkey,
             payload.share_index,
+            &author,
             payload.timestamp,
         )
         .expect("Proof verification should succeed");
@@ -196,12 +199,14 @@ async fn test_proof_verification_with_real_keys() {
     let group_pubkey = [42u8; 32];
     let share_index = 5u16;
     let timestamp = chrono::Utc::now().timestamp() as u64;
+    let author = [7u8; 32];
 
     let signature = keep_frost_net::proof::sign_proof(
         &signing_share,
         &group_pubkey,
         share_index,
         &verifying_share,
+        &author,
         timestamp,
     )
     .expect("Signing should succeed");
@@ -212,6 +217,7 @@ async fn test_proof_verification_with_real_keys() {
         &signature,
         &group_pubkey,
         share_index,
+        &author,
         timestamp,
     )
     .expect("Verification should succeed");
@@ -222,6 +228,7 @@ async fn test_proof_verification_with_real_keys() {
         &signature,
         &group_pubkey,
         share_index + 1, // Wrong index
+        &author,
         timestamp,
     );
     assert!(wrong_index_result.is_err(), "Wrong share index should fail");
@@ -232,6 +239,7 @@ async fn test_proof_verification_with_real_keys() {
         &signature,
         &[99u8; 32], // Wrong group pubkey
         share_index,
+        &author,
         timestamp,
     );
     assert!(
@@ -251,6 +259,7 @@ async fn test_proof_verification_with_real_keys() {
         &signature,
         &group_pubkey,
         share_index,
+        &author,
         timestamp,
     );
     assert!(
@@ -3340,7 +3349,7 @@ async fn test_unappraisable_tpm_evidence_is_failed_not_downgraded() {
         .await
         .expect("required node");
     required.set_expected_pcrs(ExpectedPcrs::new([1u8; 48], [2u8; 48], [3u8; 48]));
-    let status = required.test_attestation_status(&payload);
+    let status = required.test_attestation_status(&Keys::generate().public_key(), &payload);
     assert!(
         matches!(status, AttestationStatus::Failed(_)),
         "unappraisable TPM evidence on an attestation-requiring node must be Failed, got {status:?}"
@@ -3351,7 +3360,7 @@ async fn test_unappraisable_tpm_evidence_is_failed_not_downgraded() {
         .await
         .expect("permissive node");
     assert_eq!(
-        permissive.test_attestation_status(&payload),
+        permissive.test_attestation_status(&Keys::generate().public_key(), &payload),
         AttestationStatus::NotConfigured,
         "a node enforcing no attestation must report NotConfigured, not reject"
     );
@@ -3397,7 +3406,7 @@ impl keep_frost_net::AnnounceAttestor for RecordingAttestor {
 
 /// The announce path must bind the TPM quote's nonce to THIS announce: the nonce
 /// the attestor is asked to quote must be `derive_announce_attestation_nonce`
-/// over the node's group, share index, and the announce's own timestamp.
+/// over the node's group, share index, transport key, and the announce's own timestamp.
 #[tokio::test]
 async fn test_announce_binds_tpm_quote_nonce_to_announce() {
     let mock_relay = MockRelay::run().await.expect("relay");
@@ -3416,6 +3425,7 @@ async fn test_announce_binds_tpm_quote_nonce_to_announce() {
 
     let group = *node.group_pubkey();
     let idx = node.share_index();
+    let author = node.pubkey();
 
     let t0 = chrono::Utc::now().timestamp() as u64;
     node.announce().await.expect("announce");
@@ -3430,7 +3440,9 @@ async fn test_announce_binds_tpm_quote_nonce_to_announce() {
     // The exact second is the node's own `Timestamp::now()`; it lies within the
     // bracket we measured around the call.
     let candidates: Vec<[u8; 32]> = (t0..=t1 + 1)
-        .map(|ts| keep_frost_net::derive_announce_attestation_nonce(&group, idx, ts))
+        .map(|ts| {
+            keep_frost_net::derive_announce_attestation_nonce(&group, idx, author.as_bytes(), ts)
+        })
         .collect();
     assert!(
         candidates.contains(&recorded[0]),
@@ -4474,4 +4486,86 @@ async fn test_migration_sweep_destination_and_fee_guards() {
             .contains("old_recovery output does not match the descriptor"),
         "expected old_recovery-binding refusal, got: {err}"
     );
+}
+
+/// A duress beacon wrapped to the transport key a holder learned from a peer's
+/// announce reaches that peer through its relay subscription and freezes it.
+#[tokio::test]
+async fn test_duress_beacon_to_learned_transport_key_freezes_peer_over_relay() {
+    let mock_relay = MockRelay::run().await.expect("relay");
+    let relay = mock_relay.url().await.to_string();
+
+    let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+    let (mut shares, _pkg) = dealer.generate("test-duress-relay").unwrap();
+    let mut emitter = KfpNode::new(shares.remove(0), vec![relay.clone()])
+        .await
+        .expect("emitter");
+    let mut receiver = KfpNode::new(shares.remove(0), vec![relay.clone()])
+        .await
+        .expect("receiver");
+    let beacon = nostr_sdk::Keys::generate();
+    receiver.set_duress_beacon_pins(vec![beacon.public_key()]);
+
+    let mut rx = emitter.subscribe();
+    let shutdown1 = emitter.take_shutdown_handle();
+    let shutdown2 = receiver.take_shutdown_handle();
+    let emitter = std::sync::Arc::new(emitter);
+    let receiver = std::sync::Arc::new(receiver);
+    let emitter_handle = tokio::spawn({
+        let node = emitter.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+    let receiver_handle = tokio::spawn({
+        let node = receiver.clone();
+        async move {
+            let _ = node.run().await;
+        }
+    });
+
+    let discovered = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index: 2, .. }) =
+                rx.recv().await
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(discovered.is_ok(), "the emitter must discover the receiver");
+
+    let recipients: Vec<PublicKey> = emitter
+        .bound_peer_transport_keys()
+        .into_iter()
+        .map(|(_, pubkey)| pubkey)
+        .collect();
+    assert_eq!(recipients, vec![receiver.pubkey()]);
+
+    let wraps = keep_frost_net::KfpEventBuilder::duress_beacon_broadcast(
+        &beacon,
+        emitter.group_pubkey(),
+        &recipients,
+        &[9u8; 32],
+    )
+    .await
+    .expect("beacon wraps");
+    let client = nostr_sdk::Client::new(nostr_sdk::Keys::generate());
+    client.add_relay(&relay).await.expect("add relay");
+    client.connect().await;
+    for wrap in &wraps {
+        client.send_event(wrap).await.expect("publish wrap");
+    }
+
+    let frozen = timeout(Duration::from_secs(30), async {
+        while !receiver.is_duress_frozen() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+
+    graceful_shutdown(shutdown1, emitter_handle).await;
+    graceful_shutdown(shutdown2, receiver_handle).await;
+    assert!(frozen.is_ok(), "the receiver must freeze on the beacon");
 }

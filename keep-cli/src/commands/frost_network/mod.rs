@@ -79,7 +79,7 @@ pub fn cmd_frost_network_serve(
     duress_beacon_salt: Option<&str>,
     duress_beacon_pins: &[String],
     duress_state_file: Option<&Path>,
-    duress_group_total: Option<u16>,
+    duress_recipients_file: Option<&Path>,
 ) -> Result<()> {
     debug!(group = group_npub, relay, share = ?share_index, refuse_raw_sign, require_structured_sign, "starting FROST network node");
 
@@ -109,27 +109,20 @@ pub fn cmd_frost_network_serve(
     // together (clap also enforces this).
     let duress_cfg = match (duress_beacon_pubkey, duress_beacon_salt) {
         (Some(npub), Some(salt_hex)) => {
-            // The beacon is gift-wrapped to every group member, so the emitter must
-            // know the member count up front (a coerced holder never unlocks the
-            // vault to read it). Require --group-total with the emit config; fail
-            // closed here, before the password prompt, so a misconfig never leaks by
-            // surfacing only after the operator has already typed the duress word.
-            let total = duress_group_total.ok_or_else(|| {
+            // The beacon is gift-wrapped to the other members' transport keys,
+            // which derive from their shares, so a coerced holder (who never
+            // unlocks) needs them recorded. Read them here, before the password
+            // prompt, so a missing flag or corrupt file never surfaces only after
+            // the operator has typed the duress word.
+            let recipients_file = duress_recipients_file.ok_or_else(|| {
                 KeepError::invalid_input(
-                    "--group-total is required with --duress-beacon-pubkey/--duress-beacon-salt",
+                    "--duress-recipients-file is required with --duress-beacon-pubkey/--duress-beacon-salt",
                 )
             })?;
-            // A zero total derives no recipients, so the beacon would broadcast to
-            // nobody , the coerced holder would look resident but silently alert no
-            // one (fail-open). Reject it here, before the prompt, with the rest of
-            // the fail-closed config checks.
-            if total == 0 {
-                return Err(KeepError::invalid_input(
-                    "--group-total must be at least 1 (the group's share count)",
-                ));
-            }
             let (pubkey, salt) = duress::parse_duress_config(npub, salt_hex)?;
-            Some((pubkey, salt, total))
+            let group_pubkey = keep_core::keys::npub_to_bytes(group_npub)?;
+            let recipients = duress::read_recipients(recipients_file, &group_pubkey)?;
+            Some((pubkey, salt, recipients))
         }
         (None, None) => None,
         _ => {
@@ -167,7 +160,8 @@ pub fn cmd_frost_network_serve(
     // resident. To keep a coerced start wall-clock- and screen-indistinguishable
     // from a genuine one, mirror the normal path's "Unlocking vault..." spinner
     // and spend an equal-cost KDF (the vault's own params) before diverging.
-    if let Some((beacon_pubkey, salt, group_total)) = duress_cfg {
+    let recipients_on_unlock = duress_cfg.as_ref().map(|(_, _, r)| r.len());
+    if let Some((beacon_pubkey, salt, recipients)) = duress_cfg {
         if let Some(beacon) = duress::match_duress(password.expose_secret(), &salt, &beacon_pubkey)?
         {
             let spinner = out.spinner("Unlocking vault...");
@@ -180,7 +174,7 @@ pub fn cmd_frost_network_serve(
                 out,
                 &beacon,
                 &group_pubkey,
-                group_total,
+                &recipients,
                 relay,
             ));
         }
@@ -232,6 +226,9 @@ pub fn cmd_frost_network_serve(
     let oprf_seal_path = oprf_share_file.map(|p| p.to_path_buf());
     // Owned so the async event loop can move the persister closure that writes it.
     let duress_state_path = duress_state_file.map(|p| p.to_path_buf());
+    let duress_recipients_path = recipients_on_unlock
+        .and(duress_recipients_file)
+        .map(|p| p.to_path_buf());
 
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
@@ -280,6 +277,19 @@ pub fn cmd_frost_network_serve(
                 "Duress",
                 "FROZEN (persisted; co-signing + OPRF refused until operator clear)",
             );
+        }
+        if let Some(recorded) = recipients_on_unlock {
+            let others = usize::from(total_shares.saturating_sub(1));
+            out.field(
+                "Duress recipients",
+                &format!("{recorded} of {others} recorded"),
+            );
+            if recorded < others {
+                out.warn(
+                    "a duress beacon reaches only the members recorded so far; each member is \
+                     recorded the first time this node sees its announce",
+                );
+            }
         }
         if refuse_raw_sign || require_structured_sign || oprf_auto_approve {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
@@ -331,6 +341,7 @@ pub fn cmd_frost_network_serve(
         let event_node = node.clone();
         let event_keep = keep.clone();
         let event_seal_path = oprf_seal_path;
+        let event_recipients_path = duress_recipients_path;
         let event_task = tokio::spawn(async move {
             loop {
                 match event_rx.recv().await {
@@ -349,6 +360,15 @@ pub fn cmd_frost_network_serve(
                     Ok(keep_frost_net::KfpNodeEvent::PeerDiscovered { share_index, name }) => {
                         let name_str = name.unwrap_or_else(|| "unnamed".to_string());
                         tracing::info!(share_index, name = name_str, "peer discovered");
+                        if let Some(path) = &event_recipients_path {
+                            if let Err(e) = duress::record_recipients(
+                                path,
+                                &group_pubkey,
+                                &event_node.bound_peer_transport_keys(),
+                            ) {
+                                error!(error = %e, path = %path.display(), "failed to record duress recipients");
+                            }
+                        }
                     }
                     Ok(keep_frost_net::KfpNodeEvent::SignatureComplete {
                         session_id,

@@ -2415,7 +2415,8 @@ mod gate_tests {
         let (node, _relay) = test_node().await;
         let from = Keys::generate().public_key();
         let group = *node.group_pubkey();
-        node.set_peer_policy(PeerPolicy::new(from).allow_receive(false));
+        node.test_inject_peer(crate::peer::Peer::new(from, 2));
+        node.set_peer_policy(PeerPolicy::new(2).allow_receive(false));
         let req = SignRequestPayload::new([1u8; 32], group, vec![0u8; 32], "test", vec![1]);
         assert!(matches!(
             node.handle_sign_request(from, req).await,
