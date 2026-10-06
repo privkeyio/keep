@@ -548,16 +548,7 @@ impl KfpEventBuilder {
             ));
         }
 
-        let is_addressed_to_us =
-            event
-                .tags
-                .filter(TagKind::p())
-                .any(|t| match t.as_standardized() {
-                    Some(TagStandard::PublicKey { public_key, .. }) => {
-                        public_key == &keys.public_key()
-                    }
-                    _ => false,
-                });
+        let is_addressed_to_us = Self::is_addressed_to(keys, event);
 
         let content = if is_addressed_to_us {
             nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content)
@@ -573,9 +564,28 @@ impl KfpEventBuilder {
         }
 
         let msg = KfpMessage::from_json(&content).map_err(FrostNetError::Json)?;
+        // Announcements are the only plaintext message; anything else must have
+        // been encrypted to us, so a plaintext copy of any other type is refused.
+        if !is_addressed_to_us && !matches!(msg, KfpMessage::Announce(_)) {
+            return Err(FrostNetError::Protocol(
+                "Only announcements may be sent unencrypted".into(),
+            ));
+        }
         msg.validate()
             .map_err(|e| FrostNetError::Protocol(e.to_string()))?;
         Ok(msg)
+    }
+
+    /// Whether `event` carries a `p` tag for `keys`' public key, i.e. was
+    /// encrypted to this node.
+    pub fn is_addressed_to(keys: &Keys, event: &Event) -> bool {
+        event
+            .tags
+            .filter(TagKind::p())
+            .any(|t| match t.as_standardized() {
+                Some(TagStandard::PublicKey { public_key, .. }) => public_key == &keys.public_key(),
+                _ => false,
+            })
     }
 
     pub fn get_message_type(event: &Event) -> Option<String> {
@@ -650,6 +660,23 @@ pub fn verify_unwrapped_duress_beacon(
 mod tests {
     use super::*;
     use k256::schnorr::SigningKey;
+
+    #[test]
+    fn plaintext_is_accepted_only_for_announcements() {
+        let sender = Keys::generate();
+        let receiver = Keys::generate();
+        let payload = CommitmentPayload::new([7u8; 32], 2, vec![1u8; 66]);
+        let content = KfpMessage::Commitment(payload).to_json().unwrap();
+        let event = EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), content)
+            .tag(Tag::custom(TagKind::custom("t"), ["commitment"]))
+            .sign_with_keys(&sender)
+            .unwrap();
+        let result = KfpEventBuilder::decrypt_message(&receiver, &event);
+        assert!(
+            matches!(&result, Err(FrostNetError::Protocol(msg)) if msg.contains("Only announcements")),
+            "expected a plaintext commitment to be refused, got {result:?}"
+        );
+    }
 
     #[test]
     fn test_announcement_event() {

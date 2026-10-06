@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use nostr_sdk::PublicKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::protocol::AnnouncedXpub;
@@ -74,6 +74,11 @@ pub struct Peer {
     /// instead of being honored indefinitely on credit.
     pub last_attested: Option<Instant>,
     pub recovery_xpubs: Vec<AnnouncedXpub>,
+    /// Admitted on proof of its share alone, because this node could not check
+    /// the index against a canonical verifying share (a share imported from a
+    /// bech32 export in a group with a threshold of 3 or more). Recorded only;
+    /// nothing restricts such a peer yet.
+    pub admitted_by_proof_only: bool,
 }
 
 impl Peer {
@@ -91,7 +96,13 @@ impl Peer {
             attestation_status: AttestationStatus::NotProvided,
             last_attested: None,
             recovery_xpubs: Vec::new(),
+            admitted_by_proof_only: false,
         }
+    }
+
+    pub fn with_proof_only_admission(mut self, proof_only: bool) -> Self {
+        self.admitted_by_proof_only = proof_only;
+        self
     }
 
     pub fn with_attestation_status(mut self, status: AttestationStatus) -> Self {
@@ -168,6 +179,7 @@ pub struct PeerManager {
     peers: HashMap<u16, Peer>,
     our_share_index: u16,
     offline_threshold: Duration,
+    contested: HashSet<u16>,
 }
 
 impl PeerManager {
@@ -180,7 +192,18 @@ impl PeerManager {
             // minute (issue #412). A peer that drops mid-round is still caught
             // by the signing-round timeout and failover exclusion.
             offline_threshold: peer_announce_interval().saturating_mul(2),
+            contested: HashSet::new(),
         }
+    }
+
+    /// Drops the peer at `share_index` and refuses the index from then on.
+    pub fn contest(&mut self, share_index: u16) {
+        self.peers.remove(&share_index);
+        self.contested.insert(share_index);
+    }
+
+    pub fn is_contested(&self, share_index: u16) -> bool {
+        self.contested.contains(&share_index)
     }
 
     pub fn with_offline_threshold(mut self, threshold: Duration) -> Self {
