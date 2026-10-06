@@ -12,7 +12,7 @@ mod transport;
 pub use psbt::PsbtSessionSnapshot;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 pub use transport::CosignTransport;
-pub(crate) use transport::NostrTransport;
+pub(crate) use transport::{require_accepted, NostrTransport};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -2489,7 +2489,12 @@ impl KfpNode {
             }
         }
 
-        self.announce().await?;
+        // A refused announce is retried by the periodic re-announce below; any
+        // other failure, such as a TPM quote, stops the node (fail-closed).
+        match self.announce().await {
+            Err(FrostNetError::Transport(e)) => warn!(error = %e, "Initial announce failed"),
+            other => other?,
+        }
 
         // Re-announce often enough that an initiator with a short discovery
         // window reliably catches a periodic announce even if the immediate

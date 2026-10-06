@@ -1008,11 +1008,23 @@ pub fn cmd_frost_network_group_create(
             .map_err(|e| KeepError::CryptoErr(CryptoError::invalid_signature(e.to_string())))?;
 
         let spinner = out.spinner("Publishing group announcement...");
-        client
+        let output = client
             .send_event(&event)
             .await
             .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
         spinner.finish();
+        // `send_event` returns `Ok` even when every relay refused the event.
+        if output.success.is_empty() {
+            let reasons: Vec<String> = output
+                .failed
+                .iter()
+                .map(|(url, why)| format!("{url}: {why}"))
+                .collect();
+            return Err(KeepError::NetworkErr(NetworkError::publish(format!(
+                "no relay accepted the group announcement ({})",
+                reasons.join("; ")
+            ))));
+        }
 
         out.newline();
         out.success("Group announcement published!");

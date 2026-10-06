@@ -92,17 +92,39 @@ impl NostrTransport {
     }
 }
 
+/// `Client::send_event` returns `Ok` even when every relay refused the event,
+/// so a send counts only once at least one relay accepted it.
+pub(crate) fn require_accepted(output: &Output<EventId>) -> std::result::Result<(), String> {
+    if !output.success.is_empty() {
+        return Ok(());
+    }
+    let reasons: Vec<String> = output
+        .failed
+        .iter()
+        .map(|(url, why)| format!("{url}: {why}"))
+        .collect();
+    Err(format!(
+        "no relay accepted the event ({})",
+        if reasons.is_empty() {
+            "no relays".to_string()
+        } else {
+            reasons.join("; ")
+        }
+    ))
+}
+
 impl CosignTransport for NostrTransport {
     fn send_event<'a>(
         &'a self,
         event: &'a Event,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            self.client
+            let output = self
+                .client
                 .send_event(event)
                 .await
                 .map_err(|e| FrostNetError::Transport(e.to_string()))?;
-            Ok(())
+            require_accepted(&output).map_err(FrostNetError::Transport)
         })
     }
 
@@ -135,5 +157,39 @@ impl CosignTransport for NostrTransport {
 
     fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
         self.client.notifications()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    fn output(success: &[&str], failed: &[(&str, &str)]) -> Output<EventId> {
+        Output {
+            val: EventId::all_zeros(),
+            success: success
+                .iter()
+                .map(|u| RelayUrl::parse(u).unwrap())
+                .collect::<HashSet<_>>(),
+            failed: failed
+                .iter()
+                .map(|(u, why)| (RelayUrl::parse(u).unwrap(), why.to_string()))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    #[test]
+    fn a_send_no_relay_accepted_is_an_error() {
+        assert!(require_accepted(&output(&["wss://a.example"], &[])).is_ok());
+        assert!(require_accepted(&output(
+            &["wss://a.example"],
+            &[("wss://b.example", "blocked")]
+        ))
+        .is_ok());
+        let err =
+            require_accepted(&output(&[], &[("wss://b.example", "blocked: kind")])).unwrap_err();
+        assert!(err.contains("blocked: kind"), "{err}");
+        assert!(require_accepted(&output(&[], &[])).is_err());
     }
 }

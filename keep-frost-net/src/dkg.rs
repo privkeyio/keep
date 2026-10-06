@@ -736,11 +736,13 @@ impl ClientTransport {
 impl DkgTransport for ClientTransport {
     fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.client
+            let output = self
+                .client
                 .send_event(event)
                 .await
-                .map(|_| ())
-                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))
+                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e.to_string())))?;
+            crate::node::require_accepted(&output)
+                .map_err(|e| KeepError::NetworkErr(NetworkError::publish(e)))
         })
     }
 
@@ -1029,8 +1031,11 @@ pub async fn run_software_dkg(
     let mut participant_pubkeys: HashMap<u16, PublicKey> = HashMap::new();
     let mut round1_done = 0u32;
     let mut seen_round1: HashSet<EventId> = HashSet::new();
+    // A round ends only once a relay has accepted our own event too, or a
+    // peer still waiting on it would stall after we move on.
+    let mut round1_sent = false;
     let start = Instant::now();
-    while round1_done < expected_peers {
+    while round1_done < expected_peers || !round1_sent {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
@@ -1039,9 +1044,15 @@ pub async fn run_software_dkg(
                 "waiting for peer round1 packages",
             )));
         }
-        transport
+        // Each pass re-sends; a refused attempt is retried on the next pass
+        // until the round times out.
+        match transport
             .send_event(&build_signed(DKG_KIND_ROUND1, &round1_content, &[])?)
-            .await?;
+            .await
+        {
+            Ok(()) => round1_sent = true,
+            Err(e) => tracing::warn!(error = %e, "DKG round 1 send failed; retrying"),
+        }
         let events = transport
             .fetch_events(round1_filter.clone(), Duration::from_secs(5))
             .await?;
@@ -1094,7 +1105,7 @@ pub async fn run_software_dkg(
                 ),
             }
         }
-        if round1_done < expected_peers {
+        if round1_done < expected_peers || !round1_sent {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -1132,8 +1143,9 @@ pub async fn run_software_dkg(
         .custom_tag(SingleLetterTag::lowercase(Alphabet::D), group.to_string());
     let mut round2_done = 0u32;
     let mut seen_round2: HashSet<EventId> = HashSet::new();
+    let mut round2_sent: HashSet<u16> = HashSet::new();
     let start = Instant::now();
-    while round2_done < expected_peers {
+    while round2_done < expected_peers || round2_sent.len() < round2_outbound.len() {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
@@ -1147,9 +1159,17 @@ pub async fn run_software_dkg(
                 TagKind::custom("recipient_index"),
                 vec![recipient_index.to_string()],
             );
-            transport
+            match transport
                 .send_event(&build_signed(DKG_KIND_ROUND2, encrypted, &[recipient_tag])?)
-                .await?;
+                .await
+            {
+                Ok(()) => {
+                    round2_sent.insert(*recipient_index);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, recipient_index, "DKG round 2 send failed; retrying")
+                }
+            }
         }
         let events = transport
             .fetch_events(round2_filter.clone(), Duration::from_secs(5))
@@ -1211,7 +1231,7 @@ pub async fn run_software_dkg(
                 ),
             }
         }
-        if round2_done < expected_peers {
+        if round2_done < expected_peers || round2_sent.len() < round2_outbound.len() {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -1253,8 +1273,9 @@ pub async fn run_software_dkg(
     // so the finalized certificate is transferable to a peer that times out.
     let mut peer_confirmations: BTreeMap<u16, Event> = BTreeMap::new();
     let mut seen_confirm: HashSet<EventId> = HashSet::new();
+    let mut confirm_sent = false;
     let start = Instant::now();
-    while (confirmed_indices.len() as u32) < expected_peers {
+    while (confirmed_indices.len() as u32) < expected_peers || !confirm_sent {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
@@ -1263,9 +1284,13 @@ pub async fn run_software_dkg(
                 "waiting for peer group-key confirmations (possible relay equivocation)",
             )));
         }
-        transport
+        match transport
             .send_event(&build_signed(DKG_KIND_CONFIRM, &our_transcript_hex, &[])?)
-            .await?;
+            .await
+        {
+            Ok(()) => confirm_sent = true,
+            Err(e) => tracing::warn!(error = %e, "DKG confirmation send failed; retrying"),
+        }
         let events = transport
             .fetch_events(confirm_filter.clone(), Duration::from_secs(5))
             .await?;
@@ -1301,7 +1326,7 @@ pub async fn run_software_dkg(
                 });
             }
         }
-        if (confirmed_indices.len() as u32) < expected_peers {
+        if (confirmed_indices.len() as u32) < expected_peers || !confirm_sent {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
@@ -2024,6 +2049,67 @@ mod tests {
             &progress,
         )
         .await
+    }
+
+    /// Refuses the first send of each event kind, as a relay rate limit would.
+    struct RefuseFirstTransport {
+        inner: MeshTransport,
+        refused: StdMutex<std::collections::HashSet<u16>>,
+    }
+
+    impl DkgTransport for RefuseFirstTransport {
+        fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                if self.refused.lock().unwrap().insert(event.kind.as_u16()) {
+                    return Err(KeepError::NetworkErr(NetworkError::publish(
+                        "no relay accepted the event (refused in test)",
+                    )));
+                }
+                self.inner.send_event(event).await
+            })
+        }
+
+        fn fetch_events(
+            &self,
+            filter: Filter,
+            timeout: Duration,
+        ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
+            self.inner.fetch_events(filter, timeout)
+        }
+    }
+
+    /// A refused send in any round is retried on the next pass instead of
+    /// failing the DKG.
+    #[tokio::test(start_paused = true)]
+    async fn refused_sends_are_retried_until_the_round_completes() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x5c; 32]);
+        let bus = MeshBus::default();
+        let to = Duration::from_secs(300);
+
+        let flaky = async {
+            let mut session = SoftwareDkgSession::init(2, 2, 1).unwrap();
+            let transport = RefuseFirstTransport {
+                inner: MeshTransport { bus: bus.clone() },
+                refused: StdMutex::new(Default::default()),
+            };
+            let cancel = AtomicBool::new(false);
+            run_software_dkg(
+                &mut session,
+                &transport,
+                &keys[0],
+                &roster,
+                "g",
+                1,
+                to,
+                &cancel,
+                &NoopProgress,
+            )
+            .await
+        };
+        let (r1, r2) = tokio::join!(flaky, run_party(&bus, &keys[1], &roster, "g", 2, to));
+        let (o1, o2) = (r1.unwrap(), r2.unwrap());
+        assert_eq!(o1.result.group_pubkey, o2.result.group_pubkey);
     }
 
     /// A 2-of-2 DKG runs end to end over the fake transport: both parties agree
