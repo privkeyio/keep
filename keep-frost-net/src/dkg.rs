@@ -291,7 +291,7 @@ pub async fn fetch_group_roster(client: &Client, group_id_hex: &str) -> Result<D
 
     Err(last_err.unwrap_or_else(|| {
         KeepError::NetworkErr(NetworkError::timeout(
-            "no kind-21101 group announcement found for the requested group id \
+            "no kind-31101 group announcement found for the requested group id \
              (run `keep frost network group-create` first, or point at the relay it was published on)",
         ))
     }))

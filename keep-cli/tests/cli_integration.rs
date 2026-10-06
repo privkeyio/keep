@@ -1934,3 +1934,133 @@ async fn test_list_coexists_with_running_daemon() {
 
     drop(mock);
 }
+
+/// The documented CLI ceremony creates a group: each participant enrolls a
+/// subkey, the coordinator publishes the roster, and every participant runs
+/// `dkg` with its own group name and the coordinator's group id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_software_dkg_ceremony_creates_one_group() {
+    let bin = match keep_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
+            return;
+        }
+    };
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock = nostr_relay_builder::MockRelay::run()
+        .await
+        .expect("mock relay start");
+    let relay = mock.url().await.to_string();
+    let dir = TempDir::new().unwrap();
+    let names = ["alice-group", "bob-group", "carol-group"];
+    let vaults: Vec<PathBuf> = (1..=3).map(|i| dir.path().join(format!("v{i}"))).collect();
+
+    let mut subkeys = Vec::new();
+    for (vault, name) in vaults.iter().zip(names) {
+        assert_success(&KeepCmd::new(&bin).path(vault).args(["init"]).run());
+        let out = KeepCmd::new(&bin)
+            .path(vault)
+            .args(["frost", "network", "group-subkey", "--group", name])
+            .run();
+        assert_success(&out);
+        let text = String::from_utf8_lossy(&out.stderr).to_string()
+            + &String::from_utf8_lossy(&out.stdout);
+        let hex = text
+            .lines()
+            .find(|l| l.contains("Subkey pubkey (hex)"))
+            .and_then(|l| l.split_whitespace().last())
+            .expect("subkey hex printed")
+            .to_string();
+        subkeys.push(hex);
+    }
+
+    let mut create = vec![
+        "frost",
+        "network",
+        "group-create",
+        "--name",
+        "shared-roster",
+        "--threshold",
+        "2",
+        "--participants",
+        "3",
+        "--relay",
+        &relay,
+        "--publish",
+    ];
+    for subkey in &subkeys {
+        create.push("--participant-subkey");
+        create.push(subkey);
+    }
+    let created = KeepCmd::new(&bin).path(&vaults[0]).args(&create).run();
+    assert_success(&created);
+    let text = String::from_utf8_lossy(&created.stderr).to_string()
+        + &String::from_utf8_lossy(&created.stdout);
+    let group_id = text
+        .lines()
+        .find(|l| l.contains("Group ID"))
+        .and_then(|l| l.split_whitespace().last())
+        .expect("group id printed")
+        .to_string();
+
+    let runs: Vec<_> = vaults
+        .iter()
+        .zip(names)
+        .enumerate()
+        .map(|(i, (vault, name))| {
+            let mut cmd = Command::new(&bin);
+            cmd.env("KEEP_PASSWORD", TEST_PASSWORD)
+                .env("KEEP_YES", "1")
+                .arg("--path")
+                .arg(vault)
+                .args([
+                    "frost",
+                    "network",
+                    "dkg",
+                    "--group",
+                    name,
+                    "--group-id",
+                    &group_id,
+                    "--threshold",
+                    "2",
+                    "--participants",
+                    "3",
+                    "--index",
+                    &(i + 1).to_string(),
+                    "--relay",
+                    &relay,
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            cmd.spawn().expect("spawn dkg")
+        })
+        .collect();
+    let outputs: Vec<Output> = tokio::task::spawn_blocking(move || {
+        runs.into_iter()
+            .map(|c| c.wait_with_output().expect("dkg output"))
+            .collect()
+    })
+    .await
+    .unwrap();
+
+    let mut group_keys = Vec::new();
+    for out in &outputs {
+        assert_success(out);
+        let text = String::from_utf8_lossy(&out.stderr).to_string()
+            + &String::from_utf8_lossy(&out.stdout);
+        let key = text
+            .lines()
+            .find(|l| l.contains("Group public key"))
+            .and_then(|l| l.split_whitespace().last())
+            .expect("group key printed")
+            .to_string();
+        group_keys.push(key);
+    }
+    assert_eq!(group_keys[0], group_keys[1]);
+    assert_eq!(group_keys[1], group_keys[2]);
+}
