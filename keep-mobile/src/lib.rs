@@ -5151,6 +5151,7 @@ mod sign_request_mapping_tests {
             message_type: message_type.into(),
             structured_payload: None,
             derivation_path: vec![],
+            taproot_tweak: None,
         }
     }
 
@@ -5330,6 +5331,7 @@ mod baseline_presign_policy_tests {
             message_type: message_type.to_string(),
             structured_payload: None,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 

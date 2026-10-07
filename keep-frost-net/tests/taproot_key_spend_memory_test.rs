@@ -15,16 +15,18 @@ use keep_core::frost::bip32_signing::derive_child;
 use keep_core::frost::taproot::{verify_key_path_signature, TaprootTweak};
 use keep_core::frost::{ThresholdConfig, TrustedDealer};
 use keep_frost_net::test_support::{key_spend_payload, MemoryBus};
-use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent, TaprootTweakPayload};
+use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent, ServeHooks, TaprootTweakPayload};
 use tokio::time::timeout;
 
 struct Group {
     group_pubkey: [u8; 32],
     requester: Arc<KfpNode>,
-    _nodes: Vec<Arc<KfpNode>>,
+    nodes: Vec<Arc<KfpNode>>,
 }
 
-async fn group() -> Group {
+/// A 2-of-3 group whose two co-signers do (`allow`) or do not opt in to
+/// key-path spends; node 3 requests.
+async fn group_with(allow: bool) -> Group {
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
     let (shares, _) = dealer.generate("mem-taproot-spend").unwrap();
     let group_pubkey = *shares[0].group_pubkey();
@@ -41,6 +43,14 @@ async fn group() -> Group {
             .expect("node")
         })
         .collect();
+    for node in &nodes[..2] {
+        node.set_hooks(Arc::new(ServeHooks {
+            refuse_raw_sign: false,
+            require_structured_payload: false,
+            auto_approve_oprf_eval: false,
+            allow_key_path_spend: allow,
+        }));
+    }
     let mut rx = nodes[2].subscribe();
     for node in &mut nodes {
         std::mem::forget(node.take_shutdown_handle());
@@ -65,8 +75,12 @@ async fn group() -> Group {
     Group {
         group_pubkey,
         requester: Arc::clone(&nodes[2]),
-        _nodes: nodes,
+        nodes,
     }
+}
+
+async fn group() -> Group {
+    group_with(true).await
 }
 
 async fn spend(
@@ -126,6 +140,25 @@ async fn a_recovery_tree_output_is_spent_on_the_key_path() {
     let (sighash, sig) = spend(&g, &spent, 0x00, &[], tweak).await;
     let sig = sig.expect("the group signs a key-path spend of its recovery output");
     verify_key_path_signature(&sig, &sighash, &spent).unwrap();
+}
+
+/// Co-signers that have not opted in refuse, even for the group's own output.
+#[tokio::test]
+async fn co_signers_refuse_key_path_spends_unless_they_opt_in() {
+    let g = group_with(false).await;
+    let path = [0u32, 3];
+    let child = derive_child(&g.group_pubkey, &path).unwrap().child_pubkey;
+    let spent = TaprootTweak::default().script_pubkey(&child).unwrap();
+    let (_, result) = spend(&g, &spent, 0x00, &path, Default::default()).await;
+    // A peer's refusal makes the requester fail over rather than stop, so the
+    // co-signers' audit logs, not the requester's error, show why.
+    result.expect_err("no co-signer approves key-path spends");
+    for co_signer in &g.nodes[..2] {
+        assert!(
+            !co_signer.audit_log().refusals().is_empty(),
+            "each co-signer that was asked must record its refusal"
+        );
+    }
 }
 
 /// The requester refuses before asking anyone: an output that is not the

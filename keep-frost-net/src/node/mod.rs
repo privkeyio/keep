@@ -366,6 +366,10 @@ pub struct SessionInfo {
     /// Hooks can inspect this to gate signing under specific chains (e.g.
     /// enforce `/0/*` for receive and refuse `/1/*` on a receive-only role).
     pub derivation_path: Vec<u32>,
+    /// Set on a key-path spend of a taproot output: the signature will verify
+    /// under the output key, so it moves the group's funds. Co-signing one also
+    /// needs [`SigningHooks::approve_key_path_spend`].
+    pub taproot_tweak: Option<TaprootTweakPayload>,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -386,6 +390,7 @@ impl From<&NetworkSession> for SessionInfo {
             // check runs in pre_sign where the request is in scope.
             structured_payload: None,
             derivation_path: session.derivation_path().to_vec(),
+            taproot_tweak: session.taproot_tweak(),
         }
     }
 }
@@ -429,6 +434,20 @@ pub trait SigningHooks: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let _ = (requester_share_index, session_id);
         Box::pin(async { false })
+    }
+
+    /// Called before a node co-signs a key-path spend of one of the group's
+    /// taproot outputs (a request with [`SessionInfo::taproot_tweak`]), after it
+    /// has checked the input is the group's own output and before
+    /// [`Self::pre_sign`]. Returning `false` refuses.
+    ///
+    /// SECURITY: the default is DENY. Such a signature spends real funds, and
+    /// the node's own checks only prove whose output it is, not where the money
+    /// goes. A co-signer opts in only where something decides that: a human who
+    /// is shown the spend, or a destination and amount policy.
+    fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
+        let _ = session;
+        false
     }
 }
 
@@ -571,6 +590,11 @@ pub struct ServeHooks {
     pub refuse_raw_sign: bool,
     pub require_structured_payload: bool,
     pub auto_approve_oprf_eval: bool,
+    /// Co-sign key-path spends of the group's taproot outputs unattended. This
+    /// node then signs any spend a group member requests that passes its own
+    /// checks (the input is the group's output, sighash DEFAULT or ALL), with no
+    /// limit on destination or amount.
+    pub allow_key_path_spend: bool,
 }
 
 impl SigningHooks for ServeHooks {
@@ -593,6 +617,9 @@ impl SigningHooks for ServeHooks {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let approve = self.auto_approve_oprf_eval;
         Box::pin(async move { approve })
+    }
+    fn approve_key_path_spend(&self, _session: &SessionInfo) -> bool {
+        self.allow_key_path_spend
     }
 }
 
@@ -3969,6 +3996,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: true,
+            allow_key_path_spend: false,
         };
         assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
 
@@ -3976,6 +4004,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
+            allow_key_path_spend: false,
         };
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
@@ -3986,6 +4015,7 @@ mod tests {
             refuse_raw_sign: true,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
+            allow_key_path_spend: false,
         };
 
         let raw = raw_session();
@@ -4167,6 +4197,7 @@ mod tests {
             message_type: "raw".to_string(),
             structured_payload: None,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 
@@ -4182,6 +4213,7 @@ mod tests {
             message_type: crate::MSG_TYPE_NOSTR_EVENT.to_string(),
             structured_payload: structured,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 

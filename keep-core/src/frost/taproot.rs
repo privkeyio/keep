@@ -20,7 +20,9 @@ use frost_secp256k1_tr::VerifyingKey;
 
 use crate::error::{KeepError, Result};
 
-use super::bip32_signing::{derive_child, tweak_key_package_at_path};
+use super::bip32_signing::{
+    derive_child, tweak_key_package_at_path, tweak_public_key_package_at_path,
+};
 use super::SharePackage;
 
 /// The BIP-341 tweak for a key-path spend: no script tree for a BIP-86 output,
@@ -60,6 +62,45 @@ impl TaprootTweak {
     pub fn tweak_public_key_package(&self, pkp: PublicKeyPackage) -> PublicKeyPackage {
         pkp.tweak(self.merkle_root.as_ref())
     }
+}
+
+/// The taproot internal key at `path` below the x-only `group` key: the group
+/// key itself for an empty path.
+pub fn internal_key(group: &[u8; 32], path: &[u32]) -> Result<[u8; 32]> {
+    if path.is_empty() {
+        Ok(*group)
+    } else {
+        Ok(derive_child(group, path)?.child_pubkey)
+    }
+}
+
+/// `kp` as it signs for `path` below `group` and, for a key-path spend, with
+/// `tweak` on top.
+pub fn spend_key_package(
+    kp: &KeyPackage,
+    group: &[u8; 32],
+    path: &[u32],
+    tweak: Option<TaprootTweak>,
+) -> Result<KeyPackage> {
+    let kp = tweak_key_package_at_path(kp, group, path)?;
+    Ok(match tweak {
+        Some(t) => t.tweak_key_package(kp),
+        None => kp,
+    })
+}
+
+/// The public key package matching [`spend_key_package`], for aggregation.
+pub fn spend_public_key_package(
+    pkp: &PublicKeyPackage,
+    group: &[u8; 32],
+    path: &[u32],
+    tweak: Option<TaprootTweak>,
+) -> Result<PublicKeyPackage> {
+    let pkp = tweak_public_key_package_at_path(pkp, group, path)?;
+    Ok(match tweak {
+        Some(t) => t.tweak_public_key_package(pkp),
+        None => pkp,
+    })
 }
 
 /// The x-only form of a FROST verifying key: the taproot internal key it stands
@@ -104,13 +145,8 @@ pub fn sign_key_path_spend_with_local_shares(
             shares.len()
         )));
     }
-    let group = x_only(first.key_package()?.verifying_key())?;
-    let internal = if path.is_empty() {
-        group
-    } else {
-        derive_child(&group, path)?.child_pubkey
-    };
-    if tweak.script_pubkey(&internal)? != *script_pubkey {
+    let group = x_only(first.pubkey_package()?.verifying_key())?;
+    if tweak.script_pubkey(&internal_key(&group, path)?)? != *script_pubkey {
         return Err(KeepError::Frost(
             "scriptPubKey is not this group's output for the path and tweak".into(),
         ));
@@ -118,10 +154,7 @@ pub fn sign_key_path_spend_with_local_shares(
 
     let key_packages = shares[..threshold]
         .iter()
-        .map(|s| {
-            let kp = tweak_key_package_at_path(&s.key_package()?, &group, path)?;
-            Ok(tweak.tweak_key_package(kp))
-        })
+        .map(|s| spend_key_package(&s.key_package()?, &group, path, Some(tweak)))
         .collect::<Result<Vec<_>>>()?;
     let signature = super::signing::aggregate_local(&key_packages, sighash)?;
 
@@ -154,7 +187,6 @@ pub fn verify_key_path_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frost::bip32_signing::tweak_public_key_package_at_path;
     use crate::frost::{ThresholdConfig, TrustedDealer};
     use bitcoin::key::TapTweak;
     use frost_secp256k1_tr::rand_core::OsRng;

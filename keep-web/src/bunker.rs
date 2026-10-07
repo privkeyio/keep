@@ -480,6 +480,7 @@ mod tests {
             message_type: String::new(),
             structured_payload: None,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 

@@ -93,6 +93,13 @@ pub fn session_salt(attempt: u64, path: &[u32], tweak: Option<&TaprootTweakPaylo
 /// some attempt, so the session id the responder validates against it is bound
 /// to the key the request asks it to sign with.
 pub fn salt_binds(salt: &[u8], path: &[u32], tweak: Option<&TaprootTweakPayload>) -> bool {
+    // The marker is unambiguous only after unhardened path indexes.
+    if path
+        .iter()
+        .any(|&i| i >= crate::protocol::BIP32_HARDENED_INDEX_START)
+    {
+        return false;
+    }
     if salt.is_empty() {
         return path.is_empty() && tweak.is_none();
     }
@@ -588,6 +595,15 @@ impl NetworkSession {
     const MAX_SIGNATURE_SHARES: usize = 256;
 
     pub fn from_cached_state(cached: CachedSessionState) -> Result<Self> {
+        // The cache is validated against the unsalted session id below, which
+        // binds neither a path nor a tweak, so a cache claiming one is refused
+        // rather than trusted.
+        if !cached.derivation_path.is_empty() || cached.taproot_tweak.is_some() {
+            return Err(FrostNetError::Session(
+                "A cached session with a derivation path or taproot tweak cannot be restored"
+                    .into(),
+            ));
+        }
         if cached.message.len() > Self::MAX_MESSAGE_SIZE {
             return Err(FrostNetError::Session(format!(
                 "Message too large: {} bytes (max {})",
@@ -1069,17 +1085,28 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_session_keeps_its_taproot_tweak() {
+    fn a_cached_session_with_a_path_or_tweak_is_not_restored() {
         let message = vec![9u8; 32];
         let session_id = derive_session_id(&message, &[1, 2], 2);
         let mut session = NetworkSession::new(session_id, message, 2, vec![1, 2]);
         let tweak = TaprootTweakPayload {
             merkle_root: Some([4; 32]),
         };
+        assert!(NetworkSession::from_cached_state(session.to_cached_state().unwrap()).is_ok());
         session.set_taproot_tweak(Some(tweak));
-        let restored =
-            NetworkSession::from_cached_state(session.to_cached_state().unwrap()).unwrap();
-        assert_eq!(restored.taproot_tweak(), Some(tweak));
+        assert!(NetworkSession::from_cached_state(session.to_cached_state().unwrap()).is_err());
+        session.set_taproot_tweak(None);
+        session.set_derivation_path(vec![0, 1]);
+        assert!(NetworkSession::from_cached_state(session.to_cached_state().unwrap()).is_err());
+    }
+
+    #[test]
+    fn a_hardened_path_never_binds_a_salt() {
+        let hardened = [0u32, crate::protocol::BIP32_HARDENED_INDEX_START];
+        for tweak in [None, Some(TaprootTweakPayload::default())] {
+            let salt = session_salt(0, &hardened, tweak.as_ref());
+            assert!(!salt_binds(&salt, &hardened, tweak.as_ref()));
+        }
     }
 
     #[test]

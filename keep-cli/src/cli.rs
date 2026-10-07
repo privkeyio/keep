@@ -702,6 +702,12 @@ pub(crate) enum FrostNetworkCommands {
         /// structured payloads.
         #[arg(long)]
         require_structured_sign: bool,
+        /// Co-sign key-path spends of the group's taproot outputs without asking.
+        /// The node checks the input is the group's own output and the sighash is
+        /// DEFAULT or ALL, but signs any destination and amount a group member
+        /// requests. Off by default: key-path spends are refused.
+        #[arg(long)]
+        allow_key_path_spend: bool,
         /// TOML file pinning each peer's TPM attestation key and the reference
         /// PCRs they must quote. The node verifies a peer's measured-boot state
         /// against this before answering its OPRF evaluation requests. Required
