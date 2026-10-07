@@ -245,24 +245,23 @@ a number of seconds.
 
 ## Bitcoin
 
-BIP-86 Taproot addresses and PSBT signing:
+BIP-86 Taproot addresses and PSBT signing. `--network` (mainnet, testnet, signet, regtest) is required on every command:
 
 ```bash
-# Get receive address
-keep bitcoin address --key main
+# Get receive addresses
+keep bitcoin address --key main --count 5 --network mainnet
 
-# Get change address
-keep bitcoin address --key main --change
-
-# Export watch-only descriptor
-keep bitcoin descriptor --key main
+# Export the watch-only descriptors (receive and change)
+keep bitcoin descriptor --key main --network mainnet
 
 # Analyze PSBT
-keep bitcoin analyze --psbt unsigned.psbt
+keep bitcoin analyze --psbt unsigned.psbt --network mainnet
 
 # Sign PSBT
-keep bitcoin sign --key main --psbt unsigned.psbt
+keep bitcoin sign --key main --psbt unsigned.psbt --network mainnet
 ```
+
+Build the PSBT in a watch-only wallet that imported the exported descriptors, so each input carries its BIP-371 key origin (`tap_key_origins`). `sign` derives the key that origin names, applies the BIP-86 key-path tweak, and signs only an input whose scriptPubKey that tweaked key actually owns. An input without the wallet's key origin is left unsigned. Change is recognised the same way.
 
 ---
 
