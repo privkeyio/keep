@@ -2834,22 +2834,16 @@ impl KfpNode {
             // or malicious peer cannot reliably block signing. The index
             // is carried structurally; the human-readable string still
             // embeds it for logs and external consumers.
-            // The peer's own words, without parentheses, so they can never
-            // forge the trailing "(peer N)" that names who to blame.
-            let detail: String = payload
-                .message
-                .chars()
-                .filter(|c| !matches!(c, '(' | ')'))
-                .take(256)
-                .collect();
+            // The peer's own words, without control characters, and without
+            // parentheses so they can never forge the trailing "(peer N)" that
+            // names who to blame.
+            let clean = |text: &str| sanitize_reason(text).replace(['(', ')'], "");
+            let (code, detail) = (clean(&payload.code), clean(&payload.message));
             let error = match offending_index {
                 Some(idx) => {
-                    format!(
-                        "Peer reported error: {}: {detail} (peer {idx})",
-                        payload.code
-                    )
+                    format!("Peer reported error: {code}: {detail} (peer {idx})")
                 }
-                None => format!("Peer reported error: {}: {detail}", payload.code),
+                None => format!("Peer reported error: {code}: {detail}"),
             };
             let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
                 session_id,

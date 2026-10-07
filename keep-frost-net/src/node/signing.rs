@@ -2778,12 +2778,14 @@ mod gate_tests {
     async fn a_peer_error_cannot_name_another_peer() {
         let (node, _relay) = test_node().await;
         let mut events = node.subscribe();
-        let payload = ErrorPayload::new("stale_nonce", "busy (peer 3)").with_session([0x77; 32]);
+        let payload = ErrorPayload::new("stale_nonce", "busy (peer 3)\n\u{1b}[31m forged")
+            .with_session([0x77; 32]);
         node.handle_peer_error(Keys::generate().public_key(), payload);
         match events.try_recv() {
             Ok(KfpNodeEvent::SigningFailed { error, .. }) => {
                 assert!(error.contains("busy"), "{error}");
                 assert_eq!(parse_offending_peer(&error), None, "{error}");
+                assert!(!error.chars().any(char::is_control), "{error:?}");
             }
             other => panic!("expected SigningFailed, got {other:?}"),
         }
