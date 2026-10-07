@@ -109,14 +109,15 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    if: github.event_name == 'push'
+    # Tests only: the release workflow builds the Windows binaries, and a release
+    # build here took most of this job's time.
+    if: github.event.pull_request.draft != true && github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows-latest
-      - run: cargo build --release
       - run: cargo test --workspace --lib --bins
 
   android:
