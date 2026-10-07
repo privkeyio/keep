@@ -48,6 +48,8 @@ pub struct OutputInfo {
 pub struct PsbtSigner {
     secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
+    /// BIP-86 output key of the secret used directly as a key.
+    single_key_output: XOnlyPublicKey,
     fingerprint: Fingerprint,
     secp: Secp256k1<bitcoin::secp256k1::All>,
     network: Network,
@@ -78,9 +80,15 @@ impl PsbtSigner {
         let fingerprint = master.fingerprint(&secp);
         master.private_key.non_secure_erase();
 
+        let single_key_output = x_only_pubkey
+            .tap_tweak(&secp, None)
+            .0
+            .to_x_only_public_key();
+
         Ok(Self {
             secret: MlockedBox::new(secret),
             x_only_pubkey,
+            single_key_output,
             fingerprint,
             secp,
             network,
@@ -143,7 +151,7 @@ impl PsbtSigner {
     }
 
     /// The tweaked wallet key that spends BIP-86 output `spk` on the key path, if the
-    /// wallet holds it: the secret as a key, or the BIP-86 child of an `origins` entry
+    /// wallet holds it: the secret as a key (when `single_key`), or the BIP-86 child of an `origins` entry
     /// carrying this wallet's fingerprint whose path `accept` allows. Each candidate
     /// is first checked publicly (its key, tweaked, must be the output key), so PSBT
     /// metadata only names which key to try, can never make the signer use or claim a
@@ -152,6 +160,7 @@ impl PsbtSigner {
         &self,
         spk: &ScriptBuf,
         origins: &TapKeyOrigins,
+        single_key: bool,
         accept: impl Fn(&DerivationPath) -> bool,
     ) -> Result<Option<Keypair>> {
         if !spk.is_p2tr() {
@@ -163,7 +172,7 @@ impl PsbtSigner {
         let owns = |key: XOnlyPublicKey| {
             key.tap_tweak(&self.secp, None).0.to_x_only_public_key() == output_key
         };
-        let (expected, path) = if owns(self.x_only_pubkey) {
+        let (expected, path) = if single_key && self.single_key_output == output_key {
             (self.x_only_pubkey, None)
         } else {
             match origins.iter().find(|(key, (leaves, (fp, path)))| {
@@ -196,7 +205,7 @@ impl PsbtSigner {
         if input.tap_merkle_root.is_some() {
             return Ok(None);
         }
-        self.key_path_signer(&utxo.script_pubkey, &input.tap_key_origins, |p| {
+        self.key_path_signer(&utxo.script_pubkey, &input.tap_key_origins, true, |p| {
             self.is_wallet_path(p)
         })
     }
@@ -214,6 +223,7 @@ impl PsbtSigner {
                 .ok_or_else(|| BitcoinError::InvalidPsbt("input value overflow".into()))?;
 
             if self.should_sign_input(psbt, i)? {
+                requested_sighash_type(psbt, i)?;
                 signable_inputs.push(i);
             }
         }
@@ -272,30 +282,37 @@ impl PsbtSigner {
 
         let prevouts_ref = Prevouts::All(&prevouts);
 
+        // Every input is checked before anything is written, so a refusal never leaves
+        // a partly signed PSBT.
+        let mut signers: Vec<(usize, Keypair, TapSighashType)> = Vec::new();
+        let mut result = Ok(());
         for i in 0..psbt.inputs.len() {
-            let Some(mut keypair) = self.input_signer(psbt, i)? else {
-                continue;
-            };
-            // DEFAULT and ALL both commit to every input and output; anything narrower
-            // was asked for by the PSBT author and is refused rather than silently
-            // replaced with a different commitment.
-            let sighash_type = match psbt.inputs[i].sighash_type.map(|t| t.taproot_hash_ty()) {
-                None => TapSighashType::Default,
-                Some(Ok(t @ (TapSighashType::Default | TapSighashType::All))) => t,
-                Some(_) => {
-                    keypair.non_secure_erase();
-                    return Err(BitcoinError::Signing(format!(
-                        "input {i} requests a sighash type other than DEFAULT or ALL"
-                    )));
+            match self.input_signer(psbt, i) {
+                Ok(None) => {}
+                Ok(Some(mut keypair)) => match requested_sighash_type(psbt, i) {
+                    Ok(sighash_type) => signers.push((i, keypair, sighash_type)),
+                    Err(e) => {
+                        keypair.non_secure_erase();
+                        result = Err(e);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    result = Err(e);
+                    break;
                 }
-            };
-            let result = self.sign_taproot_keypath(psbt, i, &prevouts_ref, &keypair, sighash_type);
-            keypair.non_secure_erase();
-            result?;
-            signed_count += 1;
+            }
         }
-
-        Ok(signed_count)
+        for (i, keypair, sighash_type) in &signers {
+            if result.is_ok() {
+                result = self.sign_taproot_keypath(psbt, *i, &prevouts_ref, keypair, *sighash_type);
+                signed_count += usize::from(result.is_ok());
+            }
+        }
+        for (_, mut keypair, _) in signers {
+            keypair.non_secure_erase();
+        }
+        result.map(|()| signed_count)
     }
 
     fn should_sign_input(&self, psbt: &Psbt, index: usize) -> Result<bool> {
@@ -358,7 +375,9 @@ impl PsbtSigner {
         let Some(output) = psbt.outputs.get(index) else {
             return false;
         };
-        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, |p| {
+        // The single-key address is not in the exported descriptors, so a watch-only
+        // wallet never sees it: it is the wallet's, but not change.
+        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, false, |p| {
             self.is_change_path(p)
         }) {
             Ok(Some(mut keypair)) => {
@@ -367,6 +386,19 @@ impl PsbtSigner {
             }
             _ => false,
         }
+    }
+}
+
+/// The sighash type input `index` asks for, if it is one the signer will use. DEFAULT
+/// and ALL both commit to every input and output; anything narrower was asked for by
+/// the PSBT author and is refused rather than silently replaced.
+fn requested_sighash_type(psbt: &Psbt, index: usize) -> Result<TapSighashType> {
+    match psbt.inputs[index].sighash_type.map(|t| t.taproot_hash_ty()) {
+        None => Ok(TapSighashType::Default),
+        Some(Ok(t @ (TapSighashType::Default | TapSighashType::All))) => Ok(t),
+        Some(_) => Err(BitcoinError::Signing(format!(
+            "input {index} requests a sighash type other than DEFAULT or ALL"
+        ))),
     }
 }
 
@@ -589,11 +621,12 @@ mod tests {
         let mut attacker_secret = [9u8; 32];
         let attacker = other_address(&mut attacker_secret);
 
-        // An output paying the signer's own key-path address is change...
+        // The single-key address is the signer's, but no watch-only wallet built from
+        // the exported descriptors sees it, so paying it is not change...
         let change = psbt_paying(own.script_pubkey(), 10_000, 20_000, None);
         assert!(
-            signer.analyze(&change).unwrap().outputs[0].is_change,
-            "an output paying the signer's own key-path address must be change"
+            !signer.analyze(&change).unwrap().outputs[0].is_change,
+            "the single-key address is outside the exported descriptors"
         );
 
         // ...but an output paying an attacker address is NOT change, even with the
@@ -1010,5 +1043,38 @@ mod tests {
         assert_eq!(signed, 1);
         assert!(spends_on_chain(&psbt, 0));
         assert_eq!(used, 1, "secret derivations for one input");
+    }
+
+    #[test]
+    fn a_refused_input_leaves_the_whole_psbt_unsigned() {
+        use bitcoin::psbt::PsbtSighashType;
+        let a = derived(false, 0);
+        let b = derived(false, 1);
+        let mut psbt = spending(&[a.address.script_pubkey(), b.address.script_pubkey()]);
+        with_origin(
+            &mut psbt,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        with_origin(
+            &mut psbt,
+            1,
+            b.public_key,
+            fingerprint(),
+            &b.path.to_string(),
+        );
+        psbt.inputs[1].sighash_type = Some(PsbtSighashType::from(TapSighashType::Single));
+        assert!(
+            signer().analyze(&psbt).is_err(),
+            "analyze refuses before any prompt"
+        );
+        assert!(signer().sign(&mut psbt).is_err());
+        assert!(
+            psbt.inputs[0].tap_key_sig.is_none(),
+            "nothing written for input 0"
+        );
+        assert!(psbt.inputs[1].tap_key_sig.is_none());
     }
 }

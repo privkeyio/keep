@@ -261,7 +261,7 @@ keep bitcoin analyze --psbt unsigned.psbt --network mainnet
 keep bitcoin sign --key main --psbt unsigned.psbt --network mainnet
 ```
 
-Build the PSBT in a watch-only wallet that imported the exported descriptors, so each input carries its BIP-371 key origin (`tap_key_origins`). `sign` derives the key that origin names, applies the BIP-86 key-path tweak, and signs only an input whose scriptPubKey that tweaked key actually owns. An input without the wallet's key origin is left unsigned. Change is recognized the same way, on the change chain of account 0.
+Build the PSBT in a watch-only wallet that imported the exported descriptors, so each input carries its BIP-371 key origin (`tap_key_origins`). `sign` derives the key that origin names, applies the BIP-86 key-path tweak, and signs only an input whose scriptPubKey that tweaked key actually owns. An input without the wallet's key origin is left unsigned. Inputs must use sighash DEFAULT or ALL; a PSBT asking for anything narrower is refused. Change is recognized the same way, within the first 1000 addresses of account 0's change chain; any other output counts as a spend. `sign` shows the outputs, change and fee and asks for confirmation before signing (set `KEEP_YES` to skip the prompt in scripts).
 
 ---
 
