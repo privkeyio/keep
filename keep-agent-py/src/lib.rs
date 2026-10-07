@@ -413,7 +413,10 @@ impl PyAgentSession {
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
 
-        session.scope().check_psbt(&analysis).map_err(to_py_value_err)?;
+        session
+            .scope()
+            .check_psbt(&analysis)
+            .map_err(to_py_value_err)?;
 
         self.manager
             .record_request(&self.session_id)

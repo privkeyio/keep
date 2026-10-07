@@ -12,7 +12,6 @@ use zeroize::Zeroizing;
 
 use crate::error::{AgentError, Result};
 use crate::manager::SessionManager;
-use crate::scope::Operation;
 use crate::session::SessionToken;
 
 use super::tools::{self, ToolResult};
@@ -252,10 +251,12 @@ impl McpServer {
             (session, session_id.clone())
         };
 
+        if let Some(op) = tools::required_operation(name) {
+            session.check_operation(&op)?;
+        }
+
         let result = match name {
             "sign_nostr_event" => {
-                session.check_operation(&Operation::SignNostrEvent)?;
-
                 let kind_u64 = arguments
                     .get("kind")
                     .and_then(|v| v.as_u64())
@@ -328,8 +329,6 @@ impl McpServer {
             }
 
             "sign_bitcoin_psbt" => {
-                session.check_operation(&Operation::SignPsbt)?;
-
                 let psbt_base64 = arguments
                     .get("psbt")
                     .and_then(|v| v.as_str())
@@ -370,8 +369,6 @@ impl McpServer {
             }
 
             "get_nostr_pubkey" => {
-                session.check_operation(&Operation::GetPublicKey)?;
-
                 let pubkey_bytes = session.pubkey();
                 let npub = keep_core::keys::bytes_to_npub(pubkey_bytes);
 
@@ -382,8 +379,6 @@ impl McpServer {
             }
 
             "get_bitcoin_address" => {
-                session.check_operation(&Operation::GetBitcoinAddress)?;
-
                 let addr_type = arguments
                     .get("type")
                     .and_then(|v| v.as_str())
@@ -527,7 +522,7 @@ mod tests {
     // through `handle_request_async` and assert the initialize handshake, the
     // advertised toolset, per-tool call results, and the session permission
     // model (which gates every signing tool).
-    use crate::scope::SessionScope;
+    use crate::scope::{Operation, SessionScope};
     use crate::session::SessionConfig;
 
     fn signing_server() -> McpServer {
