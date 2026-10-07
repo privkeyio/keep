@@ -11,7 +11,7 @@ use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::get_password;
+use super::{confirm_prompt, get_password};
 
 pub fn cmd_bitcoin_address(
     out: &Output,
@@ -113,6 +113,7 @@ pub fn cmd_bitcoin_sign(
     psbt_path: &str,
     output_path: Option<&str>,
     network: &str,
+    yes: bool,
 ) -> Result<()> {
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -142,6 +143,23 @@ pub fn cmd_bitcoin_sign(
 
     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
+
+    let analysis = signer
+        .analyze_psbt(&psbt)
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    print_analysis(out, &analysis, true);
+    if analysis.signable_inputs.is_empty() {
+        return Err(KeepError::Runtime(
+            "no input in this PSBT spends one of this key's addresses".into(),
+        ));
+    }
+    // Only an explicit --yes skips this: it is the one check `keep bitcoin sign` has.
+    if !yes
+        && !confirm_prompt("Sign this PSBT?")
+            .map_err(|e| KeepError::Runtime(format!("{e}; pass --yes to sign without a prompt")))?
+    {
+        return Err(KeepError::Runtime("signing declined".into()));
+    }
 
     let spinner = out.spinner("Signing PSBT...");
     let signed_count = signer
@@ -181,6 +199,7 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     let net = parse_network(network)?;
+    // Amounts and fee need no key; ownership does, so it is not reported here.
     let mut dummy_secret = [1u8; 32];
     let signer = keep_bitcoin::BitcoinSigner::new(&mut dummy_secret, net)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
@@ -189,6 +208,13 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
         .analyze_psbt(&psbt)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
+    print_analysis(out, &analysis, false);
+    Ok(())
+}
+
+/// Prints a PSBT analysis. Change and signable inputs are only meaningful when
+/// `analysis` was made with the signing key (`with_key`).
+fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key: bool) {
     out.newline();
     out.header("PSBT Analysis");
     out.field("Inputs", &analysis.num_inputs.to_string());
@@ -235,31 +261,46 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
     out.info("Outputs:");
     for output in &analysis.outputs {
         let addr = output.address.as_deref().unwrap_or("(unknown)");
-        let change = if output.is_change { " (change)" } else { "" };
+        let change = if with_key && output.is_change {
+            " (change)"
+        } else {
+            ""
+        };
         out.info(&format!(
             "  {}: {} sats -> {}{}",
             output.index, output.amount_sats, addr, change
         ));
     }
 
-    if !analysis.signable_inputs.is_empty() {
+    if with_key {
         out.newline();
-        out.info(&format!("Signable inputs: {:?}", analysis.signable_inputs));
+        out.info("Inputs:");
+        for (i, sats) in analysis.input_sats.iter().enumerate() {
+            let owner = if analysis.signable_inputs.contains(&i) {
+                "this key's, will be signed"
+            } else {
+                "not signed by this key"
+            };
+            out.info(&format!("  {i}: {sats} sats ({owner})"));
+        }
+        // An upper bound: unsigned inputs may still be this wallet's (a PSBT can
+        // leave out their key origins), so their value is not netted out.
+        out.field(
+            "Leaving this wallet (at most)",
+            &format!("{} sats", analysis.leaving_wallet_sats()),
+        );
+    } else {
+        out.newline();
+        out.info("Change and signable inputs depend on the key; `keep bitcoin sign` shows them before signing.");
     }
-
-    Ok(())
 }
 
 pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
-    match s.to_lowercase().as_str() {
-        "mainnet" | "bitcoin" => Ok(keep_bitcoin::Network::Bitcoin),
-        "testnet" => Ok(keep_bitcoin::Network::Testnet),
-        "signet" => Ok(keep_bitcoin::Network::Signet),
-        "regtest" => Ok(keep_bitcoin::Network::Regtest),
-        _ => Err(KeepError::InvalidNetwork(format!(
+    keep_bitcoin::parse_network(s).map_err(|_| {
+        KeepError::InvalidNetwork(format!(
             "'{s}' (valid: mainnet/bitcoin, testnet, signet, regtest)"
-        ))),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]

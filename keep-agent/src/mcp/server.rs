@@ -12,7 +12,6 @@ use zeroize::Zeroizing;
 
 use crate::error::{AgentError, Result};
 use crate::manager::SessionManager;
-use crate::scope::Operation;
 use crate::session::SessionToken;
 
 use super::tools::{self, ToolResult};
@@ -202,8 +201,23 @@ impl McpServer {
     }
 
     async fn handle_tools_list(&self) -> Result<Value> {
+        // Only the tools the active session may call, so a model is not offered
+        // tools whose every call would be refused.
+        let scope = {
+            let guard = self.session_manager.read().await;
+            guard.as_ref().and_then(|(token, session_id)| {
+                self.manager
+                    .validate_and_get(token, session_id)
+                    .ok()
+                    .map(|s| s.scope().clone())
+            })
+        };
         let tools: Vec<Value> = tools::all_tools()
             .into_iter()
+            .filter(|t| match (&scope, tools::required_operation(&t.name)) {
+                (Some(scope), Some(op)) => scope.allows_operation(&op),
+                _ => true,
+            })
             .map(|t| {
                 serde_json::json!({
                     "name": t.name,
@@ -237,10 +251,12 @@ impl McpServer {
             (session, session_id.clone())
         };
 
+        if let Some(op) = tools::required_operation(name) {
+            session.check_operation(&op)?;
+        }
+
         let result = match name {
             "sign_nostr_event" => {
-                session.check_operation(&Operation::SignNostrEvent)?;
-
                 let kind_u64 = arguments
                     .get("kind")
                     .and_then(|v| v.as_u64())
@@ -313,27 +329,17 @@ impl McpServer {
             }
 
             "sign_bitcoin_psbt" => {
-                session.check_operation(&Operation::SignPsbt)?;
-
                 let psbt_base64 = arguments
                     .get("psbt")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| AgentError::Other("Missing psbt".into()))?;
 
-                let network_str = arguments
-                    .get("network")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("testnet");
+                let network = session
+                    .scope()
+                    .bitcoin_network(requested_network(&arguments)?)?;
 
                 if let Some(ref secret) = self.secret_key {
                     let mut secret_copy = Zeroizing::new(**secret);
-                    let network = match network_str {
-                        "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-                        "signet" => keep_bitcoin::Network::Signet,
-                        "regtest" => keep_bitcoin::Network::Regtest,
-                        _ => keep_bitcoin::Network::Testnet,
-                    };
-
                     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
                         .map_err(|e| AgentError::Other(format!("Invalid PSBT: {e}")))?;
 
@@ -344,39 +350,7 @@ impl McpServer {
                         .analyze_psbt(&psbt)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
-                    if let Some(max_sats) = session.scope().max_amount_sats {
-                        if analysis.total_output_sats > max_sats {
-                            return Err(AgentError::AmountExceeded {
-                                requested: analysis.total_output_sats,
-                                limit: max_sats,
-                            });
-                        }
-                    }
-
-                    if let Some(ref allowlist) = session.scope().address_allowlist {
-                        for output in &analysis.outputs {
-                            if output.is_change {
-                                continue;
-                            }
-                            // Fail closed. A spend output whose address cannot be
-                            // determined (a non-standard script, or an address for a
-                            // network other than the signer's) cannot be confirmed
-                            // against the allowlist, so refuse rather than sign an
-                            // unverifiable destination.
-                            match output.address {
-                                Some(ref addr) if allowlist.contains(addr) => {}
-                                Some(ref addr) => {
-                                    return Err(AgentError::AddressNotAllowed(addr.clone()))
-                                }
-                                None => {
-                                    return Err(AgentError::AddressNotAllowed(format!(
-                                        "output {} has no recognizable address",
-                                        output.index
-                                    )))
-                                }
-                            }
-                        }
-                    }
+                    session.scope().check_psbt(&analysis)?;
 
                     let signed_count = signer
                         .sign_psbt(&mut psbt)
@@ -395,8 +369,6 @@ impl McpServer {
             }
 
             "get_nostr_pubkey" => {
-                session.check_operation(&Operation::GetPublicKey)?;
-
                 let pubkey_bytes = session.pubkey();
                 let npub = keep_core::keys::bytes_to_npub(pubkey_bytes);
 
@@ -407,8 +379,6 @@ impl McpServer {
             }
 
             "get_bitcoin_address" => {
-                session.check_operation(&Operation::GetBitcoinAddress)?;
-
                 let addr_type = arguments
                     .get("type")
                     .and_then(|v| v.as_str())
@@ -426,20 +396,12 @@ impl McpServer {
                     }));
                 }
 
-                let network_str = arguments
-                    .get("network")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("testnet");
+                let network = session
+                    .scope()
+                    .bitcoin_network(requested_network(&arguments)?)?;
 
                 if let Some(ref secret) = self.secret_key {
                     let mut secret_copy = Zeroizing::new(**secret);
-                    let network = match network_str {
-                        "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-                        "signet" => keep_bitcoin::Network::Signet,
-                        "regtest" => keep_bitcoin::Network::Regtest,
-                        _ => keep_bitcoin::Network::Testnet,
-                    };
-
                     let signer = keep_bitcoin::BitcoinSigner::new(&mut secret_copy, network)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
@@ -450,7 +412,7 @@ impl McpServer {
                     ToolResult::success(serde_json::json!({
                         "address": address,
                         "type": addr_type,
-                        "network": network_str
+                        "network": network.to_string()
                     }))
                 } else {
                     ToolResult::error("No signing key available".to_string())
@@ -524,6 +486,16 @@ impl McpServer {
     }
 }
 
+/// The `network` argument, if the request gave one. It may only confirm the
+/// session's network, so anything but a string is refused.
+fn requested_network(arguments: &Value) -> Result<Option<&str>> {
+    match arguments.get("network") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name)),
+        Some(_) => Err(AgentError::Other("network must be a string".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,7 +522,7 @@ mod tests {
     // through `handle_request_async` and assert the initialize handshake, the
     // advertised toolset, per-tool call results, and the session permission
     // model (which gates every signing tool).
-    use crate::scope::SessionScope;
+    use crate::scope::{Operation, SessionScope};
     use crate::session::SessionConfig;
 
     fn signing_server() -> McpServer {
@@ -559,6 +531,13 @@ mod tests {
         let keys = nostr_sdk::Keys::parse(&hex::encode(secret)).expect("valid key");
         let pubkey: [u8; 32] = keys.public_key().to_bytes();
         McpServer::with_signing(pubkey, secret)
+    }
+
+    // A Bitcoin session on testnet with no effective cap; tests tighten it.
+    fn bitcoin_scope() -> SessionScope {
+        SessionScope::bitcoin_only()
+            .with_network(keep_bitcoin::Network::Testnet)
+            .with_max_amount(u64::MAX)
     }
 
     async fn install_session(server: &McpServer, scope: SessionScope) {
@@ -632,6 +611,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_tools_list_offers_only_the_sessions_tools() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&rpc("tools/list", Value::Null))
+            .await;
+        let r = resp.result.expect("tools/list result");
+        let mut names: Vec<&str> = r["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["get_nostr_pubkey", "get_session_info", "sign_nostr_event"]
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_tools_call_requires_an_active_session() {
         // Fail-closed: with no session established, a signing tool is refused
         // rather than executed.
@@ -686,7 +686,7 @@ mod tests {
         // The permission model: a bitcoin-only session must NOT be able to sign a
         // Nostr event; the operation is refused before any key is used.
         let server = signing_server();
-        install_session(&server, SessionScope::bitcoin_only()).await;
+        install_session(&server, bitcoin_scope()).await;
         let resp = server
             .handle_request_async(&call(
                 "sign_nostr_event",
@@ -708,11 +708,11 @@ mod tests {
     #[tokio::test]
     async fn mcp_get_bitcoin_address_succeeds_within_scope() {
         let server = signing_server();
-        install_session(&server, SessionScope::bitcoin_only()).await;
+        install_session(&server, bitcoin_scope()).await;
         let resp = server
             .handle_request_async(&call(
                 "get_bitcoin_address",
-                serde_json::json!({"type": "p2tr", "network": "testnet"}),
+                serde_json::json!({"type": "p2tr"}),
             ))
             .await;
         assert!(
@@ -724,7 +724,116 @@ mod tests {
         assert_eq!(r["isError"], serde_json::json!(false));
         let payload: Value =
             serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert!(payload.get("address").is_some());
+        assert!(payload["address"].as_str().unwrap().starts_with("tb1p"));
+        assert_eq!(payload["network"], "testnet");
+    }
+
+    #[tokio::test]
+    async fn mcp_bitcoin_sessions_need_a_network_and_signing_needs_a_limit() {
+        let server = signing_server();
+        let refused = |scope: SessionScope| {
+            let server = &server;
+            async move {
+                server
+                    .create_session(SessionConfig::new(scope))
+                    .await
+                    .expect_err("scope must be refused")
+                    .to_string()
+            }
+        };
+        assert!(refused(SessionScope::bitcoin_only())
+            .await
+            .contains("network"));
+        assert!(
+            refused(SessionScope::bitcoin_only().with_network(keep_bitcoin::Network::Bitcoin))
+                .await
+                .contains("max_amount_sats")
+        );
+        assert!(
+            refused(SessionScope::new([Operation::GetBitcoinAddress]).with_max_amount(1))
+                .await
+                .contains("network")
+        );
+        server
+            .create_session(SessionConfig::new(
+                SessionScope::new([Operation::GetBitcoinAddress])
+                    .with_network(keep_bitcoin::Network::Bitcoin),
+            ))
+            .await
+            .expect("an address-only session needs no limit");
+    }
+
+    #[tokio::test]
+    async fn mcp_allowlist_entries_must_be_on_the_sessions_network() {
+        let server = signing_server();
+        let mainnet = SessionScope::bitcoin_only()
+            .with_network(keep_bitcoin::Network::Bitcoin)
+            .with_max_amount(10_000);
+        for entry in [testnet_p2tr_address(3).to_string(), "not-an-address".into()] {
+            let e = server
+                .create_session(SessionConfig::new(
+                    mainnet.clone().with_address_allowlist([entry.clone()]),
+                ))
+                .await
+                .expect_err("a non-mainnet allowlist entry must be refused");
+            assert!(e.to_string().contains(&entry), "got: {e}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_refuses_a_network_other_than_the_sessions() {
+        // The single-key output is the same on every network, so a request naming
+        // testnet must not get a mainnet session's key to sign or render for it.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only()
+                .with_network(keep_bitcoin::Network::Bitcoin)
+                .with_max_amount(u64::MAX),
+        )
+        .await;
+        let psbt = psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 5_000, 6_000);
+        for (network, expected) in [
+            (serde_json::json!("testnet"), "does not match"),
+            (serde_json::json!("regtest"), "does not match"),
+            (serde_json::json!("main"), "Invalid network"),
+            (serde_json::json!(1), "must be a string"),
+        ] {
+            for (tool, args) in [
+                (
+                    "sign_bitcoin_psbt",
+                    serde_json::json!({"psbt": psbt, "network": network}),
+                ),
+                (
+                    "get_bitcoin_address",
+                    serde_json::json!({"network": network}),
+                ),
+            ] {
+                let resp = server.handle_request_async(&call(tool, args)).await;
+                let e = resp.error.unwrap_or_else(|| {
+                    panic!(
+                        "{tool} with network {network} must be refused, got {:?}",
+                        resp.result
+                    )
+                });
+                assert!(
+                    e.message.contains(expected),
+                    "{tool} {network}: {}",
+                    e.message
+                );
+            }
+        }
+        let resp = server
+            .handle_request_async(&call(
+                "get_bitcoin_address",
+                serde_json::json!({"network": "MAINNET"}),
+            ))
+            .await;
+        let r = resp.result.expect("the session's own network is accepted");
+        let payload: Value =
+            serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(payload["address"].as_str().unwrap().starts_with("bc1p"));
+        assert_eq!(payload["network"], "bitcoin");
     }
 
     #[tokio::test]
@@ -806,9 +915,7 @@ mod tests {
         keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
-    // The x-only key for a fixed seed. Seed 7 is `signing_server`'s own key, so
-    // `xonly_for_seed(7)` marks an output as recognized change (is_change_output
-    // matches the signer's key against the output's tap_internal_key).
+    // The x-only key for a fixed seed, used as a raw key: not a wallet address.
     fn xonly_for_seed(seed: u8) -> keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey {
         use keep_bitcoin::bitcoin::secp256k1::{Keypair, Secp256k1};
         let secp = Secp256k1::new();
@@ -829,16 +936,35 @@ mod tests {
         )
     }
 
+    // `signing_server`'s first change address (`86'/1'/0'/1/0`) and the master
+    // fingerprint its key origin names.
+    fn wallet_change() -> (
+        keep_bitcoin::DerivedAddress,
+        keep_bitcoin::bitcoin::bip32::Fingerprint,
+    ) {
+        let wallet =
+            keep_bitcoin::AddressDerivation::new(&[7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("valid secret");
+        (
+            wallet.get_change_address(0).expect("change address"),
+            wallet.master_fingerprint().expect("fingerprint"),
+        )
+    }
+
     // A base64 PSBT with two outputs: an external spend (`spend_sats` to
-    // `spend_spk`, no tap metadata -> not change) and a change output
-    // (`change_sats` to `change_spk`) whose tap_internal_key is set so
-    // is_change_output recognizes it as change. Funded by one input of `in_sats`.
+    // `spend_spk`, no tap metadata -> not change) and an output of `change_sats`
+    // to `change_spk` carrying `change_origin`'s internal key and BIP-371 key
+    // origin, which makes it change only if `change_spk` is that key's address.
+    // Funded by one input of `in_sats`.
     fn psbt_base64_spend_and_change(
         spend_spk: keep_bitcoin::bitcoin::ScriptBuf,
         spend_sats: u64,
         change_spk: keep_bitcoin::bitcoin::ScriptBuf,
         change_sats: u64,
-        change_internal_key: keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey,
+        change_origin: &(
+            keep_bitcoin::DerivedAddress,
+            keep_bitcoin::bitcoin::bip32::Fingerprint,
+        ),
         in_sats: u64,
     ) -> String {
         use keep_bitcoin::bitcoin::{
@@ -873,7 +999,12 @@ mod tests {
             value: Amount::from_sat(in_sats),
             script_pubkey: ScriptBuf::new(),
         });
-        psbt.outputs[1].tap_internal_key = Some(change_internal_key);
+        let (change, fingerprint) = change_origin;
+        psbt.outputs[1].tap_internal_key = Some(change.public_key);
+        psbt.outputs[1].tap_key_origins.insert(
+            change.public_key,
+            (vec![], (*fingerprint, change.path.clone())),
+        );
         keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
@@ -882,11 +1013,7 @@ mod tests {
         // A PSBT whose total output exceeds the session's max_amount_sats must be
         // refused before any signing, through the actual MCP tool arm.
         let server = signing_server();
-        install_session(
-            &server,
-            SessionScope::bitcoin_only().with_max_amount(10_000),
-        )
-        .await;
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
         let psbt =
             psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 50_000, 60_000);
         let resp = server
@@ -906,44 +1033,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_sign_bitcoin_psbt_counts_recognized_change_toward_the_amount_limit() {
-        // The amount guard caps total_output_sats, INCLUDING recognized change, not
-        // just the external (non-change) spend. This pins that semantic on purpose:
-        // is_change is derived from client-supplied PSBT output metadata
-        // (tap_internal_key), so trusting it to shrink the amount check would let a
-        // malicious client relabel a large output as change to exceed the cap. Here
-        // the external spend (8_000) is under the 10_000 limit but the total incl.
-        // change (58_000) is over, so the request must be refused. If the guard were
-        // changed to count only non-change spend, this test would fail.
+    async fn mcp_sign_bitcoin_psbt_counts_the_fee_toward_the_amount_limit() {
+        // 5_000 sats of outputs fit under the 10_000 limit, but the 55_000 sat fee
+        // leaves the wallet just as surely once signed: it must be refused.
         let server = signing_server();
-        install_session(
-            &server,
-            SessionScope::bitcoin_only().with_max_amount(10_000),
-        )
-        .await;
-        let psbt = psbt_base64_spend_and_change(
-            testnet_p2tr_address(2).script_pubkey(),
-            8_000,
-            testnet_p2tr_address(7).script_pubkey(),
-            50_000,
-            xonly_for_seed(7),
-            60_000,
-        );
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let psbt =
+            psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 5_000, 60_000);
         let resp = server
             .handle_request_async(&call(
                 "sign_bitcoin_psbt",
                 serde_json::json!({"psbt": psbt, "network": "testnet"}),
             ))
             .await;
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("a fee burn must be refused, got {:?}", resp.result));
+        assert!(
+            e.message.contains("Amount exceeded"),
+            "expected an amount-exceeded refusal counting the fee, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_exempts_genuine_change_from_the_amount_limit() {
+        // What leaves the wallet counts: the external spend (8_000) plus the fee
+        // (2_000) is exactly the 10_000 limit, and the 50_000 back to the wallet's own
+        // change address does not count. If the guard counted change, this would be
+        // refused.
+        let server = signing_server();
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let change = wallet_change();
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            change.0.address.script_pubkey(),
+            50_000,
+            &change,
+            60_000,
+        );
+        let analysis =
+            keep_bitcoin::BitcoinSigner::new(&mut [7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("signer")
+                .analyze_psbt(&keep_bitcoin::psbt::parse_psbt_base64(&psbt).expect("psbt"))
+                .expect("analysis");
+        assert!(
+            !analysis.outputs[0].is_change && analysis.outputs[1].is_change,
+            "the test needs output 1 to be recognized change"
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt}),
+            ))
+            .await;
+        assert!(
+            resp.error.is_none(),
+            "genuine change must not count toward the limit, got {:?}",
+            resp.error
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_counts_forged_change_toward_the_amount_limit() {
+        // An output carrying the wallet's real change origin but paying someone else's
+        // script is a spend, so its 50_000 counts and the request is refused.
+        let server = signing_server();
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            testnet_p2tr_address(3).script_pubkey(),
+            50_000,
+            &wallet_change(),
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt}),
+            ))
+            .await;
         let e = resp.error.unwrap_or_else(|| {
             panic!(
-                "total outputs over the limit (including change) must be refused, got {:?}",
+                "forged change over the limit must be refused, got {:?}",
                 resp.result
             )
         });
         assert!(
-            e.message.contains("Amount exceeded"),
-            "expected an amount-exceeded refusal counting change, got: {}",
+            e.message.contains("Amount exceeded: requested 60000"),
+            "expected the forged change to count, got: {}",
             e.message
         );
     }
@@ -957,7 +1137,7 @@ mod tests {
         let disallowed = testnet_p2tr_address(2);
         install_session(
             &server,
-            SessionScope::bitcoin_only().with_address_allowlist([allowed.to_string()]),
+            bitcoin_scope().with_address_allowlist([allowed.to_string()]),
         )
         .await;
         let psbt = psbt_base64_single_output(disallowed.script_pubkey(), 10_000, 20_000);
@@ -989,8 +1169,7 @@ mod tests {
         let server = signing_server();
         install_session(
             &server,
-            SessionScope::bitcoin_only()
-                .with_address_allowlist([testnet_p2tr_address(3).to_string()]),
+            bitcoin_scope().with_address_allowlist([testnet_p2tr_address(3).to_string()]),
         )
         .await;
         // A bare OP_RETURN script has no address encoding, so Address::from_script
@@ -1019,8 +1198,8 @@ mod tests {
     #[tokio::test]
     async fn mcp_sign_bitcoin_psbt_rejects_forged_change_paying_a_non_allowlisted_address() {
         // A malicious client cannot bypass the allowlist by forging change: an output
-        // paying an attacker address (seed 2) while attaching the signer's own x-only
-        // key (seed 7) as tap_internal_key is NOT genuine change, because change is
+        // paying an attacker address (seed 2) while attaching the key origin of the
+        // signer's own change address is NOT genuine change, because change is
         // determined from the actual scriptPubKey (must pay the signer's own key-path
         // output), not from forgeable PSBT metadata. So it is subject to the allowlist
         // and refused, even though output 0 pays the allowlisted address.
@@ -1029,7 +1208,7 @@ mod tests {
         let attacker = testnet_p2tr_address(2);
         install_session(
             &server,
-            SessionScope::bitcoin_only().with_address_allowlist([allowed.to_string()]),
+            bitcoin_scope().with_address_allowlist([allowed.to_string()]),
         )
         .await;
         let psbt = psbt_base64_spend_and_change(
@@ -1037,8 +1216,17 @@ mod tests {
             1_000,
             attacker.script_pubkey(),
             5_000,
-            xonly_for_seed(7),
+            &wallet_change(),
             10_000,
+        );
+        let analysis =
+            keep_bitcoin::BitcoinSigner::new(&mut [7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("signer")
+                .analyze_psbt(&keep_bitcoin::psbt::parse_psbt_base64(&psbt).expect("psbt"))
+                .expect("analysis");
+        assert!(
+            !analysis.outputs[1].is_change,
+            "a wallet change origin on a foreign script must not make it change"
         );
         let resp = server
             .handle_request_async(&call(

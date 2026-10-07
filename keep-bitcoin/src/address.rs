@@ -16,6 +16,21 @@ pub struct DerivedAddress {
     pub index: u32,
 }
 
+/// BIP-44 coin type for `network`: 0 on mainnet, 1 on every test network.
+pub(crate) fn coin_type(network: Network) -> u32 {
+    if network == Network::Bitcoin {
+        0
+    } else {
+        1
+    }
+}
+
+/// The BIP-32 master key `secret` seeds.
+pub(crate) fn master_xpriv(secret: &[u8; 32], network: Network) -> Result<Xpriv> {
+    Xpriv::new_master(network, secret)
+        .map_err(|e| BitcoinError::DerivationPath(format!("Failed to create master key: {e}")))
+}
+
 pub struct AddressDerivation {
     secret: MlockedBox<32>,
     secp: Secp256k1<All>,
@@ -38,8 +53,7 @@ impl AddressDerivation {
     }
 
     fn master_xpriv(&self) -> Result<Xpriv> {
-        Xpriv::new_master(self.network, &*self.secret)
-            .map_err(|e| BitcoinError::DerivationPath(format!("Failed to create master key: {e}")))
+        master_xpriv(&self.secret, self.network)
     }
 
     pub fn derive_taproot_address(
@@ -48,11 +62,7 @@ impl AddressDerivation {
         change: bool,
         index: u32,
     ) -> Result<DerivedAddress> {
-        let coin_type = if self.network == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
+        let coin_type = coin_type(self.network);
 
         let path_str = format!(
             "m/86'/{}'/{}'/{}/{}",
@@ -100,11 +110,7 @@ impl AddressDerivation {
     }
 
     pub fn account_xpub(&self, account: u32) -> Result<Xpub> {
-        let coin_type = if self.network == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
+        let coin_type = coin_type(self.network);
 
         let path_str = format!("m/86'/{coin_type}'/{account}'");
         let path = DerivationPath::from_str(&path_str)

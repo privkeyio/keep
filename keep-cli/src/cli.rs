@@ -191,6 +191,19 @@ pub(crate) enum AgentCommands {
     Mcp {
         #[arg(short, long)]
         key: String,
+        /// Bitcoin network for get_bitcoin_address and sign_bitcoin_psbt. Without it the
+        /// session has no Bitcoin tools.
+        #[arg(long)]
+        network: Option<String>,
+        /// Most one signed PSBT may take out of the wallet: every output except
+        /// recognized change, plus the fee. Enables sign_bitcoin_psbt; requires
+        /// --network.
+        #[arg(long)]
+        max_amount_sats: Option<u64>,
+        /// An address a signed PSBT may pay (repeatable). Every output that is not the
+        /// wallet's change must pay one. Requires --max-amount-sats.
+        #[arg(long = "allow-address")]
+        allow_address: Vec<String>,
     },
 }
 
@@ -1127,6 +1140,9 @@ pub(crate) enum BitcoinCommands {
             help = "Bitcoin network: mainnet, testnet, signet, regtest. Required; no default."
         )]
         network: String,
+        /// Sign without asking for confirmation. KEEP_YES does not skip this prompt.
+        #[arg(long)]
+        yes: bool,
     },
     Analyze {
         #[arg(short, long)]

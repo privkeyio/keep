@@ -24,6 +24,7 @@ class SessionScope:
     event_kinds: Optional[List[int]] = None
     max_amount_sats: Optional[int] = None
     address_allowlist: Optional[List[str]] = None
+    network: Optional[str] = None
 
     def __post_init__(self):
         if self.operations is None:
@@ -53,12 +54,14 @@ class SessionScope:
             raise RuntimeError("Native bindings not available")
 
         scope = _SessionScope(self.operations)
-        if self.event_kinds:
+        if self.event_kinds is not None:
             scope = scope.with_event_kinds(self.event_kinds)
         if self.max_amount_sats is not None:
             scope = scope.with_max_amount(self.max_amount_sats)
-        if self.address_allowlist:
+        if self.address_allowlist is not None:
             scope = scope.with_address_allowlist(self.address_allowlist)
+        if self.network is not None:
+            scope = scope.with_network(self.network)
         return scope
 
 
@@ -166,13 +169,13 @@ class AgentSession:
         result = self._native.sign_event(kind, content, tags)
         return json.loads(result)
 
-    def sign_psbt(self, psbt_base64: str, network: str = "testnet") -> str:
+    def sign_psbt(self, psbt_base64: str, network: Optional[str] = None) -> str:
         """
-        Sign a Bitcoin PSBT.
+        Sign a Bitcoin PSBT on the session's network, within its spend limit.
 
         Args:
             psbt_base64: Base64-encoded PSBT
-            network: Network (mainnet, testnet, signet, regtest)
+            network: Optional; if given, must be the session's network
 
         Returns:
             Base64-encoded signed PSBT
@@ -183,8 +186,8 @@ class AgentSession:
         """Get the Nostr public key (npub format)."""
         return self._native.get_public_key()
 
-    def get_bitcoin_address(self, network: str = "testnet") -> str:
-        """Get a Bitcoin address (p2tr taproot)."""
+    def get_bitcoin_address(self, network: Optional[str] = None) -> str:
+        """Get the first BIP-86 receive address on the session's network."""
         return self._native.get_bitcoin_address(network)
 
     def __enter__(self):

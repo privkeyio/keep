@@ -17,8 +17,9 @@ cd keep-agent-ts && npm install && npm run build
 import { KeepAgentSession, createFullScope } from '@keep/agent';
 
 // Create a session with signing capability
+// Bitcoin operations need the session's network; signing PSBTs also needs a spend limit
 const session = new KeepAgentSession(
-  createFullScope(),
+  { ...createFullScope(), network: 'testnet', maxAmountSats: 100_000 },
   null,  // Use default rate limits
   24,    // Duration in hours
   null,  // No policy
@@ -32,7 +33,7 @@ console.log(`Signature: ${event.sig}`);
 
 // Get public key and Bitcoin address
 const npub = await session.getPublicKey();
-const address = await session.getBitcoinAddress('testnet');
+const address = await session.getBitcoinAddress(); // on the session's network
 ```
 
 ## Session Constraints
@@ -47,8 +48,9 @@ const session = new KeepAgentSession(
   {
     operations: ['sign_nostr_event', 'get_public_key'],
     eventKinds: [1, 7],          // Only text notes and reactions
-    maxAmountSats: 100_000,      // Max 0.001 BTC per tx
-    addressAllowlist: ['bc1q...'],
+    maxAmountSats: 100_000,      // Max 0.001 BTC leaving the wallet per PSBT: every output but change, plus the fee
+    addressAllowlist: ['bc1q...'], // Every non-change output must pay a listed address
+    network: 'mainnet',          // Required for Bitcoin operations; every call uses it
   },
   { maxPerMinute: 10, maxPerHour: 100, maxPerDay: 1000 },
   24,
@@ -70,6 +72,8 @@ createNostrScope();   // sign_nostr_event, get_public_key
 createBitcoinScope(); // sign_psbt, get_public_key, get_bitcoin_address
 createFullScope();    // All operations
 ```
+
+A scope with `sign_psbt` or `get_bitcoin_address` must set `network`, and one with `sign_psbt` must also set `maxAmountSats`, or creating the session fails. A call's optional `network` argument may only repeat the session's network.
 
 ## Remote Signing (NIP-46)
 
@@ -106,9 +110,9 @@ await session.disconnect();
 | Method | Description |
 |--------|-------------|
 | `signEvent(kind, content, tags?)` | Sign a Nostr event |
-| `signPsbt(psbtBase64, network?)` | Sign a Bitcoin PSBT |
+| `signPsbt(psbtBase64, network?)` | Sign the inputs that spend this key's BIP-86 addresses (the PSBT must carry their BIP-371 key origins) |
 | `getPublicKey()` | Get npub |
-| `getBitcoinAddress(network?)` | Get p2tr address |
+| `getBitcoinAddress(network?)` | Get the first BIP-86 receive address (`m/86'/coin'/0'/0/0`) |
 | `getSessionInfo()` | Get session status |
 | `checkOperation(op)` | Check if operation allowed |
 | `checkEventKind(kind)` | Check if event kind allowed |
@@ -145,6 +149,7 @@ interface SessionScopeConfig {
   eventKinds?: number[];
   maxAmountSats?: number;
   addressAllowlist?: string[];
+  network?: string;
 }
 
 interface RateLimitOptions {

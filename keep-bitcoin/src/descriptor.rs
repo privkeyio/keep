@@ -46,7 +46,7 @@ impl DescriptorExport {
         let fingerprint = derivation.master_fingerprint()?;
         let xpub = derivation.account_xpub(account)?;
 
-        let coin_type = if network == Network::Bitcoin { 0 } else { 1 };
+        let coin_type = crate::address::coin_type(network);
 
         let descriptor = format!("tr([{fingerprint}/86'/{coin_type}'/{account}']{xpub}/0/*)");
 

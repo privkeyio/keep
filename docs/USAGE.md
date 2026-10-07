@@ -245,24 +245,23 @@ a number of seconds.
 
 ## Bitcoin
 
-BIP-86 Taproot addresses and PSBT signing:
+BIP-86 Taproot addresses and PSBT signing. `--network` (mainnet, testnet, signet, regtest) is required on every command:
 
 ```bash
-# Get receive address
-keep bitcoin address --key main
+# Get receive addresses
+keep bitcoin address --key main --count 5 --network mainnet
 
-# Get change address
-keep bitcoin address --key main --change
-
-# Export watch-only descriptor
-keep bitcoin descriptor --key main
+# Export the watch-only descriptors (receive and change)
+keep bitcoin descriptor --key main --network mainnet
 
 # Analyze PSBT
-keep bitcoin analyze --psbt unsigned.psbt
+keep bitcoin analyze --psbt unsigned.psbt --network mainnet
 
 # Sign PSBT
-keep bitcoin sign --key main --psbt unsigned.psbt
+keep bitcoin sign --key main --psbt unsigned.psbt --network mainnet
 ```
+
+Build the PSBT in a watch-only wallet that imported the exported descriptors, so each input carries its BIP-371 key origin (`tap_key_origins`). `sign` derives the key that origin names, applies the BIP-86 key-path tweak, and signs only an input whose scriptPubKey that tweaked key actually owns. An input without the wallet's key origin is left unsigned. The one exception is the key's own underived taproot output, which is signed on mainnet only: it is the same output on every network, so a test-network signer will not spend it. Inputs must use sighash DEFAULT or ALL; a PSBT asking for anything narrower is refused. Change is recognized the same way, within the first 1000 addresses of account 0's change chain; any other output counts as a spend. `sign` shows each input (whether this key will sign it), the outputs with change marked, the fee, and at most how much leaves the wallet (every output except change, plus the fee), then asks for confirmation. Only `--yes` skips the prompt; `KEEP_YES` does not, and without a terminal `sign` refuses rather than signs.
 
 ---
 
@@ -553,6 +552,17 @@ info = session.get_session_info()
 print(f"Requests remaining: {info.requests_remaining}")
 ```
 
+A session with Bitcoin operations must name its network, and one that signs PSBTs must also set `max_amount_sats`; otherwise creating the session fails. Every Bitcoin call uses the session's network, and a call naming a different one is refused. The limit caps what one PSBT takes out of the wallet: every output except recognized change, plus the fee. Allowlist entries must be addresses on the session's network.
+
+```python
+scope = SessionScope(
+    operations=["sign_psbt", "get_bitcoin_address"],
+    network="mainnet",
+    max_amount_sats=50_000,
+    address_allowlist=["bc1p..."],
+)
+```
+
 **LangChain:**
 
 ```python
@@ -595,8 +605,16 @@ under a constrained policy, so the model gets signing capability without ever se
 private key.
 
 ```bash
+# Nostr and NIP-44 tools only
 keep agent mcp --key main
+
+# Also get_bitcoin_address and sign_bitcoin_psbt on mainnet, spending at most 50,000 sats
+# per PSBT, and only to these addresses (besides the wallet's own change)
+keep agent mcp --key main --network mainnet --max-amount-sats 50000 \
+  --allow-address bc1p... --allow-address bc1q...
 ```
+
+The Bitcoin tools are opt-in. `--network` enables `get_bitcoin_address` and binds every Bitcoin tool to that network: a request naming another network is refused. `--max-amount-sats` also enables `sign_bitcoin_psbt`; it caps what one PSBT may take out of the wallet, every output except recognized change plus the fee. `--allow-address` (repeatable) restricts every other output to the listed addresses, which must be addresses on `--network`.
 
 Add it to your MCP client configuration:
 
@@ -676,7 +694,7 @@ KEEP_PASSWORD="hidden" keep --hidden list
 | `KEEP_HOME` | Custom vault path (default: `~/.keep`). Must be absolute. Equivalent to `--path` |
 | `KEEP_PASSWORD` | Vault password (avoids interactive prompt) |
 | `KEEP_HIDDEN_PASSWORD` | Hidden volume password (with `--hidden`) |
-| `KEEP_YES` | Auto-confirm non-destructive prompts in scripts |
+| `KEEP_YES` | Auto-confirm non-destructive prompts in scripts (not `keep bitcoin sign`, which needs `--yes`) |
 | `WARDEN_TOKEN` | JWT for Warden API authentication (requires `--features warden`) |
 
 > `KEEP_PATH` is **not** used by the CLI; it configures the vault path for the `keep-web`

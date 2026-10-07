@@ -14,9 +14,60 @@ use crate::output::Output;
 
 use super::get_password;
 
-pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) -> Result<()> {
+/// The MCP session's scope. Bitcoin tools are opt-in: an address needs the network,
+/// and signing also needs a spend limit.
+fn mcp_scope(
+    network: Option<&str>,
+    max_amount_sats: Option<u64>,
+    allow_address: Vec<String>,
+) -> Result<keep_agent::scope::SessionScope> {
+    use keep_agent::scope::{Operation, SessionScope};
+
+    let mut ops = vec![
+        Operation::SignNostrEvent,
+        Operation::GetPublicKey,
+        Operation::Nip44Encrypt,
+        Operation::Nip44Decrypt,
+    ];
+    let Some(network) = network else {
+        if max_amount_sats.is_some() || !allow_address.is_empty() {
+            return Err(KeepError::InvalidInput(
+                "--max-amount-sats and --allow-address need --network".into(),
+            ));
+        }
+        return Ok(SessionScope::new(ops));
+    };
+    let network = super::bitcoin::parse_network(network)?;
+    ops.push(Operation::GetBitcoinAddress);
+    if max_amount_sats.is_some() {
+        ops.push(Operation::SignPsbt);
+    } else if !allow_address.is_empty() {
+        return Err(KeepError::InvalidInput(
+            "--allow-address needs --max-amount-sats".into(),
+        ));
+    }
+    let mut scope = SessionScope::new(ops).with_network(network);
+    if let Some(sats) = max_amount_sats {
+        scope = scope.with_max_amount(sats);
+    }
+    if !allow_address.is_empty() {
+        scope = scope.with_address_allowlist(allow_address);
+    }
+    scope
+        .validated()
+        .map_err(|e| KeepError::InvalidInput(e.to_string()))
+}
+
+pub fn cmd_agent_mcp(
+    out: &Output,
+    path: &Path,
+    key_name: &str,
+    hidden: bool,
+    network: Option<&str>,
+    max_amount_sats: Option<u64>,
+    allow_address: Vec<String>,
+) -> Result<()> {
     use keep_agent::mcp::McpServer;
-    use keep_agent::scope::SessionScope;
     use keep_agent::session::SessionConfig;
     use std::io::{BufRead, Write};
 
@@ -25,6 +76,7 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
             "MCP server not supported for hidden volumes".into(),
         ));
     }
+    let scope = mcp_scope(network, max_amount_sats, allow_address)?;
 
     debug!(key_name, "starting MCP server");
 
@@ -46,7 +98,7 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     let server = McpServer::with_signing(pubkey, secret);
     secret.zeroize();
 
-    let config = SessionConfig::new(SessionScope::full())
+    let config = SessionConfig::new(scope)
         .with_duration_hours(24)
         .with_policy("cli_mcp");
 
@@ -84,4 +136,60 @@ pub fn cmd_agent_mcp(out: &Output, path: &Path, key_name: &str, hidden: bool) ->
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use keep_agent::scope::Operation;
+
+    const MAINNET_ADDR: &str = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+    const TESTNET_ADDR: &str = "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx";
+
+    #[test]
+    fn bitcoin_tools_are_opt_in() {
+        let scope = mcp_scope(None, None, vec![]).unwrap();
+        assert!(scope.allows_operation(&Operation::SignNostrEvent));
+        assert!(!scope.allows_operation(&Operation::GetBitcoinAddress));
+        assert!(!scope.allows_operation(&Operation::SignPsbt));
+
+        let scope = mcp_scope(Some("mainnet"), None, vec![]).unwrap();
+        assert!(scope.allows_operation(&Operation::GetBitcoinAddress));
+        assert!(!scope.allows_operation(&Operation::SignPsbt));
+        assert_eq!(scope.network, Some(keep_bitcoin::Network::Bitcoin));
+
+        let scope = mcp_scope(
+            Some("mainnet"),
+            Some(50_000),
+            vec![MAINNET_ADDR.to_uppercase()],
+        )
+        .unwrap();
+        assert!(scope.allows_operation(&Operation::SignPsbt));
+        assert_eq!(scope.max_amount_sats, Some(50_000));
+        assert!(scope.allows_address(MAINNET_ADDR));
+    }
+
+    #[test]
+    fn inconsistent_flags_are_refused() {
+        for (network, max, allow, expected) in [
+            (None, Some(1), vec![], "--network"),
+            (None, None, vec![MAINNET_ADDR.to_string()], "--network"),
+            (
+                Some("mainnet"),
+                None,
+                vec![MAINNET_ADDR.to_string()],
+                "--max-amount-sats",
+            ),
+            (Some("main"), Some(1), vec![], "main"),
+            (
+                Some("mainnet"),
+                Some(1),
+                vec![TESTNET_ADDR.to_string()],
+                TESTNET_ADDR,
+            ),
+        ] {
+            let e = mcp_scope(network, max, allow).expect_err("must be refused");
+            assert!(e.to_string().contains(expected), "{expected}: {e}");
+        }
+    }
 }
