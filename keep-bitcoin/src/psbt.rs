@@ -292,14 +292,17 @@ impl PsbtSigner {
         for i in 0..psbt.inputs.len() {
             match self.input_signer(psbt, i) {
                 Ok(None) => {}
-                Ok(Some(mut keypair)) => match requested_sighash_type(psbt, i) {
-                    Ok(sighash_type) => signers.push((i, keypair, sighash_type)),
-                    Err(e) => {
-                        keypair.non_secure_erase();
+                Ok(Some(mut keypair)) => {
+                    let requested = requested_sighash_type(psbt, i);
+                    if let Ok(sighash_type) = requested {
+                        signers.push((i, keypair, sighash_type));
+                    }
+                    keypair.non_secure_erase();
+                    if let Err(e) = requested {
                         result = Err(e);
                         break;
                     }
-                },
+                }
                 Err(e) => {
                     result = Err(e);
                     break;

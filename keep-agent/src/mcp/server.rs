@@ -1103,6 +1103,15 @@ mod tests {
             &wallet_change(),
             10_000,
         );
+        let analysis =
+            keep_bitcoin::BitcoinSigner::new(&mut [7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("signer")
+                .analyze_psbt(&keep_bitcoin::psbt::parse_psbt_base64(&psbt).expect("psbt"))
+                .expect("analysis");
+        assert!(
+            !analysis.outputs[1].is_change,
+            "a wallet change origin on a foreign script must not make it change"
+        );
         let resp = server
             .handle_request_async(&call(
                 "sign_bitcoin_psbt",
