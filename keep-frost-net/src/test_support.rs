@@ -243,3 +243,50 @@ mod memory_transport_tests {
         assert!(matches!(a_rx.try_recv(), Err(TryRecvError::Empty)));
     }
 }
+
+/// A one-input transaction spending `spent` (a 100 000 sat output) with
+/// `sighash_type`: the key-spend sighash a requester asks to have signed and the
+/// [`crate::BitcoinSighashPayload`] (JSON) co-signers recompute it from.
+pub fn key_spend_payload(spent: &bitcoin::ScriptBuf, sighash_type: u8) -> ([u8; 32], Vec<u8>) {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::hashes::Hash;
+    use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+    use bitcoin::transaction::Version;
+    use bitcoin::{Amount, OutPoint, Psbt, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+
+    let prevout = TxOut {
+        value: Amount::from_sat(100_000),
+        script_pubkey: spent.clone(),
+    };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            script_sig: bitcoin::ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(99_000),
+            script_pubkey: bitcoin::ScriptBuf::new_op_return([0u8; 4]),
+        }],
+    };
+    let sighash = SighashCache::new(&tx)
+        .taproot_key_spend_signature_hash(
+            0,
+            &Prevouts::All(std::slice::from_ref(&prevout)),
+            TapSighashType::from_consensus_u8(sighash_type).expect("a taproot sighash type"),
+        )
+        .expect("sighash");
+    let payload = crate::BitcoinSighashPayload {
+        psbt: Psbt::from_unsigned_tx(tx).expect("unsigned tx").serialize(),
+        input_index: 0,
+        sighash_type: sighash_type.into(),
+        prevouts: vec![bitcoin::consensus::serialize(&prevout)],
+    };
+    (
+        sighash.to_byte_array(),
+        serde_json::to_vec(&payload).expect("payload json"),
+    )
+}

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{FrostNetError, Result};
 use crate::nonce_store::NonceStore;
-use crate::protocol::KFP_VERSION;
+use crate::protocol::{TaprootTweakPayload, KFP_VERSION};
 
 pub fn derive_session_id(message: &[u8], participants: &[u16], threshold: u16) -> [u8; 32] {
     derive_session_id_salted(message, participants, threshold, &[])
@@ -53,6 +53,52 @@ pub fn derive_session_id_salted(
     keep_core::crypto::blake2b_256(&preimage)
 }
 
+/// Marks the taproot tweak in a session salt. A path index is below 2^31, so its
+/// first byte is below 0x80 and no path can be read as a tweak or the reverse.
+const SALT_TAPROOT_MARKER: [u8; 3] = [0xff, b'T', b'R'];
+
+fn salt_suffix(path: &[u32], tweak: Option<&TaprootTweakPayload>) -> Vec<u8> {
+    let mut suffix = Vec::with_capacity(path.len() * 4 + 36);
+    for index in path {
+        suffix.extend_from_slice(&index.to_be_bytes());
+    }
+    if let Some(tweak) = tweak {
+        suffix.extend_from_slice(&SALT_TAPROOT_MARKER);
+        match tweak.merkle_root {
+            None => suffix.push(0),
+            Some(root) => {
+                suffix.push(1);
+                suffix.extend_from_slice(&root);
+            }
+        }
+    }
+    suffix
+}
+
+/// The salt a requester sends with `attempt` of a request at `path` with
+/// `tweak`: empty for a first attempt under the group key itself (the id peers
+/// that predate salting derive), otherwise the attempt followed by the path and
+/// the tweak. Folding the path and tweak in gives requests for different keys
+/// over one digest distinct session ids.
+pub fn session_salt(attempt: u64, path: &[u32], tweak: Option<&TaprootTweakPayload>) -> Vec<u8> {
+    if attempt == 0 && path.is_empty() && tweak.is_none() {
+        return Vec::new();
+    }
+    let mut salt = attempt.to_be_bytes().to_vec();
+    salt.extend_from_slice(&salt_suffix(path, tweak));
+    salt
+}
+
+/// Whether `salt` is one [`session_salt`] produces for `path` and `tweak` at
+/// some attempt, so the session id the responder validates against it is bound
+/// to the key the request asks it to sign with.
+pub fn salt_binds(salt: &[u8], path: &[u32], tweak: Option<&TaprootTweakPayload>) -> bool {
+    if salt.is_empty() {
+        return path.is_empty() && tweak.is_none();
+    }
+    salt.len() >= 8 && salt[8..] == salt_suffix(path, tweak)[..]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionState {
     AwaitingCommitments,
@@ -72,6 +118,8 @@ pub struct CachedSessionState {
     participants: Vec<u16>,
     #[serde(default)]
     derivation_path: Vec<u32>,
+    #[serde(default)]
+    taproot_tweak: Option<TaprootTweakPayload>,
     state: SessionState,
     commitments: Vec<(Vec<u8>, Vec<u8>)>,
     signature_shares: Vec<(Vec<u8>, Vec<u8>)>,
@@ -99,6 +147,9 @@ pub struct NetworkSession {
     /// BIP-32 scalar before running round1/round2, and the aggregate
     /// signature verifies under the derived child pubkey.
     derivation_path: Vec<u32>,
+    /// The BIP-341 tweak of a key-path spend, applied after the path tweak, so
+    /// round 2 and aggregation use the key the round-1 commitment was made for.
+    taproot_tweak: Option<TaprootTweakPayload>,
     state: SessionState,
     created_at: Instant,
     timeout: Duration,
@@ -125,6 +176,7 @@ impl NetworkSession {
             threshold,
             participants,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
             state: SessionState::AwaitingCommitments,
             created_at: Instant::now(),
             timeout: Duration::from_secs(30),
@@ -177,6 +229,14 @@ impl NetworkSession {
 
     pub fn set_derivation_path(&mut self, path: Vec<u32>) {
         self.derivation_path = path;
+    }
+
+    pub fn taproot_tweak(&self) -> Option<TaprootTweakPayload> {
+        self.taproot_tweak
+    }
+
+    pub fn set_taproot_tweak(&mut self, tweak: Option<TaprootTweakPayload>) {
+        self.taproot_tweak = tweak;
     }
 
     pub fn state(&self) -> SessionState {
@@ -511,6 +571,7 @@ impl NetworkSession {
             threshold: self.threshold,
             participants: self.participants.clone(),
             derivation_path: self.derivation_path.clone(),
+            taproot_tweak: self.taproot_tweak,
             state: self.state,
             commitments,
             signature_shares,
@@ -618,6 +679,7 @@ impl NetworkSession {
             threshold: cached.threshold,
             participants: cached.participants,
             derivation_path: cached.derivation_path,
+            taproot_tweak: cached.taproot_tweak,
             state: cached.state,
             created_at: Instant::now(),
             timeout: Duration::from_secs(30),
@@ -957,6 +1019,68 @@ impl Default for SessionManager {
 mod tests {
     use super::*;
     use crate::nonce_store::MemoryNonceStore;
+
+    /// Every (path, tweak) combination gets its own salt, at every attempt, and
+    /// only that salt is accepted for it. Includes the pair a marker that could
+    /// start a path index would confuse: a tweak against a path one index longer
+    /// whose last index spells the marker and flag. Paths here are unhardened,
+    /// as protocol validation guarantees before any salt is checked.
+    #[test]
+    fn salts_bind_the_path_and_taproot_tweak() {
+        let root = |b: u8| TaprootTweakPayload {
+            merkle_root: Some([b; 32]),
+        };
+        let bip86 = TaprootTweakPayload::default();
+        let long_path: Vec<u32> = (0..8).map(|i| 0x7452_0100 + i).collect();
+        let combos: Vec<(Vec<u32>, Option<TaprootTweakPayload>)> = vec![
+            (vec![], None),
+            (vec![0, 1], None),
+            (vec![0, 1], Some(bip86)),
+            (vec![0, 1], Some(root(1))),
+            (vec![0, 1], Some(root(2))),
+            (vec![], Some(bip86)),
+            (vec![], Some(root(1))),
+            (long_path.clone(), None),
+            (long_path, Some(bip86)),
+            (vec![0, 1, 0x7452_0100], None),
+        ];
+        let mut seen = HashSet::new();
+        for attempt in [0u64, 1, 7] {
+            for (path, tweak) in &combos {
+                let salt = session_salt(attempt, path, tweak.as_ref());
+                assert!(seen.insert(salt.clone()), "{attempt} {path:?} {tweak:?}");
+                for (other_path, other_tweak) in &combos {
+                    assert_eq!(
+                        salt_binds(&salt, other_path, other_tweak.as_ref()),
+                        (other_path, other_tweak) == (path, tweak),
+                        "{attempt} {path:?} {tweak:?} vs {other_path:?} {other_tweak:?}"
+                    );
+                }
+            }
+        }
+        assert!(
+            session_salt(0, &[], None).is_empty(),
+            "the pre-salt id is kept"
+        );
+        assert_eq!(
+            session_salt(0, &[0, 5], None)[8..],
+            [0, 0, 0, 0, 0, 0, 0, 5]
+        );
+    }
+
+    #[test]
+    fn a_cached_session_keeps_its_taproot_tweak() {
+        let message = vec![9u8; 32];
+        let session_id = derive_session_id(&message, &[1, 2], 2);
+        let mut session = NetworkSession::new(session_id, message, 2, vec![1, 2]);
+        let tweak = TaprootTweakPayload {
+            merkle_root: Some([4; 32]),
+        };
+        session.set_taproot_tweak(Some(tweak));
+        let restored =
+            NetworkSession::from_cached_state(session.to_cached_state().unwrap()).unwrap();
+        assert_eq!(restored.taproot_tweak(), Some(tweak));
+    }
 
     #[test]
     fn test_session_lifecycle() {

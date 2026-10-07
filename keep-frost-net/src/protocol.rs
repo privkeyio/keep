@@ -30,6 +30,10 @@ pub const MAX_TPM_ATTEST_SIZE: usize = 1024;
 /// has 24 PCRs).
 pub const MAX_TPM_PCR_VALUES: usize = 24;
 pub const MAX_CAPABILITY_LENGTH: usize = 64;
+/// Announced by nodes that apply a [`TaprootTweakPayload`] when signing. Only
+/// peers announcing it are chosen for a tweaked session: a peer that predates the
+/// field drops it and would sign untweaked, which no aggregate can use.
+pub const CAPABILITY_TAPROOT_TWEAK: &str = "taproot-tweak";
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
@@ -346,6 +350,11 @@ fn validate_sign_request(p: &SignRequestPayload) -> Result<(), &'static str> {
     {
         return Err("Derivation path contains a hardened index; \
                          only unhardened indexes are meaningful for FROST groups");
+    }
+    if p.taproot_tweak.is_some()
+        && (p.message_type != MSG_TYPE_BITCOIN_SIGHASH || p.structured_payload.is_none())
+    {
+        return Err("A taproot tweak needs a bitcoin-sighash request with its PSBT payload");
     }
     if p.participants.len() > MAX_PARTICIPANTS {
         return Err("Participants list exceeds maximum size");
@@ -1000,7 +1009,7 @@ impl AnnouncePayload {
             verifying_share,
             proof_signature,
             timestamp,
-            capabilities: vec!["sign".into()],
+            capabilities: vec!["sign".into(), CAPABILITY_TAPROOT_TWEAK.into()],
             name: None,
             attestation: None,
             tpm_attestation: None,
@@ -1152,6 +1161,34 @@ pub struct SignRequestPayload {
     /// only unhardened paths (`/0/*`, `/1/*`, etc.) are meaningful.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derivation_path: Vec<u32>,
+    /// A key-path spend of a taproot output (BIP-341): every participant tweaks
+    /// its share, after the `derivation_path` tweak, to the output key, so the
+    /// aggregate verifies under the output key the spent scriptPubKey commits
+    /// to. Only on a `bitcoin-sighash` request with its PSBT payload, whose
+    /// spent scriptPubKey each signer checks against this tweak before
+    /// committing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub taproot_tweak: Option<TaprootTweakPayload>,
+}
+
+/// The BIP-341 tweak of a key-path spend: no script tree (BIP-86) or the tree's
+/// merkle root. Unknown fields are refused rather than ignored, so a later
+/// extension is never silently signed for without.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaprootTweakPayload {
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hex_bytes_option"
+    )]
+    pub merkle_root: Option<[u8; 32]>,
+}
+
+impl From<TaprootTweakPayload> for keep_core::frost::taproot::TaprootTweak {
+    fn from(t: TaprootTweakPayload) -> Self {
+        Self::new(t.merkle_root)
+    }
 }
 
 /// BIP-32 says index >= 2^31 selects hardened derivation (needs the private
@@ -1224,7 +1261,14 @@ impl SignRequestPayload {
             session_salt: Vec::new(),
             structured_payload: None,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
+    }
+
+    /// Ask for a key-path spend of a taproot output with this tweak.
+    pub fn with_taproot_tweak(mut self, tweak: TaprootTweakPayload) -> Self {
+        self.taproot_tweak = Some(tweak);
+        self
     }
 
     /// Attach a BIP-32 unhardened derivation path off the group pubkey. On
@@ -2643,6 +2687,91 @@ mod tests {
         assert!(err
             .to_string()
             .contains("structured payload exceeds maximum size"));
+    }
+
+    fn tweaked_request(message_type: &str, payload: bool) -> SignRequestPayload {
+        let mut p =
+            SignRequestPayload::new([1u8; 32], [2u8; 32], vec![3; 32], message_type, vec![1, 2])
+                .with_taproot_tweak(TaprootTweakPayload::default());
+        if payload {
+            p = p.with_structured_payload(b"{}".to_vec());
+        }
+        p
+    }
+
+    /// A taproot tweak is only meaningful on a Bitcoin sighash whose PSBT payload
+    /// co-signers check the spent output against.
+    #[test]
+    fn a_taproot_tweak_needs_a_bitcoin_sighash_with_its_payload() {
+        for (message_type, payload, ok) in [
+            (MSG_TYPE_BITCOIN_SIGHASH, true, true),
+            (MSG_TYPE_BITCOIN_SIGHASH, false, false),
+            (MSG_TYPE_RAW, true, false),
+            (MSG_TYPE_NOSTR_EVENT, true, false),
+        ] {
+            let msg = KfpMessage::SignRequest(tweaked_request(message_type, payload));
+            assert_eq!(
+                msg.validate().is_ok(),
+                ok,
+                "{message_type} payload={payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_taproot_tweak_wire_format() {
+        let root = [0xabu8; 32];
+        let with_root = tweaked_request(MSG_TYPE_BITCOIN_SIGHASH, true).with_taproot_tweak(
+            TaprootTweakPayload {
+                merkle_root: Some(root),
+            },
+        );
+        let json = serde_json::to_value(&with_root).unwrap();
+        assert_eq!(
+            json["taproot_tweak"],
+            serde_json::json!({"merkle_root": hex::encode(root)})
+        );
+        let back: SignRequestPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.taproot_tweak,
+            Some(TaprootTweakPayload {
+                merkle_root: Some(root)
+            })
+        );
+
+        let bip86 = serde_json::to_value(tweaked_request(MSG_TYPE_BITCOIN_SIGHASH, true)).unwrap();
+        assert_eq!(bip86["taproot_tweak"], serde_json::json!({}));
+
+        let mut untweaked = serde_json::to_value(SignRequestPayload::new(
+            [1u8; 32],
+            [2u8; 32],
+            vec![3; 32],
+            MSG_TYPE_RAW,
+            vec![1, 2],
+        ))
+        .unwrap();
+        assert!(
+            untweaked.get("taproot_tweak").is_none(),
+            "absent, as older peers send it"
+        );
+        let back: SignRequestPayload = serde_json::from_value(untweaked.clone()).unwrap();
+        assert_eq!(back.taproot_tweak, None);
+
+        untweaked["taproot_tweak"] = serde_json::json!({"leaf": "00"});
+        assert!(
+            serde_json::from_value::<SignRequestPayload>(untweaked).is_err(),
+            "a tweak this version does not understand must not be signed for without"
+        );
+    }
+
+    #[test]
+    fn announces_say_they_apply_the_taproot_tweak() {
+        let announce = AnnouncePayload::new([1u8; 32], 1, [2u8; 33], [3u8; 64], 0);
+        assert!(announce
+            .capabilities
+            .iter()
+            .any(|c| c == CAPABILITY_TAPROOT_TWEAK));
+        assert!(announce.capabilities.iter().any(|c| c == "sign"));
     }
 
     /// A derivation path deeper than `MAX_DERIVATION_PATH_DEPTH` is refused at

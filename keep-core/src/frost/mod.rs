@@ -14,6 +14,7 @@ mod recover;
 mod refresh;
 mod share;
 mod signing;
+pub mod taproot;
 mod transport;
 mod verifying_set;
 

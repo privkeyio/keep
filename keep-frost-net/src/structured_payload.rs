@@ -242,6 +242,49 @@ fn verify_bitcoin_sighash(digest: &[u8], structured: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// For a key-path spend request ([`crate::TaprootTweakPayload`]): the input
+/// being signed must spend `script_pubkey`, this group's output for the request's
+/// path and tweak, and the request may only ask for SIGHASH_DEFAULT or
+/// SIGHASH_ALL, which commit to every input and output. Run after
+/// [`verify_structured_payload`] has proven the digest is this input's sighash
+/// over these prevouts; that sighash commits to the spent scriptPubKey, so a
+/// payload naming another one yields a signature no node accepts.
+pub fn verify_taproot_key_spend(
+    structured: &[u8],
+    script_pubkey: &bitcoin::ScriptBuf,
+) -> Result<()> {
+    let payload: BitcoinSighashPayload = serde_json::from_slice(structured).map_err(|e| {
+        FrostNetError::PolicyViolation(format!(
+            "bitcoin-sighash structured payload decode failed: {e}"
+        ))
+    })?;
+    if !matches!(payload.sighash_type, 0x00 | 0x01) {
+        return Err(FrostNetError::PolicyViolation(format!(
+            "a key-path spend must use SIGHASH_DEFAULT or SIGHASH_ALL, not {:#x}",
+            payload.sighash_type
+        )));
+    }
+    let spent = payload
+        .prevouts
+        .get(payload.input_index as usize)
+        .ok_or_else(|| {
+            FrostNetError::PolicyViolation(
+                "bitcoin-sighash payload input_index out of range".into(),
+            )
+        })?;
+    let spent = bitcoin::consensus::deserialize::<TxOut>(spent).map_err(|e| {
+        FrostNetError::PolicyViolation(format!("bitcoin-sighash payload prevout decode: {e}"))
+    })?;
+    if spent.script_pubkey != *script_pubkey {
+        return Err(FrostNetError::PolicyViolation(
+            "the input does not spend this group's output for the requested path and \
+             taproot tweak; refusing to sign"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

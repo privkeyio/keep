@@ -139,8 +139,9 @@ pub use protocol::{
     PreExchangedCommitment, PsbtAbortPayload, PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo,
     PsbtProposePayload, PsbtSignPayload, RefreshCompletePayload, RefreshRequestPayload,
     RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload,
-    SignatureSharePayload, TpmQuoteEvidence, WalletPolicy, XpubAnnouncePayload,
-    DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    SignatureSharePayload, TaprootTweakPayload, TpmQuoteEvidence, WalletPolicy,
+    XpubAnnouncePayload, CAPABILITY_TAPROOT_TWEAK, DEFAULT_REPLAY_WINDOW_SECS,
+    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
     DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
     DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
     KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
@@ -167,7 +168,9 @@ pub use state_event::{
     parse_state_event, state_record_event, state_tombstone_event, StateRecord, KEEP_STATE_KIND,
     STATE_TABLES,
 };
-pub use structured_payload::{verify_structured_payload, BitcoinSighashPayload, NostrEventPayload};
+pub use structured_payload::{
+    verify_structured_payload, verify_taproot_key_spend, BitcoinSighashPayload, NostrEventPayload,
+};
 pub use tpm_policy::TpmAttestationPolicy;
 #[cfg(feature = "tpm-attestation")]
 pub use tpm_producer::{TpmQuoteService, TpmQuoter, DEFAULT_PCR_SLOTS};

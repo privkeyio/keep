@@ -2190,6 +2190,18 @@ impl KfpNode {
         threshold: usize,
         exclude: &[u16],
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+        self.select_eligible_peers_with(threshold, exclude, None)
+    }
+
+    /// [`Self::select_eligible_peers`] limited to peers that announced
+    /// `capability`, when one is given.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn select_eligible_peers_with(
+        &self,
+        threshold: usize,
+        exclude: &[u16],
+        capability: Option<&str>,
+    ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         // Defensive: every real group has threshold >= 2 (split_key rejects t < 2), but guard against
         // a 0 threshold so the `threshold - 1` sample count below cannot underflow into a huge value
         // and panic. Fail closed.
@@ -2205,6 +2217,7 @@ impl KfpNode {
                 .get_signing_peers()
                 .into_iter()
                 .filter(|p| !exclude.contains(&p.share_index))
+                .filter(|p| capability.is_none_or(|c| p.has_capability(c)))
                 .filter(|p| {
                     self.can_send_to_index(p.share_index)
                         && self.can_receive_from_index(p.share_index)
