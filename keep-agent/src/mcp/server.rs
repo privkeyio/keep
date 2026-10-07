@@ -810,9 +810,7 @@ mod tests {
         keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
-    // The x-only key for a fixed seed. Seed 7 is `signing_server`'s own key, so
-    // `xonly_for_seed(7)` marks an output as recognized change (is_change_output
-    // matches the signer's key against the output's tap_internal_key).
+    // The x-only key for a fixed seed, used as a raw key: not a wallet address.
     fn xonly_for_seed(seed: u8) -> keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey {
         use keep_bitcoin::bitcoin::secp256k1::{Keypair, Secp256k1};
         let secp = Secp256k1::new();
@@ -833,16 +831,35 @@ mod tests {
         )
     }
 
+    // `signing_server`'s first change address (`86'/1'/0'/1/0`) and the master
+    // fingerprint its key origin names.
+    fn wallet_change() -> (
+        keep_bitcoin::DerivedAddress,
+        keep_bitcoin::bitcoin::bip32::Fingerprint,
+    ) {
+        let wallet =
+            keep_bitcoin::AddressDerivation::new(&[7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("valid secret");
+        (
+            wallet.get_change_address(0).expect("change address"),
+            wallet.master_fingerprint().expect("fingerprint"),
+        )
+    }
+
     // A base64 PSBT with two outputs: an external spend (`spend_sats` to
-    // `spend_spk`, no tap metadata -> not change) and a change output
-    // (`change_sats` to `change_spk`) whose tap_internal_key is set so
-    // is_change_output recognizes it as change. Funded by one input of `in_sats`.
+    // `spend_spk`, no tap metadata -> not change) and an output of `change_sats`
+    // to `change_spk` carrying `change_origin`'s internal key and BIP-371 key
+    // origin, which makes it change only if `change_spk` is that key's address.
+    // Funded by one input of `in_sats`.
     fn psbt_base64_spend_and_change(
         spend_spk: keep_bitcoin::bitcoin::ScriptBuf,
         spend_sats: u64,
         change_spk: keep_bitcoin::bitcoin::ScriptBuf,
         change_sats: u64,
-        change_internal_key: keep_bitcoin::bitcoin::secp256k1::XOnlyPublicKey,
+        change_origin: &(
+            keep_bitcoin::DerivedAddress,
+            keep_bitcoin::bitcoin::bip32::Fingerprint,
+        ),
         in_sats: u64,
     ) -> String {
         use keep_bitcoin::bitcoin::{
@@ -877,7 +894,12 @@ mod tests {
             value: Amount::from_sat(in_sats),
             script_pubkey: ScriptBuf::new(),
         });
-        psbt.outputs[1].tap_internal_key = Some(change_internal_key);
+        let (change, fingerprint) = change_origin;
+        psbt.outputs[1].tap_internal_key = Some(change.public_key);
+        psbt.outputs[1].tap_key_origins.insert(
+            change.public_key,
+            (vec![], (*fingerprint, change.path.clone())),
+        );
         keep_bitcoin::psbt::serialize_psbt_base64(&psbt)
     }
 
@@ -939,27 +961,36 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_sign_bitcoin_psbt_counts_recognized_change_toward_the_amount_limit() {
-        // The amount guard caps total_output_sats, INCLUDING recognized change, not
-        // just the external (non-change) spend. This pins that semantic on purpose:
-        // is_change is derived from client-supplied PSBT output metadata
-        // (tap_internal_key), so trusting it to shrink the amount check would let a
-        // malicious client relabel a large output as change to exceed the cap. Here
-        // the external spend (8_000) is under the 10_000 limit but the total incl.
-        // change (58_000) is over, so the request must be refused. If the guard were
-        // changed to count only non-change spend, this test would fail.
+        // The amount guard caps every output plus the fee, INCLUDING recognized
+        // change, not just the external spend. This pins that semantic on purpose:
+        // change is recognized from client-supplied PSBT output metadata, so letting
+        // it shrink the amount check widens what a malicious client can push past
+        // the cap. Here the external spend plus fee (10_000) is at the limit but the
+        // total incl. genuine change (60_000) is over, so the request must be
+        // refused. If the guard counted only non-change spend, this test would fail.
         let server = signing_server();
         install_session(
             &server,
             SessionScope::bitcoin_only().with_max_amount(10_000),
         )
         .await;
+        let change = wallet_change();
         let psbt = psbt_base64_spend_and_change(
             testnet_p2tr_address(2).script_pubkey(),
             8_000,
-            testnet_p2tr_address(7).script_pubkey(),
+            change.0.address.script_pubkey(),
             50_000,
-            xonly_for_seed(7),
+            &change,
             60_000,
+        );
+        let analysis =
+            keep_bitcoin::BitcoinSigner::new(&mut [7u8; 32], keep_bitcoin::Network::Testnet)
+                .expect("signer")
+                .analyze_psbt(&keep_bitcoin::psbt::parse_psbt_base64(&psbt).expect("psbt"))
+                .expect("analysis");
+        assert!(
+            !analysis.outputs[0].is_change && analysis.outputs[1].is_change,
+            "the test needs output 1 to be recognized change"
         );
         let resp = server
             .handle_request_async(&call(
@@ -1051,8 +1082,8 @@ mod tests {
     #[tokio::test]
     async fn mcp_sign_bitcoin_psbt_rejects_forged_change_paying_a_non_allowlisted_address() {
         // A malicious client cannot bypass the allowlist by forging change: an output
-        // paying an attacker address (seed 2) while attaching the signer's own x-only
-        // key (seed 7) as tap_internal_key is NOT genuine change, because change is
+        // paying an attacker address (seed 2) while attaching the key origin of the
+        // signer's own change address is NOT genuine change, because change is
         // determined from the actual scriptPubKey (must pay the signer's own key-path
         // output), not from forgeable PSBT metadata. So it is subject to the allowlist
         // and refused, even though output 0 pays the allowlisted address.
@@ -1069,7 +1100,7 @@ mod tests {
             1_000,
             attacker.script_pubkey(),
             5_000,
-            xonly_for_seed(7),
+            &wallet_change(),
             10_000,
         );
         let resp = server
