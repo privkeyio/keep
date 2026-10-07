@@ -104,6 +104,13 @@ impl PySessionScope {
             inner: self.inner.clone().with_address_allowlist(addresses),
         }
     }
+
+    fn with_network(&self, network: &str) -> PyResult<Self> {
+        let network = keep_bitcoin::parse_network(network).map_err(to_py_value_err)?;
+        Ok(Self {
+            inner: self.inner.clone().with_network(network),
+        })
+    }
 }
 
 #[pyclass]
@@ -394,12 +401,10 @@ impl PyAgentSession {
             })?
             .clone();
 
-        let network = match network.unwrap_or("testnet") {
-            "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-            "signet" => keep_bitcoin::Network::Signet,
-            "regtest" => keep_bitcoin::Network::Regtest,
-            _ => keep_bitcoin::Network::Testnet,
-        };
+        let network = session
+            .scope()
+            .bitcoin_network(network)
+            .map_err(to_py_value_err)?;
 
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_base64)
             .map_err(|e| PyValueError::new_err(format!("Invalid PSBT: {}", e)))?;
@@ -408,42 +413,7 @@ impl PyAgentSession {
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
 
-        // Everything the PSBT spends, the fee included: once signed, a fee is as gone
-        // as a payment.
-        if let Some(max_sats) = session.scope().max_amount_sats {
-            let requested = analysis.total_output_sats.saturating_add(analysis.fee_sats);
-            if requested > max_sats {
-                return Err(PyValueError::new_err(format!(
-                    "Amount {} sats (outputs plus fee) exceeds limit {} sats",
-                    requested, max_sats
-                )));
-            }
-        }
-
-        if let Some(ref allowlist) = session.scope().address_allowlist {
-            for output in &analysis.outputs {
-                if output.is_change {
-                    continue;
-                }
-                // Fail closed: an output with no recognizable address cannot be
-                // checked against the allowlist.
-                match output.address {
-                    Some(ref addr) if allowlist.contains(addr) => {}
-                    Some(ref addr) => {
-                        return Err(PyValueError::new_err(format!(
-                            "Address {} not in allowlist",
-                            addr
-                        )))
-                    }
-                    None => {
-                        return Err(PyValueError::new_err(format!(
-                            "Output {} has no recognizable address",
-                            output.index
-                        )))
-                    }
-                }
-            }
-        }
+        session.scope().check_psbt(&analysis).map_err(to_py_value_err)?;
 
         self.manager
             .record_request(&self.session_id)
@@ -492,12 +462,10 @@ impl PyAgentSession {
             })?
             .clone();
 
-        let network = match network.unwrap_or("testnet") {
-            "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-            "signet" => keep_bitcoin::Network::Signet,
-            "regtest" => keep_bitcoin::Network::Regtest,
-            _ => keep_bitcoin::Network::Testnet,
-        };
+        let network = session
+            .scope()
+            .bitcoin_network(network)
+            .map_err(to_py_value_err)?;
 
         let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network).map_err(to_py_err)?;
 

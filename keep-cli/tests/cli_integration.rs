@@ -1551,7 +1551,7 @@ fn test_bitcoin_sign_spends_the_wallets_own_addresses() {
         psbt
     };
 
-    let sign = |psbt: &Psbt, name: &str| {
+    let sign = |psbt: &Psbt, name: &str, yes: bool| {
         let file = dir.path().join(name);
         let b64 = bitcoin::base64::Engine::encode(
             &bitcoin::base64::engine::general_purpose::STANDARD,
@@ -1573,12 +1573,20 @@ fn test_bitcoin_sign_spends_the_wallets_own_addresses() {
                 "--network",
                 "regtest",
             ])
+            .args(yes.then_some("--yes"))
             .run();
         (out, signed)
     };
 
     let psbt = build(spk0.clone(), Some((key0, path0)));
-    let (out, signed) = sign(&psbt, "own.psbt");
+    // KEEP_YES is set by KeepCmd and stdin is not a terminal: without --yes the
+    // prompt cannot be skipped, so nothing is signed.
+    let (out, signed) = sign(&psbt, "unconfirmed.psbt", false);
+    assert_failure(&out);
+    assert!(output_contains(&out, "pass --yes"), "{out:?}");
+    assert!(!signed.exists());
+
+    let (out, signed) = sign(&psbt, "own.psbt", true);
     assert_success(&out);
     assert!(output_contains(&out, "Signed 1 input"));
     assert!(
@@ -1586,6 +1594,12 @@ fn test_bitcoin_sign_spends_the_wallets_own_addresses() {
         "change to /1/0 must be shown as change"
     );
     assert!(output_contains(&out, "Fee"));
+    assert!(output_contains(&out, "this key's, will be signed"));
+    assert!(output_contains(&out, "Leaving this wallet"));
+    assert!(
+        output_contains(&out, "31000 sats"),
+        "100000 in, 69000 change back"
+    );
     let data = std::fs::read_to_string(&signed).unwrap();
     let bytes = bitcoin::base64::Engine::decode(
         &bitcoin::base64::engine::general_purpose::STANDARD,
@@ -1615,7 +1629,7 @@ fn test_bitcoin_sign_spends_the_wallets_own_addresses() {
         .unwrap()
         .x_only_public_key();
     let foreign = Address::p2tr(&secp, stranger, None, Network::Regtest).script_pubkey();
-    let (out, _) = sign(&build(foreign, None), "foreign.psbt");
+    let (out, _) = sign(&build(foreign, None), "foreign.psbt", true);
     assert_failure(&out);
     assert!(output_contains(
         &out,

@@ -231,6 +231,7 @@ mod tests {
             total_input_sats: total_output_sats + fee_sats,
             total_output_sats,
             fee_sats,
+            input_sats: vec![total_output_sats + fee_sats],
             outputs,
             signable_inputs: vec![0],
         }

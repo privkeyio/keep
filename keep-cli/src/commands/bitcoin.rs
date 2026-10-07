@@ -11,7 +11,7 @@ use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::{get_confirm, get_password};
+use super::{confirm_prompt, get_password};
 
 pub fn cmd_bitcoin_address(
     out: &Output,
@@ -113,6 +113,7 @@ pub fn cmd_bitcoin_sign(
     psbt_path: &str,
     output_path: Option<&str>,
     network: &str,
+    yes: bool,
 ) -> Result<()> {
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -152,7 +153,11 @@ pub fn cmd_bitcoin_sign(
             "no input in this PSBT spends one of this key's addresses".into(),
         ));
     }
-    if !get_confirm("Sign this PSBT?")? {
+    // Only an explicit --yes skips this: it is the one check `keep bitcoin sign` has.
+    if !yes
+        && !confirm_prompt("Sign this PSBT?")
+            .map_err(|e| KeepError::Runtime(format!("{e}; pass --yes to sign without a prompt")))?
+    {
         return Err(KeepError::Runtime("signing declined".into()));
     }
 
@@ -269,7 +274,34 @@ fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key:
 
     if with_key {
         out.newline();
-        out.info(&format!("Signable inputs: {:?}", analysis.signable_inputs));
+        out.info("Inputs:");
+        for (i, sats) in analysis.input_sats.iter().enumerate() {
+            let owner = if analysis.signable_inputs.contains(&i) {
+                "this key's, will be signed"
+            } else {
+                "not this key's"
+            };
+            out.info(&format!("  {i}: {sats} sats ({owner})"));
+        }
+        let spent: u128 = analysis
+            .signable_inputs
+            .iter()
+            .map(|&i| u128::from(analysis.input_sats[i]))
+            .sum();
+        let change: u128 = analysis
+            .outputs
+            .iter()
+            .filter(|o| o.is_change)
+            .map(|o| u128::from(o.amount_sats))
+            .sum();
+        if spent >= change {
+            out.field("Leaving this wallet", &format!("{} sats", spent - change));
+        } else {
+            out.field(
+                "Coming into this wallet",
+                &format!("{} sats", change - spent),
+            );
+        }
     } else {
         out.newline();
         out.info("Change and signable inputs depend on the key; `keep bitcoin sign` shows them before signing.");
@@ -277,15 +309,11 @@ fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key:
 }
 
 pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {
-    match s.to_lowercase().as_str() {
-        "mainnet" | "bitcoin" => Ok(keep_bitcoin::Network::Bitcoin),
-        "testnet" => Ok(keep_bitcoin::Network::Testnet),
-        "signet" => Ok(keep_bitcoin::Network::Signet),
-        "regtest" => Ok(keep_bitcoin::Network::Regtest),
-        _ => Err(KeepError::InvalidNetwork(format!(
+    keep_bitcoin::parse_network(s).map_err(|_| {
+        KeepError::InvalidNetwork(format!(
             "'{s}' (valid: mainnet/bitcoin, testnet, signet, regtest)"
-        ))),
-    }
+        ))
+    })
 }
 
 #[cfg(test)]

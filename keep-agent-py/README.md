@@ -17,8 +17,12 @@ pip install ./keep-agent-py
 from keep_agent import AgentSession, SessionScope
 
 # Create a session with signing capability
+# Bitcoin operations need the session's network; signing PSBTs also needs a spend limit
+scope = SessionScope.full()
+scope.network = "testnet"
+scope.max_amount_sats = 100_000
 session = AgentSession(
-    scope=SessionScope.full(),
+    scope=scope,
     secret_key="<32-byte-hex-secret-key>",  # Required for signing
 )
 
@@ -29,7 +33,7 @@ print(f"Signature: {event['sig']}")
 
 # Get public key and Bitcoin address
 npub = session.get_public_key()
-address = session.get_bitcoin_address(network="testnet")
+address = session.get_bitcoin_address()  # on the session's network
 ```
 
 ## Session Constraints
@@ -44,8 +48,9 @@ session = AgentSession(
     scope=SessionScope(
         operations=["sign_nostr_event", "get_public_key"],
         event_kinds=[1, 7],          # Only text notes and reactions
-        max_amount_sats=100_000,     # Max 0.001 BTC per PSBT: every output, change included, plus the fee
+        max_amount_sats=100_000,     # Max 0.001 BTC leaving the wallet per PSBT: every output but change, plus the fee
         address_allowlist=["bc1q..."],  # Every non-change output must pay a listed address
+        network="mainnet",           # Required for Bitcoin operations; every call uses it
     ),
     rate_limit=RateLimit(
         max_per_minute=10,
@@ -68,6 +73,8 @@ SessionScope.nostr_only()   # sign_nostr_event, get_public_key
 SessionScope.bitcoin_only() # sign_psbt, get_public_key, get_bitcoin_address
 SessionScope.full()         # All operations
 ```
+
+A scope with `sign_psbt` or `get_bitcoin_address` must set `network`, and one with `sign_psbt` must also set `max_amount_sats`, or creating the session fails. A call's optional `network` argument may only repeat the session's network.
 
 ## Remote Signing (NIP-46)
 
@@ -146,9 +153,9 @@ agent = Agent(role="Social Manager", tools=tools)
 | Method | Description |
 |--------|-------------|
 | `sign_event(kind, content, tags)` | Sign a Nostr event |
-| `sign_psbt(psbt_base64, network)` | Sign the inputs that spend this key's BIP-86 addresses (the PSBT must carry their BIP-371 key origins) |
+| `sign_psbt(psbt_base64, network=None)` | Sign the inputs that spend this key's BIP-86 addresses (the PSBT must carry their BIP-371 key origins) |
 | `get_public_key()` | Get npub |
-| `get_bitcoin_address(network)` | Get the first BIP-86 receive address (`m/86'/coin'/0'/0/0`) |
+| `get_bitcoin_address(network=None)` | Get the first BIP-86 receive address (`m/86'/coin'/0'/0/0`) |
 | `get_session_info()` | Get session status |
 | `check_operation(op)` | Check if operation allowed |
 | `check_event_kind(kind)` | Check if event kind allowed |

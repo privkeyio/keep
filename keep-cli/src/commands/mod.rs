@@ -226,6 +226,11 @@ pub fn get_confirm(prompt: &str) -> Result<bool> {
     if std::env::var("KEEP_YES").is_ok() {
         return Ok(true);
     }
+    confirm_prompt(prompt)
+}
+
+/// Asks on the terminal, whatever KEEP_YES says; fails without one.
+pub fn confirm_prompt(prompt: &str) -> Result<bool> {
     Confirm::with_theme(&ColorfulTheme::default())
         .with_prompt(prompt)
         .default(false)

@@ -46,6 +46,18 @@ pub use signer::BitcoinSigner;
 pub use bitcoin;
 pub use bitcoin::Network;
 
+/// The network a user names, case-insensitively. Anything else is refused rather
+/// than defaulted: keys, addresses and change paths all depend on it.
+pub fn parse_network(s: &str) -> Result<Network> {
+    match s.to_lowercase().as_str() {
+        "mainnet" | "bitcoin" => Ok(Network::Bitcoin),
+        "testnet" => Ok(Network::Testnet),
+        "signet" => Ok(Network::Signet),
+        "regtest" => Ok(Network::Regtest),
+        _ => Err(BitcoinError::InvalidNetwork(s.to_string())),
+    }
+}
+
 fn aux_rand() -> Result<zeroize::Zeroizing<[u8; 32]>> {
     let mut buf = [0u8; 32];
     getrandom::fill(&mut buf)

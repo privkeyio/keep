@@ -226,7 +226,20 @@ fn dispatch_agent(
     hidden: bool,
 ) -> Result<()> {
     match command {
-        AgentCommands::Mcp { key } => commands::agent::cmd_agent_mcp(out, path, &key, hidden),
+        AgentCommands::Mcp {
+            key,
+            network,
+            max_amount_sats,
+            allow_address,
+        } => commands::agent::cmd_agent_mcp(
+            out,
+            path,
+            &key,
+            hidden,
+            network.as_deref(),
+            max_amount_sats,
+            allow_address,
+        ),
     }
 }
 
@@ -662,9 +675,16 @@ fn dispatch_bitcoin(out: &Output, path: &std::path::Path, command: BitcoinComman
             psbt,
             output,
             network,
-        } => {
-            commands::bitcoin::cmd_bitcoin_sign(out, path, &key, &psbt, output.as_deref(), &network)
-        }
+            yes,
+        } => commands::bitcoin::cmd_bitcoin_sign(
+            out,
+            path,
+            &key,
+            &psbt,
+            output.as_deref(),
+            &network,
+            yes,
+        ),
         BitcoinCommands::Analyze { psbt, network } => {
             commands::bitcoin::cmd_bitcoin_analyze(out, &psbt, &network)
         }

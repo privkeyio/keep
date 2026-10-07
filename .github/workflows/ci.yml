@@ -102,6 +102,8 @@ jobs:
       # The MCP agent surface is behind the non-default `mcp` feature, so the
       # workspace test run above never compiles it; run its tests explicitly.
       - run: cargo test -p keep-agent --features mcp --lib
+      # Adversarial PSBTs and a seeded mutation loop against the single-key signer.
+      - run: cargo test -p keep-bitcoin --release --test psbt_stress
       # End-to-end CLI tests drive the release `keep` binary built above as a
       # subprocess (the tests locate `target/release/keep`), so run them in
       # --release too. Previously only compile-checked, never executed in CI.

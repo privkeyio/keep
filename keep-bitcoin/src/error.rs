@@ -10,6 +10,9 @@ pub enum BitcoinError {
     #[error("Invalid public key: {0}")]
     InvalidPublicKey(String),
 
+    #[error("Invalid network '{0}' (valid: mainnet/bitcoin, testnet, signet, regtest)")]
+    InvalidNetwork(String),
+
     #[error("Invalid PSBT: {0}")]
     InvalidPsbt(String),
 

@@ -17,8 +17,9 @@ cd keep-agent-ts && npm install && npm run build
 import { KeepAgentSession, createFullScope } from '@keep/agent';
 
 // Create a session with signing capability
+// Bitcoin operations need the session's network; signing PSBTs also needs a spend limit
 const session = new KeepAgentSession(
-  createFullScope(),
+  { ...createFullScope(), network: 'testnet', maxAmountSats: 100_000 },
   null,  // Use default rate limits
   24,    // Duration in hours
   null,  // No policy
@@ -32,7 +33,7 @@ console.log(`Signature: ${event.sig}`);
 
 // Get public key and Bitcoin address
 const npub = await session.getPublicKey();
-const address = await session.getBitcoinAddress('testnet');
+const address = await session.getBitcoinAddress(); // on the session's network
 ```
 
 ## Session Constraints
@@ -47,8 +48,9 @@ const session = new KeepAgentSession(
   {
     operations: ['sign_nostr_event', 'get_public_key'],
     eventKinds: [1, 7],          // Only text notes and reactions
-    maxAmountSats: 100_000,      // Max 0.001 BTC per PSBT: every output, change included, plus the fee
+    maxAmountSats: 100_000,      // Max 0.001 BTC leaving the wallet per PSBT: every output but change, plus the fee
     addressAllowlist: ['bc1q...'], // Every non-change output must pay a listed address
+    network: 'mainnet',          // Required for Bitcoin operations; every call uses it
   },
   { maxPerMinute: 10, maxPerHour: 100, maxPerDay: 1000 },
   24,
@@ -70,6 +72,8 @@ createNostrScope();   // sign_nostr_event, get_public_key
 createBitcoinScope(); // sign_psbt, get_public_key, get_bitcoin_address
 createFullScope();    // All operations
 ```
+
+A scope with `sign_psbt` or `get_bitcoin_address` must set `network`, and one with `sign_psbt` must also set `maxAmountSats`, or creating the session fails. A call's optional `network` argument may only repeat the session's network.
 
 ## Remote Signing (NIP-46)
 
@@ -145,6 +149,7 @@ interface SessionScopeConfig {
   eventKinds?: number[];
   maxAmountSats?: number;
   addressAllowlist?: string[];
+  network?: string;
 }
 
 interface RateLimitOptions {

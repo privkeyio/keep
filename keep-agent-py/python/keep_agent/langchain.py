@@ -23,7 +23,7 @@ class SignNostrEventInput(BaseModel if _HAS_LANGCHAIN else object):
 
 class SignPsbtInput(BaseModel if _HAS_LANGCHAIN else object):
     psbt: str = Field(description="Base64-encoded PSBT")
-    network: str = Field(default="testnet", description="Bitcoin network (mainnet, testnet, signet, regtest)")
+    network: Optional[str] = Field(default=None, description="Optional; if given, must be the session's Bitcoin network")
 
 
 class KeepSignerTool(BaseTool if _HAS_LANGCHAIN else object):
@@ -62,7 +62,7 @@ The signing is constrained by your session permissions."""
 
         elif action == "sign_psbt":
             psbt = kwargs.get("psbt", "")
-            network = kwargs.get("network", "testnet")
+            network = kwargs.get("network")
 
             try:
                 signed = self.session.sign_psbt(psbt, network)
@@ -77,7 +77,7 @@ The signing is constrained by your session permissions."""
                 return f"Error getting pubkey: {e}"
 
         elif action == "get_address":
-            network = kwargs.get("network", "testnet")
+            network = kwargs.get("network")
             try:
                 return self.session.get_bitcoin_address(network)
             except Exception as e:
@@ -127,7 +127,7 @@ class KeepBitcoinTool(BaseTool if _HAS_LANGCHAIN else object):
         super().__init__(**kwargs)
         self.session = session
 
-    def _run(self, psbt: str, network: str = "testnet") -> str:
+    def _run(self, psbt: str, network: Optional[str] = None) -> str:
         try:
             signed = self.session.sign_psbt(psbt, network=network)
             return f"Signed PSBT: {signed[:50]}..."

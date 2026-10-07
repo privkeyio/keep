@@ -36,6 +36,7 @@ pub struct SessionScopeConfig {
     pub event_kinds: Option<Vec<u32>>,
     pub max_amount_sats: Option<i64>,
     pub address_allowlist: Option<Vec<String>>,
+    pub network: Option<String>,
 }
 
 #[napi(object)]
@@ -164,6 +165,11 @@ impl KeepAgentSession {
             }
             if let Some(addrs) = config.address_allowlist {
                 scope = scope.with_address_allowlist(addrs);
+            }
+            if let Some(network) = config.network {
+                let network = keep_bitcoin::parse_network(&network)
+                    .map_err(|e| Error::from_reason(e.to_string()))?;
+                scope = scope.with_network(network);
             }
             scope
         } else {
@@ -392,12 +398,10 @@ impl KeepAgentSession {
             .ok_or_else(|| Error::from_reason("No secret key configured"))?
             .clone();
 
-        let network = match network.as_deref().unwrap_or("testnet") {
-            "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-            "signet" => keep_bitcoin::Network::Signet,
-            "regtest" => keep_bitcoin::Network::Regtest,
-            _ => keep_bitcoin::Network::Testnet,
-        };
+        let network = session
+            .scope()
+            .bitcoin_network(network.as_deref())
+            .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(&psbt_base64)
             .map_err(|e| Error::from_reason(format!("Invalid PSBT: {}", e)))?;
@@ -409,42 +413,10 @@ impl KeepAgentSession {
             .analyze_psbt(&psbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        // Everything the PSBT spends, the fee included: once signed, a fee is as gone
-        // as a payment.
-        if let Some(max_sats) = session.scope().max_amount_sats {
-            let requested = analysis.total_output_sats.saturating_add(analysis.fee_sats);
-            if requested > max_sats {
-                return Err(Error::from_reason(format!(
-                    "Amount {} sats (outputs plus fee) exceeds limit {} sats",
-                    requested, max_sats
-                )));
-            }
-        }
-
-        if let Some(ref allowlist) = session.scope().address_allowlist {
-            for output in &analysis.outputs {
-                if output.is_change {
-                    continue;
-                }
-                // Fail closed: an output with no recognizable address cannot be
-                // checked against the allowlist.
-                match output.address {
-                    Some(ref addr) if allowlist.contains(addr) => {}
-                    Some(ref addr) => {
-                        return Err(Error::from_reason(format!(
-                            "Address {} not in allowlist",
-                            addr
-                        )))
-                    }
-                    None => {
-                        return Err(Error::from_reason(format!(
-                            "Output {} has no recognizable address",
-                            output.index
-                        )))
-                    }
-                }
-            }
-        }
+        session
+            .scope()
+            .check_psbt(&analysis)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
 
         self.manager
             .record_request(&self.session_id)
@@ -491,12 +463,10 @@ impl KeepAgentSession {
             .ok_or_else(|| Error::from_reason("No secret key configured"))?
             .clone();
 
-        let network = match network.as_deref().unwrap_or("testnet") {
-            "mainnet" | "bitcoin" => keep_bitcoin::Network::Bitcoin,
-            "signet" => keep_bitcoin::Network::Signet,
-            "regtest" => keep_bitcoin::Network::Regtest,
-            _ => keep_bitcoin::Network::Testnet,
-        };
+        let network = session
+            .scope()
+            .bitcoin_network(network.as_deref())
+            .map_err(|e| Error::from_reason(e.to_string()))?;
 
         let signer = keep_bitcoin::BitcoinSigner::new(&mut secret, network)
             .map_err(|e| Error::from_reason(e.to_string()))?;
@@ -688,6 +658,7 @@ pub fn create_nostr_scope() -> SessionScopeConfig {
         event_kinds: None,
         max_amount_sats: None,
         address_allowlist: None,
+        network: None,
     }
 }
 
@@ -702,6 +673,7 @@ pub fn create_bitcoin_scope() -> SessionScopeConfig {
         event_kinds: None,
         max_amount_sats: None,
         address_allowlist: None,
+        network: None,
     }
 }
 
@@ -719,5 +691,6 @@ pub fn create_full_scope() -> SessionScopeConfig {
         event_kinds: None,
         max_amount_sats: None,
         address_allowlist: None,
+        network: None,
     }
 }

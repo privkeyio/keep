@@ -24,9 +24,10 @@ impl SessionManager {
 
     pub fn create_session(
         &self,
-        config: SessionConfig,
+        mut config: SessionConfig,
         metadata: SessionMetadata,
     ) -> Result<(SessionToken, String)> {
+        config.scope = config.scope.validated()?;
         let token = SessionToken::generate();
         let session = AgentSession::new(&token, self.pubkey, config, metadata);
         let session_id = session.id().to_string();

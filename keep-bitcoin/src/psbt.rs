@@ -8,7 +8,7 @@ use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{Signature as TaprootSignature, TapLeafHash};
-use bitcoin::{Address, Network, ScriptBuf, TxOut, XOnlyPublicKey};
+use bitcoin::{Address, Network, ScriptBuf, Transaction, TxOut, XOnlyPublicKey};
 use keep_core::crypto::MlockedBox;
 use std::collections::BTreeMap;
 
@@ -21,6 +21,8 @@ pub struct PsbtAnalysis {
     pub total_input_sats: u64,
     pub total_output_sats: u64,
     pub fee_sats: u64,
+    /// The amount each input spends, by input index.
+    pub input_sats: Vec<u64>,
     pub outputs: Vec<OutputInfo>,
     pub signable_inputs: Vec<usize>,
 }
@@ -212,6 +214,7 @@ impl PsbtSigner {
 
     pub fn analyze(&self, psbt: &Psbt) -> Result<PsbtAnalysis> {
         let mut total_input_sats = 0u64;
+        let mut input_sats = Vec::with_capacity(psbt.inputs.len());
         let mut signable_inputs = Vec::new();
 
         for (i, input) in psbt.inputs.iter().enumerate() {
@@ -221,6 +224,7 @@ impl PsbtSigner {
             total_input_sats = total_input_sats
                 .checked_add(utxo.value.to_sat())
                 .ok_or_else(|| BitcoinError::InvalidPsbt("input value overflow".into()))?;
+            input_sats.push(utxo.value.to_sat());
 
             if self.should_sign_input(psbt, i)? {
                 requested_sighash_type(psbt, i)?;
@@ -260,14 +264,13 @@ impl PsbtSigner {
             total_input_sats,
             total_output_sats,
             fee_sats,
+            input_sats,
             outputs,
             signable_inputs,
         })
     }
 
     pub fn sign(&self, psbt: &mut Psbt) -> Result<usize> {
-        let mut signed_count = 0;
-
         let prevouts: Vec<TxOut> = psbt
             .inputs
             .iter()
@@ -282,8 +285,8 @@ impl PsbtSigner {
 
         let prevouts_ref = Prevouts::All(&prevouts);
 
-        // Every input is checked before anything is written, so a refusal never leaves
-        // a partly signed PSBT.
+        // Every input is checked and every signature made before anything is written,
+        // so a refusal or a failure never leaves a partly signed PSBT.
         // Sized up front so it never reallocates (each move would leave a copy of the
         // keys in freed memory), and erased in place below: `Keypair` is `Copy`.
         let mut signers: Vec<(usize, Keypair, TapSighashType)> =
@@ -309,16 +312,36 @@ impl PsbtSigner {
                 }
             }
         }
-        for (i, keypair, sighash_type) in &signers {
-            if result.is_ok() {
-                result = self.sign_taproot_keypath(psbt, *i, &prevouts_ref, keypair, *sighash_type);
-                signed_count += usize::from(result.is_ok());
+        let mut signatures = Vec::with_capacity(signers.len());
+        if result.is_ok() {
+            // One cache for the whole transaction: its BIP-341 midstate hashes every
+            // input and output, so rebuilding it per input costs quadratic time.
+            let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
+            for (i, keypair, sighash_type) in &signers {
+                match self.taproot_keypath_signature(
+                    &mut sighash_cache,
+                    *i,
+                    &prevouts_ref,
+                    keypair,
+                    *sighash_type,
+                ) {
+                    Ok(signature) => signatures.push((*i, signature)),
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
             }
         }
         for (_, keypair, _) in signers.iter_mut() {
             keypair.non_secure_erase();
         }
-        result.map(|()| signed_count)
+        result?;
+        let signed_count = signatures.len();
+        for (i, signature) in signatures {
+            psbt.inputs[i].tap_key_sig = Some(signature);
+        }
+        Ok(signed_count)
     }
 
     fn should_sign_input(&self, psbt: &Psbt, index: usize) -> Result<bool> {
@@ -331,16 +354,14 @@ impl PsbtSigner {
         })
     }
 
-    fn sign_taproot_keypath(
+    fn taproot_keypath_signature(
         &self,
-        psbt: &mut Psbt,
+        sighash_cache: &mut SighashCache<&Transaction>,
         index: usize,
         prevouts: &Prevouts<TxOut>,
         keypair: &Keypair,
         sighash_type: TapSighashType,
-    ) -> Result<()> {
-        let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-
+    ) -> Result<TaprootSignature> {
         let sighash = sighash_cache
             .taproot_key_spend_signature_hash(index, prevouts, sighash_type)
             .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
@@ -358,14 +379,10 @@ impl PsbtSigner {
             .verify_schnorr(&sig, &msg, &keypair.x_only_public_key().0)
             .map_err(|e| BitcoinError::Signing(format!("key-path signature check failed: {e}")))?;
 
-        let taproot_sig = TaprootSignature {
+        Ok(TaprootSignature {
             signature: sig,
             sighash_type,
-        };
-
-        psbt.inputs[index].tap_key_sig = Some(taproot_sig);
-
-        Ok(())
+        })
     }
 
     fn is_change_output(&self, psbt: &Psbt, index: usize) -> bool {
@@ -408,12 +425,30 @@ fn requested_sighash_type(psbt: &Psbt, index: usize) -> Result<TapSighashType> {
     }
 }
 
+/// The largest PSBT keep parses. A maximum-size standard transaction (100,000 vB,
+/// about 1,700 taproot inputs) with every input's UTXO and key origin is well under
+/// it; the bound keeps an attacker's PSBT from costing unbounded time to analyze and
+/// sign.
+pub const MAX_PSBT_BYTES: usize = 512 * 1024;
+
 pub fn parse_psbt(data: &[u8]) -> Result<Psbt> {
+    if data.len() > MAX_PSBT_BYTES {
+        return Err(BitcoinError::InvalidPsbt(format!(
+            "{} bytes exceeds the {MAX_PSBT_BYTES}-byte limit",
+            data.len()
+        )));
+    }
     Psbt::deserialize(data).map_err(|e| BitcoinError::InvalidPsbt(e.to_string()))
 }
 
 pub fn parse_psbt_base64(base64: &str) -> Result<Psbt> {
     use bitcoin::base64::{engine::general_purpose::STANDARD, Engine};
+    if base64.len() > MAX_PSBT_BYTES.div_ceil(3) * 4 {
+        return Err(BitcoinError::InvalidPsbt(format!(
+            "{} base64 characters exceeds the {MAX_PSBT_BYTES}-byte limit",
+            base64.len()
+        )));
+    }
     let bytes = STANDARD
         .decode(base64)
         .map_err(|e| BitcoinError::InvalidPsbt(format!("Invalid base64: {e}")))?;
@@ -973,6 +1008,120 @@ mod tests {
         with_origin(&mut psbt, 0, a.public_key, fp, &a.path.to_string());
         assert_eq!(main.sign(&mut psbt).unwrap(), 1);
         assert!(spends_on_chain(&psbt, 0));
+    }
+
+    #[test]
+    fn psbts_past_the_size_limit_are_refused_before_parsing() {
+        use bitcoin::base64::{engine::general_purpose::STANDARD, Engine};
+        let mut psbt = spending(&[derived(false, 0).address.script_pubkey()]);
+        let base = psbt.serialize().len();
+        psbt.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: 0xf0,
+                key: vec![],
+            },
+            vec![0u8; MAX_PSBT_BYTES - base - 8],
+        );
+        let at_limit = psbt.serialize();
+        assert!(at_limit.len() <= MAX_PSBT_BYTES);
+        assert!(
+            parse_psbt(&at_limit).is_ok(),
+            "{:?}",
+            parse_psbt(&at_limit).err()
+        );
+        assert!(parse_psbt_base64(&STANDARD.encode(&at_limit)).is_ok());
+
+        psbt.inputs[0]
+            .unknown
+            .values_mut()
+            .for_each(|v| v.extend([0u8; 16]));
+        let over = psbt.serialize();
+        assert!(over.len() > MAX_PSBT_BYTES);
+        assert!(
+            matches!(parse_psbt(&over), Err(BitcoinError::InvalidPsbt(m)) if m.contains("limit"))
+        );
+        // Refused on its length alone, before decoding allocates anything.
+        assert!(matches!(
+            parse_psbt_base64(&STANDARD.encode(&over)),
+            Err(BitcoinError::InvalidPsbt(m)) if m.contains("base64 characters")
+        ));
+    }
+
+    #[test]
+    fn mainnet_signs_and_recognizes_change_only_under_coin_type_0() {
+        let mut secret = SECRET;
+        let main = PsbtSigner::new(&mut secret, Network::Bitcoin).unwrap();
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Bitcoin, &SECRET).unwrap();
+        let fp = master.fingerprint(&secp);
+        let key_at = |path: &str| {
+            let path = DerivationPath::from_str(path).unwrap();
+            let child = master.derive_priv(&secp, &path).unwrap();
+            let (xonly, _) = child.to_keypair(&secp).x_only_public_key();
+            let spk = Address::p2tr(&secp, xonly, None, Network::Bitcoin).script_pubkey();
+            (xonly, path, spk)
+        };
+        for (path, signs) in [
+            ("86'/0'/0'/0/5", true),
+            ("86'/0'/0'/1/7", true),
+            ("86'/0'/3'/0/0", true),
+            ("86'/1'/0'/0/5", false),
+            ("86'/1'/0'/1/7", false),
+        ] {
+            let (xonly, path_d, spk) = key_at(path);
+            let mut psbt = spending(&[spk]);
+            with_origin(&mut psbt, 0, xonly, fp, &path_d.to_string());
+            assert_eq!(main.sign(&mut psbt).unwrap(), usize::from(signs), "{path}");
+            assert_eq!(spends_on_chain(&psbt, 0), signs, "{path}");
+        }
+        for (path, change) in [
+            ("86'/0'/0'/1/0", true),
+            ("86'/0'/0'/1/999", true),
+            ("86'/0'/0'/1/1000", false),
+            ("86'/0'/0'/0/0", false),
+            ("86'/1'/0'/1/0", false),
+        ] {
+            let (xonly, path_d, spk) = key_at(path);
+            let mut psbt = psbt_paying(spk, 10_000, 20_000, None);
+            psbt.outputs[0]
+                .tap_key_origins
+                .insert(xonly, (vec![], (fp, path_d)));
+            assert_eq!(
+                main.analyze(&psbt).unwrap().outputs[0].is_change,
+                change,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_foreign_input_without_its_utxo_stops_everything() {
+        let a = derived(false, 0);
+        let mut other = [2u8; 32];
+        let mut psbt = spending(&[
+            a.address.script_pubkey(),
+            other_address(&mut other).script_pubkey(),
+        ]);
+        with_origin(
+            &mut psbt,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        let analysis = signer().analyze(&psbt).unwrap();
+        assert_eq!(analysis.input_sats, vec![50_000, 50_001]);
+        assert_eq!(analysis.signable_inputs, vec![0]);
+
+        // BIP-341 commits to every input's amount and script, so without the foreign
+        // input's UTXO there is nothing correct to sign.
+        psbt.inputs[1].witness_utxo = None;
+        assert!(signer().analyze(&psbt).is_err());
+        assert!(matches!(
+            signer().sign(&mut psbt),
+            Err(BitcoinError::MissingWitnessUtxo(1))
+        ));
+        assert!(psbt.inputs[0].tap_key_sig.is_none());
     }
 
     #[test]

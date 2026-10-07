@@ -50,6 +50,7 @@ export interface SessionScopeConfig {
   eventKinds?: Array<number>
   maxAmountSats?: number
   addressAllowlist?: Array<string>
+  network?: string
 }
 
 export interface SignedEvent {
