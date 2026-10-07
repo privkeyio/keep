@@ -284,7 +284,10 @@ impl PsbtSigner {
 
         // Every input is checked before anything is written, so a refusal never leaves
         // a partly signed PSBT.
-        let mut signers: Vec<(usize, Keypair, TapSighashType)> = Vec::new();
+        // Sized up front so it never reallocates (each move would leave a copy of the
+        // keys in freed memory), and erased in place below: `Keypair` is `Copy`.
+        let mut signers: Vec<(usize, Keypair, TapSighashType)> =
+            Vec::with_capacity(psbt.inputs.len());
         let mut result = Ok(());
         for i in 0..psbt.inputs.len() {
             match self.input_signer(psbt, i) {
@@ -309,7 +312,7 @@ impl PsbtSigner {
                 signed_count += usize::from(result.is_ok());
             }
         }
-        for (_, mut keypair, _) in signers {
+        for (_, keypair, _) in signers.iter_mut() {
             keypair.non_secure_erase();
         }
         result.map(|()| signed_count)
