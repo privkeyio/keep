@@ -409,25 +409,38 @@ impl KeepAgentSession {
             .analyze_psbt(&psbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
+        // Everything the PSBT spends, the fee included: once signed, a fee is as gone
+        // as a payment.
         if let Some(max_sats) = session.scope().max_amount_sats {
-            if analysis.total_output_sats > max_sats {
+            let requested = analysis.total_output_sats.saturating_add(analysis.fee_sats);
+            if requested > max_sats {
                 return Err(Error::from_reason(format!(
-                    "Amount {} sats exceeds limit {} sats",
-                    analysis.total_output_sats, max_sats
+                    "Amount {} sats (outputs plus fee) exceeds limit {} sats",
+                    requested, max_sats
                 )));
             }
         }
 
         if let Some(ref allowlist) = session.scope().address_allowlist {
             for output in &analysis.outputs {
-                if !output.is_change {
-                    if let Some(ref addr) = output.address {
-                        if !allowlist.contains(&addr.to_string()) {
-                            return Err(Error::from_reason(format!(
-                                "Address {} not in allowlist",
-                                addr
-                            )));
-                        }
+                if output.is_change {
+                    continue;
+                }
+                // Fail closed: an output with no recognizable address cannot be
+                // checked against the allowlist.
+                match output.address {
+                    Some(ref addr) if allowlist.contains(addr) => {}
+                    Some(ref addr) => {
+                        return Err(Error::from_reason(format!(
+                            "Address {} not in allowlist",
+                            addr
+                        )))
+                    }
+                    None => {
+                        return Err(Error::from_reason(format!(
+                            "Output {} has no recognizable address",
+                            output.index
+                        )))
                     }
                 }
             }

@@ -83,12 +83,14 @@ impl BitcoinSigner {
             None => return Ok(()),
         };
 
+        // What leaves the wallet: every non-change output plus the fee, which is as
+        // gone as a payment once the signatures commit to the input amounts.
         let spend_amount: u64 = analysis
             .outputs
             .iter()
             .filter(|o| !o.is_change)
             .map(|o| o.amount_sats)
-            .sum();
+            .fold(analysis.fee_sats, u64::saturating_add);
 
         if let Some(max) = policy.max_amount_sats {
             if spend_amount > max {
@@ -104,9 +106,16 @@ impl BitcoinSigner {
                 if output.is_change {
                     continue;
                 }
-                if let Some(addr) = &output.address {
-                    if !allowlist.contains(addr) {
-                        return Err(BitcoinError::AddressNotAllowed(addr.clone()));
+                // Fail closed: an output with no recognizable address cannot be
+                // checked against the allowlist.
+                match &output.address {
+                    Some(addr) if allowlist.contains(addr) => {}
+                    Some(addr) => return Err(BitcoinError::AddressNotAllowed(addr.clone())),
+                    None => {
+                        return Err(BitcoinError::AddressNotAllowed(format!(
+                            "output {} has no recognizable address",
+                            output.index
+                        )))
                     }
                 }
             }
@@ -200,5 +209,83 @@ mod tests {
 
         let unique: std::collections::HashSet<_> = addresses.iter().collect();
         assert_eq!(unique.len(), 5);
+    }
+
+    fn analysis(outputs: &[(u64, Option<&str>, bool)], fee_sats: u64) -> PsbtAnalysis {
+        let outputs: Vec<crate::psbt::OutputInfo> = outputs
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (amount_sats, address, is_change))| crate::psbt::OutputInfo {
+                    index,
+                    address: address.map(str::to_string),
+                    amount_sats: *amount_sats,
+                    is_change: *is_change,
+                },
+            )
+            .collect();
+        let total_output_sats = outputs.iter().map(|o| o.amount_sats).sum::<u64>();
+        PsbtAnalysis {
+            num_inputs: 1,
+            num_outputs: outputs.len(),
+            total_input_sats: total_output_sats + fee_sats,
+            total_output_sats,
+            fee_sats,
+            outputs,
+            signable_inputs: vec![0],
+        }
+    }
+
+    fn signer_with(policy: SigningPolicy) -> BitcoinSigner {
+        let mut secret = [5u8; 32];
+        BitcoinSigner::new(&mut secret, Network::Testnet)
+            .unwrap()
+            .with_policy(policy)
+    }
+
+    #[test]
+    fn the_amount_limit_counts_the_fee() {
+        let signer = signer_with(SigningPolicy {
+            max_amount_sats: Some(10_000),
+            ..Default::default()
+        });
+        assert!(signer
+            .check_policy(&analysis(&[(5_000, Some("a"), false)], 4_000))
+            .is_ok());
+        assert!(matches!(
+            signer.check_policy(&analysis(
+                &[(5_000, Some("a"), false), (90_000, Some("c"), true)],
+                55_000
+            )),
+            Err(BitcoinError::AmountExceeded {
+                amount: 60_000,
+                limit: 10_000
+            })
+        ));
+    }
+
+    #[test]
+    fn the_allowlist_refuses_outputs_without_an_address() {
+        let signer = signer_with(SigningPolicy {
+            address_allowlist: Some(vec!["a".into()]),
+            ..Default::default()
+        });
+        assert!(signer
+            .check_policy(&analysis(&[(5_000, Some("a"), false)], 100))
+            .is_ok());
+        assert!(matches!(
+            signer.check_policy(&analysis(&[(5_000, Some("b"), false)], 100)),
+            Err(BitcoinError::AddressNotAllowed(_))
+        ));
+        assert!(matches!(
+            signer.check_policy(&analysis(&[(5_000, None, false)], 100)),
+            Err(BitcoinError::AddressNotAllowed(_))
+        ));
+        assert!(signer
+            .check_policy(&analysis(
+                &[(5_000, Some("a"), false), (1_000, None, true)],
+                100
+            ))
+            .is_ok());
     }
 }

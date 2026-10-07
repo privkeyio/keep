@@ -408,25 +408,38 @@ impl PyAgentSession {
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
 
+        // Everything the PSBT spends, the fee included: once signed, a fee is as gone
+        // as a payment.
         if let Some(max_sats) = session.scope().max_amount_sats {
-            if analysis.total_output_sats > max_sats {
+            let requested = analysis.total_output_sats.saturating_add(analysis.fee_sats);
+            if requested > max_sats {
                 return Err(PyValueError::new_err(format!(
-                    "Amount {} sats exceeds limit {} sats",
-                    analysis.total_output_sats, max_sats
+                    "Amount {} sats (outputs plus fee) exceeds limit {} sats",
+                    requested, max_sats
                 )));
             }
         }
 
         if let Some(ref allowlist) = session.scope().address_allowlist {
             for output in &analysis.outputs {
-                if !output.is_change {
-                    if let Some(ref addr) = output.address {
-                        if !allowlist.contains(&addr.to_string()) {
-                            return Err(PyValueError::new_err(format!(
-                                "Address {} not in allowlist",
-                                addr
-                            )));
-                        }
+                if output.is_change {
+                    continue;
+                }
+                // Fail closed: an output with no recognizable address cannot be
+                // checked against the allowlist.
+                match output.address {
+                    Some(ref addr) if allowlist.contains(addr) => {}
+                    Some(ref addr) => {
+                        return Err(PyValueError::new_err(format!(
+                            "Address {} not in allowlist",
+                            addr
+                        )))
+                    }
+                    None => {
+                        return Err(PyValueError::new_err(format!(
+                            "Output {} has no recognizable address",
+                            output.index
+                        )))
                     }
                 }
             }

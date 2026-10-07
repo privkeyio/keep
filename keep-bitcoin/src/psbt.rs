@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
+use crate::address::{coin_type, master_xpriv};
 use crate::error::{BitcoinError, Result};
-use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv};
+use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource};
 use bitcoin::key::TapTweak;
 use bitcoin::psbt::Psbt;
 use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::taproot::{Signature as TaprootSignature, TapLeafHash, TapNodeHash};
+use bitcoin::taproot::{Signature as TaprootSignature, TapLeafHash};
 use bitcoin::{Address, Network, ScriptBuf, TxOut, XOnlyPublicKey};
 use keep_core::crypto::MlockedBox;
 use std::collections::BTreeMap;
@@ -32,22 +33,36 @@ pub struct OutputInfo {
     pub is_change: bool,
 }
 
-// NOTE: `Keypair` (from secp256k1) does not implement `Zeroize`; every keypair made
-// here is cleared with `non_secure_erase` once used. The canonical secret key is held
-// in `MlockedBox` which provides mlock + madvise + zeroize-on-drop, so the
-// authoritative copy is protected at rest.
+// NOTE: `Keypair` and `Xpriv` (from secp256k1 / rust-bitcoin) are `Copy` and do not
+// implement `Zeroize`, so erasing them here is best-effort: the copies this code holds
+// are cleared with `non_secure_erase`, but copies made inside the libraries are not.
+// The public check in `key_path_signer` keeps that to at most one secret derivation
+// per input. The canonical secret key is held in `MlockedBox` which provides mlock +
+// madvise + zeroize-on-drop, so the authoritative copy is protected at rest.
 //
 // The wallet's keys are the secret itself used as a key (the original single-key
 // address) and the BIP-86 children `m/86'/coin'/account'/{0,1}/index` of the master
-// key the secret seeds, which `AddressDerivation` hands out as addresses.
-// A key spends an output only on the key path, as BIP-341 requires: the signature is
-// made with the tweaked key, whose x-only form is the output key in the scriptPubKey.
+// key the secret seeds, which `AddressDerivation` hands out as addresses. Each spends
+// its BIP-86 output only on the key path, as BIP-341 requires: the signature is made
+// with the tweaked key, whose x-only form is the output key in the scriptPubKey.
 pub struct PsbtSigner {
     secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
     fingerprint: Fingerprint,
     secp: Secp256k1<bitcoin::secp256k1::All>,
     network: Network,
+}
+
+/// Change is recognized only where a watch-only wallet built from the exported
+/// descriptors looks for it by default: the first 1000 addresses of the change chain
+/// of account 0. An output to any other wallet key still belongs to the wallet but is
+/// treated as a spend, so it cannot hide funds from that wallet behind the change
+/// exemption.
+const CHANGE_INDEX_LIMIT: u32 = 1000;
+
+#[cfg(test)]
+thread_local! {
+    static SECRET_DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl PsbtSigner {
@@ -59,9 +74,7 @@ impl PsbtSigner {
         let (x_only_pubkey, _parity) = keypair.x_only_public_key();
         keypair.non_secure_erase();
 
-        let mut master = Xpriv::new_master(network, secret).map_err(|e| {
-            BitcoinError::DerivationPath(format!("Failed to create master key: {e}"))
-        })?;
+        let mut master = master_xpriv(secret, network)?;
         let fingerprint = master.fingerprint(&secp);
         master.private_key.non_secure_erase();
 
@@ -79,18 +92,10 @@ impl PsbtSigner {
         self.x_only_pubkey
     }
 
-    pub fn master_fingerprint(&self) -> Fingerprint {
-        self.fingerprint
-    }
-
-    /// `m/86'/coin'/account'/{0,1}/index` for this network's coin type, the only
-    /// layout `AddressDerivation` produces.
+    /// `m/86'/coin'/account'/{0,1}/index` for this network's coin type, the layout
+    /// `AddressDerivation` produces. Any account: `keep bitcoin descriptor --account`.
     fn is_wallet_path(&self, path: &DerivationPath) -> bool {
-        let coin = if self.network == Network::Bitcoin {
-            0
-        } else {
-            1
-        };
+        let coin = coin_type(self.network);
         matches!(
             path.as_ref(),
             [
@@ -103,16 +108,31 @@ impl PsbtSigner {
         )
     }
 
+    /// `m/86'/coin'/0'/1/index` with `index < CHANGE_INDEX_LIMIT`.
+    fn is_change_path(&self, path: &DerivationPath) -> bool {
+        let coin = coin_type(self.network);
+        matches!(
+            path.as_ref(),
+            [
+                ChildNumber::Hardened { index: 86 },
+                ChildNumber::Hardened { index: c },
+                ChildNumber::Hardened { index: 0 },
+                ChildNumber::Normal { index: 1 },
+                ChildNumber::Normal { index: i },
+            ] if *c == coin && *i < CHANGE_INDEX_LIMIT
+        )
+    }
+
     /// The keypair for `path` from the master key the secret seeds, or the secret
     /// itself as a key for `None`.
     fn derive_keypair(&self, path: Option<&DerivationPath>) -> Result<Keypair> {
+        #[cfg(test)]
+        SECRET_DERIVATIONS.with(|n| n.set(n.get() + 1));
         let Some(path) = path else {
             return Keypair::from_seckey_slice(&self.secp, &*self.secret)
                 .map_err(|e| BitcoinError::InvalidSecretKey(e.to_string()));
         };
-        let mut master = Xpriv::new_master(self.network, &*self.secret).map_err(|e| {
-            BitcoinError::DerivationPath(format!("Failed to create master key: {e}"))
-        })?;
+        let mut master = master_xpriv(&self.secret, self.network)?;
         let derived = master.derive_priv(&self.secp, path);
         master.private_key.non_secure_erase();
         let mut child =
@@ -122,54 +142,63 @@ impl PsbtSigner {
         Ok(keypair)
     }
 
-    /// The wallet key that spends `spk` on the key path, already tweaked with
-    /// `merkle_root` per BIP-341. Candidates are the secret as a key and the BIP-86
-    /// child named by any `origins` entry carrying this wallet's fingerprint; a candidate
-    /// is accepted only if its tweaked output key is exactly `spk`, so forged PSBT
-    /// metadata can never make the signer use, or claim, a key that does not own the
-    /// output.
+    /// The tweaked wallet key that spends BIP-86 output `spk` on the key path, if the
+    /// wallet holds it: the secret as a key, or the BIP-86 child of an `origins` entry
+    /// carrying this wallet's fingerprint whose path `accept` allows. Each candidate
+    /// is first checked publicly (its key, tweaked, must be the output key), so PSBT
+    /// metadata only names which key to try, can never make the signer use or claim a
+    /// key that does not own the output, and costs at most one secret derivation.
     fn key_path_signer(
         &self,
         spk: &ScriptBuf,
         origins: &TapKeyOrigins,
-        merkle_root: Option<TapNodeHash>,
+        accept: impl Fn(&DerivationPath) -> bool,
     ) -> Result<Option<Keypair>> {
         if !spk.is_p2tr() {
             return Ok(None);
         }
-        let mut paths: Vec<Option<&DerivationPath>> = vec![None];
-        paths.extend(
-            origins
-                .values()
-                .filter(|(leaves, (fp, path))| {
-                    leaves.is_empty() && *fp == self.fingerprint && self.is_wallet_path(path)
-                })
-                .map(|(_, (_, path))| Some(path)),
-        );
-        for path in paths {
-            let mut keypair = self.derive_keypair(path)?;
-            let tweaked = keypair.tap_tweak(&self.secp, merkle_root);
-            keypair.non_secure_erase();
-            let mut tweaked = tweaked.to_keypair();
-            let (output_key, _) = tweaked.x_only_public_key();
-            if *spk == ScriptBuf::new_p2tr_tweaked(output_key.dangerous_assume_tweaked()) {
-                return Ok(Some(tweaked));
+        let Ok(output_key) = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..34]) else {
+            return Ok(None);
+        };
+        let owns = |key: XOnlyPublicKey| {
+            key.tap_tweak(&self.secp, None).0.to_x_only_public_key() == output_key
+        };
+        let (expected, path) = if owns(self.x_only_pubkey) {
+            (self.x_only_pubkey, None)
+        } else {
+            match origins.iter().find(|(key, (leaves, (fp, path)))| {
+                leaves.is_empty() && *fp == self.fingerprint && accept(path) && owns(**key)
+            }) {
+                Some((key, (_, (_, path)))) => (*key, Some(path)),
+                None => return Ok(None),
             }
+        };
+        let mut keypair = self.derive_keypair(path)?;
+        let derived_key = keypair.x_only_public_key().0;
+        let tweaked = keypair.tap_tweak(&self.secp, None);
+        keypair.non_secure_erase();
+        let mut tweaked = tweaked.to_keypair();
+        if derived_key != expected || tweaked.x_only_public_key().0 != output_key {
             tweaked.non_secure_erase();
+            return Ok(None);
         }
-        Ok(None)
+        Ok(Some(tweaked))
     }
 
+    /// The signer for input `index`: its witness UTXO must be a BIP-86 output of one
+    /// of the wallet's keys. Inputs naming a script tree (`tap_merkle_root`) are not
+    /// the wallet's addresses and are left alone.
     fn input_signer(&self, psbt: &Psbt, index: usize) -> Result<Option<Keypair>> {
         let input = &psbt.inputs[index];
         let Some(utxo) = &input.witness_utxo else {
             return Ok(None);
         };
-        self.key_path_signer(
-            &utxo.script_pubkey,
-            &input.tap_key_origins,
-            input.tap_merkle_root,
-        )
+        if input.tap_merkle_root.is_some() {
+            return Ok(None);
+        }
+        self.key_path_signer(&utxo.script_pubkey, &input.tap_key_origins, |p| {
+            self.is_wallet_path(p)
+        })
     }
 
     pub fn analyze(&self, psbt: &Psbt) -> Result<PsbtAnalysis> {
@@ -247,7 +276,20 @@ impl PsbtSigner {
             let Some(mut keypair) = self.input_signer(psbt, i)? else {
                 continue;
             };
-            let result = self.sign_taproot_keypath(psbt, i, &prevouts_ref, &keypair);
+            // DEFAULT and ALL both commit to every input and output; anything narrower
+            // was asked for by the PSBT author and is refused rather than silently
+            // replaced with a different commitment.
+            let sighash_type = match psbt.inputs[i].sighash_type.map(|t| t.taproot_hash_ty()) {
+                None => TapSighashType::Default,
+                Some(Ok(t @ (TapSighashType::Default | TapSighashType::All))) => t,
+                Some(_) => {
+                    keypair.non_secure_erase();
+                    return Err(BitcoinError::Signing(format!(
+                        "input {i} requests a sighash type other than DEFAULT or ALL"
+                    )));
+                }
+            };
+            let result = self.sign_taproot_keypath(psbt, i, &prevouts_ref, &keypair, sighash_type);
             keypair.non_secure_erase();
             result?;
             signed_count += 1;
@@ -272,11 +314,12 @@ impl PsbtSigner {
         index: usize,
         prevouts: &Prevouts<TxOut>,
         keypair: &Keypair,
+        sighash_type: TapSighashType,
     ) -> Result<()> {
         let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
 
         let sighash = sighash_cache
-            .taproot_key_spend_signature_hash(index, prevouts, TapSighashType::Default)
+            .taproot_key_spend_signature_hash(index, prevouts, sighash_type)
             .map_err(|e| BitcoinError::Sighash(e.to_string()))?;
 
         let msg = Message::from_digest_slice(sighash.as_ref())
@@ -294,7 +337,7 @@ impl PsbtSigner {
 
         let taproot_sig = TaprootSignature {
             signature: sig,
-            sighash_type: TapSighashType::Default,
+            sighash_type,
         };
 
         psbt.inputs[index].tap_key_sig = Some(taproot_sig);
@@ -315,7 +358,9 @@ impl PsbtSigner {
         let Some(output) = psbt.outputs.get(index) else {
             return false;
         };
-        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, None) {
+        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, |p| {
+            self.is_change_path(p)
+        }) {
             Ok(Some(mut keypair)) => {
                 keypair.non_secure_erase();
                 true
@@ -568,7 +613,8 @@ mod tests {
     // === Key-path spends of the wallet's own addresses (BIP-86 / BIP-341) ===
 
     use crate::address::{AddressDerivation, DerivedAddress};
-    use bitcoin::bip32::DerivationPath;
+    use bitcoin::bip32::Xpriv;
+    use bitcoin::taproot::TapNodeHash;
     use std::str::FromStr;
 
     const SECRET: [u8; 32] = [7u8; 32];
@@ -798,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn change_to_a_derived_address_is_recognised_only_with_a_matching_origin() {
+    fn change_to_a_derived_address_is_recognized_only_with_a_matching_origin() {
         let s = signer();
         let c = derived(true, 3);
         let mut psbt = psbt_paying(c.address.script_pubkey(), 10_000, 20_000, None);
@@ -825,5 +871,144 @@ mod tests {
             !s.analyze(&forged).unwrap().outputs[0].is_change,
             "origin on a foreign output"
         );
+    }
+
+    #[test]
+    fn change_is_only_the_first_change_addresses_of_account_0() {
+        let s = signer();
+        let secp = Secp256k1::new();
+        let master = Xpriv::new_master(Network::Testnet, &SECRET).unwrap();
+        let output_to = |path: &str| {
+            let child = master
+                .derive_priv(&secp, &DerivationPath::from_str(path).unwrap())
+                .unwrap();
+            let (xonly, _) = child.to_keypair(&secp).x_only_public_key();
+            let mut psbt = psbt_paying(
+                Address::p2tr(&secp, xonly, None, Network::Testnet).script_pubkey(),
+                10_000,
+                20_000,
+                None,
+            );
+            psbt.outputs[0].tap_key_origins.insert(
+                xonly,
+                (
+                    vec![],
+                    (fingerprint(), DerivationPath::from_str(path).unwrap()),
+                ),
+            );
+            s.analyze(&psbt).unwrap().outputs[0].is_change
+        };
+        assert!(output_to("86'/1'/0'/1/0"));
+        assert!(output_to("86'/1'/0'/1/999"));
+        assert!(
+            !output_to("86'/1'/0'/1/1000"),
+            "past the watched change range"
+        );
+        assert!(!output_to("86'/1'/0'/1/2147483647"));
+        assert!(!output_to("86'/1'/1'/1/0"), "another account");
+        assert!(!output_to("86'/1'/0'/0/0"), "the receive chain");
+    }
+
+    #[test]
+    fn signs_for_any_account_and_on_mainnet() {
+        let d = AddressDerivation::new(&SECRET, Network::Testnet).unwrap();
+        let a = d.derive_taproot_address(4, false, 9).unwrap();
+        let mut psbt = spending(&[a.address.script_pubkey()]);
+        with_origin(
+            &mut psbt,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        assert_eq!(signer().sign(&mut psbt).unwrap(), 1);
+        assert!(spends_on_chain(&psbt, 0));
+
+        let mut secret = SECRET;
+        let main = PsbtSigner::new(&mut secret, Network::Bitcoin).unwrap();
+        let d = AddressDerivation::new(&SECRET, Network::Bitcoin).unwrap();
+        let a = d.get_receive_address(2).unwrap();
+        assert!(a.path.to_string().starts_with("86'/0'/0'"));
+        let mut psbt = spending(&[a.address.script_pubkey()]);
+        let fp = d.master_fingerprint().unwrap();
+        with_origin(&mut psbt, 0, a.public_key, fp, &a.path.to_string());
+        assert_eq!(main.sign(&mut psbt).unwrap(), 1);
+        assert!(spends_on_chain(&psbt, 0));
+    }
+
+    #[test]
+    fn sighash_all_is_signed_and_narrower_types_are_refused() {
+        use bitcoin::psbt::PsbtSighashType;
+        let a = derived(false, 1);
+        let mut psbt = spending(&[a.address.script_pubkey()]);
+        with_origin(
+            &mut psbt,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        psbt.inputs[0].sighash_type = Some(PsbtSighashType::from(TapSighashType::All));
+        assert_eq!(signer().sign(&mut psbt).unwrap(), 1);
+        assert_eq!(
+            psbt.inputs[0].tap_key_sig.unwrap().sighash_type,
+            TapSighashType::All
+        );
+        assert!(spends_on_chain(&psbt, 0));
+
+        for ty in [
+            TapSighashType::None,
+            TapSighashType::Single,
+            TapSighashType::AllPlusAnyoneCanPay,
+        ] {
+            let mut psbt = spending(&[a.address.script_pubkey()]);
+            with_origin(
+                &mut psbt,
+                0,
+                a.public_key,
+                fingerprint(),
+                &a.path.to_string(),
+            );
+            psbt.inputs[0].sighash_type = Some(PsbtSighashType::from(ty));
+            assert!(signer().sign(&mut psbt).is_err(), "{ty:?}");
+            assert!(psbt.inputs[0].tap_key_sig.is_none(), "{ty:?}");
+        }
+    }
+
+    /// Forged origins all carrying the wallet's fingerprint and a valid path cost
+    /// public checks only: one secret derivation for the input that is the wallet's.
+    #[test]
+    fn forged_origins_cost_at_most_one_secret_derivation_per_input() {
+        let a = derived(false, 0);
+        let mut psbt = spending(&[a.address.script_pubkey()]);
+        let secp = Secp256k1::new();
+        for n in 1..=2000u32 {
+            let mut sk = [0u8; 32];
+            sk[28..].copy_from_slice(&n.to_be_bytes());
+            let (xonly, _) = Keypair::from_seckey_slice(&secp, &sk)
+                .unwrap()
+                .x_only_public_key();
+            with_origin(
+                &mut psbt,
+                0,
+                xonly,
+                fingerprint(),
+                &format!("86'/1'/0'/0/{n}"),
+            );
+        }
+        with_origin(
+            &mut psbt,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        let s = signer();
+        let before = SECRET_DERIVATIONS.with(|n| n.get());
+        let signed = s.sign(&mut psbt).unwrap();
+        let used = SECRET_DERIVATIONS.with(|n| n.get()) - before;
+        assert_eq!(signed, 1);
+        assert!(spends_on_chain(&psbt, 0));
+        assert_eq!(used, 1, "secret derivations for one input");
     }
 }

@@ -1418,6 +1418,211 @@ fn test_bitcoin_address_taproot_per_network() {
     assert!(output_contains(&mainnet, "bc1p"), "mainnet taproot HRP");
 }
 
+/// `keep bitcoin sign` spends the addresses `keep bitcoin address` hands out: the
+/// signature verifies under each address's BIP-86 output key with the BIP-341 sighash
+/// (what a node checks), change back to the wallet is shown as change, and a PSBT
+/// with no input of this key is refused rather than "signed" for zero inputs.
+#[test]
+fn test_bitcoin_sign_spends_the_wallets_own_addresses() {
+    use bitcoin::bip32::{DerivationPath, Fingerprint, Xpub};
+    use bitcoin::hashes::Hash;
+    use bitcoin::psbt::Psbt;
+    use bitcoin::secp256k1::{Message, Secp256k1, XOnlyPublicKey};
+    use bitcoin::sighash::{Prevouts, SighashCache};
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Address, Amount, Network, OutPoint, ScriptBuf,
+        Sequence, Transaction, TxIn, TxOut, Witness,
+    };
+    use std::str::FromStr;
+
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("btc-sign-vault");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k"])
+            .run(),
+    );
+    let desc = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "bitcoin",
+            "descriptor",
+            "--key",
+            "k",
+            "--network",
+            "regtest",
+        ])
+        .run();
+    assert_success(&desc);
+    let text = String::from_utf8_lossy(&desc.stdout).to_string();
+    let external = text
+        .split_whitespace()
+        .find(|w| w.starts_with("tr([") && w.contains("/0/*"))
+        .expect("external descriptor");
+    let fp = Fingerprint::from_str(&external[4..12]).unwrap();
+    let xpub_str = external
+        .split(']')
+        .nth(1)
+        .unwrap()
+        .split('/')
+        .next()
+        .unwrap();
+    let account = Xpub::from_str(xpub_str).unwrap();
+
+    let secp = Secp256k1::new();
+    let child = |chain: u32, index: u32| {
+        let path = DerivationPath::from_str(&format!("m/{chain}/{index}")).unwrap();
+        let xonly = account
+            .derive_pub(&secp, &path)
+            .unwrap()
+            .public_key
+            .x_only_public_key()
+            .0;
+        let full = DerivationPath::from_str(&format!("m/86'/1'/0'/{chain}/{index}")).unwrap();
+        let spk = Address::p2tr(&secp, xonly, None, Network::Regtest).script_pubkey();
+        (xonly, full, spk)
+    };
+
+    let addresses = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "bitcoin",
+            "address",
+            "--key",
+            "k",
+            "--count",
+            "1",
+            "--network",
+            "regtest",
+        ])
+        .run();
+    assert_success(&addresses);
+    let (key0, path0, spk0) = child(0, 0);
+    let addr0 = Address::from_script(&spk0, Network::Regtest)
+        .unwrap()
+        .to_string();
+    assert!(
+        output_contains(&addresses, &addr0),
+        "the descriptor's /0/0 must be the first address keep hands out"
+    );
+    let (key_c, path_c, spk_c) = child(1, 0);
+
+    let build = |spend: ScriptBuf, origin: Option<(XOnlyPublicKey, DerivationPath)>| {
+        let tx = Transaction {
+            version: Version(2),
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::all_zeros(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::default(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(30_000),
+                    script_pubkey: ScriptBuf::new_op_return([0u8; 4]),
+                },
+                TxOut {
+                    value: Amount::from_sat(69_000),
+                    script_pubkey: spk_c.clone(),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: spend,
+        });
+        if let Some((key, path)) = origin {
+            psbt.inputs[0].tap_internal_key = Some(key);
+            psbt.inputs[0]
+                .tap_key_origins
+                .insert(key, (vec![], (fp, path)));
+        }
+        psbt.outputs[1]
+            .tap_key_origins
+            .insert(key_c, (vec![], (fp, path_c.clone())));
+        psbt
+    };
+
+    let sign = |psbt: &Psbt, name: &str| {
+        let file = dir.path().join(name);
+        let b64 = bitcoin::base64::Engine::encode(
+            &bitcoin::base64::engine::general_purpose::STANDARD,
+            psbt.serialize(),
+        );
+        std::fs::write(&file, b64).unwrap();
+        let signed = dir.path().join(format!("{name}.signed"));
+        let out = KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "bitcoin",
+                "sign",
+                "--key",
+                "k",
+                "--psbt",
+                file.to_str().unwrap(),
+                "-o",
+                signed.to_str().unwrap(),
+                "--network",
+                "regtest",
+            ])
+            .run();
+        (out, signed)
+    };
+
+    let psbt = build(spk0.clone(), Some((key0, path0)));
+    let (out, signed) = sign(&psbt, "own.psbt");
+    assert_success(&out);
+    assert!(output_contains(&out, "Signed 1 input"));
+    assert!(
+        output_contains(&out, "(change)"),
+        "change to /1/0 must be shown as change"
+    );
+    assert!(output_contains(&out, "Fee"));
+    let data = std::fs::read_to_string(&signed).unwrap();
+    let bytes = bitcoin::base64::Engine::decode(
+        &bitcoin::base64::engine::general_purpose::STANDARD,
+        data.trim(),
+    )
+    .unwrap();
+    let signed = Psbt::deserialize(&bytes).unwrap();
+    let sig = signed.inputs[0].tap_key_sig.expect("tap_key_sig");
+    let prevouts = [signed.inputs[0].witness_utxo.clone().unwrap()];
+    let sighash = SighashCache::new(&signed.unsigned_tx)
+        .taproot_key_spend_signature_hash(0, &Prevouts::All(&prevouts), sig.sighash_type)
+        .unwrap();
+    let output_key = XOnlyPublicKey::from_slice(&spk0.as_bytes()[2..34]).unwrap();
+    assert!(
+        secp.verify_schnorr(
+            &sig.signature,
+            &Message::from_digest(sighash.to_byte_array()),
+            &output_key
+        )
+        .is_ok(),
+        "the signature must verify under the address's output key"
+    );
+
+    let mut other = [0u8; 32];
+    other[31] = 9;
+    let (stranger, _) = bitcoin::secp256k1::Keypair::from_seckey_slice(&secp, &other)
+        .unwrap()
+        .x_only_public_key();
+    let foreign = Address::p2tr(&secp, stranger, None, Network::Regtest).script_pubkey();
+    let (out, _) = sign(&build(foreign, None), "foreign.psbt");
+    assert_failure(&out);
+    assert!(output_contains(
+        &out,
+        "no input in this PSBT spends one of this key's addresses"
+    ));
+}
+
 /// BIP-86 derivation is deterministic (same key+index -> same address) and each
 /// index yields a distinct address.
 #[test]

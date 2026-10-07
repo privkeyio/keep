@@ -11,7 +11,7 @@ use keep_core::Keep;
 
 use crate::output::Output;
 
-use super::get_password;
+use super::{get_confirm, get_password};
 
 pub fn cmd_bitcoin_address(
     out: &Output,
@@ -143,6 +143,19 @@ pub fn cmd_bitcoin_sign(
     let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
+    let analysis = signer
+        .analyze_psbt(&psbt)
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    print_analysis(out, &analysis, true);
+    if analysis.signable_inputs.is_empty() {
+        return Err(KeepError::Runtime(
+            "no input in this PSBT spends one of this key's addresses".into(),
+        ));
+    }
+    if !get_confirm("Sign this PSBT?")? {
+        return Err(KeepError::Runtime("signing declined".into()));
+    }
+
     let spinner = out.spinner("Signing PSBT...");
     let signed_count = signer
         .sign_psbt(&mut psbt)
@@ -181,6 +194,7 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
     let net = parse_network(network)?;
+    // Amounts and fee need no key; ownership does, so it is not reported here.
     let mut dummy_secret = [1u8; 32];
     let signer = keep_bitcoin::BitcoinSigner::new(&mut dummy_secret, net)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
@@ -189,6 +203,13 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
         .analyze_psbt(&psbt)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
 
+    print_analysis(out, &analysis, false);
+    Ok(())
+}
+
+/// Prints a PSBT analysis. Change and signable inputs are only meaningful when
+/// `analysis` was made with the signing key (`with_key`).
+fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key: bool) {
     out.newline();
     out.header("PSBT Analysis");
     out.field("Inputs", &analysis.num_inputs.to_string());
@@ -235,19 +256,24 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
     out.info("Outputs:");
     for output in &analysis.outputs {
         let addr = output.address.as_deref().unwrap_or("(unknown)");
-        let change = if output.is_change { " (change)" } else { "" };
+        let change = if with_key && output.is_change {
+            " (change)"
+        } else {
+            ""
+        };
         out.info(&format!(
             "  {}: {} sats -> {}{}",
             output.index, output.amount_sats, addr, change
         ));
     }
 
-    if !analysis.signable_inputs.is_empty() {
+    if with_key {
         out.newline();
         out.info(&format!("Signable inputs: {:?}", analysis.signable_inputs));
+    } else {
+        out.newline();
+        out.info("Change and signable inputs depend on the key; `keep bitcoin sign` shows them before signing.");
     }
-
-    Ok(())
 }
 
 pub fn parse_network(s: &str) -> Result<keep_bitcoin::Network> {

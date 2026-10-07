@@ -344,10 +344,14 @@ impl McpServer {
                         .analyze_psbt(&psbt)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
+                    // Everything the PSBT spends, the fee included: once signed, a
+                    // fee is as gone as a payment.
                     if let Some(max_sats) = session.scope().max_amount_sats {
-                        if analysis.total_output_sats > max_sats {
+                        let requested =
+                            analysis.total_output_sats.saturating_add(analysis.fee_sats);
+                        if requested > max_sats {
                             return Err(AgentError::AmountExceeded {
-                                requested: analysis.total_output_sats,
+                                requested,
                                 limit: max_sats,
                             });
                         }
@@ -901,6 +905,34 @@ mod tests {
         assert!(
             e.message.contains("Amount exceeded"),
             "expected an amount-exceeded refusal, got: {}",
+            e.message
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_sign_bitcoin_psbt_counts_the_fee_toward_the_amount_limit() {
+        // 5_000 sats of outputs fit under the 10_000 limit, but the 55_000 sat fee
+        // leaves the wallet just as surely once signed: it must be refused.
+        let server = signing_server();
+        install_session(
+            &server,
+            SessionScope::bitcoin_only().with_max_amount(10_000),
+        )
+        .await;
+        let psbt =
+            psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 5_000, 60_000);
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt, "network": "testnet"}),
+            ))
+            .await;
+        let e = resp
+            .error
+            .unwrap_or_else(|| panic!("a fee burn must be refused, got {:?}", resp.result));
+        assert!(
+            e.message.contains("Amount exceeded"),
+            "expected an amount-exceeded refusal counting the fee, got: {}",
             e.message
         );
     }
