@@ -146,13 +146,15 @@ unsafe fn create_owner_only(
         flags,
         ptr::null_mut(),
     );
+    // Read before the cleanup calls below can overwrite the thread's last error.
+    let open_error = std::io::Error::last_os_error();
 
     LocalFree(acl as _);
     HeapFree(heap, 0, token_info);
     CloseHandle(token_handle);
 
     if file_handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error());
+        return Err(open_error);
     }
 
     Ok(File::from_raw_handle(file_handle as *mut _))

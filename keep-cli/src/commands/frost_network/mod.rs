@@ -1322,7 +1322,7 @@ fn remote_share_indices(box_id: u16, total: u16) -> Vec<u16> {
 /// The bytes go to a fresh sibling temp file opened with `create_new` (O_CREAT|O_EXCL, which refuses
 /// to follow or clobber a symlink and forces the 0600 mode on a guaranteed-new file), are fsync'd,
 /// then `rename`d into place, after which the parent directory is fsync'd so the new name is durable
-/// across a crash. This avoids both the `mode()`-only-applies-on-create gap and symlink/TOCTOU on
+/// across a crash (on Windows, the replace is written through instead). This avoids both the `mode()`-only-applies-on-create gap and symlink/TOCTOU on
 /// the destination that plain open-truncate has. The containing directory MUST be root-owned for
 /// full protection. Used for the LUKS key and the box's own OPRF share.
 fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
