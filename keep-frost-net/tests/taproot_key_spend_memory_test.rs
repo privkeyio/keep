@@ -150,9 +150,13 @@ async fn co_signers_refuse_key_path_spends_unless_they_opt_in() {
     let child = derive_child(&g.group_pubkey, &path).unwrap().child_pubkey;
     let spent = TaprootTweak::default().script_pubkey(&child).unwrap();
     let (_, result) = spend(&g, &spent, 0x00, &path, Default::default()).await;
-    // A peer's refusal makes the requester fail over rather than stop, so the
-    // co-signers' audit logs, not the requester's error, show why.
-    result.expect_err("no co-signer approves key-path spends");
+    // A peer's refusal makes the requester fail over rather than stop; the
+    // last refusal is carried into the error, and each co-signer records it.
+    let e = result.expect_err("no co-signer approves key-path spends");
+    assert!(
+        e.to_string().contains("does not approve key-path spends"),
+        "{e}"
+    );
     for co_signer in &g.nodes[..2] {
         assert!(
             !co_signer.audit_log().refusals().is_empty(),

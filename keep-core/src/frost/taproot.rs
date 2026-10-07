@@ -115,6 +115,15 @@ pub fn x_only(verifying_key: &VerifyingKey) -> Result<[u8; 32]> {
         .ok_or_else(|| KeepError::Frost("verifying key is not a 33-byte point".into()))
 }
 
+/// The P2TR scriptPubKey paying the x-only `output_key` (already tweaked).
+pub fn output_script_pubkey(output_key: &[u8; 32]) -> Result<ScriptBuf> {
+    let key = XOnlyPublicKey::from_slice(output_key)
+        .map_err(|e| KeepError::Frost(format!("taproot output key invalid: {e}")))?;
+    Ok(ScriptBuf::new_p2tr_tweaked(
+        bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(key),
+    ))
+}
+
 /// The x-only output key of a P2TR scriptPubKey.
 pub fn output_key(script_pubkey: &ScriptBuf) -> Result<XOnlyPublicKey> {
     if !script_pubkey.is_p2tr() {

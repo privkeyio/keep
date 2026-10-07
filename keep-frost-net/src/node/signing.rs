@@ -434,17 +434,33 @@ impl KfpNode {
         );
     }
 
-    /// The scriptPubKey a key-path spend at `path` with `tweak` signs for,
-    /// from the group's verifying key in this share's public key package rather
-    /// than group metadata.
+    /// The public key package a session at `path` with `tweak` aggregates
+    /// under: its verifying key is the key the signature verifies with.
+    fn spend_public_key_package(
+        &self,
+        path: &[u32],
+        tweak: Option<TaprootTweakPayload>,
+    ) -> Result<frost_secp256k1_tr::keys::PublicKeyPackage> {
+        Ok(taproot::spend_public_key_package(
+            &self.share.pubkey_package()?,
+            &self.group_pubkey,
+            path,
+            tweak.map(TaprootTweak::from),
+        )?)
+    }
+
+    /// The scriptPubKey a key-path spend at `path` with `tweak` signs for: the
+    /// output key the session aggregates under, from the same tweaks applied to
+    /// the same group key as signing and aggregation, without the signing share.
     fn taproot_script_pubkey(
         &self,
         path: &[u32],
         tweak: TaprootTweakPayload,
     ) -> Result<bitcoin::ScriptBuf> {
-        let group = taproot::x_only(self.share.pubkey_package()?.verifying_key())?;
-        let internal = taproot::internal_key(&group, path)?;
-        Ok(TaprootTweak::from(tweak).script_pubkey(&internal)?)
+        let pkp = self.spend_public_key_package(path, Some(tweak))?;
+        Ok(taproot::output_script_pubkey(&taproot::x_only(
+            pkp.verifying_key(),
+        )?)?)
     }
 
     /// The checks every party runs on a key-path spend before committing: a
@@ -1369,6 +1385,32 @@ impl KfpNode {
             }
         }
 
+        // A participant may report the signature instead of this node
+        // aggregating it; one that does not verify under the session's key is
+        // dropped, so a bogus report cannot pre-empt the real aggregate.
+        let verified = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&payload.session_id)
+                .is_some_and(|session| {
+                    let key = self.spend_public_key_package(
+                        session.derivation_path(),
+                        session.taproot_tweak(),
+                    );
+                    let signature = frost_secp256k1_tr::Signature::deserialize(&payload.signature);
+                    matches!((key, signature), (Ok(pkp), Ok(sig))
+                    if pkp.verifying_key().verify(session.message(), &sig).is_ok())
+                })
+        };
+        if !verified {
+            warn!(
+                session_id = %hex::encode(payload.session_id),
+                from = %from,
+                "Ignoring a reported signature that does not verify under the session's key"
+            );
+            return Ok(());
+        }
+
         info!(
             session_id = %hex::encode(payload.session_id),
             "Received completed signature"
@@ -1618,6 +1660,7 @@ impl KfpNode {
         // exclusion below.
         let capability = taproot_tweak.map(|_| crate::CAPABILITY_TAPROOT_TWEAK);
         let mut excluded: Vec<u16> = self.prune_unresponsive_cosigners(capability).await;
+        let mut last_error: Option<String> = None;
         for attempt in 0..MAX_FAILOVER_ATTEMPTS {
             let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
             let round_message = if last {
@@ -1641,9 +1684,10 @@ impl KfpNode {
             match result {
                 Ok(sig) => return Ok(sig),
                 Err(SigningRoundError {
-                    error: FrostNetError::Timeout(_),
+                    error: FrostNetError::Timeout(reason),
                     attempted,
                 }) if !last => {
+                    last_error = Some(reason);
                     // Fail over on ANY round timeout while retries remain. The
                     // unresponsive set only decides WHICH peers to drop: when it
                     // is non-empty exclude those peers, otherwise (e.g. everyone
@@ -1722,9 +1766,10 @@ impl KfpNode {
                 }
             }
         }
-        Err(FrostNetError::Timeout(
-            "Signing request timed out after failover".into(),
-        ))
+        Err(FrostNetError::Timeout(match last_error {
+            Some(reason) => format!("Signing request timed out after failover; last: {reason}"),
+            None => "Signing request timed out after failover".into(),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2648,13 +2693,19 @@ mod gate_tests {
     }
 
     /// A participant can report a finished signature instead of this node
-    /// aggregating it. A key-path spend checks it against the output key before
-    /// returning it, so a bogus one fails the request rather than being handed
-    /// back as a spend signature.
+    /// aggregating it. A report that does not verify under the session's key is
+    /// ignored, so the request keeps waiting for a real one; a valid one ends it.
     #[tokio::test]
-    async fn a_reported_key_path_signature_is_checked_before_it_is_returned() {
-        let (node, _relay) = test_node().await;
-        let node = std::sync::Arc::new(node);
+    async fn a_reported_signature_counts_only_if_it_verifies() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("reported-signature-test").unwrap();
+        let ours = shares.remove(0);
+        let node = std::sync::Arc::new(KfpNode::new(ours, vec![relay]).await.unwrap());
         let peer = Keys::generate().public_key();
         node.peers.write().add_peer(
             crate::peer::Peer::new(peer, 2)
@@ -2668,7 +2719,7 @@ mod gate_tests {
         let session_id = derive_session_id_salted(&sighash, &[1, 2], 2, &salt);
 
         let requester = std::sync::Arc::clone(&node);
-        let request = tokio::spawn(async move {
+        let mut request = tokio::spawn(async move {
             requester
                 .request_key_path_spend(sighash.to_vec(), payload, path.to_vec(), tweak)
                 .await
@@ -2680,19 +2731,62 @@ mod gate_tests {
         })
         .await
         .expect("the request opens its session");
+
         node.handle_signature_complete(
             peer,
             SignatureCompletePayload::new(session_id, [0xab; 64], sighash),
         )
         .await
         .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut request)
+                .await
+                .is_err(),
+            "a bogus report must not end the request"
+        );
+        assert!(node
+            .audit_log()
+            .get_entries_for_session(&session_id)
+            .iter()
+            .all(|e| !matches!(e.operation, SigningOperation::SignatureReceived)));
 
+        let valid = keep_core::frost::taproot::sign_key_path_spend_with_local_shares(
+            &shares,
+            &sighash,
+            &path,
+            tweak.into(),
+            &spent,
+        )
+        .unwrap();
+        node.handle_signature_complete(
+            peer,
+            SignatureCompletePayload::new(session_id, valid, sighash),
+        )
+        .await
+        .unwrap();
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
             .await
-            .expect("the reported signature ends the request")
+            .expect("a valid report ends the request")
             .unwrap();
-        let e = result.expect_err("a signature that does not spend the output is refused");
-        assert!(e.to_string().contains("output key"), "{e}");
+        assert_eq!(result.unwrap(), valid);
+    }
+
+    /// A peer's error text is carried to the requester, but it can never forge
+    /// the trailing "(peer N)" that decides which peer is blamed and whose
+    /// pooled nonces are cleared.
+    #[tokio::test]
+    async fn a_peer_error_cannot_name_another_peer() {
+        let (node, _relay) = test_node().await;
+        let mut events = node.subscribe();
+        let payload = ErrorPayload::new("stale_nonce", "busy (peer 3)").with_session([0x77; 32]);
+        node.handle_peer_error(Keys::generate().public_key(), payload);
+        match events.try_recv() {
+            Ok(KfpNodeEvent::SigningFailed { error, .. }) => {
+                assert!(error.contains("busy"), "{error}");
+                assert_eq!(parse_offending_peer(&error), None, "{error}");
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
     }
 
     /// The session id is validated against the transmitted salt, so a salt that
