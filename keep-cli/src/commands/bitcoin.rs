@@ -279,29 +279,16 @@ fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key:
             let owner = if analysis.signable_inputs.contains(&i) {
                 "this key's, will be signed"
             } else {
-                "not this key's"
+                "not signed by this key"
             };
             out.info(&format!("  {i}: {sats} sats ({owner})"));
         }
-        let spent: u128 = analysis
-            .signable_inputs
-            .iter()
-            .map(|&i| u128::from(analysis.input_sats[i]))
-            .sum();
-        let change: u128 = analysis
-            .outputs
-            .iter()
-            .filter(|o| o.is_change)
-            .map(|o| u128::from(o.amount_sats))
-            .sum();
-        if spent >= change {
-            out.field("Leaving this wallet", &format!("{} sats", spent - change));
-        } else {
-            out.field(
-                "Coming into this wallet",
-                &format!("{} sats", change - spent),
-            );
-        }
+        // An upper bound: unsigned inputs may still be this wallet's (a PSBT can
+        // leave out their key origins), so their value is not netted out.
+        out.field(
+            "Leaving this wallet (at most)",
+            &format!("{} sats", analysis.leaving_wallet_sats()),
+        );
     } else {
         out.newline();
         out.info("Change and signable inputs depend on the key; `keep bitcoin sign` shows them before signing.");

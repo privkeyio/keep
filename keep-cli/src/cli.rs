@@ -195,8 +195,9 @@ pub(crate) enum AgentCommands {
         /// session has no Bitcoin tools.
         #[arg(long)]
         network: Option<String>,
-        /// Most one signed PSBT may spend, every output plus the fee. Enables
-        /// sign_bitcoin_psbt; requires --network.
+        /// Most one signed PSBT may take out of the wallet: every output except
+        /// recognized change, plus the fee. Enables sign_bitcoin_psbt; requires
+        /// --network.
         #[arg(long)]
         max_amount_sats: Option<u64>,
         /// An address a signed PSBT may pay (repeatable). Every output that is not the

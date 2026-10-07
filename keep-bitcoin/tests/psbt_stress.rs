@@ -225,7 +225,7 @@ fn check_signatures(psbt: &Psbt, net: Network) -> Vec<usize> {
                 &output_key,
             )
             .unwrap_or_else(|e| panic!("input {i}: signature does not verify: {e}"));
-        let member = output_key == tweaked(single_key())
+        let member = (net == Network::Bitcoin && output_key == tweaked(single_key()))
             || input.tap_key_origins.values().any(|(leaves, (f, p))| {
                 leaves.is_empty()
                     && *f == fp()
@@ -322,8 +322,13 @@ fn garbage_scripts_never_sign_or_panic() {
         ),
         ("OP_RETURN", with(&[0x6a, 0x20], &ok_bytes, &[])),
     ];
-    let s = signer(Network::Testnet);
-    for (label, spk) in cases {
+    for (label, spk) in cases
+        .iter()
+        .flat_map(|c| [(Network::Testnet, c.clone()), (Network::Bitcoin, c.clone())])
+        .map(|(net, (label, spk))| ((label, net), spk))
+    {
+        let s = signer(label.1);
+        let label = format!("{} on {:?}", label.0, label.1);
         let mut psbt = psbt_with(&[(spk.clone(), 50_000)], &[(spk.clone(), 1_000)]);
         origin_in(&mut psbt, 0, k0, fp(), p0.clone());
         psbt.inputs[0].tap_internal_key = Some(k0);
@@ -342,18 +347,18 @@ fn missing_witness_utxo_on_any_input_refuses_everything() {
     for missing in [0usize, 1] {
         let mut psbt = spend_to_foreign(&[single_spk(), foreign_spk(3)]);
         psbt.inputs[missing].witness_utxo = None;
-        let s = signer(Network::Testnet);
+        let s = signer(Network::Bitcoin);
         assert!(s.analyze(&psbt).is_err());
         assert!(s.sign(&mut psbt).is_err());
-        assert!(btc_signer(Network::Testnet).sign_psbt(&mut psbt).is_err());
+        assert!(btc_signer(Network::Bitcoin).sign_psbt(&mut psbt).is_err());
         assert!(psbt.inputs.iter().all(|i| i.tap_key_sig.is_none()));
     }
 }
 
 #[test]
 fn amount_overflow_and_negative_fee_are_refused_before_signing() {
-    let s = signer(Network::Testnet);
-    let b = btc_signer(Network::Testnet);
+    let s = signer(Network::Bitcoin);
+    let b = btc_signer(Network::Bitcoin);
     let cases = [
         (vec![u64::MAX, 1], vec![1_000]),
         (vec![u64::MAX / 2 + 1, u64::MAX / 2 + 1], vec![1_000]),
@@ -373,7 +378,7 @@ fn amount_overflow_and_negative_fee_are_refused_before_signing() {
     let a = s.analyze(&psbt).unwrap();
     assert_eq!(a.fee_sats, 0);
     assert_eq!(b.sign_psbt(&mut psbt).unwrap(), 1);
-    check_signatures(&psbt, Network::Testnet);
+    check_signatures(&psbt, Network::Bitcoin);
 }
 
 #[test]
@@ -480,7 +485,7 @@ fn foreign_spk_naming_the_wallet_key_never_signs() {
 
 #[test]
 fn script_tree_fields_and_prefilled_fields() {
-    let s = signer(Network::Testnet);
+    let s = signer(Network::Bitcoin);
     let mut psbt = spend_to_foreign(&[single_spk()]);
     psbt.inputs[0].tap_merkle_root = Some(TapNodeHash::from_byte_array([1; 32]));
     assert_eq!(s.sign(&mut psbt).unwrap(), 0, "merkle root set");
@@ -502,12 +507,12 @@ fn script_tree_fields_and_prefilled_fields() {
     assert_eq!(signed, 1);
     assert_ne!(psbt.inputs[0].tap_key_sig, Some(junk));
     psbt.inputs[1].tap_key_sig = None;
-    assert_eq!(check_signatures(&psbt, Network::Testnet), vec![0]);
+    assert_eq!(check_signatures(&psbt, Network::Bitcoin), vec![0]);
 }
 
 #[test]
 fn every_sighash_value() {
-    let s = signer(Network::Testnet);
+    let s = signer(Network::Bitcoin);
     let values = [
         0u32,
         1,
@@ -542,7 +547,7 @@ fn every_sighash_value() {
             assert!(a.is_ok());
             let sig = psbt.inputs[0].tap_key_sig.unwrap();
             assert_eq!(sig.sighash_type as u8 as u32, v);
-            check_signatures(&psbt, Network::Testnet);
+            check_signatures(&psbt, Network::Bitcoin);
         } else {
             assert!(r.is_err() && a.is_err(), "{v:#x} must be refused");
             assert!(psbt.inputs[0].tap_key_sig.is_none());
@@ -554,7 +559,7 @@ fn every_sighash_value() {
             1,
             "foreign {v:#x} is not ours to judge"
         );
-        check_signatures(&foreign, Network::Testnet);
+        check_signatures(&foreign, Network::Bitcoin);
     }
 }
 
@@ -646,10 +651,12 @@ fn cross_network_paths() {
         Network::Signet,
         Network::Regtest,
     ] {
+        // The single-key output is the same on every network, so only a mainnet
+        // signer spends it.
         let mut psbt = spend_to_foreign(&[single_spk()]);
         assert_eq!(
             signer(net).sign(&mut psbt).unwrap(),
-            1,
+            usize::from(net == Network::Bitcoin),
             "single key on {net:?}"
         );
     }
@@ -657,7 +664,7 @@ fn cross_network_paths() {
 
 #[test]
 fn duplicate_outpoints() {
-    let s = signer(Network::Testnet);
+    let s = signer(Network::Bitcoin);
     let mut psbt = spend_to_foreign(&[single_spk(), single_spk()]);
     psbt.unsigned_tx.input[1].previous_output = psbt.unsigned_tx.input[0].previous_output;
     let a = s.analyze(&psbt).unwrap();
@@ -666,12 +673,12 @@ fn duplicate_outpoints() {
         "[info] duplicate outpoint: total_input_sats={} (one utxo of 50000) signable={:?} signed={n}",
         a.total_input_sats, a.signable_inputs
     );
-    check_signatures(&psbt, Network::Testnet);
+    check_signatures(&psbt, Network::Bitcoin);
 }
 
 #[test]
 fn mismatched_map_lengths_do_not_panic() {
-    let s = signer(Network::Testnet);
+    let s = signer(Network::Bitcoin);
     let mut extra_in = spend_to_foreign(&[single_spk()]);
     extra_in.inputs.push(Input {
         witness_utxo: Some(TxOut {
@@ -681,17 +688,13 @@ fn mismatched_map_lengths_do_not_panic() {
         ..Default::default()
     });
     let _ = s.analyze(&extra_in);
-    eprintln!(
-        "[info] extra psbt input: sign={:?}",
-        s.sign(&mut extra_in).map_err(|e| e.to_string())
-    );
+    assert!(s.sign(&mut extra_in).is_err());
+    assert!(extra_in.inputs.iter().all(|i| i.tap_key_sig.is_none()));
     let mut fewer_in = spend_to_foreign(&[single_spk(), single_spk()]);
     fewer_in.inputs.pop();
     let _ = s.analyze(&fewer_in);
-    eprintln!(
-        "[info] missing psbt input: sign={:?}",
-        s.sign(&mut fewer_in).map_err(|e| e.to_string())
-    );
+    assert!(s.sign(&mut fewer_in).is_err());
+    assert!(fewer_in.inputs.iter().all(|i| i.tap_key_sig.is_none()));
     let mut fewer_out = spend_to_foreign(&[single_spk()]);
     fewer_out.outputs.clear();
     assert!(!s.analyze(&fewer_out).unwrap().outputs[0].is_change);
@@ -727,12 +730,17 @@ fn wallet_inputs_psbt(n: usize, with_origins: bool) -> Psbt {
 #[test]
 #[ignore]
 fn timing_many_inputs() {
-    let s = signer(Network::Testnet);
     let counts: Vec<usize> = std::env::var("STRESS_INPUTS")
         .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
         .unwrap_or_else(|_| vec![500, 1000, 2000, 4000, 8000]);
     for n in counts {
         for with_origins in [false, true] {
+            let net = if with_origins {
+                Network::Testnet
+            } else {
+                Network::Bitcoin
+            };
+            let s = signer(net);
             let psbt = wallet_inputs_psbt(n, with_origins);
             let bytes = psbt.serialize();
             let mut psbt = timed(
@@ -748,7 +756,7 @@ fn timing_many_inputs() {
             });
             assert_eq!(signed, n);
             if n <= 2000 {
-                assert_eq!(check_signatures(&psbt, Network::Testnet).len(), n);
+                assert_eq!(check_signatures(&psbt, net).len(), n);
             }
         }
     }

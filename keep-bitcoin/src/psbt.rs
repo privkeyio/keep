@@ -27,6 +27,20 @@ pub struct PsbtAnalysis {
     pub signable_inputs: Vec<usize>,
 }
 
+impl PsbtAnalysis {
+    /// The most this transaction can take out of the wallet: every output except
+    /// recognized change, plus the fee. Change is recognized only when its script is
+    /// one of the wallet's change outputs, so this bounds the wallet's loss even when
+    /// the PSBT also spends someone else's inputs.
+    pub fn leaving_wallet_sats(&self) -> u64 {
+        self.outputs
+            .iter()
+            .filter(|o| !o.is_change)
+            .map(|o| o.amount_sats)
+            .fold(self.fee_sats, u64::saturating_add)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OutputInfo {
     pub index: usize,
@@ -43,15 +57,18 @@ pub struct OutputInfo {
 // madvise + zeroize-on-drop, so the authoritative copy is protected at rest.
 //
 // The wallet's keys are the secret itself used as a key (the original single-key
-// address) and the BIP-86 children `m/86'/coin'/account'/{0,1}/index` of the master
+// address, spent only on mainnet) and the BIP-86 children `m/86'/coin'/account'/{0,1}/index` of the master
 // key the secret seeds, which `AddressDerivation` hands out as addresses. Each spends
 // its BIP-86 output only on the key path, as BIP-341 requires: the signature is made
 // with the tweaked key, whose x-only form is the output key in the scriptPubKey.
 pub struct PsbtSigner {
     secret: MlockedBox<32>,
     x_only_pubkey: XOnlyPublicKey,
-    /// BIP-86 output key of the secret used directly as a key.
-    single_key_output: XOnlyPublicKey,
+    /// BIP-86 output key of the secret used directly as a key, signed for only on
+    /// mainnet. Unlike the BIP-86 children, whose coin type differs, this output is
+    /// the same on every network, so a test-network signer that spent it would be
+    /// signing a mainnet spend its caller saw rendered as test-network addresses.
+    single_key_output: Option<XOnlyPublicKey>,
     fingerprint: Fingerprint,
     secp: Secp256k1<bitcoin::secp256k1::All>,
     network: Network,
@@ -82,10 +99,12 @@ impl PsbtSigner {
         let fingerprint = master.fingerprint(&secp);
         master.private_key.non_secure_erase();
 
-        let single_key_output = x_only_pubkey
-            .tap_tweak(&secp, None)
-            .0
-            .to_x_only_public_key();
+        let single_key_output = (network == Network::Bitcoin).then(|| {
+            x_only_pubkey
+                .tap_tweak(&secp, None)
+                .0
+                .to_x_only_public_key()
+        });
 
         Ok(Self {
             secret: MlockedBox::new(secret),
@@ -174,7 +193,7 @@ impl PsbtSigner {
         let owns = |key: XOnlyPublicKey| {
             key.tap_tweak(&self.secp, None).0.to_x_only_public_key() == output_key
         };
-        let (expected, path) = if single_key && self.single_key_output == output_key {
+        let (expected, path) = if single_key && self.single_key_output == Some(output_key) {
             (self.x_only_pubkey, None)
         } else {
             match origins.iter().find(|(key, (leaves, (fp, path)))| {
@@ -570,7 +589,7 @@ mod tests {
     #[test]
     fn should_sign_input_returns_true_for_our_own_p2tr_input() {
         let mut our_secret = [1u8; 32];
-        let signer = PsbtSigner::new(&mut our_secret, Network::Testnet).unwrap();
+        let signer = PsbtSigner::new(&mut our_secret, Network::Bitcoin).unwrap();
         let our_addr = own_address(&signer);
         let psbt = fixture_psbt_to(our_addr.script_pubkey(), 60_000);
 
@@ -604,7 +623,7 @@ mod tests {
     #[test]
     fn sign_signs_our_own_input_and_reports_count() {
         let mut our_secret = [1u8; 32];
-        let signer = PsbtSigner::new(&mut our_secret, Network::Testnet).unwrap();
+        let signer = PsbtSigner::new(&mut our_secret, Network::Bitcoin).unwrap();
         let our_addr = own_address(&signer);
         let mut psbt = fixture_psbt_to(our_addr.script_pubkey(), 60_000);
 
@@ -811,8 +830,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_single_key_address_spends_with_the_tweak() {
-        let s = signer();
+    fn legacy_single_key_address_spends_with_the_tweak_on_mainnet_only() {
+        for network in [Network::Testnet, Network::Signet, Network::Regtest] {
+            let mut secret = SECRET;
+            let s = PsbtSigner::new(&mut secret, network).unwrap();
+            let mut psbt = spending(&[own_address(&s).script_pubkey()]);
+            assert!(
+                s.analyze(&psbt).unwrap().signable_inputs.is_empty(),
+                "{network}"
+            );
+            assert_eq!(s.sign(&mut psbt).unwrap(), 0, "{network}");
+        }
+        let mut secret = SECRET;
+        let s = PsbtSigner::new(&mut secret, Network::Bitcoin).unwrap();
         let mut psbt = spending(&[own_address(&s).script_pubkey()]);
         assert_eq!(s.sign(&mut psbt).unwrap(), 1);
         assert!(

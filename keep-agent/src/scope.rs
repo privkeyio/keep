@@ -160,12 +160,7 @@ impl SessionScope {
         let limit = self
             .max_amount_sats
             .ok_or_else(|| AgentError::ScopeViolation("sign_psbt needs max_amount_sats".into()))?;
-        let requested = analysis
-            .outputs
-            .iter()
-            .filter(|o| !o.is_change)
-            .map(|o| o.amount_sats)
-            .fold(analysis.fee_sats, u64::saturating_add);
+        let requested = analysis.leaving_wallet_sats();
         if requested > limit {
             return Err(AgentError::AmountExceeded { requested, limit });
         }

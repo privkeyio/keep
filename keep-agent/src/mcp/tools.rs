@@ -122,6 +122,18 @@ pub fn get_session_info_tool() -> ToolDefinition {
     }
 }
 
+/// The session operation a tool needs, if any.
+pub fn required_operation(tool: &str) -> Option<crate::scope::Operation> {
+    use crate::scope::Operation;
+    match tool {
+        "sign_nostr_event" => Some(Operation::SignNostrEvent),
+        "sign_bitcoin_psbt" => Some(Operation::SignPsbt),
+        "get_nostr_pubkey" => Some(Operation::GetPublicKey),
+        "get_bitcoin_address" => Some(Operation::GetBitcoinAddress),
+        _ => None,
+    }
+}
+
 pub fn all_tools() -> Vec<ToolDefinition> {
     vec![
         sign_nostr_event_tool(),

@@ -202,8 +202,23 @@ impl McpServer {
     }
 
     async fn handle_tools_list(&self) -> Result<Value> {
+        // Only the tools the active session may call, so a model is not offered
+        // tools whose every call would be refused.
+        let scope = {
+            let guard = self.session_manager.read().await;
+            guard.as_ref().and_then(|(token, session_id)| {
+                self.manager
+                    .validate_and_get(token, session_id)
+                    .ok()
+                    .map(|s| s.scope().clone())
+            })
+        };
         let tools: Vec<Value> = tools::all_tools()
             .into_iter()
+            .filter(|t| match (&scope, tools::required_operation(&t.name)) {
+                (Some(scope), Some(op)) => scope.allows_operation(&op),
+                _ => true,
+            })
             .map(|t| {
                 serde_json::json!({
                     "name": t.name,
@@ -598,6 +613,27 @@ mod tests {
                 "tools/list missing {expected}; got {names:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_list_offers_only_the_sessions_tools() {
+        let server = signing_server();
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&rpc("tools/list", Value::Null))
+            .await;
+        let r = resp.result.expect("tools/list result");
+        let mut names: Vec<&str> = r["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["get_nostr_pubkey", "get_session_info", "sign_nostr_event"]
+        );
     }
 
     #[tokio::test]

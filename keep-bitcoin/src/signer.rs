@@ -83,14 +83,7 @@ impl BitcoinSigner {
             None => return Ok(()),
         };
 
-        // What leaves the wallet: every non-change output plus the fee, which is as
-        // gone as a payment once the signatures commit to the input amounts.
-        let spend_amount: u64 = analysis
-            .outputs
-            .iter()
-            .filter(|o| !o.is_change)
-            .map(|o| o.amount_sats)
-            .fold(analysis.fee_sats, u64::saturating_add);
+        let spend_amount = analysis.leaving_wallet_sats();
 
         if let Some(max) = policy.max_amount_sats {
             if spend_amount > max {

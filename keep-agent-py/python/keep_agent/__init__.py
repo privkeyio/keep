@@ -54,11 +54,11 @@ class SessionScope:
             raise RuntimeError("Native bindings not available")
 
         scope = _SessionScope(self.operations)
-        if self.event_kinds:
+        if self.event_kinds is not None:
             scope = scope.with_event_kinds(self.event_kinds)
         if self.max_amount_sats is not None:
             scope = scope.with_max_amount(self.max_amount_sats)
-        if self.address_allowlist:
+        if self.address_allowlist is not None:
             scope = scope.with_address_allowlist(self.address_allowlist)
         if self.network is not None:
             scope = scope.with_network(self.network)
