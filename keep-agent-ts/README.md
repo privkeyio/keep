@@ -47,8 +47,8 @@ const session = new KeepAgentSession(
   {
     operations: ['sign_nostr_event', 'get_public_key'],
     eventKinds: [1, 7],          // Only text notes and reactions
-    maxAmountSats: 100_000,      // Max 0.001 BTC per tx
-    addressAllowlist: ['bc1q...'],
+    maxAmountSats: 100_000,      // Max 0.001 BTC per PSBT: every output, change included, plus the fee
+    addressAllowlist: ['bc1q...'], // Every non-change output must pay a listed address
   },
   { maxPerMinute: 10, maxPerHour: 100, maxPerDay: 1000 },
   24,
@@ -106,9 +106,9 @@ await session.disconnect();
 | Method | Description |
 |--------|-------------|
 | `signEvent(kind, content, tags?)` | Sign a Nostr event |
-| `signPsbt(psbtBase64, network?)` | Sign a Bitcoin PSBT |
+| `signPsbt(psbtBase64, network?)` | Sign the inputs that spend this key's BIP-86 addresses (the PSBT must carry their BIP-371 key origins) |
 | `getPublicKey()` | Get npub |
-| `getBitcoinAddress(network?)` | Get p2tr address |
+| `getBitcoinAddress(network?)` | Get the first BIP-86 receive address (`m/86'/coin'/0'/0/0`) |
 | `getSessionInfo()` | Get session status |
 | `checkOperation(op)` | Check if operation allowed |
 | `checkEventKind(kind)` | Check if event kind allowed |
