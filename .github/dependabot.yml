@@ -27,6 +27,11 @@ updates:
       # weekly cargo job fails on it. Tracked separately; unpin when that lands.
       - dependency-name: "nostr-sdk"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # redb 4.2 and later require Rust 1.90; the toolchain is pinned to 1.89.0
+      # (rust-toolchain.toml), so those releases fail every build job. redb is the
+      # vault storage engine: move it together with the toolchain bump.
+      - dependency-name: "redb"
+        versions: [">= 4.2"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
