@@ -359,6 +359,13 @@ fn validate_sign_request(p: &SignRequestPayload) -> Result<(), &'static str> {
     if p.participants.len() > MAX_PARTICIPANTS {
         return Err("Participants list exceeds maximum size");
     }
+    let mut distinct = HashSet::new();
+    if p.participants
+        .iter()
+        .any(|&i| i == 0 || !distinct.insert(i))
+    {
+        return Err("Participants must be distinct nonzero share indices");
+    }
     if p.nonce_refs.len() > MAX_PARTICIPANTS {
         return Err("Nonce refs exceed maximum size");
     }
@@ -2574,6 +2581,26 @@ mod tests {
         assert!(mk(vec![0u8; 64], vec![0x04u8; 64]).validate().is_err());
         // The well-formed evidence passes the bound checks.
         assert!(mk(vec![0u8; 64], good_ak).validate().is_ok());
+    }
+
+    #[test]
+    fn sign_request_participants_must_be_distinct_and_nonzero() {
+        let request = |participants: Vec<u16>| {
+            KfpMessage::SignRequest(SignRequestPayload::new(
+                [2u8; 32],
+                [3u8; 32],
+                vec![4],
+                "raw",
+                participants,
+            ))
+        };
+        for participants in [vec![1u16, 1], vec![0, 2], vec![2, 1, 2]] {
+            assert!(
+                request(participants.clone()).validate().is_err(),
+                "{participants:?}"
+            );
+        }
+        assert!(request(vec![2, 1]).validate().is_ok());
     }
 
     #[test]

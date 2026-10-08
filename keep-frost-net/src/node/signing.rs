@@ -605,6 +605,28 @@ impl KfpNode {
                 FrostNetError::UntrustedPeer(format!("Peer {from} not found in peer list"))
             })?;
 
+        // The requester signs too, and a session is exactly the threshold of
+        // signers.
+        if !request.participants.contains(&requester)
+            || request.participants.len() != usize::from(self.share.metadata.threshold)
+        {
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                requester,
+                participants = ?request.participants,
+                "Rejecting sign request: participants must be the threshold and include the requester"
+            );
+            self.record_refusal(&request, Some(requester));
+            self.send_session_error(
+                &from,
+                "policy_violation",
+                "participants must be the threshold of signers including the requester",
+                request.session_id,
+            )
+            .await?;
+            return Ok(());
+        }
+
         let session_info = SessionInfo {
             session_id: request.session_id,
             message: request.message.clone(),
@@ -1120,12 +1142,14 @@ impl KfpNode {
     /// Attempt aggregation and emit `SignatureComplete` if every participant has
     /// supplied both a commitment and a signature share. Safe to call from any
     /// handler; it is a no-op while `ready_to_aggregate()` is false.
-    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<()> {
+    /// Aggregates once every share is in; true when this call completed the
+    /// signature.
+    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<bool> {
         let completed = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
-                None => return Ok(()),
+                None => return Ok(false),
             };
 
             // Idempotent: once aggregation has produced the signature the session
@@ -1134,7 +1158,7 @@ impl KfpNode {
             // re-aggregate and re-emit SignatureComplete / re-run the post-sign
             // hook (e.g. broadcast the tx twice).
             if session.is_complete() || !session.ready_to_aggregate() {
-                return Ok(());
+                return Ok(false);
             }
 
             // #487 PR3: aggregate under the composite-tweaked pubkey
@@ -1185,9 +1209,10 @@ impl KfpNode {
                 session_id: *session_id,
                 signature: sig,
             });
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
@@ -1245,25 +1270,16 @@ impl KfpNode {
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
             .map_err(|e| FrostNetError::Crypto(format!("Signing failed: {e}")))?;
 
-        {
+        let (session_participants, session_message): (Vec<u16>, Vec<u8>) = {
             let mut sessions = self.sessions.write();
-            if let Some(session) = sessions.get_session_mut(session_id) {
-                session.add_signature_share(self.share.metadata.identifier, sig_share)?;
-            }
-        }
-
-        // Our own share may complete the set (e.g. single-participant, or we were
-        // the last to commit+sign). Gate on `ready_to_aggregate()` so we never
-        // aggregate over a mismatched commitment/share id set under reordering.
-        self.try_complete_signature(session_id)?;
-        {
-            let sessions = self.sessions.read();
-            if let Some(session) = sessions.get_session(session_id) {
-                if session.is_complete() {
-                    return Ok(());
+            match sessions.get_session_mut(session_id) {
+                Some(session) => {
+                    session.add_signature_share(self.share.metadata.identifier, sig_share)?;
+                    (session.participants().to_vec(), session.message().to_vec())
                 }
+                None => Default::default(),
             }
-        }
+        };
 
         let share_bytes = sig_share.serialize();
         let payload = SignatureSharePayload::new(
@@ -1271,14 +1287,6 @@ impl KfpNode {
             self.share.metadata.identifier,
             share_bytes.to_vec(),
         );
-
-        let (session_participants, session_message): (Vec<u16>, Vec<u8>) = {
-            let sessions = self.sessions.read();
-            sessions
-                .get_session(session_id)
-                .map(|s| (s.participants().to_vec(), s.message().to_vec()))
-                .unwrap_or_default()
-        };
 
         let peer_pubkeys: Vec<PublicKey> = self
             .peers
@@ -1303,23 +1311,41 @@ impl KfpNode {
                 }
             }
         }
-        if sent == 0 {
-            if let Some(e) = last_err {
-                return Err(e);
-            }
+        // Recorded as soon as it has left, before aggregation can fail.
+        if sent > 0 {
+            debug!(session_id = %hex::encode(session_id), "Sent signature share");
+            self.audit_log.log_signing_operation(
+                *session_id,
+                &session_message,
+                None,
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureShareSent,
+                None,
+            );
         }
 
-        debug!(session_id = %hex::encode(session_id), "Sent signature share");
-
-        self.audit_log.log_signing_operation(
-            *session_id,
-            &session_message,
-            None,
-            session_participants,
-            self.share.metadata.identifier,
-            SigningOperation::SignatureShareSent,
-            None,
-        );
+        // Aggregate only after sending. Our own share may complete the set (we
+        // were the last to commit and sign), and the others aggregate from the
+        // shares they receive; completing removes the session, which is why its
+        // participants were read when the share was added. Gate on
+        // `ready_to_aggregate()` so we never aggregate over a mismatched
+        // commitment/share id set under reordering.
+        let completed = self.try_complete_signature(session_id)?;
+        if sent == 0 {
+            if let Some(e) = last_err {
+                // A signature this node completed stands even if no peer was
+                // reached; failing here would tear it down.
+                if !completed {
+                    return Err(e);
+                }
+                warn!(
+                    session_id = %hex::encode(session_id),
+                    error = %e,
+                    "Signature completed locally but the share reached no peer"
+                );
+            }
+        }
 
         Ok(())
     }
@@ -2383,6 +2409,219 @@ mod gate_tests {
         let from = Keys::generate().public_key();
         let req = SignRequestPayload::new([1u8; 32], [0xAA; 32], vec![0u8; 32], "test", vec![1]);
         assert!(node.handle_sign_request(from, req).await.is_ok());
+    }
+
+    /// A 2-of-3 co-signer (identifier 1) whose session already holds peer 2's
+    /// commitment and signature share (an invalid one when `corrupt`), so its
+    /// own share completes the set.
+    async fn session_completed_by_our_share(
+        corrupt: bool,
+    ) -> (KfpNode, MockRelay, String, Keys, [u8; 32]) {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("completes-the-set").unwrap();
+        let peer_share = shares.remove(1);
+        let node = KfpNode::new(shares.remove(0), vec![relay.clone()])
+            .await
+            .unwrap();
+        let peer_keys = Keys::generate();
+        node.peers
+            .write()
+            .add_peer(crate::peer::Peer::new(peer_keys.public_key(), 2));
+
+        let message = vec![0x42u8; 32];
+        let participants = vec![1u16, 2];
+        let session_id = crate::session::derive_session_id(&message, &participants, 2);
+        let our_kp = node.share.key_package().unwrap();
+        let peer_kp = peer_share.key_package().unwrap();
+        let (our_nonces, our_c) =
+            frost_secp256k1_tr::round1::commit(our_kp.signing_share(), &mut OsRng);
+        let (peer_nonces, peer_c) =
+            frost_secp256k1_tr::round1::commit(peer_kp.signing_share(), &mut OsRng);
+        {
+            let mut sessions = node.sessions.write();
+            let session = sessions
+                .create_session(session_id, message, 2, participants)
+                .unwrap();
+            session.set_our_nonces(our_nonces);
+            session.set_our_commitment(our_c);
+            session.add_commitment(1, our_c).unwrap();
+            session.add_commitment(2, peer_c).unwrap();
+            let package = session.get_signing_package().unwrap();
+            let peer_sig = if corrupt {
+                frost_secp256k1_tr::round2::SignatureShare::deserialize(&[1u8; 32]).unwrap()
+            } else {
+                frost_secp256k1_tr::round2::sign(&package, &peer_nonces, &peer_kp).unwrap()
+            };
+            session.add_signature_share(2, peer_sig).unwrap();
+        }
+        (node, mock, relay, peer_keys, session_id)
+    }
+
+    fn audited(node: &KfpNode, session_id: &[u8; 32], op: SigningOperation) -> bool {
+        node.audit_log()
+            .get_entries_for_session(session_id)
+            .iter()
+            .any(|e| std::mem::discriminant(&e.operation) == std::mem::discriminant(&op))
+    }
+
+    fn completed(node: &KfpNode, session_id: &[u8; 32]) -> bool {
+        audited(node, session_id, SigningOperation::SignatureCompleted)
+    }
+
+    /// A client for `keys` subscribed to the KFP events addressed to it, once
+    /// the relay has acknowledged the subscription (KFP events are ephemeral:
+    /// the relay forwards them only to a subscriber already listening).
+    async fn listening(
+        relay: &str,
+        keys: &Keys,
+    ) -> (
+        Client,
+        tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+    ) {
+        let client = Client::new(keys.clone());
+        client.add_relay(relay).await.unwrap();
+        client.connect().await;
+        let mut notifications = client.notifications();
+        let sub = client
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::Custom(crate::protocol::KFP_EVENT_KIND))
+                    .pubkey(keys.public_key()),
+                None,
+            )
+            .await
+            .unwrap()
+            .val;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(id),
+                    ..
+                }) = notifications.recv().await
+                {
+                    if *id == sub {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("subscription is live");
+        (client, notifications)
+    }
+
+    /// Whether `keys` receives this node's share for `session_id` within 5 s.
+    async fn receives_share(
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        keys: &Keys,
+        session_id: &[u8; 32],
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let next = tokio::time::timeout_at(deadline, notifications.recv()).await;
+            let Ok(Ok(RelayPoolNotification::Event { event, .. })) = next else {
+                if next.is_err() {
+                    return false;
+                }
+                continue;
+            };
+            let Ok(plain) = nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) else {
+                continue;
+            };
+            if let Ok(KfpMessage::SignatureShare(p)) = KfpMessage::from_json(&plain) {
+                if p.session_id == *session_id && p.share_index == 1 {
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// A co-signer whose own share completes the set still sends it. The
+    /// other participants aggregate from the shares they receive, and
+    /// completing removes the session, so the participants to send to must be
+    /// read before aggregating.
+    #[tokio::test]
+    async fn a_share_that_completes_the_set_is_still_sent() {
+        let (node, _mock, relay, peer_keys, session_id) =
+            session_completed_by_our_share(false).await;
+        let (client, mut notifications) = listening(&relay, &peer_keys).await;
+        node.generate_and_send_share(&session_id).await.unwrap();
+        assert!(completed(&node, &session_id), "our share completed the set");
+        assert!(
+            receives_share(&mut notifications, &peer_keys, &session_id).await,
+            "the share that completed the set must still reach the other participant"
+        );
+        client.disconnect().await;
+    }
+
+    /// The share goes out before local aggregation, so a peer's bad share
+    /// failing it here does not keep ours from the others.
+    #[tokio::test]
+    async fn a_failed_local_aggregation_does_not_withhold_the_share() {
+        let (node, _mock, relay, peer_keys, session_id) =
+            session_completed_by_our_share(true).await;
+        let (client, mut notifications) = listening(&relay, &peer_keys).await;
+        assert!(node.generate_and_send_share(&session_id).await.is_err());
+        assert!(receives_share(&mut notifications, &peer_keys, &session_id).await);
+        assert!(
+            audited(&node, &session_id, SigningOperation::SignatureShareSent),
+            "a share that left is recorded even though aggregation failed"
+        );
+        assert!(!completed(&node, &session_id));
+        client.disconnect().await;
+    }
+
+    /// When no peer can be reached, a signature this node completed with its
+    /// own share still stands rather than failing the round.
+    #[tokio::test]
+    async fn a_completed_signature_survives_an_unreachable_peer() {
+        let (node, mock, _relay, _peer_keys, session_id) =
+            session_completed_by_our_share(false).await;
+        mock.shutdown();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            node.generate_and_send_share(&session_id),
+        )
+        .await
+        .expect("does not hang")
+        .expect("a completed signature is not torn down by a failed send");
+        assert!(completed(&node, &session_id));
+        assert!(
+            !audited(&node, &session_id, SigningOperation::SignatureShareSent),
+            "a share that reached no peer is not recorded as sent"
+        );
+    }
+
+    /// A request whose participants leave out the requester, or are not
+    /// exactly the threshold, is refused before any commitment is made.
+    #[tokio::test]
+    async fn participants_must_be_the_threshold_including_the_requester() {
+        let (node, _relay) = test_node().await;
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(crate::peer::Peer::new(peer, 2));
+        let group = *node.group_pubkey();
+        for participants in [vec![1u16, 3], vec![1, 2, 3], vec![1]] {
+            let message = vec![0x51u8; 32];
+            let session_id = derive_session_id(&message, &participants, 2);
+            let req =
+                SignRequestPayload::new(session_id, group, message, "raw", participants.clone());
+            node.handle_sign_request(peer, req)
+                .await
+                .expect("a refusal is reported to the requester, not surfaced here");
+            assert!(
+                refused(&node, &session_id),
+                "{participants:?}: refusal audited"
+            );
+            assert!(
+                node.sessions.read().get_session(&session_id).is_none(),
+                "{participants:?}: no session may be opened"
+            );
+        }
     }
 
     /// A refused request leaves a durable record.
