@@ -1910,6 +1910,16 @@ impl KfpNode {
         self.peers.read().online_count()
     }
 
+    /// Online peers that can sign and announced `capability`.
+    pub fn online_peers_with(&self, capability: &str) -> usize {
+        self.peers
+            .read()
+            .get_signing_peers()
+            .into_iter()
+            .filter(|p| p.has_capability(capability))
+            .count()
+    }
+
     /// Number of our own pre-generated nonces currently available in the pool.
     pub fn nonce_pool_own_available(&self) -> usize {
         self.nonce_pool.own_available()

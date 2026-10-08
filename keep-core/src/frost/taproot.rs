@@ -64,6 +64,22 @@ impl TaprootTweak {
     }
 }
 
+/// One key-path spend to sign.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPathSpendRequest {
+    /// The input's key-spend sighash.
+    pub sighash: [u8; 32],
+    /// The path below the group key (empty for the group key itself).
+    pub path: Vec<u32>,
+    /// The BIP-341 tweak of the spent output.
+    pub tweak: TaprootTweak,
+    /// The scriptPubKey the input spends; the signature must verify under its
+    /// output key.
+    pub script_pubkey: ScriptBuf,
+    /// What is being spent, recorded in the audit log (e.g. the txid and input).
+    pub context: String,
+}
+
 /// The taproot internal key at `path` below the x-only `group` key: the group
 /// key itself for an empty path.
 pub fn internal_key(group: &[u8; 32], path: &[u32]) -> Result<[u8; 32]> {

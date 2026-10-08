@@ -80,6 +80,61 @@ pub struct BitcoinSighashPayload {
     pub prevouts: Vec<Vec<u8>>,
 }
 
+/// The largest key-spend payload (JSON) a sign request carries. The request
+/// hex-encodes it, NIP-44 pads and base64-encodes the result, and relays commonly
+/// refuse events over 64 KiB, so this keeps a full request comfortably inside one.
+pub const MAX_KEY_SPEND_PAYLOAD_BYTES: usize = 16 * 1024;
+
+impl BitcoinSighashPayload {
+    /// The payload for a key-path spend of input `input_index` of `psbt`, with
+    /// the PSBT reduced to what co-signers recompute the sighash from and what a
+    /// spend policy reads: the unsigned transaction, every input's UTXO and the
+    /// outputs' key origins. The prevouts come from the inputs' UTXOs. Returns
+    /// the payload as JSON, refusing one too large for a sign request.
+    pub fn for_key_spend(
+        psbt: &Psbt,
+        input_index: usize,
+        sighash_type: TapSighashType,
+    ) -> Result<Vec<u8>> {
+        let mut reduced = Psbt::from_unsigned_tx(psbt.unsigned_tx.clone())
+            .map_err(|e| FrostNetError::PolicyViolation(format!("bitcoin-sighash psbt: {e}")))?;
+        let mut prevouts = Vec::with_capacity(psbt.inputs.len());
+        for (i, (input, kept)) in psbt
+            .inputs
+            .iter()
+            .zip(reduced.inputs.iter_mut())
+            .enumerate()
+        {
+            let utxo = input.witness_utxo.clone().ok_or_else(|| {
+                FrostNetError::PolicyViolation(format!("input {i} has no witness UTXO"))
+            })?;
+            prevouts.push(bitcoin::consensus::serialize(&utxo));
+            kept.witness_utxo = Some(utxo);
+        }
+        for (output, kept) in psbt.outputs.iter().zip(reduced.outputs.iter_mut()) {
+            kept.tap_internal_key = output.tap_internal_key;
+            kept.tap_key_origins = output.tap_key_origins.clone();
+        }
+        let payload = Self {
+            psbt: reduced.serialize(),
+            input_index: u32::try_from(input_index)
+                .map_err(|_| FrostNetError::PolicyViolation("input index out of range".into()))?,
+            sighash_type: u32::from(sighash_type as u8),
+            prevouts,
+        };
+        let json = serde_json::to_vec(&payload).map_err(|e| {
+            FrostNetError::PolicyViolation(format!("bitcoin-sighash payload encode: {e}"))
+        })?;
+        if json.len() > MAX_KEY_SPEND_PAYLOAD_BYTES {
+            return Err(FrostNetError::PolicyViolation(format!(
+                "the PSBT is too large for a sign request ({} bytes of payload, at most {MAX_KEY_SPEND_PAYLOAD_BYTES})",
+                json.len()
+            )));
+        }
+        Ok(json)
+    }
+}
+
 mod vec_hex {
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(v: &[Vec<u8>], s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -283,6 +338,127 @@ pub fn verify_taproot_key_spend(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod key_spend_payload_tests {
+    use super::*;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, Txid, Witness};
+
+    fn psbt(outputs: usize) -> Psbt {
+        let spent = |b: u8| {
+            ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                bitcoin::secp256k1::Keypair::from_seckey_slice(
+                    &bitcoin::secp256k1::Secp256k1::new(),
+                    &[b; 32],
+                )
+                .unwrap()
+                .x_only_public_key()
+                .0,
+            ))
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: (0..2)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), vout),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: (0..outputs)
+                .map(|_| TxOut {
+                    value: Amount::from_sat(1_000),
+                    script_pubkey: spent(3),
+                })
+                .collect(),
+        };
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        for (i, input) in psbt.inputs.iter_mut().enumerate() {
+            input.witness_utxo = Some(TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: spent(1 + i as u8),
+            });
+            input.final_script_witness = Some(Witness::from_slice(&[vec![7u8; 500]]));
+        }
+        psbt
+    }
+
+    /// Co-signers recompute the requested sighash from the reduced payload, and
+    /// fields they do not need are left out.
+    #[test]
+    fn a_key_spend_payload_recomputes_the_sighash() {
+        let psbt = psbt(2);
+        let prevouts: Vec<TxOut> = psbt
+            .inputs
+            .iter()
+            .map(|i| i.witness_utxo.clone().unwrap())
+            .collect();
+        for sighash_type in [TapSighashType::Default, TapSighashType::All] {
+            let sighash = SighashCache::new(&psbt.unsigned_tx)
+                .taproot_key_spend_signature_hash(1, &Prevouts::All(&prevouts), sighash_type)
+                .unwrap();
+            let json = BitcoinSighashPayload::for_key_spend(&psbt, 1, sighash_type).unwrap();
+            verify_structured_payload(MSG_TYPE_BITCOIN_SIGHASH, sighash.as_ref(), &json).unwrap();
+            let payload: BitcoinSighashPayload = serde_json::from_slice(&json).unwrap();
+            let reduced = Psbt::deserialize(&payload.psbt).unwrap();
+            assert!(reduced
+                .inputs
+                .iter()
+                .all(|i| i.final_script_witness.is_none()));
+            assert_eq!(reduced.inputs[1].witness_utxo, psbt.inputs[1].witness_utxo);
+        }
+    }
+
+    /// A sign request carrying a payload at the cap, the tweak and nonce
+    /// references for 16 participants still encrypts and fits in a 64 KiB event.
+    #[test]
+    fn a_request_at_the_payload_cap_fits_one_event() {
+        use crate::{KfpEventBuilder, NonceRef, SignRequestPayload, TaprootTweakPayload};
+        let participants: Vec<u16> = (1..=16).collect();
+        let nonce_refs = participants
+            .iter()
+            .map(|&i| NonceRef {
+                share_index: i,
+                nonce_id: if i == 1 { [0; 32] } else { [i as u8; 32] },
+                commitment: vec![0x02; 66],
+            })
+            .collect();
+        let request = SignRequestPayload::new(
+            [7; 32],
+            [8; 32],
+            vec![9; 32],
+            MSG_TYPE_BITCOIN_SIGHASH,
+            participants,
+        )
+        .with_structured_payload(vec![b'7'; MAX_KEY_SPEND_PAYLOAD_BYTES])
+        .with_taproot_tweak(TaprootTweakPayload {
+            merkle_root: Some([1; 32]),
+        })
+        .with_derivation_path(vec![1, 999])
+        .with_session_salt(vec![0xaa; 48])
+        .with_nonce_refs(nonce_refs);
+        let keys = nostr_sdk::Keys::generate();
+        let recipient = nostr_sdk::Keys::generate().public_key();
+        let event = KfpEventBuilder::sign_request(&keys, &recipient, request).unwrap();
+        let size = nostr_sdk::JsonUtil::as_json(&event).len();
+        assert!(size <= 64 * 1024, "{size} bytes");
+    }
+
+    #[test]
+    fn a_key_spend_payload_needs_every_utxo_and_fits_a_request() {
+        let mut missing = psbt(1);
+        missing.inputs[0].witness_utxo = None;
+        assert!(
+            BitcoinSighashPayload::for_key_spend(&missing, 1, TapSighashType::Default).is_err()
+        );
+        let e = BitcoinSighashPayload::for_key_spend(&psbt(400), 0, TapSighashType::Default)
+            .expect_err("a PSBT too large for one request");
+        assert!(e.to_string().contains("too large"), "{e}");
+    }
 }
 
 #[cfg(test)]

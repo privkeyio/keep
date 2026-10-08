@@ -45,6 +45,141 @@ fn parse_group_hex(group_id: &str) -> Result<[u8; 32]> {
         .map_err(|_| KeepError::InvalidInput("group pubkey must be 32 bytes".into()))
 }
 
+/// Sign the inputs of a PSBT that spend this FROST group's own taproot outputs
+/// on the key path, with co-signers over `relay` or, with `local`, with
+/// threshold shares held in this vault.
+#[allow(clippy::too_many_arguments)]
+pub fn cmd_wallet_sign(
+    out: &Output,
+    path: &Path,
+    group: &str,
+    psbt_path: &str,
+    output_path: Option<&str>,
+    local: bool,
+    share_index: Option<u16>,
+    relay: &str,
+    timeout_secs: u64,
+    any_network: bool,
+    yes: bool,
+) -> Result<()> {
+    use crate::commands::bitcoin::{
+        confirm_sign, print_analysis, read_psbt_file, write_signed_psbt,
+    };
+    use keep_bitcoin::frost_psbt::{self, FrostWallet};
+    use keep_core::frost::taproot::KeyPathSpendRequest;
+
+    let group_pubkey = parse_group_id(group)?;
+    let mut psbt = read_psbt_file(psbt_path)?;
+
+    let mut keep = Keep::open(path)?;
+    let password = get_password("Enter password")?;
+    let spinner = out.spinner("Unlocking vault...");
+    keep.unlock(password.expose_secret())?;
+    drop(password);
+    spinner.finish();
+
+    // The latest version decides change; older ones still hold coins the group
+    // can spend, so their outputs are signable but paying them is not change.
+    let latest = keep
+        .get_wallet_descriptor(&group_pubkey)?
+        .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
+    let network = crate::commands::bitcoin::parse_network(&latest.network)?;
+    // The group key and the unhardened path below it do not depend on the
+    // network, so a test-network PSBT names the same outputs as mainnet.
+    if network != keep_bitcoin::Network::Bitcoin && !any_network {
+        return Err(KeepError::InvalidInput(format!(
+            "this group's wallet is on {network}, but its outputs are the same scripts on \
+             mainnet, so these signatures would spend them there too; pass --any-network \
+             to sign anyway"
+        )));
+    }
+    let version_error = |version: u32, e: keep_bitcoin::BitcoinError| {
+        KeepError::Runtime(format!("stored wallet descriptor version {version}: {e}"))
+    };
+    let mut wallet = FrostWallet::new(group_pubkey, &latest.external_descriptor, network)
+        .map_err(|e| version_error(latest.version, e))?;
+    for older in keep
+        .list_wallet_descriptor_versions(&group_pubkey)?
+        .into_iter()
+        .filter(|d| d.network == latest.network && d.version != latest.version)
+    {
+        wallet
+            .add_older(&older.external_descriptor)
+            .map_err(|e| version_error(older.version, e))?;
+    }
+    let (analysis, spends) = wallet
+        .analyze(&psbt)
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    print_analysis(out, &analysis, true);
+    if spends.is_empty() {
+        return Err(KeepError::Runtime(
+            "no input in this PSBT spends one of this group's addresses".into(),
+        ));
+    }
+    if network != keep_bitcoin::Network::Bitcoin {
+        out.warn(&format!(
+            "Addresses are shown for {network}, but these outputs are the same scripts on \
+             mainnet: if this PSBT spends mainnet coins, signing it spends them"
+        ));
+    }
+    confirm_sign(yes)?;
+
+    let sighashes =
+        frost_psbt::sighashes(&psbt, &spends).map_err(|e| KeepError::Runtime(e.to_string()))?;
+    let txid = psbt.unsigned_tx.compute_txid();
+    let requests: Vec<KeyPathSpendRequest> = spends
+        .iter()
+        .zip(&sighashes)
+        .map(|(s, sighash)| KeyPathSpendRequest {
+            sighash: *sighash,
+            path: s.path.clone(),
+            tweak: s.tweak,
+            script_pubkey: s.script_pubkey.clone(),
+            context: format!("key-path spend of txid {txid} input {}", s.input),
+        })
+        .collect();
+    let signatures = if local {
+        keep.frost_sign_key_path_spends(&group_pubkey, &requests)?
+    } else {
+        let share = match share_index {
+            Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
+            None => keep.frost_get_share(&group_pubkey)?,
+        };
+        let network_spends = spends
+            .iter()
+            .zip(requests)
+            .map(|(s, request)| {
+                Ok(crate::commands::frost_network::NetworkKeyPathSpend {
+                    payload: keep_frost_net::BitcoinSighashPayload::for_key_spend(
+                        &psbt,
+                        s.input,
+                        s.sighash_type,
+                    )
+                    .map_err(|e| KeepError::Runtime(e.to_string()))?,
+                    request,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // The share lives in the node for the round; the vault is locked first
+        // so its master key is not held through the network wait.
+        keep.lock();
+        drop(keep);
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+        rt.block_on(crate::commands::frost_network::key_path_spend_round(
+            out,
+            share,
+            relay,
+            Duration::from_secs(timeout_secs),
+            network_spends,
+        ))?
+    };
+
+    frost_psbt::apply_signatures(&mut psbt, &spends, &sighashes, &signatures)
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    write_signed_psbt(out, &psbt, output_path, spends.len())
+}
+
 pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;

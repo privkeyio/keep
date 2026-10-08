@@ -79,7 +79,7 @@ pub struct PsbtSigner {
 /// of account 0. An output to any other wallet key still belongs to the wallet but is
 /// treated as a spend, so it cannot hide funds from that wallet behind the change
 /// exemption.
-const CHANGE_INDEX_LIMIT: u32 = 1000;
+pub(crate) const CHANGE_INDEX_LIMIT: u32 = 1000;
 
 #[cfg(test)]
 thread_local! {
@@ -434,7 +434,7 @@ impl PsbtSigner {
 /// The sighash type input `index` asks for, if it is one the signer will use. DEFAULT
 /// and ALL both commit to every input and output; anything narrower was asked for by
 /// the PSBT author and is refused rather than silently replaced.
-fn requested_sighash_type(psbt: &Psbt, index: usize) -> Result<TapSighashType> {
+pub(crate) fn requested_sighash_type(psbt: &Psbt, index: usize) -> Result<TapSighashType> {
     match psbt.inputs[index].sighash_type.map(|t| t.taproot_hash_ty()) {
         None => Ok(TapSighashType::Default),
         Some(Ok(t @ (TapSighashType::Default | TapSighashType::All))) => Ok(t),

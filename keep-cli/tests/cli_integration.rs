@@ -1,3 +1,6 @@
+mod common;
+
+use common::{frost_wallet_psbt, npub_in, read_psbt, signed_key_path_inputs, write_psbt};
 use sha2::Digest;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -2282,4 +2285,119 @@ async fn test_software_dkg_ceremony_creates_one_group() {
     }
     assert_eq!(group_keys[0], group_keys[1]);
     assert_eq!(group_keys[1], group_keys[2]);
+}
+
+/// `keep wallet sign --local` signs exactly the inputs that spend the group's
+/// own addresses, each verifying under its output key, shows the change, and
+/// asks first: KEEP_YES does not skip the prompt. Off mainnet it signs only
+/// with `--any-network`, since the group's outputs are the same on mainnet.
+#[test]
+fn test_wallet_sign_local_spends_the_groups_addresses() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("frost-wallet");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    let generated = KeepCmd::new(&bin)
+        .path(&vault)
+        .args([
+            "frost",
+            "generate",
+            "--threshold",
+            "2",
+            "--shares",
+            "3",
+            "--name",
+            "g",
+        ])
+        .run();
+    assert_success(&generated);
+    let npub = npub_in(&generated);
+    let group = keep_core::keys::npub_to_bytes(&npub).unwrap();
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "wallet",
+                "descriptor",
+                "--group",
+                &npub,
+                "--network",
+                "regtest",
+            ])
+            .run(),
+    );
+
+    let sign = |name: &str, psbt: &bitcoin::Psbt, flags: &[&str]| {
+        let file = dir.path().join(name);
+        write_psbt(&file, psbt);
+        let signed = dir.path().join(format!("{name}.signed"));
+        let out = KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "wallet",
+                "sign",
+                "--group",
+                &npub,
+                "--psbt",
+                file.to_str().unwrap(),
+                "-o",
+                signed.to_str().unwrap(),
+                "--local",
+            ])
+            .args(flags)
+            .run();
+        (out, signed)
+    };
+
+    let psbt = frost_wallet_psbt(&group, 1, &[[0, 2], [1, 4]]);
+    let (out, signed) = sign("test-network.psbt", &psbt, &["--yes"]);
+    assert_failure(&out);
+    assert!(output_contains(&out, "pass --any-network"), "{out:?}");
+    assert!(!signed.exists());
+
+    let (out, signed) = sign("unconfirmed.psbt", &psbt, &["--any-network"]);
+    assert_failure(&out);
+    assert!(output_contains(&out, "pass --yes"), "{out:?}");
+    assert!(!signed.exists());
+
+    let (out, signed) = sign("spend.psbt", &psbt, &["--any-network", "--yes"]);
+    assert_success(&out);
+    assert!(output_contains(&out, "Signed 2 input(s)"));
+    assert!(output_contains(&out, "(change)"));
+    assert!(output_contains(&out, "Leaving this wallet"));
+    assert!(output_contains(&out, "same scripts on mainnet"));
+    assert_eq!(signed_key_path_inputs(&read_psbt(&signed)), vec![0, 1]);
+
+    let (out, _) = sign(
+        "foreign.psbt",
+        &frost_wallet_psbt(&group, 1, &[]),
+        &["--any-network", "--yes"],
+    );
+    assert_failure(&out);
+    assert!(output_contains(
+        &out,
+        "no input in this PSBT spends one of this group's addresses"
+    ));
+
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "wallet",
+                "descriptor",
+                "--group",
+                &npub,
+                "--network",
+                "mainnet",
+            ])
+            .run(),
+    );
+    let (out, signed) = sign(
+        "mainnet.psbt",
+        &frost_wallet_psbt(&group, 0, &[[0, 2], [1, 4]]),
+        &["--yes"],
+    );
+    assert_success(&out);
+    assert!(!output_contains(&out, "same scripts on mainnet"));
+    assert_eq!(signed_key_path_inputs(&read_psbt(&signed)), vec![0, 1]);
 }

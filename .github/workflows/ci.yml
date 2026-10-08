@@ -109,6 +109,10 @@ jobs:
       # subprocess (the tests locate `target/release/keep`), so run them in
       # --release too. Previously only compile-checked, never executed in CI.
       - run: cargo test -p keep-cli --release --test cli_integration
+      # A network key-path spend between two `keep` processes over an in-process
+      # relay. The binary is rebuilt with `local-relay-tests` so it accepts a
+      # loopback ws:// relay; this stays the last step so no later step runs it.
+      - run: cargo test -p keep-cli --release --features local-relay-tests --test frost_spend_network
 
   build-windows:
     runs-on: windows-latest
