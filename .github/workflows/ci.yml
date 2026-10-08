@@ -91,6 +91,7 @@ jobs:
       - run: cargo test --workspace --lib --bins
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
+      - run: cargo test -p keep-frost-net --features testing --test taproot_key_spend_memory_test
       - run: cargo test -p keep-enclave-host --test integration_tests
       # keep-enclave-bin (the Nitro Enclave binary) is a separate workspace excluded
       # from the root workspace, so `cargo test --workspace` never builds it. It is

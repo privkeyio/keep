@@ -13,6 +13,7 @@ use crate::error::{FrostNetError, Result};
 use crate::event::KfpEventBuilder;
 use crate::protocol::*;
 use crate::session::{derive_session_id, derive_session_id_salted};
+use keep_core::frost::taproot::{self, TaprootTweak};
 
 use super::{KfpNode, KfpNodeEvent, NonceId, SessionInfo};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
@@ -433,6 +434,59 @@ impl KfpNode {
         );
     }
 
+    /// The public key package a session at `path` with `tweak` aggregates
+    /// under: its verifying key is the key the signature verifies with.
+    fn spend_public_key_package(
+        &self,
+        path: &[u32],
+        tweak: Option<TaprootTweakPayload>,
+    ) -> Result<frost_secp256k1_tr::keys::PublicKeyPackage> {
+        Ok(taproot::spend_public_key_package(
+            &self.share.pubkey_package()?,
+            &self.group_pubkey,
+            path,
+            tweak.map(TaprootTweak::from),
+        )?)
+    }
+
+    /// The scriptPubKey a key-path spend at `path` with `tweak` signs for: the
+    /// output key the session aggregates under, from the same tweaks applied to
+    /// the same group key as signing and aggregation, without the signing share.
+    fn taproot_script_pubkey(
+        &self,
+        path: &[u32],
+        tweak: TaprootTweakPayload,
+    ) -> Result<bitcoin::ScriptBuf> {
+        let pkp = self.spend_public_key_package(path, Some(tweak))?;
+        Ok(taproot::output_script_pubkey(&taproot::x_only(
+            pkp.verifying_key(),
+        )?)?)
+    }
+
+    /// The checks every party runs on a key-path spend before committing: a
+    /// bitcoin-sighash request with its PSBT payload, whose signed input spends
+    /// this group's output for `path` and `tweak` under SIGHASH_DEFAULT or ALL.
+    /// The payload must already be proven to hash to the message. Returns the
+    /// spent scriptPubKey.
+    fn check_key_path_spend(
+        &self,
+        message_type: &str,
+        structured_payload: Option<&[u8]>,
+        path: &[u32],
+        tweak: TaprootTweakPayload,
+    ) -> Result<bitcoin::ScriptBuf> {
+        let payload = structured_payload
+            .filter(|_| message_type == crate::MSG_TYPE_BITCOIN_SIGHASH)
+            .ok_or_else(|| {
+                FrostNetError::PolicyViolation(
+                    "a taproot tweak needs a bitcoin-sighash request with its PSBT payload".into(),
+                )
+            })?;
+        let spk = self.taproot_script_pubkey(path, tweak)?;
+        crate::verify_taproot_key_spend(payload, &spk)?;
+        Ok(spk)
+    }
+
     pub(crate) async fn handle_sign_request(
         &self,
         from: PublicKey,
@@ -486,6 +540,23 @@ impl KfpNode {
             return Err(FrostNetError::PolicyViolation(format!(
                 "Peer {from} not allowed to send sign requests"
             )));
+        }
+
+        // The session id is validated against the transmitted salt, so the salt
+        // must encode the key this request signs with: otherwise one session id
+        // could be reused for a different path or taproot tweak.
+        if !crate::session::salt_binds(
+            &request.session_salt,
+            &request.derivation_path,
+            request.taproot_tweak.as_ref(),
+        ) {
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                "Rejecting sign request: session salt does not bind its path and taproot tweak"
+            );
+            return Err(FrostNetError::PolicyViolation(
+                "Session salt does not bind the request's derivation path and taproot tweak".into(),
+            ));
         }
 
         info!(
@@ -543,6 +614,7 @@ impl KfpNode {
             message_type: request.message_type.clone(),
             structured_payload: request.structured_payload.clone(),
             derivation_path: request.derivation_path.clone(),
+            taproot_tweak: request.taproot_tweak,
         };
 
         // Recompute the digest from the structured payload BEFORE the pre-sign
@@ -578,7 +650,46 @@ impl KfpNode {
             }
         }
 
+        // A key-path spend: the input must spend this group's output for the
+        // path and tweak, under SIGHASH_DEFAULT or ALL, before anything is
+        // committed. The structured payload is present (protocol validation)
+        // and already proven to hash to `message` above.
         let hooks = self.hooks.read().clone();
+        if let Some(tweak) = request.taproot_tweak {
+            let check = self
+                .check_key_path_spend(
+                    &request.message_type,
+                    request.structured_payload.as_deref(),
+                    &request.derivation_path,
+                    tweak,
+                )
+                .and_then(|_| {
+                    if hooks.approve_key_path_spend(&session_info) {
+                        Ok(())
+                    } else {
+                        Err(FrostNetError::PolicyViolation(
+                            "this co-signer does not approve key-path spends".into(),
+                        ))
+                    }
+                });
+            if let Err(e) = check {
+                warn!(
+                    session_id = %hex::encode(request.session_id),
+                    error = %e,
+                    "Sign request refused: key-path spend check failed"
+                );
+                self.record_refusal(&request, Some(requester));
+                self.send_session_error(
+                    &from,
+                    "policy_violation",
+                    &e.to_string(),
+                    request.session_id,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+
         if let Err(e) = hooks.pre_sign(&session_info) {
             // Notify the requester so it fails fast instead of hanging until
             // timeout/failover exhaustion, mirroring the stale-nonce path below.
@@ -747,6 +858,7 @@ impl KfpNode {
             )?;
             session.set_message_type(request.message_type.clone());
             session.set_derivation_path(request.derivation_path.clone());
+            session.set_taproot_tweak(request.taproot_tweak);
 
             // All nonce_refs have now been validated above, and a pre-exchange
             // request that reaches here covers the full threshold set. The
@@ -1030,15 +1142,17 @@ impl KfpNode {
             // signature-share validation and the aggregate signature line
             // up under the derived child key.
             let base_pubkey_pkg = self.aggregation_pubkey_package(session.participants())?;
-            let pubkey_pkg = keep_core::frost::bip32_signing::tweak_public_key_package_at_path(
+            // A key-path spend aggregates under the output key, so the
+            // self-check in `try_aggregate` verifies against the key the spent
+            // scriptPubKey commits to.
+            let pubkey_pkg = taproot::spend_public_key_package(
                 &base_pubkey_pkg,
                 &self.group_pubkey,
                 session.derivation_path(),
+                session.taproot_tweak().map(TaprootTweak::from),
             )
             .map_err(|e| {
-                FrostNetError::Crypto(format!(
-                    "BIP-32 tweak on aggregation pubkey package failed: {e}"
-                ))
+                FrostNetError::Crypto(format!("tweak on aggregation pubkey package failed: {e}"))
             })?;
             session.try_aggregate(&pubkey_pkg)?.map(|sig| {
                 (
@@ -1091,7 +1205,7 @@ impl KfpNode {
             return Ok(());
         }
 
-        let (signing_package, nonces, derivation_path) = {
+        let (signing_package, nonces, derivation_path, taproot_tweak) = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
@@ -1111,19 +1225,21 @@ impl KfpNode {
             };
 
             let derivation_path = session.derivation_path().to_vec();
-            (signing_package, nonces, derivation_path)
+            let taproot_tweak = session.taproot_tweak();
+            (signing_package, nonces, derivation_path, taproot_tweak)
         };
 
         // #487 PR3: sign under the composite-tweaked key package when the
         // session carries a derivation path, so the sig share aggregates to
         // a signature under the derived child pubkey rather than the group.
-        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+        let key_package = taproot::spend_key_package(
             &self.share.key_package()?,
             &self.group_pubkey,
             &derivation_path,
+            taproot_tweak.map(TaprootTweak::from),
         )
         .map_err(|e| {
-            FrostNetError::Crypto(format!("BIP-32 tweak on responder key package failed: {e}"))
+            FrostNetError::Crypto(format!("tweak on responder key package failed: {e}"))
         })?;
 
         let sig_share = frost_secp256k1_tr::round2::sign(&signing_package, &nonces, &key_package)
@@ -1269,6 +1385,32 @@ impl KfpNode {
             }
         }
 
+        // A participant may report the signature instead of this node
+        // aggregating it; one that does not verify under the session's key is
+        // dropped, so a bogus report cannot pre-empt the real aggregate.
+        let verified = {
+            let sessions = self.sessions.read();
+            sessions
+                .get_session(&payload.session_id)
+                .is_some_and(|session| {
+                    let key = self.spend_public_key_package(
+                        session.derivation_path(),
+                        session.taproot_tweak(),
+                    );
+                    let signature = frost_secp256k1_tr::Signature::deserialize(&payload.signature);
+                    matches!((key, signature), (Ok(pkp), Ok(sig))
+                    if pkp.verifying_key().verify(session.message(), &sig).is_ok())
+                })
+        };
+        if !verified {
+            warn!(
+                session_id = %hex::encode(payload.session_id),
+                from = %from,
+                "Ignoring a reported signature that does not verify under the session's key"
+            );
+            return Ok(());
+        }
+
         info!(
             session_id = %hex::encode(payload.session_id),
             "Received completed signature"
@@ -1311,20 +1453,9 @@ impl KfpNode {
     /// spare co-signers (single-peer / exactly-threshold), and its result is
     /// ignored if too few peers answer to still reach threshold, since then the
     /// normal round and failover should decide rather than a flaky ping.
-    async fn prune_unresponsive_cosigners(&self) -> Vec<u16> {
+    async fn prune_unresponsive_cosigners(&self, capability: Option<&str>) -> Vec<u16> {
         let needed = (self.share.metadata.threshold as usize).saturating_sub(1);
-        let snapshot: Vec<(u16, PublicKey, Option<std::time::Instant>)> = {
-            let peers = self.peers.read();
-            peers
-                .get_signing_peers()
-                .into_iter()
-                .filter(|p| {
-                    self.can_send_to_index(p.share_index)
-                        && self.can_receive_from_index(p.share_index)
-                })
-                .map(|p| (p.share_index, p.pubkey, p.last_pong))
-                .collect()
-        };
+        let snapshot = self.liveness_candidates(capability);
         if snapshot.len() <= needed {
             return Vec::new();
         }
@@ -1355,6 +1486,25 @@ impl KfpNode {
             );
         }
         unresponsive
+    }
+
+    /// The co-signers a round could select, which are the ones the liveness
+    /// ping judges: a peer that could not take part (no `capability`) must not
+    /// count toward the spare co-signers that justify excluding a slow one.
+    fn liveness_candidates(
+        &self,
+        capability: Option<&str>,
+    ) -> Vec<(u16, PublicKey, Option<std::time::Instant>)> {
+        self.peers
+            .read()
+            .get_signing_peers()
+            .into_iter()
+            .filter(|p| capability.is_none_or(|c| p.has_capability(c)))
+            .filter(|p| {
+                self.can_send_to_index(p.share_index) && self.can_receive_from_index(p.share_index)
+            })
+            .map(|p| (p.share_index, p.pubkey, p.last_pong))
+            .collect()
     }
 
     pub async fn request_signature(
@@ -1395,10 +1545,69 @@ impl KfpNode {
     /// Hardened indexes are refused at protocol validation.
     pub async fn request_signature_at_path(
         &self,
+        message: Vec<u8>,
+        message_type: &str,
+        structured_payload: Option<Vec<u8>>,
+        derivation_path: Vec<u32>,
+    ) -> Result<[u8; 64]> {
+        self.request_signature_inner(
+            message,
+            message_type,
+            structured_payload,
+            derivation_path,
+            None,
+        )
+        .await
+    }
+
+    /// Request a key-path spend of a taproot output (BIP-341): the aggregate
+    /// verifies under the output key of `tr(<child at derivation_path>)` (BIP-86,
+    /// no merkle root) or `tr(<group>, <tree>)` (the tree's merkle root, empty
+    /// path). `sighash` is the input's key-spend sighash and `psbt_payload` the
+    /// [`crate::BitcoinSighashPayload`] it is recomputed from. The spent
+    /// scriptPubKey is checked against the group's output here and by every
+    /// co-signer, and only co-signers announcing
+    /// [`crate::CAPABILITY_TAPROOT_TWEAK`] are asked.
+    pub async fn request_key_path_spend(
+        &self,
+        sighash: Vec<u8>,
+        psbt_payload: Vec<u8>,
+        derivation_path: Vec<u32>,
+        tweak: crate::TaprootTweakPayload,
+    ) -> Result<[u8; 64]> {
+        crate::verify_structured_payload(crate::MSG_TYPE_BITCOIN_SIGHASH, &sighash, &psbt_payload)?;
+        let spk = self.check_key_path_spend(
+            crate::MSG_TYPE_BITCOIN_SIGHASH,
+            Some(&psbt_payload),
+            &derivation_path,
+            tweak,
+        )?;
+        let digest: [u8; 32] = sighash
+            .as_slice()
+            .try_into()
+            .map_err(|_| FrostNetError::Protocol("a sighash is 32 bytes".into()))?;
+        let signature = self
+            .request_signature_inner(
+                sighash,
+                crate::MSG_TYPE_BITCOIN_SIGHASH,
+                Some(psbt_payload),
+                derivation_path,
+                Some(tweak),
+            )
+            .await?;
+        // A co-signer may report the signature instead of this node aggregating
+        // it, so check it the way consensus will before handing it back.
+        taproot::verify_key_path_signature(&signature, &digest, &spk)?;
+        Ok(signature)
+    }
+
+    async fn request_signature_inner(
+        &self,
         mut message: Vec<u8>,
         message_type: &str,
         structured_payload: Option<Vec<u8>>,
         derivation_path: Vec<u32>,
+        taproot_tweak: Option<crate::TaprootTweakPayload>,
     ) -> Result<[u8; 64]> {
         // Reject an oversized or hardened path locally, mirroring the wire-side
         // check in `KfpMessage::validate`, so a bad path fails fast with a clear
@@ -1449,7 +1658,9 @@ impl KfpNode {
         // first round goes straight to live peers instead of timing out on a
         // dead one. Peers that drop mid-round are still caught by the failover
         // exclusion below.
-        let mut excluded: Vec<u16> = self.prune_unresponsive_cosigners().await;
+        let capability = taproot_tweak.map(|_| crate::CAPABILITY_TAPROOT_TWEAK);
+        let mut excluded: Vec<u16> = self.prune_unresponsive_cosigners(capability).await;
+        let mut last_error: Option<String> = None;
         for attempt in 0..MAX_FAILOVER_ATTEMPTS {
             let last = attempt + 1 == MAX_FAILOVER_ATTEMPTS;
             let round_message = if last {
@@ -1463,6 +1674,7 @@ impl KfpNode {
                     message_type,
                     structured_payload.clone(),
                     derivation_path.clone(),
+                    taproot_tweak,
                     &excluded,
                     logical_id,
                     attempt,
@@ -1472,9 +1684,10 @@ impl KfpNode {
             match result {
                 Ok(sig) => return Ok(sig),
                 Err(SigningRoundError {
-                    error: FrostNetError::Timeout(_),
+                    error: FrostNetError::Timeout(reason),
                     attempted,
                 }) if !last => {
+                    last_error = Some(reason);
                     // Fail over on ANY round timeout while retries remain. The
                     // unresponsive set only decides WHICH peers to drop: when it
                     // is non-empty exclude those peers, otherwise (e.g. everyone
@@ -1553,9 +1766,10 @@ impl KfpNode {
                 }
             }
         }
-        Err(FrostNetError::Timeout(
-            "Signing request timed out after failover".into(),
-        ))
+        Err(FrostNetError::Timeout(match last_error {
+            Some(reason) => format!("Signing request timed out after failover; last: {reason}"),
+            None => "Signing request timed out after failover".into(),
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1565,6 +1779,7 @@ impl KfpNode {
         message_type: &str,
         structured_payload: Option<Vec<u8>>,
         derivation_path: Vec<u32>,
+        taproot_tweak: Option<crate::TaprootTweakPayload>,
         exclude: &[u16],
         logical_id: [u8; 32],
         attempt: usize,
@@ -1579,8 +1794,11 @@ impl KfpNode {
 
         let threshold = self.share.metadata.threshold;
 
+        // A peer that predates the taproot tweak drops it and signs untweaked,
+        // so a key-path spend only goes to peers that announced support.
+        let capability = taproot_tweak.map(|_| crate::CAPABILITY_TAPROOT_TWEAK);
         let (participants, participant_peers) = self
-            .select_eligible_peers(threshold as usize, exclude)
+            .select_eligible_peers_with(threshold as usize, exclude, capability)
             .map_err(SigningRoundError::fatal)?;
 
         let attempted: Vec<u16> = participant_peers.iter().map(|(idx, _)| *idx).collect();
@@ -1597,16 +1815,8 @@ impl KfpNode {
         // responder resends its cached commitment for the first path, never
         // adopting the second. The responder recomputes and validates the id
         // from the transmitted salt, so this binds the path on both sides.
-        let session_salt: Vec<u8> = if attempt == 0 && derivation_path.is_empty() {
-            Vec::new()
-        } else {
-            let mut salt = Vec::with_capacity(8 + derivation_path.len() * 4);
-            salt.extend_from_slice(&(attempt as u64).to_be_bytes());
-            for index in &derivation_path {
-                salt.extend_from_slice(&index.to_be_bytes());
-            }
-            salt
-        };
+        let session_salt =
+            crate::session::session_salt(attempt as u64, &derivation_path, taproot_tweak.as_ref());
         let session_id =
             derive_session_id_salted(&message, &participants, threshold, &session_salt);
 
@@ -1632,17 +1842,18 @@ impl KfpNode {
         // for the requested path before generating round1 nonces, so the
         // commitment we announce matches what co-signers will validate
         // against their own tweaked packages.
-        let key_package = keep_core::frost::bip32_signing::tweak_key_package_at_path(
+        let key_package = taproot::spend_key_package(
             &self
                 .share
                 .key_package()
                 .map_err(|e| SigningRoundError::fatal(e.into()))?,
             &self.group_pubkey,
             &derivation_path,
+            taproot_tweak.map(TaprootTweak::from),
         )
         .map_err(|e| {
             SigningRoundError::fatal(FrostNetError::Crypto(format!(
-                "BIP-32 tweak on requester key package failed: {e}"
+                "tweak on requester key package failed: {e}"
             )))
         })?;
         let (nonces, our_commitment) =
@@ -1698,6 +1909,9 @@ impl KfpNode {
         if !derivation_path.is_empty() {
             request = request.with_derivation_path(derivation_path.clone());
         }
+        if let Some(tweak) = taproot_tweak {
+            request = request.with_taproot_tweak(tweak);
+        }
 
         let session_info = SessionInfo {
             session_id,
@@ -1708,6 +1922,7 @@ impl KfpNode {
             message_type: message_type.to_string(),
             structured_payload: structured_payload.clone(),
             derivation_path: derivation_path.clone(),
+            taproot_tweak,
         };
         let hooks = self.hooks.read().clone();
         hooks.pre_sign(&session_info)?;
@@ -1734,6 +1949,7 @@ impl KfpNode {
             )?;
             session.set_message_type(message_type.to_string());
             session.set_derivation_path(derivation_path.clone());
+            session.set_taproot_tweak(taproot_tweak);
 
             session.set_our_nonces(nonces);
             session.set_our_commitment(our_commitment);
@@ -2252,6 +2468,362 @@ mod gate_tests {
         );
     }
 
+    /// A key-path spend request from peer 2 to this node (identifier 1) over the
+    /// output `spent`, salted as an honest requester would.
+    fn key_spend_request(
+        node: &KfpNode,
+        spent: &bitcoin::ScriptBuf,
+        sighash_type: u8,
+        path: &[u32],
+        tweak: TaprootTweakPayload,
+    ) -> SignRequestPayload {
+        let (sighash, payload) = crate::test_support::key_spend_payload(spent, sighash_type);
+        let salt = crate::session::session_salt(0, path, Some(&tweak));
+        let session_id = derive_session_id_salted(&sighash, &[1, 2], 2, &salt);
+        SignRequestPayload::new(
+            session_id,
+            *node.group_pubkey(),
+            sighash.to_vec(),
+            crate::MSG_TYPE_BITCOIN_SIGHASH,
+            vec![1, 2],
+        )
+        .with_structured_payload(payload)
+        .with_derivation_path(path.to_vec())
+        .with_taproot_tweak(tweak)
+        .with_session_salt(salt)
+    }
+
+    fn refused(node: &KfpNode, session_id: &[u8; 32]) -> bool {
+        node.audit_log()
+            .get_entries_for_session(session_id)
+            .iter()
+            .any(|e| matches!(e.operation, SigningOperation::SignRequestRefused))
+    }
+
+    async fn node_with_requester() -> (KfpNode, MockRelay, PublicKey) {
+        let (node, relay) = test_node().await;
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(crate::peer::Peer::new(peer, 2));
+        (node, relay, peer)
+    }
+
+    fn own_output(node: &KfpNode, path: &[u32], tweak: TaprootTweakPayload) -> bitcoin::ScriptBuf {
+        node.taproot_script_pubkey(path, tweak).unwrap()
+    }
+
+    /// A co-signer checks the output itself rather than trusting the requester:
+    /// a key-path spend of anything but this group's output for the path and
+    /// tweak, or under a sighash narrower than ALL, is refused before any
+    /// commitment, while its own output under DEFAULT is accepted and the tweak
+    /// is kept for round 2.
+    #[tokio::test]
+    async fn a_co_signer_checks_the_key_path_spend_itself() {
+        let (node, _relay, peer) = node_with_requester().await;
+        node.set_hooks(std::sync::Arc::new(RecordingHooks::approving(true)));
+        let path = [0u32, 2];
+        let bip86 = TaprootTweakPayload::default();
+        let rooted = TaprootTweakPayload {
+            merkle_root: Some([3; 32]),
+        };
+        let ours = own_output(&node, &path, bip86);
+        let cases = [
+            (own_output(&node, &[0, 9], bip86), 0x00, bip86, true),
+            (own_output(&node, &path, rooted), 0x00, bip86, true),
+            (ours.clone(), 0x02, bip86, true),
+            (ours.clone(), 0x81, bip86, true),
+            (ours.clone(), 0x00, rooted, true),
+            (ours.clone(), 0x00, bip86, false),
+            (own_output(&node, &path, rooted), 0x01, rooted, false),
+        ];
+        for (i, (spent, sighash_type, tweak, refuse)) in cases.into_iter().enumerate() {
+            let req = key_spend_request(&node, &spent, sighash_type, &path, tweak);
+            let session_id = req.session_id;
+            node.handle_sign_request(peer, req).await.unwrap();
+            assert_eq!(refused(&node, &session_id), refuse, "case {i}");
+            let session_tweak = node
+                .sessions
+                .read()
+                .get_session(&session_id)
+                .map(|s| s.taproot_tweak());
+            assert_eq!(session_tweak, (!refuse).then_some(Some(tweak)), "case {i}");
+        }
+    }
+
+    /// A peer that predates the tweak drops it and would sign untweaked, so a
+    /// key-path spend only selects peers announcing the capability.
+    #[tokio::test]
+    async fn a_key_path_spend_only_selects_peers_announcing_the_tweak() {
+        let (node, _relay) = test_node().await;
+        let capability = Some(crate::CAPABILITY_TAPROOT_TWEAK);
+        node.peers
+            .write()
+            .add_peer(crate::peer::Peer::new(Keys::generate().public_key(), 2));
+        assert!(node.select_eligible_peers(2, &[]).is_ok());
+        assert!(matches!(
+            node.select_eligible_peers_with(2, &[], capability),
+            Err(FrostNetError::InsufficientPeers { .. })
+        ));
+
+        node.peers.write().add_peer(
+            crate::peer::Peer::new(Keys::generate().public_key(), 3)
+                .with_capabilities(vec!["sign".into(), crate::CAPABILITY_TAPROOT_TWEAK.into()]),
+        );
+        for _ in 0..16 {
+            let (participants, _) = node.select_eligible_peers_with(2, &[], capability).unwrap();
+            assert_eq!(participants, vec![1, 3]);
+        }
+    }
+
+    /// The requester asks for the capability too: with only a co-signer that
+    /// predates the tweak, a key-path spend fails for want of peers instead of
+    /// starting a round that peer would sign untweaked.
+    #[tokio::test]
+    async fn a_key_path_spend_is_not_sent_to_peers_without_the_tweak() {
+        let (node, _relay) = test_node().await;
+        node.peers
+            .write()
+            .add_peer(crate::peer::Peer::new(Keys::generate().public_key(), 2));
+        let path = [0u32, 1];
+        let tweak = TaprootTweakPayload::default();
+        let spent = own_output(&node, &path, tweak);
+        let (sighash, payload) = crate::test_support::key_spend_payload(&spent, 0x00);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            node.request_key_path_spend(sighash.to_vec(), payload, path.to_vec(), tweak),
+        )
+        .await
+        .expect("refused at selection, before any round could time out");
+        assert!(
+            matches!(result, Err(FrostNetError::InsufficientPeers { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// Records what the key-path spend approval saw and whether `pre_sign` ran.
+    struct RecordingHooks {
+        approve: bool,
+        approvals: parking_lot::Mutex<Vec<Option<TaprootTweakPayload>>>,
+        pre_signs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingHooks {
+        fn approving(approve: bool) -> Self {
+            Self {
+                approve,
+                approvals: Default::default(),
+                pre_signs: Default::default(),
+            }
+        }
+    }
+
+    impl crate::SigningHooks for RecordingHooks {
+        fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+            self.pre_signs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+        fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
+            self.approvals.lock().push(session.taproot_tweak);
+            self.approve
+        }
+    }
+
+    /// A key-path spend needs the hooks' explicit approval, which is asked only
+    /// after the node's own checks pass and before `pre_sign` (a human prompt
+    /// never sees a spend the policy already refused). The default hooks refuse.
+    #[tokio::test]
+    async fn a_key_path_spend_needs_the_hooks_approval() {
+        let path = [0u32, 2];
+        let tweak = TaprootTweakPayload {
+            merkle_root: Some([8; 32]),
+        };
+        for approve in [false, true] {
+            let (node, _relay, peer) = node_with_requester().await;
+            let hooks = std::sync::Arc::new(RecordingHooks::approving(approve));
+            node.set_hooks(hooks.clone());
+            let req =
+                key_spend_request(&node, &own_output(&node, &path, tweak), 0x00, &path, tweak);
+            let session_id = req.session_id;
+            node.handle_sign_request(peer, req).await.unwrap();
+            assert_eq!(refused(&node, &session_id), !approve);
+            assert_eq!(*hooks.approvals.lock(), vec![Some(tweak)]);
+            assert_eq!(
+                hooks.pre_signs.load(std::sync::atomic::Ordering::SeqCst),
+                usize::from(approve)
+            );
+        }
+
+        let (node, _relay, peer) = node_with_requester().await;
+        let req = key_spend_request(&node, &own_output(&node, &path, tweak), 0x00, &path, tweak);
+        let session_id = req.session_id;
+        node.handle_sign_request(peer, req).await.unwrap();
+        assert!(refused(&node, &session_id), "the default hooks refuse");
+
+        // A spend failing the node's own checks never reaches the hooks.
+        let (node, _relay, peer) = node_with_requester().await;
+        let hooks = std::sync::Arc::new(RecordingHooks::approving(true));
+        node.set_hooks(hooks.clone());
+        let other = own_output(&node, &[0, 9], tweak);
+        node.handle_sign_request(peer, key_spend_request(&node, &other, 0x00, &path, tweak))
+            .await
+            .unwrap();
+        assert!(hooks.approvals.lock().is_empty());
+    }
+
+    /// The liveness prune judges only peers a round could select, so an old peer
+    /// that cannot take part in a key-path spend is not counted as a spare.
+    #[tokio::test]
+    async fn liveness_candidates_follow_the_capability() {
+        let (node, _relay) = test_node().await;
+        node.peers.write().add_peer(
+            crate::peer::Peer::new(Keys::generate().public_key(), 2)
+                .with_capabilities(vec!["sign".into(), crate::CAPABILITY_TAPROOT_TWEAK.into()]),
+        );
+        node.peers
+            .write()
+            .add_peer(crate::peer::Peer::new(Keys::generate().public_key(), 3));
+        let indexes = |c| {
+            let mut v: Vec<u16> = node.liveness_candidates(c).iter().map(|p| p.0).collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(indexes(None), vec![2, 3]);
+        assert_eq!(indexes(Some(crate::CAPABILITY_TAPROOT_TWEAK)), vec![2]);
+    }
+
+    /// A participant can report a finished signature instead of this node
+    /// aggregating it. A report that does not verify under the session's key is
+    /// ignored, so the request keeps waiting for a real one; a valid one ends it.
+    #[tokio::test]
+    async fn a_reported_signature_counts_only_if_it_verifies() {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let mock = MockRelay::run().await.unwrap();
+        let relay = mock.url().await.to_string();
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("reported-signature-test").unwrap();
+        let ours = shares.remove(0);
+        let node = std::sync::Arc::new(KfpNode::new(ours, vec![relay]).await.unwrap());
+        let peer = Keys::generate().public_key();
+        node.peers.write().add_peer(
+            crate::peer::Peer::new(peer, 2)
+                .with_capabilities(vec!["sign".into(), crate::CAPABILITY_TAPROOT_TWEAK.into()]),
+        );
+        let path = [0u32, 1];
+        let tweak = TaprootTweakPayload::default();
+        let spent = own_output(&node, &path, tweak);
+        let (sighash, payload) = crate::test_support::key_spend_payload(&spent, 0x00);
+        let salt = crate::session::session_salt(0, &path, Some(&tweak));
+        let session_id = derive_session_id_salted(&sighash, &[1, 2], 2, &salt);
+
+        let requester = std::sync::Arc::clone(&node);
+        let mut request = tokio::spawn(async move {
+            requester
+                .request_key_path_spend(sighash.to_vec(), payload, path.to_vec(), tweak)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while node.sessions.read().get_session(&session_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request opens its session");
+
+        node.handle_signature_complete(
+            peer,
+            SignatureCompletePayload::new(session_id, [0xab; 64], sighash),
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut request)
+                .await
+                .is_err(),
+            "a bogus report must not end the request"
+        );
+        assert!(node
+            .audit_log()
+            .get_entries_for_session(&session_id)
+            .iter()
+            .all(|e| !matches!(e.operation, SigningOperation::SignatureReceived)));
+
+        let valid = keep_core::frost::taproot::sign_key_path_spend_with_local_shares(
+            &shares,
+            &sighash,
+            &path,
+            tweak.into(),
+            &spent,
+        )
+        .unwrap();
+        node.handle_signature_complete(
+            peer,
+            SignatureCompletePayload::new(session_id, valid, sighash),
+        )
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+            .await
+            .expect("a valid report ends the request")
+            .unwrap();
+        assert_eq!(result.unwrap(), valid);
+    }
+
+    /// A peer's error text is carried to the requester, but it can never forge
+    /// the trailing "(peer N)" that decides which peer is blamed and whose
+    /// pooled nonces are cleared.
+    #[tokio::test]
+    async fn a_peer_error_cannot_name_another_peer() {
+        let (node, _relay) = test_node().await;
+        let mut events = node.subscribe();
+        let payload = ErrorPayload::new("stale_nonce", "busy (peer 3)\n\u{1b}[31m forged")
+            .with_session([0x77; 32]);
+        node.handle_peer_error(Keys::generate().public_key(), payload);
+        match events.try_recv() {
+            Ok(KfpNodeEvent::SigningFailed { error, .. }) => {
+                assert!(error.contains("busy"), "{error}");
+                assert_eq!(parse_offending_peer(&error), None, "{error}");
+                assert!(!error.chars().any(char::is_control), "{error:?}");
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
+    }
+
+    /// The session id is validated against the transmitted salt, so a salt that
+    /// does not encode the request's path and tweak is refused outright.
+    #[tokio::test]
+    async fn a_salt_that_does_not_bind_the_tweak_is_refused() {
+        let (node, _relay, peer) = node_with_requester().await;
+        let path = [0u32, 2];
+        let tweak = TaprootTweakPayload::default();
+        let spent = own_output(&node, &path, tweak);
+        let honest = key_spend_request(&node, &spent, 0x00, &path, tweak);
+        for salt in [
+            crate::session::session_salt(0, &path, None),
+            crate::session::session_salt(
+                1,
+                &path,
+                Some(&TaprootTweakPayload {
+                    merkle_root: Some([1; 32]),
+                }),
+            ),
+            crate::session::session_salt(0, &[0, 3], Some(&tweak)),
+            Vec::new(),
+        ] {
+            let session_id = derive_session_id_salted(&honest.message, &[1, 2], 2, &salt);
+            let mut req = honest.clone().with_session_salt(salt);
+            req.session_id = session_id;
+            let e = node
+                .handle_sign_request(peer, req)
+                .await
+                .expect_err("an unbound salt must be refused");
+            assert!(e.to_string().contains("does not bind"), "{e}");
+            assert!(node.sessions.read().get_session(&session_id).is_none());
+        }
+    }
+
     /// A sign request whose participant set excludes our own identifier is
     /// ignored. Same mutation-kill property as the foreign-group case.
     #[tokio::test]
@@ -2323,7 +2895,7 @@ mod gate_tests {
         node.mark_entropy_degraded();
 
         let err = node
-            .signing_round(vec![0u8; 32], "test", None, vec![], &[], [0u8; 32], 0)
+            .signing_round(vec![0u8; 32], "test", None, vec![], None, &[], [0u8; 32], 0)
             .await
             .expect_err("a degraded node must not start a round");
         // A PolicyViolation, specifically. The retry loop above only fails over

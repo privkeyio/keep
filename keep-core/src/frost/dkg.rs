@@ -434,7 +434,7 @@ fn identifier_to_u16(id: &Identifier) -> Option<u16> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::frost::signing::sign_with_local_shares;
     use crate::frost::SharePackage;
@@ -455,6 +455,14 @@ mod tests {
     }
 
     fn run_group(threshold: u16, participants: u16) {
+        let share_packages = software_dkg_shares(threshold, participants);
+        let message = b"software dkg produces spendable shares";
+        let sig = sign_with_local_shares(&share_packages[..threshold as usize], message).unwrap();
+        assert_eq!(sig.len(), 64);
+    }
+
+    /// Every participant's `SharePackage` from a full in-memory software DKG.
+    pub(crate) fn software_dkg_shares(threshold: u16, participants: u16) -> Vec<SharePackage> {
         let mut sessions: Vec<SoftwareDkgSession> = (1..=participants)
             .map(|idx| SoftwareDkgSession::init(threshold, participants, idx).unwrap())
             .collect();
@@ -494,12 +502,8 @@ mod tests {
             assert_eq!(r.group_pubkey, first_group);
         }
 
-        // Assemble SharePackages for the threshold set and produce a real
-        // signature. If any DKG step corrupted a share this would fail at
-        // aggregation time.
-        let share_packages: Vec<SharePackage> = results
+        results
             .iter()
-            .take(threshold as usize)
             .map(|r| {
                 let metadata = crate::frost::ShareMetadata::new(
                     r.our_index,
@@ -510,11 +514,7 @@ mod tests {
                 );
                 SharePackage::new(metadata, &r.key_package, &r.public_key_package).unwrap()
             })
-            .collect();
-
-        let message = b"software dkg produces spendable shares";
-        let sig = sign_with_local_shares(&share_packages, message).unwrap();
-        assert_eq!(sig.len(), 64);
+            .collect()
     }
 
     /// A version-tag mismatch on a peer's round1 package MUST refuse rather

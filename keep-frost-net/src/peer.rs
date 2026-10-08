@@ -147,7 +147,11 @@ impl Peer {
     }
 
     pub fn can_sign(&self) -> bool {
-        self.capabilities.contains(&"sign".to_string())
+        self.has_capability("sign")
+    }
+
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|c| c == capability)
     }
 
     pub fn is_online(&self, offline_threshold: Duration) -> bool {

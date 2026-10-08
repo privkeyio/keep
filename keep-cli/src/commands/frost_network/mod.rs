@@ -69,6 +69,7 @@ pub fn cmd_frost_network_serve(
     auto_contribute_descriptor: bool,
     refuse_raw_sign: bool,
     require_structured_sign: bool,
+    allow_key_path_spend: bool,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
@@ -307,12 +308,20 @@ pub fn cmd_frost_network_serve(
                 "duress beacon recipients recorded"
             );
         }
-        if refuse_raw_sign || require_structured_sign || oprf_auto_approve {
+        if refuse_raw_sign || require_structured_sign || oprf_auto_approve || allow_key_path_spend
+        {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
                 refuse_raw_sign,
                 require_structured_payload: require_structured_sign,
                 auto_approve_oprf_eval: oprf_auto_approve,
+                allow_key_path_spend,
             }));
+        }
+        if allow_key_path_spend {
+            out.warn(
+                "co-signing key-path spends of the group's taproot outputs to any \
+                 destination and amount a member requests",
+            );
         }
         if refuse_raw_sign {
             out.field(
@@ -2232,6 +2241,7 @@ mod tests {
                 &group,
                 "wss://relay.example",
                 None,
+                false,
                 false,
                 false,
                 false,

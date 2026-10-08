@@ -366,6 +366,10 @@ pub struct SessionInfo {
     /// Hooks can inspect this to gate signing under specific chains (e.g.
     /// enforce `/0/*` for receive and refuse `/1/*` on a receive-only role).
     pub derivation_path: Vec<u32>,
+    /// Set on a key-path spend of a taproot output: the signature will verify
+    /// under the output key, so it moves the group's funds. Co-signing one also
+    /// needs [`SigningHooks::approve_key_path_spend`].
+    pub taproot_tweak: Option<TaprootTweakPayload>,
 }
 
 impl From<&NetworkSession> for SessionInfo {
@@ -386,6 +390,7 @@ impl From<&NetworkSession> for SessionInfo {
             // check runs in pre_sign where the request is in scope.
             structured_payload: None,
             derivation_path: session.derivation_path().to_vec(),
+            taproot_tweak: session.taproot_tweak(),
         }
     }
 }
@@ -429,6 +434,20 @@ pub trait SigningHooks: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let _ = (requester_share_index, session_id);
         Box::pin(async { false })
+    }
+
+    /// Called before a node co-signs a key-path spend of one of the group's
+    /// taproot outputs (a request with [`SessionInfo::taproot_tweak`]), after it
+    /// has checked the input is the group's own output and before
+    /// [`Self::pre_sign`]. Returning `false` refuses.
+    ///
+    /// SECURITY: the default is DENY. Such a signature spends real funds, and
+    /// the node's own checks only prove whose output it is, not where the money
+    /// goes. A co-signer opts in only where something decides that: a human who
+    /// is shown the spend, or a destination and amount policy.
+    fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
+        let _ = session;
+        false
     }
 }
 
@@ -571,6 +590,11 @@ pub struct ServeHooks {
     pub refuse_raw_sign: bool,
     pub require_structured_payload: bool,
     pub auto_approve_oprf_eval: bool,
+    /// Co-sign key-path spends of the group's taproot outputs unattended. This
+    /// node then signs any spend a group member requests that passes its own
+    /// checks (the input is the group's output, sighash DEFAULT or ALL), with no
+    /// limit on destination or amount.
+    pub allow_key_path_spend: bool,
 }
 
 impl SigningHooks for ServeHooks {
@@ -593,6 +617,9 @@ impl SigningHooks for ServeHooks {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let approve = self.auto_approve_oprf_eval;
         Box::pin(async move { approve })
+    }
+    fn approve_key_path_spend(&self, _session: &SessionInfo) -> bool {
+        self.allow_key_path_spend
     }
 }
 
@@ -2190,6 +2217,18 @@ impl KfpNode {
         threshold: usize,
         exclude: &[u16],
     ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
+        self.select_eligible_peers_with(threshold, exclude, None)
+    }
+
+    /// [`Self::select_eligible_peers`] limited to peers that announced
+    /// `capability`, when one is given.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn select_eligible_peers_with(
+        &self,
+        threshold: usize,
+        exclude: &[u16],
+        capability: Option<&str>,
+    ) -> Result<(Vec<u16>, Vec<(u16, PublicKey)>)> {
         // Defensive: every real group has threshold >= 2 (split_key rejects t < 2), but guard against
         // a 0 threshold so the `threshold - 1` sample count below cannot underflow into a huge value
         // and panic. Fail closed.
@@ -2205,6 +2244,7 @@ impl KfpNode {
                 .get_signing_peers()
                 .into_iter()
                 .filter(|p| !exclude.contains(&p.share_index))
+                .filter(|p| capability.is_none_or(|c| p.has_capability(c)))
                 .filter(|p| {
                     self.can_send_to_index(p.share_index)
                         && self.can_receive_from_index(p.share_index)
@@ -2794,11 +2834,16 @@ impl KfpNode {
             // or malicious peer cannot reliably block signing. The index
             // is carried structurally; the human-readable string still
             // embeds it for logs and external consumers.
+            // The peer's own words, without control characters, and without
+            // parentheses so they can never forge the trailing "(peer N)" that
+            // names who to blame.
+            let clean = |text: &str| sanitize_reason(text).replace(['(', ')'], "");
+            let (code, detail) = (clean(&payload.code), clean(&payload.message));
             let error = match offending_index {
                 Some(idx) => {
-                    format!("Peer reported error: {} (peer {idx})", payload.code)
+                    format!("Peer reported error: {code}: {detail} (peer {idx})")
                 }
-                None => format!("Peer reported error: {}", payload.code),
+                None => format!("Peer reported error: {code}: {detail}"),
             };
             let _ = self.event_tx.send(KfpNodeEvent::SigningFailed {
                 session_id,
@@ -3956,6 +4001,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: true,
+            allow_key_path_spend: false,
         };
         assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
 
@@ -3963,6 +4009,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
+            allow_key_path_spend: false,
         };
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
@@ -3973,6 +4020,7 @@ mod tests {
             refuse_raw_sign: true,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
+            allow_key_path_spend: false,
         };
 
         let raw = raw_session();
@@ -4154,6 +4202,7 @@ mod tests {
             message_type: "raw".to_string(),
             structured_payload: None,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 
@@ -4169,6 +4218,7 @@ mod tests {
             message_type: crate::MSG_TYPE_NOSTR_EVENT.to_string(),
             structured_payload: structured,
             derivation_path: Vec::new(),
+            taproot_tweak: None,
         }
     }
 

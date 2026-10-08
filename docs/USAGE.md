@@ -309,6 +309,8 @@ keep frost network sign --group npub1... --message <hex>
 keep frost network sign-event --group npub1... --kind 1 --content "Posted via FROST"
 ```
 
+A co-signer refuses key-path spends of the group's taproot outputs (signatures that move the group's Bitcoin) unless it opts in. `serve --allow-key-path-spend` opts in unattended: the node then checks that the input being signed is the group's own output for the requested path and that the sighash is DEFAULT or ALL, but signs whatever destination and amount a group member asks for. The desktop and mobile apps refuse them until their approval prompts can show the spend. Only co-signers running a version that applies the taproot tweak are asked to sign one.
+
 ### Threshold-OPRF Vault Unlock (advanced)
 
 Reconstruct a disk-encryption (LUKS) key at boot from a *t-of-n* Oblivious-PRF
