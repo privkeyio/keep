@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use keep_core::agent::MAX_AUDIT_TEXT;
+use keep_core::agent::cap_text;
 use keep_core::Keep;
 
 use crate::error::{AgentError, Result};
@@ -17,7 +17,8 @@ pub const REFUSAL_WINDOW_SECS: u64 = 60;
 pub const AUDIT_BUDGET_PER_DAY: u32 = 2_000;
 
 /// Entries every credential together may write per day, well under the log's
-/// agent ceiling, so agents cannot fill it in a day.
+/// agent ceiling, so agents cannot fill it in a day. Refusals may use only
+/// half of it, so refused requests cannot leave signatures without room.
 pub const GATEWAY_AUDIT_BUDGET_PER_DAY: u32 = 40_000;
 
 const DAY_SECS: u64 = 24 * 60 * 60;
@@ -27,6 +28,14 @@ const MAX_PENDING: usize = 1_024;
 
 /// Credentials whose budgets are tracked before stale ones are dropped.
 const MAX_TRACKED: usize = 256;
+
+/// Open refusal windows one credential may hold; past it, its refusals are
+/// written one by one, so it cannot leave a burst of counts for another
+/// credential's request to write out.
+const MAX_WINDOWS_PER_CREDENTIAL: usize = 32;
+
+/// The id the gateway's own budget entry is recorded under.
+const GATEWAY_ID: [u8; 16] = [0; 16];
 
 /// Why a request was refused, as the audit log records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +53,7 @@ pub enum RefusalKind {
 }
 
 impl RefusalKind {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Unauthenticated => "unauthenticated",
             Self::Denied => "denied",
@@ -62,8 +71,9 @@ impl RefusalKind {
 /// State is held in memory. The daemon calls [`Self::flush_expired`] on a
 /// timer and [`Self::flush_all`] before it stops, since counts still open in
 /// a window are lost if the process exits; calls [`Self::reset`] after the
-/// owner unfreezes a credential; passes only authenticated credential ids; and
-/// passes `now` from one clock that only advances with elapsed time.
+/// owner unfreezes a credential; passes only the ids of credentials a token
+/// matched (accepted or refused); and passes `now` from one clock that only
+/// advances with elapsed time.
 pub struct AgentAudit {
     credential_budget: u32,
     gateway_budget: u32,
@@ -83,7 +93,9 @@ struct Window {
 struct Spent {
     since: u64,
     entries: u32,
+    refusals: u32,
     exhausted: bool,
+    refusals_exhausted: bool,
     frozen: bool,
 }
 
@@ -95,16 +107,16 @@ impl Spent {
         }
     }
 
+    /// Start a new day once a day has passed. A credential the budget froze
+    /// stays marked frozen, so it is not frozen again each day.
     fn roll(&mut self, now: u64) {
         if now >= self.since.saturating_add(DAY_SECS) {
-            *self = Self::starting(now);
+            *self = Self {
+                frozen: self.frozen,
+                ..Self::starting(now)
+            };
         }
     }
-}
-
-enum Exhausted {
-    Credential,
-    Gateway,
 }
 
 impl Default for AgentAudit {
@@ -139,7 +151,7 @@ impl AgentAudit {
         now: u64,
     ) -> Result<()> {
         self.flush_expired(keep, now)?;
-        let key = (*id, kind, capped(detail));
+        let key = (*id, kind, cap_text(detail).to_string());
         if let Some(window) = self.pending.get_mut(&key) {
             window.repeats = window.repeats.saturating_add(1);
             return Ok(());
@@ -147,9 +159,12 @@ impl AgentAudit {
         if self.pending.len() >= MAX_PENDING {
             self.flush_all(keep, now)?;
         }
-        self.check(keep, id, now)?;
+        self.check(keep, id, true, now)?;
         keep.record_agent_refusal(id, kind.label(), Some(&key.2))?;
-        self.charge(id);
+        self.charge(id, true);
+        if self.pending.keys().filter(|k| k.0 == *id).count() >= MAX_WINDOWS_PER_CREDENTIAL {
+            return Ok(());
+        }
         self.pending.insert(
             key,
             Window {
@@ -172,10 +187,10 @@ impl AgentAudit {
         now: u64,
     ) -> Result<()> {
         self.flush_expired(keep, now)?;
-        self.check(keep, id, now)?;
+        self.check(keep, id, false, now)?;
         let context = format!("agent {} {context}", hex::encode(id));
         keep.record_agent_signature(pubkey, message, &context)?;
-        self.charge(id);
+        self.charge(id, false);
         Ok(())
     }
 
@@ -208,7 +223,7 @@ impl AgentAudit {
             let Some(window) = self.pending.remove(&key) else {
                 continue;
             };
-            if window.repeats == 0 || self.check(keep, &key.0, now).is_err() {
+            if window.repeats == 0 || self.check(keep, &key.0, true, now).is_err() {
                 continue;
             }
             let label = format!(
@@ -221,15 +236,15 @@ impl AgentAudit {
                 self.pending.insert(key, window);
                 return Err(e.into());
             }
-            self.charge(&key.0);
+            self.charge(&key.0, true);
         }
         Ok(())
     }
 
-    /// Whether credential `id` and the gateway can still write today. The
-    /// first time a budget runs out, one entry beyond it says so, and a
-    /// credential over its own budget is frozen.
-    fn check(&mut self, keep: &mut Keep, id: &[u8; 16], now: u64) -> Result<()> {
+    /// Whether credential `id` and the gateway can still write a refusal or a
+    /// signature today. The first time a budget runs out, one entry beyond it
+    /// says so, and a credential over its own budget is frozen.
+    fn check(&mut self, keep: &mut Keep, id: &[u8; 16], refusal: bool, now: u64) -> Result<()> {
         self.gateway.roll(now);
         if self.spent.len() >= MAX_TRACKED && !self.spent.contains_key(id) {
             self.spent
@@ -240,54 +255,73 @@ impl AgentAudit {
             .entry(*id)
             .or_insert_with(|| Spent::starting(now));
         spent.roll(now);
-        let exhausted = if self.gateway.entries >= self.gateway_budget {
-            Exhausted::Gateway
-        } else if spent.entries >= self.credential_budget {
-            Exhausted::Credential
-        } else {
-            return Ok(());
-        };
-        match exhausted {
-            Exhausted::Gateway => {
-                if !self.gateway.exhausted {
-                    self.gateway.exhausted = true;
-                    let _ =
-                        keep.record_agent_refusal(id, "gateway audit budget used for today", None);
-                }
-                Err(AgentError::RateLimitExceeded(
-                    "the gateway has used its audit budget for today".into(),
-                ))
+        let credential_over = spent.entries >= self.credential_budget;
+        let gateway_over = self.gateway.entries >= self.gateway_budget;
+        let refusals_over = refusal && self.gateway.refusals >= self.gateway_budget / 2;
+        if credential_over {
+            if !spent.exhausted
+                && keep
+                    .record_agent_refusal(id, "audit budget used for today", None)
+                    .is_ok()
+            {
+                spent.exhausted = true;
             }
-            Exhausted::Credential => {
-                if !spent.exhausted {
-                    spent.exhausted = true;
-                    let _ = keep.record_agent_refusal(id, "audit budget used for today", None);
+            if !spent.frozen {
+                match keep.set_agent_credential_frozen(id, true) {
+                    Ok(()) => spent.frozen = true,
+                    Err(e) => tracing::warn!(
+                        id = %hex::encode(id),
+                        error = %e,
+                        "could not freeze agent credential over its audit budget"
+                    ),
                 }
-                if !spent.frozen {
-                    match keep.set_agent_credential_frozen(id, true) {
-                        Ok(()) => spent.frozen = true,
-                        Err(e) => tracing::warn!(
-                            id = %hex::encode(id),
-                            error = %e,
-                            "could not freeze agent credential over its audit budget"
-                        ),
-                    }
-                }
-                let state = if spent.frozen {
-                    "and is frozen"
-                } else {
-                    "and could not be frozen"
-                };
-                Err(AgentError::RateLimitExceeded(format!(
-                    "agent {} has used its audit budget {state}",
-                    hex::encode(id)
-                )))
             }
+            let state = if spent.frozen {
+                "and is frozen"
+            } else {
+                "and could not be frozen"
+            };
+            return Err(AgentError::RateLimitExceeded(format!(
+                "agent {} has used its audit budget {state}",
+                hex::encode(id)
+            )));
         }
+        if gateway_over {
+            if !self.gateway.exhausted
+                && keep
+                    .record_agent_refusal(&GATEWAY_ID, "gateway audit budget used for today", None)
+                    .is_ok()
+            {
+                self.gateway.exhausted = true;
+            }
+            return Err(AgentError::RateLimitExceeded(
+                "the gateway has used its audit budget for today".into(),
+            ));
+        }
+        if refusals_over {
+            if !self.gateway.refusals_exhausted
+                && keep
+                    .record_agent_refusal(
+                        &GATEWAY_ID,
+                        "gateway refusal budget used for today",
+                        None,
+                    )
+                    .is_ok()
+            {
+                self.gateway.refusals_exhausted = true;
+            }
+            return Err(AgentError::RateLimitExceeded(
+                "the gateway has used its refusal budget for today".into(),
+            ));
+        }
+        Ok(())
     }
 
-    fn charge(&mut self, id: &[u8; 16]) {
+    fn charge(&mut self, id: &[u8; 16], refusal: bool) {
         self.gateway.entries = self.gateway.entries.saturating_add(1);
+        if refusal {
+            self.gateway.refusals = self.gateway.refusals.saturating_add(1);
+        }
         if let Some(spent) = self.spent.get_mut(id) {
             spent.entries = spent.entries.saturating_add(1);
         }
@@ -302,13 +336,4 @@ impl AgentAudit {
     pub(super) fn tracked(&self) -> usize {
         self.spent.len()
     }
-}
-
-/// `detail` cut to the audit log's limit at a character boundary.
-fn capped(detail: &str) -> String {
-    let mut end = detail.len().min(MAX_AUDIT_TEXT);
-    while !detail.is_char_boundary(end) {
-        end -= 1;
-    }
-    detail[..end].to_string()
 }

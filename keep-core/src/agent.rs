@@ -129,14 +129,20 @@ pub struct AgentRefused {
 pub const MAX_AUDIT_TEXT: usize = 256;
 
 /// `text` made safe for an audit entry: cut to [`MAX_AUDIT_TEXT`] bytes at a
-/// character boundary, with control characters, quotes and backslashes
-/// escaped, so it cannot run on, break a line or pose as other text.
+/// character boundary, then with control and invisible characters, quotes and
+/// backslashes escaped (which can lengthen it, to at most a few times the
+/// cap), so it cannot run on, break a line or pose as other text.
 pub fn audit_text(text: &str) -> String {
+    cap_text(text).escape_debug().to_string()
+}
+
+/// `text` cut to [`MAX_AUDIT_TEXT`] bytes at a character boundary.
+pub fn cap_text(text: &str) -> &str {
     let mut end = text.len().min(MAX_AUDIT_TEXT);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    text[..end].escape_debug().to_string()
+    &text[..end]
 }
 
 /// Whether a credential may be bound to `uid`: never root, the overflow uid or

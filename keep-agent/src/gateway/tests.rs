@@ -343,6 +343,10 @@ fn the_gateway_budget_spans_credentials_without_freezing_them() {
             .count(),
         1
     );
+    assert!(refused.contains(&format!(
+        "agent {} gateway audit budget used for today",
+        hex::encode([0u8; 16])
+    )));
     assert!(v.entries(AuditEventType::AgentFreeze).is_empty());
     assert!(authenticate(&v.keep, &token, 1000, NOW).unwrap().is_ok());
     audit
@@ -448,4 +452,157 @@ fn a_signature_writes_out_refusal_windows_that_have_passed() {
         .reasons(AuditEventType::AgentRefused)
         .iter()
         .any(|r| r.contains("denied x1 more since")));
+}
+
+/// A credential over its own budget is frozen even while the gateway's budget
+/// is spent too.
+#[test]
+fn a_credential_over_budget_is_frozen_when_the_gateway_is_too() {
+    let mut v = Vault::new();
+    let (issued, token) = v.issue(3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(1, 1);
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW)
+        .unwrap();
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "2", NOW)
+        .is_err());
+    assert_eq!(
+        authenticate(&v.keep, &token, 1000, NOW)
+            .unwrap()
+            .unwrap_err()
+            .because,
+        RefusedBecause::Credential(AgentRefusal::Frozen)
+    );
+}
+
+/// The "budget used" notice is retried until it is written.
+#[test]
+fn a_budget_notice_that_fails_is_retried() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(1, u32::MAX);
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW)
+        .unwrap();
+    v.break_log(true);
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "2", NOW)
+        .is_err());
+    v.break_log(false);
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "3", NOW)
+        .is_err());
+    assert_eq!(
+        v.reasons(AuditEventType::AgentRefused)
+            .iter()
+            .filter(|r| r.ends_with("audit budget used for today"))
+            .count(),
+        1
+    );
+}
+
+/// One credential holds a bounded number of open windows; past it, its
+/// refusals are written one by one.
+#[test]
+fn one_credential_holds_a_bounded_number_of_windows() {
+    let mut v = Vault::new();
+    let mut audit = AgentAudit::with_budgets(u32::MAX, u32::MAX);
+    let id = [5; 16];
+    for i in 0..40 {
+        audit
+            .record_refusal(&mut v.keep, &id, RefusalKind::Denied, &format!("d{i}"), NOW)
+            .unwrap();
+    }
+    assert_eq!(audit.open_windows(), 32);
+    audit
+        .record_refusal(&mut v.keep, &id, RefusalKind::Denied, "d39", NOW)
+        .unwrap();
+    assert_eq!(v.entries(AuditEventType::AgentRefused).len(), 41);
+}
+
+/// Every summary label fits the audit log's label limit, however large the
+/// count and time.
+#[test]
+fn every_summary_label_fits() {
+    for kind in [
+        RefusalKind::Unauthenticated,
+        RefusalKind::Denied,
+        RefusalKind::NeedsApproval,
+        RefusalKind::RateLimited,
+        RefusalKind::Invalid,
+    ] {
+        let label = format!("{} x{} more since {}", kind.label(), u32::MAX, u64::MAX);
+        assert!(label.len() <= 64, "{label}");
+    }
+}
+
+/// A counted entry is charged to its credential's budget.
+#[test]
+fn a_flushed_count_is_charged() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(2, u32::MAX);
+    for _ in 0..2 {
+        audit
+            .record_refusal(&mut v.keep, &id, RefusalKind::Denied, "kind 4", NOW)
+            .unwrap();
+    }
+    audit
+        .flush_expired(&mut v.keep, NOW + REFUSAL_WINDOW_SECS)
+        .unwrap();
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW + REFUSAL_WINDOW_SECS)
+        .is_err());
+}
+
+/// Refusals use at most half the gateway's budget, so signatures keep room.
+#[test]
+fn refusals_cannot_crowd_out_signatures() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(u32::MAX, 4);
+    for i in 0..2 {
+        audit
+            .record_refusal(&mut v.keep, &[i; 16], RefusalKind::Denied, "x", NOW)
+            .unwrap();
+    }
+    assert!(audit
+        .record_refusal(&mut v.keep, &[9; 16], RefusalKind::Denied, "x", NOW)
+        .is_err());
+    assert!(audit
+        .record_refusal(&mut v.keep, &[9; 16], RefusalKind::Denied, "y", NOW)
+        .is_err());
+    for n in ["1", "2"] {
+        audit
+            .record_signature(&mut v.keep, &id, &KEY, b"m", n, NOW)
+            .unwrap();
+    }
+    assert_eq!(
+        v.reasons(AuditEventType::AgentRefused)
+            .iter()
+            .filter(|r| r.ends_with("gateway refusal budget used for today"))
+            .count(),
+        1
+    );
+}
+
+/// A credential the budget froze is not frozen again on later days.
+#[test]
+fn a_frozen_credential_is_frozen_once() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3 * 24 * 3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(1, u32::MAX);
+    for day in 0..3 {
+        let now = NOW + day * 24 * 3600;
+        for n in ["1", "2"] {
+            let _ = audit.record_signature(&mut v.keep, &id, &KEY, b"m", n, now);
+        }
+    }
+    assert_eq!(v.entries(AuditEventType::AgentFreeze).len(), 1);
 }
