@@ -610,10 +610,11 @@ const info = await session.getSessionInfo();
 
 `keep agent mcp` runs a stdio MCP signing server bound to one vault key. The server signs
 under a constrained policy, so the model gets signing capability without ever seeing the
-private key.
+private key. Every signature is recorded in the vault's audit log (`keep audit`) before it is
+returned, and a signature that cannot be recorded is not returned.
 
 ```bash
-# Nostr and NIP-44 tools only
+# Nostr tools only: get_nostr_pubkey and sign_nostr_event
 keep agent mcp --key main
 
 # Also get_bitcoin_address and sign_bitcoin_psbt on mainnet, spending at most 50,000 sats

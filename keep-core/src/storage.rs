@@ -59,9 +59,22 @@ impl Default for ProxyConfig {
     }
 }
 
-const MAX_RECORD_SIZE: u64 = 1024 * 1024;
+/// The largest serialized record a read accepts; writes of secrets are held to
+/// it so nothing stored becomes unreadable.
+pub const MAX_RECORD_SIZE: u64 = 1024 * 1024;
 const MIN_PASSWORD_LEN: usize = 8;
 const MAX_PASSWORD_LEN: usize = 4096;
+
+/// A secret record serialized with the same bound reads apply, so a record too
+/// large to load back is refused when stored rather than lost.
+fn serialize_secret(record: &SecretRecord) -> Result<Vec<u8>> {
+    bincode_options().serialize(record).map_err(|e| match *e {
+        bincode::ErrorKind::SizeLimit => KeepError::invalid_input(format!(
+            "secret too large: a record may be at most {MAX_RECORD_SIZE} bytes"
+        )),
+        other => KeepError::from(Box::new(other)),
+    })
+}
 
 pub(crate) fn bincode_options() -> impl Options {
     bincode::options()
@@ -1007,7 +1020,7 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let serialized = Zeroizing::new(bincode::serialize(record)?);
+        let serialized = Zeroizing::new(serialize_secret(record)?);
         let encrypted = crypto::encrypt(&serialized, data_key)?;
         let encrypted_bytes = encrypted.to_bytes();
         // A seal row is what marks a secret's `value` as DEK-ciphertext. Overwriting
@@ -1085,7 +1098,7 @@ impl Storage {
         let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
 
-        let rec_serialized = Zeroizing::new(bincode::serialize(record)?);
+        let rec_serialized = Zeroizing::new(serialize_secret(record)?);
         let rec_encrypted = crypto::encrypt(&rec_serialized, data_key)?.to_bytes();
         let seal_serialized = Zeroizing::new(bincode::serialize(seal)?);
         let seal_encrypted = crypto::encrypt(&seal_serialized, data_key)?.to_bytes();

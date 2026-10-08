@@ -47,6 +47,7 @@ pub struct McpServer {
     session_manager: Arc<RwLock<Option<(SessionToken, String)>>>,
     manager: SessionManager,
     secret_key: Option<Zeroizing<[u8; 32]>>,
+    audit: Option<std::sync::Mutex<keep_core::Keep>>,
 }
 
 impl McpServer {
@@ -57,6 +58,7 @@ impl McpServer {
             session_manager: Arc::new(RwLock::new(None)),
             manager: SessionManager::new(pubkey),
             secret_key: None,
+            audit: None,
         }
     }
 
@@ -67,7 +69,26 @@ impl McpServer {
             session_manager: Arc::new(RwLock::new(None)),
             manager: SessionManager::new(pubkey),
             secret_key: Some(Zeroizing::new(secret)),
+            audit: None,
         }
+    }
+
+    /// Records every signature in `keep`'s audit log before returning it; a
+    /// signature that cannot be recorded is withheld. `keep` must stay unlocked.
+    pub fn with_audit(mut self, keep: keep_core::Keep) -> Self {
+        self.audit = Some(std::sync::Mutex::new(keep));
+        self
+    }
+
+    fn record_signature(&self, pubkey: &[u8; 32], message: &[u8], context: &str) -> Option<String> {
+        let keep = self.audit.as_ref()?;
+        let mut keep = match keep.lock() {
+            Ok(k) => k,
+            Err(_) => return Some("audit log unavailable".into()),
+        };
+        keep.record_agent_signature(pubkey, message, context)
+            .err()
+            .map(|e| e.to_string())
     }
 
     pub fn handle_request(&self, input: &str) -> String {
@@ -308,6 +329,16 @@ impl McpServer {
                         .sign_with_keys(&keys)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
+                    if let Some(e) = self.record_signature(
+                        session.pubkey(),
+                        event.id.as_bytes(),
+                        &format!("mcp sign_nostr_event kind {kind} id {}", event.id),
+                    ) {
+                        return Err(AgentError::Other(format!(
+                            "signature withheld: it could not be recorded: {e}"
+                        )));
+                    }
+
                     let tags_vec: Vec<Vec<String>> = event
                         .tags
                         .iter()
@@ -355,6 +386,20 @@ impl McpServer {
                     let signed_count = signer
                         .sign_psbt(&mut psbt)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
+
+                    let txid = psbt.unsigned_tx.compute_txid();
+                    if let Some(e) = self.record_signature(
+                        session.pubkey(),
+                        txid.as_ref(),
+                        &format!(
+                            "mcp sign_bitcoin_psbt txid {txid} inputs {signed_count} fee {} sats",
+                            analysis.fee_sats
+                        ),
+                    ) {
+                        return Err(AgentError::Other(format!(
+                            "signature withheld: it could not be recorded: {e}"
+                        )));
+                    }
 
                     let signed_base64 = keep_bitcoin::psbt::serialize_psbt_base64(&psbt);
 
@@ -679,6 +724,104 @@ mod tests {
         let event: Value = serde_json::from_str(text).unwrap();
         assert!(event.get("id").is_some() && event.get("sig").is_some());
         assert_eq!(event["kind"], serde_json::json!(1));
+    }
+
+    /// A signing server whose signatures are recorded in a fresh vault's audit
+    /// log (locked first when `locked`, so recording fails).
+    fn audited_server(dir: &std::path::Path, locked: bool) -> McpServer {
+        let path = dir.join("keep");
+        keep_core::storage::Storage::create(
+            &path,
+            "testpass",
+            keep_core::crypto::Argon2Params::TESTING,
+        )
+        .unwrap();
+        let mut keep = keep_core::Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        if locked {
+            keep.lock();
+        }
+        signing_server().with_audit(keep)
+    }
+
+    fn recorded_signatures(server: &McpServer) -> Vec<String> {
+        server
+            .audit
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == keep_core::audit::AuditEventType::Sign)
+            .filter_map(|e| e.reason)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mcp_signatures_are_recorded_in_the_vault_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = audited_server(dir.path(), false);
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "recorded", "tags": []}),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let event: Value =
+            serde_json::from_str(resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let id = event["id"].as_str().unwrap();
+        let recorded = recorded_signatures(&server);
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].contains("sign_nostr_event kind 1") && recorded[0].contains(id),
+            "{recorded:?}"
+        );
+
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let change = wallet_change();
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            change.0.address.script_pubkey(),
+            50_000,
+            &change,
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt}),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let recorded = recorded_signatures(&server);
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded[1].contains("sign_bitcoin_psbt txid"),
+            "{recorded:?}"
+        );
+    }
+
+    /// A signature the vault cannot record is withheld rather than returned.
+    #[tokio::test]
+    async fn mcp_withholds_a_signature_it_cannot_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = audited_server(dir.path(), true);
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "unrecorded", "tags": []}),
+            ))
+            .await;
+        let e = resp.error.expect("must be refused");
+        assert!(e.message.contains("signature withheld"), "{}", e.message);
+        assert!(resp.result.is_none(), "no signature leaves");
     }
 
     #[tokio::test]

@@ -60,12 +60,23 @@ pub fn read_secret_value(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
         let value = read_password(prompt)?;
         Ok(Zeroizing::new(value.into_bytes()))
     } else {
+        // Read at most one byte past what a record may hold, so an oversized
+        // value is refused without buffering all of it.
+        let limit = keep_core::storage::MAX_RECORD_SIZE;
         let mut buf = Zeroizing::new(Vec::new());
-        std::io::stdin().read_to_end(&mut buf).map_err(|e| {
-            KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                "read secret value from stdin: {e}"
-            )))
-        })?;
+        std::io::stdin()
+            .take(limit + 1)
+            .read_to_end(&mut buf)
+            .map_err(|e| {
+                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+                    "read secret value from stdin: {e}"
+                )))
+            })?;
+        if buf.len() as u64 > limit {
+            return Err(KeepError::InvalidInput(format!(
+                "secret value too large: at most {limit} bytes"
+            )));
+        }
         if buf.last() == Some(&b'\n') {
             buf.pop();
             if buf.last() == Some(&b'\r') {

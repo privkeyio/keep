@@ -517,6 +517,36 @@ impl Keep {
         self.storage.load_secret(id)
     }
 
+    /// The plaintext value of a plain (not threshold-sealed) secret. The
+    /// `SecretReveal` audit event is written first and nothing is returned if it
+    /// cannot be, so no value leaves the vault unrecorded.
+    pub fn reveal_secret(&mut self, id: &[u8; 32]) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        if self.storage.load_secret_seal(id)?.is_some() {
+            return Err(KeepError::invalid_input(
+                "secret is threshold-sealed; reveal it with its quorum",
+            ));
+        }
+        let record = self.storage.load_secret(id)?;
+        self.audit_event_required(AuditEventType::SecretReveal, |e| e.with_pubkey(id))?;
+        Ok(zeroize::Zeroizing::new(record.value.clone()))
+    }
+
+    /// Records a signature an agent obtained with `pubkey`'s key over `message`,
+    /// with `context` naming what was signed. Fails when the entry cannot be
+    /// written, so a caller can withhold a signature that would go unrecorded.
+    pub fn record_agent_signature(
+        &mut self,
+        pubkey: &[u8; 32],
+        message: &[u8],
+        context: &str,
+    ) -> Result<()> {
+        self.audit_event_required(AuditEventType::Sign, |e| {
+            e.with_pubkey(pubkey)
+                .with_message_hash(message)
+                .with_reason(context)
+        })
+    }
+
     /// List all stored secret records.
     pub fn list_secrets(&self) -> Result<Vec<crate::secret::SecretRecord>> {
         self.storage.list_secrets()
@@ -597,7 +627,7 @@ impl Keep {
             .load_secret_seal(id)?
             .ok_or_else(|| KeepError::invalid_input("secret is not threshold-sealed"))?;
         let plaintext = crate::secret::unseal_value(&record.value, &seal, oprf_key)?;
-        self.audit_event(AuditEventType::SecretReveal, |e| e.with_pubkey(id));
+        self.audit_event_required(AuditEventType::SecretReveal, |e| e.with_pubkey(id))?;
         Ok(plaintext)
     }
 
@@ -1990,6 +2020,83 @@ mod tests {
         let mut keep = Keep::open(path).unwrap();
         keep.unlock("testpass").unwrap();
         keep
+    }
+
+    fn audited(keep: &Keep, event: AuditEventType, id: &[u8; 32]) -> bool {
+        keep.audit_read_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == event && e.pubkey.as_deref() == Some(&hex::encode(id)))
+    }
+
+    /// Revealing a plain secret's value leaves a `SecretReveal` entry, like a
+    /// sealed reveal; a sealed secret is refused here (it needs its quorum).
+    #[test]
+    fn revealing_a_plain_secret_is_audited() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let record = crate::secret::SecretRecord::new(
+            "api".into(),
+            crate::secret::SecretKind::ApiToken,
+            b"tok".to_vec(),
+        )
+        .unwrap();
+        keep.store_secret(&record).unwrap();
+        assert!(!audited(&keep, AuditEventType::SecretReveal, &record.id));
+        assert_eq!(keep.reveal_secret(&record.id).unwrap().as_slice(), b"tok");
+        assert!(audited(&keep, AuditEventType::SecretReveal, &record.id));
+
+        keep.lock();
+        assert!(
+            keep.reveal_secret(&record.id).is_err(),
+            "nothing is revealed from a locked vault"
+        );
+    }
+
+    #[test]
+    fn a_sealed_secret_is_not_revealed_without_its_quorum() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let record = crate::secret::SecretRecord::new(
+            "s".into(),
+            crate::secret::SecretKind::Generic,
+            b"v".to_vec(),
+        )
+        .unwrap();
+        let oprf_key = crate::crypto::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let stored = keep.store_sealed_secret(record, &oprf_key, 0).unwrap();
+        let err = keep.reveal_secret(&stored.id).unwrap_err();
+        assert!(err.to_string().contains("threshold-sealed"), "{err}");
+        assert!(!audited(&keep, AuditEventType::SecretReveal, &stored.id));
+    }
+
+    /// A value too large to load back is refused when stored, not lost.
+    #[test]
+    fn a_secret_too_large_to_load_is_refused() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let limit = crate::storage::MAX_RECORD_SIZE as usize;
+        let big = crate::secret::SecretRecord::new(
+            "big".into(),
+            crate::secret::SecretKind::Generic,
+            vec![7u8; limit],
+        )
+        .unwrap();
+        let err = keep.store_secret(&big).unwrap_err();
+        assert!(err.to_string().contains("secret too large"), "{err}");
+        assert!(keep.load_secret(&big.id).is_err(), "nothing was stored");
+
+        let fits = crate::secret::SecretRecord::new(
+            "fits".into(),
+            crate::secret::SecretKind::Generic,
+            vec![7u8; limit - 1024],
+        )
+        .unwrap();
+        keep.store_secret(&fits).unwrap();
+        assert_eq!(
+            keep.load_secret(&fits.id).unwrap().value.len(),
+            limit - 1024
+        );
     }
 
     #[test]

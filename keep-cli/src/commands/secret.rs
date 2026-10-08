@@ -198,16 +198,16 @@ pub fn cmd_secret_get(
         return Ok(());
     }
 
-    // Unseal via the quorum before logging the reveal, so a failed quorum does not
-    // leave a misleading "revealed" audit/log entry. `reveal_sealed_secret` emits
-    // the `SecretReveal` audit event only on success.
+    // Both reveals record `SecretReveal` before handing out the value, and fail
+    // when it cannot be written. A sealed one unseals first, so a failed quorum
+    // leaves no misleading "revealed" entry.
     let revealed: Zeroizing<Vec<u8>> = match seal {
         Some(seal) => {
             let oprf_key =
                 derive_secret_seal_key(out, &keep, oprf, default_relay, &seal.oprf_id, seal.epoch)?;
             keep.reveal_sealed_secret(&id, &oprf_key)?
         }
-        None => Zeroizing::new(record.value.clone()),
+        None => keep.reveal_secret(&id)?,
     };
 
     warn!(id = %hex::encode(id), "secret value revealed");

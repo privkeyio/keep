@@ -2287,6 +2287,47 @@ async fn test_software_dkg_ceremony_creates_one_group() {
     assert_eq!(group_keys[1], group_keys[2]);
 }
 
+/// A piped secret value larger than a record can hold is refused, and nothing
+/// is stored; one that fits is stored and listed.
+#[test]
+fn test_secret_add_refuses_a_value_too_large_to_store() {
+    use std::io::Write;
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("secrets");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    let add = |name: &str, value: &[u8]| {
+        let mut child = Command::new(&bin)
+            .env("KEEP_PASSWORD", TEST_PASSWORD)
+            .env("KEEP_YES", "1")
+            .arg("--path")
+            .arg(&vault)
+            .args(["secret", "add", "--name", name])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn secret add");
+        // A refusal may close stdin before every byte is written.
+        let _ = child.stdin.take().unwrap().write_all(value);
+        child.wait_with_output().expect("secret add output")
+    };
+    let too_large = add("huge", &vec![b'a'; 2 * 1024 * 1024]);
+    assert_failure(&too_large);
+    assert!(
+        output_contains(&too_large, "secret value too large"),
+        "{too_large:?}"
+    );
+    let fits = add("small", b"token");
+    assert_success(&fits);
+    let listed = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["secret", "list"])
+        .run();
+    assert_success(&listed);
+    assert!(output_contains(&listed, "small") && !output_contains(&listed, "huge"));
+}
+
 /// `keep wallet sign --local` signs exactly the inputs that spend the group's
 /// own addresses, each verifying under its output key, shows the change, and
 /// asks first: KEEP_YES does not skip the prompt. Off mainnet it signs only
