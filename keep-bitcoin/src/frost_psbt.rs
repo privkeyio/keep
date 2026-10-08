@@ -278,6 +278,7 @@ impl FrostWallet {
             input_sats,
             outputs,
             signable_inputs: spends.iter().map(|s| s.input).collect(),
+            network: self.network,
         };
         Ok((analysis, spends))
     }

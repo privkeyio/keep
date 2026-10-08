@@ -25,6 +25,8 @@ pub struct PsbtAnalysis {
     pub input_sats: Vec<u64>,
     pub outputs: Vec<OutputInfo>,
     pub signable_inputs: Vec<usize>,
+    /// The network the outputs' addresses are rendered for: the signer's.
+    pub network: Network,
 }
 
 impl PsbtAnalysis {
@@ -286,6 +288,7 @@ impl PsbtSigner {
             input_sats,
             outputs,
             signable_inputs,
+            network: self.network,
         })
     }
 

@@ -227,6 +227,7 @@ mod tests {
             input_sats: vec![total_output_sats + fee_sats],
             outputs,
             signable_inputs: vec![0],
+            network: bitcoin::Network::Bitcoin,
         }
     }
 
