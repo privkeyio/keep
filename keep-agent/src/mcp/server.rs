@@ -47,6 +47,7 @@ pub struct McpServer {
     session_manager: Arc<RwLock<Option<(SessionToken, String)>>>,
     manager: SessionManager,
     secret_key: Option<Zeroizing<[u8; 32]>>,
+    audit: Option<std::sync::Mutex<keep_core::Keep>>,
 }
 
 impl McpServer {
@@ -57,17 +58,35 @@ impl McpServer {
             session_manager: Arc::new(RwLock::new(None)),
             manager: SessionManager::new(pubkey),
             secret_key: None,
+            audit: None,
         }
     }
 
-    pub fn with_signing(pubkey: [u8; 32], secret: [u8; 32]) -> Self {
+    /// A server that signs with `secret` and records every signature in
+    /// `keep`'s audit log before returning it; a signature that cannot be
+    /// recorded is withheld. `keep` must stay unlocked.
+    pub fn with_signing(pubkey: [u8; 32], secret: [u8; 32], keep: keep_core::Keep) -> Self {
         Self {
             name: "keep-signer".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             session_manager: Arc::new(RwLock::new(None)),
             manager: SessionManager::new(pubkey),
             secret_key: Some(Zeroizing::new(secret)),
+            audit: Some(std::sync::Mutex::new(keep)),
         }
+    }
+
+    fn record_signature(&self, pubkey: &[u8; 32], message: &[u8], context: &str) -> Option<String> {
+        let Some(keep) = self.audit.as_ref() else {
+            return Some("no audit log attached".into());
+        };
+        let mut keep = match keep.lock() {
+            Ok(k) => k,
+            Err(_) => return Some("audit log unavailable".into()),
+        };
+        keep.record_agent_signature(pubkey, message, context)
+            .err()
+            .map(|e| e.to_string())
     }
 
     pub fn handle_request(&self, input: &str) -> String {
@@ -308,6 +327,16 @@ impl McpServer {
                         .sign_with_keys(&keys)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
 
+                    if let Some(e) = self.record_signature(
+                        session.pubkey(),
+                        event.id.as_bytes(),
+                        &format!("mcp sign_nostr_event kind {kind} id {}", event.id),
+                    ) {
+                        return Err(AgentError::Other(format!(
+                            "signature withheld: it could not be recorded: {e}"
+                        )));
+                    }
+
                     let tags_vec: Vec<Vec<String>> = event
                         .tags
                         .iter()
@@ -355,6 +384,20 @@ impl McpServer {
                     let signed_count = signer
                         .sign_psbt(&mut psbt)
                         .map_err(|e| AgentError::Other(e.to_string()))?;
+
+                    let txid = psbt.unsigned_tx.compute_txid();
+                    if let Some(e) = self.record_signature(
+                        session.pubkey(),
+                        txid.as_ref(),
+                        &format!(
+                            "mcp sign_bitcoin_psbt txid {txid} inputs {signed_count} fee {} sats",
+                            analysis.fee_sats
+                        ),
+                    ) {
+                        return Err(AgentError::Other(format!(
+                            "signature withheld: it could not be recorded: {e}"
+                        )));
+                    }
 
                     let signed_base64 = keep_bitcoin::psbt::serialize_psbt_base64(&psbt);
 
@@ -525,12 +568,36 @@ mod tests {
     use crate::scope::{Operation, SessionScope};
     use crate::session::SessionConfig;
 
-    fn signing_server() -> McpServer {
+    /// A fresh unlocked vault for the server's audit log (locked when
+    /// `locked`, so recording fails).
+    fn test_vault(dir: &std::path::Path, locked: bool) -> keep_core::Keep {
+        let path = dir.join("keep");
+        keep_core::storage::Storage::create(
+            &path,
+            "testpass",
+            keep_core::crypto::Argon2Params::TESTING,
+        )
+        .unwrap();
+        let mut keep = keep_core::Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        if locked {
+            keep.lock();
+        }
+        keep
+    }
+
+    fn server_over(keep: keep_core::Keep) -> McpServer {
         // Deterministic key so a produced signature is reproducible in shape.
         let secret = [7u8; 32];
         let keys = nostr_sdk::Keys::parse(&hex::encode(secret)).expect("valid key");
         let pubkey: [u8; 32] = keys.public_key().to_bytes();
-        McpServer::with_signing(pubkey, secret)
+        McpServer::with_signing(pubkey, secret, keep)
+    }
+
+    fn signing_server() -> (tempfile::TempDir, McpServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let server = server_over(test_vault(dir.path(), false));
+        (dir, server)
     }
 
     // A Bitcoin session on testnet with no effective cap; tests tighten it.
@@ -564,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_initialize_handshake_over_jsonrpc() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let resp = server
             .handle_request_async(&rpc_id(42, "initialize", Value::Null))
             .await;
@@ -585,7 +652,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tools_list_reports_the_signing_toolset() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let resp = server
             .handle_request_async(&rpc("tools/list", Value::Null))
             .await;
@@ -612,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_tools_list_offers_only_the_sessions_tools() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&rpc("tools/list", Value::Null))
@@ -635,7 +702,7 @@ mod tests {
     async fn mcp_tools_call_requires_an_active_session() {
         // Fail-closed: with no session established, a signing tool is refused
         // rather than executed.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let resp = server
             .handle_request_async(&call("get_nostr_pubkey", serde_json::json!({})))
             .await;
@@ -649,7 +716,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_get_nostr_pubkey_succeeds_within_scope() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&call("get_nostr_pubkey", serde_json::json!({})))
@@ -664,7 +731,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_sign_nostr_event_produces_a_signed_event() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&call(
@@ -681,11 +748,124 @@ mod tests {
         assert_eq!(event["kind"], serde_json::json!(1));
     }
 
+    fn audited_server(dir: &std::path::Path, locked: bool) -> McpServer {
+        server_over(test_vault(dir, locked))
+    }
+
+    fn recorded_signatures(server: &McpServer) -> Vec<String> {
+        server
+            .audit
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == keep_core::audit::AuditEventType::Sign)
+            .filter_map(|e| e.reason)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mcp_signatures_are_recorded_in_the_vault_audit_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = audited_server(dir.path(), false);
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "recorded", "tags": []}),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let event: Value =
+            serde_json::from_str(resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let id = event["id"].as_str().unwrap();
+        let recorded = recorded_signatures(&server);
+        assert_eq!(recorded.len(), 1);
+        assert!(
+            recorded[0].contains("sign_nostr_event kind 1") && recorded[0].contains(id),
+            "{recorded:?}"
+        );
+
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let change = wallet_change();
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            change.0.address.script_pubkey(),
+            50_000,
+            &change,
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt}),
+            ))
+            .await;
+        assert!(resp.error.is_none(), "{:?}", resp.error);
+        let out: Value =
+            serde_json::from_str(resp.result.unwrap()["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let signed =
+            keep_bitcoin::psbt::parse_psbt_base64(out["signed_psbt"].as_str().unwrap()).unwrap();
+        let txid = signed.unsigned_tx.compute_txid().to_string();
+        let recorded = recorded_signatures(&server);
+        assert_eq!(recorded.len(), 2);
+        assert!(
+            recorded[1].contains(&format!(
+                "sign_bitcoin_psbt txid {txid} inputs {} fee {} sats",
+                out["inputs_signed"], out["fee_sats"]
+            )),
+            "{recorded:?}"
+        );
+    }
+
+    /// A signature the vault cannot record is withheld rather than returned.
+    #[tokio::test]
+    async fn mcp_withholds_a_signature_it_cannot_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = audited_server(dir.path(), true);
+        install_session(&server, SessionScope::nostr_only()).await;
+        let resp = server
+            .handle_request_async(&call(
+                "sign_nostr_event",
+                serde_json::json!({"kind": 1, "content": "unrecorded", "tags": []}),
+            ))
+            .await;
+        let e = resp.error.expect("must be refused");
+        assert!(e.message.contains("signature withheld"), "{}", e.message);
+        assert!(resp.result.is_none(), "no signature leaves");
+
+        install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
+        let change = wallet_change();
+        let psbt = psbt_base64_spend_and_change(
+            testnet_p2tr_address(2).script_pubkey(),
+            8_000,
+            change.0.address.script_pubkey(),
+            50_000,
+            &change,
+            60_000,
+        );
+        let resp = server
+            .handle_request_async(&call(
+                "sign_bitcoin_psbt",
+                serde_json::json!({"psbt": psbt}),
+            ))
+            .await;
+        let e = resp.error.expect("must be refused");
+        assert!(e.message.contains("signature withheld"), "{}", e.message);
+        assert!(resp.result.is_none(), "no signed PSBT leaves");
+    }
+
     #[tokio::test]
     async fn mcp_enforces_the_operation_scope() {
         // The permission model: a bitcoin-only session must NOT be able to sign a
         // Nostr event; the operation is refused before any key is used.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope()).await;
         let resp = server
             .handle_request_async(&call(
@@ -707,7 +887,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_get_bitcoin_address_succeeds_within_scope() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope()).await;
         let resp = server
             .handle_request_async(&call(
@@ -730,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_bitcoin_sessions_need_a_network_and_signing_needs_a_limit() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let refused = |scope: SessionScope| {
             let server = &server;
             async move {
@@ -765,7 +945,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_allowlist_entries_must_be_on_the_sessions_network() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let mainnet = SessionScope::bitcoin_only()
             .with_network(keep_bitcoin::Network::Bitcoin)
             .with_max_amount(10_000);
@@ -784,7 +964,7 @@ mod tests {
     async fn mcp_refuses_a_network_other_than_the_sessions() {
         // The single-key output is the same on every network, so a request naming
         // testnet must not get a mainnet session's key to sign or render for it.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(
             &server,
             SessionScope::bitcoin_only()
@@ -838,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_get_session_info_reports_the_active_session() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&call("get_session_info", serde_json::json!({})))
@@ -850,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_unknown_method_is_rejected() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let resp = server
             .handle_request_async(&rpc_id(7, "does/not/exist", Value::Null))
             .await;
@@ -862,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_unknown_tool_returns_a_tool_error() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&call("no_such_tool", serde_json::json!({})))
@@ -1012,7 +1192,7 @@ mod tests {
     async fn mcp_sign_bitcoin_psbt_refuses_overspend() {
         // A PSBT whose total output exceeds the session's max_amount_sats must be
         // refused before any signing, through the actual MCP tool arm.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
         let psbt =
             psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 50_000, 60_000);
@@ -1036,7 +1216,7 @@ mod tests {
     async fn mcp_sign_bitcoin_psbt_counts_the_fee_toward_the_amount_limit() {
         // 5_000 sats of outputs fit under the 10_000 limit, but the 55_000 sat fee
         // leaves the wallet just as surely once signed: it must be refused.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
         let psbt =
             psbt_base64_single_output(testnet_p2tr_address(2).script_pubkey(), 5_000, 60_000);
@@ -1062,7 +1242,7 @@ mod tests {
         // (2_000) is exactly the 10_000 limit, and the 50_000 back to the wallet's own
         // change address does not count. If the guard counted change, this would be
         // refused.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
         let change = wallet_change();
         let psbt = psbt_base64_spend_and_change(
@@ -1099,7 +1279,7 @@ mod tests {
     async fn mcp_sign_bitcoin_psbt_counts_forged_change_toward_the_amount_limit() {
         // An output carrying the wallet's real change origin but paying someone else's
         // script is a spend, so its 50_000 counts and the request is refused.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, bitcoin_scope().with_max_amount(10_000)).await;
         let psbt = psbt_base64_spend_and_change(
             testnet_p2tr_address(2).script_pubkey(),
@@ -1132,7 +1312,7 @@ mod tests {
     async fn mcp_sign_bitcoin_psbt_refuses_non_allowlisted_output() {
         // A non-change output to an address outside the allowlist must be refused
         // through the actual MCP tool arm.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let allowed = testnet_p2tr_address(3);
         let disallowed = testnet_p2tr_address(2);
         install_session(
@@ -1166,7 +1346,7 @@ mod tests {
         // Fail closed: a non-change spend output whose scriptPubKey does not decode
         // to an address cannot be confirmed against the allowlist, so it must be
         // refused rather than signed. Previously such an output escaped the check.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(
             &server,
             bitcoin_scope().with_address_allowlist([testnet_p2tr_address(3).to_string()]),
@@ -1203,7 +1383,7 @@ mod tests {
         // determined from the actual scriptPubKey (must pay the signer's own key-path
         // output), not from forgeable PSBT metadata. So it is subject to the allowlist
         // and refused, even though output 0 pays the allowlisted address.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         let allowed = testnet_p2tr_address(3);
         let attacker = testnet_p2tr_address(2);
         install_session(
@@ -1249,7 +1429,7 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_sign_nostr_event_rejects_kind_above_u16_max() {
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(&server, SessionScope::nostr_only()).await;
         let resp = server
             .handle_request_async(&call(
@@ -1271,7 +1451,7 @@ mod tests {
     async fn mcp_sign_nostr_event_enforces_the_event_kind_allowlist() {
         // A session restricted to kinds {1,4,7} must refuse to sign kind 5 before
         // any key use, through the MCP tool arm.
-        let server = signing_server();
+        let (_vault, server) = signing_server();
         install_session(
             &server,
             SessionScope::nostr_only().with_event_kinds([1, 4, 7]),

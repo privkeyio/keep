@@ -290,10 +290,17 @@ impl Default for RetentionPolicy {
     }
 }
 
+/// The most entries the audit log is read back with; a longer log is refused.
+pub const MAX_AUDIT_ENTRIES: usize = 100_000;
+
 /// Encrypted audit log with hash chain integrity.
 pub struct AuditLog {
     path: PathBuf,
     last_hash: [u8; 32],
+    entries: usize,
+    /// Where to cut a partial line a failed write left, before the next append.
+    torn: Option<u64>,
+    read_cap: usize,
     retention: RetentionPolicy,
 }
 
@@ -301,17 +308,25 @@ impl AuditLog {
     /// Open or create an audit log at the given path.
     pub fn open(path: &Path, data_key: &SecretKey) -> Result<Self> {
         let audit_path = path.join("audit.log");
-        let last_hash = if audit_path.exists() {
-            Self::read_last_hash(&audit_path, data_key)?
+        let (last_hash, entries) = if audit_path.exists() {
+            Self::read_tail(&audit_path, data_key)?
         } else {
-            [0u8; 32]
+            ([0u8; 32], 0)
         };
 
         Ok(Self {
             path: audit_path,
             last_hash,
+            entries,
+            torn: None,
+            read_cap: MAX_AUDIT_ENTRIES,
             retention: RetentionPolicy::default(),
         })
+    }
+
+    /// The number of entries in the log.
+    pub fn entry_count(&self) -> usize {
+        self.entries
     }
 
     /// Set the retention policy.
@@ -334,11 +349,23 @@ impl AuditLog {
         opts.create(true).append(true);
         #[cfg(unix)]
         opts.mode(0o600);
+        if let Some(len) = self.torn {
+            truncate(&self.path, len)?;
+            self.torn = None;
+        }
         let mut file = opts.open(&self.path)?;
-        file.write_all(line.as_bytes())?;
-        file.sync_all()?;
+        let len = file.metadata()?.len();
+        // A partial line left by a failed write would make the log unreadable.
+        if let Err(e) = file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            self.torn = truncate(&self.path, len).err().map(|_| len);
+            return Err(e.into());
+        }
 
         self.last_hash = entry.hash;
+        self.entries += 1;
         Ok(())
     }
 
@@ -347,7 +374,7 @@ impl AuditLog {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        Self::read_entries(&self.path, data_key)
+        Self::read_entries(&self.path, data_key, self.read_cap)
     }
 
     /// Verify the hash chain integrity.
@@ -366,8 +393,12 @@ impl AuditLog {
     }
 
     /// Apply the retention policy, returning the number of entries removed.
+    /// It reads past the cap on reads, so a log too long to list can be pruned.
     pub fn apply_retention(&mut self, data_key: &SecretKey) -> Result<usize> {
-        let entries = self.read_all(data_key)?;
+        if !self.path.exists() {
+            return Ok(0);
+        }
+        let entries = Self::read_entries(&self.path, data_key, usize::MAX)?;
         let original_count = entries.len();
         let now = chrono::Utc::now().timestamp();
         let max_age_secs = self.retention.max_age_days.map(|d| i64::from(d) * 86400);
@@ -398,22 +429,48 @@ impl AuditLog {
             .map_err(|e| StorageError::serialization(format!("export audit log: {e}")).into())
     }
 
-    fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
-        let entries = Self::read_entries(path, data_key)?;
-        Ok(entries.last().map_or([0u8; 32], |e| e.hash))
+    /// The last entry's hash and the entry count, decrypting only the last
+    /// entry, so opening never depends on the log's length. A final line
+    /// without its newline is an append cut short by a crash, and is dropped.
+    fn read_tail(path: &Path, data_key: &SecretKey) -> Result<([u8; 32], usize)> {
+        let mut reader = BufReader::new(File::open(path)?);
+        let (mut line, mut last) = (Vec::new(), Vec::new());
+        let (mut count, mut complete) = (0, 0u64);
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                truncate(path, complete)?;
+                break;
+            }
+            complete += n as u64;
+            if !line_text(&line).is_empty() {
+                count += 1;
+                std::mem::swap(&mut last, &mut line);
+            }
+        }
+        if count == 0 {
+            return Ok(([0u8; 32], 0));
+        }
+        let entry = std::str::from_utf8(line_text(&last))
+            .map_err(|e| StorageError::invalid_format(format!("audit line: {e}")).into())
+            .and_then(|text| Self::decrypt_line(text, data_key))
+            .map_err(|e| StorageError::corrupted(format!("audit log at entry {count}: {e}")))?;
+        Ok((entry.hash, count))
     }
 
-    fn read_entries(path: &Path, data_key: &SecretKey) -> Result<Vec<AuditEntry>> {
-        const MAX_ENTRIES: usize = 100_000;
-
+    fn read_entries(path: &Path, data_key: &SecretKey, cap: usize) -> Result<Vec<AuditEntry>> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
 
         for (line_num, line) in reader.lines().enumerate() {
-            if entries.len() >= MAX_ENTRIES {
+            if entries.len() >= cap {
                 return Err(StorageError::io(format!(
-                    "audit log exceeds maximum of {MAX_ENTRIES} entries"
+                    "audit log exceeds maximum of {cap} entries"
                 ))
                 .into());
             }
@@ -471,6 +528,8 @@ impl AuditLog {
 
         let _ = std::fs::remove_file(&backup_path);
         self.last_hash = final_hash;
+        self.entries = entries.len();
+        self.torn = None;
         Ok(())
     }
 
@@ -515,12 +574,31 @@ impl AuditLog {
         if !self.path.exists() {
             return Ok(());
         }
-        let entries = Self::read_entries(&self.path, old_key)?;
+        // Past the read cap too, so rotating a long log cannot strand it under
+        // the old key after the new one is committed.
+        let entries = Self::read_entries(&self.path, old_key, usize::MAX)?;
         if entries.is_empty() {
             return Ok(());
         }
         self.rewrite(&entries, new_key)
     }
+}
+
+/// Cut `path` back to `len` bytes, durably; never grows it. A separate write
+/// handle, since an append-only handle cannot truncate on every platform.
+fn truncate(path: &Path, len: u64) -> std::io::Result<()> {
+    let file = OpenOptions::new().write(true).open(path)?;
+    if file.metadata()?.len() > len {
+        file.set_len(len)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+/// A line without its `\n` or `\r\n` ending, as `BufRead::lines` yields it.
+fn line_text(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// NIP-46 signing request type.
@@ -988,6 +1066,151 @@ mod tests {
 
     fn test_key() -> SecretKey {
         SecretKey::generate().unwrap()
+    }
+
+    /// Opening reads only the last entry, so a log longer than it can be read
+    /// back with still opens and its chain continues from the last entry.
+    #[test]
+    fn a_log_past_the_read_cap_still_opens_and_chains() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let last = log.last_hash();
+        let path = dir.path().join("audit.log");
+        let line = std::fs::read(&path).unwrap();
+        std::fs::write(&path, line.repeat(MAX_AUDIT_ENTRIES + 1)).unwrap();
+        // Reading back that many entries is too slow for a debug test; the cap
+        // on reads is covered with a small cap below.
+
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.entry_count(), MAX_AUDIT_ENTRIES + 1);
+        assert_eq!(log.last_hash(), last);
+        log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key)
+            .unwrap();
+        assert_eq!(log.entry_count(), MAX_AUDIT_ENTRIES + 2);
+        let reopened = AuditLog::open(dir.path(), &key).unwrap();
+        assert_ne!(reopened.last_hash(), last);
+        assert_eq!(reopened.last_hash(), log.last_hash());
+    }
+
+    /// Listing stops at the read cap, but retention and re-encryption read the
+    /// whole log, so a log too long to list can still be pruned and rotated.
+    #[test]
+    fn a_log_past_the_read_cap_can_be_pruned_and_reencrypted() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        for _ in 0..5 {
+            log.log(AuditEntry::new(AuditEventType::Sign, [0; 32]), &key)
+                .unwrap();
+        }
+        log.read_cap = 3;
+        let err = log.read_all(&key).unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum of 3"), "{err}");
+
+        let new_key = test_key();
+        log.reencrypt(&key, &new_key).unwrap();
+        log.set_retention(RetentionPolicy {
+            max_entries: Some(2),
+            max_age_days: None,
+        });
+        assert_eq!(log.apply_retention(&new_key).unwrap(), 3);
+        assert_eq!(log.read_all(&new_key).unwrap().len(), 2);
+        assert!(log.verify_chain(&new_key).unwrap());
+    }
+
+    /// A partial line a failed write could not cut off is cut before the next
+    /// append, so the next entry is not glued onto it.
+    #[test]
+    fn a_partial_line_is_cut_before_the_next_append() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let path = dir.path().join("audit.log");
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"partial").unwrap();
+        log.torn = Some(len);
+
+        log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key)
+            .unwrap();
+        assert_eq!(log.torn, None);
+        assert_eq!(log.read_all(&key).unwrap().len(), 2);
+        assert!(log.verify_chain(&key).unwrap());
+    }
+
+    /// A rewrite replaces the file, so a cut pending against the old file is
+    /// dropped rather than applied to the new one.
+    #[test]
+    fn a_rewrite_drops_a_pending_cut() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        for _ in 0..3 {
+            log.log(AuditEntry::new(AuditEventType::Sign, [0; 32]), &key)
+                .unwrap();
+        }
+        let len = std::fs::metadata(dir.path().join("audit.log"))
+            .unwrap()
+            .len();
+        log.torn = Some(len - 1);
+        log.reencrypt(&key, &key).unwrap();
+        assert_eq!(log.torn, None);
+        log.log(AuditEntry::new(AuditEventType::Sign, [0; 32]), &key)
+            .unwrap();
+        assert_eq!(log.read_all(&key).unwrap().len(), 4);
+        assert!(log.verify_chain(&key).unwrap());
+    }
+
+    /// A log whose lines end in `\r\n` opens and counts like `read_all` reads it.
+    #[test]
+    fn crlf_line_endings_open() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let last = log.last_hash();
+        let path = dir.path().join("audit.log");
+        let crlf = String::from_utf8(std::fs::read(&path).unwrap())
+            .unwrap()
+            .replace('\n', "\r\n");
+        std::fs::write(&path, format!("{crlf}\r\n")).unwrap();
+
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.entry_count(), 1);
+        assert_eq!(log.last_hash(), last);
+        assert_eq!(log.read_all(&key).unwrap().len(), 1);
+    }
+
+    /// An append a crash cut short (no trailing newline) is dropped on open, so
+    /// the log still opens, reads back and chains.
+    #[test]
+    fn a_torn_final_line_is_dropped_on_open() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key)
+            .unwrap();
+        let path = dir.path().join("audit.log");
+        let whole = std::fs::read(&path).unwrap();
+        let mut torn = whole.clone();
+        torn.extend_from_slice(&whole[..20]);
+        std::fs::write(&path, torn).unwrap();
+
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), whole);
+        assert_eq!(log.entry_count(), 2);
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        assert_eq!(log.read_all(&key).unwrap().len(), 3);
+        assert!(log.verify_chain(&key).unwrap());
     }
 
     #[test]

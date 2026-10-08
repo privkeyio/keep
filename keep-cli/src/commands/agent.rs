@@ -23,12 +23,7 @@ fn mcp_scope(
 ) -> Result<keep_agent::scope::SessionScope> {
     use keep_agent::scope::{Operation, SessionScope};
 
-    let mut ops = vec![
-        Operation::SignNostrEvent,
-        Operation::GetPublicKey,
-        Operation::Nip44Encrypt,
-        Operation::Nip44Decrypt,
-    ];
+    let mut ops = vec![Operation::SignNostrEvent, Operation::GetPublicKey];
     let Some(network) = network else {
         if max_amount_sats.is_some() || !allow_address.is_empty() {
             return Err(KeepError::InvalidInput(
@@ -95,7 +90,9 @@ pub fn cmd_agent_mcp(
     let pubkey = slot.pubkey;
     let mut secret = *slot.expose_secret();
 
-    let server = McpServer::with_signing(pubkey, secret);
+    // The vault stays unlocked for the server's life so every signature can be
+    // recorded in its audit log before it is returned.
+    let server = McpServer::with_signing(pubkey, secret, keep);
     secret.zeroize();
 
     let config = SessionConfig::new(scope)
@@ -167,6 +164,8 @@ mod tests {
         assert!(scope.allows_operation(&Operation::SignPsbt));
         assert_eq!(scope.max_amount_sats, Some(50_000));
         assert!(scope.allows_address(MAINNET_ADDR));
+        assert!(!scope.allows_operation(&Operation::Nip44Encrypt));
+        assert!(!scope.allows_operation(&Operation::Nip44Decrypt));
     }
 
     #[test]
