@@ -616,10 +616,15 @@ impl KfpNode {
                 participants = ?request.participants,
                 "Rejecting sign request: participants must be the threshold and include the requester"
             );
-            return Err(FrostNetError::PolicyViolation(
-                "Sign request participants must be the threshold of signers including the requester"
-                    .into(),
-            ));
+            self.record_refusal(&request, Some(requester));
+            self.send_session_error(
+                &from,
+                "policy_violation",
+                "participants must be the threshold of signers including the requester",
+                request.session_id,
+            )
+            .await?;
+            return Ok(());
         }
 
         let session_info = SessionInfo {
@@ -1137,12 +1142,14 @@ impl KfpNode {
     /// Attempt aggregation and emit `SignatureComplete` if every participant has
     /// supplied both a commitment and a signature share. Safe to call from any
     /// handler; it is a no-op while `ready_to_aggregate()` is false.
-    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<()> {
+    /// Aggregates once every share is in; true when this call completed the
+    /// signature.
+    fn try_complete_signature(&self, session_id: &[u8; 32]) -> Result<bool> {
         let completed = {
             let mut sessions = self.sessions.write();
             let session = match sessions.get_session_mut(session_id) {
                 Some(s) => s,
-                None => return Ok(()),
+                None => return Ok(false),
             };
 
             // Idempotent: once aggregation has produced the signature the session
@@ -1151,7 +1158,7 @@ impl KfpNode {
             // re-aggregate and re-emit SignatureComplete / re-run the post-sign
             // hook (e.g. broadcast the tx twice).
             if session.is_complete() || !session.ready_to_aggregate() {
-                return Ok(());
+                return Ok(false);
             }
 
             // #487 PR3: aggregate under the composite-tweaked pubkey
@@ -1202,9 +1209,10 @@ impl KfpNode {
                 session_id: *session_id,
                 signature: sig,
             });
+            return Ok(true);
         }
 
-        Ok(())
+        Ok(false)
     }
 
     pub(crate) async fn generate_and_send_share(&self, session_id: &[u8; 32]) -> Result<()> {
@@ -1273,12 +1281,6 @@ impl KfpNode {
             }
         };
 
-        // Our own share may complete the set (e.g. single-participant, or we were
-        // the last to commit+sign). Gate on `ready_to_aggregate()` so we never
-        // aggregate over a mismatched commitment/share id set under reordering.
-        // The share is still sent: the others aggregate from what they receive.
-        self.try_complete_signature(session_id)?;
-
         let share_bytes = sig_share.serialize();
         let payload = SignatureSharePayload::new(
             *session_id,
@@ -1309,9 +1311,25 @@ impl KfpNode {
                 }
             }
         }
+        // Aggregate only after sending. Our own share may complete the set (we
+        // were the last to commit and sign), and the others aggregate from the
+        // shares they receive; completing removes the session, which is why its
+        // participants were read when the share was added. Gate on
+        // `ready_to_aggregate()` so we never aggregate over a mismatched
+        // commitment/share id set under reordering.
+        let completed = self.try_complete_signature(session_id)?;
         if sent == 0 {
             if let Some(e) = last_err {
-                return Err(e);
+                // A signature this node completed stands even if no peer was
+                // reached; failing here would tear it down.
+                if !completed {
+                    return Err(e);
+                }
+                warn!(
+                    session_id = %hex::encode(session_id),
+                    error = %e,
+                    "Signature completed locally but the share reached no peer"
+                );
             }
         }
 
@@ -2391,11 +2409,12 @@ mod gate_tests {
         assert!(node.handle_sign_request(from, req).await.is_ok());
     }
 
-    /// A co-signer whose own share completes the set still sends it. The
-    /// other participants aggregate from the shares they receive, so holding it
-    /// back because this node already has the signature stalls every one of them.
-    #[tokio::test]
-    async fn a_share_that_completes_the_set_is_still_sent() {
+    /// A 2-of-3 co-signer (identifier 1) whose session already holds peer 2's
+    /// commitment and signature share (an invalid one when `corrupt`), so its
+    /// own share completes the set.
+    async fn session_completed_by_our_share(
+        corrupt: bool,
+    ) -> (KfpNode, MockRelay, String, Keys, [u8; 32]) {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
@@ -2424,62 +2443,143 @@ mod gate_tests {
         {
             let mut sessions = node.sessions.write();
             let session = sessions
-                .create_session(session_id, message.clone(), 2, participants)
+                .create_session(session_id, message, 2, participants)
                 .unwrap();
             session.set_our_nonces(our_nonces);
             session.set_our_commitment(our_c);
             session.add_commitment(1, our_c).unwrap();
             session.add_commitment(2, peer_c).unwrap();
             let package = session.get_signing_package().unwrap();
-            let peer_sig =
-                frost_secp256k1_tr::round2::sign(&package, &peer_nonces, &peer_kp).unwrap();
+            let peer_sig = if corrupt {
+                frost_secp256k1_tr::round2::SignatureShare::deserialize(&[1u8; 32]).unwrap()
+            } else {
+                frost_secp256k1_tr::round2::sign(&package, &peer_nonces, &peer_kp).unwrap()
+            };
             session.add_signature_share(2, peer_sig).unwrap();
         }
+        (node, mock, relay, peer_keys, session_id)
+    }
 
-        // KFP events are ephemeral, so the relay only forwards them to a
-        // subscriber already listening.
-        let client = Client::new(peer_keys.clone());
-        client.add_relay(&relay).await.unwrap();
+    fn completed(node: &KfpNode, session_id: &[u8; 32]) -> bool {
+        node.sessions
+            .read()
+            .get_session(session_id)
+            .is_none_or(|s| s.is_complete())
+    }
+
+    /// A client for `keys` subscribed to the KFP events addressed to it, once
+    /// the relay has acknowledged the subscription (KFP events are ephemeral:
+    /// the relay forwards them only to a subscriber already listening).
+    async fn listening(
+        relay: &str,
+        keys: &Keys,
+    ) -> (
+        Client,
+        tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+    ) {
+        let client = Client::new(keys.clone());
+        client.add_relay(relay).await.unwrap();
         client.connect().await;
         let mut notifications = client.notifications();
-        client
+        let sub = client
             .subscribe(
                 Filter::new()
                     .kind(Kind::Custom(crate::protocol::KFP_EVENT_KIND))
-                    .pubkey(peer_keys.public_key()),
+                    .pubkey(keys.public_key()),
                 None,
             )
             .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+            .unwrap()
+            .val;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(id),
+                    ..
+                }) = notifications.recv().await
+                {
+                    if *id == sub {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("subscription is live");
+        (client, notifications)
+    }
 
-        node.generate_and_send_share(&session_id).await.unwrap();
-
-        let mut shares_sent: Vec<SignatureSharePayload> = Vec::new();
+    /// Whether `keys` receives this node's share for `session_id` within 5 s.
+    async fn receives_share(
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        keys: &Keys,
+        session_id: &[u8; 32],
+    ) -> bool {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while shares_sent.is_empty() {
+        loop {
             let next = tokio::time::timeout_at(deadline, notifications.recv()).await;
             let Ok(Ok(RelayPoolNotification::Event { event, .. })) = next else {
                 if next.is_err() {
-                    break;
+                    return false;
                 }
                 continue;
             };
-            let Ok(plain) = nip44::decrypt(peer_keys.secret_key(), &event.pubkey, &event.content)
-            else {
+            let Ok(plain) = nip44::decrypt(keys.secret_key(), &event.pubkey, &event.content) else {
                 continue;
             };
             if let Ok(KfpMessage::SignatureShare(p)) = KfpMessage::from_json(&plain) {
-                shares_sent.push(p);
+                if p.session_id == *session_id && p.share_index == 1 {
+                    return true;
+                }
             }
         }
+    }
+
+    /// A co-signer whose own share completes the set still sends it. The
+    /// other participants aggregate from the shares they receive, and
+    /// completing removes the session, so the participants to send to must be
+    /// read before aggregating.
+    #[tokio::test]
+    async fn a_share_that_completes_the_set_is_still_sent() {
+        let (node, _mock, relay, peer_keys, session_id) =
+            session_completed_by_our_share(false).await;
+        let (client, mut notifications) = listening(&relay, &peer_keys).await;
+        node.generate_and_send_share(&session_id).await.unwrap();
+        assert!(completed(&node, &session_id), "our share completed the set");
         assert!(
-            shares_sent
-                .iter()
-                .any(|p| p.session_id == session_id && p.share_index == 1),
+            receives_share(&mut notifications, &peer_keys, &session_id).await,
             "the share that completed the set must still reach the other participant"
         );
         client.disconnect().await;
+    }
+
+    /// The share goes out before local aggregation, so a peer's bad share
+    /// failing it here does not keep ours from the others.
+    #[tokio::test]
+    async fn a_failed_local_aggregation_does_not_withhold_the_share() {
+        let (node, _mock, relay, peer_keys, session_id) =
+            session_completed_by_our_share(true).await;
+        let (client, mut notifications) = listening(&relay, &peer_keys).await;
+        assert!(node.generate_and_send_share(&session_id).await.is_err());
+        assert!(receives_share(&mut notifications, &peer_keys, &session_id).await);
+        client.disconnect().await;
+    }
+
+    /// When no peer can be reached, a signature this node completed with its
+    /// own share still stands rather than failing the round.
+    #[tokio::test]
+    async fn a_completed_signature_survives_an_unreachable_peer() {
+        let (node, mock, _relay, _peer_keys, session_id) =
+            session_completed_by_our_share(false).await;
+        mock.shutdown();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            node.generate_and_send_share(&session_id),
+        )
+        .await
+        .expect("does not hang")
+        .expect("a completed signature is not torn down by a failed send");
+        assert!(completed(&node, &session_id));
     }
 
     /// A request whose participants leave out the requester, or are not
@@ -2495,13 +2595,12 @@ mod gate_tests {
             let session_id = derive_session_id(&message, &participants, 2);
             let req =
                 SignRequestPayload::new(session_id, group, message, "raw", participants.clone());
-            let err = node
-                .handle_sign_request(peer, req)
+            node.handle_sign_request(peer, req)
                 .await
-                .expect_err("must be refused");
+                .expect("a refusal is reported to the requester, not surfaced here");
             assert!(
-                matches!(err, FrostNetError::PolicyViolation(_)),
-                "{participants:?}: {err}"
+                refused(&node, &session_id),
+                "{participants:?}: refusal audited"
             );
             assert!(
                 node.sessions.read().get_session(&session_id).is_none(),
