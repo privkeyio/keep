@@ -436,10 +436,7 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         "  Secrets: {} created / {} deleted / {} revealed",
         stats.secret_create, stats.secret_delete, stats.secret_reveal
     ));
-    out.info(&format!(
-        "  Agent requests refused: {}",
-        stats.agent_refused
-    ));
+    out.info(&format!("  Agent refusal entries: {}", stats.agent_refused));
     out.info(&format!(
         "  Agent credentials: {} issued / {} revoked / {} deleted, {} freezes / {} unfreezes",
         stats.agent_issue,

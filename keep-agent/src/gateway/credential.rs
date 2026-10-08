@@ -17,8 +17,9 @@ pub struct GrantedCredential {
 
 impl GrantedCredential {
     /// Decode and validate a stored credential's grant. A grant that does not
-    /// decode, fails validation, or is not stored exactly as validation leaves
-    /// it is refused, so nothing but a validated grant is ever enforced.
+    /// decode (unknown fields included), fails validation, or does not decode
+    /// to what validation leaves is refused, so nothing but a validated grant
+    /// is ever enforced.
     pub fn new(credential: AgentCredential) -> Result<Self> {
         let refuse = |why: String| {
             AgentError::ScopeViolation(format!("agent {} grant {why}", credential.id_hex()))
@@ -49,17 +50,49 @@ pub fn issue_credential(
     Ok((GrantedCredential { credential, grant }, token))
 }
 
-/// Authenticate a token presented by `peer_uid` at `now` and decode its grant.
-/// An `Err` (a vault fault, or a grant that will not load) is as much a refusal
-/// as an `Ok(Err(_))`; the gateway answers the agent the same way for both.
+/// Why a presented token was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBecause {
+    /// The token, or the credential it matched, was refused.
+    Credential(AgentRefusal),
+    /// The credential's grant does not load.
+    Grant,
+}
+
+/// A refused token, with the credential it matched when there is one, so the
+/// refusal can be recorded and budgeted against that credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused {
+    pub because: RefusedBecause,
+    pub credential: Option<[u8; 16]>,
+}
+
+/// Authenticate a token presented by `peer_uid` at `now` and load its grant.
+/// An `Err` (a vault fault) is as much a refusal as an `Ok(Err(_))`; the
+/// gateway answers the agent the same way for every refusal.
 pub fn authenticate(
     keep: &Keep,
     token: &str,
     peer_uid: u32,
     now: u64,
-) -> Result<std::result::Result<GrantedCredential, AgentRefusal>> {
+) -> Result<std::result::Result<GrantedCredential, Refused>> {
     match keep.authenticate_agent(token, peer_uid, now)? {
-        Ok(credential) => Ok(Ok(GrantedCredential::new(credential)?)),
-        Err(refusal) => Ok(Err(refusal)),
+        Ok(credential) => {
+            let id = credential.id;
+            match GrantedCredential::new(credential) {
+                Ok(granted) => Ok(Ok(granted)),
+                Err(e) => {
+                    tracing::warn!(id = %hex::encode(id), error = %e, "agent credential grant does not load");
+                    Ok(Err(Refused {
+                        because: RefusedBecause::Grant,
+                        credential: Some(id),
+                    }))
+                }
+            }
+        }
+        Err(refused) => Ok(Err(Refused {
+            because: RefusedBecause::Credential(refused.reason),
+            credential: refused.credential,
+        })),
     }
 }
