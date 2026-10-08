@@ -1010,6 +1010,71 @@ async fn frost_network_sign_round(
     Ok(signature)
 }
 
+/// One key-path spend for a network round: the input's sighash, its
+/// `BitcoinSighashPayload`, the path below the group key and the tweak.
+pub(crate) struct NetworkKeyPathSpend {
+    pub sighash: [u8; 32],
+    pub payload: Vec<u8>,
+    pub path: Vec<u32>,
+    pub tweak: keep_frost_net::TaprootTweakPayload,
+}
+
+/// Sign each spend with co-signers over `relay`, once `threshold - 1` of them
+/// that support key-path spends are online (waiting at most `timeout`). Every
+/// signature is obtained before any is returned.
+pub(crate) async fn key_path_spend_round(
+    out: &Output,
+    share: keep_core::frost::SharePackage,
+    relay: &str,
+    timeout: std::time::Duration,
+    spends: Vec<NetworkKeyPathSpend>,
+) -> Result<Vec<[u8; 64]>> {
+    let needed = usize::from(share.metadata.threshold.saturating_sub(1));
+    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
+        .await
+        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    let shutdown_tx = node.take_shutdown_handle();
+    let node = std::sync::Arc::new(node);
+    let node_clone = node.clone();
+    let _run_guard = NodeRunGuard {
+        handle: tokio::spawn(async move {
+            let _ = node_clone.run().await;
+        }),
+        shutdown: shutdown_tx,
+    };
+
+    let spinner = out.spinner("Waiting for co-signers that support key-path spends...");
+    let deadline = tokio::time::Instant::now() + timeout;
+    while node.online_peers_with(keep_frost_net::CAPABILITY_TAPROOT_TWEAK) < needed {
+        if tokio::time::Instant::now() >= deadline {
+            spinner.finish();
+            return Err(KeepError::Frost(format!(
+                "only {} of the {needed} co-signers needed are online with key-path spend support",
+                node.online_peers_with(keep_frost_net::CAPABILITY_TAPROOT_TWEAK)
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    spinner.finish();
+
+    let mut signatures = Vec::with_capacity(spends.len());
+    for (i, spend) in spends.into_iter().enumerate() {
+        let spinner = out.spinner(&format!("Signing spend {}...", i + 1));
+        let signature = node
+            .request_key_path_spend(
+                spend.sighash.to_vec(),
+                spend.payload,
+                spend.path,
+                spend.tweak,
+            )
+            .await
+            .map_err(|e| KeepError::Frost(e.to_string()));
+        spinner.finish();
+        signatures.push(signature?);
+    }
+    Ok(signatures)
+}
+
 /// Winds down the background `KfpNode::run()` task on drop so a signing
 /// helper's every exit path (Ok return, `?` error, panic) stops the relay
 /// loop instead of leaving a detached task for the surrounding tokio runtime

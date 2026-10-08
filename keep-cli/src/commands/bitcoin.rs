@@ -214,7 +214,7 @@ pub fn cmd_bitcoin_analyze(out: &Output, psbt_path: &str, network: &str) -> Resu
 
 /// Prints a PSBT analysis. Change and signable inputs are only meaningful when
 /// `analysis` was made with the signing key (`with_key`).
-fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key: bool) {
+pub(crate) fn print_analysis(out: &Output, analysis: &keep_bitcoin::PsbtAnalysis, with_key: bool) {
     out.newline();
     out.header("PSBT Analysis");
     out.field("Inputs", &analysis.num_inputs.to_string());

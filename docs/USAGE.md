@@ -461,10 +461,9 @@ Turn a FROST group into a Bitcoin wallet with proper external/internal address c
 optional time-locked recovery tiers, coordinated across signers over Nostr.
 
 ```bash
-# Simple descriptor from a FROST group (no recovery tiers).
-# Single-key FROST descriptors have no BIP-32 derivation, so receive and change
-# collapse to one address; --allow-address-reuse is required to acknowledge that.
-keep wallet descriptor --group npub1... --network mainnet --allow-address-reuse
+# Descriptor from a FROST group (no recovery tiers): BIP-86 receive (/0/*) and
+# change (/1/*) chains below the group key, importable into a watch-only wallet.
+keep wallet descriptor --group npub1... --network mainnet
 
 # Propose a coordinated descriptor with a recovery tier (preferred: distinct chains)
 keep wallet propose --group npub1... --network mainnet \
@@ -478,6 +477,11 @@ keep wallet export --group npub1... --format sparrow
 keep wallet announce-keys --group npub1... --xpub 'xpub.../fingerprint/label'
 keep wallet register --group npub1... --device 'bunker://...'
 
+# Sign a PSBT spending the group's own addresses (key path), with co-signers over a
+# relay, or with threshold shares held in this vault
+keep wallet sign --group npub1... --psbt unsigned.psbt -o signed.psbt
+keep wallet sign --group npub1... --psbt unsigned.psbt -o signed.psbt --local
+
 # Coordinate a recovery-tier (scriptpath) spend via PSBT
 keep wallet spend --group npub1... --recovery-tier 0 --psbt-file unsigned.psbt
 keep wallet approve-psbt --group npub1... --session <id> --signer-bunker 'fp:bunker://...'
@@ -487,6 +491,8 @@ keep wallet list
 ```
 
 Recovery tier syntax is `threshold-of-keys@timelock`, e.g. `2of3@6mo` or `3of5@1y`.
+
+`wallet sign` signs the inputs that spend the group's own outputs on the key path: an address of the stored descriptor (build the PSBT in a watch-only wallet that imported it, so each input carries its key origin), or the key path of a recovery-tier wallet. The spent scriptPubKey is checked against the group's output for that path, not trusted from the PSBT; other inputs are left unsigned, inputs must use sighash DEFAULT or ALL, and every input needs its UTXO. It shows each input, the outputs with change marked, the fee and at most how much leaves the wallet, then asks for confirmation (only `--yes` skips it). Over a relay it waits for enough co-signers that support key-path spends; each co-signer must opt in (`frost network serve --allow-key-path-spend`) and checks the spend itself. The signed PSBT carries a key-path signature per group input and is not finalized.
 
 ---
 

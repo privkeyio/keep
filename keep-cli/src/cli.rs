@@ -431,7 +431,7 @@ pub(crate) enum WalletCommands {
         network: String,
         #[arg(
             long,
-            help = "Allow a single-chain descriptor where external (receive) and internal (change) collapse to the same address. Required because simple FROST-key descriptors have no BIP-32 derivation; addresses will be reused. Prefer `wallet propose` with a recovery tier for proper external/internal split."
+            help = "Allow a descriptor whose external (receive) and internal (change) outputs are the same address. keep's FROST descriptors derive distinct receive (/0/*) and change (/1/*) addresses, so they do not need this."
         )]
         allow_address_reuse: bool,
     },
@@ -516,6 +516,33 @@ pub(crate) enum WalletCommands {
         /// the group. Belt-and-suspenders against muscle-memory --force.
         #[arg(long, requires = "force")]
         replacing_version: Option<u32>,
+    },
+    /// Sign a PSBT's inputs that spend this FROST group's own taproot outputs
+    /// (key path), with co-signers over a relay or, with --local, with threshold
+    /// shares held in this vault. Needs the group's stored wallet descriptor.
+    Sign {
+        #[arg(short, long)]
+        group: String,
+        /// Base64 PSBT file
+        #[arg(long)]
+        psbt: String,
+        /// Write the signed PSBT here instead of stdout
+        #[arg(short, long)]
+        output: Option<String>,
+        /// Sign with threshold shares held in this vault instead of co-signers
+        #[arg(long)]
+        local: bool,
+        /// The share to sign with in a network round (default: the first one held)
+        #[arg(long)]
+        share: Option<u16>,
+        #[arg(short, long)]
+        relay: Option<String>,
+        /// Seconds to wait for co-signers that support key-path spends
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+        /// Sign without asking for confirmation. KEEP_YES does not skip this prompt.
+        #[arg(long)]
+        yes: bool,
     },
     /// Propose a recovery-tier (scriptpath) spend via WDC PSBT coordination
     Spend {

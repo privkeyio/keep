@@ -14,6 +14,7 @@ mod error;
 /// compiling; the module lives in keep-core because bip32-composed FROST
 /// signing lives there and keep-bitcoin cannot depend upward on keep-core.
 pub use keep_core::frost_bip32;
+pub mod frost_psbt;
 pub mod key_proof;
 pub mod psbt;
 pub mod recovery;

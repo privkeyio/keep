@@ -77,6 +77,10 @@ windows-sys = { version = "0.61", features = [
 [features]
 default = []
 testing = ["keep-core/testing"]
+# Lets the binary use loopback and ws:// relays, for the network spend test
+# against an in-process relay. Never enable it for a build anyone runs: it turns
+# off the relay SSRF checks.
+local-relay-tests = ["keep-core/allow-internal", "keep-core/allow-ws"]
 warden = ["dep:reqwest", "dep:uuid"]
 # TPM-side quote producer for the on-prem box (links the tpm2-tss C stack via
 # keep-frost-net). Off by default; only a node that attests via a TPM needs it.

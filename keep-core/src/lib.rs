@@ -1384,6 +1384,75 @@ impl Keep {
         }
     }
 
+    /// Sign key-path spends of the group's taproot outputs with local shares, one
+    /// per `(sighash, path, tweak, script_pubkey)`. Every signature is checked
+    /// against the output key of its scriptPubKey, and all are made before any is
+    /// returned. Requires threshold shares locally.
+    pub fn frost_sign_key_path_spends(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        spends: &[frost::taproot::KeyPathSpendRequest],
+    ) -> Result<Vec<[u8; 64]>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let data_key = self.get_data_key()?;
+        let shares = self.storage.list_shares()?;
+        let ours: Vec<_> = shares
+            .iter()
+            .filter(|s| {
+                s.metadata.group_pubkey == *group_pubkey
+                    && s.ciphersuite == crate::frost::Ciphersuite::Secp256k1Tr
+            })
+            .collect();
+        let threshold = ours
+            .first()
+            .ok_or_else(|| KeepError::KeyNotFound("No shares for group".into()))?
+            .metadata
+            .threshold;
+        if ours.len() < threshold as usize {
+            return Err(KeepError::Frost(format!(
+                "Need {} shares to sign, only {} available",
+                threshold,
+                ours.len()
+            )));
+        }
+        let decrypted = ours
+            .iter()
+            .take(threshold as usize)
+            .map(|stored| stored.decrypt(&data_key))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut signatures = Vec::with_capacity(spends.len());
+        for spend in spends {
+            match frost::taproot::sign_key_path_spend_with_local_shares(
+                &decrypted,
+                &spend.sighash,
+                &spend.path,
+                spend.tweak,
+                &spend.script_pubkey,
+            ) {
+                Ok(sig) => {
+                    self.audit_event(AuditEventType::FrostSign, |e| {
+                        e.with_group(group_pubkey)
+                            .with_message_hash(&spend.sighash)
+                            .with_threshold(threshold)
+                    });
+                    signatures.push(sig);
+                }
+                Err(e) => {
+                    self.audit_event(AuditEventType::FrostSignFailed, |e| {
+                        e.with_group(group_pubkey)
+                            .with_message_hash(&spend.sighash)
+                            .with_success(false)
+                    });
+                    return Err(e);
+                }
+            }
+        }
+        Ok(signatures)
+    }
+
     /// Generate a FROST-Ed25519 threshold key and store its shares.
     ///
     /// Shares are tagged with [`Ciphersuite::Ed25519`], which is bound into the
