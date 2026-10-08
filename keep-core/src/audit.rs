@@ -447,15 +447,15 @@ impl AuditLog {
                 break;
             }
             complete += n as u64;
-            if line.len() > 1 {
+            if !line_text(&line).is_empty() {
                 count += 1;
                 std::mem::swap(&mut last, &mut line);
             }
         }
-        let Some((_, text)) = last.split_last() else {
+        if count == 0 {
             return Ok(([0u8; 32], 0));
-        };
-        let entry = std::str::from_utf8(text)
+        }
+        let entry = std::str::from_utf8(line_text(&last))
             .map_err(|e| StorageError::invalid_format(format!("audit line: {e}")).into())
             .and_then(|text| Self::decrypt_line(text, data_key))
             .map_err(|e| StorageError::corrupted(format!("audit log at entry {count}: {e}")))?;
@@ -529,6 +529,7 @@ impl AuditLog {
         let _ = std::fs::remove_file(&backup_path);
         self.last_hash = final_hash;
         self.entries = entries.len();
+        self.torn = None;
         Ok(())
     }
 
@@ -583,12 +584,21 @@ impl AuditLog {
     }
 }
 
-/// Cut `path` back to `len` bytes, durably. A separate write handle, since an
-/// append-only handle cannot truncate on every platform.
+/// Cut `path` back to `len` bytes, durably; never grows it. A separate write
+/// handle, since an append-only handle cannot truncate on every platform.
 fn truncate(path: &Path, len: u64) -> std::io::Result<()> {
     let file = OpenOptions::new().write(true).open(path)?;
-    file.set_len(len)?;
-    file.sync_all()
+    if file.metadata()?.len() > len {
+        file.set_len(len)?;
+        file.sync_all()?;
+    }
+    Ok(())
+}
+
+/// A line without its `\n` or `\r\n` ending, as `BufRead::lines` yields it.
+fn line_text(line: &[u8]) -> &[u8] {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    line.strip_suffix(b"\r").unwrap_or(line)
 }
 
 /// NIP-46 signing request type.
@@ -1131,6 +1141,50 @@ mod tests {
         assert_eq!(log.torn, None);
         assert_eq!(log.read_all(&key).unwrap().len(), 2);
         assert!(log.verify_chain(&key).unwrap());
+    }
+
+    /// A rewrite replaces the file, so a cut pending against the old file is
+    /// dropped rather than applied to the new one.
+    #[test]
+    fn a_rewrite_drops_a_pending_cut() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        for _ in 0..3 {
+            log.log(AuditEntry::new(AuditEventType::Sign, [0; 32]), &key)
+                .unwrap();
+        }
+        let len = std::fs::metadata(dir.path().join("audit.log"))
+            .unwrap()
+            .len();
+        log.torn = Some(len - 1);
+        log.reencrypt(&key, &key).unwrap();
+        assert_eq!(log.torn, None);
+        log.log(AuditEntry::new(AuditEventType::Sign, [0; 32]), &key)
+            .unwrap();
+        assert_eq!(log.read_all(&key).unwrap().len(), 4);
+        assert!(log.verify_chain(&key).unwrap());
+    }
+
+    /// A log whose lines end in `\r\n` opens and counts like `read_all` reads it.
+    #[test]
+    fn crlf_line_endings_open() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let last = log.last_hash();
+        let path = dir.path().join("audit.log");
+        let crlf = String::from_utf8(std::fs::read(&path).unwrap())
+            .unwrap()
+            .replace('\n', "\r\n");
+        std::fs::write(&path, format!("{crlf}\r\n")).unwrap();
+
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.entry_count(), 1);
+        assert_eq!(log.last_hash(), last);
+        assert_eq!(log.read_all(&key).unwrap().len(), 1);
     }
 
     /// An append a crash cut short (no trailing newline) is dropped on open, so
