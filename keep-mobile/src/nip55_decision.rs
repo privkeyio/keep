@@ -13,9 +13,11 @@
 //! `assess_signing_risk`) in the exact gate order:
 //!
 //!   caller-verified -> kill-switch -> lock -> front-door rate limit ->
-//!   velocity -> relay-auth whitelist -> app expiry and standing DENY ->
-//!   sign policy -> standing permission. An expired app or an explicit per-app
-//!   DENY rejects before the sign policy or a whitelisted relay can approve.
+//!   velocity -> relay-auth whitelist -> app expiry, permission lookup and
+//!   standing DENY -> sign policy -> standing permission. An expired app, an
+//!   unreadable permission store or an explicit per-app DENY rejects before the
+//!   sign policy or a whitelisted relay can approve, and an explicit per-app ASK
+//!   keeps the sign policy from auto-approving.
 //!
 //! The function is pure: the Android layer gathers the platform inputs (verified
 //! caller, kill-switch/lock flags, the stateful front-door and opt-in rate-limit
@@ -259,9 +261,9 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         };
     }
 
-    // Gate 6: app expiry and the standing permission, before the sign policy,
-    // so neither an expired app nor one the user explicitly denied is ever
-    // auto-approved. Each fails closed: an unknown expiry or an unreadable
+    // Gate 6: app expiry, the permission lookup and a standing DENY, before the
+    // sign policy, so neither an expired app nor one the user explicitly denied
+    // is ever auto-approved. Each fails closed: an unknown expiry or an unreadable
     // permission store rejects, since either could hide a denial.
     match inputs.app_expired {
         None => {
@@ -348,7 +350,11 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         )
     };
 
-    if policy_result == SignPolicyEvaluation::AutoApprove {
+    // An ASK row is only ever set by the user, to be asked; the policy does not
+    // override that choice.
+    if policy_result == SignPolicyEvaluation::AutoApprove
+        && decision != Some(Nip55PermissionDecision::Ask)
+    {
         return Nip55Outcome::AutoApprove;
     }
 
@@ -879,10 +885,11 @@ mod tests {
         }
     }
 
-    // Only an explicit DENY moved ahead of the sign policy: a kind-agnostic DENY
-    // blocks it too, while an ASK or an expired DENY row does not.
+    // Of the stored decisions, a live DENY (exact or kind-agnostic, by either
+    // clock) rejects and an explicit ASK prompts, even under an auto-approving
+    // policy; a lapsed DENY row no longer applies.
     #[test]
-    fn only_a_live_deny_overrides_an_auto_approving_policy() {
+    fn stored_decisions_against_an_auto_approving_policy() {
         let mut i = base();
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
@@ -892,13 +899,30 @@ mod tests {
         assert_eq!(reject_reason(&evaluate_nip55_request(generic)), "deny");
         let mut ask = i.clone();
         ask.stored_exact_permission = Some(perm("ask"));
-        assert_eq!(evaluate_nip55_request(ask), Nip55Outcome::AutoApprove);
-        let mut lapsed = i;
-        lapsed.stored_exact_permission = Some(Nip55StoredPermission {
+        assert!(matches!(
+            evaluate_nip55_request(ask),
+            Nip55Outcome::RequireUi { .. }
+        ));
+        let monotonic = |duration_ms| Nip55StoredPermission {
+            created_at_elapsed: 1_000,
+            duration_ms: Some(duration_ms),
+            ..perm("deny")
+        };
+        let mut live = i.clone();
+        live.stored_exact_permission = Some(monotonic(DAY_MS as i64));
+        assert_eq!(reject_reason(&evaluate_nip55_request(live)), "deny");
+        let mut lapsed = i.clone();
+        lapsed.stored_exact_permission = Some(monotonic(1_000));
+        assert_eq!(evaluate_nip55_request(lapsed), Nip55Outcome::AutoApprove);
+        let mut lapsed_wall = i;
+        lapsed_wall.stored_exact_permission = Some(Nip55StoredPermission {
             expires_at: Some(1),
             ..perm("deny")
         });
-        assert_eq!(evaluate_nip55_request(lapsed), Nip55Outcome::AutoApprove);
+        assert_eq!(
+            evaluate_nip55_request(lapsed_wall),
+            Nip55Outcome::AutoApprove
+        );
     }
 
     #[test]
@@ -934,7 +958,7 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(base())));
     }
 
-    // Gate 8: whitelisted-relay AUTO_ACCEPT with per-app DENY-wins.
+    // Gate 8: whitelisted-relay AUTO_ACCEPT; a per-app DENY rejects at gate 6.
     #[test]
     fn whitelisted_relay_auto_approves() {
         let mut i = base();
@@ -993,7 +1017,7 @@ mod tests {
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "lookup_timeout");
     }
 
-    // Non-SignEvent operations: gate 7 always falls to UI, gate 8 still resolves.
+    // Non-SignEvent operations: gate 7 always falls to UI; gates 6 and 8 resolve.
     #[test]
     fn get_public_key_stored_allow_auto_approves() {
         let mut i = base();
