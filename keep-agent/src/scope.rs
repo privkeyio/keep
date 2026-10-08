@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::error::{AgentError, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     SignNostrEvent,
@@ -211,7 +211,7 @@ impl SessionScope {
 }
 
 /// `address` as the signer renders it, if it is an address on `network`.
-fn canonical_address(address: &str, network: Network) -> Option<String> {
+pub(crate) fn canonical_address(address: &str, network: Network) -> Option<String> {
     let parsed: Address<NetworkUnchecked> = address.parse().ok()?;
     Some(parsed.require_network(network).ok()?.to_string())
 }
