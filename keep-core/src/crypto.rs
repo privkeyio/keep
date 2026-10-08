@@ -1312,6 +1312,46 @@ mod tests {
         );
     }
 
+    // Known answers from independent implementations (the reference Argon2 C
+    // library and Python's hashlib BLAKE2b), so a dependency upgrade that changed
+    // these outputs, and with them every existing vault key, fails here.
+    #[test]
+    fn kdf_and_hashes_match_independent_implementations() {
+        let salt: [u8; SALT_SIZE] = std::array::from_fn(|i| i as u8);
+        let password = b"correct horse battery staple";
+        let derived = |memory_kib, iterations, parallelism| {
+            let params = Argon2Params {
+                memory_kib,
+                iterations,
+                parallelism,
+            };
+            hex::encode(
+                *derive_key(password, &salt, params)
+                    .unwrap()
+                    .decrypt()
+                    .unwrap(),
+            )
+        };
+        assert_eq!(
+            derived(1024, 1, 1),
+            "0b4deef4d5e474a020b44b82001387ec7d86f72ead3bac8b1d5be7f93c6d1a0b"
+        );
+        assert_eq!(
+            derived(2048, 2, 4),
+            "1e39d447aa61a6cd3c2bdb94f7e7c0a86406ec0a59ddf58bb0768aa7ee8de873"
+        );
+        assert_eq!(
+            hex::encode(blake2b_256(b"keep known-answer")),
+            "7732f601900cd21c5599289efbde5327f3174fabe6962464b541cd27fb8f2c50"
+        );
+        let master = SecretKey::new([0x42; KEY_SIZE]).unwrap();
+        let subkey = derive_subkey(&master, b"keep-subkey-context").unwrap();
+        assert_eq!(
+            hex::encode(*subkey.decrypt().unwrap()),
+            "a16f6b06ace35a1ebde90766da02fa34dfb2686dceac1e11fe84233844108af3"
+        );
+    }
+
     #[test]
     fn test_key_derivation() {
         let password = b"test password";

@@ -325,6 +325,20 @@ mod tests {
 
     const TEST_KEY: [u8; 32] = [0xAB; 32];
 
+    // Known answers from Python's hashlib BLAKE2b.
+    #[test]
+    fn hmac_key_and_tag_match_an_independent_implementation() {
+        let salt: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(
+            hex::encode(derive_hmac_key(&salt)),
+            "170ad355c0c6457a42ef7ef5ed9ec6703feb5ab983dd6c4ca94d873df2e98d67"
+        );
+        assert_eq!(
+            hex::encode(compute_hmac(b"keep known-answer", &[0x42; 32])),
+            "cc19d17628dc0740"
+        );
+    }
+
     #[test]
     fn test_no_delay_on_first_attempts() {
         let dir = tempdir().unwrap();
