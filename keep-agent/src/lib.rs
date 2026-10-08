@@ -9,6 +9,7 @@ pub mod entropy;
 pub mod error;
 pub mod frost;
 pub mod manager;
+pub mod policy;
 pub mod rate_limit;
 pub mod scope;
 pub mod session;

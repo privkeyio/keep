@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::error::{AgentError, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     SignNostrEvent,
@@ -120,17 +120,7 @@ impl SessionScope {
                     "An address allowlist needs the session's network".into(),
                 )
             })?;
-            let canonical = allowlist
-                .iter()
-                .map(|a| {
-                    canonical_address(a, network).ok_or_else(|| {
-                        AgentError::ScopeViolation(format!(
-                            "Allowlist entry '{a}' is not an address on {network}"
-                        ))
-                    })
-                })
-                .collect::<Result<HashSet<_>>>()?;
-            self.address_allowlist = Some(canonical);
+            self.address_allowlist = Some(canonical_allowlist(&allowlist, network)?);
         }
         Ok(self)
     }
@@ -160,25 +150,19 @@ impl SessionScope {
         let limit = self
             .max_amount_sats
             .ok_or_else(|| AgentError::ScopeViolation("sign_psbt needs max_amount_sats".into()))?;
-        let requested = analysis.leaving_wallet_sats();
-        if requested > limit {
-            return Err(AgentError::AmountExceeded { requested, limit });
-        }
-        if let Some(allowlist) = &self.address_allowlist {
-            for output in analysis.outputs.iter().filter(|o| !o.is_change) {
-                match &output.address {
-                    Some(addr) if allowlist.contains(addr) => {}
-                    Some(addr) => return Err(AgentError::AddressNotAllowed(addr.clone())),
-                    None => {
-                        return Err(AgentError::AddressNotAllowed(format!(
-                            "output {} has no recognizable address",
-                            output.index
-                        )))
-                    }
-                }
+        let allowed = self
+            .address_allowlist
+            .as_ref()
+            .map(|set| move |a: &str| set.contains(a));
+        check_outputs(analysis, limit, allowed.as_ref().map(|f| f as _)).map_err(|r| match r {
+            OutputRejection::OverLimit { requested, limit } => {
+                AgentError::AmountExceeded { requested, limit }
             }
-        }
-        Ok(())
+            OutputRejection::NotAllowed(addr) => AgentError::AddressNotAllowed(addr),
+            OutputRejection::NoAddress(index) => {
+                AgentError::AddressNotAllowed(format!("output {index} has no recognizable address"))
+            }
+        })
     }
 
     pub fn allows_operation(&self, op: &Operation) -> bool {
@@ -214,6 +198,55 @@ impl SessionScope {
 fn canonical_address(address: &str, network: Network) -> Option<String> {
     let parsed: Address<NetworkUnchecked> = address.parse().ok()?;
     Some(parsed.require_network(network).ok()?.to_string())
+}
+
+/// Every allowlist entry in canonical form, refusing one that is not an
+/// address on `network`.
+pub(crate) fn canonical_allowlist<'a, C: FromIterator<String>>(
+    entries: impl IntoIterator<Item = &'a String>,
+    network: Network,
+) -> Result<C> {
+    entries
+        .into_iter()
+        .map(|a| {
+            canonical_address(a, network).ok_or_else(|| {
+                AgentError::ScopeViolation(format!(
+                    "Allowlist entry '{a}' is not an address on {network}"
+                ))
+            })
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OutputRejection {
+    OverLimit { requested: u64, limit: u64 },
+    NotAllowed(String),
+    NoAddress(usize),
+}
+
+/// Whether a PSBT fits `limit` and, when `allowed` is given, pays only allowed
+/// addresses. What leaves the wallet, every output but recognized change plus
+/// the fee, counts toward the limit; an output with no address fails closed.
+pub(crate) fn check_outputs(
+    analysis: &PsbtAnalysis,
+    limit: u64,
+    allowed: Option<&dyn Fn(&str) -> bool>,
+) -> std::result::Result<(), OutputRejection> {
+    let requested = analysis.leaving_wallet_sats();
+    if requested > limit {
+        return Err(OutputRejection::OverLimit { requested, limit });
+    }
+    if let Some(allowed) = allowed {
+        for output in analysis.outputs.iter().filter(|o| !o.is_change) {
+            match &output.address {
+                Some(addr) if allowed(addr) => {}
+                Some(addr) => return Err(OutputRejection::NotAllowed(addr.clone())),
+                None => return Err(OutputRejection::NoAddress(output.index)),
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Default for SessionScope {
@@ -354,6 +387,7 @@ mod tests {
             input_sats: vec![total_input_sats],
             outputs,
             signable_inputs: vec![0],
+            network: Network::Bitcoin,
         }
     }
 
