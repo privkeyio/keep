@@ -12,8 +12,9 @@ use tracing::warn;
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE,
-    RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE, SHARES_TABLE,
+    RedbBackend, StorageBackend, AGENT_CREDENTIALS_TABLE, AGENT_LEDGERS_TABLE, CONFIG_TABLE,
+    DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE,
+    SECRET_SEALS_TABLE, SHARES_TABLE,
 };
 use crate::crypto::{self, EncryptedData, SecretKey};
 use crate::error::{KeepError, Result};
@@ -38,11 +39,16 @@ use crate::wallet::WalletDescriptor;
 /// `SECRET_SEALS_TABLE` likewise: each row is `crypto::encrypt(bincode(ThresholdSeal))`. Rotation
 /// re-wraps only this outer data-key layer; the inner DEK-ciphertext value and the OPRF-wrapped DEK
 /// are opaque bytes carried through untouched, so no OPRF quorum is needed to rotate the data key.
-const OPAQUE_TABLES: [&str; 4] = [
+///
+/// `AGENT_CREDENTIALS_TABLE` and `AGENT_LEDGERS_TABLE` likewise: each row is one blob under the
+/// data key.
+const OPAQUE_TABLES: [&str; 6] = [
     CONFIG_TABLE,
     HEALTH_STATUS_TABLE,
     SECRETS_TABLE,
     SECRET_SEALS_TABLE,
+    AGENT_CREDENTIALS_TABLE,
+    AGENT_LEDGERS_TABLE,
 ];
 
 /// One row of an [`OPAQUE_TABLES`] table, held decrypted across a rotation.
@@ -1187,6 +1193,55 @@ mod tests {
             plaintext.as_slice(),
             original_secret.as_slice(),
             "decrypted secret bytes MUST match the pre-rotation value"
+        );
+    }
+
+    /// Agent credentials and ledgers MUST survive a data-key rotation, and a
+    /// token MUST still match its credential afterwards.
+    #[test]
+    fn rotate_data_key_preserves_agent_credentials_and_ledgers() {
+        use crate::agent::AgentCredential;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agents-survive-rotation");
+        let (credential, token) =
+            AgentCredential::issue("claude", 1000, b"grant".to_vec(), 1_800_000_000, 3600).unwrap();
+        {
+            let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
+            storage.insert_agent_credential(&credential).unwrap();
+            storage
+                .update_agent_ledgers(&[&credential.id, b"wallet"], |_| {
+                    Ok(vec![b"ledger".to_vec(), b"wallet ledger".to_vec()])
+                })
+                .unwrap();
+        }
+        {
+            let mut storage = Storage::open(&path).unwrap();
+            storage.rotate_data_key("pass1234").unwrap();
+        }
+        let mut storage = Storage::open(&path).unwrap();
+        storage.unlock("pass1234").unwrap();
+        let loaded = storage.list_agent_credentials().unwrap();
+        assert_eq!(loaded, vec![credential.clone()]);
+        let hash = crate::agent::hash_presented_token(&token).unwrap();
+        assert!(
+            loaded[0].matches_hash(&hash),
+            "a token MUST survive a data-key rotation"
+        );
+        assert_eq!(
+            storage
+                .load_agent_ledger(&credential.id)
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"ledger"
+        );
+        assert_eq!(
+            storage
+                .load_agent_ledger(b"wallet")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"wallet ledger"
         );
     }
 

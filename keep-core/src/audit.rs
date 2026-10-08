@@ -95,6 +95,16 @@ pub enum AuditEventType {
     /// sensitive read in the store (it hands out the plaintext), audited like
     /// `KeyExport`.
     SecretReveal = 27,
+    /// Agent gateway credential issued.
+    AgentCredentialIssue = 28,
+    /// Agent gateway credential revoked.
+    AgentCredentialRevoke = 29,
+    /// Agent gateway credential deleted.
+    AgentCredentialDelete = 30,
+    /// One agent credential, or every one, frozen.
+    AgentFreeze = 31,
+    /// One agent credential, or every one, unfrozen.
+    AgentUnfreeze = 32,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -128,6 +138,11 @@ impl std::fmt::Display for AuditEventType {
             Self::SecretCreate => write!(f, "secret_create"),
             Self::SecretDelete => write!(f, "secret_delete"),
             Self::SecretReveal => write!(f, "secret_reveal"),
+            Self::AgentCredentialIssue => write!(f, "agent_credential_issue"),
+            Self::AgentCredentialRevoke => write!(f, "agent_credential_revoke"),
+            Self::AgentCredentialDelete => write!(f, "agent_credential_delete"),
+            Self::AgentFreeze => write!(f, "agent_freeze"),
+            Self::AgentUnfreeze => write!(f, "agent_unfreeze"),
         }
     }
 }

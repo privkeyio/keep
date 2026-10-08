@@ -314,6 +314,11 @@ struct AuditStats {
     secret_create: u32,
     secret_delete: u32,
     secret_reveal: u32,
+    agent_issue: u32,
+    agent_revoke: u32,
+    agent_delete: u32,
+    agent_freeze: u32,
+    agent_unfreeze: u32,
 }
 
 impl AuditStats {
@@ -348,6 +353,11 @@ impl AuditStats {
             AuditEventType::SecretCreate => self.secret_create += 1,
             AuditEventType::SecretDelete => self.secret_delete += 1,
             AuditEventType::SecretReveal => self.secret_reveal += 1,
+            AuditEventType::AgentCredentialIssue => self.agent_issue += 1,
+            AuditEventType::AgentCredentialRevoke => self.agent_revoke += 1,
+            AuditEventType::AgentCredentialDelete => self.agent_delete += 1,
+            AuditEventType::AgentFreeze => self.agent_freeze += 1,
+            AuditEventType::AgentUnfreeze => self.agent_unfreeze += 1,
         }
     }
 }
@@ -424,6 +434,14 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         "  Secrets: {} created / {} deleted / {} revealed",
         stats.secret_create, stats.secret_delete, stats.secret_reveal
     ));
+    out.info(&format!(
+        "  Agent credentials: {} issued / {} revoked / {} deleted, {} freezes / {} unfreezes",
+        stats.agent_issue,
+        stats.agent_revoke,
+        stats.agent_delete,
+        stats.agent_freeze,
+        stats.agent_unfreeze
+    ));
 
     Ok(())
 }
@@ -470,6 +488,11 @@ mod stats_tests {
         stats.record(AuditEventType::SecretCreate);
         stats.record(AuditEventType::SecretDelete);
         stats.record(AuditEventType::SecretReveal);
+        stats.record(AuditEventType::AgentCredentialIssue);
+        stats.record(AuditEventType::AgentCredentialRevoke);
+        stats.record(AuditEventType::AgentCredentialDelete);
+        stats.record(AuditEventType::AgentFreeze);
+        stats.record(AuditEventType::AgentUnfreeze);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -496,6 +519,11 @@ mod stats_tests {
         assert_eq!(stats.secret_create, 1);
         assert_eq!(stats.secret_delete, 1);
         assert_eq!(stats.secret_reveal, 1);
+        assert_eq!(stats.agent_issue, 1);
+        assert_eq!(stats.agent_revoke, 1);
+        assert_eq!(stats.agent_delete, 1);
+        assert_eq!(stats.agent_freeze, 1);
+        assert_eq!(stats.agent_unfreeze, 1);
     }
 
     /// Closes the #526 gap surfaced by #441's testing pass: each of the

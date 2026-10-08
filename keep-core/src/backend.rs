@@ -33,6 +33,15 @@ pub const SECRETS_TABLE: &str = "secrets";
 /// (wrapped DEK + OPRF params), present only for secrets whose value is gated
 /// behind a t-of-n OPRF quorum. Like `SECRETS_TABLE`, NOT a replicable table.
 pub const SECRET_SEALS_TABLE: &str = "secret_seals";
+/// Table name for agent gateway credentials: maps a credential id to its
+/// encrypted `AgentCredential`. Not replicable, and not part of a backup: a
+/// credential is bound to a local uid, and a restore must not revive a revoked
+/// one.
+pub const AGENT_CREDENTIALS_TABLE: &str = "agent_credentials";
+/// Table name for the agent gateway's spend ledgers: maps a credential id (or
+/// the wallet key) to its encrypted serialized ledger. Like
+/// `AGENT_CREDENTIALS_TABLE`, neither replicable nor backed up.
+pub const AGENT_LEDGERS_TABLE: &str = "agent_ledgers";
 /// Table name for the keep-state replication high-water-mark: maps a `<table>:<record-id>` d-tag to
 /// the highest `created_at` (8-byte big-endian) applied for it, so the consumer rejects any replicated
 /// event that is not strictly newer (replay/rollback protection).
@@ -156,6 +165,10 @@ const HEALTH_STATUS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("key_health_status");
 const SECRETS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secrets");
 const SECRET_SEALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> = TableDefinition::new("secret_seals");
+const AGENT_CREDENTIALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("agent_credentials");
+const AGENT_LEDGERS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("agent_ledgers");
 const STATE_VERSIONS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("state_versions");
 const PENDING_TOMBSTONES_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
@@ -219,6 +232,9 @@ impl RedbBackend {
             // undecryptable if only one of the pair carried through). Missing tables are skipped below.
             SECRETS_TABLE,
             SECRET_SEALS_TABLE,
+            // Agent gateway credentials and ledgers, carried through like every other table.
+            AGENT_CREDENTIALS_TABLE,
+            AGENT_LEDGERS_TABLE,
             // Carried through a file-format upgrade so the keep-state rollback-guard high-water-marks
             // survive; otherwise they reset and the guard reverts to first-sync (TOFU) for every d-tag.
             STATE_VERSIONS_TABLE,
@@ -397,6 +413,8 @@ impl RedbBackend {
             HEALTH_STATUS_TABLE => Ok(HEALTH_STATUS_TABLE_DEF),
             SECRETS_TABLE => Ok(SECRETS_TABLE_DEF),
             SECRET_SEALS_TABLE => Ok(SECRET_SEALS_TABLE_DEF),
+            AGENT_CREDENTIALS_TABLE => Ok(AGENT_CREDENTIALS_TABLE_DEF),
+            AGENT_LEDGERS_TABLE => Ok(AGENT_LEDGERS_TABLE_DEF),
             STATE_VERSIONS_TABLE => Ok(STATE_VERSIONS_TABLE_DEF),
             PENDING_TOMBSTONES_TABLE => Ok(PENDING_TOMBSTONES_TABLE_DEF),
             _ => Err(StorageError::database(format!("unknown table: {name}")).into()),

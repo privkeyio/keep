@@ -902,6 +902,40 @@ mod tests {
         assert_eq!(loaded.created_at, created);
     }
 
+    /// Agent credentials are bound to this machine's users and a restore must
+    /// not revive a revoked one, so a backup carries none of them, nor their
+    /// ledgers.
+    #[test]
+    fn backup_leaves_out_agent_credentials() {
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let mut keep = create_test_keep(&src_path);
+        keep.unlock("test-password-123").unwrap();
+        let (credential, _) = keep
+            .issue_agent_credential("claude", 1000, b"grant".to_vec(), 1_800_000_000, 3600)
+            .unwrap();
+        keep.update_agent_ledgers(&[&credential.id], |_| Ok(vec![b"ledger".to_vec()]))
+            .unwrap();
+
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+        let dst_path = dir.path().join("dst");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+        assert!(restored.agent_credentials().unwrap().is_empty());
+        assert!(restored
+            .load_agent_ledger(&credential.id)
+            .unwrap()
+            .is_none());
+    }
+
     /// A threshold-sealed secret MUST survive backup + restore with its value
     /// still gated behind the OPRF quorum: the backup carries the DEK-ciphertext
     /// and the wrapped DEK (never plaintext), so after restore the value only
