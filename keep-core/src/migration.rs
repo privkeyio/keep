@@ -8,7 +8,9 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
-/// The current schema version supported by this build.
+/// The current schema version supported by this build. A bump also keeps an
+/// older binary, which refuses a newer schema, from reading audit event types
+/// it does not know (v8 added the agent credential events).
 pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// A migration function that transforms the database schema.

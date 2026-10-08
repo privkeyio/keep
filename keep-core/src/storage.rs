@@ -1174,22 +1174,53 @@ impl Storage {
         crypto::decrypt(&encrypted, data_key)?.as_slice()
     }
 
+    /// Decrypt an agent credential row, refusing one whose id is not its key so
+    /// a row copied under another key is not taken for that credential.
+    fn decode_agent_credential(&self, key: &[u8], stored: &[u8]) -> Result<AgentCredential> {
+        let credential: AgentCredential =
+            bincode_options().deserialize(&self.decrypt_value(stored)?)?;
+        if credential.id.as_slice() != key {
+            return Err(StorageError::corrupted(format!(
+                "agent credential {} stored under another id",
+                credential.id_hex()
+            ))
+            .into());
+        }
+        Ok(credential)
+    }
+
     /// Insert or overwrite an agent credential, encrypted under the data key.
-    /// A new credential is refused once [`MAX_AGENT_CREDENTIALS`] are stored.
+    /// A new credential is refused once [`MAX_AGENT_CREDENTIALS`] are stored,
+    /// and a revoked credential is never stored as unrevoked again.
     pub fn store_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend
-            .get(AGENT_CREDENTIALS_TABLE, &credential.id)?
-            .is_none()
-            && backend.list(AGENT_CREDENTIALS_TABLE)?.len() >= MAX_AGENT_CREDENTIALS
-        {
-            return Err(KeepError::invalid_input(format!(
-                "a vault holds at most {MAX_AGENT_CREDENTIALS} agent credentials; delete a revoked one first"
-            )));
+        match self.load_agent_credential(&credential.id)? {
+            Some(existing) if existing.revoked && !credential.revoked => {
+                return Err(KeepError::invalid_input(
+                    "a revoked agent credential cannot be reinstated",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if backend.list(AGENT_CREDENTIALS_TABLE)?.len() >= MAX_AGENT_CREDENTIALS {
+                    return Err(KeepError::invalid_input(format!(
+                        "a vault holds at most {MAX_AGENT_CREDENTIALS} agent credentials; delete a revoked one first"
+                    )));
+                }
+            }
         }
         let serialized = Zeroizing::new(bincode_options().serialize(credential)?);
         let encrypted = self.encrypt_value(&serialized)?;
         backend.put(AGENT_CREDENTIALS_TABLE, &credential.id, &encrypted)
+    }
+
+    /// The agent credential with `id`, if any.
+    pub fn load_agent_credential(&self, id: &[u8; 16]) -> Result<Option<AgentCredential>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend
+            .get(AGENT_CREDENTIALS_TABLE, id)?
+            .map(|stored| self.decode_agent_credential(id, &stored))
+            .transpose()
     }
 
     /// Every stored agent credential.
@@ -1198,15 +1229,17 @@ impl Storage {
         backend
             .list(AGENT_CREDENTIALS_TABLE)?
             .iter()
-            .map(|(_, stored)| Ok(bincode_options().deserialize(&self.decrypt_value(stored)?)?))
+            .map(|(key, stored)| self.decode_agent_credential(key, stored))
             .collect()
     }
 
     /// Delete an agent credential and its ledger in one transaction. Errors if
-    /// no such credential exists.
+    /// neither exists; a ledger left without its credential is removed too.
     pub fn delete_agent_credential(&self, id: &[u8; 16]) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none() {
+        if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none()
+            && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none()
+        {
             return Err(KeepError::NotFound(hex::encode(id)));
         }
         backend.write_atomic(&[
@@ -1232,18 +1265,34 @@ impl Storage {
             .transpose()
     }
 
-    /// Store serialized agent ledgers, all in one durable transaction, so a
-    /// spend is never counted in one ledger and missing from another.
-    pub fn store_agent_ledgers(&self, ledgers: &[(&[u8], &[u8])]) -> Result<()> {
+    /// Read the ledgers stored under `keys`, let `update` replace them, and
+    /// store every replacement in one durable transaction, so a spend is never
+    /// counted in one ledger and missing from another. Nothing is written if
+    /// `update` fails. The caller holds `&mut Keep` across the whole update, so
+    /// no other update interleaves.
+    pub fn update_agent_ledgers<F>(&self, keys: &[&[u8]], update: F) -> Result<()>
+    where
+        F: FnOnce(&[Option<Zeroizing<Vec<u8>>>]) -> Result<Vec<Vec<u8>>>,
+    {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let encrypted = ledgers
+        let current = keys
             .iter()
-            .map(|(_, ledger)| self.encrypt_value(ledger))
+            .map(|key| self.load_agent_ledger(key))
             .collect::<Result<Vec<_>>>()?;
-        let ops: Vec<AtomicOp<'_>> = ledgers
+        let replaced = update(&current)?;
+        if replaced.len() != keys.len() {
+            return Err(KeepError::invalid_input(
+                "an agent ledger update must return one ledger per key",
+            ));
+        }
+        let encrypted = replaced
+            .iter()
+            .map(|ledger| self.encrypt_value(ledger))
+            .collect::<Result<Vec<_>>>()?;
+        let ops: Vec<AtomicOp<'_>> = keys
             .iter()
             .zip(&encrypted)
-            .map(|((key, _), value)| AtomicOp {
+            .map(|(key, value)| AtomicOp {
                 table: AGENT_LEDGERS_TABLE,
                 key,
                 value: Some(value),
@@ -1673,41 +1722,33 @@ impl Storage {
         }
     }
 
-    /// Get the kill switch state from the vault.
-    pub fn get_kill_switch(&self) -> Result<bool> {
-        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+    fn get_config_flag(&self, key: &[u8]) -> Result<bool> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-
-        let Some(encrypted_bytes) = backend.get(CONFIG_TABLE, b"kill_switch")? else {
+        let Some(stored) = backend.get(CONFIG_TABLE, key)? else {
             return Ok(false);
         };
+        Ok(self.decrypt_value(&stored)?.first().copied() == Some(1))
+    }
 
-        let encrypted = EncryptedData::from_bytes(&encrypted_bytes)?;
-        let decrypted = crypto::decrypt(&encrypted, data_key)?;
-        let bytes = decrypted.as_slice()?;
-        Ok(bytes.first().copied() == Some(1))
+    fn set_config_flag(&self, key: &[u8], value: bool) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = self.encrypt_value(&[u8::from(value)])?;
+        backend.put(CONFIG_TABLE, key, &encrypted)
+    }
+
+    /// Get the kill switch state from the vault.
+    pub fn get_kill_switch(&self) -> Result<bool> {
+        self.get_config_flag(b"kill_switch")
     }
 
     /// Set the kill switch state in the vault.
     pub fn set_kill_switch(&self, active: bool) -> Result<()> {
-        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-
-        let value = if active { [1u8] } else { [0u8] };
-        let encrypted = crypto::encrypt(&value, data_key)?;
-        let encrypted_bytes = encrypted.to_bytes();
-
-        backend.put(CONFIG_TABLE, b"kill_switch", &encrypted_bytes)?;
-        Ok(())
+        self.set_config_flag(b"kill_switch", active)
     }
 
     /// Whether every agent credential is frozen.
     pub fn get_agent_freeze(&self) -> Result<bool> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let Some(stored) = backend.get(CONFIG_TABLE, b"agent_freeze")? else {
-            return Ok(false);
-        };
-        Ok(self.decrypt_value(&stored)?.first().copied() == Some(1))
+        self.get_config_flag(b"agent_freeze")
     }
 
     /// Write raw bytes into a table, for tests that corrupt a stored value.
@@ -1719,11 +1760,15 @@ impl Storage {
             .put(table, key, value)
     }
 
+    /// Every raw row of a table, for tests that copy a stored value.
+    #[cfg(test)]
+    pub(crate) fn list_raw(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.backend.as_ref().ok_or(KeepError::Locked)?.list(table)
+    }
+
     /// Freeze or unfreeze every agent credential.
     pub fn set_agent_freeze(&self, frozen: bool) -> Result<()> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let encrypted = self.encrypt_value(&[u8::from(frozen)])?;
-        backend.put(CONFIG_TABLE, b"agent_freeze", &encrypted)
+        self.set_config_flag(b"agent_freeze", frozen)
     }
 
     /// Get the proxy configuration from the vault.

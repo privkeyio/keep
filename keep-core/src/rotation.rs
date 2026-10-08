@@ -1196,10 +1196,8 @@ mod tests {
         );
     }
 
-    /// A `rotate_data_key` (new random data key, every row re-encrypted) MUST
-    /// carry `secrets` rows through: they are registered in `OPAQUE_TABLES`, so a
-    /// missed registration would leave them under the OLD key and fail to decrypt
-    /// here.
+    /// Agent credentials and ledgers MUST survive a data-key rotation, and a
+    /// token MUST still match its credential afterwards.
     #[test]
     fn rotate_data_key_preserves_agent_credentials_and_ledgers() {
         use crate::agent::AgentCredential;
@@ -1211,7 +1209,9 @@ mod tests {
             let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
             storage.store_agent_credential(&credential).unwrap();
             storage
-                .store_agent_ledgers(&[(&credential.id, b"ledger"), (b"wallet", b"wallet ledger")])
+                .update_agent_ledgers(&[&credential.id, b"wallet"], |_| {
+                    Ok(vec![b"ledger".to_vec(), b"wallet ledger".to_vec()])
+                })
                 .unwrap();
         }
         {
@@ -1222,8 +1222,9 @@ mod tests {
         storage.unlock("pass1234").unwrap();
         let loaded = storage.list_agent_credentials().unwrap();
         assert_eq!(loaded, vec![credential.clone()]);
+        let hash = crate::agent::hash_presented_token(&token).unwrap();
         assert!(
-            loaded[0].matches(&token),
+            loaded[0].matches_hash(&hash),
             "a token MUST survive a data-key rotation"
         );
         assert_eq!(
@@ -1244,6 +1245,10 @@ mod tests {
         );
     }
 
+    /// A `rotate_data_key` (new random data key, every row re-encrypted) MUST
+    /// carry `secrets` rows through: they are registered in `OPAQUE_TABLES`, so a
+    /// missed registration would leave them under the OLD key and fail to decrypt
+    /// here.
     #[test]
     fn rotate_data_key_preserves_secrets() {
         use crate::secret::{SecretKind, SecretRecord};

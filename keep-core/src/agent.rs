@@ -8,7 +8,7 @@
 //! is opaque here: the gateway serializes it and validates it again whenever it
 //! loads a credential.
 
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -21,14 +21,20 @@ use crate::error::{KeepError, Result};
 /// Prefix of every agent token.
 pub const TOKEN_PREFIX: &str = "keep_agt_";
 
+/// Length of a token: the prefix and 64 lowercase hex digits.
+pub const TOKEN_LEN: usize = TOKEN_PREFIX.len() + 64;
+
 /// The most credentials a vault holds, revoked ones included.
 pub const MAX_AGENT_CREDENTIALS: usize = 64;
 
 /// The longest a credential may live.
 pub const MAX_CREDENTIAL_TTL_SECS: u64 = 365 * 24 * 60 * 60;
 
-/// The uid the kernel reports for a peer outside the reader's user namespace.
-/// No credential is bound to it, nor to root.
+/// The largest grant a credential carries.
+pub const MAX_GRANT_BYTES: usize = 64 * 1024;
+
+/// The kernel's default uid for a peer outside the reader's user namespace
+/// (`/proc/sys/kernel/overflowuid`). No credential is bound to it.
 pub const OVERFLOW_UID: u32 = 65_534;
 
 const MAX_NAME_LEN: usize = 64;
@@ -36,11 +42,11 @@ const TOKEN_HASH_DOMAIN: &[u8] = b"keep-agent-token-v1";
 
 /// A credential an agent authenticates with. Stored encrypted under the vault
 /// data key; the token itself is never stored.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentCredential {
     /// Random identifier, shown to the owner and recorded in the audit log.
     pub id: [u8; 16],
-    /// The owner's label for the agent.
+    /// The owner's label for the agent: printable ASCII.
     pub name: String,
     /// Domain-separated hash of the token. The token carries 256 random bits, so
     /// a keyed hash would add nothing, and one keyed by the data key would void
@@ -61,6 +67,59 @@ pub struct AgentCredential {
     pub grant: Vec<u8>,
 }
 
+impl fmt::Debug for AgentCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentCredential")
+            .field("id", &self.id_hex())
+            .field("name", &self.name)
+            .field("uid", &self.uid)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("revoked", &self.revoked)
+            .field("frozen", &self.frozen)
+            .field("grant_len", &self.grant.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why a presented token was refused. The gateway records it, but answers the
+/// agent with one uniform refusal, so a token's state never leaks to whoever
+/// holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRefusal {
+    /// The token is malformed or matches no credential.
+    Unknown,
+    /// The credential is revoked.
+    Revoked,
+    /// The credential has expired.
+    Expired,
+    /// The credential, or every credential, is frozen.
+    Frozen,
+    /// The token was presented by a uid other than the one it is bound to.
+    WrongUid,
+    /// The clock reads earlier than the credential was issued.
+    ClockBehind,
+}
+
+impl fmt::Display for AgentRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Unknown => "unknown token",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+            Self::Frozen => "frozen",
+            Self::WrongUid => "presented by another user",
+            Self::ClockBehind => "clock reads before issue",
+        })
+    }
+}
+
+/// Whether a credential may be bound to `uid`: never root, the overflow uid or
+/// `(uid_t)-1`.
+pub fn bindable_uid(uid: u32) -> bool {
+    uid != 0 && uid != OVERFLOW_UID && uid != u32::MAX
+}
+
 impl AgentCredential {
     /// A new credential and the token for it, shown to the owner once.
     pub fn issue(
@@ -70,12 +129,15 @@ impl AgentCredential {
         now: u64,
         ttl_secs: u64,
     ) -> Result<(Self, Zeroizing<String>)> {
-        if name.is_empty() || name.len() > MAX_NAME_LEN || name.chars().any(char::is_control) {
+        if name.is_empty()
+            || name.len() > MAX_NAME_LEN
+            || !name.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        {
             return Err(KeepError::invalid_input(format!(
-                "an agent name is 1 to {MAX_NAME_LEN} bytes without control characters"
+                "an agent name is 1 to {MAX_NAME_LEN} printable ASCII characters"
             )));
         }
-        if uid == 0 || uid == OVERFLOW_UID {
+        if !bindable_uid(uid) {
             return Err(KeepError::invalid_input(format!(
                 "an agent credential cannot be bound to uid {uid}"
             )));
@@ -85,9 +147,14 @@ impl AgentCredential {
                 "an agent credential lives 1 to {MAX_CREDENTIAL_TTL_SECS} seconds"
             )));
         }
+        if grant.len() > MAX_GRANT_BYTES {
+            return Err(KeepError::invalid_input(format!(
+                "an agent grant is at most {MAX_GRANT_BYTES} bytes"
+            )));
+        }
         let secret: Zeroizing<[u8; 32]> = Zeroizing::new(entropy::try_random_bytes()?);
         // Written into one buffer so no unwiped copy of the token is left behind.
-        let mut token = Zeroizing::new(String::with_capacity(TOKEN_PREFIX.len() + 64));
+        let mut token = Zeroizing::new(String::with_capacity(TOKEN_LEN));
         token.push_str(TOKEN_PREFIX);
         for byte in secret.iter() {
             write!(token, "{byte:02x}").map_err(|e| KeepError::Other(e.to_string()))?;
@@ -106,30 +173,35 @@ impl AgentCredential {
         Ok((credential, token))
     }
 
-    /// Whether `token` is this credential's, compared in constant time.
-    pub fn matches(&self, token: &str) -> bool {
-        bool::from(self.token_hash.ct_eq(&token_hash(token)))
+    /// Whether this credential's token hashes to `hash`, compared in constant
+    /// time.
+    pub fn matches_hash(&self, hash: &[u8; 32]) -> bool {
+        bool::from(self.token_hash.ct_eq(hash))
     }
 
     /// Refuses the credential unless it is live, unfrozen and presented by its
-    /// own uid. `all_frozen` is the vault-wide agent freeze.
-    pub fn check_usable(&self, peer_uid: u32, now: u64, all_frozen: bool) -> Result<()> {
-        let refuse = |why: &str| {
-            Err(KeepError::permission_denied(format!(
-                "agent credential {why}"
-            )))
-        };
+    /// own uid at a time not before it was issued. `all_frozen` is the
+    /// vault-wide agent freeze.
+    pub fn check_usable(
+        &self,
+        peer_uid: u32,
+        now: u64,
+        all_frozen: bool,
+    ) -> std::result::Result<(), AgentRefusal> {
         if self.revoked {
-            return refuse("is revoked");
+            return Err(AgentRefusal::Revoked);
+        }
+        if now < self.created_at {
+            return Err(AgentRefusal::ClockBehind);
         }
         if now >= self.expires_at {
-            return refuse("has expired");
+            return Err(AgentRefusal::Expired);
         }
         if self.frozen || all_frozen {
-            return refuse("is frozen");
+            return Err(AgentRefusal::Frozen);
         }
-        if peer_uid != self.uid {
-            return refuse("is bound to another user");
+        if peer_uid != self.uid || !bindable_uid(peer_uid) {
+            return Err(AgentRefusal::WrongUid);
         }
         Ok(())
     }
@@ -140,13 +212,22 @@ impl AgentCredential {
     }
 }
 
+/// The stored hash of a well-formed token, or `None` for anything else, so a
+/// malformed or oversized token is refused before any hashing.
+pub fn hash_presented_token(token: &str) -> Option<[u8; 32]> {
+    let well_formed = token.len() == TOKEN_LEN
+        && token.starts_with(TOKEN_PREFIX)
+        && token[TOKEN_PREFIX.len()..]
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    well_formed.then(|| token_hash(token))
+}
+
 fn token_hash(token: &str) -> [u8; 32] {
-    let mut input = Vec::with_capacity(TOKEN_HASH_DOMAIN.len() + token.len());
+    let mut input = Zeroizing::new(Vec::with_capacity(TOKEN_HASH_DOMAIN.len() + token.len()));
     input.extend_from_slice(TOKEN_HASH_DOMAIN);
     input.extend_from_slice(token.as_bytes());
-    let hash = blake2b_256(&input);
-    zeroize::Zeroize::zeroize(&mut input);
-    hash
+    blake2b_256(&input)
 }
 
 #[cfg(test)]
@@ -160,54 +241,94 @@ mod tests {
         AgentCredential::issue("claude", 1000, b"grant".to_vec(), NOW, DAY).unwrap()
     }
 
+    fn matches(c: &AgentCredential, token: &str) -> bool {
+        hash_presented_token(token).is_some_and(|h| c.matches_hash(&h))
+    }
+
     #[test]
     fn a_token_matches_only_its_own_credential() {
         let (a, token_a) = issue();
         let (b, token_b) = issue();
         assert!(token_a.starts_with(TOKEN_PREFIX));
-        assert_eq!(token_a.len(), TOKEN_PREFIX.len() + 64);
+        assert_eq!(token_a.len(), TOKEN_LEN);
         assert_ne!(a.id, b.id);
-        assert!(a.matches(&token_a));
-        assert!(!a.matches(&token_b));
-        assert!(!b.matches(&token_a));
-        assert!(!a.matches(""));
+        assert!(matches(&a, &token_a));
+        assert!(!matches(&a, &token_b));
+        assert!(!matches(&b, &token_a));
         let mut altered = token_a.to_string();
         let last = altered.pop().unwrap();
         altered.push(if last == '0' { '1' } else { '0' });
-        assert!(!a.matches(&altered));
+        assert!(!matches(&a, &altered));
     }
 
     #[test]
-    fn the_token_is_not_stored() {
+    fn only_a_well_formed_token_is_hashed() {
+        let (_, token) = issue();
+        assert!(hash_presented_token(&token).is_some());
+        let hex = &token[TOKEN_PREFIX.len()..];
+        for bad in [
+            String::new(),
+            hex.to_string(),
+            format!("{TOKEN_PREFIX}{}", &hex[1..]),
+            format!("{}0", token.as_str()),
+            format!("{TOKEN_PREFIX}{}", hex.to_uppercase()),
+            format!("{TOKEN_PREFIX}{}g", &hex[1..]),
+            format!("keep_xxx_{hex}"),
+            format!("{TOKEN_PREFIX}{}", "0".repeat(1 << 20)),
+        ] {
+            assert!(hash_presented_token(&bad).is_none(), "{:.40}", bad);
+        }
+    }
+
+    #[test]
+    fn neither_the_token_nor_its_hash_is_shown() {
         let (credential, token) = issue();
+        let hex = &token[TOKEN_PREFIX.len()..];
         let stored = serde_json::to_string(&credential).unwrap();
-        assert!(!stored.contains(&token[TOKEN_PREFIX.len()..]));
+        assert!(!stored.contains(hex));
+        let shown = format!("{credential:?}");
+        assert!(!shown.contains(hex));
+        assert!(!shown.contains(&hex::encode(credential.token_hash)));
+        assert!(shown.contains("grant_len: 5"));
     }
 
     #[test]
-    fn issuing_refuses_bad_names_uids_and_lifetimes() {
-        let refused = |name: &str, uid: u32, ttl: u64| {
-            AgentCredential::issue(name, uid, Vec::new(), NOW, ttl).unwrap_err()
+    fn issuing_refuses_bad_names_uids_lifetimes_and_grants() {
+        let refused = |name: &str, uid: u32, ttl: u64, grant: usize| {
+            AgentCredential::issue(name, uid, vec![0; grant], NOW, ttl).unwrap_err()
         };
-        assert!(refused("", 1000, DAY).to_string().contains("agent name"));
-        assert!(refused(&"a".repeat(65), 1000, DAY)
-            .to_string()
-            .contains("agent name"));
-        assert!(refused("a\nb", 1000, DAY)
-            .to_string()
-            .contains("agent name"));
-        assert!(refused("ok", 0, DAY).to_string().contains("uid 0"));
-        assert!(refused("ok", OVERFLOW_UID, DAY)
-            .to_string()
-            .contains("uid 65534"));
-        assert!(refused("ok", 1000, 0).to_string().contains("seconds"));
-        assert!(refused("ok", 1000, MAX_CREDENTIAL_TTL_SECS + 1)
+        let long = "a".repeat(65);
+        for name in [
+            "",
+            long.as_str(),
+            "a\nb",
+            "a\u{202e}b",
+            "caf\u{e9}",
+            "a\u{200b}b",
+        ] {
+            assert!(
+                refused(name, 1000, DAY, 0)
+                    .to_string()
+                    .contains("agent name"),
+                "{name:?}"
+            );
+        }
+        for uid in [0, OVERFLOW_UID, u32::MAX] {
+            assert!(refused("ok", uid, DAY, 0)
+                .to_string()
+                .contains(&format!("uid {uid}")));
+        }
+        assert!(refused("ok", 1000, 0, 0).to_string().contains("seconds"));
+        assert!(refused("ok", 1000, MAX_CREDENTIAL_TTL_SECS + 1, 0)
             .to_string()
             .contains("seconds"));
+        assert!(refused("ok", 1000, DAY, MAX_GRANT_BYTES + 1)
+            .to_string()
+            .contains("grant"));
         let (credential, _) = AgentCredential::issue(
-            &"a".repeat(64),
+            "my agent 1",
             1000,
-            Vec::new(),
+            vec![0; MAX_GRANT_BYTES],
             NOW,
             MAX_CREDENTIAL_TTL_SECS,
         )
@@ -218,19 +339,35 @@ mod tests {
     #[test]
     fn only_a_live_unfrozen_credential_from_its_uid_is_usable() {
         let (credential, _) = issue();
-        assert!(credential.check_usable(1000, NOW, false).is_ok());
-        assert!(credential.check_usable(1000, NOW + DAY - 1, false).is_ok());
-        let refusal = |c: &AgentCredential, uid, now, all| {
-            c.check_usable(uid, now, all).unwrap_err().to_string()
-        };
-        assert!(refusal(&credential, 1000, NOW + DAY, false).contains("expired"));
-        assert!(refusal(&credential, 1001, NOW, false).contains("another user"));
-        assert!(refusal(&credential, 1000, NOW, true).contains("frozen"));
+        assert_eq!(credential.check_usable(1000, NOW, false), Ok(()));
+        assert_eq!(credential.check_usable(1000, NOW + DAY - 1, false), Ok(()));
+        let refusal =
+            |c: &AgentCredential, uid, now, all| c.check_usable(uid, now, all).unwrap_err();
+        assert_eq!(
+            refusal(&credential, 1000, NOW + DAY, false),
+            AgentRefusal::Expired
+        );
+        assert_eq!(
+            refusal(&credential, 1000, NOW - 1, false),
+            AgentRefusal::ClockBehind
+        );
+        assert_eq!(
+            refusal(&credential, 1000, 0, false),
+            AgentRefusal::ClockBehind
+        );
+        assert_eq!(
+            refusal(&credential, 1001, NOW, false),
+            AgentRefusal::WrongUid
+        );
+        assert_eq!(refusal(&credential, 1000, NOW, true), AgentRefusal::Frozen);
         let mut frozen = credential.clone();
         frozen.frozen = true;
-        assert!(refusal(&frozen, 1000, NOW, false).contains("frozen"));
+        assert_eq!(refusal(&frozen, 1000, NOW, false), AgentRefusal::Frozen);
+        let mut tampered = credential.clone();
+        tampered.uid = 0;
+        assert_eq!(refusal(&tampered, 0, NOW, false), AgentRefusal::WrongUid);
         let mut revoked = credential;
         revoked.revoked = true;
-        assert!(refusal(&revoked, 1000, NOW, false).contains("revoked"));
+        assert_eq!(refusal(&revoked, 1000, NOW, false), AgentRefusal::Revoked);
     }
 }

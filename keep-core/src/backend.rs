@@ -232,6 +232,9 @@ impl RedbBackend {
             // undecryptable if only one of the pair carried through). Missing tables are skipped below.
             SECRETS_TABLE,
             SECRET_SEALS_TABLE,
+            // Agent gateway credentials and ledgers, carried through like every other table.
+            AGENT_CREDENTIALS_TABLE,
+            AGENT_LEDGERS_TABLE,
             // Carried through a file-format upgrade so the keep-state rollback-guard high-water-marks
             // survive; otherwise they reset and the guard reverts to first-sync (TOFU) for every d-tag.
             STATE_VERSIONS_TABLE,

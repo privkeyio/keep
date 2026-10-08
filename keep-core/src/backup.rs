@@ -914,7 +914,7 @@ mod tests {
         let (credential, _) = keep
             .issue_agent_credential("claude", 1000, b"grant".to_vec(), 3600)
             .unwrap();
-        keep.store_agent_ledgers(&[(&credential.id, b"ledger")])
+        keep.update_agent_ledgers(&[&credential.id], |_| Ok(vec![b"ledger".to_vec()]))
             .unwrap();
 
         let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
