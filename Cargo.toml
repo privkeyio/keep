@@ -36,7 +36,7 @@ keep-frost-net = { path = "keep-frost-net" }
 keep-nip46 = { path = "keep-nip46" }
 
 # Crypto
-argon2 = "0.5"
+argon2 = "0.6"
 chacha20poly1305 = "0.11"
 blake2 = "0.11"
 k256 = { version = "0.13", features = ["schnorr", "ecdh"] }
