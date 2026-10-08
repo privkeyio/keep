@@ -1311,6 +1311,20 @@ impl KfpNode {
                 }
             }
         }
+        // Recorded as soon as it has left, before aggregation can fail.
+        if sent > 0 {
+            debug!(session_id = %hex::encode(session_id), "Sent signature share");
+            self.audit_log.log_signing_operation(
+                *session_id,
+                &session_message,
+                None,
+                session_participants,
+                self.share.metadata.identifier,
+                SigningOperation::SignatureShareSent,
+                None,
+            );
+        }
+
         // Aggregate only after sending. Our own share may complete the set (we
         // were the last to commit and sign), and the others aggregate from the
         // shares they receive; completing removes the session, which is why its
@@ -1332,18 +1346,6 @@ impl KfpNode {
                 );
             }
         }
-
-        debug!(session_id = %hex::encode(session_id), "Sent signature share");
-
-        self.audit_log.log_signing_operation(
-            *session_id,
-            &session_message,
-            None,
-            session_participants,
-            self.share.metadata.identifier,
-            SigningOperation::SignatureShareSent,
-            None,
-        );
 
         Ok(())
     }
@@ -2460,11 +2462,15 @@ mod gate_tests {
         (node, mock, relay, peer_keys, session_id)
     }
 
+    fn audited(node: &KfpNode, session_id: &[u8; 32], op: SigningOperation) -> bool {
+        node.audit_log()
+            .get_entries_for_session(session_id)
+            .iter()
+            .any(|e| std::mem::discriminant(&e.operation) == std::mem::discriminant(&op))
+    }
+
     fn completed(node: &KfpNode, session_id: &[u8; 32]) -> bool {
-        node.sessions
-            .read()
-            .get_session(session_id)
-            .is_none_or(|s| s.is_complete())
+        audited(node, session_id, SigningOperation::SignatureCompleted)
     }
 
     /// A client for `keys` subscribed to the KFP events addressed to it, once
@@ -2562,6 +2568,11 @@ mod gate_tests {
         let (client, mut notifications) = listening(&relay, &peer_keys).await;
         assert!(node.generate_and_send_share(&session_id).await.is_err());
         assert!(receives_share(&mut notifications, &peer_keys, &session_id).await);
+        assert!(
+            audited(&node, &session_id, SigningOperation::SignatureShareSent),
+            "a share that left is recorded even though aggregation failed"
+        );
+        assert!(!completed(&node, &session_id));
         client.disconnect().await;
     }
 
@@ -2580,6 +2591,10 @@ mod gate_tests {
         .expect("does not hang")
         .expect("a completed signature is not torn down by a failed send");
         assert!(completed(&node, &session_id));
+        assert!(
+            !audited(&node, &session_id, SigningOperation::SignatureShareSent),
+            "a share that reached no peer is not recorded as sent"
+        );
     }
 
     /// A request whose participants leave out the requester, or are not
