@@ -32,6 +32,8 @@
 
 #![deny(missing_docs)]
 
+/// Credentials for AI agents served by the agent gateway.
+pub mod agent;
 /// Tamper-evident audit logging with hash chain integrity.
 pub mod audit;
 /// Pluggable storage backends.
@@ -559,6 +561,141 @@ impl Keep {
                 .with_message_hash(message)
                 .with_reason(context)
         })
+    }
+
+    /// Issue an agent gateway credential bound to `uid` for `ttl_secs`, with the
+    /// gateway's serialized `grant`. Returns it with its token, which is never
+    /// stored and must be handed to the agent now. Nothing is issued unless the
+    /// `AgentCredentialIssue` entry is written.
+    pub fn issue_agent_credential(
+        &mut self,
+        name: &str,
+        uid: u32,
+        grant: Vec<u8>,
+        ttl_secs: u64,
+    ) -> Result<(crate::agent::AgentCredential, Zeroizing<String>)> {
+        let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let (credential, token) =
+            crate::agent::AgentCredential::issue(name, uid, grant, now, ttl_secs)?;
+        self.storage.store_agent_credential(&credential)?;
+        let reason = format!(
+            "agent {} \"{}\" uid {} expires {}",
+            credential.id_hex(),
+            credential.name.escape_debug(),
+            credential.uid,
+            credential.expires_at
+        );
+        if let Err(e) = self.audit_event_required(AuditEventType::AgentCredentialIssue, |e| {
+            e.with_reason(&reason)
+        }) {
+            self.storage.delete_agent_credential(&credential.id)?;
+            return Err(e);
+        }
+        Ok((credential, token))
+    }
+
+    /// Every agent credential, revoked and expired ones included.
+    pub fn agent_credentials(&self) -> Result<Vec<crate::agent::AgentCredential>> {
+        self.storage.list_agent_credentials()
+    }
+
+    fn agent_credential(&self, id: &[u8; 16]) -> Result<crate::agent::AgentCredential> {
+        self.storage
+            .list_agent_credentials()?
+            .into_iter()
+            .find(|c| &c.id == id)
+            .ok_or_else(|| KeepError::NotFound(hex::encode(id)))
+    }
+
+    /// Revoke an agent credential for good. Revoking is never held back by the
+    /// audit log; its `AgentCredentialRevoke` entry is best effort.
+    pub fn revoke_agent_credential(&mut self, id: &[u8; 16]) -> Result<()> {
+        let mut credential = self.agent_credential(id)?;
+        credential.revoked = true;
+        self.storage.store_agent_credential(&credential)?;
+        self.audit_event(AuditEventType::AgentCredentialRevoke, |e| {
+            e.with_reason(&format!("agent {}", hex::encode(id)))
+        });
+        Ok(())
+    }
+
+    /// Delete an agent credential and its ledger, freeing its slot.
+    pub fn delete_agent_credential(&mut self, id: &[u8; 16]) -> Result<()> {
+        self.storage.delete_agent_credential(id)?;
+        self.audit_event(AuditEventType::AgentCredentialDelete, |e| {
+            e.with_reason(&format!("agent {}", hex::encode(id)))
+        });
+        Ok(())
+    }
+
+    /// Freeze or unfreeze one agent credential. Freezing is never held back by
+    /// the audit log; unfreezing is refused unless its entry is written.
+    pub fn set_agent_credential_frozen(&mut self, id: &[u8; 16], frozen: bool) -> Result<()> {
+        let mut credential = self.agent_credential(id)?;
+        let reason = format!("agent {}", hex::encode(id));
+        if frozen {
+            credential.frozen = true;
+            self.storage.store_agent_credential(&credential)?;
+            self.audit_event(AuditEventType::AgentFreeze, |e| e.with_reason(&reason));
+        } else {
+            self.audit_event_required(AuditEventType::AgentUnfreeze, |e| e.with_reason(&reason))?;
+            credential.frozen = false;
+            self.storage.store_agent_credential(&credential)?;
+        }
+        Ok(())
+    }
+
+    /// Freeze or unfreeze every agent credential at once, on the same terms as
+    /// [`Self::set_agent_credential_frozen`].
+    pub fn set_agent_freeze(&mut self, frozen: bool) -> Result<()> {
+        if frozen {
+            self.storage.set_agent_freeze(true)?;
+            self.audit_event(AuditEventType::AgentFreeze, |e| {
+                e.with_reason("every agent")
+            });
+        } else {
+            self.audit_event_required(AuditEventType::AgentUnfreeze, |e| {
+                e.with_reason("every agent")
+            })?;
+            self.storage.set_agent_freeze(false)?;
+        }
+        Ok(())
+    }
+
+    /// The credential `token` belongs to, if it is live, unfrozen and presented
+    /// by its own `peer_uid` at Unix time `now`. Every stored credential is
+    /// compared, so the time taken does not depend on which one matches. An
+    /// unreadable vault-wide freeze counts as frozen.
+    pub fn authenticate_agent(
+        &self,
+        token: &str,
+        peer_uid: u32,
+        now: u64,
+    ) -> Result<crate::agent::AgentCredential> {
+        let denied = || KeepError::permission_denied("agent credential refused");
+        if !token.starts_with(crate::agent::TOKEN_PREFIX) {
+            return Err(denied());
+        }
+        let mut found = None;
+        for credential in self.storage.list_agent_credentials()? {
+            if credential.matches(token) {
+                found = Some(credential);
+            }
+        }
+        let credential = found.ok_or_else(denied)?;
+        let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
+        credential.check_usable(peer_uid, now, all_frozen)?;
+        Ok(credential)
+    }
+
+    /// The serialized agent ledger stored under `key`, if any.
+    pub fn load_agent_ledger(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.storage.load_agent_ledger(key)
+    }
+
+    /// Store serialized agent ledgers in one durable transaction.
+    pub fn store_agent_ledgers(&self, ledgers: &[(&[u8], &[u8])]) -> Result<()> {
+        self.storage.store_agent_ledgers(ledgers)
     }
 
     /// List all stored secret records.
@@ -2041,6 +2178,179 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.event_type == event && e.pubkey.as_deref() == Some(&hex::encode(id)))
+    }
+
+    fn agent_entries(keep: &Keep, event: AuditEventType) -> Vec<String> {
+        keep.audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == event)
+            .filter_map(|e| e.reason)
+            .collect()
+    }
+
+    fn unix_now() -> u64 {
+        u64::try_from(chrono::Utc::now().timestamp()).unwrap()
+    }
+
+    /// An issued token authenticates only from its own uid, only while live,
+    /// and never once revoked; the lifecycle is audited with the credential id.
+    #[test]
+    fn an_agent_credential_authenticates_until_revoked() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (credential, token) = keep
+            .issue_agent_credential("claude", 1000, b"grant".to_vec(), 3600)
+            .unwrap();
+        let id = credential.id_hex();
+        let now = unix_now();
+        assert_eq!(
+            keep.authenticate_agent(&token, 1000, now).unwrap(),
+            credential
+        );
+        let refused = |keep: &Keep, token: &str, uid, now| {
+            matches!(
+                keep.authenticate_agent(token, uid, now),
+                Err(KeepError::PermissionDenied(_))
+            )
+        };
+        assert!(refused(&keep, &token, 1001, now));
+        assert!(refused(&keep, &token, 1000, credential.expires_at));
+        assert!(refused(&keep, &token[1..], 1000, now));
+        let (_, other) = keep
+            .issue_agent_credential("other", 1000, Vec::new(), 3600)
+            .unwrap();
+        assert_ne!(
+            keep.authenticate_agent(&other, 1000, now).unwrap().id,
+            credential.id
+        );
+        assert!(
+            agent_entries(&keep, AuditEventType::AgentCredentialIssue)[0]
+                .contains(&format!("agent {id} \"claude\" uid 1000"))
+        );
+
+        keep.revoke_agent_credential(&credential.id).unwrap();
+        assert!(refused(&keep, &token, 1000, now));
+        assert!(agent_entries(&keep, AuditEventType::AgentCredentialRevoke)[0].contains(&id));
+
+        keep.lock();
+        keep.unlock("testpass").unwrap();
+        assert!(refused(&keep, &token, 1000, now), "revocation persists");
+        assert!(keep.authenticate_agent(&other, 1000, now).is_ok());
+    }
+
+    /// A frozen credential, or every credential under the vault-wide freeze, is
+    /// refused until unfrozen.
+    #[test]
+    fn frozen_agent_credentials_are_refused() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (credential, token) = keep
+            .issue_agent_credential("claude", 1000, Vec::new(), 3600)
+            .unwrap();
+        let now = unix_now();
+        keep.set_agent_credential_frozen(&credential.id, true)
+            .unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, now).is_err());
+        keep.set_agent_credential_frozen(&credential.id, false)
+            .unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, now).is_ok());
+        keep.set_agent_freeze(true).unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, now).is_err());
+        keep.set_agent_freeze(false).unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, now).is_ok());
+        assert_eq!(agent_entries(&keep, AuditEventType::AgentFreeze).len(), 2);
+        assert_eq!(agent_entries(&keep, AuditEventType::AgentUnfreeze).len(), 2);
+    }
+
+    /// A vault-wide freeze flag that cannot be read counts as frozen.
+    #[test]
+    fn an_unreadable_agent_freeze_refuses_every_credential() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (_, token) = keep
+            .issue_agent_credential("claude", 1000, Vec::new(), 3600)
+            .unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, unix_now()).is_ok());
+        keep.storage
+            .put_raw(
+                crate::backend::CONFIG_TABLE,
+                b"agent_freeze",
+                b"not ciphertext",
+            )
+            .unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, unix_now()).is_err());
+    }
+
+    /// Without a writable audit log, nothing is issued and nothing is
+    /// unfrozen, while revoking and freezing still take effect.
+    #[test]
+    fn agent_credential_changes_that_loosen_need_the_audit_log() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let (credential, token) = keep
+            .issue_agent_credential("claude", 1000, Vec::new(), 3600)
+            .unwrap();
+        let (second, second_token) = keep
+            .issue_agent_credential("second", 1000, Vec::new(), 3600)
+            .unwrap();
+        keep.set_agent_credential_frozen(&second.id, true).unwrap();
+        let audit = path.join("audit.log");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+
+        let err = keep
+            .issue_agent_credential("unaudited", 1000, Vec::new(), 3600)
+            .unwrap_err();
+        assert!(matches!(err, KeepError::AuditWriteFailed(_)), "{err}");
+        assert_eq!(keep.agent_credentials().unwrap().len(), 2, "nothing issued");
+
+        assert!(keep.set_agent_credential_frozen(&second.id, false).is_err());
+        assert!(keep
+            .authenticate_agent(&second_token, 1000, unix_now())
+            .is_err());
+        assert!(keep.set_agent_freeze(true).is_ok());
+        assert!(keep.set_agent_freeze(false).is_err());
+        keep.revoke_agent_credential(&credential.id).unwrap();
+        assert!(keep.authenticate_agent(&token, 1000, unix_now()).is_err());
+    }
+
+    /// A vault holds a bounded number of credentials; deleting one frees its
+    /// slot and drops its ledger with it.
+    #[test]
+    fn agent_credentials_are_capped_and_deletable() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let mut ids = Vec::new();
+        for i in 0..crate::agent::MAX_AGENT_CREDENTIALS {
+            let (c, _) = keep
+                .issue_agent_credential(&format!("a{i}"), 1000, Vec::new(), 3600)
+                .unwrap();
+            ids.push(c.id);
+        }
+        let err = keep
+            .issue_agent_credential("one too many", 1000, Vec::new(), 3600)
+            .unwrap_err();
+        assert!(err.to_string().contains("at most"), "{err}");
+        keep.store_agent_ledgers(&[(&ids[0], b"ledger"), (b"wallet", b"w")])
+            .unwrap();
+        keep.delete_agent_credential(&ids[0]).unwrap();
+        assert!(keep.load_agent_ledger(&ids[0]).unwrap().is_none());
+        assert_eq!(
+            keep.load_agent_ledger(b"wallet")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"w"
+        );
+        assert!(keep
+            .issue_agent_credential("fits again", 1000, Vec::new(), 3600)
+            .is_ok());
+        assert!(matches!(
+            keep.delete_agent_credential(&ids[0]),
+            Err(KeepError::NotFound(_))
+        ));
     }
 
     /// Revealing a plain secret's value leaves a `SecretReveal` entry, like a

@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, trace, warn};
 
+use crate::agent::{AgentCredential, MAX_AGENT_CREDENTIALS};
 use crate::backend::{
-    AtomicOp, RedbBackend, StorageBackend, CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE,
-    KEYS_TABLE, PENDING_TOMBSTONES_TABLE, RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE,
-    SHARES_TABLE, STATE_VERSIONS_TABLE,
+    AtomicOp, RedbBackend, StorageBackend, AGENT_CREDENTIALS_TABLE, AGENT_LEDGERS_TABLE,
+    CONFIG_TABLE, DESCRIPTORS_TABLE, HEALTH_STATUS_TABLE, KEYS_TABLE, PENDING_TOMBSTONES_TABLE,
+    RELAY_CONFIGS_TABLE, SECRETS_TABLE, SECRET_SEALS_TABLE, SHARES_TABLE, STATE_VERSIONS_TABLE,
 };
 use crate::crypto::{self, Argon2Params, EncryptedData, SecretKey, SALT_SIZE};
 use crate::error::{KeepError, Result, StorageError};
@@ -650,6 +651,8 @@ impl Storage {
         backend.create_table(HEALTH_STATUS_TABLE)?;
         backend.create_table(SECRETS_TABLE)?;
         backend.create_table(SECRET_SEALS_TABLE)?;
+        backend.create_table(AGENT_CREDENTIALS_TABLE)?;
+        backend.create_table(AGENT_LEDGERS_TABLE)?;
         backend.create_table(STATE_VERSIONS_TABLE)?;
 
         Ok(Self {
@@ -1160,6 +1163,95 @@ impl Storage {
         Ok(())
     }
 
+    fn encrypt_value(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        Ok(crypto::encrypt(plaintext, data_key)?.to_bytes())
+    }
+
+    fn decrypt_value(&self, stored: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+        let data_key = self.data_key.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = EncryptedData::from_bytes(stored)?;
+        crypto::decrypt(&encrypted, data_key)?.as_slice()
+    }
+
+    /// Insert or overwrite an agent credential, encrypted under the data key.
+    /// A new credential is refused once [`MAX_AGENT_CREDENTIALS`] are stored.
+    pub fn store_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend
+            .get(AGENT_CREDENTIALS_TABLE, &credential.id)?
+            .is_none()
+            && backend.list(AGENT_CREDENTIALS_TABLE)?.len() >= MAX_AGENT_CREDENTIALS
+        {
+            return Err(KeepError::invalid_input(format!(
+                "a vault holds at most {MAX_AGENT_CREDENTIALS} agent credentials; delete a revoked one first"
+            )));
+        }
+        let serialized = Zeroizing::new(bincode_options().serialize(credential)?);
+        let encrypted = self.encrypt_value(&serialized)?;
+        backend.put(AGENT_CREDENTIALS_TABLE, &credential.id, &encrypted)
+    }
+
+    /// Every stored agent credential.
+    pub fn list_agent_credentials(&self) -> Result<Vec<AgentCredential>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend
+            .list(AGENT_CREDENTIALS_TABLE)?
+            .iter()
+            .map(|(_, stored)| Ok(bincode_options().deserialize(&self.decrypt_value(stored)?)?))
+            .collect()
+    }
+
+    /// Delete an agent credential and its ledger in one transaction. Errors if
+    /// no such credential exists.
+    pub fn delete_agent_credential(&self, id: &[u8; 16]) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none() {
+            return Err(KeepError::NotFound(hex::encode(id)));
+        }
+        backend.write_atomic(&[
+            AtomicOp {
+                table: AGENT_CREDENTIALS_TABLE,
+                key: id,
+                value: None,
+            },
+            AtomicOp {
+                table: AGENT_LEDGERS_TABLE,
+                key: id,
+                value: None,
+            },
+        ])
+    }
+
+    /// The serialized agent ledger stored under `key`, if any.
+    pub fn load_agent_ledger(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend
+            .get(AGENT_LEDGERS_TABLE, key)?
+            .map(|stored| self.decrypt_value(&stored))
+            .transpose()
+    }
+
+    /// Store serialized agent ledgers, all in one durable transaction, so a
+    /// spend is never counted in one ledger and missing from another.
+    pub fn store_agent_ledgers(&self, ledgers: &[(&[u8], &[u8])]) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = ledgers
+            .iter()
+            .map(|(_, ledger)| self.encrypt_value(ledger))
+            .collect::<Result<Vec<_>>>()?;
+        let ops: Vec<AtomicOp<'_>> = ledgers
+            .iter()
+            .zip(&encrypted)
+            .map(|((key, _), value)| AtomicOp {
+                table: AGENT_LEDGERS_TABLE,
+                key,
+                value: Some(value),
+            })
+            .collect();
+        backend.write_atomic(&ops)
+    }
+
     /// The storage directory path.
     pub fn path(&self) -> &Path {
         &self.path
@@ -1607,6 +1699,31 @@ impl Storage {
 
         backend.put(CONFIG_TABLE, b"kill_switch", &encrypted_bytes)?;
         Ok(())
+    }
+
+    /// Whether every agent credential is frozen.
+    pub fn get_agent_freeze(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let Some(stored) = backend.get(CONFIG_TABLE, b"agent_freeze")? else {
+            return Ok(false);
+        };
+        Ok(self.decrypt_value(&stored)?.first().copied() == Some(1))
+    }
+
+    /// Write raw bytes into a table, for tests that corrupt a stored value.
+    #[cfg(test)]
+    pub(crate) fn put_raw(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .put(table, key, value)
+    }
+
+    /// Freeze or unfreeze every agent credential.
+    pub fn set_agent_freeze(&self, frozen: bool) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = self.encrypt_value(&[u8::from(frozen)])?;
+        backend.put(CONFIG_TABLE, b"agent_freeze", &encrypted)
     }
 
     /// Get the proxy configuration from the vault.

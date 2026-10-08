@@ -9,7 +9,7 @@ const METADATA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("metad
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 
 /// The current schema version supported by this build.
-pub const CURRENT_SCHEMA_VERSION: u32 = 7;
+pub const CURRENT_SCHEMA_VERSION: u32 = 8;
 
 /// A migration function that transforms the database schema.
 pub type MigrationFn = fn(&Database) -> Result<()>;
@@ -143,6 +143,22 @@ fn migrate_v6_to_v7(db: &Database) -> Result<()> {
     Ok(())
 }
 
+const AGENT_CREDENTIALS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("agent_credentials");
+const AGENT_LEDGERS_TABLE_DEF: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("agent_ledgers");
+
+/// v7 → v8: introduce the agent gateway's `agent_credentials` and
+/// `agent_ledgers` tables. Creating the empty tables is the whole migration;
+/// existing rows are untouched.
+fn migrate_v7_to_v8(db: &Database) -> Result<()> {
+    let wtxn = db.begin_write()?;
+    wtxn.open_table(AGENT_CREDENTIALS_TABLE_DEF)?;
+    wtxn.open_table(AGENT_LEDGERS_TABLE_DEF)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
 fn get_migrations() -> Vec<Migration> {
     vec![
         Migration {
@@ -174,6 +190,11 @@ fn get_migrations() -> Vec<Migration> {
             from_version: 6,
             to_version: 7,
             migrate: migrate_v6_to_v7,
+        },
+        Migration {
+            from_version: 7,
+            to_version: 8,
+            migrate: migrate_v7_to_v8,
         },
     ]
 }
@@ -495,6 +516,18 @@ mod tests {
             read_schema_version(&db).unwrap(),
             Some(CURRENT_SCHEMA_VERSION)
         );
+    }
+
+    /// A v7 vault gains the agent gateway's tables, empty.
+    #[test]
+    fn v7_to_v8_adds_the_agent_tables() {
+        let (_dir, db) = create_test_db();
+        write_schema_version(&db, 7).unwrap();
+        assert_eq!(run_migrations(&db).unwrap().migrations_run, 1);
+        let rtxn = db.begin_read().unwrap();
+        for table in [AGENT_CREDENTIALS_TABLE_DEF, AGENT_LEDGERS_TABLE_DEF] {
+            assert_eq!(rtxn.open_table(table).unwrap().iter().unwrap().count(), 0);
+        }
     }
 
     /// `read_schema_version().unwrap_or(1)` means an uninitialized vault is
