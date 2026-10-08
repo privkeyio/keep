@@ -2351,6 +2351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3864,7 +3873,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -4559,7 +4568,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "dialoguer",
- "dirs",
+ "dirs 7.0.0",
  "frost-secp256k1-tr",
  "fs2",
  "hex",
@@ -4613,7 +4622,7 @@ dependencies = [
  "chacha20poly1305 0.11.0",
  "chrono",
  "criterion",
- "dirs",
+ "dirs 7.0.0",
  "frost-ed25519",
  "frost-secp256k1-tr",
  "fs2",
@@ -4652,7 +4661,7 @@ dependencies = [
  "base64 0.23.1",
  "bitcoin",
  "chrono",
- "dirs",
+ "dirs 7.0.0",
  "gtk",
  "hex",
  "iced",
@@ -5976,7 +5985,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 3.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -8315,7 +8324,7 @@ version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
 ]
 
 [[package]]
@@ -9479,7 +9488,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "045979e3f037cd18ad1cb2a419dfda133c5c29c9f3453370079f2255d46c257e"
 dependencies = [
  "crossbeam-channel",
- "dirs",
+ "dirs 6.0.0",
  "libappindicator",
  "muda",
  "objc2 0.6.4",
