@@ -52,17 +52,27 @@ proptest! {
     fn sign_request_roundtrip(
         message in prop::collection::vec(any::<u8>(), 1..1024),
         msg_type in "[a-z_]{1,32}",
-        participants in prop::collection::vec(1u16..256, 2..10)
+        participants in prop::collection::btree_set(1u16..256, 2..10)
     ) {
+        let participants: Vec<u16> = participants.into_iter().collect();
         let payload = SignRequestPayload::new(
             [1u8; 32], [2u8; 32], message.clone(), &msg_type, participants.clone(),
         );
         let KfpMessage::SignRequest(p) = roundtrip(KfpMessage::SignRequest(payload)) else {
             panic!("Expected SignRequest");
         };
-        prop_assert_eq!(p.message, message);
-        prop_assert_eq!(p.message_type, msg_type);
-        prop_assert_eq!(p.participants, participants);
+        prop_assert_eq!(p.message, message.clone());
+        prop_assert_eq!(p.message_type, msg_type.clone());
+        prop_assert_eq!(p.participants, participants.clone());
+
+        let mut repeated = participants.clone();
+        repeated.push(participants[0]);
+        let json = KfpMessage::SignRequest(SignRequestPayload::new(
+            [1u8; 32], [2u8; 32], message, &msg_type, repeated,
+        ))
+        .to_json()
+        .unwrap();
+        prop_assert!(KfpMessage::from_json(&json).is_err(), "a repeated participant is refused");
     }
 
     #[test]
