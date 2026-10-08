@@ -553,8 +553,9 @@ const POLL_WAKE: Duration = Duration::from_millis(500);
 /// once they move on. So after a round completes, our package goes out again
 /// until a relay has accepted [`FINAL_SENDS`] copies [`FINAL_SEND_GAP`] apart,
 /// which also outlasts a relay that registers a REQ after a later EVENT or
-/// refuses a burst. After [`FINAL_SEND_ATTEMPTS`] passes the round ends anyway:
-/// a completed round is never turned into a failure.
+/// refuses a burst. After [`FINAL_SEND_ATTEMPTS`] passes, or once the round's
+/// deadline passes, the round ends anyway: a completed round is never turned
+/// into a failure.
 const FINAL_SENDS: u32 = 2;
 const FINAL_SEND_GAP: Duration = Duration::from_secs(1);
 const FINAL_SEND_ATTEMPTS: u32 = 5;
@@ -1091,7 +1092,7 @@ pub async fn run_software_dkg(
         };
         round1_sent |= accepted;
         if round1_done >= expected_peers && round1_sent {
-            if final_sends.done(accepted).await {
+            if start.elapsed() > timeout || final_sends.done(accepted).await {
                 break;
             }
             continue;
@@ -1222,7 +1223,7 @@ pub async fn run_software_dkg(
             }
         }
         if round2_done >= expected_peers && round2_sent.len() >= round2_outbound.len() {
-            if final_sends.done(accepted).await {
+            if start.elapsed() > timeout || final_sends.done(accepted).await {
                 break;
             }
             continue;
@@ -1342,7 +1343,12 @@ pub async fn run_software_dkg(
     let mut final_sends = FinalSends::default();
     let start = Instant::now();
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        // Once every confirmation is in and ours is out, peers can finalize
+        // with ours, so a cancel no longer drops our share: the final sends
+        // finish and the group is kept.
+        if cancel.load(Ordering::Relaxed)
+            && !(confirmed_indices.len() as u32 >= expected_peers && confirm_sent)
+        {
             return Err(cancelled());
         }
         let accepted = match transport
@@ -1357,7 +1363,7 @@ pub async fn run_software_dkg(
         };
         confirm_sent |= accepted;
         if confirmed_indices.len() as u32 >= expected_peers && confirm_sent {
-            if final_sends.done(accepted).await {
+            if start.elapsed() > timeout || final_sends.done(accepted).await {
                 break;
             }
             continue;
@@ -2229,6 +2235,9 @@ mod tests {
         /// Reach the round of this kind this much later than the others: the
         /// first send or fetch of that kind waits this long.
         late_for: StdMutex<Option<(Kind, Duration)>>,
+        /// Set this flag once an event of this kind is collected, as a user
+        /// pressing cancel at that moment would.
+        cancel_on_collect: Option<(Kind, Arc<AtomicBool>)>,
     }
 
     impl EphemeralRelay {
@@ -2246,6 +2255,7 @@ mod tests {
                 relay: self.clone(),
                 me,
                 late_for: StdMutex::new(late_for),
+                cancel_on_collect: None,
             }
         }
     }
@@ -2274,6 +2284,11 @@ mod tests {
             }
             for ev in self.me.inbox.lock().unwrap().drain(..) {
                 if filter.match_event(&ev, MatchEventOptions::new()) {
+                    if let Some((kind, cancel)) = &self.cancel_on_collect {
+                        if ev.kind == *kind {
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
                     collecting.1.push(ev);
                 }
             }
@@ -2445,6 +2460,85 @@ mod tests {
         );
         for o in &outcomes {
             assert_eq!(o.result.group_pubkey, outcomes[0].result.group_pubkey);
+            o.certificate.verify(&roster).unwrap();
+        }
+    }
+
+    /// Run a 2-of-2 DKG in which each participant's cancel flag is set when it
+    /// collects its first event of `cancel_on`.
+    async fn cancel_when_collecting(cancel_on: u16) -> Vec<Result<DkgOutcome>> {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x5e; 32]);
+        let relay = EphemeralRelay::new(RelayBehavior {
+            ordered: true,
+            subscribe_latency: Duration::from_millis(200),
+            refuse_after_delivery: 0,
+        });
+        let local = tokio::task::LocalSet::new();
+        let runs: Vec<_> = (1..=2u16)
+            .map(|index| {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let mut transport = relay.join(None);
+                transport.cancel_on_collect = Some((Kind::Custom(cancel_on), cancel.clone()));
+                let keys = keys[index as usize - 1].clone();
+                let roster = roster.clone();
+                local.spawn_local(async move {
+                    let mut session = SoftwareDkgSession::init(2, 2, index).unwrap();
+                    run_software_dkg(
+                        &mut session,
+                        &transport,
+                        &keys,
+                        &roster,
+                        "g",
+                        index,
+                        Duration::from_secs(5),
+                        &cancel,
+                        &NoopProgress,
+                    )
+                    .await
+                })
+            })
+            .collect();
+        let mut results = Vec::new();
+        local
+            .run_until(async {
+                for run in runs {
+                    results.push(run.await.unwrap());
+                }
+            })
+            .await;
+        results
+    }
+
+    /// Cancelling before the confirmation round completes aborts the run, and
+    /// no participant finalizes (one that did not cancel times out).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_before_confirmation_completes_aborts() {
+        let errors: Vec<String> = cancel_when_collecting(DKG_KIND_ROUND1)
+            .await
+            .into_iter()
+            .map(|r| r.err().expect("no participant may finalize").to_string())
+            .collect();
+        assert!(errors.iter().any(|e| e.contains("cancelled")), "{errors:?}");
+    }
+
+    /// Once a participant holds every confirmation and a relay accepted its
+    /// own, peers can finalize with it, so a cancel then keeps the group: the
+    /// run returns its certificate instead of dropping its share.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_after_confirmation_completes_keeps_the_group() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x5e; 32]);
+        let outcomes: Vec<DkgOutcome> = cancel_when_collecting(DKG_KIND_CONFIRM)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            outcomes[0].result.group_pubkey,
+            outcomes[1].result.group_pubkey
+        );
+        for o in &outcomes {
             o.certificate.verify(&roster).unwrap();
         }
     }

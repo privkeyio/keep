@@ -1436,7 +1436,10 @@ impl KeepMobile {
     /// (the id delivered via `DkgProgressUpdate::Started`). The coordinator polls
     /// the run's flag between relay fetches (§8/§9) and aborts promptly with a
     /// cancelled error, tearing down the transport cleanly, instead of leaving a
-    /// live session for a `reset` to corrupt. A `run_id` that does not match the
+    /// live session for a `reset` to corrupt. A cancel that arrives once this
+    /// device holds every confirmation and a relay accepted its own is not
+    /// honored, since peers can already finalize with it: the run completes and
+    /// the share is kept. A `run_id` that does not match the
     /// active run is ignored, so a cancel issued for a run that has since finished
     /// cannot abort a later run (§8: no wiping a concurrent run).
     pub fn frost_cancel_dkg(&self, run_id: u64) {

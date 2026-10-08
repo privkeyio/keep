@@ -353,6 +353,9 @@ CLI keeps its current transport, mobile supplies the hardened one.
   pre-ECDH; `session_secret` survives only as the optional private channel id. ✅
 - **Cancellation:** in scope — `CancellationToken` through the coordinator; the UI
   gets a clean cancel instead of `frost_dkg_reset` corrupting a live session. ✅
+  A cancel after this device holds every confirmation and a relay accepted its
+  own is not honored: peers can already finalize with it, so the run finishes
+  its final sends and returns the group rather than discarding its share.
 - **Collector variant:** deferred; the §5 transcript binds the full roster, so a
   malicious collector swapping an entry makes every honest transcript diverge →
   CertEq fails. ✅ (door stays open)
