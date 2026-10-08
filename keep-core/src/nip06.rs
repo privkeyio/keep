@@ -99,6 +99,23 @@ mod tests {
         );
     }
 
+    // The passphrase is NFKD-normalized into the seed (BIP-39), so composed and
+    // decomposed spellings derive the same key. Known answers from an independent
+    // Python BIP-39/BIP-32 derivation.
+    #[test]
+    fn passphrase_is_part_of_the_seed_and_normalized() {
+        let mnemonic =
+            "leader monkey parrot ring guide accident before fence cannon height naive bean";
+        let derived = |passphrase| hex::encode(*derive_nostr_key(mnemonic, passphrase, 0).unwrap());
+        assert_eq!(
+            derived("TREZOR"),
+            "3e8ef6dcb3fd0d9fe65ae48accd01a3058677b033de5310c4d8b6c28377aada8"
+        );
+        let normalized = "670b784399167fabb60d4462880284ce624ba6a5a227e0579ce61f89ac9e8d0d";
+        assert_eq!(derived("Pr\u{fc}fung"), normalized);
+        assert_eq!(derived("Pru\u{308}fung"), normalized);
+    }
+
     #[test]
     fn reject_invalid_mnemonic() {
         let err = derive_nostr_key("not a valid mnemonic", "", 0).unwrap_err();

@@ -56,6 +56,21 @@ mod tests {
         assert!(generate_mnemonic(0).is_err());
     }
 
+    // BIP-39 reference vectors: generation encodes entropy with this mapping.
+    #[test]
+    fn entropy_encodes_to_the_reference_mnemonics() {
+        let encode = |entropy: &[u8]| Mnemonic::from_entropy(entropy).unwrap().to_string();
+        assert_eq!(
+            encode(&[0x00; 16]),
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        );
+        assert_eq!(
+            encode(&[0x7f; 16]),
+            "legal winner thank year wave sausage worth useful legal winner thank yellow"
+        );
+        assert_eq!(encode(&[0xff; 32]), format!("{}vote", "zoo ".repeat(23)));
+    }
+
     #[test]
     fn validate_known_mnemonic() {
         validate_mnemonic(
