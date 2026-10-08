@@ -319,6 +319,7 @@ struct AuditStats {
     agent_delete: u32,
     agent_freeze: u32,
     agent_unfreeze: u32,
+    agent_refused: u32,
 }
 
 impl AuditStats {
@@ -358,6 +359,7 @@ impl AuditStats {
             AuditEventType::AgentCredentialDelete => self.agent_delete += 1,
             AuditEventType::AgentFreeze => self.agent_freeze += 1,
             AuditEventType::AgentUnfreeze => self.agent_unfreeze += 1,
+            AuditEventType::AgentRefused => self.agent_refused += 1,
         }
     }
 }
@@ -435,6 +437,10 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         stats.secret_create, stats.secret_delete, stats.secret_reveal
     ));
     out.info(&format!(
+        "  Agent requests refused: {}",
+        stats.agent_refused
+    ));
+    out.info(&format!(
         "  Agent credentials: {} issued / {} revoked / {} deleted, {} freezes / {} unfreezes",
         stats.agent_issue,
         stats.agent_revoke,
@@ -493,6 +499,7 @@ mod stats_tests {
         stats.record(AuditEventType::AgentCredentialDelete);
         stats.record(AuditEventType::AgentFreeze);
         stats.record(AuditEventType::AgentUnfreeze);
+        stats.record(AuditEventType::AgentRefused);
 
         assert_eq!(stats.key_gen, 1);
         assert_eq!(stats.key_import, 2);
@@ -524,6 +531,7 @@ mod stats_tests {
         assert_eq!(stats.agent_delete, 1);
         assert_eq!(stats.agent_freeze, 1);
         assert_eq!(stats.agent_unfreeze, 1);
+        assert_eq!(stats.agent_refused, 1);
     }
 
     /// Closes the #526 gap surfaced by #441's testing pass: each of the

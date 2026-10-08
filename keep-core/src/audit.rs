@@ -105,6 +105,8 @@ pub enum AuditEventType {
     AgentFreeze = 31,
     /// One agent credential, or every one, unfrozen.
     AgentUnfreeze = 32,
+    /// An agent gateway request refused, or held for an approval.
+    AgentRefused = 33,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -143,6 +145,7 @@ impl std::fmt::Display for AuditEventType {
             Self::AgentCredentialDelete => write!(f, "agent_credential_delete"),
             Self::AgentFreeze => write!(f, "agent_freeze"),
             Self::AgentUnfreeze => write!(f, "agent_unfreeze"),
+            Self::AgentRefused => write!(f, "agent_refused"),
         }
     }
 }

@@ -8,7 +8,7 @@ description = "Agent SDK for Keep - secure signing for AI agents"
 
 [features]
 default = []
-mcp = ["dep:serde_json"]
+mcp = []
 enclave = ["dep:aws-nitro-enclaves-nsm-api"]
 
 [dependencies]
@@ -16,7 +16,7 @@ keep-core = { path = "../keep-core" }
 keep-bitcoin = { path = "../keep-bitcoin" }
 
 serde = { workspace = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }

@@ -548,14 +548,7 @@ impl Keep {
         message: &[u8],
         context: &str,
     ) -> Result<()> {
-        let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
-        if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
-            return Err(KeepError::AuditWriteFailed(format!(
-                "audit log is full ({count} entries): stop the agent, export the log with \
-                 `keep audit export`, then prune it with \
-                 `keep audit retention --max-entries 10000 --apply`"
-            )));
-        }
+        self.check_agent_audit_room()?;
         self.audit_event_required(AuditEventType::Sign, |e| {
             e.with_pubkey(pubkey)
                 .with_message_hash(message)
@@ -735,6 +728,28 @@ impl Keep {
         F: FnOnce(&[Option<Zeroizing<Vec<u8>>>]) -> Result<Vec<Vec<u8>>>,
     {
         self.storage.update_agent_ledgers(keys, update)
+    }
+
+    /// Records a request by the agent credential `id` that was refused or held
+    /// for an approval, with `detail` saying why. Fails when the entry cannot be
+    /// written, and stops [`AGENT_AUDIT_HEADROOM`] short of the most entries the
+    /// log is read back with, like [`Self::record_agent_signature`].
+    pub fn record_agent_refusal(&mut self, id: &[u8; 16], detail: &str) -> Result<()> {
+        self.check_agent_audit_room()?;
+        let reason = format!("agent {} {detail}", hex::encode(id));
+        self.audit_event_required(AuditEventType::AgentRefused, |e| e.with_reason(&reason))
+    }
+
+    fn check_agent_audit_room(&self) -> Result<()> {
+        let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
+        if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
+            return Err(KeepError::AuditWriteFailed(format!(
+                "audit log is full ({count} entries): stop the agent, export the log with \
+                 `keep audit export`, then prune it with \
+                 `keep audit retention --max-entries 10000 --apply`"
+            )));
+        }
+        Ok(())
     }
 
     /// List all stored secret records.
@@ -2604,13 +2619,41 @@ mod tests {
             .record_agent_signature(&[1; 32], b"m", "over")
             .unwrap_err();
         assert!(err.to_string().contains("audit log is full"), "{err}");
+        let err = keep.record_agent_refusal(&[2; 16], "over").unwrap_err();
+        assert!(err.to_string().contains("audit log is full"), "{err}");
         assert_eq!(
             lines(&audit),
             ceiling,
-            "the refused signature wrote nothing"
+            "the refused signature and refusal wrote nothing"
         );
         keep.audit_event_required(AuditEventType::VaultLock, |e| e)
             .unwrap();
+    }
+
+    /// A refused agent request is recorded with its credential and reason, and
+    /// a refusal that cannot be recorded fails.
+    #[test]
+    fn agent_refusals_are_recorded_fail_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.record_agent_refusal(&[7; 16], "deny kind 4 is not granted")
+            .unwrap();
+        let entries = agent_entries(&keep, AuditEventType::AgentRefused);
+        assert_eq!(
+            entries,
+            vec![format!(
+                "agent {} deny kind 4 is not granted",
+                hex::encode([7u8; 16])
+            )]
+        );
+        let audit = path.join("audit.log");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        assert!(matches!(
+            keep.record_agent_refusal(&[7; 16], "again"),
+            Err(KeepError::AuditWriteFailed(_))
+        ));
     }
 
     #[test]
