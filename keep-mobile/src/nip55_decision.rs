@@ -350,23 +350,27 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         )
     };
 
-    // An ASK row is only ever set by the user, to be asked; the policy does not
-    // override that choice.
+    // An ASK row is only ever set by the user, to be asked; neither the sign
+    // policy nor a whitelisted relay (gate 8) overrides that choice.
     if policy_result == SignPolicyEvaluation::AutoApprove
         && decision != Some(Nip55PermissionDecision::Ask)
     {
         return Nip55Outcome::AutoApprove;
     }
 
-    // Gate 8: standing permission. A whitelisted relay auto-signs (an explicit
-    // per-app DENY already rejected at gate 6).
+    // Gate 8: standing permission. A whitelisted relay auto-signs unless the
+    // app's own decision is ASK (an explicit per-app DENY already rejected at
+    // gate 6).
     // `decision` is the per-kind (kind-22242) resolution: because 22242 is a
     // sensitive kind, a kind-agnostic DENY row never falls back here (matching
     // how the standing-permission storage resolves it), so a blanket DENY does
     // not block a whitelisted relay. The DENY checks here and below cannot be
     // reached after gate 6 and stay as defense in depth.
     if relay_gate == Some(Nip55RelayAuthGate::AutoAccept)
-        && decision != Some(Nip55PermissionDecision::Deny)
+        && !matches!(
+            decision,
+            Some(Nip55PermissionDecision::Deny | Nip55PermissionDecision::Ask)
+        )
     {
         return Nip55Outcome::AutoApprove;
     }
@@ -897,12 +901,15 @@ mod tests {
         let mut generic = i.clone();
         generic.stored_generic_permission = Some(perm("deny"));
         assert_eq!(reject_reason(&evaluate_nip55_request(generic)), "deny");
-        let mut ask = i.clone();
-        ask.stored_exact_permission = Some(perm("ask"));
-        assert!(matches!(
-            evaluate_nip55_request(ask),
-            Nip55Outcome::RequireUi { .. }
-        ));
+        for (exact, generic) in [(Some(perm("ask")), None), (None, Some(perm("ask")))] {
+            let mut ask = i.clone();
+            ask.stored_exact_permission = exact;
+            ask.stored_generic_permission = generic;
+            assert!(matches!(
+                evaluate_nip55_request(ask),
+                Nip55Outcome::RequireUi { .. }
+            ));
+        }
         let monotonic = |duration_ms| Nip55StoredPermission {
             created_at_elapsed: 1_000,
             duration_ms: Some(duration_ms),
@@ -974,6 +981,18 @@ mod tests {
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_exact_permission = Some(perm("deny"));
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny");
+    }
+
+    #[test]
+    fn whitelisted_relay_defers_to_an_explicit_ask() {
+        let mut i = base();
+        i.event_json = relay_auth_event("relay.allowed.com");
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i.stored_exact_permission = Some(perm("ask"));
+        assert!(matches!(
+            evaluate_nip55_request(i),
+            Nip55Outcome::RequireUi { .. }
+        ));
     }
 
     // Relay auth is a sensitive kind, so a kind-agnostic DENY does not apply to
