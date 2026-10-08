@@ -13,8 +13,9 @@
 //! `assess_signing_risk`) in the exact gate order:
 //!
 //!   caller-verified -> kill-switch -> lock -> front-door rate limit ->
-//!   velocity -> relay-auth whitelist -> sign policy -> app expiry ->
-//!   standing permission (per-app DENY wins over a whitelisted relay).
+//!   velocity -> relay-auth whitelist -> app expiry and standing DENY ->
+//!   sign policy -> standing permission. An expired app or an explicit per-app
+//!   DENY rejects before the sign policy or a whitelisted relay can approve.
 //!
 //! The function is pure: the Android layer gathers the platform inputs (verified
 //! caller, kill-switch/lock flags, the stateful front-door and opt-in rate-limit
@@ -103,7 +104,7 @@ pub struct Nip55DecisionInputs {
     /// Age of the app's first grant, if known.
     pub app_age_ms: Option<u64>,
     /// The caller's current LOCAL hour (0-23) for risk scoring. It drives both
-    /// the gate-6 auto-approve decision and the gate-7 risk shown in the prompt,
+    /// the gate-7 auto-approve decision and the gate-8 risk shown in the prompt,
     /// so the score that gates the decision cannot diverge from the displayed one.
     pub current_hour: u32,
 
@@ -258,6 +259,42 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         };
     }
 
+    // Gate 6: app expiry and the standing permission, before the sign policy,
+    // so neither an expired app nor one the user explicitly denied is ever
+    // auto-approved. Each fails closed: an unknown expiry or an unreadable
+    // permission store rejects, since either could hide a denial.
+    match inputs.app_expired {
+        None => {
+            return Nip55Outcome::Reject {
+                reason: "deny_timeout".to_string(),
+            }
+        }
+        Some(true) => {
+            return Nip55Outcome::Reject {
+                reason: "deny_expired".to_string(),
+            }
+        }
+        Some(false) => {}
+    }
+    if !inputs.permission_lookup_ok {
+        return Nip55Outcome::Reject {
+            reason: "lookup_timeout".to_string(),
+        };
+    }
+    // `event_kind` is bounded to u16 at derivation, so the i32 cast never wraps.
+    let decision = nip55_resolve_decision(
+        inputs.stored_exact_permission.clone(),
+        inputs.stored_generic_permission.clone(),
+        event_kind.map(|k| k as i32),
+        inputs.now_elapsed_ms,
+        inputs.now_wall_ms,
+    );
+    if decision == Some(Nip55PermissionDecision::Deny) {
+        return Nip55Outcome::Reject {
+            reason: "deny".to_string(),
+        };
+    }
+
     let ctx = SigningRequestContext {
         operation: inputs.request_type.clone(),
         package_name: inputs.package_name.clone(),
@@ -266,8 +303,8 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         app_age_ms: inputs.app_age_ms,
     };
 
-    // Gate 6: sign policy. When opted in, use the limiter result (an unavailable
-    // limiter fails open to the UI, i.e. falls through to gate 7). When not opted
+    // Gate 7: sign policy. When opted in, use the limiter result (an unavailable
+    // limiter fails open to the UI, i.e. falls through to gate 8). When not opted
     // in, feed a synthetic "allowed" so evaluate_sign_policy_selection runs and
     // applies its own not-opted-in denial.
     //
@@ -276,7 +313,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     // below the stricter `BASIC_RISK_THRESHOLD`, and `Auto` auto-approves only
     // below `RISK_ESCALATION_THRESHOLD`. `Basic` is therefore a strict subset of
     // `Auto`. Both tiers score against `inputs.current_hour`, the same local hour
-    // gate 7 displays.
+    // gate 8 displays.
     let (policy_result, recent_count) = if inputs.is_opted_in {
         match &inputs.opt_in_rate_check {
             None => (SignPolicyEvaluation::FallToUi, 0),
@@ -315,44 +352,13 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         return Nip55Outcome::AutoApprove;
     }
 
-    // Gate 7: app expiry (fail closed on a lookup timeout or an expired app).
-    match inputs.app_expired {
-        None => {
-            return Nip55Outcome::Reject {
-                reason: "deny_timeout".to_string(),
-            }
-        }
-        Some(true) => {
-            return Nip55Outcome::Reject {
-                reason: "deny_expired".to_string(),
-            }
-        }
-        Some(false) => {}
-    }
-
-    // The relay AUTO_REJECT was already enforced at gate 5 (the gate is computed
-    // once), so only the standing-permission lookup remains.
-    if !inputs.permission_lookup_ok {
-        return Nip55Outcome::Reject {
-            reason: "lookup_timeout".to_string(),
-        };
-    }
-
-    // `event_kind` is bounded to u16 at derivation, so the i32 cast never wraps.
-    let decision = nip55_resolve_decision(
-        inputs.stored_exact_permission.clone(),
-        inputs.stored_generic_permission.clone(),
-        event_kind.map(|k| k as i32),
-        inputs.now_elapsed_ms,
-        inputs.now_wall_ms,
-    );
-
-    // A whitelisted relay auto-signs, but an explicit per-app DENY still wins.
+    // Gate 8: standing permission. A whitelisted relay auto-signs (an explicit
+    // per-app DENY already rejected at gate 6).
     // `decision` is the per-kind (kind-22242) resolution: because 22242 is a
     // sensitive kind, a kind-agnostic DENY row never falls back here (matching
     // how the standing-permission storage resolves it), so a blanket DENY does
-    // not block a whitelisted relay. This reaches gate 7 only after the expiry
-    // and lookup checks above have already passed.
+    // not block a whitelisted relay. The DENY checks here and below cannot be
+    // reached after gate 6 and stay as defense in depth.
     if relay_gate == Some(Nip55RelayAuthGate::AutoAccept)
         && decision != Some(Nip55PermissionDecision::Deny)
     {
@@ -380,8 +386,8 @@ mod tests {
 
     const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
-    // Baseline: a benign non-sensitive SignEvent that clears gates 0-6 (Manual
-    // policy -> FallToUi) and reaches gate 7 with no standing decision, i.e.
+    // Baseline: a benign non-sensitive SignEvent that clears gates 0-7 (Manual
+    // policy -> FallToUi) and reaches gate 8 with no standing decision, i.e.
     // RequireUi. Individual tests mutate one field to exercise one gate.
     fn base() -> Nip55DecisionInputs {
         Nip55DecisionInputs {
@@ -650,7 +656,7 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
-    // Gate 6: sign policy.
+    // Gate 7: sign policy.
     #[test]
     fn opted_in_auto_policy_benign_auto_approves() {
         let mut i = base();
@@ -665,7 +671,7 @@ mod tests {
         let mut i = base();
         i.is_opted_in = false;
         i.policy_selection = SignPolicySelection::Auto;
-        // Falls through to gate 7; no stored grant -> RequireUi (not AutoApprove).
+        // Falls through to gate 8; no stored grant -> RequireUi (not AutoApprove).
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
@@ -699,7 +705,7 @@ mod tests {
 
     #[test]
     fn opted_in_limiter_unavailable_still_honors_stored_allow() {
-        // Limiter unavailable falls to gate 7, which can still auto-approve on a
+        // Limiter unavailable falls to gate 8, which can still auto-approve on a
         // standing ALLOW grant.
         let mut i = base();
         i.is_opted_in = true;
@@ -709,7 +715,7 @@ mod tests {
         assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
     }
 
-    // Gate 6: the Basic tier is a strictly stricter auto-approval band than Auto.
+    // Gate 7: the Basic tier is a strictly stricter auto-approval band than Auto.
     // A benign SignEvent from an app of unknown age (+5) inside a high-frequency
     // burst (+20) scores exactly 25 at the fixture's normal local hour (12),
     // between BASIC_RISK_THRESHOLD (20) and RISK_ESCALATION_THRESHOLD (40).
@@ -758,7 +764,7 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
-    // Gate 6 must score against `inputs.current_hour` (the caller's LOCAL hour),
+    // Gate 7 must score against `inputs.current_hour` (the caller's LOCAL hour),
     // not any clock of its own. A new app (+15) sits just under BASIC_RISK_THRESHOLD
     // (20) at a normal hour, so the extra UnusualTime (+10) at an unusual hour is
     // what tips it to the UI. Pinning both ends here means substituting a fixed
@@ -810,7 +816,7 @@ mod tests {
         }
     }
 
-    // Gate 7: expiry, lookup, standing decision.
+    // Gate 6: expiry, lookup and standing DENY; gate 8: standing decision.
     #[test]
     fn app_expiry_timeout_rejects() {
         let mut i = base();
@@ -823,6 +829,76 @@ mod tests {
         let mut i = base();
         i.app_expired = Some(true);
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_expired");
+    }
+
+    // An expired app, or one whose expiry could not be looked up, is rejected
+    // even when its sign policy would auto-approve the request.
+    #[test]
+    fn expiry_rejects_before_an_auto_approving_policy() {
+        for selection in [SignPolicySelection::Auto, SignPolicySelection::Basic] {
+            for (expired, reason) in [(Some(true), "deny_expired"), (None, "deny_timeout")] {
+                let mut i = base();
+                i.is_opted_in = true;
+                i.policy_selection = selection;
+                i.opt_in_rate_check = Some(allowed());
+                assert_eq!(evaluate_nip55_request(i.clone()), Nip55Outcome::AutoApprove);
+                i.app_expired = expired;
+                assert_eq!(
+                    reject_reason(&evaluate_nip55_request(i)),
+                    reason,
+                    "{selection:?} with app_expired {expired:?}"
+                );
+            }
+        }
+    }
+
+    // An explicit per-app DENY, or a permission store that could not be read
+    // (it could hide one), rejects even when the sign policy would auto-approve.
+    #[test]
+    fn standing_deny_rejects_before_an_auto_approving_policy() {
+        for selection in [SignPolicySelection::Auto, SignPolicySelection::Basic] {
+            let mut i = base();
+            i.is_opted_in = true;
+            i.policy_selection = selection;
+            i.opt_in_rate_check = Some(allowed());
+            assert_eq!(evaluate_nip55_request(i.clone()), Nip55Outcome::AutoApprove);
+            let mut denied = i.clone();
+            denied.stored_exact_permission = Some(perm("deny"));
+            assert_eq!(
+                reject_reason(&evaluate_nip55_request(denied)),
+                "deny",
+                "{selection:?}"
+            );
+            let mut unreadable = i;
+            unreadable.permission_lookup_ok = false;
+            assert_eq!(
+                reject_reason(&evaluate_nip55_request(unreadable)),
+                "lookup_timeout",
+                "{selection:?}"
+            );
+        }
+    }
+
+    // Only an explicit DENY moved ahead of the sign policy: a kind-agnostic DENY
+    // blocks it too, while an ASK or an expired DENY row does not.
+    #[test]
+    fn only_a_live_deny_overrides_an_auto_approving_policy() {
+        let mut i = base();
+        i.is_opted_in = true;
+        i.policy_selection = SignPolicySelection::Auto;
+        i.opt_in_rate_check = Some(allowed());
+        let mut generic = i.clone();
+        generic.stored_generic_permission = Some(perm("deny"));
+        assert_eq!(reject_reason(&evaluate_nip55_request(generic)), "deny");
+        let mut ask = i.clone();
+        ask.stored_exact_permission = Some(perm("ask"));
+        assert_eq!(evaluate_nip55_request(ask), Nip55Outcome::AutoApprove);
+        let mut lapsed = i;
+        lapsed.stored_exact_permission = Some(Nip55StoredPermission {
+            expires_at: Some(1),
+            ..perm("deny")
+        });
+        assert_eq!(evaluate_nip55_request(lapsed), Nip55Outcome::AutoApprove);
     }
 
     #[test]
@@ -858,7 +934,7 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(base())));
     }
 
-    // Gate 7: whitelisted-relay AUTO_ACCEPT with per-app DENY-wins.
+    // Gate 8: whitelisted-relay AUTO_ACCEPT with per-app DENY-wins.
     #[test]
     fn whitelisted_relay_auto_approves() {
         let mut i = base();
@@ -876,7 +952,18 @@ mod tests {
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny");
     }
 
-    // A whitelisted relay must not bypass the gate-7 fail-closed checks (expiry
+    // Relay auth is a sensitive kind, so a kind-agnostic DENY does not apply to
+    // it and a whitelisted relay still auto-signs.
+    #[test]
+    fn whitelisted_relay_ignores_a_kind_agnostic_deny() {
+        let mut i = base();
+        i.event_json = relay_auth_event("relay.allowed.com");
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i.stored_generic_permission = Some(perm("deny"));
+        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    // A whitelisted relay must not bypass the gate-6 fail-closed checks (expiry
     // and lookup), which run before the AUTO_ACCEPT auto-sign.
     fn whitelisted_relay_base() -> Nip55DecisionInputs {
         let mut i = base();
@@ -906,7 +993,7 @@ mod tests {
         assert_eq!(reject_reason(&evaluate_nip55_request(i)), "lookup_timeout");
     }
 
-    // Non-SignEvent operations: gate 6 always falls to UI, gate 7 still resolves.
+    // Non-SignEvent operations: gate 7 always falls to UI, gate 8 still resolves.
     #[test]
     fn get_public_key_stored_allow_auto_approves() {
         let mut i = base();
