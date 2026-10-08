@@ -44,7 +44,7 @@ rand = "0.10"
 frost-secp256k1-tr = "3.0"
 
 # Bitcoin
-bip39 = { version = "2.2", features = ["zeroize"] }
+bip39 = { version = "3.0", features = ["zeroize"] }
 bitcoin = { version = "0.32", features = ["serde"] }
 
 # Secure memory
