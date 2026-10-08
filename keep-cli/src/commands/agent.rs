@@ -92,7 +92,7 @@ pub fn cmd_agent_mcp(
 
     // The vault stays unlocked for the server's life so every signature can be
     // recorded in its audit log before it is returned.
-    let server = McpServer::with_signing(pubkey, secret).with_audit(keep);
+    let server = McpServer::with_signing(pubkey, secret, keep);
     secret.zeroize();
 
     let config = SessionConfig::new(scope)
@@ -164,6 +164,8 @@ mod tests {
         assert!(scope.allows_operation(&Operation::SignPsbt));
         assert_eq!(scope.max_amount_sats, Some(50_000));
         assert!(scope.allows_address(MAINNET_ADDR));
+        assert!(!scope.allows_operation(&Operation::Nip44Encrypt));
+        assert!(!scope.allows_operation(&Operation::Nip44Decrypt));
     }
 
     #[test]

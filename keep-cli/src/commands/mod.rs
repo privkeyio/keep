@@ -74,7 +74,7 @@ pub fn read_secret_value(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
             })?;
         if buf.len() as u64 > limit {
             return Err(KeepError::InvalidInput(format!(
-                "secret value too large: at most {limit} bytes"
+                "secret value too large: a secret record may be at most {limit} bytes"
             )));
         }
         if buf.last() == Some(&b'\n') {

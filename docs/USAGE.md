@@ -611,10 +611,12 @@ const info = await session.getSessionInfo();
 `keep agent mcp` runs a stdio MCP signing server bound to one vault key. The server signs
 under a constrained policy, so the model gets signing capability without ever seeing the
 private key. Every signature is recorded in the vault's audit log (`keep audit`) before it is
-returned, and a signature that cannot be recorded is not returned.
+returned, and a signature that cannot be recorded is not returned. Signing stops when the
+log nears 90,000 entries, so the vault stays readable; export the log (`keep audit export`)
+and prune it (`keep audit retention --apply`) to resume.
 
 ```bash
-# Nostr tools only: get_nostr_pubkey and sign_nostr_event
+# Nostr tools only: get_nostr_pubkey, sign_nostr_event and get_session_info
 keep agent mcp --key main
 
 # Also get_bitcoin_address and sign_bitcoin_psbt on mainnet, spending at most 50,000 sats

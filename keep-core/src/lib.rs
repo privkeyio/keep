@@ -107,6 +107,9 @@ fn frost_group_subkey_name(group_name: &str) -> String {
     format!("frost-group-subkey:{group_name}")
 }
 
+/// Entries kept free for the owner's own events once agent signatures stop.
+pub const AGENT_AUDIT_HEADROOM: usize = 10_000;
+
 /// The main Keep type for encrypted key management.
 pub struct Keep {
     storage: Storage,
@@ -534,12 +537,22 @@ impl Keep {
     /// Records a signature an agent obtained with `pubkey`'s key over `message`,
     /// with `context` naming what was signed. Fails when the entry cannot be
     /// written, so a caller can withhold a signature that would go unrecorded.
+    ///
+    /// Agent entries stop [`AGENT_AUDIT_HEADROOM`] short of the most entries the
+    /// log is read back with, so an agent cannot make the log unreadable.
     pub fn record_agent_signature(
         &mut self,
         pubkey: &[u8; 32],
         message: &[u8],
         context: &str,
     ) -> Result<()> {
+        let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
+        if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
+            return Err(KeepError::AuditWriteFailed(format!(
+                "audit log is full ({count} entries): export it with `keep audit export`, \
+                 then prune it with `keep audit retention --apply`"
+            )));
+        }
         self.audit_event_required(AuditEventType::Sign, |e| {
             e.with_pubkey(pubkey)
                 .with_message_hash(message)
@@ -2051,6 +2064,84 @@ mod tests {
             keep.reveal_secret(&record.id).is_err(),
             "nothing is revealed from a locked vault"
         );
+    }
+
+    /// No value is revealed when its `SecretReveal` entry cannot be written,
+    /// plain or sealed.
+    #[test]
+    fn a_reveal_that_cannot_be_recorded_returns_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let plain = crate::secret::SecretRecord::new(
+            "p".into(),
+            crate::secret::SecretKind::Generic,
+            b"v".to_vec(),
+        )
+        .unwrap();
+        keep.store_secret(&plain).unwrap();
+        let sealed = crate::secret::SecretRecord::new(
+            "s".into(),
+            crate::secret::SecretKind::Generic,
+            b"v".to_vec(),
+        )
+        .unwrap();
+        let oprf_key = crate::crypto::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let sealed = keep.store_sealed_secret(sealed, &oprf_key, 0).unwrap();
+        assert_eq!(
+            &*keep.reveal_sealed_secret(&sealed.id, &oprf_key).unwrap(),
+            b"v"
+        );
+
+        let audit = path.join("audit.log");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        let err = keep.reveal_secret(&plain.id).unwrap_err();
+        assert!(matches!(err, KeepError::AuditWriteFailed(_)), "{err}");
+        let err = keep
+            .reveal_sealed_secret(&sealed.id, &oprf_key)
+            .unwrap_err();
+        assert!(matches!(err, KeepError::AuditWriteFailed(_)), "{err}");
+    }
+
+    /// Agent signatures stop short of the log's read cap, leaving room for the
+    /// owner's entries, so an agent cannot make the log unreadable.
+    #[test]
+    fn agent_signatures_stop_before_the_audit_log_fills() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let audit = path.join("audit.log");
+        let lines = |p: &Path| {
+            std::fs::read(p).map_or(0, |b| {
+                b.split(|&c| c == b'\n').filter(|l| !l.is_empty()).count()
+            })
+        };
+        keep.lock();
+        let before = lines(&audit);
+        keep.unlock("testpass").unwrap();
+        let per_unlock = lines(&audit) - before;
+        keep.lock();
+
+        let ceiling = crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM;
+        let filler = ceiling - 1 - lines(&audit) - per_unlock;
+        let mut long = b"x\n".repeat(filler);
+        long.extend_from_slice(&std::fs::read(&audit).unwrap());
+        std::fs::write(&audit, long).unwrap();
+        keep.unlock("testpass").unwrap();
+
+        keep.record_agent_signature(&[1; 32], b"m", "last").unwrap();
+        let err = keep
+            .record_agent_signature(&[1; 32], b"m", "over")
+            .unwrap_err();
+        assert!(err.to_string().contains("audit log is full"), "{err}");
+        assert_eq!(
+            lines(&audit),
+            ceiling,
+            "the refused signature wrote nothing"
+        );
+        keep.audit_event_required(AuditEventType::VaultLock, |e| e)
+            .unwrap();
     }
 
     #[test]
