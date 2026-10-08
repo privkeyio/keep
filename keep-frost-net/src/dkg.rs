@@ -547,6 +547,38 @@ fn event_size(e: &Event) -> usize {
 /// re-checks its deadline and cancellation flag.
 const POLL_WAKE: Duration = Duration::from_millis(500);
 
+/// DKG kinds are ephemeral, so a relay forwards an event only to subscribers
+/// already listening, and the peer whose package completed a round may have
+/// subscribed after every earlier copy of ours went by; its peers stop resending
+/// once they move on. So after a round completes, our package goes out again
+/// until a relay has accepted [`FINAL_SENDS`] copies [`FINAL_SEND_GAP`] apart,
+/// which also outlasts a relay that registers a REQ after a later EVENT or
+/// refuses a burst. After [`FINAL_SEND_ATTEMPTS`] passes the round ends anyway:
+/// a completed round is never turned into a failure.
+const FINAL_SENDS: u32 = 2;
+const FINAL_SEND_GAP: Duration = Duration::from_secs(1);
+const FINAL_SEND_ATTEMPTS: u32 = 5;
+
+#[derive(Default)]
+struct FinalSends {
+    accepted: u32,
+    attempts: u32,
+}
+
+impl FinalSends {
+    /// Record one pass's send after the round completed; true once the round
+    /// may end, otherwise waits [`FINAL_SEND_GAP`] before the next pass.
+    async fn done(&mut self, accepted: bool) -> bool {
+        self.attempts += 1;
+        self.accepted += u32::from(accepted);
+        if self.accepted >= FINAL_SENDS || self.attempts >= FINAL_SEND_ATTEMPTS {
+            return true;
+        }
+        tokio::time::sleep(FINAL_SEND_GAP).await;
+        false
+    }
+}
+
 /// Total buffered event size per round, in bytes, counting tags as well as
 /// content. The count cap alone does not bound memory: the pinned SDK sets no
 /// per-event size limit (only a 5 MB websocket frame and 2000 tags), so a few
@@ -1034,14 +1066,12 @@ pub async fn run_software_dkg(
     // A round ends only once a relay has accepted our own event too, or a
     // peer still waiting on it would stall after we move on.
     let mut round1_sent = false;
-    // These kinds are ephemeral, so a relay forwards an event only to
-    // subscribers already listening. Subscribe before our first send, and send
-    // once more after the round completes: the peer whose package completed it
-    // may have subscribed after every earlier copy of ours went by, and its
-    // peers stop resending once they have moved on.
+    // Subscribe before our first send so no copy sent to us after it is
+    // missed, and finish with FinalSends (see there).
     transport
         .fetch_events(round1_filter.clone(), Duration::ZERO)
         .await?;
+    let mut final_sends = FinalSends::default();
     let start = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -1049,15 +1079,22 @@ pub async fn run_software_dkg(
         }
         // Each pass re-sends; a refused attempt is retried on the next pass
         // until the round times out.
-        match transport
+        let accepted = match transport
             .send_event(&build_signed(DKG_KIND_ROUND1, &round1_content, &[])?)
             .await
         {
-            Ok(()) => round1_sent = true,
-            Err(e) => tracing::warn!(error = %e, "DKG round 1 send failed; retrying"),
-        }
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "DKG round 1 send failed; retrying");
+                false
+            }
+        };
+        round1_sent |= accepted;
         if round1_done >= expected_peers && round1_sent {
-            break;
+            if final_sends.done(accepted).await {
+                break;
+            }
+            continue;
         }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
@@ -1155,15 +1192,17 @@ pub async fn run_software_dkg(
     let mut round2_done = 0u32;
     let mut seen_round2: HashSet<EventId> = HashSet::new();
     let mut round2_sent: HashSet<u16> = HashSet::new();
-    // Subscribe first and send once more at the end, as in round 1.
+    // Subscribe first and finish with FinalSends, as in round 1.
     transport
         .fetch_events(round2_filter.clone(), Duration::ZERO)
         .await?;
+    let mut final_sends = FinalSends::default();
     let start = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
+        let mut accepted = true;
         for (recipient_index, encrypted) in round2_outbound.iter() {
             let recipient_tag = Tag::custom(
                 TagKind::custom("recipient_index"),
@@ -1177,12 +1216,16 @@ pub async fn run_software_dkg(
                     round2_sent.insert(*recipient_index);
                 }
                 Err(e) => {
+                    accepted = false;
                     tracing::warn!(error = %e, recipient_index, "DKG round 2 send failed; retrying")
                 }
             }
         }
         if round2_done >= expected_peers && round2_sent.len() >= round2_outbound.len() {
-            break;
+            if final_sends.done(accepted).await {
+                break;
+            }
+            continue;
         }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
@@ -1292,24 +1335,32 @@ pub async fn run_software_dkg(
     let mut peer_confirmations: BTreeMap<u16, Event> = BTreeMap::new();
     let mut seen_confirm: HashSet<EventId> = HashSet::new();
     let mut confirm_sent = false;
-    // Subscribe first and send once more at the end, as in round 1.
+    // Subscribe first and finish with FinalSends, as in round 1.
     transport
         .fetch_events(confirm_filter.clone(), Duration::ZERO)
         .await?;
+    let mut final_sends = FinalSends::default();
     let start = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
         }
-        match transport
+        let accepted = match transport
             .send_event(&build_signed(DKG_KIND_CONFIRM, &our_transcript_hex, &[])?)
             .await
         {
-            Ok(()) => confirm_sent = true,
-            Err(e) => tracing::warn!(error = %e, "DKG confirmation send failed; retrying"),
-        }
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "DKG confirmation send failed; retrying");
+                false
+            }
+        };
+        confirm_sent |= accepted;
         if confirmed_indices.len() as u32 >= expected_peers && confirm_sent {
-            break;
+            if final_sends.done(accepted).await {
+                break;
+            }
+            continue;
         }
         if start.elapsed() > timeout {
             return Err(KeepError::NetworkErr(NetworkError::timeout(
@@ -2137,22 +2188,39 @@ mod tests {
         assert_eq!(o1.result.group_pubkey, o2.result.group_pubkey);
     }
 
+    /// How the [`EphemeralRelay`] in a test behaves.
+    #[derive(Clone, Copy, Debug)]
+    struct RelayBehavior {
+        /// A REQ takes effect before any later message from the same peer, as
+        /// on a relay that processes each connection in order. Otherwise it
+        /// takes effect `subscribe_latency` after it was sent, whatever the peer
+        /// published meanwhile.
+        ordered: bool,
+        /// How long a REQ takes to take effect, such as a round trip over Tor.
+        subscribe_latency: Duration,
+        /// Each delivery to a peer makes the relay refuse that peer's next this
+        /// many publishes, as a rate limit on bursts would.
+        refuse_after_delivery: u32,
+    }
+
     /// A relay for ephemeral kinds: an event reaches only the participants
     /// subscribed to a matching filter when it is published, and each one keeps
     /// only what matches the filter it is collecting when it drains, as
-    /// `ClientTransport` does. A subscription takes effect a moment after it is
-    /// requested, as a REQ does, and an event is not echoed to its author, so a
-    /// peer with nothing yet to collect waits in its fetch instead of resending.
-    #[derive(Clone, Default)]
+    /// `ClientTransport` does. An event is not echoed to its author, so a peer
+    /// with nothing yet to collect waits in its fetch instead of resending.
+    #[derive(Clone)]
     struct EphemeralRelay {
+        behavior: RelayBehavior,
         peers: Arc<StdMutex<Vec<Arc<EphemeralPeer>>>>,
     }
 
     #[derive(Default)]
     struct EphemeralPeer {
+        requested: StdMutex<Vec<Filter>>,
         subscribed: StdMutex<Vec<Filter>>,
         inbox: StdMutex<Vec<Event>>,
         collecting: StdMutex<(Option<Filter>, Vec<Event>)>,
+        refusals: StdMutex<u32>,
     }
 
     struct EphemeralTransport {
@@ -2163,9 +2231,14 @@ mod tests {
         late_for: StdMutex<Option<(Kind, Duration)>>,
     }
 
-    const SUBSCRIBE_LATENCY: Duration = Duration::from_millis(200);
-
     impl EphemeralRelay {
+        fn new(behavior: RelayBehavior) -> Self {
+            Self {
+                behavior,
+                peers: Arc::default(),
+            }
+        }
+
         fn join(&self, late_for: Option<(Kind, Duration)>) -> EphemeralTransport {
             let me = Arc::new(EphemeralPeer::default());
             self.peers.lock().unwrap().push(me.clone());
@@ -2212,6 +2285,15 @@ mod tests {
         fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
             Box::pin(async move {
                 self.arrive(event.kind).await;
+                {
+                    let mut refusals = self.me.refusals.lock().unwrap();
+                    if *refusals > 0 {
+                        *refusals -= 1;
+                        return Err(KeepError::NetworkErr(NetworkError::publish(
+                            "rate limited (refused in test)",
+                        )));
+                    }
+                }
                 for peer in self.relay.peers.lock().unwrap().iter() {
                     if Arc::ptr_eq(peer, &self.me) {
                         continue;
@@ -2224,6 +2306,7 @@ mod tests {
                         .any(|f| f.match_event(event, MatchEventOptions::new()));
                     if listening {
                         peer.inbox.lock().unwrap().push(event.clone());
+                        *peer.refusals.lock().unwrap() = self.relay.behavior.refuse_after_delivery;
                     }
                 }
                 Ok(())
@@ -2239,9 +2322,29 @@ mod tests {
                 for kind in filter.kinds.iter().flatten() {
                     self.arrive(*kind).await;
                 }
-                if !self.me.subscribed.lock().unwrap().contains(&filter) {
-                    tokio::time::sleep(SUBSCRIBE_LATENCY).await;
-                    self.me.subscribed.lock().unwrap().push(filter.clone());
+                let new = {
+                    let mut requested = self.me.requested.lock().unwrap();
+                    let new = !requested.contains(&filter);
+                    if new {
+                        requested.push(filter.clone());
+                    }
+                    new
+                };
+                if new {
+                    let me = self.me.clone();
+                    let latency = self.relay.behavior.subscribe_latency;
+                    let register = {
+                        let filter = filter.clone();
+                        async move {
+                            tokio::time::sleep(latency).await;
+                            me.subscribed.lock().unwrap().push(filter);
+                        }
+                    };
+                    if self.relay.behavior.ordered {
+                        register.await;
+                    } else {
+                        tokio::spawn(register);
+                    }
                 }
                 let deadline = tokio::time::Instant::now() + timeout;
                 loop {
@@ -2258,22 +2361,46 @@ mod tests {
     /// The last participant to reach a round subscribes only then, after its
     /// peers' earlier copies went by, and its own package completes the round
     /// for them. It must still receive theirs, in every round, whether its
-    /// peers are idle waiting (2-of-2) or still resending (2-of-3).
+    /// peers are idle waiting (2-of-2) or still resending (2-of-3), and whether
+    /// the relay registers its REQ in order or late, or refuses a burst.
     #[tokio::test(start_paused = true)]
     async fn a_participant_that_arrives_last_still_completes() {
-        for participants in [2, 3] {
-            for kind in [DKG_KIND_ROUND1, DKG_KIND_ROUND2, DKG_KIND_CONFIRM] {
-                late_participant_completes(participants, Kind::Custom(kind)).await;
+        let behaviors = [
+            RelayBehavior {
+                ordered: true,
+                subscribe_latency: Duration::from_secs(3),
+                refuse_after_delivery: 0,
+            },
+            RelayBehavior {
+                ordered: false,
+                subscribe_latency: Duration::from_millis(200),
+                refuse_after_delivery: 0,
+            },
+            RelayBehavior {
+                ordered: true,
+                subscribe_latency: Duration::from_millis(200),
+                refuse_after_delivery: 2,
+            },
+        ];
+        for behavior in behaviors {
+            for participants in [2, 3] {
+                for kind in [DKG_KIND_ROUND1, DKG_KIND_ROUND2, DKG_KIND_CONFIRM] {
+                    late_participant_completes(behavior, participants, Kind::Custom(kind)).await;
+                }
             }
         }
     }
 
     /// Every participant but the last runs on time; the last reaches the round
     /// of `late_kind` 3 s after the others, between two of their resends.
-    async fn late_participant_completes(participants: u16, late_kind: Kind) {
+    async fn late_participant_completes(
+        behavior: RelayBehavior,
+        participants: u16,
+        late_kind: Kind,
+    ) {
         let keys = mesh_keys(participants);
         let roster = mesh_roster(&keys, 2, [0x5d; 32]);
-        let relay = EphemeralRelay::default();
+        let relay = EphemeralRelay::new(behavior);
         let local = tokio::task::LocalSet::new();
         let runs: Vec<_> = (1..=participants)
             .map(|index| {
@@ -2298,16 +2425,24 @@ mod tests {
                 })
             })
             .collect();
+        let started = tokio::time::Instant::now();
         let mut outcomes = Vec::new();
         local
             .run_until(async {
                 for run in runs {
                     outcomes.push(run.await.unwrap().unwrap_or_else(|e| {
-                        panic!("{participants} parties, late for {late_kind}: {e}")
+                        panic!("{behavior:?}, {participants} parties, late for {late_kind}: {e}")
                     }));
                 }
             })
             .await;
+        // The round timeout runs on the wall clock while this test's time is
+        // paused, so bound the simulated duration here.
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{behavior:?}, {participants} parties, late for {late_kind}: took {:?}",
+            started.elapsed()
+        );
         for o in &outcomes {
             assert_eq!(o.result.group_pubkey, outcomes[0].result.group_pubkey);
             o.certificate.verify(&roster).unwrap();
