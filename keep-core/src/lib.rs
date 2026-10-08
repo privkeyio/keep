@@ -1432,13 +1432,14 @@ impl Keep {
                 }
             }
         }
+        // These signatures move funds, so they are released only once recorded.
         for spend in spends {
-            self.audit_event(AuditEventType::FrostSign, |e| {
+            self.audit_event_required(AuditEventType::FrostSign, |e| {
                 e.with_group(group_pubkey)
                     .with_message_hash(&spend.sighash)
                     .with_threshold(threshold)
                     .with_reason(&spend.context)
-            });
+            })?;
         }
         Ok(signatures)
     }

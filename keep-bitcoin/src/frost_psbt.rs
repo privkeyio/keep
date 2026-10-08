@@ -40,17 +40,22 @@ pub struct KeyPathSpend {
     pub sighash_type: TapSighashType,
 }
 
-/// A FROST group's taproot wallet, from every external descriptor stored for it
-/// (a replaced version still holds coins the group can spend).
+/// A FROST group's taproot wallet. It spends the group's BIP-86 outputs (one per
+/// path below the group key, whatever descriptor is stored) and the outputs of
+/// every stored descriptor version, but recognizes change only for the latest
+/// version: a replaced version was often replaced because its recovery tree is no
+/// longer trusted, so paying it counts as money leaving.
 pub struct FrostWallet {
     group: [u8; 32],
     network: Network,
     fingerprint: Fingerprint,
-    /// Some version is `tr(<group xpub>/0/*)`: one output per path below the
-    /// group key, the same for every such version.
-    bip86: bool,
-    /// The `tr(<group>[, <tree>])` outputs: each spent with its tree's root.
+    /// The `tr(<group>[, <tree>])` outputs of every version: each spent with its
+    /// tree's root.
     singles: Vec<(ScriptBuf, Option<[u8; 32]>)>,
+    /// The latest version is the BIP-86 wallet: its change chain is change.
+    bip86_change: bool,
+    /// The latest version's single output, which is its change.
+    single_change: Option<ScriptBuf>,
 }
 
 fn keep_error(e: keep_core::error::KeepError) -> BitcoinError {
@@ -58,29 +63,31 @@ fn keep_error(e: keep_core::error::KeepError) -> BitcoinError {
 }
 
 impl FrostWallet {
-    /// The wallet the group's `external_descriptors` describe. Each must be the
-    /// group's: its first address is the group's, or its internal key is the
-    /// group key.
-    pub fn new(group: [u8; 32], external_descriptors: &[&str], network: Network) -> Result<Self> {
-        if external_descriptors.is_empty() {
-            return Err(BitcoinError::Descriptor("no wallet descriptor".into()));
-        }
+    /// The wallet whose latest external descriptor is `latest`, which must be the
+    /// group's (its first address is the group's, or its internal key is the
+    /// group key). Change is recognized for this version only.
+    pub fn new(group: [u8; 32], latest: &str, network: Network) -> Result<Self> {
         let fingerprint = Fingerprint::from_str(&DescriptorExport::pubkey_fingerprint(&group))
             .map_err(|e| BitcoinError::Descriptor(format!("group fingerprint: {e}")))?;
         let mut wallet = Self {
             group,
             network,
             fingerprint,
-            bip86: false,
             singles: Vec::new(),
+            bip86_change: false,
+            single_change: None,
         };
-        for descriptor in external_descriptors {
-            wallet.add(descriptor)?;
-        }
+        wallet.add(latest, true)?;
         Ok(wallet)
     }
 
-    fn add(&mut self, external_descriptor: &str) -> Result<()> {
+    /// Also spend the outputs of an older stored version, which must be the
+    /// group's too; outputs paying it are not change.
+    pub fn add_older(&mut self, external_descriptor: &str) -> Result<()> {
+        self.add(external_descriptor, false)
+    }
+
+    fn add(&mut self, external_descriptor: &str, latest: bool) -> Result<()> {
         let body = external_descriptor
             .split('#')
             .next()
@@ -104,7 +111,7 @@ impl FrostWallet {
                     "the descriptor is not this group's wallet".into(),
                 ));
             }
-            self.bip86 = true;
+            self.bip86_change |= latest;
         } else {
             let definite = parsed
                 .at_derivation_index(0)
@@ -118,8 +125,12 @@ impl FrostWallet {
                     "the descriptor's internal key is not the group key".into(),
                 ));
             }
+            let script_pubkey = definite.script_pubkey();
+            if latest {
+                self.single_change = Some(script_pubkey.clone());
+            }
             self.singles.push((
-                definite.script_pubkey(),
+                script_pubkey,
                 info.merkle_root().map(|root| root.to_byte_array()),
             ));
         }
@@ -189,7 +200,7 @@ impl FrostWallet {
                 return Ok(Some((Vec::new(), TaprootTweak::new(*merkle_root))));
             }
         }
-        if !self.bip86 || input.tap_merkle_root.is_some() {
+        if input.tap_merkle_root.is_some() {
             return Ok(None);
         }
         Ok(self
@@ -197,12 +208,12 @@ impl FrostWallet {
             .map(|path| (path, TaprootTweak::default())))
     }
 
-    /// Whether `output` pays the wallet's change: one of the first change
+    /// Whether `output` pays the latest version's change: one of the first change
     /// addresses of the BIP-86 wallet, which a watch-only wallet looks at, or a
     /// recovery wallet's output. Origins only name the index to check.
     fn is_change(&self, output: &Output, script_pubkey: &ScriptBuf) -> bool {
-        self.singles.iter().any(|(ours, _)| ours == script_pubkey)
-            || (self.bip86
+        self.single_change.as_ref() == Some(script_pubkey)
+            || (self.bip86_change
                 && self
                     .bip86_path(&output.tap_key_origins, script_pubkey, true)
                     .is_ok_and(|path| path.is_some()))
@@ -353,7 +364,7 @@ mod tests {
 
     fn bip86(group: &[u8; 32]) -> FrostWallet {
         let desc = DescriptorExport::from_frost_wallet(group, None, NET).unwrap();
-        FrostWallet::new(*group, &[desc.external_descriptor()], NET).unwrap()
+        FrostWallet::new(*group, desc.external_descriptor(), NET).unwrap()
     }
 
     fn fp(group: &[u8; 32]) -> Fingerprint {
@@ -647,7 +658,7 @@ mod tests {
         let (shares, group) = new_group();
         let recovery_key = hex::encode(&foreign().as_bytes()[2..34]);
         let descriptor = format!("tr({},pk({recovery_key}))", hex::encode(group));
-        let wallet = FrostWallet::new(group, &[&descriptor], NET).unwrap();
+        let wallet = FrostWallet::new(group, &descriptor, NET).unwrap();
         let (script_pubkey, merkle_root) = &wallet.singles[0];
         assert!(merkle_root.is_some());
         let mut p = psbt(
@@ -673,58 +684,80 @@ mod tests {
         let (_, group) = new_group();
         let (_, other) = new_group();
         let theirs = DescriptorExport::from_frost_wallet(&other, None, NET).unwrap();
-        assert!(FrostWallet::new(group, &[theirs.external_descriptor()], NET).is_err());
+        assert!(FrostWallet::new(group, theirs.external_descriptor(), NET).is_err());
         let key = hex::encode(&foreign().as_bytes()[2..34]);
-        assert!(FrostWallet::new(group, &[&format!("tr({key})")], NET).is_err());
+        assert!(FrostWallet::new(group, &format!("tr({key})"), NET).is_err());
         assert!(FrostWallet::new(
             group,
-            &["wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"],
+            "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)",
             NET
         )
         .is_err());
-        assert!(FrostWallet::new(group, &[], NET).is_err());
-        let ours = DescriptorExport::from_frost_wallet(&group, None, NET).unwrap();
+        let mut ours = bip86(&group);
         assert!(
-            FrostWallet::new(
-                group,
-                &[ours.external_descriptor(), theirs.external_descriptor()],
-                NET
-            )
-            .is_err(),
+            ours.add_older(theirs.external_descriptor()).is_err(),
             "every stored version must be the group's"
         );
     }
 
-    /// Coins at a replaced descriptor's outputs stay spendable: an input is the
-    /// group's if any stored version claims it.
-    #[test]
-    fn every_stored_version_is_spendable() {
-        let (shares, group) = new_group();
-        let bip86 = DescriptorExport::from_frost_wallet(&group, None, NET).unwrap();
-        let recovery = format!(
+    fn recovery_descriptor(group: &[u8; 32], recovery_seed: u8) -> String {
+        let (key, _) = bitcoin::secp256k1::Keypair::from_seckey_slice(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            &[recovery_seed; 32],
+        )
+        .unwrap()
+        .x_only_public_key();
+        format!(
             "tr({},pk({}))",
             hex::encode(group),
-            hex::encode(&foreign().as_bytes()[2..34])
+            hex::encode(key.serialize())
+        )
+    }
+
+    /// Coins at an older version's outputs stay spendable, and so do the group's
+    /// BIP-86 outputs whatever is stored; but only the latest version's outputs
+    /// are change, so paying a replaced recovery tree counts as leaving.
+    #[test]
+    fn older_versions_are_spendable_but_only_the_latest_is_change() {
+        let (shares, group) = new_group();
+        let (old, new) = (
+            recovery_descriptor(&group, 21),
+            recovery_descriptor(&group, 22),
         );
-        let wallet =
-            FrostWallet::new(group, &[bip86.external_descriptor(), &recovery], NET).unwrap();
+        let mut wallet = FrostWallet::new(group, &new, NET).unwrap();
+        wallet.add_older(&old).unwrap();
+        let (new_spk, old_spk) = (wallet.singles[0].0.clone(), wallet.singles[1].0.clone());
         let (k0, s0) = child(&group, &[0, 3]);
-        let recovery_spk = wallet.singles[0].0.clone();
+        let (kc, sc) = child(&group, &[1, 4]);
         let mut p = psbt(
             vec![
                 (s0, Some(origin(&group, k0, "86'/1'/0'/0/3"))),
-                (recovery_spk, None),
+                (old_spk.clone(), None),
+                (new_spk.clone(), None),
             ],
-            None,
+            Some((old_spk.clone(), origin(&group, group, "86'/1'/0'/1/0"))),
         );
         let (analysis, spends) = wallet.analyze(&p).unwrap();
-        assert_eq!(analysis.signable_inputs, vec![0, 1]);
-        assert_eq!(spends[1].tweak, TaprootTweak::new(wallet.singles[0].1));
+        assert_eq!(analysis.signable_inputs, vec![0, 1, 2]);
+        assert_eq!(spends[1].tweak, TaprootTweak::new(wallet.singles[1].1));
+        assert!(
+            !analysis.outputs[1].is_change,
+            "a replaced tree's output is not change"
+        );
         sign_all(&shares, &mut p, &spends);
-        let only_recovery = FrostWallet::new(group, &[&recovery], NET).unwrap();
-        assert_eq!(
-            only_recovery.analyze(&p).unwrap().0.signable_inputs,
-            vec![1]
+
+        let to_new = psbt(
+            vec![(new_spk.clone(), None)],
+            Some((new_spk, origin(&group, group, "86'/1'/0'/1/0"))),
+        );
+        assert!(wallet.analyze(&to_new).unwrap().0.outputs[1].is_change);
+        let to_bip86_change = psbt(
+            vec![(old_spk, None)],
+            Some((sc, origin(&group, kc, "86'/1'/0'/1/4"))),
+        );
+        assert!(
+            !wallet.analyze(&to_bip86_change).unwrap().0.outputs[1].is_change,
+            "the BIP-86 chain is change only when it is the latest version"
         );
     }
 }

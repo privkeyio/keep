@@ -76,23 +76,30 @@ pub fn cmd_wallet_sign(
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    // Every stored version: coins at a replaced descriptor's outputs are still
-    // the group's to spend.
+    // The latest version decides change; older ones still hold coins the group
+    // can spend, so their outputs are signable but paying them is not change.
     let latest = keep
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
-    let versions: Vec<WalletDescriptor> = keep
+    let network = crate::commands::bitcoin::parse_network(&latest.network)?;
+    let version_error = |version: u32, e: keep_bitcoin::BitcoinError| {
+        KeepError::Runtime(format!("stored wallet descriptor version {version}: {e}"))
+    };
+    let mut wallet = FrostWallet::new(group_pubkey, &latest.external_descriptor, network)
+        .map_err(|e| version_error(latest.version, e))?;
+    for older in keep
         .list_all_wallet_descriptor_versions()?
         .into_iter()
-        .filter(|d| d.group_pubkey == group_pubkey && d.network == latest.network)
-        .collect();
-    let network = crate::commands::bitcoin::parse_network(&latest.network)?;
-    let externals: Vec<&str> = versions
-        .iter()
-        .map(|d| d.external_descriptor.as_str())
-        .collect();
-    let wallet = FrostWallet::new(group_pubkey, &externals, network)
-        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+        .filter(|d| {
+            d.group_pubkey == group_pubkey
+                && d.network == latest.network
+                && d.version != latest.version
+        })
+    {
+        wallet
+            .add_older(&older.external_descriptor)
+            .map_err(|e| version_error(older.version, e))?;
+    }
     let (analysis, spends) = wallet
         .analyze(&psbt)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
