@@ -46,7 +46,8 @@ const TOKEN_HASH_DOMAIN: &[u8] = b"keep-agent-token-v1";
 pub struct AgentCredential {
     /// Random identifier, shown to the owner and recorded in the audit log.
     pub id: [u8; 16],
-    /// The owner's label for the agent: printable ASCII.
+    /// The owner's label for the agent: printable ASCII without leading or
+    /// trailing spaces.
     pub name: String,
     /// Domain-separated hash of the token. The token carries 256 random bits, so
     /// a keyed hash would add nothing, and one keyed by the data key would void
@@ -131,6 +132,7 @@ impl AgentCredential {
     ) -> Result<(Self, Zeroizing<String>)> {
         if name.is_empty()
             || name.len() > MAX_NAME_LEN
+            || name.trim() != name
             || !name.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
         {
             return Err(KeepError::invalid_input(format!(
@@ -202,6 +204,34 @@ impl AgentCredential {
         }
         if peer_uid != self.uid || !bindable_uid(peer_uid) {
             return Err(AgentRefusal::WrongUid);
+        }
+        Ok(())
+    }
+
+    /// Refuses `self` as the stored replacement for `existing` unless it only
+    /// revokes, freezes or unfreezes it, or shortens its life: its identity,
+    /// token, uid and grant never change, and a revocation is never undone.
+    pub(crate) fn check_replaces(&self, existing: &Self) -> Result<()> {
+        let unchanged = self.id == existing.id
+            && self.name == existing.name
+            && self.token_hash == existing.token_hash
+            && self.uid == existing.uid
+            && self.created_at == existing.created_at
+            && self.grant == existing.grant;
+        if !unchanged {
+            return Err(KeepError::invalid_input(
+                "an agent credential's identity, token, uid and grant cannot change",
+            ));
+        }
+        if existing.revoked && !self.revoked {
+            return Err(KeepError::invalid_input(
+                "a revoked agent credential cannot be reinstated",
+            ));
+        }
+        if self.expires_at > existing.expires_at {
+            return Err(KeepError::invalid_input(
+                "an agent credential's life cannot be extended",
+            ));
         }
         Ok(())
     }
@@ -305,6 +335,9 @@ mod tests {
             "a\u{202e}b",
             "caf\u{e9}",
             "a\u{200b}b",
+            "   ",
+            " lead",
+            "trail ",
         ] {
             assert!(
                 refused(name, 1000, DAY, 0)
@@ -334,6 +367,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(credential.expires_at, NOW + MAX_CREDENTIAL_TTL_SECS);
+    }
+
+    #[test]
+    fn a_replacement_may_only_revoke_freeze_or_shorten() {
+        let (credential, _) = issue();
+        let replaced = |f: fn(&mut AgentCredential)| {
+            let mut next = credential.clone();
+            f(&mut next);
+            next.check_replaces(&credential)
+        };
+        assert!(replaced(|c| c.revoked = true).is_ok());
+        assert!(replaced(|c| c.frozen = true).is_ok());
+        assert!(replaced(|c| c.expires_at -= 1).is_ok());
+        assert!(replaced(|c| c.expires_at += 1).is_err());
+        assert!(replaced(|c| c.uid += 1).is_err());
+        assert!(replaced(|c| c.grant.push(0)).is_err());
+        assert!(replaced(|c| c.name.push('x')).is_err());
+        assert!(replaced(|c| c.created_at -= 1).is_err());
+        assert!(replaced(|c| c.token_hash[0] ^= 1).is_err());
+        assert!(replaced(|c| c.id[0] ^= 1).is_err());
+        let mut revoked = credential.clone();
+        revoked.revoked = true;
+        assert!(credential.check_replaces(&revoked).is_err());
     }
 
     #[test]

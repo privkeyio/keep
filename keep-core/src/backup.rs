@@ -912,7 +912,7 @@ mod tests {
         let mut keep = create_test_keep(&src_path);
         keep.unlock("test-password-123").unwrap();
         let (credential, _) = keep
-            .issue_agent_credential("claude", 1000, b"grant".to_vec(), 3600)
+            .issue_agent_credential("claude", 1000, b"grant".to_vec(), 1_800_000_000, 3600)
             .unwrap();
         keep.update_agent_ledgers(&[&credential.id], |_| Ok(vec![b"ledger".to_vec()]))
             .unwrap();

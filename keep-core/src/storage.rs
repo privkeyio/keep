@@ -1189,29 +1189,40 @@ impl Storage {
         Ok(credential)
     }
 
-    /// Insert or overwrite an agent credential, encrypted under the data key.
-    /// A new credential is refused once [`MAX_AGENT_CREDENTIALS`] are stored,
-    /// and a revoked credential is never stored as unrevoked again.
-    pub fn store_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
+    fn put_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        match self.load_agent_credential(&credential.id)? {
-            Some(existing) if existing.revoked && !credential.revoked => {
-                return Err(KeepError::invalid_input(
-                    "a revoked agent credential cannot be reinstated",
-                ));
-            }
-            Some(_) => {}
-            None => {
-                if backend.list(AGENT_CREDENTIALS_TABLE)?.len() >= MAX_AGENT_CREDENTIALS {
-                    return Err(KeepError::invalid_input(format!(
-                        "a vault holds at most {MAX_AGENT_CREDENTIALS} agent credentials; delete a revoked one first"
-                    )));
-                }
-            }
-        }
         let serialized = Zeroizing::new(bincode_options().serialize(credential)?);
         let encrypted = self.encrypt_value(&serialized)?;
         backend.put(AGENT_CREDENTIALS_TABLE, &credential.id, &encrypted)
+    }
+
+    /// Store a newly issued agent credential, encrypted under the data key. An
+    /// existing id is refused, as is a new credential once
+    /// [`MAX_AGENT_CREDENTIALS`] are stored.
+    pub(crate) fn insert_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend
+            .get(AGENT_CREDENTIALS_TABLE, &credential.id)?
+            .is_some()
+        {
+            return Err(KeepError::AlreadyExists(credential.id_hex()));
+        }
+        if backend.list(AGENT_CREDENTIALS_TABLE)?.len() >= MAX_AGENT_CREDENTIALS {
+            return Err(KeepError::invalid_input(format!(
+                "a vault holds at most {MAX_AGENT_CREDENTIALS} agent credentials; delete a revoked one first"
+            )));
+        }
+        self.put_agent_credential(credential)
+    }
+
+    /// Replace a stored agent credential, which may only revoke, freeze,
+    /// unfreeze or shorten it (see `AgentCredential::check_replaces`).
+    pub(crate) fn update_agent_credential(&self, credential: &AgentCredential) -> Result<()> {
+        let existing = self
+            .load_agent_credential(&credential.id)?
+            .ok_or_else(|| KeepError::NotFound(credential.id_hex()))?;
+        credential.check_replaces(&existing)?;
+        self.put_agent_credential(credential)
     }
 
     /// The agent credential with `id`, if any.
@@ -1221,6 +1232,20 @@ impl Storage {
             .get(AGENT_CREDENTIALS_TABLE, id)?
             .map(|stored| self.decode_agent_credential(id, &stored))
             .transpose()
+    }
+
+    /// The id of every stored agent credential, read from the row keys alone.
+    pub fn agent_credential_ids(&self) -> Result<Vec<[u8; 16]>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        backend
+            .list(AGENT_CREDENTIALS_TABLE)?
+            .into_iter()
+            .map(|(key, _)| {
+                key.try_into().map_err(|_| {
+                    StorageError::corrupted("agent credential key is not 16 bytes").into()
+                })
+            })
+            .collect()
     }
 
     /// Every stored agent credential.
@@ -1270,11 +1295,17 @@ impl Storage {
     /// counted in one ledger and missing from another. Nothing is written if
     /// `update` fails. The caller holds `&mut Keep` across the whole update, so
     /// no other update interleaves.
-    pub fn update_agent_ledgers<F>(&self, keys: &[&[u8]], update: F) -> Result<()>
+    pub(crate) fn update_agent_ledgers<F>(&self, keys: &[&[u8]], update: F) -> Result<()>
     where
         F: FnOnce(&[Option<Zeroizing<Vec<u8>>>]) -> Result<Vec<Vec<u8>>>,
     {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let distinct: std::collections::HashSet<&[u8]> = keys.iter().copied().collect();
+        if distinct.len() != keys.len() {
+            return Err(KeepError::invalid_input(
+                "an agent ledger update names each ledger once",
+            ));
+        }
         let current = keys
             .iter()
             .map(|key| self.load_agent_ledger(key))

@@ -1207,7 +1207,7 @@ mod tests {
             AgentCredential::issue("claude", 1000, b"grant".to_vec(), 1_800_000_000, 3600).unwrap();
         {
             let storage = Storage::create(&path, "pass1234", Argon2Params::TESTING).unwrap();
-            storage.store_agent_credential(&credential).unwrap();
+            storage.insert_agent_credential(&credential).unwrap();
             storage
                 .update_agent_ledgers(&[&credential.id, b"wallet"], |_| {
                     Ok(vec![b"ledger".to_vec(), b"wallet ledger".to_vec()])
