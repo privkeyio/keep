@@ -10,7 +10,7 @@ use std::process::Output;
 /// A PSBT spending the FROST group's BIP-86 outputs at `paths` (100 000 sats
 /// each) plus one foreign input, paying 30 000 sats away and 69 000 to the
 /// group's change address `/1/5`, with the key origins a watch-only wallet adds.
-pub fn frost_wallet_psbt(group: &[u8; 32], paths: &[[u32; 2]]) -> bitcoin::Psbt {
+pub fn frost_wallet_psbt(group: &[u8; 32], coin: u32, paths: &[[u32; 2]]) -> bitcoin::Psbt {
     use bitcoin::bip32::{DerivationPath, Fingerprint};
     use bitcoin::hashes::Hash;
     use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
@@ -27,7 +27,7 @@ pub fn frost_wallet_psbt(group: &[u8; 32], paths: &[[u32; 2]]) -> bitcoin::Psbt 
                 vec![],
                 (
                     fp,
-                    DerivationPath::from_str(&format!("86'/1'/0'/{}/{}", path[0], path[1]))
+                    DerivationPath::from_str(&format!("86'/{coin}'/0'/{}/{}", path[0], path[1]))
                         .unwrap(),
                 ),
             ),

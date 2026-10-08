@@ -117,7 +117,7 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
     assert!(import.wait_with_output().unwrap().status.success());
 
     let psbt_file = dir.path().join("spend.psbt");
-    write_psbt(&psbt_file, &frost_wallet_psbt(&group, &[[0, 2], [1, 4]]));
+    write_psbt(&psbt_file, &frost_wallet_psbt(&group, 1, &[[0, 2], [1, 4]]));
     let sign = |output: &Path| {
         let mut cmd = keep(&requester);
         cmd.args([
@@ -135,6 +135,7 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
             "1",
             "--timeout",
             "60",
+            "--any-network",
             "--yes",
         ]);
         cmd.output().expect("run wallet sign")

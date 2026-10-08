@@ -59,6 +59,7 @@ pub fn cmd_wallet_sign(
     share_index: Option<u16>,
     relay: &str,
     timeout_secs: u64,
+    any_network: bool,
     yes: bool,
 ) -> Result<()> {
     use crate::commands::bitcoin::{
@@ -74,6 +75,7 @@ pub fn cmd_wallet_sign(
     let password = get_password("Enter password")?;
     let spinner = out.spinner("Unlocking vault...");
     keep.unlock(password.expose_secret())?;
+    drop(password);
     spinner.finish();
 
     // The latest version decides change; older ones still hold coins the group
@@ -82,19 +84,24 @@ pub fn cmd_wallet_sign(
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
     let network = crate::commands::bitcoin::parse_network(&latest.network)?;
+    // The group key and the unhardened path below it do not depend on the
+    // network, so a test-network PSBT names the same outputs as mainnet.
+    if network != keep_bitcoin::Network::Bitcoin && !any_network {
+        return Err(KeepError::InvalidInput(format!(
+            "this group's wallet is on {network}, but its outputs are the same scripts on \
+             mainnet, so these signatures would spend them there too; pass --any-network \
+             to sign anyway"
+        )));
+    }
     let version_error = |version: u32, e: keep_bitcoin::BitcoinError| {
         KeepError::Runtime(format!("stored wallet descriptor version {version}: {e}"))
     };
     let mut wallet = FrostWallet::new(group_pubkey, &latest.external_descriptor, network)
         .map_err(|e| version_error(latest.version, e))?;
     for older in keep
-        .list_all_wallet_descriptor_versions()?
+        .list_wallet_descriptor_versions(&group_pubkey)?
         .into_iter()
-        .filter(|d| {
-            d.group_pubkey == group_pubkey
-                && d.network == latest.network
-                && d.version != latest.version
-        })
+        .filter(|d| d.network == latest.network && d.version != latest.version)
     {
         wallet
             .add_older(&older.external_descriptor)
@@ -107,6 +114,12 @@ pub fn cmd_wallet_sign(
     if spends.is_empty() {
         return Err(KeepError::Runtime(
             "no input in this PSBT spends one of this group's addresses".into(),
+        ));
+    }
+    if network != keep_bitcoin::Network::Bitcoin {
+        out.warn(&format!(
+            "Addresses are shown for {network}, but these outputs are the same scripts on \
+             mainnet: if this PSBT spends mainnet coins, signing it spends them"
         ));
     }
     confirm_sign(yes)?;

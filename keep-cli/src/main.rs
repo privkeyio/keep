@@ -780,6 +780,7 @@ fn dispatch_wallet(
             share,
             relay,
             timeout,
+            any_network,
             yes,
         } => {
             let relay = relay.as_deref().unwrap_or_else(|| cfg.default_relay());
@@ -793,6 +794,7 @@ fn dispatch_wallet(
                 share,
                 relay,
                 timeout,
+                any_network,
                 yes,
             )
         }

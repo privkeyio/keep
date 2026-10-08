@@ -540,6 +540,10 @@ pub(crate) enum WalletCommands {
         /// Seconds to wait for co-signers that support key-path spends
         #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
+        /// Sign with a test-network descriptor. The group's outputs are the same
+        /// scripts on mainnet, so the signatures spend them there too.
+        #[arg(long)]
+        any_network: bool,
         /// Sign without asking for confirmation. KEEP_YES does not skip this prompt.
         #[arg(long)]
         yes: bool,

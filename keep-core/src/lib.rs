@@ -1152,6 +1152,17 @@ impl Keep {
         self.storage.list_all_descriptor_versions()
     }
 
+    /// List every stored wallet descriptor version for one group, oldest first.
+    pub fn list_wallet_descriptor_versions(
+        &self,
+        group_pubkey: &[u8; 32],
+    ) -> Result<Vec<WalletDescriptor>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        self.storage.list_descriptors_for_group(group_pubkey)
+    }
+
     /// Delete a wallet descriptor.
     pub fn delete_wallet_descriptor(&self, group_pubkey: &[u8; 32]) -> Result<()> {
         if !self.is_unlocked() {
