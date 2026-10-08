@@ -76,6 +76,8 @@ pub struct KeyPathSpendRequest {
     /// The scriptPubKey the input spends; the signature must verify under its
     /// output key.
     pub script_pubkey: ScriptBuf,
+    /// What is being spent, recorded in the audit log (e.g. the txid and input).
+    pub context: String,
 }
 
 /// The taproot internal key at `path` below the x-only `group` key: the group

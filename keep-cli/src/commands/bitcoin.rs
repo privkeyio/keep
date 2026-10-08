@@ -135,14 +135,7 @@ pub fn cmd_bitcoin_sign(
     secret.zeroize();
     let signer = signer?;
 
-    let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
-        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-            "read PSBT: {e}"
-        )))
-    })?;
-
-    let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
-        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    let mut psbt = read_psbt_file(psbt_path)?;
 
     let analysis = signer
         .analyze_psbt(&psbt)
@@ -153,13 +146,7 @@ pub fn cmd_bitcoin_sign(
             "no input in this PSBT spends one of this key's addresses".into(),
         ));
     }
-    // Only an explicit --yes skips this: it is the one check `keep bitcoin sign` has.
-    if !yes
-        && !confirm_prompt("Sign this PSBT?")
-            .map_err(|e| KeepError::Runtime(format!("{e}; pass --yes to sign without a prompt")))?
-    {
-        return Err(KeepError::Runtime("signing declined".into()));
-    }
+    confirm_sign(yes)?;
 
     let spinner = out.spinner("Signing PSBT...");
     let signed_count = signer
@@ -167,8 +154,41 @@ pub fn cmd_bitcoin_sign(
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
     spinner.finish();
 
-    let signed_base64 = keep_bitcoin::psbt::serialize_psbt_base64(&psbt);
+    write_signed_psbt(out, &psbt, output_path, signed_count)
+}
 
+/// A base64 PSBT from `path`.
+pub(crate) fn read_psbt_file(path: &str) -> Result<keep_bitcoin::bitcoin::Psbt> {
+    let data = std::fs::read_to_string(path).map_err(|e| {
+        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
+            "read PSBT: {e}"
+        )))
+    })?;
+    keep_bitcoin::psbt::parse_psbt_base64(data.trim())
+        .map_err(|e| KeepError::Runtime(e.to_string()))
+}
+
+/// Asks before signing; only an explicit `--yes` skips it, since it is the one
+/// check a signing command has. KEEP_YES does not, and without a terminal it
+/// refuses.
+pub(crate) fn confirm_sign(yes: bool) -> Result<()> {
+    if !yes
+        && !confirm_prompt("Sign this PSBT?")
+            .map_err(|e| KeepError::Runtime(format!("{e}; pass --yes to sign without a prompt")))?
+    {
+        return Err(KeepError::Runtime("signing declined".into()));
+    }
+    Ok(())
+}
+
+/// Writes the signed PSBT as base64 to `output_path` (or stdout), then reports.
+pub(crate) fn write_signed_psbt(
+    out: &Output,
+    psbt: &keep_bitcoin::bitcoin::Psbt,
+    output_path: Option<&str>,
+    signed_count: usize,
+) -> Result<()> {
+    let signed_base64 = keep_bitcoin::psbt::serialize_psbt_base64(psbt);
     if let Some(output) = output_path {
         std::fs::write(output, &signed_base64).map_err(|e| {
             KeepError::StorageErr(keep_core::error::StorageError::io(format!(
@@ -184,7 +204,6 @@ pub fn cmd_bitcoin_sign(
         out.newline();
         println!("{signed_base64}");
     }
-
     Ok(())
 }
 

@@ -1010,13 +1010,33 @@ async fn frost_network_sign_round(
     Ok(signature)
 }
 
-/// One key-path spend for a network round: the input's sighash, its
-/// `BitcoinSighashPayload`, the path below the group key and the tweak.
+/// One key-path spend for a network round: what to sign and the
+/// `BitcoinSighashPayload` co-signers recompute it from.
 pub(crate) struct NetworkKeyPathSpend {
-    pub sighash: [u8; 32],
+    pub request: keep_core::frost::taproot::KeyPathSpendRequest,
     pub payload: Vec<u8>,
-    pub path: Vec<u32>,
-    pub tweak: keep_frost_net::TaprootTweakPayload,
+}
+
+/// Waits until `count()` reaches `needed`, checking twice a second, or fails
+/// after `timeout` naming how many there are.
+async fn wait_for_peers(
+    count: impl Fn() -> usize,
+    needed: usize,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| KeepError::InvalidInput("timeout too large".into()))?;
+    while count() < needed {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(KeepError::Frost(format!(
+                "only {} of the {needed} co-signers needed are online with key-path spend support",
+                count()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Ok(())
 }
 
 /// Sign each spend with co-signers over `relay`, once `threshold - 1` of them
@@ -1044,28 +1064,30 @@ pub(crate) async fn key_path_spend_round(
     };
 
     let spinner = out.spinner("Waiting for co-signers that support key-path spends...");
-    let deadline = tokio::time::Instant::now() + timeout;
-    while node.online_peers_with(keep_frost_net::CAPABILITY_TAPROOT_TWEAK) < needed {
-        if tokio::time::Instant::now() >= deadline {
-            spinner.finish();
-            return Err(KeepError::Frost(format!(
-                "only {} of the {needed} co-signers needed are online with key-path spend support",
-                node.online_peers_with(keep_frost_net::CAPABILITY_TAPROOT_TWEAK)
-            )));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
+    let waited = wait_for_peers(
+        || node.online_peers_with(keep_frost_net::CAPABILITY_TAPROOT_TWEAK),
+        needed,
+        timeout,
+    )
+    .await;
     spinner.finish();
+    waited?;
+    // A co-signer refuses a request from a peer it has not yet seen announce,
+    // so give our announce a moment to reach the ones we just discovered.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     let mut signatures = Vec::with_capacity(spends.len());
     for (i, spend) in spends.into_iter().enumerate() {
         let spinner = out.spinner(&format!("Signing spend {}...", i + 1));
+        let tweak = keep_frost_net::TaprootTweakPayload {
+            merkle_root: spend.request.tweak.merkle_root,
+        };
         let signature = node
             .request_key_path_spend(
-                spend.sighash.to_vec(),
+                spend.request.sighash.to_vec(),
                 spend.payload,
-                spend.path,
-                spend.tweak,
+                spend.request.path,
+                tweak,
             )
             .await
             .map_err(|e| KeepError::Frost(e.to_string()));
@@ -1965,6 +1987,29 @@ fn format_duration_ago(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn waiting_for_co_signers_succeeds_once_enough_are_online() {
+        let online = std::sync::atomic::AtomicUsize::new(0);
+        let waiter = wait_for_peers(
+            || online.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            std::time::Duration::from_secs(5),
+        );
+        online.store(2, std::sync::atomic::Ordering::SeqCst);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_for_co_signers_times_out_naming_how_many_there_are() {
+        let e = wait_for_peers(|| 1, 2, std::time::Duration::from_millis(600))
+            .await
+            .expect_err("too few co-signers");
+        assert!(e.to_string().contains("only 1 of the 2"), "{e}");
+        assert!(wait_for_peers(|| 0, 1, std::time::Duration::MAX)
+            .await
+            .is_err());
+    }
+
     use super::*;
 
     #[test]

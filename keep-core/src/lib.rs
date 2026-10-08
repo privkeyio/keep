@@ -1329,40 +1329,7 @@ impl Keep {
             return Err(KeepError::Locked);
         }
 
-        let data_key = self.get_data_key()?;
-        let shares = self.storage.list_shares()?;
-        let our_shares: Vec<_> = shares
-            .iter()
-            .filter(|s| {
-                s.metadata.group_pubkey == *group_pubkey
-                    && s.ciphersuite == crate::frost::Ciphersuite::Secp256k1Tr
-            })
-            .collect();
-
-        if our_shares.is_empty() {
-            return Err(KeepError::KeyNotFound("No shares for group".into()));
-        }
-
-        let threshold = our_shares[0].metadata.threshold;
-
-        if our_shares.len() < threshold as usize {
-            self.audit_event(AuditEventType::FrostSignFailed, |e| {
-                e.with_group(group_pubkey)
-                    .with_message_hash(message)
-                    .with_success(false)
-                    .with_reason("Insufficient shares")
-            });
-            return Err(KeepError::Frost(format!(
-                "Need {} shares to sign, only {} available",
-                threshold,
-                our_shares.len()
-            )));
-        }
-
-        let mut decrypted_shares = Vec::new();
-        for stored in our_shares.iter().take(threshold as usize) {
-            decrypted_shares.push(stored.decrypt(&data_key)?);
-        }
+        let (threshold, decrypted_shares) = self.local_threshold_shares(group_pubkey, message)?;
 
         match frost::sign_with_local_shares(&decrypted_shares, message) {
             Ok(sig) => {
@@ -1384,18 +1351,13 @@ impl Keep {
         }
     }
 
-    /// Sign key-path spends of the group's taproot outputs with local shares, one
-    /// per `(sighash, path, tweak, script_pubkey)`. Every signature is checked
-    /// against the output key of its scriptPubKey, and all are made before any is
-    /// returned. Requires threshold shares locally.
-    pub fn frost_sign_key_path_spends(
+    /// Decrypt `threshold` of this vault's secp256k1 shares of `group_pubkey`,
+    /// recording a refusal (against `audit_hash`) when too few are held.
+    fn local_threshold_shares(
         &mut self,
         group_pubkey: &[u8; 32],
-        spends: &[frost::taproot::KeyPathSpendRequest],
-    ) -> Result<Vec<[u8; 64]>> {
-        if !self.is_unlocked() {
-            return Err(KeepError::Locked);
-        }
+        audit_hash: &[u8],
+    ) -> Result<(u16, Vec<frost::SharePackage>)> {
         let data_key = self.get_data_key()?;
         let shares = self.storage.list_shares()?;
         let ours: Vec<_> = shares
@@ -1411,6 +1373,12 @@ impl Keep {
             .metadata
             .threshold;
         if ours.len() < threshold as usize {
+            self.audit_event(AuditEventType::FrostSignFailed, |e| {
+                e.with_group(group_pubkey)
+                    .with_message_hash(audit_hash)
+                    .with_success(false)
+                    .with_reason("Insufficient shares")
+            });
             return Err(KeepError::Frost(format!(
                 "Need {} shares to sign, only {} available",
                 threshold,
@@ -1422,6 +1390,26 @@ impl Keep {
             .take(threshold as usize)
             .map(|stored| stored.decrypt(&data_key))
             .collect::<Result<Vec<_>>>()?;
+        Ok((threshold, decrypted))
+    }
+
+    /// Sign key-path spends of the group's taproot outputs with local shares, one
+    /// per request. Every signature is checked against the output key of its
+    /// scriptPubKey, and all are made before any is returned or recorded: the
+    /// audit log gets one entry per spend (its sighash and context) only once all
+    /// have succeeded, or the failure. Requires threshold shares locally.
+    pub fn frost_sign_key_path_spends(
+        &mut self,
+        group_pubkey: &[u8; 32],
+        spends: &[frost::taproot::KeyPathSpendRequest],
+    ) -> Result<Vec<[u8; 64]>> {
+        if !self.is_unlocked() {
+            return Err(KeepError::Locked);
+        }
+        let first = spends
+            .first()
+            .ok_or_else(|| KeepError::InvalidInput("nothing to sign".into()))?;
+        let (threshold, decrypted) = self.local_threshold_shares(group_pubkey, &first.sighash)?;
 
         let mut signatures = Vec::with_capacity(spends.len());
         for spend in spends {
@@ -1432,23 +1420,25 @@ impl Keep {
                 spend.tweak,
                 &spend.script_pubkey,
             ) {
-                Ok(sig) => {
-                    self.audit_event(AuditEventType::FrostSign, |e| {
-                        e.with_group(group_pubkey)
-                            .with_message_hash(&spend.sighash)
-                            .with_threshold(threshold)
-                    });
-                    signatures.push(sig);
-                }
+                Ok(sig) => signatures.push(sig),
                 Err(e) => {
-                    self.audit_event(AuditEventType::FrostSignFailed, |e| {
-                        e.with_group(group_pubkey)
+                    self.audit_event(AuditEventType::FrostSignFailed, |ev| {
+                        ev.with_group(group_pubkey)
                             .with_message_hash(&spend.sighash)
                             .with_success(false)
+                            .with_reason(&spend.context)
                     });
                     return Err(e);
                 }
             }
+        }
+        for spend in spends {
+            self.audit_event(AuditEventType::FrostSign, |e| {
+                e.with_group(group_pubkey)
+                    .with_message_hash(&spend.sighash)
+                    .with_threshold(threshold)
+                    .with_reason(&spend.context)
+            });
         }
         Ok(signatures)
     }
@@ -2225,6 +2215,63 @@ mod tests {
 
         let stored_shares = keep.frost_list_shares().unwrap();
         assert_eq!(stored_shares.len(), 3);
+    }
+
+    /// Local key-path spends: each signature verifies under its output key, and the
+    /// audit log records each spend with its context only once all are signed; a
+    /// spend that fails records the failure and nothing for the ones before it.
+    #[test]
+    fn local_key_path_spends_are_signed_then_audited() {
+        use crate::frost::taproot::{self, KeyPathSpendRequest, TaprootTweak};
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let shares = keep.frost_generate(2, 3, "spend-test").unwrap();
+        let group = *shares[0].group_pubkey();
+        let request = |path: Vec<u32>, sighash: [u8; 32], context: &str| {
+            let internal = taproot::internal_key(&group, &path).unwrap();
+            KeyPathSpendRequest {
+                sighash,
+                path,
+                tweak: TaprootTweak::default(),
+                script_pubkey: TaprootTweak::default().script_pubkey(&internal).unwrap(),
+                context: context.into(),
+            }
+        };
+        let spends = [
+            request(vec![0, 1], [1; 32], "txid aa input 0"),
+            request(vec![1, 2], [2; 32], "txid aa input 1"),
+        ];
+        let sigs = keep.frost_sign_key_path_spends(&group, &spends).unwrap();
+        for (spend, sig) in spends.iter().zip(&sigs) {
+            taproot::verify_key_path_signature(sig, &spend.sighash, &spend.script_pubkey).unwrap();
+        }
+        let signed: Vec<_> = keep
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == AuditEventType::FrostSign)
+            .filter_map(|e| e.reason)
+            .collect();
+        assert_eq!(signed, vec!["txid aa input 0", "txid aa input 1"]);
+
+        let mut bad = request(vec![0, 3], [3; 32], "txid bb input 1");
+        bad.script_pubkey = request(vec![0, 4], [3; 32], "").script_pubkey;
+        let before = keep.audit_read_all().unwrap().len();
+        assert!(keep
+            .frost_sign_key_path_spends(
+                &group,
+                &[request(vec![0, 5], [4; 32], "txid bb input 0"), bad]
+            )
+            .is_err());
+        let after: Vec<_> = keep
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .skip(before)
+            .collect();
+        assert_eq!(after.len(), 1, "only the failure is recorded");
+        assert_eq!(after[0].event_type, AuditEventType::FrostSignFailed);
+        assert_eq!(after[0].reason.as_deref(), Some("txid bb input 1"));
     }
 
     #[test]

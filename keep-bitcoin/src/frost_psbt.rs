@@ -10,7 +10,7 @@
 //! one of those outputs, checking the spent scriptPubKey rather than trusting the
 //! PSBT's key origins, and recognizes change the same way.
 
-use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
+use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource};
 use bitcoin::hashes::Hash;
 use bitcoin::psbt::{Input, Output, Psbt};
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -18,10 +18,14 @@ use bitcoin::taproot::Signature as TaprootSignature;
 use bitcoin::{Address, Network, ScriptBuf, TxOut};
 use keep_core::frost::taproot::{self, TaprootTweak};
 use miniscript::descriptor::{Descriptor, DescriptorPublicKey};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
+type TapKeyOrigins =
+    BTreeMap<bitcoin::XOnlyPublicKey, (Vec<bitcoin::taproot::TapLeafHash>, KeySource)>;
+
 use crate::address::coin_type;
-use crate::descriptor::{change_script_at_index, descriptor_address_at_index, DescriptorExport};
+use crate::descriptor::{descriptor_address_at_index, DescriptorExport};
 use crate::error::{BitcoinError, Result};
 use crate::psbt::{requested_sighash_type, OutputInfo, PsbtAnalysis, CHANGE_INDEX_LIMIT};
 
@@ -36,23 +40,17 @@ pub struct KeyPathSpend {
     pub sighash_type: TapSighashType,
 }
 
-/// A FROST group's taproot wallet, from its stored external descriptor.
+/// A FROST group's taproot wallet, from every external descriptor stored for it
+/// (a replaced version still holds coins the group can spend).
 pub struct FrostWallet {
     group: [u8; 32],
     network: Network,
-    external: String,
     fingerprint: Fingerprint,
-    kind: WalletKind,
-}
-
-enum WalletKind {
-    /// `tr(<group xpub>/0/*)`: one output per path below the group key.
-    Bip86,
-    /// `tr(<group>[, <tree>])`: one output, spent with the tree's merkle root.
-    Single {
-        script_pubkey: ScriptBuf,
-        merkle_root: Option<[u8; 32]>,
-    },
+    /// Some version is `tr(<group xpub>/0/*)`: one output per path below the
+    /// group key, the same for every such version.
+    bip86: bool,
+    /// The `tr(<group>[, <tree>])` outputs: each spent with its tree's root.
+    singles: Vec<(ScriptBuf, Option<[u8; 32]>)>,
 }
 
 fn keep_error(e: keep_core::error::KeepError) -> BitcoinError {
@@ -60,10 +58,29 @@ fn keep_error(e: keep_core::error::KeepError) -> BitcoinError {
 }
 
 impl FrostWallet {
-    /// The wallet `external_descriptor` describes, which must be one of the
+    /// The wallet the group's `external_descriptors` describe. Each must be the
     /// group's: its first address is the group's, or its internal key is the
     /// group key.
-    pub fn new(group: [u8; 32], external_descriptor: &str, network: Network) -> Result<Self> {
+    pub fn new(group: [u8; 32], external_descriptors: &[&str], network: Network) -> Result<Self> {
+        if external_descriptors.is_empty() {
+            return Err(BitcoinError::Descriptor("no wallet descriptor".into()));
+        }
+        let fingerprint = Fingerprint::from_str(&DescriptorExport::pubkey_fingerprint(&group))
+            .map_err(|e| BitcoinError::Descriptor(format!("group fingerprint: {e}")))?;
+        let mut wallet = Self {
+            group,
+            network,
+            fingerprint,
+            bip86: false,
+            singles: Vec::new(),
+        };
+        for descriptor in external_descriptors {
+            wallet.add(descriptor)?;
+        }
+        Ok(wallet)
+    }
+
+    fn add(&mut self, external_descriptor: &str) -> Result<()> {
         let body = external_descriptor
             .split('#')
             .next()
@@ -74,23 +91,20 @@ impl FrostWallet {
         let Descriptor::Tr(tr) = &parsed else {
             return Err(BitcoinError::Descriptor("not a taproot descriptor".into()));
         };
-        let kind = if parsed.has_wildcard() {
+        if parsed.has_wildcard() {
             if tr.tap_tree().is_some() {
                 return Err(BitcoinError::Descriptor(
                     "a ranged descriptor with a script tree is not a keep FROST wallet".into(),
                 ));
             }
-            let first = TaprootTweak::default()
-                .script_pubkey(&taproot::internal_key(&group, &[0, 0]).map_err(keep_error)?)
-                .map_err(keep_error)?;
-            if descriptor_address_at_index(external_descriptor, network, 0)?.script_pubkey()
-                != first
+            if descriptor_address_at_index(external_descriptor, self.network, 0)?.script_pubkey()
+                != self.bip86_script(&[0, 0])?
             {
                 return Err(BitcoinError::Descriptor(
                     "the descriptor is not this group's wallet".into(),
                 ));
             }
-            WalletKind::Bip86
+            self.bip86 = true;
         } else {
             let definite = parsed
                 .at_derivation_index(0)
@@ -99,25 +113,24 @@ impl FrostWallet {
                 return Err(BitcoinError::Descriptor("not a taproot descriptor".into()));
             };
             let info = tr.spend_info();
-            if info.internal_key().serialize() != group {
+            if info.internal_key().serialize() != self.group {
                 return Err(BitcoinError::Descriptor(
                     "the descriptor's internal key is not the group key".into(),
                 ));
             }
-            WalletKind::Single {
-                script_pubkey: definite.script_pubkey(),
-                merkle_root: info.merkle_root().map(|root| root.to_byte_array()),
-            }
-        };
-        let fingerprint = Fingerprint::from_str(&DescriptorExport::pubkey_fingerprint(&group))
-            .map_err(|e| BitcoinError::Descriptor(format!("group fingerprint: {e}")))?;
-        Ok(Self {
-            group,
-            network,
-            external: external_descriptor.to_string(),
-            fingerprint,
-            kind,
-        })
+            self.singles.push((
+                definite.script_pubkey(),
+                info.merkle_root().map(|root| root.to_byte_array()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The BIP-86 output at `path` below the group key.
+    fn bip86_script(&self, path: &[u32]) -> Result<ScriptBuf> {
+        TaprootTweak::default()
+            .script_pubkey(&taproot::internal_key(&self.group, path).map_err(keep_error)?)
+            .map_err(keep_error)
     }
 
     /// The path below the group key an origin names, if it has the wallet's
@@ -136,64 +149,63 @@ impl FrostWallet {
         }
     }
 
+    /// The BIP-86 path below the group key an origin set names whose output is
+    /// `spent`, if any: the origins only name paths to try.
+    fn bip86_path(
+        &self,
+        origins: &TapKeyOrigins,
+        spent: &ScriptBuf,
+        change_only: bool,
+    ) -> Result<Option<Vec<u32>>> {
+        for (leaves, (fp, path)) in origins.values() {
+            if !leaves.is_empty() || *fp != self.fingerprint {
+                continue;
+            }
+            let Some(group_path) = self.group_path(path) else {
+                continue;
+            };
+            if change_only && !matches!(group_path.as_slice(), [1, i] if *i < CHANGE_INDEX_LIMIT) {
+                continue;
+            }
+            if self.bip86_script(&group_path)? == *spent {
+                return Ok(Some(group_path));
+            }
+        }
+        Ok(None)
+    }
+
     /// How the group spends input `input`, if it is one of the group's outputs:
-    /// the key origins only name a path to try, the spent scriptPubKey decides.
+    /// the spent scriptPubKey decides.
     fn spend_of(
         &self,
         input: &Input,
         spent: &ScriptBuf,
     ) -> Result<Option<(Vec<u32>, TaprootTweak)>> {
-        match &self.kind {
-            WalletKind::Single {
-                script_pubkey,
-                merkle_root,
-            } => {
-                let root_matches = input
-                    .tap_merkle_root
-                    .is_none_or(|r| Some(r.to_byte_array()) == *merkle_root);
-                Ok((spent == script_pubkey && root_matches)
-                    .then(|| (Vec::new(), TaprootTweak::new(*merkle_root))))
-            }
-            WalletKind::Bip86 => {
-                if input.tap_merkle_root.is_some() {
-                    return Ok(None);
-                }
-                for (leaves, (fp, path)) in input.tap_key_origins.values() {
-                    if !leaves.is_empty() || *fp != self.fingerprint {
-                        continue;
-                    }
-                    let Some(group_path) = self.group_path(path) else {
-                        continue;
-                    };
-                    let internal =
-                        taproot::internal_key(&self.group, &group_path).map_err(keep_error)?;
-                    let tweak = TaprootTweak::default();
-                    if tweak.script_pubkey(&internal).map_err(keep_error)? == *spent {
-                        return Ok(Some((group_path, tweak)));
-                    }
-                }
-                Ok(None)
+        for (script_pubkey, merkle_root) in &self.singles {
+            let root_matches = input
+                .tap_merkle_root
+                .is_none_or(|r| Some(r.to_byte_array()) == *merkle_root);
+            if spent == script_pubkey && root_matches {
+                return Ok(Some((Vec::new(), TaprootTweak::new(*merkle_root))));
             }
         }
+        if !self.bip86 || input.tap_merkle_root.is_some() {
+            return Ok(None);
+        }
+        Ok(self
+            .bip86_path(&input.tap_key_origins, spent, false)?
+            .map(|path| (path, TaprootTweak::default())))
     }
 
-    /// Whether `output` pays the wallet's change: the first change addresses
-    /// of the BIP-86 wallet a watch-only wallet looks at, or the single output of
-    /// a recovery wallet. Origins only name the index to check.
+    /// Whether `output` pays the wallet's change: one of the first change
+    /// addresses of the BIP-86 wallet, which a watch-only wallet looks at, or a
+    /// recovery wallet's output. Origins only name the index to check.
     fn is_change(&self, output: &Output, script_pubkey: &ScriptBuf) -> bool {
-        match &self.kind {
-            WalletKind::Single {
-                script_pubkey: ours,
-                ..
-            } => script_pubkey == ours,
-            WalletKind::Bip86 => output.tap_key_origins.values().any(|(leaves, (fp, path))| {
-                leaves.is_empty()
-                    && *fp == self.fingerprint
-                    && matches!(self.group_path(path).as_deref(), Some([1, i]) if *i < CHANGE_INDEX_LIMIT)
-                    && change_script_at_index(&self.external, self.network, path.as_ref()[4].into())
-                        .is_ok_and(|change| change == *script_pubkey)
-            }),
-        }
+        self.singles.iter().any(|(ours, _)| ours == script_pubkey)
+            || (self.bip86
+                && self
+                    .bip86_path(&output.tap_key_origins, script_pubkey, true)
+                    .is_ok_and(|path| path.is_some()))
     }
 
     /// What the PSBT spends and pays, and the inputs the group signs. Every
@@ -341,7 +353,7 @@ mod tests {
 
     fn bip86(group: &[u8; 32]) -> FrostWallet {
         let desc = DescriptorExport::from_frost_wallet(group, None, NET).unwrap();
-        FrostWallet::new(*group, desc.external_descriptor(), NET).unwrap()
+        FrostWallet::new(*group, &[desc.external_descriptor()], NET).unwrap()
     }
 
     fn fp(group: &[u8; 32]) -> Fingerprint {
@@ -635,14 +647,8 @@ mod tests {
         let (shares, group) = new_group();
         let recovery_key = hex::encode(&foreign().as_bytes()[2..34]);
         let descriptor = format!("tr({},pk({recovery_key}))", hex::encode(group));
-        let wallet = FrostWallet::new(group, &descriptor, NET).unwrap();
-        let WalletKind::Single {
-            script_pubkey,
-            merkle_root,
-        } = &wallet.kind
-        else {
-            panic!("a definite descriptor is a single output");
-        };
+        let wallet = FrostWallet::new(group, &[&descriptor], NET).unwrap();
+        let (script_pubkey, merkle_root) = &wallet.singles[0];
         assert!(merkle_root.is_some());
         let mut p = psbt(
             vec![(script_pubkey.clone(), None)],
@@ -667,14 +673,58 @@ mod tests {
         let (_, group) = new_group();
         let (_, other) = new_group();
         let theirs = DescriptorExport::from_frost_wallet(&other, None, NET).unwrap();
-        assert!(FrostWallet::new(group, theirs.external_descriptor(), NET).is_err());
+        assert!(FrostWallet::new(group, &[theirs.external_descriptor()], NET).is_err());
         let key = hex::encode(&foreign().as_bytes()[2..34]);
-        assert!(FrostWallet::new(group, &format!("tr({key})"), NET).is_err());
+        assert!(FrostWallet::new(group, &[&format!("tr({key})")], NET).is_err());
         assert!(FrostWallet::new(
             group,
-            "wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)",
+            &["wpkh(02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5)"],
             NET
         )
         .is_err());
+        assert!(FrostWallet::new(group, &[], NET).is_err());
+        let ours = DescriptorExport::from_frost_wallet(&group, None, NET).unwrap();
+        assert!(
+            FrostWallet::new(
+                group,
+                &[ours.external_descriptor(), theirs.external_descriptor()],
+                NET
+            )
+            .is_err(),
+            "every stored version must be the group's"
+        );
+    }
+
+    /// Coins at a replaced descriptor's outputs stay spendable: an input is the
+    /// group's if any stored version claims it.
+    #[test]
+    fn every_stored_version_is_spendable() {
+        let (shares, group) = new_group();
+        let bip86 = DescriptorExport::from_frost_wallet(&group, None, NET).unwrap();
+        let recovery = format!(
+            "tr({},pk({}))",
+            hex::encode(group),
+            hex::encode(&foreign().as_bytes()[2..34])
+        );
+        let wallet =
+            FrostWallet::new(group, &[bip86.external_descriptor(), &recovery], NET).unwrap();
+        let (k0, s0) = child(&group, &[0, 3]);
+        let recovery_spk = wallet.singles[0].0.clone();
+        let mut p = psbt(
+            vec![
+                (s0, Some(origin(&group, k0, "86'/1'/0'/0/3"))),
+                (recovery_spk, None),
+            ],
+            None,
+        );
+        let (analysis, spends) = wallet.analyze(&p).unwrap();
+        assert_eq!(analysis.signable_inputs, vec![0, 1]);
+        assert_eq!(spends[1].tweak, TaprootTweak::new(wallet.singles[0].1));
+        sign_all(&shares, &mut p, &spends);
+        let only_recovery = FrostWallet::new(group, &[&recovery], NET).unwrap();
+        assert_eq!(
+            only_recovery.analyze(&p).unwrap().0.signable_inputs,
+            vec![1]
+        );
     }
 }

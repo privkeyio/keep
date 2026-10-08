@@ -538,7 +538,7 @@ pub(crate) enum WalletCommands {
         #[arg(short, long)]
         relay: Option<String>,
         /// Seconds to wait for co-signers that support key-path spends
-        #[arg(long, default_value = "60")]
+        #[arg(long, default_value = "60", value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout: u64,
         /// Sign without asking for confirmation. KEEP_YES does not skip this prompt.
         #[arg(long)]

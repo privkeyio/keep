@@ -81,9 +81,9 @@ pub struct BitcoinSighashPayload {
 }
 
 /// The largest key-spend payload (JSON) a sign request carries. The request
-/// hex-encodes it inside a NIP-44 message, whose plaintext is capped at 65535
-/// bytes, so this leaves room for the hex doubling and the request's other fields.
-pub const MAX_KEY_SPEND_PAYLOAD_BYTES: usize = 28 * 1024;
+/// hex-encodes it, NIP-44 pads and base64-encodes the result, and relays commonly
+/// refuse events over 64 KiB, so this keeps a full request comfortably inside one.
+pub const MAX_KEY_SPEND_PAYLOAD_BYTES: usize = 16 * 1024;
 
 impl BitcoinSighashPayload {
     /// The payload for a key-path spend of input `input_index` of `psbt`, with
@@ -411,6 +411,41 @@ mod key_spend_payload_tests {
                 .all(|i| i.final_script_witness.is_none()));
             assert_eq!(reduced.inputs[1].witness_utxo, psbt.inputs[1].witness_utxo);
         }
+    }
+
+    /// A sign request carrying a payload at the cap, the tweak and nonce
+    /// references for 16 participants still encrypts and fits in a 64 KiB event.
+    #[test]
+    fn a_request_at_the_payload_cap_fits_one_event() {
+        use crate::{KfpEventBuilder, NonceRef, SignRequestPayload, TaprootTweakPayload};
+        let participants: Vec<u16> = (1..=16).collect();
+        let nonce_refs = participants
+            .iter()
+            .map(|&i| NonceRef {
+                share_index: i,
+                nonce_id: if i == 1 { [0; 32] } else { [i as u8; 32] },
+                commitment: vec![0x02; 66],
+            })
+            .collect();
+        let request = SignRequestPayload::new(
+            [7; 32],
+            [8; 32],
+            vec![9; 32],
+            MSG_TYPE_BITCOIN_SIGHASH,
+            participants,
+        )
+        .with_structured_payload(vec![b'7'; MAX_KEY_SPEND_PAYLOAD_BYTES])
+        .with_taproot_tweak(TaprootTweakPayload {
+            merkle_root: Some([1; 32]),
+        })
+        .with_derivation_path(vec![1, 999])
+        .with_session_salt(vec![0xaa; 48])
+        .with_nonce_refs(nonce_refs);
+        let keys = nostr_sdk::Keys::generate();
+        let recipient = nostr_sdk::Keys::generate().public_key();
+        let event = KfpEventBuilder::sign_request(&keys, &recipient, request).unwrap();
+        let size = nostr_sdk::JsonUtil::as_json(&event).len();
+        assert!(size <= 64 * 1024, "{size} bytes");
     }
 
     #[test]

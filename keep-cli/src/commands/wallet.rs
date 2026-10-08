@@ -61,16 +61,14 @@ pub fn cmd_wallet_sign(
     timeout_secs: u64,
     yes: bool,
 ) -> Result<()> {
+    use crate::commands::bitcoin::{
+        confirm_sign, print_analysis, read_psbt_file, write_signed_psbt,
+    };
     use keep_bitcoin::frost_psbt::{self, FrostWallet};
+    use keep_core::frost::taproot::KeyPathSpendRequest;
 
     let group_pubkey = parse_group_id(group)?;
-    let psbt_data = std::fs::read_to_string(psbt_path).map_err(|e| {
-        KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-            "read PSBT: {e}"
-        )))
-    })?;
-    let mut psbt = keep_bitcoin::psbt::parse_psbt_base64(psbt_data.trim())
-        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    let mut psbt = read_psbt_file(psbt_path)?;
 
     let mut keep = Keep::open(path)?;
     let password = get_password("Enter password")?;
@@ -78,66 +76,67 @@ pub fn cmd_wallet_sign(
     keep.unlock(password.expose_secret())?;
     spinner.finish();
 
-    let descriptor = keep
+    // Every stored version: coins at a replaced descriptor's outputs are still
+    // the group's to spend.
+    let latest = keep
         .get_wallet_descriptor(&group_pubkey)?
         .ok_or_else(|| KeepError::KeyNotFound("no wallet descriptor for this group".into()))?;
-    let network = crate::commands::bitcoin::parse_network(&descriptor.network)?;
-    let wallet = FrostWallet::new(group_pubkey, &descriptor.external_descriptor, network)
+    let versions: Vec<WalletDescriptor> = keep
+        .list_all_wallet_descriptor_versions()?
+        .into_iter()
+        .filter(|d| d.group_pubkey == group_pubkey && d.network == latest.network)
+        .collect();
+    let network = crate::commands::bitcoin::parse_network(&latest.network)?;
+    let externals: Vec<&str> = versions
+        .iter()
+        .map(|d| d.external_descriptor.as_str())
+        .collect();
+    let wallet = FrostWallet::new(group_pubkey, &externals, network)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
     let (analysis, spends) = wallet
         .analyze(&psbt)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
-    crate::commands::bitcoin::print_analysis(out, &analysis, true);
+    print_analysis(out, &analysis, true);
     if spends.is_empty() {
         return Err(KeepError::Runtime(
             "no input in this PSBT spends one of this group's addresses".into(),
         ));
     }
-    // Only an explicit --yes skips this: it is the one check this command has.
-    if !yes
-        && !super::confirm_prompt("Sign this PSBT?")
-            .map_err(|e| KeepError::Runtime(format!("{e}; pass --yes to sign without a prompt")))?
-    {
-        return Err(KeepError::Runtime("signing declined".into()));
-    }
+    confirm_sign(yes)?;
 
     let sighashes =
         frost_psbt::sighashes(&psbt, &spends).map_err(|e| KeepError::Runtime(e.to_string()))?;
+    let txid = psbt.unsigned_tx.compute_txid();
+    let requests: Vec<KeyPathSpendRequest> = spends
+        .iter()
+        .zip(&sighashes)
+        .map(|(s, sighash)| KeyPathSpendRequest {
+            sighash: *sighash,
+            path: s.path.clone(),
+            tweak: s.tweak,
+            script_pubkey: s.script_pubkey.clone(),
+            context: format!("key-path spend of txid {txid} input {}", s.input),
+        })
+        .collect();
     let signatures = if local {
-        let requests: Vec<_> = spends
-            .iter()
-            .zip(&sighashes)
-            .map(
-                |(s, sighash)| keep_core::frost::taproot::KeyPathSpendRequest {
-                    sighash: *sighash,
-                    path: s.path.clone(),
-                    tweak: s.tweak,
-                    script_pubkey: s.script_pubkey.clone(),
-                },
-            )
-            .collect();
         keep.frost_sign_key_path_spends(&group_pubkey, &requests)?
     } else {
         let share = match share_index {
             Some(idx) => keep.frost_get_share_by_index(&group_pubkey, idx)?,
             None => keep.frost_get_share(&group_pubkey)?,
         };
-        let requests = spends
+        let network_spends = spends
             .iter()
-            .zip(&sighashes)
-            .map(|(s, sighash)| {
+            .zip(requests)
+            .map(|(s, request)| {
                 Ok(crate::commands::frost_network::NetworkKeyPathSpend {
-                    sighash: *sighash,
                     payload: keep_frost_net::BitcoinSighashPayload::for_key_spend(
                         &psbt,
                         s.input,
                         s.sighash_type,
                     )
                     .map_err(|e| KeepError::Runtime(e.to_string()))?,
-                    path: s.path.clone(),
-                    tweak: keep_frost_net::TaprootTweakPayload {
-                        merkle_root: s.tweak.merkle_root,
-                    },
+                    request,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -152,27 +151,13 @@ pub fn cmd_wallet_sign(
             share,
             relay,
             Duration::from_secs(timeout_secs),
-            requests,
+            network_spends,
         ))?
     };
 
     frost_psbt::apply_signatures(&mut psbt, &spends, &sighashes, &signatures)
         .map_err(|e| KeepError::Runtime(e.to_string()))?;
-    let signed = keep_bitcoin::psbt::serialize_psbt_base64(&psbt);
-    out.newline();
-    out.success(&format!("Signed {} input(s)", spends.len()));
-    match output_path {
-        Some(output) => {
-            std::fs::write(output, &signed).map_err(|e| {
-                KeepError::StorageErr(keep_core::error::StorageError::io(format!(
-                    "write output: {e}"
-                )))
-            })?;
-            out.field("Output", output);
-        }
-        None => println!("{signed}"),
-    }
-    Ok(())
+    write_signed_psbt(out, &psbt, output_path, spends.len())
 }
 
 pub fn cmd_wallet_list(out: &Output, path: &Path) -> Result<()> {
