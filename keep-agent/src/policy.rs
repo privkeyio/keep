@@ -47,6 +47,9 @@ pub const APPROVAL_KINDS: &[u16] = &[
 /// Replaceable kinds (10000-19999) overwrite the owner's previous state, such
 /// as relay lists and the NIP-60 wallet. Ephemeral kinds (20000-29999) carry
 /// payment, auth and remote-signing requests. Both always need an approval.
+/// Addressable kinds (30000-39999) are named content, such as articles and app
+/// data, that a grant may list like any other kind; the one that holds a
+/// wallet key is in `APPROVAL_KINDS`.
 const APPROVAL_RANGE: std::ops::Range<u16> = 10_000..30_000;
 
 fn kind_needs_approval(kind: u16) -> bool {
@@ -57,7 +60,9 @@ fn kind_needs_approval(kind: u16) -> bool {
 /// allows nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
-    /// The keys (x-only public keys) the credential may use.
+    /// The vault keys (x-only public keys) the credential may use: the key a
+    /// request signs or encrypts with, or whose wallet a PSBT spends from. NIP-44
+    /// with any of these as the counterparty counts as the owner's own payload.
     pub keys: BTreeSet<[u8; 32]>,
     pub operations: BTreeSet<Operation>,
     pub event_kinds: BTreeSet<u16>,
@@ -162,8 +167,8 @@ pub enum Decision {
     /// Allowed, with nothing reserved.
     Allow,
     /// An allowed spend, already reserved in the credential's and the wallet's
-    /// ledgers. Persist the ledgers before signing; release the reservation if
-    /// no signature leaves the gateway.
+    /// ledgers. Persist both ledgers in one transaction before signing; release
+    /// the reservation if no signature leaves the gateway.
     Spend(Reservation),
     Deny(DenyReason),
     RequireApproval(ApprovalReason),
@@ -345,7 +350,8 @@ pub fn evaluate(
 /// Decide a request a human has approved. Everything is checked again except
 /// what only needed the approval (risky kinds, own-key NIP-44 and the spend
 /// threshold); hard limits and budgets still apply, and an approved spend is
-/// reserved like any other.
+/// reserved like any other. The caller must hold an approval bound to this
+/// exact request (its hash) and consume it, so one approval clears one request.
 pub fn evaluate_approved(
     grant: &Grant,
     key: &[u8; 32],
@@ -392,7 +398,7 @@ fn decide(
         Request::Nip44Encrypt { peer } | Request::Nip44Decrypt { peer } => {
             if !grant.nip44_peers.contains(&peer) {
                 Decision::Deny(DenyReason::PeerNotGranted)
-            } else if peer != *key {
+            } else if !grant.keys.contains(&peer) {
                 Decision::Allow
             } else if op == Operation::Nip44Encrypt {
                 needs(ApprovalReason::EncryptToOwnKey)
@@ -450,6 +456,11 @@ fn spend_decision(
         });
     }
     let requested = analysis.leaving_wallet_sats();
+    // Nothing leaves the wallet, so there is nothing to count or approve, and
+    // recording it would only fill the ledgers.
+    if requested == 0 {
+        return Decision::Allow;
+    }
     let at = budgets
         .credential
         .advance(now)
@@ -478,11 +489,6 @@ fn spend_decision(
                 threshold,
             });
         }
-    }
-    // Nothing leaves the wallet, so there is nothing to count; recording it
-    // would only fill the ledgers.
-    if requested == 0 {
-        return Decision::Allow;
     }
     if budgets.credential.spends.len() >= MAX_CREDENTIAL_ENTRIES
         || budgets.wallet.spends.len() >= MAX_WALLET_ENTRIES
@@ -672,10 +678,10 @@ mod tests {
         // Explicit kinds, both ends of the ranges, and the kinds the ranges are
         // there for: relay and DM relay lists, the NIP-60 wallet, nutzap info,
         // relay auth, NWC, NIP-46, Blossom and HTTP auth.
-        let risky = APPROVAL_KINDS.iter().copied().chain([
-            10_000, 10_002, 10_019, 10_050, 17_375, 19_999, 20_000, 22_242, 23_194, 24_133, 24_242,
-            27_235, 29_999,
-        ]);
+        let risky = [
+            0, 3, 5, 62, 7_374, 7_375, 7_376, 9_321, 37_375, 10_000, 10_002, 10_019, 10_050,
+            17_375, 19_999, 20_000, 22_242, 23_194, 24_133, 24_242, 27_235, 29_999,
+        ];
         for kind in risky {
             let mut g = grant();
             g.event_kinds = [kind].into();
@@ -736,6 +742,18 @@ mod tests {
         assert_eq!(
             s.approved(&g, Request::Nip44Decrypt { peer: KEY }, T0),
             Decision::Allow
+        );
+
+        // Another key of the same grant is the owner too.
+        let mut g = grant();
+        g.keys.insert(PEER);
+        assert_eq!(
+            s.decide(&g, Request::Nip44Decrypt { peer: PEER }, T0),
+            Decision::RequireApproval(ApprovalReason::DecryptOwnPayload)
+        );
+        assert_eq!(
+            s.decide(&g, Request::Nip44Encrypt { peer: PEER }, T0),
+            Decision::RequireApproval(ApprovalReason::EncryptToOwnKey)
         );
     }
 
@@ -924,6 +942,12 @@ mod tests {
             s.approved(&g, sign(&spend(9_000)), T0),
             Decision::Deny(DenyReason::CredentialBudgetExceeded { spent: 17_000, .. })
         ));
+        let change_only = analysis(&[(5_000, None, true)], 0);
+        assert_eq!(
+            s.decide(&g, sign(&change_only), T0),
+            Decision::Allow,
+            "moving nothing out needs no approval past the threshold"
+        );
     }
 
     #[test]
