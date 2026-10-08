@@ -822,6 +822,17 @@ dependencies = [
  "bitcoin_hashes",
  "serde",
  "unicode-normalization",
+]
+
+[[package]]
+name = "bip39"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4559bb9225f8401dcea601cf8dc9ed81ea0dadd9cf7755fdefdd93ef7961e19e"
+dependencies = [
+ "bitcoin_hashes",
+ "serde",
+ "unicode-normalization",
  "zeroize",
 ]
 
@@ -4614,7 +4625,7 @@ dependencies = [
  "base64 0.23.1",
  "bech32 0.12.0",
  "bincode",
- "bip39",
+ "bip39 3.0.0",
  "bitcoin",
  "blake2",
  "cbc 0.2.1",
@@ -5764,7 +5775,7 @@ dependencies = [
  "aes 0.8.4",
  "base64 0.22.1",
  "bech32 0.11.1",
- "bip39",
+ "bip39 2.2.2",
  "bitcoin_hashes",
  "cbc 0.1.2",
  "chacha20 0.9.1",
