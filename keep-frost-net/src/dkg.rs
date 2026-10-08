@@ -1034,15 +1034,18 @@ pub async fn run_software_dkg(
     // A round ends only once a relay has accepted our own event too, or a
     // peer still waiting on it would stall after we move on.
     let mut round1_sent = false;
+    // These kinds are ephemeral, so a relay forwards an event only to
+    // subscribers already listening. Subscribe before our first send, and send
+    // once more after the round completes: the peer whose package completed it
+    // may have subscribed after every earlier copy of ours went by, and its
+    // peers stop resending once they have moved on.
+    transport
+        .fetch_events(round1_filter.clone(), Duration::ZERO)
+        .await?;
     let start = Instant::now();
-    while round1_done < expected_peers || !round1_sent {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
-        }
-        if start.elapsed() > timeout {
-            return Err(KeepError::NetworkErr(NetworkError::timeout(
-                "waiting for peer round1 packages",
-            )));
         }
         // Each pass re-sends; a refused attempt is retried on the next pass
         // until the round times out.
@@ -1052,6 +1055,14 @@ pub async fn run_software_dkg(
         {
             Ok(()) => round1_sent = true,
             Err(e) => tracing::warn!(error = %e, "DKG round 1 send failed; retrying"),
+        }
+        if round1_done >= expected_peers && round1_sent {
+            break;
+        }
+        if start.elapsed() > timeout {
+            return Err(KeepError::NetworkErr(NetworkError::timeout(
+                "waiting for peer round1 packages",
+            )));
         }
         let events = transport
             .fetch_events(round1_filter.clone(), Duration::from_secs(5))
@@ -1144,15 +1155,14 @@ pub async fn run_software_dkg(
     let mut round2_done = 0u32;
     let mut seen_round2: HashSet<EventId> = HashSet::new();
     let mut round2_sent: HashSet<u16> = HashSet::new();
+    // Subscribe first and send once more at the end, as in round 1.
+    transport
+        .fetch_events(round2_filter.clone(), Duration::ZERO)
+        .await?;
     let start = Instant::now();
-    while round2_done < expected_peers || round2_sent.len() < round2_outbound.len() {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
-        }
-        if start.elapsed() > timeout {
-            return Err(KeepError::NetworkErr(NetworkError::timeout(
-                "waiting for peer round2 shares",
-            )));
         }
         for (recipient_index, encrypted) in round2_outbound.iter() {
             let recipient_tag = Tag::custom(
@@ -1170,6 +1180,14 @@ pub async fn run_software_dkg(
                     tracing::warn!(error = %e, recipient_index, "DKG round 2 send failed; retrying")
                 }
             }
+        }
+        if round2_done >= expected_peers && round2_sent.len() >= round2_outbound.len() {
+            break;
+        }
+        if start.elapsed() > timeout {
+            return Err(KeepError::NetworkErr(NetworkError::timeout(
+                "waiting for peer round2 shares",
+            )));
         }
         let events = transport
             .fetch_events(round2_filter.clone(), Duration::from_secs(5))
@@ -1274,15 +1292,14 @@ pub async fn run_software_dkg(
     let mut peer_confirmations: BTreeMap<u16, Event> = BTreeMap::new();
     let mut seen_confirm: HashSet<EventId> = HashSet::new();
     let mut confirm_sent = false;
+    // Subscribe first and send once more at the end, as in round 1.
+    transport
+        .fetch_events(confirm_filter.clone(), Duration::ZERO)
+        .await?;
     let start = Instant::now();
-    while (confirmed_indices.len() as u32) < expected_peers || !confirm_sent {
+    loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(cancelled());
-        }
-        if start.elapsed() > timeout {
-            return Err(KeepError::NetworkErr(NetworkError::timeout(
-                "waiting for peer group-key confirmations (possible relay equivocation)",
-            )));
         }
         match transport
             .send_event(&build_signed(DKG_KIND_CONFIRM, &our_transcript_hex, &[])?)
@@ -1290,6 +1307,14 @@ pub async fn run_software_dkg(
         {
             Ok(()) => confirm_sent = true,
             Err(e) => tracing::warn!(error = %e, "DKG confirmation send failed; retrying"),
+        }
+        if confirmed_indices.len() as u32 >= expected_peers && confirm_sent {
+            break;
+        }
+        if start.elapsed() > timeout {
+            return Err(KeepError::NetworkErr(NetworkError::timeout(
+                "waiting for peer group-key confirmations (possible relay equivocation)",
+            )));
         }
         let events = transport
             .fetch_events(confirm_filter.clone(), Duration::from_secs(5))
@@ -2110,6 +2135,183 @@ mod tests {
         let (r1, r2) = tokio::join!(flaky, run_party(&bus, &keys[1], &roster, "g", 2, to));
         let (o1, o2) = (r1.unwrap(), r2.unwrap());
         assert_eq!(o1.result.group_pubkey, o2.result.group_pubkey);
+    }
+
+    /// A relay for ephemeral kinds: an event reaches only the participants
+    /// subscribed to a matching filter when it is published, and each one keeps
+    /// only what matches the filter it is collecting when it drains, as
+    /// `ClientTransport` does. A subscription takes effect a moment after it is
+    /// requested, as a REQ does, and an event is not echoed to its author, so a
+    /// peer with nothing yet to collect waits in its fetch instead of resending.
+    #[derive(Clone, Default)]
+    struct EphemeralRelay {
+        peers: Arc<StdMutex<Vec<Arc<EphemeralPeer>>>>,
+    }
+
+    #[derive(Default)]
+    struct EphemeralPeer {
+        subscribed: StdMutex<Vec<Filter>>,
+        inbox: StdMutex<Vec<Event>>,
+        collecting: StdMutex<(Option<Filter>, Vec<Event>)>,
+    }
+
+    struct EphemeralTransport {
+        relay: EphemeralRelay,
+        me: Arc<EphemeralPeer>,
+        /// Reach the round of this kind this much later than the others: the
+        /// first send or fetch of that kind waits this long.
+        late_for: StdMutex<Option<(Kind, Duration)>>,
+    }
+
+    const SUBSCRIBE_LATENCY: Duration = Duration::from_millis(200);
+
+    impl EphemeralRelay {
+        fn join(&self, late_for: Option<(Kind, Duration)>) -> EphemeralTransport {
+            let me = Arc::new(EphemeralPeer::default());
+            self.peers.lock().unwrap().push(me.clone());
+            EphemeralTransport {
+                relay: self.clone(),
+                me,
+                late_for: StdMutex::new(late_for),
+            }
+        }
+    }
+
+    impl EphemeralTransport {
+        async fn arrive(&self, kind: Kind) {
+            let delay = {
+                let mut late_for = self.late_for.lock().unwrap();
+                match *late_for {
+                    Some((k, delay)) if k == kind => {
+                        *late_for = None;
+                        Some(delay)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        fn drain(&self, filter: &Filter) -> Vec<Event> {
+            let mut collecting = self.me.collecting.lock().unwrap();
+            if collecting.0.as_ref() != Some(filter) {
+                *collecting = (Some(filter.clone()), Vec::new());
+            }
+            for ev in self.me.inbox.lock().unwrap().drain(..) {
+                if filter.match_event(&ev, MatchEventOptions::new()) {
+                    collecting.1.push(ev);
+                }
+            }
+            collecting.1.clone()
+        }
+    }
+
+    impl DkgTransport for EphemeralTransport {
+        fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
+            Box::pin(async move {
+                self.arrive(event.kind).await;
+                for peer in self.relay.peers.lock().unwrap().iter() {
+                    if Arc::ptr_eq(peer, &self.me) {
+                        continue;
+                    }
+                    let listening = peer
+                        .subscribed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|f| f.match_event(event, MatchEventOptions::new()));
+                    if listening {
+                        peer.inbox.lock().unwrap().push(event.clone());
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        fn fetch_events(
+            &self,
+            filter: Filter,
+            timeout: Duration,
+        ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
+            Box::pin(async move {
+                for kind in filter.kinds.iter().flatten() {
+                    self.arrive(*kind).await;
+                }
+                if !self.me.subscribed.lock().unwrap().contains(&filter) {
+                    tokio::time::sleep(SUBSCRIBE_LATENCY).await;
+                    self.me.subscribed.lock().unwrap().push(filter.clone());
+                }
+                let deadline = tokio::time::Instant::now() + timeout;
+                loop {
+                    let matched = self.drain(&filter);
+                    if !matched.is_empty() || tokio::time::Instant::now() >= deadline {
+                        return Ok(matched);
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        }
+    }
+
+    /// The last participant to reach a round subscribes only then, after its
+    /// peers' earlier copies went by, and its own package completes the round
+    /// for them. It must still receive theirs, in every round, whether its
+    /// peers are idle waiting (2-of-2) or still resending (2-of-3).
+    #[tokio::test(start_paused = true)]
+    async fn a_participant_that_arrives_last_still_completes() {
+        for participants in [2, 3] {
+            for kind in [DKG_KIND_ROUND1, DKG_KIND_ROUND2, DKG_KIND_CONFIRM] {
+                late_participant_completes(participants, Kind::Custom(kind)).await;
+            }
+        }
+    }
+
+    /// Every participant but the last runs on time; the last reaches the round
+    /// of `late_kind` 3 s after the others, between two of their resends.
+    async fn late_participant_completes(participants: u16, late_kind: Kind) {
+        let keys = mesh_keys(participants);
+        let roster = mesh_roster(&keys, 2, [0x5d; 32]);
+        let relay = EphemeralRelay::default();
+        let local = tokio::task::LocalSet::new();
+        let runs: Vec<_> = (1..=participants)
+            .map(|index| {
+                let late = (index == participants).then_some((late_kind, Duration::from_secs(3)));
+                let transport = relay.join(late);
+                let keys = keys[index as usize - 1].clone();
+                let roster = roster.clone();
+                local.spawn_local(async move {
+                    let mut session = SoftwareDkgSession::init(2, participants, index).unwrap();
+                    run_software_dkg(
+                        &mut session,
+                        &transport,
+                        &keys,
+                        &roster,
+                        "g",
+                        index,
+                        Duration::from_secs(20),
+                        &AtomicBool::new(false),
+                        &NoopProgress,
+                    )
+                    .await
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        local
+            .run_until(async {
+                for run in runs {
+                    outcomes.push(run.await.unwrap().unwrap_or_else(|e| {
+                        panic!("{participants} parties, late for {late_kind}: {e}")
+                    }));
+                }
+            })
+            .await;
+        for o in &outcomes {
+            assert_eq!(o.result.group_pubkey, outcomes[0].result.group_pubkey);
+            o.certificate.verify(&roster).unwrap();
+        }
     }
 
     /// A 2-of-2 DKG runs end to end over the fake transport: both parties agree

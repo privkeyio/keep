@@ -303,7 +303,10 @@ handling is acceptable for a desktop but not for a phone that may be on Tor:
 - **Reception:** long-lived `subscribe` + `notifications()` (signing path,
   `node/mod.rs:2202+`), not an `ExitOnEOSE` `fetch_events` poll loop (which spins
   on ephemeral kinds and starves late joiners). Re-publish with fresh timestamps
-  for late peers; collect to the round condition, then tear down.
+  for late peers; collect to the round condition, then tear down. Subscribe to a
+  round before the first publish in it, and publish once more after the round
+  condition is met: the peer whose event completed the round may have subscribed
+  after every earlier copy went by, and no one resends a round they have left.
 - **Filters:** `#d` + `#t`/kind + `authors(roster pubkeys)` + `limit`; scopes off
   the shared kind firehose and satisfies strict relays.
 - **Local re-checks:** re-verify `#d`, round/kind, `#p`, `created_at`, and
