@@ -61,9 +61,10 @@ pub fn read_secret_value(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
         Ok(Zeroizing::new(value.into_bytes()))
     } else {
         // Read at most one byte past what a record may hold, so an oversized
-        // value is refused without buffering all of it.
+        // value is refused without buffering all of it, into one allocation so
+        // no unwiped copy is freed while the buffer grows.
         let limit = keep_core::storage::MAX_RECORD_SIZE;
-        let mut buf = Zeroizing::new(Vec::new());
+        let mut buf = Zeroizing::new(Vec::with_capacity(limit as usize + 1));
         std::io::stdin()
             .take(limit + 1)
             .read_to_end(&mut buf)

@@ -549,8 +549,9 @@ impl Keep {
         let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
         if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
             return Err(KeepError::AuditWriteFailed(format!(
-                "audit log is full ({count} entries): export it with `keep audit export`, \
-                 then prune it with `keep audit retention --apply`"
+                "audit log is full ({count} entries): stop the agent, export the log with \
+                 `keep audit export`, then prune it with \
+                 `keep audit retention --max-entries 10000 --apply`"
             )));
         }
         self.audit_event_required(AuditEventType::Sign, |e| {
