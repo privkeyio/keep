@@ -95,9 +95,6 @@ pub fn read_credential(dir: &Path, name: &str, euid: u32) -> Result<Zeroizing<St
             meta.mode() & 0o7777
         )));
     }
-    if meta.len() > MAX_PASSWORD as u64 {
-        return Err(fail(format!("is larger than {MAX_PASSWORD} bytes")));
-    }
     let mut buf = Zeroizing::new([0u8; MAX_PASSWORD + 1]);
     let mut len = 0;
     loop {

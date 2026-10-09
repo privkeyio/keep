@@ -153,6 +153,22 @@ systemctl daemon-reload
 VERIFY=$(systemd-analyze verify "$UNIT_FILE" 2>&1) || fail "systemd-analyze verify: $VERIFY"
 [[ -z $VERIFY ]] || fail "systemd-analyze verify warns: $VERIFY"
 pass "the unit passes systemd-analyze verify"
+# The unit as systemd loaded it.
+PROPS=$(systemctl show --all "$UNIT")
+for want in User=keep Group=keep NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes \
+    PrivateTmp=yes PrivateDevices=yes PrivateIPC=yes PrivateNetwork=yes ProtectProc=invisible \
+    ProtectKernelTunables=yes ProtectKernelModules=yes ProtectKernelLogs=yes ProtectControlGroups=yes \
+    ProtectClock=yes ProtectHostname=yes RestrictRealtime=yes RestrictSUIDSGID=yes \
+    MemoryDenyWriteExecute=yes LockPersonality=yes RemoveIPC=yes KeyringMode=private \
+    DevicePolicy=closed CapabilityBoundingSet= AmbientCapabilities= RestrictAddressFamilies=AF_UNIX \
+    RestrictNamespaces=yes SystemCallArchitectures=native SystemCallErrorNumber=1 LimitCORE=0 \
+    UMask=0077 PrivateUsers=no 'ReadWritePaths=-/run/keep-gateway -/run/keep-gateway-admin'; do
+    grep -qxF "$want" <<<"$PROPS" || fail "the unit does not set $want: $(grep "^${want%%=*}=" <<<"$PROPS")"
+done
+grep -qx 'LoadCredentialEncrypted=vault-password:/etc/keep/gateway/vault-password.cred' <<<"$(systemctl cat "$UNIT")" \
+    || fail "the unit does not load the encrypted credential"
+grep -q '^SystemCallFilter=' <<<"$PROPS" || fail "no system call filter"
+pass "the unit sets every hardening option as loaded by systemd"
 EXPOSURE=$(systemd-analyze security "$UNIT" --no-pager 2>/dev/null | grep -o 'Overall exposure level.*' | grep -oE '[0-9]+\.[0-9]+ [A-Z]+')
 echo "   systemd-analyze security: exposure $EXPOSURE"
 

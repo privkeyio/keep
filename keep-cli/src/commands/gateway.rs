@@ -190,11 +190,6 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
 }
 
 fn serve(out: &Output, config: Config) -> Result<()> {
-    if daemon::euid() == 0 {
-        return Err(KeepError::InvalidInput(
-            "run the gateway as its own user, never root".into(),
-        ));
-    }
     // A password in the environment is visible to `systemctl show`, to
     // anything the unit's environment files reach, and to root through
     // /proc, and is too easily left there: the gateway never reads one.
@@ -205,6 +200,11 @@ fn serve(out: &Output, config: Config) -> Result<()> {
              asked for on a terminal",
             unlock::PASSWORD_CREDENTIAL
         )));
+    }
+    if daemon::euid() == 0 {
+        return Err(KeepError::InvalidInput(
+            "run the gateway as its own user, never root".into(),
+        ));
     }
     // Before the vault is unlocked: no core dump or same-uid debugger may
     // read the process from here on.
