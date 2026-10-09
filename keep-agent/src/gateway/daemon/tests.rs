@@ -1886,3 +1886,25 @@ fn bound_uids_are_known_again_after_a_restart() {
         .get("result")
         .is_some());
 }
+
+/// Journal lines for refused requests are written on the tick, never before
+/// the answer, once a minute per uid.
+#[test]
+fn journal_lines_wait_for_the_tick() {
+    let mut g = Gw::new();
+    g.send(5_000, "nope", ping());
+    g.send(5_000, "nope", ping());
+    g.send(5_001, "nope", ping());
+    assert_eq!(g.state.journal_lines(), 2, "once a minute per uid");
+    g.state.tick();
+    assert_eq!(g.state.journal_lines(), 0);
+    g.send(5_000, "nope", ping());
+    assert_eq!(g.state.journal_lines(), 0, "not again this minute");
+    for uid in 10_000..12_000 {
+        g.send(uid, "nope", ping());
+    }
+    assert!(
+        g.state.journal_lines() < 1_024,
+        "at most so many uids a minute"
+    );
+}

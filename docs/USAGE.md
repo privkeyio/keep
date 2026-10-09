@@ -658,7 +658,7 @@ sudo useradd --system --create-home --shell /usr/sbin/nologin keep
 sudo usermod -aG keep-agents agent-user
 sudo usermod -aG keep-admins "$USER"
 sudo install -d -m 0750 -o keep -g keep-agents /run/keep-gateway
-sudo install -d -m 0750 -o keep -g keep-admins /run/keep-gateway-admin
+sudo install -d -m 0750 -o keep -g keep-admins /run/keep-gateway-admin  # /run is cleared at boot: recreate both each boot
 
 # As the keep user, with its vault (KEEP_PASSWORD in its environment):
 keep gateway serve --admin-uid "$(id -u "$USER")" --wallet-budget-sats 100000

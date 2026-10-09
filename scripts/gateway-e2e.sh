@@ -37,6 +37,7 @@ GW_PID=
 PASS=e2e-vault-password
 CREATED_USERS=()
 CREATED_GROUPS=()
+CREATED_RUN=
 
 # Never touch accounts or a run directory this script did not create.
 for u in $GW $ADMIN $A1 $A2 $OUT; do
@@ -88,7 +89,8 @@ cleanup() {
     for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
     for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
     for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
-    rm -rf "$WORK" "$RUN"
+    rm -rf "$WORK"
+    if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
 }
 trap cleanup EXIT
 
@@ -138,6 +140,7 @@ pass "vault created with keys $NPUB and $BTC_NPUB"
 
 # The socket directories: agents reach only theirs, the admin only theirs.
 install -d -m 0755 "$RUN"
+CREATED_RUN=1
 install -d -m 0750 -o "$GW" -g "$AGENTS" "$RUN/agent"
 install -d -m 0750 -o "$GW" -g "$ADMINS" "$RUN/admin"
 AGENT_SOCK=$RUN/agent/agent.sock

@@ -257,6 +257,9 @@ pub struct State {
     /// The minute each uid last had a refusal logged to the journal, so an
     /// agent cannot flood it.
     journal: HashMap<u32, u64>,
+    /// Journal lines waiting for the next tick, written then rather than
+    /// before the answer, like deferred refusals.
+    journal_lines: Vec<(u32, &'static str)>,
     /// Set once the gateway has written out its state to stop: nothing more is
     /// served, so nothing is left unwritten.
     closed: bool,
@@ -404,6 +407,7 @@ impl State {
             uid_counts: Counters::new(MAX_TRACKED_UIDS),
             credential_counts: Counters::new(MAX_TRACKED_CREDENTIALS),
             journal: HashMap::new(),
+            journal_lines: Vec::new(),
             closed: false,
             expiry_seen: false,
             heartbeat_ignored,
@@ -461,6 +465,7 @@ impl State {
     /// Record the refusals deferred since the last tick, then write out
     /// refusal counts whose window has passed.
     pub fn tick(&mut self) {
+        self.write_journal();
         self.record_deferred();
         if std::mem::take(&mut self.expiry_seen) {
             if let Err(e) = self.persist_heartbeat() {
@@ -477,6 +482,7 @@ impl State {
     /// more.
     pub fn shut_down(&mut self) {
         self.closed = true;
+        self.write_journal();
         self.record_deferred();
         let now = self.clock.now();
         if let Err(e) = self.audit.flush_all(&mut self.keep, now) {
@@ -524,18 +530,28 @@ impl State {
         }
     }
 
-    /// Log a refusal to the journal at most once a minute per `counted` key
-    /// (a bound uid, or [`UNBOUND`] for all the rest).
-    fn journal_refusal(&mut self, counted: u32, peer_uid: u32, now: u64, what: &str) {
+    /// Log a refusal to the journal at most once a minute per uid, and for at
+    /// most [`MAX_TRACKED_UIDS`] uids a minute, so no number of uids can flood
+    /// it and no one uid can hide the others.
+    fn journal_refusal(&mut self, peer_uid: u32, now: u64, what: &'static str) {
         let minute = now / 60;
-        if self.journal.get(&counted) == Some(&minute) {
+        if self.journal.get(&peer_uid) == Some(&minute) {
             return;
         }
         if self.journal.len() >= MAX_TRACKED_UIDS {
             self.journal.retain(|_, m| *m == minute);
+            if self.journal.len() >= MAX_TRACKED_UIDS {
+                return;
+            }
         }
-        self.journal.insert(counted, minute);
-        tracing::warn!(peer_uid, what, "agent request refused");
+        self.journal.insert(peer_uid, minute);
+        self.journal_lines.push((peer_uid, what));
+    }
+
+    fn write_journal(&mut self) {
+        for (peer_uid, what) in std::mem::take(&mut self.journal_lines) {
+            tracing::warn!(peer_uid, what, "agent request refused");
+        }
     }
 
     /// Handle one line from the agent socket, sent by `peer_uid`.
@@ -546,13 +562,13 @@ impl State {
         let now = self.clock.now();
         let counted = pool(&self.bound, peer_uid);
         if let Err(window) = self.uid_counts.hit(counted, &self.settings.uid_limits, now) {
-            self.journal_refusal(counted, peer_uid, now, window);
+            self.journal_refusal(peer_uid, now, window);
             return Answer::refused(Value::Null);
         }
         let envelope: Envelope = match serde_json::from_slice(request) {
             Ok(e) => e,
             Err(_) => {
-                self.journal_refusal(counted, peer_uid, now, "malformed envelope");
+                self.journal_refusal(peer_uid, now, "malformed envelope");
                 return Answer::refused(Value::Null);
             }
         };
@@ -599,10 +615,10 @@ impl State {
                         };
                         self.defer_refusal(cid, detail, now);
                     }
-                    None => self.journal_refusal(counted, peer_uid, now, "unknown token"),
+                    None => self.journal_refusal(peer_uid, now, "unknown token"),
                 }
                 if forbidden {
-                    self.journal_refusal(counted, peer_uid, now, "uid may not hold a credential");
+                    self.journal_refusal(peer_uid, now, "uid may not hold a credential");
                 }
                 return refused(id);
             }
@@ -1139,7 +1155,11 @@ impl State {
                 self.keep.delete_agent_credential(&id)?;
                 self.audit.reset(&id);
                 self.credential_counts.remove(&id);
-                self.refresh_bound()?;
+                // The credential is gone either way; a stale bound uid only
+                // keeps its own slots until the next start.
+                if let Err(e) = self.refresh_bound() {
+                    tracing::error!(error = %e, "the bound uids could not be recounted");
+                }
                 Ok(json!({ "deleted": hex::encode(id) }))
             }
             AdminRequest::Freeze { id } => {
@@ -1183,6 +1203,11 @@ impl State {
                 ))
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn journal_lines(&self) -> usize {
+        self.journal_lines.len()
     }
 
     #[cfg(test)]
