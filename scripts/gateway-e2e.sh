@@ -352,8 +352,11 @@ gw_admin revoke "$ID" >/dev/null || fail "revoke"
 pass "restarted; revocation applies on the next request"
 
 # A gateway killed outright leaves a stale socket, which the next one replaces.
-kill -KILL "$GW_PID"
-wait "$GW_PID" 2>/dev/null || true
+# (The group's redirect also silences bash's notice that the job was killed.)
+{
+    kill -KILL "$GW_PID"
+    wait "$GW_PID" || true
+} 2>/dev/null
 GW_PID=
 [[ -S $AGENT_SOCK ]] || fail "expected a stale socket"
 start_gateway
