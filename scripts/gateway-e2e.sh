@@ -112,7 +112,7 @@ start_gateway() {
     GW_PID=$!
     # Ready once the admin socket answers (a stale socket file does not).
     for _ in $(seq 100); do
-        "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" >/dev/null 2>&1 && return 0
+        "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1 && return 0
         kill -0 "$GW_PID" 2>/dev/null || fail "gateway exited at start"
         sleep 0.1
     done
@@ -153,7 +153,7 @@ if as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" gateway serve \
     fail "a second gateway started"
 fi
 grep -q "already opened by another process" "$WORK/second.log" || fail "second gateway: $(cat "$WORK/second.log")"
-"$KEEP" gateway status --admin-socket "$ADMIN_SOCK" >/dev/null || fail "the first gateway lost its socket"
+"$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null || fail "the first gateway lost its socket"
 pass "a second gateway is refused by the vault lock and the first keeps serving"
 
 # The agent client: sends one envelope per message and prints each answer.
@@ -181,12 +181,11 @@ chmod 0644 "$WORK/client.py"
 rpc() { printf '{"jsonrpc":"2.0","id":%s,"method":"%s","params":%s}\n' "$1" "$2" "$3"; }
 call() { rpc "$1" tools/call "{\"name\":\"$2\",\"arguments\":$3}"; }
 
-admin() { as "$ADMIN" "$KEEP" gateway --admin-socket "$ADMIN_SOCK" "$@" 2>&1; }
-gw_admin() { as "$ADMIN" "$KEEP" gateway "$1" --admin-socket "$ADMIN_SOCK" "${@:2}" 2>&1; }
+gw_admin() { as "$ADMIN" "$KEEP" gateway "$1" --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" "${@:2}" 2>&1; }
 
 # Issue a credential bound to agent 1 through the admin socket.
 install -d -m 0700 -o "$ADMIN" "$WORK/admin-out"
-as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name e2e --uid "$(uid "$A1")" \
+as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name e2e --uid "$(uid "$A1")" \
     --key "$NPUB" --op get_public_key --op sign_nostr_event --kind 1 --kind 0 \
     --token-out "$WORK/admin-out/token" >"$WORK/issue.json" 2>"$WORK/issue.err" \
     || fail "issue: $(cat "$WORK/issue.err")"
@@ -201,7 +200,7 @@ pass "issued credential $ID"
 
 # A token file that cannot be created stops the issue before a credential exists.
 BEFORE=$(gw_admin list | grep -c '"id"')
-if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name lost --uid "$(uid "$A1")" \
+if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name lost --uid "$(uid "$A1")" \
     --key "$NPUB" --op get_public_key --token-out "$WORK/admin-out/missing/token" >/dev/null 2>&1; then
     fail "issued with an unwritable token file"
 fi
@@ -210,7 +209,7 @@ pass "an unwritable token file issues nothing"
 
 # Issuing to the gateway's or the admin's uid is refused.
 for u in "$GW" "$ADMIN"; do
-    if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name bad --uid "$(uid "$u")" \
+    if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name bad --uid "$(uid "$u")" \
         --key "$NPUB" --op get_public_key >/dev/null 2>&1; then
         fail "issued a credential bound to $u"
     fi
@@ -262,14 +261,21 @@ pass "a stolen or unknown token gets the uniform refusal"
 if rpc 1 ping '{}' | as "$OUT" python3 "$WORK/client.py" "$AGENT_SOCK" - >/dev/null 2>&1; then
     fail "an outsider reached the agent socket"
 fi
-if as "$A1" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" >/dev/null 2>&1; then
+if as "$A1" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "an agent reached the admin socket"
 fi
-if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" >/dev/null 2>&1; then
+if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "the gateway's own uid was admitted to the admin socket"
 fi
-"$KEEP" gateway status --admin-socket "$ADMIN_SOCK" >/dev/null || fail "root was refused"
+"$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null || fail "root was refused"
 pass "socket access: outsiders and agents shut out, root and the admin let in"
+
+# The admin client sends nothing to a socket not served by the gateway user.
+if OUT_MSG=$("$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$A1" 2>&1); then
+    fail "the admin client trusted a socket of another user"
+fi
+echo "$OUT_MSG" | grep -q "not the gateway's uid" || fail "wrong gateway user: $OUT_MSG"
+pass "the admin client checks the socket belongs to the gateway user"
 
 # Freeze, unfreeze and revoke take effect on the next request.
 ask_ping() { rpc 1 ping '{}' | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/token" | norm; }
@@ -301,7 +307,7 @@ pass "audit log records signatures, served answers, denials and the stolen token
 
 # Agent 2 may sign PSBTs from the Bitcoin key: 20,000 sats per PSBT, 50,000
 # in any 24 hours.
-as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name btc --uid "$(uid "$A2")" \
+as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name btc --uid "$(uid "$A2")" \
     --key "$BTC_NPUB" --op get_bitcoin_address --op sign_psbt --network testnet \
     --per-psbt-sats 20000 --window-sats 50000 --token-out "$WORK/admin-out/btc" >/dev/null 2>&1 \
     || fail "issue the Bitcoin credential"

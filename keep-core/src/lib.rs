@@ -677,6 +677,17 @@ impl Keep {
         Ok(())
     }
 
+    /// Overwrite the vault-wide agent freeze with bytes that do not decrypt,
+    /// for tests of what must fail closed when it cannot be read.
+    #[cfg(feature = "testing")]
+    pub fn corrupt_agent_freeze_for_testing(&self) -> Result<()> {
+        self.storage.put_raw(
+            crate::backend::CONFIG_TABLE,
+            b"agent_freeze",
+            b"not ciphertext",
+        )
+    }
+
     /// Whether every agent credential is frozen. An `Err` means the flag could
     /// not be read; the gateway then refuses to serve.
     pub fn agent_freeze(&self) -> Result<bool> {

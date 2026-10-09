@@ -3,7 +3,7 @@
 
 //! `keep gateway`: run the agent gateway, and manage it over its admin socket.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +18,7 @@ use keep_agent::scope::Operation;
 use keep_core::error::{KeepError, Result};
 use keep_core::Keep;
 
-use crate::cli::GatewayCommands;
+use crate::cli::{AdminTarget, GatewayCommands, IssueArgs};
 use crate::output::Output;
 
 use super::get_password;
@@ -30,7 +30,6 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             admin_socket,
             admin_uid,
             wallet_budget_sats,
-            accept_clock_jump,
         } => {
             if hidden {
                 return Err(KeepError::NotImplemented(
@@ -52,34 +51,30 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     },
                     settings,
                     limits: Limits::default(),
-                    accept_clock_jump,
                 },
             )
         }
-        GatewayCommands::Status { admin_socket } => {
-            print(&admin(&admin_socket, json!({ "op": "status" }))?)
-        }
-        GatewayCommands::List { admin_socket } => {
-            print(&admin(&admin_socket, json!({ "op": "list" }))?)
-        }
-        GatewayCommands::Issue {
-            admin_socket,
-            name,
-            uid,
-            keys,
-            operations,
-            kinds,
-            network,
-            per_psbt_sats,
-            window_sats,
-            approval_above_sats,
-            allow_addresses,
-            per_minute,
-            per_hour,
-            per_day,
-            ttl_days,
-            token_out,
-        } => {
+        GatewayCommands::Status { target } => print(&admin(&target, json!({ "op": "status" }))?),
+        GatewayCommands::List { target } => print(&admin(&target, json!({ "op": "list" }))?),
+        GatewayCommands::Issue(args) => {
+            let IssueArgs {
+                target,
+                name,
+                uid,
+                keys,
+                operations,
+                kinds,
+                network,
+                per_psbt_sats,
+                window_sats,
+                approval_above_sats,
+                allow_addresses,
+                per_minute,
+                per_hour,
+                per_day,
+                ttl_days,
+                token_out,
+            } = *args;
             let grant = build_grant(GrantArgs {
                 keys,
                 operations,
@@ -105,7 +100,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                 None => None,
             };
             let answer = admin_answer(
-                &admin_socket,
+                &target,
                 json!({
                     "op": "issue",
                     "name": name,
@@ -114,18 +109,25 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     "ttl_secs": ttl_secs,
                 }),
             );
-            let (result, token) = match answer.and_then(|a| {
-                let token = a
-                    .token
-                    .ok_or_else(|| KeepError::Other("the gateway returned no token".into()))?;
-                Ok((a.result, token))
-            }) {
+            let issued = answer.and_then(|a| match a.token {
+                Some(token) => Ok((a.result, token)),
+                None => Err(KeepError::Other("the gateway returned no token".into()).into()),
+            });
+            let (result, token) = match issued {
                 Ok(issued) => issued,
-                Err(e) => {
+                Err(failure) => {
                     if let Some(file) = &token_out {
                         let _ = std::fs::remove_file(file);
                     }
-                    return Err(e);
+                    if failure.refused {
+                        return Err(failure.error);
+                    }
+                    // The gateway may have issued it before the answer was lost.
+                    return Err(KeepError::Runtime(format!(
+                        "{}; the credential may have been issued without its token reaching \
+                         you: check `keep gateway list` for one named {name:?} and revoke it",
+                        failure.error
+                    )));
                 }
             };
             print(&result)?;
@@ -134,7 +136,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     if let Err(e) = write_token(&mut file, &token) {
                         // Never leave a live credential whose token was lost.
                         let id = result["id"].as_str().unwrap_or_default().to_string();
-                        let revoked = admin(&admin_socket, json!({ "op": "revoke", "id": id }));
+                        let revoked = admin(&target, json!({ "op": "revoke", "id": id }));
                         let _ = std::fs::remove_file(&path);
                         return Err(KeepError::Runtime(format!(
                             "the token could not be written to {} ({e}); the credential {}",
@@ -158,17 +160,13 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             }
             Ok(())
         }
-        GatewayCommands::Revoke { id, admin_socket } => {
-            print(&admin(&admin_socket, json!({ "op": "revoke", "id": id }))?)
+        GatewayCommands::Revoke { id, target } => {
+            print(&admin(&target, json!({ "op": "revoke", "id": id }))?)
         }
-        GatewayCommands::Delete { id, admin_socket } => {
-            print(&admin(&admin_socket, json!({ "op": "delete", "id": id }))?)
+        GatewayCommands::Delete { id, target } => {
+            print(&admin(&target, json!({ "op": "delete", "id": id }))?)
         }
-        GatewayCommands::Freeze {
-            id,
-            all,
-            admin_socket,
-        } => {
+        GatewayCommands::Freeze { id, all, target } => {
             let request = match (id, all) {
                 (_, true) => json!({ "op": "freeze_all" }),
                 (Some(id), false) => json!({ "op": "freeze", "id": id }),
@@ -176,13 +174,9 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     return Err(KeepError::InvalidInput("name a credential or --all".into()))
                 }
             };
-            print(&admin(&admin_socket, request)?)
+            print(&admin(&target, request)?)
         }
-        GatewayCommands::Unfreeze {
-            id,
-            all,
-            admin_socket,
-        } => {
+        GatewayCommands::Unfreeze { id, all, target } => {
             let request = match (id, all) {
                 (_, true) => json!({ "op": "unfreeze_all" }),
                 (Some(id), false) => json!({ "op": "unfreeze", "id": id }),
@@ -190,15 +184,11 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     return Err(KeepError::InvalidInput("name a credential or --all".into()))
                 }
             };
-            print(&admin(&admin_socket, request)?)
+            print(&admin(&target, request)?)
         }
-        GatewayCommands::Audit {
-            limit,
-            admin_socket,
-        } => print(&admin(
-            &admin_socket,
-            json!({ "op": "audit", "limit": limit }),
-        )?),
+        GatewayCommands::Audit { limit, target } => {
+            print(&admin(&target, json!({ "op": "audit", "limit": limit }))?)
+        }
     }
 }
 
@@ -251,12 +241,93 @@ struct AdminAnswer {
 }
 
 /// Send one request to the admin socket and return its result.
-fn admin(socket: &Path, request: Value) -> Result<Value> {
-    admin_answer(socket, request).map(|a| a.result)
+fn admin(target: &AdminTarget, request: Value) -> Result<Value> {
+    admin_answer(target, request)
+        .map(|a| a.result)
+        .map_err(|f| f.error)
 }
 
-fn admin_answer(socket: &Path, request: Value) -> Result<AdminAnswer> {
-    let stream = daemon::server::connect_checked(socket)
+/// Why an admin request failed, and whether the gateway itself refused it
+/// (rather than the request or its answer being lost on the way).
+struct AdminFailure {
+    refused: bool,
+    error: KeepError,
+}
+
+impl From<KeepError> for AdminFailure {
+    fn from(error: KeepError) -> Self {
+        Self {
+            refused: false,
+            error,
+        }
+    }
+}
+
+/// The uid of the gateway's user, given by name or number. Names are looked
+/// up in /etc/passwd, where a system user such as `keep` is defined.
+fn gateway_uid(user: &str) -> Result<u32> {
+    if let Ok(uid) = user.parse() {
+        return Ok(uid);
+    }
+    let passwd = std::fs::read_to_string("/etc/passwd")
+        .map_err(|e| KeepError::Runtime(format!("read /etc/passwd: {e}")))?;
+    passwd
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(':');
+            Some((f.next()?, f.nth(1)?))
+        })
+        .find(|(name, _)| *name == user)
+        .and_then(|(_, uid)| uid.parse().ok())
+        .ok_or_else(|| {
+            KeepError::InvalidInput(format!(
+                "no user named {user:?}: pass --gateway-user with the gateway's user"
+            ))
+        })
+}
+
+/// Read one answer line straight into a buffer that is wiped, never through
+/// an intermediate buffer that would be freed holding a token.
+fn read_answer(mut stream: &std::os::unix::net::UnixStream) -> std::io::Result<Zeroizing<Vec<u8>>> {
+    use std::io::Read;
+    const MAX: usize = 64 * 1024 * 1024;
+    let mut line = Zeroizing::new(Vec::with_capacity(64 * 1024));
+    let mut chunk = Zeroizing::new([0u8; 8192]);
+    loop {
+        let n = stream.read(&mut chunk[..])?;
+        if n == 0 {
+            return Ok(line);
+        }
+        if let Some(end) = chunk[..n].iter().position(|&b| b == b'\n') {
+            extend_wiped(&mut line, &chunk[..end]);
+            return Ok(line);
+        }
+        if line.len() + n > MAX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "admin answer too long",
+            ));
+        }
+        extend_wiped(&mut line, &chunk[..n]);
+    }
+}
+
+/// Append, moving to a larger buffer and wiping the old one when it is full.
+fn extend_wiped(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
+    if buf.len() + bytes.len() > buf.capacity() {
+        let mut grown = Zeroizing::new(Vec::with_capacity((buf.len() + bytes.len()) * 2));
+        grown.extend_from_slice(buf);
+        *buf = grown;
+    }
+    buf.extend_from_slice(bytes);
+}
+
+fn admin_answer(
+    target: &AdminTarget,
+    request: Value,
+) -> std::result::Result<AdminAnswer, AdminFailure> {
+    let uid = gateway_uid(&target.gateway_user)?;
+    let stream = daemon::server::connect_checked(&target.admin_socket, uid)
         .map_err(|e| KeepError::Runtime(format!("connect to the gateway's admin socket: {e}")))?;
     let io = |e: std::io::Error| KeepError::Runtime(format!("admin socket: {e}"));
     stream
@@ -269,23 +340,27 @@ fn admin_answer(socket: &Path, request: Value) -> Result<AdminAnswer> {
     writer
         .write_all(format!("{request}\n").as_bytes())
         .map_err(io)?;
-    // Sized so an answer carrying a token never reallocates.
-    let mut line = Zeroizing::new(String::with_capacity(64 * 1024));
-    BufReader::new(&stream).read_line(&mut line).map_err(io)?;
+    let line = read_answer(&stream).map_err(io)?;
     if line.is_empty() {
         return Err(KeepError::Runtime(
             "the gateway closed the admin connection: run as root or the gateway's admin uid"
                 .into(),
-        ));
+        )
+        .into());
     }
-    let answer: AdminAnswer = serde_json::from_str(&line)
+    let answer: AdminAnswer = serde_json::from_slice(&line)
         .map_err(|e| KeepError::Runtime(format!("unexpected admin answer: {e}")))?;
     if answer.ok {
         Ok(answer)
     } else {
-        Err(KeepError::Runtime(answer.error.unwrap_or_else(|| {
-            "the gateway refused the request".into()
-        })))
+        Err(AdminFailure {
+            refused: true,
+            error: KeepError::Runtime(
+                answer
+                    .error
+                    .unwrap_or_else(|| "the gateway refused the request".into()),
+            ),
+        })
     }
 }
 

@@ -61,8 +61,6 @@ pub struct Config {
     pub sockets: Sockets,
     pub settings: Settings,
     pub limits: Limits,
-    /// The owner confirmed a wall clock far ahead of what the vault last saw.
-    pub accept_clock_jump: bool,
 }
 
 /// This process's effective uid.
@@ -106,7 +104,6 @@ pub async fn run(
         sockets,
         settings,
         limits,
-        accept_clock_jump,
     } = config;
     if same_directory(&sockets.agent, &sockets.admin)? {
         return Err(AgentError::Other(
@@ -120,8 +117,6 @@ pub async fn run(
         host,
         Box::new(clock::Kernel),
         clock::boot_id()?,
-        clock::wall_clock()?,
-        accept_clock_jump,
     )?;
     let agent = server::bind(&sockets.agent, host.euid)?;
     let admin = match server::bind(&sockets.admin, host.euid) {

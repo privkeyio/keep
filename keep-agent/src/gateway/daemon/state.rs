@@ -261,8 +261,6 @@ impl State {
         host: Host,
         source: Box<dyn TimeSource>,
         boot_id: String,
-        wall: u64,
-        accept_clock_jump: bool,
     ) -> Result<Self> {
         if !keep.is_unlocked() {
             return Err(AgentError::Other("the vault is locked".into()));
@@ -287,8 +285,9 @@ impl State {
         let mut bound_wrongly = Vec::new();
         for id in keep.agent_credential_ids()? {
             match load_credential(&keep, &id) {
+                // Issue times are on the calendar clock, so they never move the
+                // budget clock.
                 Ok(Some(c)) => {
-                    floor = floor.max(c.created_at);
                     let forbidden = forbidden_uid(&host, &settings, c.uid);
                     if !c.revoked && forbidden {
                         bound_wrongly.push(format!("{} (uid {})", c.id_hex(), c.uid));
@@ -312,22 +311,19 @@ impl State {
         }
         let pubkeys: Vec<[u8; 32]> = keep.keyring().list().map(|s| s.pubkey).collect();
         for pubkey in &pubkeys {
-            for network in NETWORKS {
+            for network in LEDGER_NETWORKS {
                 floor = floor.max(ledger_last_seen(&keep, &wallet_key(pubkey, network)));
             }
         }
         let heartbeat = match keep.load_agent_ledger(HEARTBEAT_KEY)? {
             None => None,
+            // Without it the clock resumes from the ledgers and credentials,
+            // which hold every spend: budgets are kept, never released early.
             Some(bytes) => match Heartbeat::decode(&bytes) {
                 Ok(hb) => Some(hb),
-                Err(e) if accept_clock_jump => {
+                Err(e) => {
                     tracing::warn!(error = %e, "ignoring an unreadable clock heartbeat");
                     None
-                }
-                Err(e) => {
-                    return Err(AgentError::Other(format!(
-                        "{e}; if the clock is right, start once with --accept-clock-jump"
-                    )))
                 }
             },
         };
@@ -337,11 +333,10 @@ impl State {
         let start = clock::start_time(&Seed {
             heartbeat: heartbeat.as_ref(),
             floor,
-            wall,
+            wall: source.wall(),
             boot_id: &boot_id,
             boottime: source.boottime(),
-            accept_jump: accept_clock_jump,
-        })?;
+        });
         let clock = Clock::new(start, boot_id, source);
         let mut state = Self {
             keep,
@@ -361,9 +356,14 @@ impl State {
         Ok(state)
     }
 
-    /// The gateway's clock now.
+    /// The budget clock now.
     pub fn now(&self) -> u64 {
         self.clock.now()
+    }
+
+    /// The calendar clock now, which credential lifetimes are measured on.
+    pub fn calendar(&self) -> u64 {
+        self.clock.calendar()
     }
 
     /// The one non-root uid allowed on the admin socket.
@@ -417,6 +417,10 @@ impl State {
 
     fn record_deferred(&mut self) {
         for d in std::mem::take(&mut self.deferred) {
+            // A credential deleted since has nothing left to record against.
+            if matches!(self.keep.load_agent_credential(&d.credential), Ok(None)) {
+                continue;
+            }
             if let Err(e) = self.audit.record_refusal(
                 &mut self.keep,
                 &d.credential,
@@ -482,7 +486,7 @@ impl State {
         // its credential as the theft signal it is.
         let forbidden =
             forbidden_uid(&self.host, &self.settings, peer_uid) || !bindable_uid(peer_uid);
-        let granted = match authenticate(&self.keep, &token, peer_uid, now) {
+        let granted = match authenticate(&self.keep, &token, peer_uid, self.clock.calendar()) {
             Ok(Ok(granted)) if !forbidden => granted,
             Ok(Ok(granted)) => {
                 drop(token);
@@ -560,7 +564,12 @@ impl State {
             "ping" => {
                 // Returns nothing, so it is only checked against the budget.
                 if let Err(e) = self.audit.admit(&mut self.keep, &cid, now) {
-                    return Some(rpc_error(id, -32603, &e.to_string()));
+                    tracing::warn!(error = %e, "agent ping refused");
+                    return Some(rpc_error(
+                        id,
+                        -32603,
+                        "the gateway could not complete the request",
+                    ));
                 }
                 Some(rpc_result(id, json!({})))
             }
@@ -960,7 +969,8 @@ impl State {
         grant: Value,
         ttl_secs: Option<u64>,
     ) -> Result<Zeroizing<String>> {
-        let now = self.clock.now();
+        // Credentials live on the calendar clock, which they are checked against.
+        let now = self.clock.calendar();
         if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
             return Err(AgentError::ScopeViolation(format!(
                 "uid {uid} is root, the gateway's, the vault owner's, the admin's or the \
@@ -1002,10 +1012,11 @@ impl State {
     }
 
     fn admin(&mut self, request: AdminRequest) -> Result<Value> {
-        let now = self.clock.now();
+        let now = self.clock.calendar();
         match request {
             AdminRequest::Status {} => Ok(json!({
-                "clock": now,
+                "clock": self.clock.now(),
+                "calendar": now,
                 "frozen": self.keep.agent_freeze()?,
                 "credentials": self.keep.agent_credential_ids()?.len(),
                 "wallet_budget_sats": self.settings.wallet_budget_sats,
@@ -1153,20 +1164,19 @@ fn ledger_last_seen(keep: &Keep, key: &[u8]) -> u64 {
     }
 }
 
-/// Every network a wallet ledger may be kept for.
-const NETWORKS: [Network; 5] = [
-    Network::Bitcoin,
-    Network::Testnet,
-    Network::Testnet4,
-    Network::Signet,
-    Network::Regtest,
-];
+/// One network of each wallet ledger: mainnet, and the test networks.
+const LEDGER_NETWORKS: [Network; 2] = [Network::Bitcoin, Network::Testnet];
 
-/// The ledger key of `pubkey`'s wallet on `network`. Each network has its own
-/// budget, so spends of test coins never use up the mainnet budget. Never 16
-/// bytes, so never a credential's.
+/// The ledger key of `pubkey`'s wallet on `network`. Mainnet has its own
+/// budget, so spends of test coins never use up the mainnet budget; the test
+/// networks share one, as they share the wallet's keys. Never 16 bytes, so
+/// never a credential's.
 pub fn wallet_key(pubkey: &[u8; 32], network: Network) -> Vec<u8> {
-    let mut key = format!("wallet:{}:", network.to_core_arg()).into_bytes();
+    let tag: &[u8] = match network {
+        Network::Bitcoin => b"wallet:main:",
+        _ => b"wallet:test:",
+    };
+    let mut key = tag.to_vec();
     key.extend_from_slice(pubkey);
     key
 }

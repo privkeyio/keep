@@ -12,7 +12,7 @@ use keep_core::Keep;
 use serde_json::{json, Value};
 
 use super::clock::tests::FakeBoot;
-use super::clock::{Heartbeat, HEARTBEAT_KEY, MAX_UNCONFIRMED_GAP_SECS};
+use super::clock::{Heartbeat, HEARTBEAT_KEY};
 use super::state::{wallet_key, Host, Settings, State, REFUSED_CODE};
 use crate::policy::{BitcoinGrant, Grant, RequestLimits};
 use crate::scope::Operation;
@@ -67,23 +67,14 @@ fn vault(dir: &std::path::Path) -> (Keep, [u8; 32]) {
     (keep, key)
 }
 
+/// Start a gateway whose clocks read `boot` (boot time and wall clock).
 fn start(
     keep: Keep,
     settings: Settings,
     boot: &FakeBoot,
     boot_id: &str,
-    wall: u64,
-    accept: bool,
 ) -> crate::error::Result<State> {
-    State::start(
-        keep,
-        settings,
-        HOST,
-        Box::new(boot.clone()),
-        boot_id.into(),
-        wall,
-        accept,
-    )
+    State::start(keep, settings, HOST, Box::new(boot.clone()), boot_id.into())
 }
 
 impl Gw {
@@ -96,7 +87,8 @@ impl Gw {
         let (keep, key) = vault(dir.path());
         let boot = FakeBoot::default();
         boot.advance(10_000);
-        let state = start(keep, settings, &boot, BOOT, T0, false).unwrap();
+        boot.set_wall(T0);
+        let state = start(keep, settings, &boot, BOOT).unwrap();
         Self {
             dir,
             boot,
@@ -105,8 +97,9 @@ impl Gw {
         }
     }
 
-    /// Stop this gateway and start another on the same vault.
-    fn restart(self, boot_id: &str, wall: u64, accept: bool) -> crate::error::Result<Gw> {
+    /// Stop this gateway and start another on the same vault, in boot
+    /// `boot_id` with the wall clock at `wall`.
+    fn restart(self, boot_id: &str, wall: u64) -> crate::error::Result<Gw> {
         let Gw {
             dir,
             boot,
@@ -116,7 +109,8 @@ impl Gw {
         state.shut_down();
         drop(state);
         let (keep, _) = vault(dir.path());
-        let state = start(keep, settings(), &boot, boot_id, wall, accept)?;
+        boot.set_wall(wall);
+        let state = start(keep, settings(), &boot, boot_id)?;
         Ok(Gw {
             dir,
             boot,
@@ -658,6 +652,15 @@ fn a_signature_or_answer_that_cannot_be_recorded_is_withheld() {
         );
         assert!(!answer.to_string().contains("\"sig\""));
     }
+    for method in ["initialize", "tools/list"] {
+        let answer = g.rpc(&token, method, json!({}));
+        assert_eq!(
+            answer["error"]["message"],
+            json!("the gateway could not complete the request"),
+            "{method}: {answer}"
+        );
+        assert!(answer.get("result").is_none());
+    }
     g.break_log(false);
     assert!(g.entries(AuditEventType::Sign).is_empty());
 }
@@ -735,7 +738,7 @@ fn psbts_are_signed_within_the_grant_and_spends_are_persisted() {
     assert_eq!(g.spent(&cid), 50_000);
 
     // A restart keeps the spends.
-    let mut g = g.restart(BOOT, T0, false).unwrap();
+    let mut g = g.restart(BOOT, T0).unwrap();
     let (why, err) = g.tool(
         &token,
         "sign_bitcoin_psbt",
@@ -927,8 +930,6 @@ fn start_refuses_what_it_cannot_serve_safely() {
             host,
             Box::new(FakeBoot::default()),
             BOOT.into(),
-            T0,
-            false,
         )
         .err()
         .unwrap()
@@ -948,6 +949,12 @@ fn start_refuses_what_it_cannot_serve_safely() {
     let (mut keep, _) = vault(dir.path());
     keep.lock();
     assert!(err(keep, settings(), HOST).contains("locked"));
+    let (keep, _) = vault(dir.path());
+    keep.corrupt_agent_freeze_for_testing().unwrap();
+    assert!(err(keep, settings(), HOST).contains("agent freeze cannot be read"));
+    let (mut keep, _) = vault(dir.path());
+    keep.set_agent_freeze(false).unwrap();
+    drop(keep);
 
     // A live credential bound to a uid it cannot protect against.
     let (mut keep, key) = vault(dir.path());
@@ -958,58 +965,134 @@ fn start_refuses_what_it_cannot_serve_safely() {
     assert!(err(keep, settings(), HOST).contains(&bad.id_hex()));
     let (mut keep, _) = vault(dir.path());
     keep.revoke_agent_credential(&bad.id).unwrap();
-    start(keep, settings(), &boot, BOOT, T0, false).unwrap();
+    start(keep, settings(), &boot, BOOT).unwrap();
 }
 
 #[test]
-fn the_clock_continues_within_a_boot_and_bounds_the_wall_clock_after_a_reboot() {
+fn the_budget_clock_counts_only_running_time_whatever_the_wall_clock() {
     let g = Gw::new();
     g.boot.advance(500);
-    // Same boot: the wall clock is ignored, even far ahead or behind.
-    let g = g
-        .restart(BOOT, T0 + 10 * MAX_UNCONFIRMED_GAP_SECS, false)
-        .unwrap();
+    // Same boot: continued by boot time, the wall clock far ahead or behind.
+    let g = g.restart(BOOT, T0 + 1_000 * 86_400).unwrap();
     assert_eq!(g.state.now(), T0 + 500);
-    let g = g.restart(BOOT, 0, false).unwrap();
-    assert_eq!(g.state.now(), T0 + 500);
-    // A reboot with the wall clock behind starts from what the vault saw.
-    let g = g.restart(REBOOT, T0, false).unwrap();
-    assert_eq!(g.state.now(), T0 + 500);
-    // Far ahead needs the owner to confirm it.
-    let far = T0 + 500 + MAX_UNCONFIRMED_GAP_SECS + 1;
-    let path = g.path();
-    let dir = g.dir;
-    let boot = g.boot;
-    drop(g.state);
-    let (keep, _) = vault(dir.path());
-    let refused = start(keep, settings(), &boot, BOOT, far, false)
-        .err()
-        .unwrap();
-    assert!(
-        refused.to_string().contains("--accept-clock-jump"),
-        "{refused}"
+    assert_eq!(
+        g.state.calendar(),
+        T0 + 1_000 * 86_400,
+        "credentials see it"
     );
-    let (keep, _) = vault(dir.path());
-    let state = start(keep, settings(), &boot, BOOT, far, true).unwrap();
-    assert_eq!(state.now(), far);
-    let stored = state
+    let g = g.restart(BOOT, 0).unwrap();
+    assert_eq!(g.state.now(), T0 + 500);
+    assert_eq!(
+        g.state.calendar(),
+        T0 + 500,
+        "never behind the budget clock"
+    );
+    // A reboot resumes from what the vault saw, behind or ahead.
+    let g = g.restart(REBOOT, T0).unwrap();
+    assert_eq!(g.state.now(), T0 + 500);
+    let g = g.restart(BOOT, T0 + 23 * 3_600).unwrap();
+    assert_eq!(g.state.now(), T0 + 500);
+    let stored = g
+        .state
         .keep()
         .load_agent_ledger(HEARTBEAT_KEY)
         .unwrap()
         .unwrap();
-    assert_eq!(Heartbeat::decode(&stored).unwrap().clock, far);
-    drop(state);
+    assert_eq!(Heartbeat::decode(&stored).unwrap().clock, T0 + 500);
 
-    // A heartbeat that does not decode stops the gateway until confirmed.
+    // A heartbeat that does not decode is ignored: the ledgers hold budgets.
+    let Gw {
+        dir, boot, state, ..
+    } = g;
+    drop(state);
     let (mut keep, _) = vault(dir.path());
     keep.update_agent_ledgers(&[HEARTBEAT_KEY], |_| Ok(vec![b"junk".to_vec()]))
         .unwrap();
     drop(keep);
     let (keep, _) = vault(dir.path());
-    assert!(start(keep, settings(), &boot, BOOT, far, false).is_err());
-    let (keep, _) = vault(dir.path());
-    assert!(start(keep, settings(), &boot, BOOT, far, true).is_ok());
-    let _ = path;
+    assert!(start(keep, settings(), &boot, REBOOT).is_ok());
+}
+
+/// The reviewer's scenario: an agent spends its whole window, the host
+/// reboots, and the wall clock comes back a day ahead. The budget stays spent
+/// until a day of the gateway's own running time has passed.
+#[test]
+fn a_spent_budget_stays_spent_across_a_reboot_with_the_clock_ahead() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue_for(&bitcoin_grant(g.key), AGENT, 30 * 86_400);
+    for _ in 0..2 {
+        assert!(
+            !g.tool(
+                &token,
+                "sign_bitcoin_psbt",
+                json!({ "psbt": psbt(19_900, 100_000, 100) })
+            )
+            .1
+        );
+    }
+    assert!(
+        !g.tool(
+            &token,
+            "sign_bitcoin_psbt",
+            json!({ "psbt": psbt(9_900, 100_000, 100) })
+        )
+        .1
+    );
+    let spend = |g: &mut Gw| {
+        g.tool(
+            &token,
+            "sign_bitcoin_psbt",
+            json!({ "psbt": psbt(900, 100_000, 100) }),
+        )
+        .1
+    };
+    assert!(spend(&mut g), "the window is spent");
+    g.boot.advance(3_600);
+    // (Far enough ahead and the credential itself expires, on the calendar.)
+    for wall in [T0 + 86_400, T0 + 2 * 86_400, T0 + 20 * 86_400] {
+        g = g.restart(REBOOT, wall).unwrap();
+        assert!(spend(&mut g), "still spent with the wall clock at {wall}");
+    }
+    g.boot.advance(86_400 - 3_600);
+    assert!(!spend(&mut g), "a day of running time later");
+}
+
+/// A credential issued while the wall clock ran ahead is stamped on the
+/// calendar, and does not drag the budget clock forward on the next start.
+#[test]
+fn issue_times_never_move_the_budget_clock() {
+    let mut g = Gw::new();
+    g.boot.set_wall(T0 + 10 * 86_400);
+    let (_, token) = g.issue_for(&nostr_grant(g.key), AGENT, 30 * 86_400);
+    let g = g.restart(REBOOT, T0 + 10 * 86_400).unwrap();
+    assert_eq!(g.state.now(), T0, "the budget clock stays where it was");
+    let mut g = g;
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
+}
+
+/// Credentials expire on the calendar clock, which a reboot does not hold
+/// back: a credential does not outlive its expiry by the gateway's downtime.
+#[test]
+fn credentials_expire_on_the_calendar_across_a_reboot() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue_for(&nostr_grant(g.key), AGENT, 3_600);
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
+    let mut g = g.restart(REBOOT, T0 + 2 * 3_600).unwrap();
+    assert_eq!(g.state.now(), T0, "the budget clock did not move");
+    assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    g.state.tick();
+    assert!(g
+        .reasons(AuditEventType::AgentRefused)
+        .iter()
+        .any(|r| r.ends_with("unauthenticated \"expired\"")));
 }
 
 #[test]
@@ -1043,7 +1126,8 @@ fn a_ledger_ahead_of_the_wall_clock_holds_the_clock() {
     } = g;
     drop(state);
     let (keep, _) = vault(dir.path());
-    let state = start(keep, settings(), &boot, REBOOT, T0, false).unwrap();
+    boot.set_wall(T0);
+    let state = start(keep, settings(), &boot, REBOOT).unwrap();
     assert_eq!(state.now(), T0 + 1_000);
 }
 
@@ -1173,7 +1257,8 @@ mod sockets {
             admin_uid,
             ..settings()
         };
-        let mut state = start(keep, s, &boot, BOOT, T0, false).unwrap();
+        boot.set_wall(T0);
+        let mut state = start(keep, s, &boot, BOOT).unwrap();
         let can_hold = keep_core::agent::bindable_uid(me) && admin_uid != Some(me);
         let token = can_hold.then(|| {
             let answer = state.admin_request(
@@ -1337,25 +1422,32 @@ mod sockets {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clients_connect_only_to_the_directory_owners_socket() {
         let gw = running(Some(my_uid()).filter(|&u| u != 0)).await;
-        let checked = |p: &std::path::Path| {
-            server::connect_checked(p)
+        let me = my_uid();
+        let checked = |p: &std::path::Path, uid: u32| {
+            server::connect_checked(p, uid)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         };
-        checked(&gw.admin).unwrap();
+        checked(&gw.admin, me).unwrap();
+        // Another expected gateway user: the directory and peer are not it.
+        assert!(checked(&gw.admin, me + 1)
+            .unwrap_err()
+            .contains("is owned by uid"));
         let dir = gw.admin.parent().unwrap().to_path_buf();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
-        assert!(checked(&gw.admin)
+        assert!(checked(&gw.admin, me)
             .unwrap_err()
             .contains("could replace the socket"));
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
-        if my_uid() == 0 {
-            // Served by root, in a directory another user owns: an impostor.
+        if me == 0 {
+            // A directory the expected user owns, served by root: an impostor.
             std::os::unix::fs::chown(&dir, Some(4_321), None).unwrap();
-            assert!(checked(&gw.admin).unwrap_err().contains("not uid 4321"));
+            assert!(checked(&gw.admin, 4_321)
+                .unwrap_err()
+                .contains("served by uid 0"));
             std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
         }
-        assert!(checked(&gw.admin.with_file_name("missing.sock")).is_err());
+        assert!(checked(&gw.admin.with_file_name("missing.sock"), me).is_err());
         gw.stop().await.0.unwrap();
     }
 
@@ -1490,10 +1582,10 @@ fn a_request_without_a_method_is_answered() {
     assert!(g.send(AGENT, &token, json!({ "jsonrpc": "2.0" })).is_none());
 }
 
-/// Spends of test coins are counted apart from mainnet: each network has its
-/// own wallet ledger.
+/// Spends of test coins are counted apart from mainnet. The test networks,
+/// which share the wallet's keys, share one ledger.
 #[test]
-fn each_network_has_its_own_wallet_budget() {
+fn mainnet_has_its_own_wallet_budget() {
     let mut g = Gw::new();
     let (_, token) = g.issue(&bitcoin_grant(g.key), AGENT);
     assert!(
@@ -1504,15 +1596,59 @@ fn each_network_has_its_own_wallet_budget() {
         )
         .1
     );
-    assert_eq!(g.spent(&wallet_key(&g.key, NETWORK)), 10_000);
+    assert_eq!(
+        g.spent(&wallet_key(&g.key, keep_bitcoin::Network::Bitcoin)),
+        0
+    );
     for network in [
-        keep_bitcoin::Network::Bitcoin,
+        keep_bitcoin::Network::Testnet,
+        keep_bitcoin::Network::Testnet4,
         keep_bitcoin::Network::Signet,
         keep_bitcoin::Network::Regtest,
-        keep_bitcoin::Network::Testnet4,
     ] {
-        assert_eq!(g.spent(&wallet_key(&g.key, network)), 0, "{network}");
+        assert_eq!(g.spent(&wallet_key(&g.key, network)), 10_000, "{network}");
     }
+}
+
+/// A request the gateway cannot complete is recorded as failed, and the agent
+/// learns only that it failed.
+#[test]
+fn a_failed_request_is_recorded_and_its_detail_kept_from_the_agent() {
+    let mut g = Gw::new();
+    let (id, token) = g.issue(&bitcoin_grant(g.key), AGENT);
+    let cid: [u8; 16] = hex::decode(&id).unwrap().try_into().unwrap();
+    g.state
+        .keep_mut()
+        .update_agent_ledgers(&[&cid], |_| Ok(vec![b"not a ledger".to_vec()]))
+        .unwrap();
+    let answer = g.rpc(
+        &token,
+        "tools/call",
+        json!({ "name": "sign_bitcoin_psbt", "arguments": { "psbt": psbt(9_900, 100_000, 100) } }),
+    );
+    assert_eq!(
+        answer["error"],
+        json!({ "code": -32603, "message": "the gateway could not complete the request" })
+    );
+    assert!(g
+        .reasons(AuditEventType::AgentRefused)
+        .iter()
+        .any(|r| r.starts_with(&format!("agent {id} failed")) && r.contains("ledger")));
+    assert!(g.entries(AuditEventType::Sign).is_empty());
+}
+
+/// Refusals deferred for a credential deleted before the tick are dropped.
+#[test]
+fn deferred_refusals_of_a_deleted_credential_are_dropped() {
+    let mut g = Gw::new();
+    let (id, token) = g.issue(&nostr_grant(g.key), AGENT);
+    assert_eq!(g.send(OTHER, &token, ping()), Some(refused(json!(1))));
+    g.admin_ok(json!({ "op": "delete", "id": id }));
+    g.state.tick();
+    assert!(!g
+        .reasons(AuditEventType::AgentRefused)
+        .iter()
+        .any(|r| r.contains(&id)));
 }
 
 /// A vault fault while authenticating (here, credentials that cannot be
