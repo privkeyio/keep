@@ -8,6 +8,7 @@ pub mod client;
 pub mod entropy;
 pub mod error;
 pub mod frost;
+pub mod gateway;
 pub mod manager;
 pub mod policy;
 pub mod rate_limit;

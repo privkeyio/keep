@@ -115,6 +115,36 @@ impl fmt::Display for AgentRefusal {
     }
 }
 
+/// A refused token: why, and which credential it matched, if any. The
+/// credential is known for every refusal except an unknown token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRefused {
+    /// Why the token was refused.
+    pub reason: AgentRefusal,
+    /// The credential the token matched.
+    pub credential: Option<[u8; 16]>,
+}
+
+/// The most bytes of caller-supplied text an agent audit entry keeps.
+pub const MAX_AUDIT_TEXT: usize = 256;
+
+/// `text` made safe for an audit entry: cut to [`MAX_AUDIT_TEXT`] bytes at a
+/// character boundary, then with control and invisible characters, quotes and
+/// backslashes escaped (which can lengthen it, to at most a few times the
+/// cap), so it cannot run on, break a line or pose as other text.
+pub fn audit_text(text: &str) -> String {
+    cap_text(text).escape_debug().to_string()
+}
+
+/// `text` cut to [`MAX_AUDIT_TEXT`] bytes at a character boundary.
+pub fn cap_text(text: &str) -> &str {
+    let mut end = text.len().min(MAX_AUDIT_TEXT);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Whether a credential may be bound to `uid`: never root, the overflow uid or
 /// `(uid_t)-1`.
 pub fn bindable_uid(uid: u32) -> bool {
@@ -289,6 +319,20 @@ mod tests {
         let last = altered.pop().unwrap();
         altered.push(if last == '0' { '1' } else { '0' });
         assert!(!matches(&a, &altered));
+    }
+
+    #[test]
+    fn audit_text_is_capped_and_escaped() {
+        assert_eq!(audit_text("kind 4"), "kind 4");
+        assert_eq!(audit_text("a\nOK agent_unfreeze"), "a\\nOK agent_unfreeze");
+        assert_eq!(audit_text("\u{1b}[2J\"x\""), "\\u{1b}[2J\\\"x\\\"");
+        assert_eq!(audit_text(&"a".repeat(1 << 20)).len(), MAX_AUDIT_TEXT);
+        let cut = audit_text(&format!("{}\u{e9}", "a".repeat(MAX_AUDIT_TEXT - 1)));
+        assert_eq!(
+            cut,
+            "a".repeat(MAX_AUDIT_TEXT - 1),
+            "never splits a character"
+        );
     }
 
     #[test]

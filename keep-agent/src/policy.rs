@@ -59,6 +59,7 @@ fn kind_needs_approval(kind: u16) -> bool {
 /// What a credential may do. Every field is an explicit allowance: an empty set
 /// allows nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Grant {
     /// The vault keys (x-only public keys) the credential may use: the key a
     /// request signs or encrypts with, or whose wallet a PSBT spends from. NIP-44
@@ -72,6 +73,7 @@ pub struct Grant {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BitcoinGrant {
     pub network: Network,
     /// What one PSBT may take out of the wallet, fee included.

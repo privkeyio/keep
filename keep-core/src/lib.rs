@@ -548,18 +548,12 @@ impl Keep {
         message: &[u8],
         context: &str,
     ) -> Result<()> {
-        let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
-        if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
-            return Err(KeepError::AuditWriteFailed(format!(
-                "audit log is full ({count} entries): stop the agent, export the log with \
-                 `keep audit export`, then prune it with \
-                 `keep audit retention --max-entries 10000 --apply`"
-            )));
-        }
+        self.check_agent_audit_room()?;
+        let context = crate::agent::audit_text(context);
         self.audit_event_required(AuditEventType::Sign, |e| {
             e.with_pubkey(pubkey)
                 .with_message_hash(message)
-                .with_reason(context)
+                .with_reason(&context)
         })
     }
 
@@ -695,11 +689,15 @@ impl Keep {
         token: &str,
         peer_uid: u32,
         now: u64,
-    ) -> Result<std::result::Result<crate::agent::AgentCredential, crate::agent::AgentRefusal>>
+    ) -> Result<std::result::Result<crate::agent::AgentCredential, crate::agent::AgentRefused>>
     {
-        use crate::agent::AgentRefusal;
+        use crate::agent::{AgentRefusal, AgentRefused};
+        let unknown = AgentRefused {
+            reason: AgentRefusal::Unknown,
+            credential: None,
+        };
         let Some(hash) = crate::agent::hash_presented_token(token) else {
-            return Ok(Err(AgentRefusal::Unknown));
+            return Ok(Err(unknown));
         };
         let mut found = None;
         let mut matched = 0usize;
@@ -713,12 +711,16 @@ impl Keep {
         // here is defense in depth.
         let credential = match (matched, found) {
             (1, Some(credential)) => credential,
-            _ => return Ok(Err(AgentRefusal::Unknown)),
+            _ => return Ok(Err(unknown)),
         };
         let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
-        Ok(credential
-            .check_usable(peer_uid, now, all_frozen)
-            .map(|()| credential))
+        match credential.check_usable(peer_uid, now, all_frozen) {
+            Ok(()) => Ok(Ok(credential)),
+            Err(reason) => Ok(Err(AgentRefused {
+                reason,
+                credential: Some(credential.id),
+            })),
+        }
     }
 
     /// The serialized agent ledger stored under `key`, if any.
@@ -735,6 +737,49 @@ impl Keep {
         F: FnOnce(&[Option<Zeroizing<Vec<u8>>>]) -> Result<Vec<Vec<u8>>>,
     {
         self.storage.update_agent_ledgers(keys, update)
+    }
+
+    /// Records a request by the agent credential `id` that was refused or held
+    /// for an approval. `label` is the gateway's own fixed text (printable
+    /// ASCII, at most 64 bytes); `detail`, which may hold text the agent sent, is
+    /// capped, escaped and quoted so it cannot pose as anything else. Fails when
+    /// the entry cannot be written, and stops [`AGENT_AUDIT_HEADROOM`] short of
+    /// the most entries the log is read back with, like
+    /// [`Self::record_agent_signature`].
+    pub fn record_agent_refusal(
+        &mut self,
+        id: &[u8; 16],
+        label: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        if label.is_empty()
+            || label.len() > 64
+            || !label.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+        {
+            return Err(KeepError::invalid_input(
+                "an agent refusal label is 1 to 64 printable ASCII characters",
+            ));
+        }
+        self.check_agent_audit_room()?;
+        let mut reason = format!("agent {} {label}", hex::encode(id));
+        if let Some(detail) = detail {
+            reason.push_str(&format!(" \"{}\"", crate::agent::audit_text(detail)));
+        }
+        self.audit_event_required(AuditEventType::AgentRefused, |e| {
+            e.with_reason(&reason).with_success(false)
+        })
+    }
+
+    fn check_agent_audit_room(&self) -> Result<()> {
+        let count = self.audit.as_ref().map_or(0, AuditLog::entry_count);
+        if count >= crate::audit::MAX_AUDIT_ENTRIES - AGENT_AUDIT_HEADROOM {
+            return Err(KeepError::AuditWriteFailed(format!(
+                "audit log is full ({count} entries): stop the agent, export the log with \
+                 `keep audit export`, then prune it with \
+                 `keep audit retention --max-entries 10000 --apply`"
+            )));
+        }
+        Ok(())
     }
 
     /// List all stored secret records.
@@ -2236,6 +2281,7 @@ mod tests {
         keep.authenticate_agent(token, uid, now)
             .unwrap()
             .unwrap_err()
+            .reason
     }
 
     fn accepted(keep: &Keep, token: &str, uid: u32, now: u64) -> crate::agent::AgentCredential {
@@ -2279,8 +2325,22 @@ mod tests {
         assert!(issued[0].contains(&grant_hash), "{issued:?}");
         assert!(!issued[0].contains("claude"), "{issued:?}");
 
+        assert_eq!(
+            keep.authenticate_agent(&token[1..], 1000, now)
+                .unwrap()
+                .unwrap_err()
+                .credential,
+            None
+        );
         keep.revoke_agent_credential(&credential.id).unwrap();
         assert_eq!(refusal(&keep, &token, 1000, now), AgentRefusal::Revoked);
+        assert_eq!(
+            keep.authenticate_agent(&token, 1000, now)
+                .unwrap()
+                .unwrap_err()
+                .credential,
+            Some(credential.id)
+        );
         assert!(agent_entries(&keep, AuditEventType::AgentCredentialRevoke)[0].contains(&id));
 
         keep.lock();
@@ -2604,13 +2664,78 @@ mod tests {
             .record_agent_signature(&[1; 32], b"m", "over")
             .unwrap_err();
         assert!(err.to_string().contains("audit log is full"), "{err}");
+        let err = keep
+            .record_agent_refusal(&[2; 16], "over", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("audit log is full"), "{err}");
         assert_eq!(
             lines(&audit),
             ceiling,
-            "the refused signature wrote nothing"
+            "the refused signature and refusal wrote nothing"
         );
         keep.audit_event_required(AuditEventType::VaultLock, |e| e)
             .unwrap();
+    }
+
+    /// A refused agent request is recorded as a failure with its credential,
+    /// the gateway's label and the agent's text capped, escaped and quoted; a
+    /// refusal that cannot be recorded fails.
+    #[test]
+    fn agent_refusals_are_recorded_fail_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let id = hex::encode([7u8; 16]);
+        keep.record_agent_refusal(&[7; 16], "deny", Some("kind 4\nOK agent_unfreeze"))
+            .unwrap();
+        keep.record_agent_refusal(&[7; 16], "deny x3", None)
+            .unwrap();
+        keep.record_agent_refusal(&[7; 16], "deny", Some(&"a".repeat(1 << 16)))
+            .unwrap();
+        let refused: Vec<_> = keep
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == AuditEventType::AgentRefused)
+            .collect();
+        assert!(refused.iter().all(|e| !e.success));
+        let reasons: Vec<_> = refused.iter().filter_map(|e| e.reason.clone()).collect();
+        assert_eq!(
+            reasons[0],
+            format!("agent {id} deny \"kind 4\\nOK agent_unfreeze\"")
+        );
+        assert_eq!(reasons[1], format!("agent {id} deny x3"));
+        assert!(
+            reasons[2].len() < crate::agent::MAX_AUDIT_TEXT + 64,
+            "{}",
+            reasons[2].len()
+        );
+        for label in ["", "a\nb", &"a".repeat(65)] {
+            assert!(
+                keep.record_agent_refusal(&[7; 16], label, None).is_err(),
+                "{label:?}"
+            );
+        }
+
+        let audit = path.join("audit.log");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        assert!(matches!(
+            keep.record_agent_refusal(&[7; 16], "again", None),
+            Err(KeepError::AuditWriteFailed(_))
+        ));
+    }
+
+    /// An agent signature's context is capped and escaped like a refusal's.
+    #[test]
+    fn agent_signature_context_is_capped_and_escaped() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        keep.record_agent_signature(&[1; 32], b"m", &format!("x\ny{}", "z".repeat(1 << 16)))
+            .unwrap();
+        let reason = agent_entries(&keep, AuditEventType::Sign).remove(0);
+        assert!(reason.starts_with("x\\ny"), "{reason:.20}");
+        assert!(reason.len() <= crate::agent::MAX_AUDIT_TEXT + 2);
     }
 
     #[test]
