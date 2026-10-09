@@ -199,6 +199,15 @@ install -d -m 0700 -o "$A2" "$WORK/a2"
 install -m 0600 -o "$A2" "$WORK/admin-out/token" "$WORK/a2/stolen"
 pass "issued credential $ID"
 
+# A token file that cannot be created stops the issue before a credential exists.
+BEFORE=$(gw_admin list | grep -c '"id"')
+if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name lost --uid "$(uid "$A1")" \
+    --key "$NPUB" --op get_public_key --token-out "$WORK/admin-out/missing/token" >/dev/null 2>&1; then
+    fail "issued with an unwritable token file"
+fi
+[[ $(gw_admin list | grep -c '"id"') == "$BEFORE" ]] || fail "a credential was issued without its token file"
+pass "an unwritable token file issues nothing"
+
 # Issuing to the gateway's or the admin's uid is refused.
 for u in "$GW" "$ADMIN"; do
     if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --name bad --uid "$(uid "$u")" \
@@ -277,7 +286,13 @@ gw_admin unfreeze --all >/dev/null || fail "unfreeze all"
 pass "freeze and unfreeze apply on the next request"
 
 # The audit log holds the signature, what was served, and the theft signal.
-AUDIT=$(gw_admin audit --limit 200)
+# Refusals of real tokens are written on the gateway's 10 s tick, not before
+# the answer, so wait for one.
+for _ in $(seq 40); do
+    AUDIT=$(gw_admin audit --limit 200)
+    echo "$AUDIT" | grep -q "presented by uid $(uid "$A2")" && break
+    sleep 0.5
+done
 echo "$AUDIT" | grep -q "sign_nostr_event kind 1" || fail "no signature entry: $AUDIT"
 echo "$AUDIT" | grep -q "agent_served" || fail "no served entry"
 echo "$AUDIT" | grep -q "presented by uid $(uid "$A2")" || fail "no theft entry"

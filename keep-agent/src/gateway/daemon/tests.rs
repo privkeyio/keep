@@ -141,16 +141,23 @@ impl Gw {
     }
 
     fn issue(&mut self, grant: &Grant, uid: u32) -> (String, String) {
-        let result = self.admin_ok(json!({
+        self.issue_for(grant, uid, 3_600)
+    }
+
+    /// Issue a credential; the token comes beside the result, never in it.
+    fn issue_for(&mut self, grant: &Grant, uid: u32, ttl_secs: u64) -> (String, String) {
+        let answer = self.admin(json!({
             "op": "issue",
             "name": "test agent",
             "uid": uid,
             "grant": grant,
-            "ttl_secs": 3_600,
+            "ttl_secs": ttl_secs,
         }));
+        assert_eq!(answer["ok"], json!(true), "{answer}");
+        assert!(answer["result"].get("token").is_none());
         (
-            result["id"].as_str().unwrap().to_string(),
-            result["token"].as_str().unwrap().to_string(),
+            answer["result"]["id"].as_str().unwrap().to_string(),
+            answer["token"].as_str().unwrap().to_string(),
         )
     }
 
@@ -360,12 +367,15 @@ fn an_agent_is_served_only_what_its_grant_allows_and_every_answer_is_recorded_fi
     assert!(!err);
     assert_eq!(pubkey["hex"], json!(hex::encode(key)));
     assert_eq!(pubkey["npub"], json!(keep_core::keys::bytes_to_npub(&key)));
+    // The handshake and the public key were each recorded before they were
+    // returned.
     assert_eq!(
         g.reasons(AuditEventType::AgentServed),
-        [format!(
-            "agent {id} get_nostr_pubkey \"{}\"",
-            hex::encode(key)
-        )]
+        [
+            format!("agent {id} initialize"),
+            format!("agent {id} tools/list"),
+            format!("agent {id} get_nostr_pubkey \"{}\"", hex::encode(key)),
+        ]
     );
 
     let (event, err) = g.tool(
@@ -479,16 +489,7 @@ fn malformed_requests_are_refused_and_recorded() {
 fn every_refused_token_gets_the_same_answer_and_matched_ones_are_recorded() {
     let mut g = Gw::new();
     let (id, token) = g.issue(&nostr_grant(g.key), AGENT);
-    let (expired_id, expired) = {
-        let result = g.admin_ok(json!({
-            "op": "issue", "name": "short", "uid": AGENT,
-            "grant": nostr_grant(g.key), "ttl_secs": 1,
-        }));
-        (
-            result["id"].as_str().unwrap().to_string(),
-            result["token"].as_str().unwrap().to_string(),
-        )
-    };
+    let (expired_id, expired) = g.issue_for(&nostr_grant(g.key), AGENT, 1);
     g.boot.advance(2);
     let message = ping();
     let mut answers = Vec::new();
@@ -524,7 +525,26 @@ fn every_refused_token_gets_the_same_answer_and_matched_ones_are_recorded() {
         assert_eq!(answer, Some(refused(Value::Null)), "{line}");
         assert!(!authenticated);
     }
+    // Refusals of real tokens are recorded on the next tick, not before the
+    // answer, so the answer takes as long as for an unknown token.
+    assert!(g.reasons(AuditEventType::AgentRefused).is_empty());
+    g.state.tick();
     let refusals = g.reasons(AuditEventType::AgentRefused);
+    for uid in [
+        0,
+        HOST.euid,
+        HOST.vault_owner,
+        ADMIN,
+        HOST.overflow_uid,
+        u32::MAX,
+    ] {
+        assert!(
+            refusals.contains(&format!(
+                "agent {id} unauthenticated \"presented by uid {uid}\""
+            )),
+            "a real token from forbidden uid {uid} is a theft signal: {refusals:?}"
+        );
+    }
     assert!(
         refusals.contains(&format!(
             "agent {id} unauthenticated \"presented by uid {OTHER}\""
@@ -557,6 +577,7 @@ fn every_refused_token_gets_the_same_answer_and_matched_ones_are_recorded() {
         .is_some());
     g.admin_ok(json!({ "op": "revoke", "id": id }));
     assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    g.state.tick();
     let refusals = g.reasons(AuditEventType::AgentRefused);
     assert!(refusals.contains(&format!("agent {id} unauthenticated \"frozen\"")));
     assert!(refusals.contains(&format!("agent {id} unauthenticated \"revoked\"")));
@@ -630,7 +651,11 @@ fn a_signature_or_answer_that_cannot_be_recorded_is_withheld() {
             json!({ "name": name, "arguments": args }),
         );
         assert_eq!(answer["error"]["code"], json!(-32603), "{answer}");
-        assert!(answer.to_string().contains("withheld"), "{answer}");
+        assert_eq!(
+            answer["error"]["message"],
+            json!("the gateway could not complete the request"),
+            "{answer}"
+        );
         assert!(!answer.to_string().contains("\"sig\""));
     }
     g.break_log(false);
@@ -642,7 +667,7 @@ fn psbts_are_signed_within_the_grant_and_spends_are_persisted() {
     let mut g = Gw::new();
     let (id, token) = g.issue(&bitcoin_grant(g.key), AGENT);
     let cid: [u8; 16] = hex::decode(&id).unwrap().try_into().unwrap();
-    let wallet = wallet_key(&g.key);
+    let wallet = wallet_key(&g.key, NETWORK);
 
     let (address, err) = g.tool(
         &token,
@@ -751,9 +776,19 @@ fn the_wallet_budget_spans_credentials_and_zero_refuses_every_spend() {
     );
     let over = send_b(&mut g, 900);
     assert_eq!(over["isError"], json!(true));
+    // The agent is not told what other credentials spent; the log is.
     assert!(
-        over.to_string().contains("wallet's 50000 sat budget"),
+        over.to_string()
+            .contains("this spend would exceed the wallet's budget"),
         "{over}"
+    );
+    assert!(!over.to_string().contains("50000"), "{over}");
+    assert!(
+        g.reasons(AuditEventType::AgentRefused)
+            .iter()
+            .any(|r| r.contains("on top of 50000 already spent") && r.contains("50000 sat budget")),
+        "{:?}",
+        g.reasons(AuditEventType::AgentRefused)
     );
 
     let mut s = settings();
@@ -767,7 +802,7 @@ fn the_wallet_budget_spans_credentials_and_zero_refuses_every_spend() {
     );
     assert!(err);
     assert!(
-        why.as_str().unwrap().contains("wallet's 0 sat budget"),
+        why.as_str().unwrap().contains("exceed the wallet's budget"),
         "{why}"
     );
 }
@@ -783,11 +818,11 @@ fn a_spend_whose_signature_cannot_be_recorded_is_released() {
         "tools/call",
         json!({ "name": "sign_bitcoin_psbt", "arguments": { "psbt": psbt(9_900, 100_000, 100) } }),
     );
-    assert!(answer.to_string().contains("withheld"), "{answer}");
+    assert_eq!(answer["error"]["code"], json!(-32603), "{answer}");
     assert!(!answer.to_string().contains("signed_psbt"));
     g.break_log(false);
     assert_eq!(g.spent(&cid), 0, "the reservation was returned");
-    assert_eq!(g.spent(&wallet_key(&g.key)), 0);
+    assert_eq!(g.spent(&wallet_key(&g.key, NETWORK)), 0);
 }
 
 #[test]
@@ -850,14 +885,15 @@ fn admin_issue_refuses_uids_that_would_stop_nothing_and_keys_not_in_the_vault() 
     }
     assert!(g.state.keep().agent_credentials().unwrap().is_empty());
 
-    let result = g.admin_ok(json!({
+    let answer = g.admin(json!({
         "op": "issue", "name": "x", "uid": AGENT, "grant": nostr_grant(g.key)
     }));
     assert_eq!(
-        result["expires_at"],
+        answer["result"]["expires_at"],
         json!(T0 + super::state::DEFAULT_TTL_SECS)
     );
-    let token = result["token"].as_str().unwrap().to_string();
+    let token = answer["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with(keep_core::agent::TOKEN_PREFIX));
     let list = g.admin_ok(json!({ "op": "list" }));
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert!(
@@ -1049,6 +1085,12 @@ mod sockets {
         let open = socket_dir(root.path(), "open", 0o755);
         let err = server::bind(&open.join("s"), me).err().unwrap().to_string();
         assert!(err.contains("closed to others"), "{err}");
+        let group_writable = socket_dir(root.path(), "group", 0o770);
+        let err = server::bind(&group_writable.join("s"), me)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("writable by the gateway alone"), "{err}");
         let closed = socket_dir(root.path(), "closed", 0o750);
         let err = server::bind(&closed.join("s"), me + 1)
             .err()
@@ -1099,13 +1141,28 @@ mod sockets {
             idle: Duration::from_secs(5),
             admin_idle: Duration::from_secs(5),
             write: Duration::from_secs(5),
-            pre_auth_refusals: 3,
+            refusals_in_a_row: 3,
         }
     }
 
     /// A gateway on fresh sockets. When this test's uid can hold a
     /// credential, one is issued to it before serving.
     async fn running(admin_uid: Option<u32>) -> Running {
+        running_with(admin_uid, limits()).await
+    }
+
+    /// Limits under which only the check a test exercises can close a
+    /// connection within [`Conn::recv`]'s wait: the pre-auth deadline is far
+    /// longer.
+    fn patient() -> Limits {
+        Limits {
+            pre_auth: Duration::from_secs(60),
+            idle: Duration::from_secs(60),
+            ..limits()
+        }
+    }
+
+    async fn running_with(admin_uid: Option<u32>, limits: Limits) -> Running {
         let root = tempfile::tempdir().unwrap();
         let me = my_uid();
         let agent_dir = socket_dir(root.path(), "agent", 0o750);
@@ -1125,7 +1182,7 @@ mod sockets {
                     .as_bytes(),
             );
             let answer: Value = serde_json::from_str(&answer).unwrap();
-            answer["result"]["token"].as_str().unwrap().to_string()
+            answer["token"].as_str().unwrap().to_string()
         });
         let agent = agent_dir.join("agent.sock");
         let admin = admin_dir.join("admin.sock");
@@ -1136,7 +1193,7 @@ mod sockets {
             state,
             agent_listener,
             admin_listener,
-            limits(),
+            limits,
             async {
                 let _ = stopped.await;
             },
@@ -1224,25 +1281,81 @@ mod sockets {
         let mut idle = Conn::open(&gw.agent).await;
         assert!(idle.recv().await.is_none());
 
-        // Three refusals before any token is accepted close the connection.
+        drop(c);
+        gw.stop().await.0.unwrap();
+    }
+
+    /// Each of these closes a connection by itself: the pre-auth deadline is a
+    /// minute away, and every wait below is five seconds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refusals_long_lines_and_extra_connections_are_closed_at_once() {
+        let gw = running_with(None, patient()).await;
+
+        // Three refusals in a row close the connection.
         let mut guessing = Conn::open(&gw.agent).await;
         for _ in 0..3 {
             assert_eq!(guessing.ask("nope", ping()).await, Some(refused(json!(1))));
         }
         assert!(guessing.recv().await.is_none());
 
-        // A line past the limit closes the connection unanswered.
+        // Blank lines are refused requests too, not free.
+        let mut blank = Conn::open(&gw.agent).await;
+        blank.send("\n\n").await;
+        assert_eq!(blank.recv().await, Some(refused(Value::Null)));
+        assert_eq!(blank.recv().await, Some(refused(Value::Null)));
+        assert_eq!(blank.recv().await, Some(refused(Value::Null)));
+        assert!(blank.recv().await.is_none());
+
+        // A line one byte past the limit, newline included, closes the
+        // connection unanswered.
         let mut long = Conn::open(&gw.agent).await;
-        long.send(&"a".repeat(MAX_LINE + 10)).await;
+        long.send(&"a".repeat(MAX_LINE + 1)).await;
         assert!(long.recv().await.is_none());
 
+        // After a token was accepted, refusals in a row still close it.
+        if let Some(token) = &gw.token {
+            let mut c = Conn::open(&gw.agent).await;
+            assert!(c.ask(token, ping()).await.unwrap().get("result").is_some());
+            for _ in 0..3 {
+                assert_eq!(c.ask("nope", ping()).await, Some(refused(json!(1))));
+            }
+            assert!(c.recv().await.is_none());
+        }
+
         // Two connections per uid: a third is closed at once.
-        let _second = Conn::open(&gw.agent).await;
+        let first = Conn::open(&gw.agent).await;
+        let second = Conn::open(&gw.agent).await;
         let mut third = Conn::open(&gw.agent).await;
         assert!(third.recv().await.is_none());
-        drop(_second);
-        drop(c);
+        drop((first, second));
 
+        gw.stop().await.0.unwrap();
+    }
+
+    /// A client connects only to a socket served by the owner of a directory
+    /// no one else can write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clients_connect_only_to_the_directory_owners_socket() {
+        let gw = running(Some(my_uid()).filter(|&u| u != 0)).await;
+        let checked = |p: &std::path::Path| {
+            server::connect_checked(p)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        checked(&gw.admin).unwrap();
+        let dir = gw.admin.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(checked(&gw.admin)
+            .unwrap_err()
+            .contains("could replace the socket"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        if my_uid() == 0 {
+            // Served by root, in a directory another user owns: an impostor.
+            std::os::unix::fs::chown(&dir, Some(4_321), None).unwrap();
+            assert!(checked(&gw.admin).unwrap_err().contains("not uid 4321"));
+            std::os::unix::fs::chown(&dir, Some(0), None).unwrap();
+        }
+        assert!(checked(&gw.admin.with_file_name("missing.sock")).is_err());
         gw.stop().await.0.unwrap();
     }
 
@@ -1296,6 +1409,110 @@ fn a_credential_bound_to_a_forbidden_uid_is_refused_per_request() {
         );
     }
     assert!(g.entries(AuditEventType::AgentServed).is_empty());
+    g.state.tick();
+    let refusals = g.reasons(AuditEventType::AgentRefused);
+    for uid in [HOST.euid, HOST.vault_owner, ADMIN] {
+        assert!(
+            refusals.iter().any(|r| r.contains(&format!(
+                "presented by uid {uid}, which may hold no credential"
+            ))),
+            "{refusals:?}"
+        );
+    }
+}
+
+/// A public key is served only for a granted key, and only under a grant
+/// that allows it.
+#[test]
+fn a_public_key_is_served_only_for_a_granted_key() {
+    let mut g = Gw::new();
+    let other = g
+        .state
+        .keep_mut()
+        .import_secret_bytes(&mut [8; 32], "other")
+        .unwrap();
+    let mut grant = nostr_grant(g.key);
+    grant.limits.per_minute = 100;
+    grant.limits.per_hour = 100;
+    let (_, token) = g.issue(&grant, AGENT);
+    let (why, err) = g.tool(
+        &token,
+        "get_nostr_pubkey",
+        json!({ "key": hex::encode(other) }),
+    );
+    assert!(err);
+    assert_eq!(why, json!("denied: that key is not granted"));
+    let (why, err) = g.tool(
+        &token,
+        "get_nostr_pubkey",
+        json!({ "key": keep_core::keys::bytes_to_npub(&other) }),
+    );
+    assert!(err, "{why}");
+    let (_, err) = g.tool(
+        &token,
+        "get_nostr_pubkey",
+        json!({ "key": hex::encode(g.key) }),
+    );
+    assert!(!err);
+
+    // Two granted keys: the request must name one.
+    let mut both = grant.clone();
+    both.keys.insert(other);
+    let (_, token) = g.issue(&both, AGENT);
+    let answer = g.rpc(&token, "tools/call", json!({ "name": "get_nostr_pubkey" }));
+    assert_eq!(answer["error"]["code"], json!(-32602), "{answer}");
+
+    // A grant without get_public_key.
+    let (_, token) = g.issue(&bitcoin_grant(g.key), AGENT);
+    let (why, err) = g.tool(&token, "get_nostr_pubkey", json!({}));
+    assert!(err);
+    assert_eq!(why, json!("denied: get_public_key is not granted"));
+    assert_eq!(
+        g.reasons(AuditEventType::AgentServed)
+            .iter()
+            .filter(|r| r.contains("get_nostr_pubkey"))
+            .count(),
+        1
+    );
+}
+
+/// A request with an id but no method is answered, so the client is not left
+/// waiting.
+#[test]
+fn a_request_without_a_method_is_answered() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue(&nostr_grant(g.key), AGENT);
+    let answer = g
+        .send(AGENT, &token, json!({ "jsonrpc": "2.0", "id": 5 }))
+        .unwrap();
+    assert_eq!(answer["id"], json!(5));
+    assert_eq!(answer["error"]["code"], json!(-32600));
+    assert!(g.send(AGENT, &token, json!({ "jsonrpc": "2.0" })).is_none());
+}
+
+/// Spends of test coins are counted apart from mainnet: each network has its
+/// own wallet ledger.
+#[test]
+fn each_network_has_its_own_wallet_budget() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue(&bitcoin_grant(g.key), AGENT);
+    assert!(
+        !g.tool(
+            &token,
+            "sign_bitcoin_psbt",
+            json!({ "psbt": psbt(9_900, 100_000, 100) })
+        )
+        .1
+    );
+    assert_eq!(g.spent(&wallet_key(&g.key, NETWORK)), 10_000);
+    for network in [
+        keep_bitcoin::Network::Bitcoin,
+        keep_bitcoin::Network::Signet,
+        keep_bitcoin::Network::Regtest,
+        keep_bitcoin::Network::Testnet4,
+    ] {
+        assert_eq!(g.spent(&wallet_key(&g.key, network)), 0, "{network}");
+    }
 }
 
 /// A vault fault while authenticating (here, credentials that cannot be

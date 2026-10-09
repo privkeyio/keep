@@ -534,6 +534,7 @@ fn every_summary_label_fits() {
         RefusalKind::NeedsApproval,
         RefusalKind::RateLimited,
         RefusalKind::Invalid,
+        RefusalKind::Failed,
     ] {
         let label = format!("{} x{} more since {}", kind.label(), u32::MAX, u64::MAX);
         assert!(keep_core::agent::valid_audit_label(&label), "{label}");

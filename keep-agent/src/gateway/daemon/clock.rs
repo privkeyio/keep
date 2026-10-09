@@ -12,9 +12,10 @@
 //! heartbeat by elapsed boot time alone. After a reboot the wall clock is the
 //! only source, so it is trusted only within bounds: never earlier than any
 //! time the vault has seen, and never further ahead of it than
-//! [`MAX_UNCONFIRMED_GAP_SECS`] unless the owner confirms the jump, so a wall
-//! clock wrongly far ahead cannot age out every budget or pin the ledgers
-//! in the future.
+//! [`MAX_UNCONFIRMED_GAP_SECS`] (a budget window) unless the owner confirms
+//! the jump, so a wall clock wrongly far ahead cannot reset every budget or
+//! pin the ledgers in the future. A gateway down for longer than a day needs
+//! that confirmation to start.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +26,10 @@ use crate::error::{AgentError, Result};
 pub const HEARTBEAT_KEY: &[u8] = b"gateway-clock";
 
 /// How far past the latest time the vault has seen the wall clock may read
-/// after a reboot before the owner must confirm it.
-pub const MAX_UNCONFIRMED_GAP_SECS: u64 = 30 * 24 * 60 * 60;
+/// after a reboot before the owner must confirm it: one budget window, so a
+/// clock that jumped forward while the gateway was down can at most age out
+/// what real time would have, never reset a budget outright.
+pub const MAX_UNCONFIRMED_GAP_SECS: u64 = crate::policy::BUDGET_WINDOW_SECS;
 
 /// The persisted clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,6 +231,12 @@ pub(crate) mod tests {
             T + 1_000,
             "never before the floor"
         );
+    }
+
+    #[test]
+    fn a_confirmation_is_needed_past_one_budget_window() {
+        assert_eq!(MAX_UNCONFIRMED_GAP_SECS, 24 * 60 * 60);
+        assert_eq!(MAX_UNCONFIRMED_GAP_SECS, crate::policy::BUDGET_WINDOW_SECS);
     }
 
     #[test]

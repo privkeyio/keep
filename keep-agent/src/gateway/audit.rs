@@ -50,6 +50,8 @@ pub enum RefusalKind {
     RateLimited,
     /// The request is malformed.
     Invalid,
+    /// The gateway could not complete the request.
+    Failed,
 }
 
 impl RefusalKind {
@@ -60,6 +62,7 @@ impl RefusalKind {
             Self::NeedsApproval => "needs approval",
             Self::RateLimited => "rate limited",
             Self::Invalid => "invalid",
+            Self::Failed => "failed",
         }
     }
 }

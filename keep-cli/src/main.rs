@@ -37,6 +37,9 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static GRACEFUL_STOP: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>> =
     std::sync::OnceLock::new();
 
+/// Set by the first signal a graceful command receives.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn next_request_id() -> String {
     let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("req-{id:08x}")
@@ -86,9 +89,12 @@ fn main() {
     ctrlc::set_handler(|| {
         // A command that stops cleanly on a signal (the agent gateway) is told
         // to, and exits once it has written out its state.
+        // A second signal exits at once, should stopping hang.
         if let Some(stop) = GRACEFUL_STOP.get() {
-            stop.notify_one();
-            return;
+            if !STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+                stop.notify_one();
+                return;
+            }
         }
         // Restore raw mode, but emit LeaveAlternateScreen only if the TUI actually
         // entered the alt screen -- otherwise this signal (incl. the SIGTERM the

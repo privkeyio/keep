@@ -39,8 +39,9 @@ pub struct Limits {
     pub admin_idle: Duration,
     /// How long writing an answer may take.
     pub write: Duration,
-    /// Refused requests a connection may send before any token is accepted.
-    pub pre_auth_refusals: u32,
+    /// Refused requests in a row, before or after a token is accepted, that
+    /// close a connection.
+    pub refusals_in_a_row: u32,
 }
 
 impl Default for Limits {
@@ -53,7 +54,7 @@ impl Default for Limits {
             idle: Duration::from_secs(600),
             admin_idle: Duration::from_secs(60),
             write: Duration::from_secs(10),
-            pre_auth_refusals: 3,
+            refusals_in_a_row: 3,
         }
     }
 }
@@ -92,9 +93,12 @@ fn prepare(path: &Path, euid: u32) -> Result<()> {
             meta.uid()
         ));
     }
-    if meta.mode() & 0o007 != 0 {
+    // Group members may enter the directory, but neither they nor anyone else
+    // may write to it, or they could swap the socket for their own.
+    if meta.mode() & 0o027 != 0 {
         return fail(format!(
-            "its directory has mode {:o}; it must be closed to others (0750 or tighter)",
+            "its directory has mode {:o}; it must be writable by the gateway alone and closed \
+             to others (0750 or tighter)",
             meta.mode() & 0o7777
         ));
     }
@@ -126,11 +130,52 @@ pub fn bind(path: &Path, euid: u32) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// Connect to a gateway socket as a client, refusing unless the socket's
+/// directory is a real directory writable by its owner alone and the peer is
+/// that owner. No one else could have put a socket there, so the peer is the
+/// gateway and not an impostor collecting what clients send.
+pub fn connect_checked(path: &Path) -> Result<std::os::unix::net::UnixStream> {
+    let fail = |m: String| AgentError::Other(format!("{}: {m}", path.display()));
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| fail("a socket path needs a directory".into()))?;
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| fail(format!("its directory cannot be read: {e}")))?;
+    if !meta.file_type().is_dir() {
+        return Err(fail("its directory is not a directory".into()));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(fail(format!(
+            "its directory has mode {:o}; anyone but its owner could replace the socket",
+            meta.mode() & 0o7777
+        )));
+    }
+    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| fail(e.to_string()))?;
+    let peer = rustix::net::sockopt::socket_peercred(&stream)
+        .map_err(|e| fail(format!("SO_PEERCRED: {e}")))?
+        .uid
+        .as_raw();
+    if peer != meta.uid() {
+        return Err(fail(format!(
+            "it is served by uid {peer}, not uid {} that owns its directory",
+            meta.uid()
+        )));
+    }
+    Ok(stream)
+}
+
 /// Reads newline-terminated lines of at most `max` bytes, wiping every buffer
-/// a line passed through, since request lines carry tokens.
+/// a line passed through, since request lines carry tokens. Each byte is
+/// scanned once and copied at most twice, so a stream of tiny lines costs no
+/// more than one long one.
 pub struct LineReader<R> {
     inner: R,
-    pending: Zeroizing<Vec<u8>>,
+    buf: Zeroizing<Vec<u8>>,
+    /// Where the next line starts.
+    start: usize,
+    /// How far the buffer has been searched for a newline.
+    scanned: usize,
     max: usize,
 }
 
@@ -138,51 +183,96 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
     pub fn new(inner: R, max: usize) -> Self {
         Self {
             inner,
-            pending: Zeroizing::new(Vec::with_capacity(16 * 1024)),
+            buf: Zeroizing::new(Vec::with_capacity(16 * 1024)),
+            start: 0,
+            scanned: 0,
             max,
         }
+    }
+
+    fn too_long() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "request line too long")
     }
 
     /// The next line without its `\n` (and `\r`), `None` at end of stream,
     /// or an error once a line runs past the limit.
     pub async fn next_line(&mut self) -> std::io::Result<Option<Zeroizing<Vec<u8>>>> {
         loop {
-            if let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-                let mut line = Zeroizing::new(self.pending[..pos].to_vec());
+            if let Some(offset) = self.buf[self.scanned..].iter().position(|&b| b == b'\n') {
+                let end = self.scanned + offset;
+                if end - self.start > self.max {
+                    return Err(Self::too_long());
+                }
+                let mut line = Zeroizing::new(self.buf[self.start..end].to_vec());
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
-                let rest = Zeroizing::new(self.pending[pos + 1..].to_vec());
-                self.pending.clear();
-                self.pending.extend_from_slice(&rest);
+                self.start = end + 1;
+                self.scanned = self.start;
                 return Ok(Some(line));
             }
-            if self.pending.len() > self.max {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "request line too long",
-                ));
+            self.scanned = self.buf.len();
+            if self.buf.len() - self.start > self.max {
+                return Err(Self::too_long());
             }
+            self.compact();
             let mut chunk = Zeroizing::new([0u8; 8192]);
             let n = self.inner.read(&mut chunk[..]).await?;
             if n == 0 {
                 return Ok(None);
             }
             self.reserve(n);
-            self.pending.extend_from_slice(&chunk[..n]);
+            self.buf.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    /// Move the unread bytes to the front and wipe what they leave behind.
+    fn compact(&mut self) {
+        if self.start == 0 {
+            return;
+        }
+        let len = self.buf.len();
+        self.buf.copy_within(self.start..len, 0);
+        let kept = len - self.start;
+        self.buf[kept..].fill(0);
+        self.buf.truncate(kept);
+        self.scanned -= self.start;
+        self.start = 0;
     }
 
     /// Grow the buffer into a new one and wipe the old, so a reallocation
     /// never frees a copy of a token unwiped.
     fn reserve(&mut self, more: usize) {
-        let needed = self.pending.len() + more;
-        if needed <= self.pending.capacity() {
+        let needed = self.buf.len() + more;
+        if needed <= self.buf.capacity() {
             return;
         }
-        let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(2 * self.pending.capacity())));
-        grown.extend_from_slice(&self.pending);
-        self.pending = grown;
+        let mut grown = Zeroizing::new(Vec::with_capacity(needed.max(2 * self.buf.capacity())));
+        grown.extend_from_slice(&self.buf);
+        self.buf = grown;
+    }
+}
+
+/// Logs a refused connection at most once a minute per uid, so a peer cannot
+/// flood the journal and push out what matters.
+#[derive(Default)]
+struct Throttle(HashMap<u32, tokio::time::Instant>);
+
+impl Throttle {
+    fn allow(&mut self, uid: u32) -> bool {
+        let now = tokio::time::Instant::now();
+        if self
+            .0
+            .get(&uid)
+            .is_some_and(|t| now.duration_since(*t) < Duration::from_secs(60))
+        {
+            return false;
+        }
+        if self.0.len() >= 1_024 {
+            self.0.clear();
+        }
+        self.0.insert(uid, now);
+        true
     }
 }
 
@@ -272,6 +362,7 @@ async fn agent_connection(
     let mut reader = LineReader::new(read, MAX_LINE);
     let deadline = tokio::time::Instant::now() + limits.pre_auth;
     let mut authenticated = false;
+    // Refused requests since the last accepted one.
     let mut refusals = 0u32;
     loop {
         let next = if authenticated {
@@ -283,16 +374,16 @@ async fn agent_connection(
             Ok(Ok(Some(line))) => line,
             _ => return,
         };
-        if request.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
+        // Blank lines are requests too: refused and counted like any other,
+        // so they cannot be sent for free.
         let Some(answer) = with_state(&state, &stop, move |s| s.agent_request(uid, &request)).await
         else {
             return;
         };
         if answer.authenticated {
             authenticated = true;
-        } else if !authenticated {
+            refusals = 0;
+        } else {
             refusals += 1;
         }
         if let Some(line) = &answer.line {
@@ -300,9 +391,12 @@ async fn agent_connection(
                 return;
             }
         }
-        if !authenticated && refusals >= limits.pre_auth_refusals {
+        // Refused requests in a row end the connection, before or after a
+        // token was accepted on it.
+        if refusals >= limits.refusals_in_a_row {
             return;
         }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -320,9 +414,6 @@ async fn admin_connection(
             Ok(Ok(Some(line))) => line,
             _ => return,
         };
-        if request.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
         let Some(answer) = with_state(&state, &stop, move |s| s.admin_request(&request)).await
         else {
             return;
@@ -330,6 +421,7 @@ async fn admin_connection(
         if !write_line(&mut write, &answer, limits.write).await {
             return;
         }
+        tokio::task::yield_now().await;
     }
 }
 
@@ -354,6 +446,7 @@ pub async fn serve(
     let state: Shared = Arc::new(Mutex::new(state));
     let (stop, mut stopped) = watch::channel(false);
     let agent_slots = Slots::default();
+    let mut refused_log = Throttle::default();
     let admin_slots = Slots::default();
     let mut flush = tokio::time::interval(Duration::from_secs(10));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
@@ -386,7 +479,11 @@ pub async fn serve(
                             stream, uid, state.clone(), limits.clone(), stop.clone(), slot,
                         ));
                     }
-                    None => tracing::warn!(uid, "agent connection refused: too many open"),
+                    None => {
+                        if refused_log.allow(uid) {
+                            tracing::warn!(uid, "agent connection refused: too many open");
+                        }
+                    }
                 }
             }
             accepted = admin.accept() => {
@@ -400,7 +497,9 @@ pub async fn serve(
                 let Ok(cred) = stream.peer_cred() else { continue };
                 let uid = cred.uid();
                 if !is_admin(uid) {
-                    tracing::warn!(uid, "admin connection refused: not root or the admin uid");
+                    if refused_log.allow(uid) {
+                        tracing::warn!(uid, "admin connection refused: not root or the admin uid");
+                    }
                     continue;
                 }
                 match admin_slots.take(0, limits.admin_connections, limits.admin_connections) {
@@ -409,7 +508,11 @@ pub async fn serve(
                             stream, state.clone(), limits.clone(), stop.clone(), slot,
                         ));
                     }
-                    None => tracing::warn!(uid, "admin connection refused: too many open"),
+                    None => {
+                        if refused_log.allow(uid) {
+                            tracing::warn!(uid, "admin connection refused: too many open");
+                        }
+                    }
                 }
             }
         }
@@ -424,6 +527,10 @@ pub async fn serve(
     })
     .await;
     if failed {
+        tracing::error!(
+            "a request failed while holding the gateway state; open refusal counts and the \
+             clock were not written out, and the next start resumes the clock from the vault"
+        );
         return Err(AgentError::Other(
             "the gateway stopped after a request failed".into(),
         ));
@@ -435,5 +542,89 @@ pub async fn serve(
 pub fn remove_socket(path: &Path) {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LineReader, Throttle};
+
+    #[tokio::test(start_paused = true)]
+    async fn refused_connections_are_logged_once_a_minute_per_uid() {
+        let mut t = Throttle::default();
+        assert!(t.allow(1));
+        assert!(!t.allow(1));
+        assert!(t.allow(2), "another uid is counted apart");
+        tokio::time::advance(std::time::Duration::from_secs(59)).await;
+        assert!(!t.allow(1));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        assert!(t.allow(1));
+        for uid in 10..2_000 {
+            t.allow(uid);
+        }
+        assert!(t.0.len() <= 1_024, "bounded");
+    }
+
+    async fn lines(input: &[u8], max: usize) -> (Vec<Vec<u8>>, Option<std::io::ErrorKind>) {
+        let mut reader = LineReader::new(input, max);
+        let mut out = Vec::new();
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => out.push(line.to_vec()),
+                Ok(None) => return (out, None),
+                Err(e) => return (out, Some(e.kind())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lines_are_split_and_a_trailing_partial_line_is_dropped() {
+        let (got, err) = lines(b"a\r\nbc\n\n\rd\nend", 16).await;
+        assert_eq!(
+            got,
+            [b"a".to_vec(), b"bc".to_vec(), vec![], b"\rd".to_vec()]
+        );
+        assert_eq!(err, None);
+    }
+
+    #[tokio::test]
+    async fn a_line_over_the_limit_is_refused_even_with_its_newline() {
+        for max in [1, 10, 8_191, 8_192, 8_193, 20_000] {
+            let mut ok = vec![b'a'; max];
+            ok.push(b'\n');
+            let (got, err) = lines(&ok, max).await;
+            assert_eq!((got.len(), err), (1, None), "a line of exactly {max}");
+            let mut over = vec![b'a'; max + 1];
+            over.extend_from_slice(b"\nb\n");
+            let (got, err) = lines(&over, max).await;
+            assert!(got.is_empty(), "{max}");
+            assert_eq!(err, Some(std::io::ErrorKind::InvalidData), "{max}");
+            let (_, err) = lines(&vec![b'a'; max + 1], max).await;
+            assert_eq!(
+                err,
+                Some(std::io::ErrorKind::InvalidData),
+                "{max} with no newline"
+            );
+        }
+        // A short line after a long one that fit is unaffected.
+        let mut input = vec![b'a'; 9_000];
+        input.extend_from_slice(b"\nok\n");
+        let (got, err) = lines(&input, 9_000).await;
+        assert_eq!((got.len(), got[1].as_slice(), err), (2, &b"ok"[..], None));
+    }
+
+    /// A megabyte of empty lines is read in linear time: each byte is scanned
+    /// once, not once per line.
+    #[tokio::test]
+    async fn many_tiny_lines_cost_linear_time() {
+        let input = vec![b'\n'; 1 << 20];
+        let started = std::time::Instant::now();
+        let (got, err) = lines(&input, 1 << 20).await;
+        assert_eq!((got.len(), err), (1 << 20, None));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }
