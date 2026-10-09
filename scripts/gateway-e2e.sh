@@ -353,7 +353,9 @@ CONNECT=("$KEEP" agent connect --socket "$AGENT_SOCK" --gateway-user "$GW" --tok
 mcp() {
     local user=$1 plan=$2
     shift 2
-    as "$user" python3 "$WORK/mcp_client.py" "$plan" "$@" 2>>"$WORK/bridge.log"
+    # Logging everything, so the check below that the log never holds a
+    # token covers every message the bridge can write.
+    as "$user" env RUST_LOG=trace python3 "$WORK/mcp_client.py" "$plan" "$@" 2>>"$WORK/bridge.log"
 }
 cat >"$WORK/session.json" <<'JSON'
 [
@@ -434,13 +436,17 @@ s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o
 while True:
     c, _ = s.accept(); c.settimeout(2)
     try: data = c.recv(65536)
-    except OSError: data = b"?"
-    open(sys.argv[2], "ab").write(data or b"")
+    except OSError: data = b""
+    open(sys.argv[2], "ab").write(data)
 ' "$RUN/impostor/agent.sock" "$RUN/impostor/got" &
 IMPOSTOR=$!
 for _ in $(seq 50); do [[ -S $RUN/impostor/agent.sock ]] && break; sleep 0.1; done
-bridge_refuses "an impostor's socket" "not the gateway's uid" \
-    as "$A1" "$KEEP" agent connect --socket "$RUN/impostor/agent.sock" --gateway-user "$GW" --token-file "$WORK/a1/token"
+IMPOSTOR_CONNECT=(as "$A1" "$KEEP" agent connect --socket "$RUN/impostor/agent.sock" --gateway-user "$GW"
+    --token-file "$WORK/a1/token")
+bridge_refuses "an impostor's directory" "its directory is owned by uid $(uid "$A2")" "${IMPOSTOR_CONNECT[@]}"
+# Its socket in a directory of the gateway user's: the server is checked too.
+chown "$GW" "$RUN/impostor"
+bridge_refuses "an impostor's socket" "served by uid $(uid "$A2")" "${IMPOSTOR_CONNECT[@]}"
 {
     kill "$IMPOSTOR"
     wait "$IMPOSTOR" || true
@@ -557,6 +563,9 @@ assert down["id"] == 2 and down["error"]["code"] == -32010, down
 assert back == {"jsonrpc": "2.0", "id": 3, "result": {}}, back
 PY
 pass "a bridge left running reports the stopped gateway and reconnects to the restarted one"
+grep -q keep_agt_ "$WORK/bridge.log" && fail "a token is in the bridge's log"
+grep -q "connected to the gateway" "$WORK/bridge.log" || fail "the bridge's log was not captured"
+pass "the bridge's log, at trace level, holds no token"
 # The 10,000 sats spent before the restart still count: four more fit the
 # 50,000 budget, the fifth does not.
 for _ in 1 2 3 4; do
