@@ -222,6 +222,46 @@ for line in sys.stdin:
     print(answer.decode().strip())
 PY
 chmod 0644 "$WORK/client.py"
+# An MCP client on stdio, as Claude or Cursor runs one: starts the server
+# command given after the plan, follows the plan, prints each answer, then
+# closes the server's input and prints its exit status. A plan step is
+# {"request": message} (answer printed), {"notify": message},
+# {"raw": line} (answer printed), {"touch": path} or {"wait_for": path}.
+cat >"$WORK/mcp_client.py" <<'PY'
+import json, os, select, subprocess, sys, time
+plan = json.load(open(sys.argv[1]))
+server = subprocess.Popen(sys.argv[2:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def send(line):
+    server.stdin.write((line + "\n").encode())
+    server.stdin.flush()
+def answer():
+    ready, _, _ = select.select([server.stdout], [], [], 30)
+    line = server.stdout.readline() if ready else b""
+    print(line.decode().strip() if line else "NO ANSWER", flush=True)
+for step in plan:
+    if "request" in step:
+        send(json.dumps(step["request"]))
+        answer()
+    elif "notify" in step:
+        send(json.dumps(step["notify"]))
+    elif "raw" in step:
+        send(step["raw"])
+        answer()
+    elif "touch" in step:
+        open(step["touch"], "w").close()
+    elif "wait_for" in step:
+        for _ in range(600):
+            if os.path.exists(step["wait_for"]):
+                break
+            time.sleep(0.1)
+server.stdin.close()
+try:
+    print("EXIT", server.wait(timeout=10), flush=True)
+except subprocess.TimeoutExpired:
+    server.kill()
+    print("EXIT hung", flush=True)
+PY
+chmod 0644 "$WORK/mcp_client.py"
 rpc() { printf '{"jsonrpc":"2.0","id":%s,"method":"%s","params":%s}\n' "$1" "$2" "$3"; }
 call() { rpc "$1" tools/call "{\"name\":\"$2\",\"arguments\":$3}"; }
 
@@ -230,7 +270,7 @@ gw_admin() { as "$ADMIN" "$KEEP" gateway "$1" --admin-socket "$ADMIN_SOCK" --gat
 # Issue a credential bound to agent 1 through the admin socket.
 install -d -m 0700 -o "$ADMIN" "$WORK/admin-out"
 as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name e2e --uid "$(uid "$A1")" \
-    --key "$NPUB" --op get_public_key --op sign_nostr_event --kind 1 --kind 0 \
+    --key "$NPUB" --op get_public_key --op sign_nostr_event --kind 1 --kind 0 --per-minute 60 \
     --token-out "$WORK/admin-out/token" >"$WORK/issue.json" 2>"$WORK/issue.err" \
     || fail "issue: $(cat "$WORK/issue.err")"
 ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK/issue.json")
@@ -308,6 +348,107 @@ GOT=$(rpc 1 ping '{}' | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" - | nor
 [[ $GOT == "$WANT" ]] || fail "unknown token: $GOT"
 pass "a stolen or unknown token gets the uniform refusal"
 
+# A stock MCP client's session through `keep agent connect`, as agent 1.
+CONNECT=("$KEEP" agent connect --socket "$AGENT_SOCK" --gateway-user "$GW" --token-file)
+mcp() {
+    local user=$1 plan=$2
+    shift 2
+    as "$user" python3 "$WORK/mcp_client.py" "$plan" "$@" 2>>"$WORK/bridge.log"
+}
+cat >"$WORK/session.json" <<'JSON'
+[
+ {"request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}}},
+ {"notify": {"jsonrpc": "2.0", "method": "notifications/initialized"}},
+ {"request": {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}},
+ {"request": {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "get_nostr_pubkey", "arguments": {}}}},
+ {"request": {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "sign_nostr_event", "arguments": {"kind": 1, "content": "hello through the bridge"}}}},
+ {"request": {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "sign_nostr_event", "arguments": {"kind": 4, "content": "dm"}}}},
+ {"raw": "{not json"},
+ {"request": {"jsonrpc": "2.0", "id": "last", "method": "ping"}}
+]
+JSON
+chmod 0644 "$WORK/session.json"
+SIGNED_BEFORE=$(gw_admin audit --limit 200 | grep -c "sign_nostr_event kind 1")
+mcp "$A1" "$WORK/session.json" "${CONNECT[@]}" "$WORK/a1/token" >"$WORK/bridge-a1" || fail "bridge session: $(cat "$WORK/bridge.log")"
+python3 - "$NPUB" "$WORK/bridge-a1" <<'PY' || fail "bridge session answers: $(cat "$WORK/bridge-a1") $(cat "$WORK/bridge.log")"
+import json, sys
+npub = sys.argv[1]
+lines = [l.strip() for l in open(sys.argv[2]) if l.strip()]
+assert lines[-1] == "EXIT 0", lines[-1]
+answers = [json.loads(l) for l in lines[:-1]]
+assert [a["id"] for a in answers] == [1, 2, 3, 4, 5, None, "last"], answers
+init, tools, pk, signed, denied, garbled, ping = answers
+assert init["result"]["serverInfo"]["name"] == "keep-gateway", init
+names = sorted(t["name"] for t in tools["result"]["tools"])
+assert names == ["get_nostr_pubkey", "get_session_info", "sign_nostr_event"], names
+assert json.loads(pk["result"]["content"][0]["text"])["npub"] == npub, pk
+assert signed["result"]["isError"] is False, signed
+event = json.loads(signed["result"]["content"][0]["text"])
+assert event["content"] == "hello through the bridge" and len(event["sig"]) == 128, event
+assert denied["result"]["isError"] is True and "not granted" in denied["result"]["content"][0]["text"], denied
+assert garbled["error"]["code"] == -32700, garbled
+assert ping["result"] == {}, ping
+PY
+[[ $(gw_admin audit --limit 200 | grep -c "sign_nostr_event kind 1") -eq $((SIGNED_BEFORE + 1)) ]] \
+    || fail "the bridge's signature was not audited"
+pass "an MCP client's session through the bridge: initialize, tools, a signature and a denial"
+
+# The stolen token through the bridge, from agent 2's uid: refused alike.
+cat >"$WORK/init.json" <<'JSON'
+[{"request": {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}}]
+JSON
+chmod 0644 "$WORK/init.json"
+GOT=$(mcp "$A2" "$WORK/init.json" "${CONNECT[@]}" "$WORK/a2/stolen" | sed -n 1p | norm)
+[[ $GOT == "$WANT" ]] || fail "stolen token through the bridge: $GOT"
+pass "a stolen token through the bridge gets the uniform refusal"
+
+# The bridge refuses what would expose the token or the vault, before
+# sending anything.
+bridge_refuses() {
+    local why=$1 want=$2
+    shift 2
+    local msg
+    if msg=$("$@" </dev/null 2>&1); then
+        fail "the bridge ran with $why"
+    fi
+    echo "$msg" | grep -q "$want" || fail "$why: $msg"
+    echo "$msg" | grep -q keep_agt_ && fail "$why: the token was printed"
+    echo "$msg" | grep -q "$PASS" && fail "$why: the password was printed"
+    return 0
+}
+install -m 0640 -o "$A1" "$WORK/a1/token" "$WORK/a1/loose"
+bridge_refuses "a token file others can read" "readable by its owner alone" \
+    as "$A1" "${CONNECT[@]}" "$WORK/a1/loose"
+install -m 0644 -o "$A2" "$WORK/a1/token" "$WORK/a1/foreign"
+bridge_refuses "a token file of another user" "is owned by uid" \
+    as "$A1" "${CONNECT[@]}" "$WORK/a1/foreign"
+bridge_refuses "KEEP_PASSWORD set" "refusing to run with KEEP_PASSWORD" \
+    as "$A1" env KEEP_PASSWORD=$PASS "${CONNECT[@]}" "$WORK/a1/token"
+bridge_refuses "root" "root can hold no gateway credential" "${CONNECT[@]}" "$WORK/a1/token"
+# Agent 2 serves a socket of its own and points agent 1 at it. (setpriv
+# directly, so $! is the server itself.)
+install -d -m 0755 -o "$A2" "$RUN/impostor"
+setpriv --reuid="$A2" --regid="$(id -g "$A2")" --init-groups env -i PATH=/usr/bin:/bin python3 -c '
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o777); s.listen(4)
+while True:
+    c, _ = s.accept(); c.settimeout(2)
+    try: data = c.recv(65536)
+    except OSError: data = b"?"
+    open(sys.argv[2], "ab").write(data or b"")
+' "$RUN/impostor/agent.sock" "$RUN/impostor/got" &
+IMPOSTOR=$!
+for _ in $(seq 50); do [[ -S $RUN/impostor/agent.sock ]] && break; sleep 0.1; done
+bridge_refuses "an impostor's socket" "not the gateway's uid" \
+    as "$A1" "$KEEP" agent connect --socket "$RUN/impostor/agent.sock" --gateway-user "$GW" --token-file "$WORK/a1/token"
+{
+    kill "$IMPOSTOR"
+    wait "$IMPOSTOR" || true
+} 2>/dev/null
+pgrep -u "$A2" python3 >/dev/null && fail "the impostor is still running"
+[[ ! -s $RUN/impostor/got ]] || fail "the bridge sent something to the impostor"
+pass "the bridge refuses a loose or foreign token file, KEEP_PASSWORD, root and an impostor's socket"
+
 # Users outside the agents group cannot reach the agent socket; agents cannot
 # reach the admin socket.
 if rpc 1 ping '{}' | as "$OUT" python3 "$WORK/client.py" "$AGENT_SOCK" - >/dev/null 2>&1; then
@@ -377,12 +518,45 @@ GOT=$(sign_psbt "$PSBT_60K")
 gw_admin audit --limit 50 | grep -q "sign_bitcoin_psbt txid" || fail "no PSBT signature entry"
 pass "agent 2 signs a PSBT within its grant; one over the per-PSBT limit is denied"
 
+# A bridge left running across the restart below: refused nothing, sent
+# nothing while the gateway is down, and served again once it is back.
+SYNC=$WORK/a1/sync
+cat >"$WORK/restart.json" <<JSON
+[
+ {"request": {"jsonrpc": "2.0", "id": 1, "method": "ping"}},
+ {"touch": "$SYNC-up"},
+ {"wait_for": "$SYNC-down"},
+ {"request": {"jsonrpc": "2.0", "id": 2, "method": "ping"}},
+ {"touch": "$SYNC-asked"},
+ {"wait_for": "$SYNC-back"},
+ {"request": {"jsonrpc": "2.0", "id": 3, "method": "ping"}}
+]
+JSON
+chmod 0644 "$WORK/restart.json"
+mcp "$A1" "$WORK/restart.json" "${CONNECT[@]}" "$WORK/a1/token" >"$WORK/bridge-restart" &
+BRIDGE_CLIENT=$!
+wait_file() { for _ in $(seq 300); do [[ -e $1 ]] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
+wait_file "$SYNC-up"
 # SIGTERM stops it cleanly and removes the sockets; it restarts on the same vault.
 stop_gateway
+touch "$SYNC-down"
+wait_file "$SYNC-asked"
 [[ ! -e $AGENT_SOCK && ! -e $ADMIN_SOCK ]] || fail "sockets left behind"
 pass "SIGTERM stops the gateway cleanly"
 start_gateway
 [[ $(ask_ping) == "$OK" ]] || fail "not served after restart"
+touch "$SYNC-back"
+wait "$BRIDGE_CLIENT" || fail "bridge client across the restart"
+python3 - "$WORK/bridge-restart" <<'PY' || fail "bridge across the restart: $(cat "$WORK/bridge-restart") $(cat "$WORK/bridge.log")"
+import json, sys
+lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+assert lines[-1] == "EXIT 0", lines
+up, down, back = (json.loads(l) for l in lines[:-1])
+assert up == {"jsonrpc": "2.0", "id": 1, "result": {}}, up
+assert down["id"] == 2 and down["error"]["code"] == -32010, down
+assert back == {"jsonrpc": "2.0", "id": 3, "result": {}}, back
+PY
+pass "a bridge left running reports the stopped gateway and reconnects to the restarted one"
 # The 10,000 sats spent before the restart still count: four more fit the
 # 50,000 budget, the fifth does not.
 for _ in 1 2 3 4; do
