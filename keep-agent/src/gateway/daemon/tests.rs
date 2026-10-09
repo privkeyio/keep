@@ -1276,3 +1276,24 @@ mod sockets {
         assert!(keep.load_agent_ledger(HEARTBEAT_KEY).unwrap().is_some());
     }
 }
+
+/// A credential bound to a uid it cannot protect against, planted after
+/// start, is still refused on every request.
+#[test]
+fn a_credential_bound_to_a_forbidden_uid_is_refused_per_request() {
+    let mut g = Gw::new();
+    let grant = serde_json::to_vec(&nostr_grant(g.key).validated().unwrap()).unwrap();
+    for uid in [HOST.euid, HOST.vault_owner, ADMIN] {
+        let (_, token) = g
+            .state
+            .keep_mut()
+            .issue_agent_credential("planted", uid, grant.clone(), T0, 3_600)
+            .unwrap();
+        assert_eq!(
+            g.send(uid, &token, ping()),
+            Some(refused(json!(1))),
+            "uid {uid}"
+        );
+    }
+    assert!(g.entries(AuditEventType::AgentServed).is_empty());
+}
