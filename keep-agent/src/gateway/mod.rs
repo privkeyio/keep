@@ -8,6 +8,8 @@
 
 mod audit;
 mod credential;
+#[cfg(all(feature = "mcp", target_os = "linux"))]
+pub mod daemon;
 
 pub use audit::{
     AgentAudit, RefusalKind, AUDIT_BUDGET_PER_DAY, GATEWAY_AUDIT_BUDGET_PER_DAY,

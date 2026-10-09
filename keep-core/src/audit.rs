@@ -107,6 +107,9 @@ pub enum AuditEventType {
     AgentUnfreeze = 32,
     /// An agent gateway request refused, or held for an approval.
     AgentRefused = 33,
+    /// An agent gateway request served something other than a signature (a
+    /// public key, an address, its own grant), recorded before it is returned.
+    AgentServed = 34,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -146,6 +149,7 @@ impl std::fmt::Display for AuditEventType {
             Self::AgentFreeze => write!(f, "agent_freeze"),
             Self::AgentUnfreeze => write!(f, "agent_unfreeze"),
             Self::AgentRefused => write!(f, "agent_refused"),
+            Self::AgentServed => write!(f, "agent_served"),
         }
     }
 }
