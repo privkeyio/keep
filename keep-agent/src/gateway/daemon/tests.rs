@@ -1297,3 +1297,18 @@ fn a_credential_bound_to_a_forbidden_uid_is_refused_per_request() {
     }
     assert!(g.entries(AuditEventType::AgentServed).is_empty());
 }
+
+/// A vault fault while authenticating (here, credentials that cannot be
+/// read) is answered with the same refusal as a bad token.
+#[test]
+fn a_vault_fault_during_authentication_is_a_uniform_refusal() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue(&nostr_grant(g.key), AGENT);
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
+    g.state.keep_mut().lock();
+    assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+}
