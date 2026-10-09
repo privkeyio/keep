@@ -196,7 +196,9 @@ fn identical_refusals_collapse_and_different_ones_are_each_recorded() {
     audit.flush_expired(&mut v.keep, later).unwrap();
     let refused = v.reasons(AuditEventType::AgentRefused);
     assert!(
-        refused.contains(&format!("agent {id} denied x4 more since {NOW} \"kind 4\"")),
+        refused.contains(&format!(
+            "agent {id} denied x4 more since the first \"kind 4\""
+        )),
         "{refused:?}"
     );
     assert_eq!(
@@ -213,7 +215,7 @@ fn identical_refusals_collapse_and_different_ones_are_each_recorded() {
         .unwrap();
     audit.flush_all(&mut v.keep, later).unwrap();
     assert!(v.reasons(AuditEventType::AgentRefused).contains(&format!(
-        "agent {id} denied x1 more since {later} \"kind 4\""
+        "agent {id} denied x1 more since the first \"kind 4\""
     )));
 }
 
@@ -536,7 +538,7 @@ fn every_summary_label_fits() {
         RefusalKind::Invalid,
         RefusalKind::Failed,
     ] {
-        let label = format!("{} x{} more since {}", kind.label(), u32::MAX, u64::MAX);
+        let label = format!("{} x{} more since the first", kind.label(), u32::MAX);
         assert!(keep_core::agent::valid_audit_label(&label), "{label}");
     }
 }

@@ -119,7 +119,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     if let Some(file) = &token_out {
                         let _ = std::fs::remove_file(file);
                     }
-                    if failure.refused {
+                    if !failure.maybe_done {
                         return Err(failure.error);
                     }
                     // The gateway may have issued it before the answer was lost.
@@ -247,17 +247,17 @@ fn admin(target: &AdminTarget, request: Value) -> Result<Value> {
         .map_err(|f| f.error)
 }
 
-/// Why an admin request failed, and whether the gateway itself refused it
-/// (rather than the request or its answer being lost on the way).
+/// Why an admin request failed, and whether the gateway may have acted on
+/// it: the request was sent, and no refusal from the gateway came back.
 struct AdminFailure {
-    refused: bool,
+    maybe_done: bool,
     error: KeepError,
 }
 
 impl From<KeepError> for AdminFailure {
     fn from(error: KeepError) -> Self {
         Self {
-            refused: false,
+            maybe_done: false,
             error,
         }
     }
@@ -281,7 +281,8 @@ fn gateway_uid(user: &str) -> Result<u32> {
         .and_then(|(_, uid)| uid.parse().ok())
         .ok_or_else(|| {
             KeepError::InvalidInput(format!(
-                "no user named {user:?}: pass --gateway-user with the gateway's user"
+                "no user named {user:?} in /etc/passwd: pass --gateway-user with the \
+                 gateway's user name or uid"
             ))
         })
 }
@@ -340,21 +341,25 @@ fn admin_answer(
     writer
         .write_all(format!("{request}\n").as_bytes())
         .map_err(io)?;
-    let line = read_answer(&stream).map_err(io)?;
+    // From here the gateway may have acted on the request.
+    let sent = |error: KeepError| AdminFailure {
+        maybe_done: true,
+        error,
+    };
+    let line = read_answer(&stream).map_err(|e| sent(io(e)))?;
     if line.is_empty() {
-        return Err(KeepError::Runtime(
+        return Err(sent(KeepError::Runtime(
             "the gateway closed the admin connection: run as root or the gateway's admin uid"
                 .into(),
-        )
-        .into());
+        )));
     }
     let answer: AdminAnswer = serde_json::from_slice(&line)
-        .map_err(|e| KeepError::Runtime(format!("unexpected admin answer: {e}")))?;
+        .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;
     if answer.ok {
         Ok(answer)
     } else {
         Err(AdminFailure {
-            refused: true,
+            maybe_done: false,
             error: KeepError::Runtime(
                 answer
                     .error
@@ -490,6 +495,14 @@ mod tests {
             .address_allowlist
             .unwrap()
             .contains("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"));
+    }
+
+    #[test]
+    fn the_gateway_user_is_a_uid_or_a_name_in_passwd() {
+        assert_eq!(gateway_uid("990").unwrap(), 990);
+        assert_eq!(gateway_uid("root").unwrap(), 0);
+        let err = gateway_uid("no-such-gateway-user").unwrap_err().to_string();
+        assert!(err.contains("name or uid"), "{err}");
     }
 
     #[test]

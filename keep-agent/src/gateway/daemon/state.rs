@@ -282,12 +282,14 @@ impl State {
             .agent_freeze()
             .map_err(|e| AgentError::Other(format!("the agent freeze cannot be read: {e}")))?;
         let mut floor = 0u64;
+        let mut issued = 0u64;
         let mut bound_wrongly = Vec::new();
         for id in keep.agent_credential_ids()? {
             match load_credential(&keep, &id) {
-                // Issue times are on the calendar clock, so they never move the
-                // budget clock.
+                // Issue times are on the calendar clock: they hold the calendar,
+                // never the budget clock.
                 Ok(Some(c)) => {
+                    issued = issued.max(c.created_at);
                     let forbidden = forbidden_uid(&host, &settings, c.uid);
                     if !c.revoked && forbidden {
                         bound_wrongly.push(format!("{} (uid {})", c.id_hex(), c.uid));
@@ -330,14 +332,16 @@ impl State {
         if let Some(hb) = &heartbeat {
             floor = floor.max(hb.clock);
         }
-        let start = clock::start_time(&Seed {
+        let seed = Seed {
             heartbeat: heartbeat.as_ref(),
             floor,
             wall: source.wall(),
             boot_id: &boot_id,
             boottime: source.boottime(),
-        });
-        let clock = Clock::new(start, boot_id, source);
+        };
+        let start = clock::start_time(&seed);
+        let calendar = clock::calendar_start(&seed, issued);
+        let clock = Clock::new(start, calendar, boot_id, source);
         let mut state = Self {
             keep,
             audit: AgentAudit::default(),
