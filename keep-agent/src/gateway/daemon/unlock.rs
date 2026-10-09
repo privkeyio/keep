@@ -199,6 +199,40 @@ mod tests {
             let err = other.err().unwrap().to_string();
             assert!(err.contains("is owned by uid"), "{err}");
         }
+        if me() != 0 {
+            return;
+        }
+        // Only root can give them to other users: each check on its own.
+        const READER: u32 = 5_555;
+        const STRANGER: u32 = 4_321;
+        let chown = |p: &Path, uid: u32| std::os::unix::fs::chown(p, Some(uid), None).unwrap();
+        let file = dir.join(PASSWORD_CREDENTIAL);
+        // The reader's credential in a stranger's directory.
+        chown(&file, READER);
+        chown(&dir, STRANGER);
+        let err = read_credential(&dir, PASSWORD_CREDENTIAL, READER)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string()
+                .contains("the credentials directory is owned by uid 4321"),
+            "{err}"
+        );
+        // A stranger's credential in a directory of root's.
+        chown(&dir, 0);
+        chown(&file, STRANGER);
+        let err = read_credential(&dir, PASSWORD_CREDENTIAL, READER)
+            .err()
+            .unwrap();
+        assert!(
+            err.to_string().contains("is owned by uid 4321, not root"),
+            "{err}"
+        );
+        // Both the reader's, or the directory root's: read.
+        chown(&file, READER);
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, READER).is_ok());
+        chown(&dir, READER);
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, READER).is_ok());
     }
 
     #[test]
@@ -239,6 +273,13 @@ mod tests {
         for name in ["", ".", "..", "a/b"] {
             assert!(read_credential(&dir, name, me()).is_err(), "{name:?}");
         }
+        // A name that leads out of the directory, to a file that would pass
+        // every other check.
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, PASSWORD).unwrap();
+        std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o400)).unwrap();
+        let err = read_credential(&dir, "../outside", me()).err().unwrap();
+        assert!(err.to_string().contains("not a credential name"), "{err}");
     }
 
     #[test]
