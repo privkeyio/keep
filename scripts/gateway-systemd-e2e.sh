@@ -167,7 +167,16 @@ for want in User=keep Group=keep NoNewPrivileges=yes ProtectSystem=strict Protec
 done
 grep -qx 'LoadCredentialEncrypted=vault-password:/etc/keep/gateway/vault-password.cred' <<<"$(systemctl cat "$UNIT")" \
     || fail "the unit does not load the encrypted credential"
-grep -q '^SystemCallFilter=' <<<"$PROPS" || fail "no system call filter"
+# An allow list (a deny list shows as `~...`) that leaves out what the unit
+# denies, and what no service it allows would need.
+FILTER=$(grep '^SystemCallFilter=' <<<"$PROPS")
+[[ $FILTER == SystemCallFilter=* && $FILTER != SystemCallFilter=~* ]] || fail "not an allow list: ${FILTER:0:80}"
+for call in accept4 bind mlock read; do
+    grep -qw "$call" <<<"$FILTER" || fail "the filter denies $call"
+done
+for call in mount reboot setrlimit init_module ptrace kexec_load; do
+    grep -qw "$call" <<<"$FILTER" && fail "the filter allows $call"
+done
 pass "the unit sets every hardening option as loaded by systemd"
 EXPOSURE=$(systemd-analyze security "$UNIT" --no-pager 2>/dev/null | grep -o 'Overall exposure level.*' | grep -oE '[0-9]+\.[0-9]+ [A-Z]+')
 echo "   systemd-analyze security: exposure $EXPOSURE"
