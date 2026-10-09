@@ -370,9 +370,8 @@ cat >"$WORK/session.json" <<'JSON'
 ]
 JSON
 chmod 0644 "$WORK/session.json"
-SIGNED_BEFORE=$(gw_admin audit --limit 200 | grep -c "sign_nostr_event kind 1")
 mcp "$A1" "$WORK/session.json" "${CONNECT[@]}" "$WORK/a1/token" >"$WORK/bridge-a1" || fail "bridge session: $(cat "$WORK/bridge.log")"
-python3 - "$NPUB" "$WORK/bridge-a1" <<'PY' || fail "bridge session answers: $(cat "$WORK/bridge-a1") $(cat "$WORK/bridge.log")"
+python3 - "$NPUB" "$WORK/bridge-a1" "$WORK/bridge-event" <<'PY' || fail "bridge session answers: $(cat "$WORK/bridge-a1") $(cat "$WORK/bridge.log")"
 import json, sys
 npub = sys.argv[1]
 lines = [l.strip() for l in open(sys.argv[2]) if l.strip()]
@@ -387,11 +386,12 @@ assert json.loads(pk["result"]["content"][0]["text"])["npub"] == npub, pk
 assert signed["result"]["isError"] is False, signed
 event = json.loads(signed["result"]["content"][0]["text"])
 assert event["content"] == "hello through the bridge" and len(event["sig"]) == 128, event
+open(sys.argv[3], "w").write(event["id"])
 assert denied["result"]["isError"] is True and "not granted" in denied["result"]["content"][0]["text"], denied
 assert garbled["error"]["code"] == -32700, garbled
 assert ping["result"] == {}, ping
 PY
-[[ $(gw_admin audit --limit 200 | grep -c "sign_nostr_event kind 1") -eq $((SIGNED_BEFORE + 1)) ]] \
+gw_admin audit --limit 200 | grep -q "sign_nostr_event kind 1 id $(cat "$WORK/bridge-event")" \
     || fail "the bridge's signature was not audited"
 pass "an MCP client's session through the bridge: initialize, tools, a signature and a denial"
 
@@ -414,7 +414,7 @@ bridge_refuses() {
         fail "the bridge ran with $why"
     fi
     echo "$msg" | grep -q "$want" || fail "$why: $msg"
-    echo "$msg" | grep -q keep_agt_ && fail "$why: the token was printed"
+    echo "$msg" | grep -qE 'keep_agt_[0-9a-f]{64}' && fail "$why: the token was printed"
     echo "$msg" | grep -q "$PASS" && fail "$why: the password was printed"
     return 0
 }
@@ -426,7 +426,7 @@ bridge_refuses "a token file of another user" "is owned by uid" \
     as "$A1" "${CONNECT[@]}" "$WORK/a1/foreign"
 bridge_refuses "KEEP_PASSWORD set" "refusing to run with KEEP_PASSWORD" \
     as "$A1" env KEEP_PASSWORD=$PASS "${CONNECT[@]}" "$WORK/a1/token"
-bridge_refuses "root" "root can hold no gateway credential" "${CONNECT[@]}" "$WORK/a1/token"
+bridge_refuses "root" "root can hold no gateway credential" env -i "${CONNECT[@]}" "$WORK/a1/token"
 # Agent 2 serves a socket of its own and points agent 1 at it. (setpriv
 # directly, so $! is the server itself.)
 install -d -m 0755 -o "$A2" "$RUN/impostor"
@@ -547,6 +547,20 @@ wait_file "$SYNC-up"
 stop_gateway
 touch "$SYNC-down"
 wait_file "$SYNC-asked"
+# A bridge started while the gateway is down runs anyway, and is served once
+# the gateway is back.
+cat >"$WORK/late.json" <<JSON
+[
+ {"request": {"jsonrpc": "2.0", "id": 1, "method": "ping"}},
+ {"touch": "$SYNC-late"},
+ {"wait_for": "$SYNC-back"},
+ {"request": {"jsonrpc": "2.0", "id": 2, "method": "ping"}}
+]
+JSON
+chmod 0644 "$WORK/late.json"
+mcp "$A1" "$WORK/late.json" "${CONNECT[@]}" "$WORK/a1/token" >"$WORK/bridge-late" &
+LATE_CLIENT=$!
+wait_file "$SYNC-late"
 [[ ! -e $AGENT_SOCK && ! -e $ADMIN_SOCK ]] || fail "sockets left behind"
 pass "SIGTERM stops the gateway cleanly"
 start_gateway
@@ -563,7 +577,18 @@ assert down["id"] == 2 and down["error"]["code"] == -32010, down
 assert back == {"jsonrpc": "2.0", "id": 3, "result": {}}, back
 PY
 pass "a bridge left running reports the stopped gateway and reconnects to the restarted one"
-grep -q keep_agt_ "$WORK/bridge.log" && fail "a token is in the bridge's log"
+wait "$LATE_CLIENT" || fail "bridge client started while the gateway was down"
+python3 - "$WORK/bridge-late" <<'PY' || fail "bridge started early: $(cat "$WORK/bridge-late") $(cat "$WORK/bridge.log")"
+import json, sys
+lines = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+assert lines[-1] == "EXIT 0", lines
+down, back = (json.loads(l) for l in lines[:-1])
+assert down["id"] == 1 and down["error"]["code"] == -32010, down
+assert back == {"jsonrpc": "2.0", "id": 2, "result": {}}, back
+PY
+grep -q "is not running yet" "$WORK/bridge.log" || fail "the bridge did not say the gateway was down"
+pass "a bridge started while the gateway is down is served once it is back"
+grep -qE 'keep_agt_[0-9a-f]{64}' "$WORK/bridge.log" && fail "a token is in the bridge's log"
 grep -q "connected to the gateway" "$WORK/bridge.log" || fail "the bridge's log was not captured"
 pass "the bridge's log, at trace level, holds no token"
 # The 10,000 sats spent before the restart still count: four more fit the

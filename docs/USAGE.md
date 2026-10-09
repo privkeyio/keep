@@ -690,13 +690,15 @@ Credentials expire after 30 days by default (`--ttl-days`). A credential may not
 
 `keep agent connect` lets a stock MCP client (Claude, Cursor, any client that runs a stdio server) use the gateway. It speaks MCP on stdio and passes each request to the gateway's agent socket with the agent's token. It needs no vault and no password.
 
-Give the token to the agent's user in a file only that user can read:
+Give the token to the agent's user in a file only that user can read, then remove your copy:
 
 ```bash
+sudo -u agent-user mkdir -p -m 0700 /home/agent-user/.config/keep
 sudo install -m 0600 -o agent-user writer.token /home/agent-user/.config/keep/agent.token
+shred -u writer.token
 ```
 
-Then add the bridge to the client's configuration, run as the agent's user (for Claude and Cursor, under `mcpServers`):
+Then add the bridge to the client's configuration (for Claude and Cursor, under `mcpServers`). The client itself must run as the agent's user: the bridge runs as whoever starts it, and the gateway checks that uid.
 
 ```json
 {
@@ -714,18 +716,18 @@ Then add the bridge to the client's configuration, run as the agent's user (for 
 The bridge protects the token:
 
 - It reads the token only from the file, never from an argument or an environment variable, since MCP configurations are often committed. The file must be a regular file owned by the user running the bridge, with no access for group or others (mode 0600 or 0400).
-- Before sending anything it checks that the socket's directory belongs to the gateway's user and that no one else can write to it, and that the gateway's user is the one serving the socket. It checks again on every new connection, so the token never reaches a socket someone else put in its place.
-- It refuses to run with `KEEP_PASSWORD`, `KEEP_HIDDEN_PASSWORD`, `KEEP_DURESS_PASSWORD` or `KEEP_NSEC` set, since the agent can read its own environment, and it refuses to run as root, which can hold no credential.
-- It never prints or logs the token, keeps the process out of core dumps, and wipes its copies of the token when it stops.
+- Before sending anything it checks that the socket's directory belongs to the gateway's user and that no one else can write to it, and that the gateway's user is the one serving the socket. It checks again on every new connection, so the token never reaches a socket someone else put in its place. If the socket fails these checks when the bridge starts, it exits.
+- It refuses to run with any of `KEEP_PASSWORD`, `KEEP_NEW_PASSWORD`, `KEEP_HIDDEN_PASSWORD`, `KEEP_DURESS_PASSWORD`, `KEEP_NSEC`, `KEEP_STORAGE_KEY` or `KEEP_WEB_AUTH_TOKEN` set, since the agent can read its own environment, and it refuses to run as root, which can hold no credential.
+- It never prints or logs the token, and keeps the process out of core dumps.
 
-The bridge sends one request at a time and keeps running when the gateway closes the connection: after 10 idle minutes, after three refused requests in a row, or when the gateway restarts. It connects again for the next request, so the client's session survives. It never sends a request twice if the first may have been carried out:
+The bridge sends one request at a time over one connection. It keeps running when the gateway closes that connection (after 10 idle minutes, after three refused requests in a row, or when the gateway restarts) and connects again for the next request, so the client's session survives. If the gateway is not running yet when the client starts the bridge, the bridge starts anyway and answers `-32010` until it is. It never sends a request twice if the first may have been carried out:
 
 | Error code | Meaning |
 |------------|---------|
-| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or comes from the wrong uid. |
-| `-32002` | The credential is over one of its request limits. |
-| `-32010` | The gateway could not be reached (stopped, restarting, or the socket failed the checks above). The request was not sent. |
-| `-32011` | The connection closed after the request was sent and before the answer came. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
+| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. |
+| `-32002` | The credential is over its per-minute, per-hour or per-day request limit. |
+| `-32010` | The request was not sent, or the gateway turned it away unread: the gateway is stopped or restarting, the socket failed the checks above, or the agent's uid already holds as many connections as the gateway allows (8 by default, so at most 8 bridges at once per agent user). |
+| `-32011` | The request was sent and no answer came: the connection closed, the answer took more than 150 seconds, or the answer was not for this request. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
 
 Notifications from the client are not sent to the gateway, which acts on none of them.
 
