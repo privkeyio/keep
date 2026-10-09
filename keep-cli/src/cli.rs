@@ -119,6 +119,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// The agent gateway: a daemon holding the vault that agents use through
+    /// scoped tokens, and the owner's commands to manage it
+    #[cfg(target_os = "linux")]
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommands,
+    },
     /// FROST wallet descriptors, proposals, and PSBT spend coordination
     Wallet {
         #[command(subcommand)]
@@ -184,6 +191,136 @@ pub(crate) enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum MigrateCommands {
     Status,
+}
+
+/// Where the gateway's agent socket is by default.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_AGENT_SOCKET: &str = "/run/keep-gateway/agent.sock";
+
+/// Where the gateway's admin socket is by default.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_ADMIN_SOCKET: &str = "/run/keep-gateway-admin/admin.sock";
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub(crate) enum GatewayCommands {
+    /// Run the gateway: unlock the vault and serve agents until stopped.
+    /// Runs as its own user, never root; each socket's directory must already
+    /// exist, be owned by that user and be closed to others.
+    Serve {
+        #[arg(long, default_value = DEFAULT_AGENT_SOCKET)]
+        agent_socket: PathBuf,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+        /// The one non-root uid allowed to manage the gateway. No credential
+        /// may be bound to it.
+        #[arg(long)]
+        admin_uid: Option<u32>,
+        /// What all agents together may take out of one key's wallet in any
+        /// 24 hours, fees included. 0 (the default) refuses every spend.
+        #[arg(long, default_value_t = 0)]
+        wallet_budget_sats: u64,
+        /// Start even though the wall clock is far past the latest time the
+        /// vault has seen. Only when the clock is known to be right.
+        #[arg(long)]
+        accept_clock_jump: bool,
+    },
+    /// Show the running gateway's state
+    Status {
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// List agent credentials (never their tokens)
+    List {
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// Issue an agent credential. The token is shown once.
+    Issue {
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+        /// The owner's label for the agent
+        #[arg(long)]
+        name: String,
+        /// The uid the agent runs as; the token is refused from any other
+        #[arg(long)]
+        uid: u32,
+        /// A vault key the agent may use, as hex or npub (repeatable)
+        #[arg(long = "key", required = true)]
+        keys: Vec<String>,
+        /// An operation the agent may request (repeatable): get_public_key,
+        /// sign_nostr_event, get_bitcoin_address, sign_psbt
+        #[arg(long = "op", required = true)]
+        operations: Vec<String>,
+        /// A Nostr event kind the agent may sign (repeatable)
+        #[arg(long = "kind")]
+        kinds: Vec<u16>,
+        /// Bitcoin network for the Bitcoin operations
+        #[arg(long)]
+        network: Option<String>,
+        /// Most one PSBT may take out of the wallet, fee included
+        #[arg(long)]
+        per_psbt_sats: Option<u64>,
+        /// Most the agent may take out of the wallet in any 24 hours
+        #[arg(long)]
+        window_sats: Option<u64>,
+        /// Spends past this within 24 hours need an approval
+        #[arg(long)]
+        approval_above_sats: Option<u64>,
+        /// An address the agent's PSBTs may pay (repeatable); without any,
+        /// every address may be paid
+        #[arg(long = "allow-address")]
+        allow_addresses: Vec<String>,
+        #[arg(long, default_value_t = 10)]
+        per_minute: u32,
+        #[arg(long, default_value_t = 100)]
+        per_hour: u32,
+        #[arg(long, default_value_t = 1000)]
+        per_day: u32,
+        /// Days until the credential expires
+        #[arg(long, default_value_t = 30)]
+        ttl_days: u64,
+        /// Write the token to this new file (mode 0600) instead of stdout
+        #[arg(long)]
+        token_out: Option<PathBuf>,
+    },
+    /// Revoke an agent credential for good
+    Revoke {
+        id: String,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// Delete an agent credential and its spend ledger
+    Delete {
+        id: String,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// Freeze one agent credential, or every one with --all
+    Freeze {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// Unfreeze one agent credential, or lift the freeze on all with --all
+    Unfreeze {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
+    /// Show the latest audit log entries
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]

@@ -70,6 +70,34 @@ pub struct Grant {
     /// Counterparty x-only public keys for NIP-44 encrypt and decrypt.
     pub nip44_peers: BTreeSet<[u8; 32]>,
     pub bitcoin: Option<BitcoinGrant>,
+    /// How many requests the credential may make, allowed or not.
+    #[serde(default)]
+    pub limits: RequestLimits,
+}
+
+/// The most requests a grant may allow a day. Each allowed request writes an
+/// audit entry, so this stays well under a credential's daily audit budget,
+/// leaving room for its refusals.
+pub const MAX_REQUESTS_PER_DAY: u32 = 1_000;
+
+/// Requests a credential may make per minute, hour and day, counted whether
+/// they are allowed or not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestLimits {
+    pub per_minute: u32,
+    pub per_hour: u32,
+    pub per_day: u32,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            per_minute: 10,
+            per_hour: 100,
+            per_day: MAX_REQUESTS_PER_DAY,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +140,16 @@ impl Grant {
         }
         if has(Operation::GetBitcoinAddress) && self.bitcoin.is_none() {
             return refuse("get_bitcoin_address needs a Bitcoin grant");
+        }
+        let l = self.limits;
+        if l.per_minute == 0
+            || l.per_minute > l.per_hour
+            || l.per_hour > l.per_day
+            || l.per_day > MAX_REQUESTS_PER_DAY
+        {
+            return Err(AgentError::ScopeViolation(format!(
+                "request limits need 0 < per_minute <= per_hour <= per_day <= {MAX_REQUESTS_PER_DAY}"
+            )));
         }
         if let Some(btc) = self.bitcoin.as_mut() {
             if btc.per_psbt_sats > btc.window_sats {
@@ -291,6 +329,11 @@ impl Ledger {
             .filter(|s| s.at > start)
             .map(|s| s.sats)
             .fold(0, u64::saturating_add)
+    }
+
+    /// The latest time the ledger has seen.
+    pub fn last_seen(&self) -> u64 {
+        self.last_seen
     }
 
     fn advance(&mut self, now: u64) -> u64 {
@@ -544,6 +587,7 @@ mod tests {
                 approval_above_sats: None,
                 address_allowlist: None,
             }),
+            limits: RequestLimits::default(),
         }
     }
 
@@ -1071,6 +1115,40 @@ mod tests {
         btc(&mut g).address_allowlist = Some([ADDR.to_uppercase()].into());
         let g = g.validated().unwrap();
         assert!(g.bitcoin.unwrap().address_allowlist.unwrap().contains(ADDR));
+        let max = MAX_REQUESTS_PER_DAY;
+        for (per_minute, per_hour, per_day) in
+            [(0, 0, 0), (0, 1, 1), (2, 1, 1), (1, 2, 1), (1, 1, max + 1)]
+        {
+            let mut g = grant();
+            g.limits = RequestLimits {
+                per_minute,
+                per_hour,
+                per_day,
+            };
+            assert!(
+                refused(g).contains("request limits"),
+                "{per_minute} {per_hour} {per_day}"
+            );
+        }
+        let mut g = grant();
+        g.limits = RequestLimits {
+            per_minute: 1,
+            per_hour: 1,
+            per_day: max,
+        };
+        assert!(g.validated().is_ok());
+    }
+
+    #[test]
+    fn a_grant_without_limits_takes_the_defaults() {
+        let mut json: serde_json::Value = serde_json::to_value(grant()).unwrap();
+        json.as_object_mut().unwrap().remove("limits");
+        let g: Grant = serde_json::from_value(json).unwrap();
+        assert_eq!(g.limits, RequestLimits::default());
+        assert_eq!(g.clone().validated().unwrap(), g);
+        let mut json = serde_json::to_value(grant()).unwrap();
+        json["limits"]["per_week"] = 1.into();
+        assert!(serde_json::from_value::<Grant>(json).is_err());
     }
 
     #[test]

@@ -84,6 +84,7 @@ fn grant() -> Grant {
             approval_above_sats: None,
             address_allowlist: Some([ADDR.to_string()].into()),
         }),
+        limits: Default::default(),
     }
 }
 
@@ -535,7 +536,7 @@ fn every_summary_label_fits() {
         RefusalKind::Invalid,
     ] {
         let label = format!("{} x{} more since {}", kind.label(), u32::MAX, u64::MAX);
-        assert!(label.len() <= 64, "{label}");
+        assert!(keep_core::agent::valid_audit_label(&label), "{label}");
     }
 }
 
@@ -605,4 +606,127 @@ fn a_frozen_credential_is_frozen_once() {
         }
     }
     assert_eq!(v.entries(AuditEventType::AgentFreeze).len(), 1);
+}
+
+/// Once its budget froze a credential, its refusals are not written: they
+/// would only spend the gateway's refusal budget. The owner's unfreeze lifts
+/// that.
+#[test]
+fn a_credential_its_budget_froze_writes_no_more_refusals() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3 * DAY);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(1, u32::MAX);
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW)
+        .unwrap();
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "2", NOW)
+        .is_err());
+    assert!(audit.froze(&id));
+    let before = v.entries(AuditEventType::AgentRefused).len();
+    for i in 0..5 {
+        audit
+            .record_refusal(
+                &mut v.keep,
+                &id,
+                RefusalKind::Unauthenticated,
+                &format!("frozen {i}"),
+                NOW + DAY + i,
+            )
+            .unwrap();
+    }
+    assert_eq!(v.entries(AuditEventType::AgentRefused).len(), before);
+    v.keep.set_agent_credential_frozen(&id, false).unwrap();
+    audit.reset(&id);
+    assert!(!audit.froze(&id));
+    audit
+        .record_refusal(&mut v.keep, &id, RefusalKind::Denied, "x", NOW + DAY)
+        .unwrap();
+    assert_eq!(v.entries(AuditEventType::AgentRefused).len(), before + 1);
+}
+
+/// Pruning stale budgets keeps the credentials a budget froze, so none is
+/// frozen and recorded twice.
+#[test]
+fn pruning_keeps_credentials_their_budget_froze() {
+    let mut v = Vault::new();
+    let (issued, _) = v.issue(3 * DAY);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(1, u32::MAX);
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW)
+        .unwrap();
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "2", NOW)
+        .is_err());
+    let other = |i: u32| {
+        let mut id = [0xee; 16];
+        id[..4].copy_from_slice(&i.to_le_bytes());
+        id
+    };
+    for i in 0..300 {
+        let _ = audit.record_refusal(
+            &mut v.keep,
+            &other(i),
+            RefusalKind::Denied,
+            "x",
+            NOW + DAY + 1,
+        );
+    }
+    assert!(audit.froze(&id), "still tracked after the stale prune");
+    let later = NOW + 2 * DAY;
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "3", later)
+        .unwrap();
+    assert!(audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "4", later)
+        .is_err());
+    assert_eq!(
+        v.entries(AuditEventType::AgentFreeze).len(),
+        1,
+        "not frozen a second time"
+    );
+}
+
+/// What a credential was served is recorded and budgeted like a signature,
+/// and an over-budget credential is neither served nor admitted.
+#[test]
+fn served_answers_and_admission_are_budgeted() {
+    let mut v = Vault::new();
+    let (issued, token) = v.issue(3600);
+    let id = issued.credential.id;
+    let mut audit = AgentAudit::with_budgets(2, u32::MAX);
+    audit.admit(&mut v.keep, &id, NOW).unwrap();
+    audit
+        .record_served(&mut v.keep, &id, "get_nostr_pubkey", Some("k\n"), NOW)
+        .unwrap();
+    let served = v.reasons(AuditEventType::AgentServed);
+    assert_eq!(
+        served,
+        [format!(
+            "agent {} get_nostr_pubkey \"k\\n\"",
+            hex::encode(id)
+        )]
+    );
+    audit
+        .record_signature(&mut v.keep, &id, &KEY, b"m", "1", NOW)
+        .unwrap();
+    assert!(audit
+        .record_served(&mut v.keep, &id, "get_nostr_pubkey", None, NOW)
+        .is_err());
+    assert!(audit.admit(&mut v.keep, &id, NOW).is_err());
+    assert_eq!(v.reasons(AuditEventType::AgentServed).len(), 1);
+    assert_eq!(
+        authenticate(&v.keep, &token, 1000, NOW)
+            .unwrap()
+            .unwrap_err()
+            .because,
+        RefusedBecause::Credential(AgentRefusal::Frozen)
+    );
+    v.break_log(true);
+    let mut fresh = AgentAudit::default();
+    assert!(fresh
+        .record_served(&mut v.keep, &[9; 16], "get_nostr_pubkey", None, NOW)
+        .is_err());
 }
