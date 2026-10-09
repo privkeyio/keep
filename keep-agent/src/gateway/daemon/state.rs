@@ -232,6 +232,12 @@ pub struct State {
     /// Set once the gateway has written out its state to stop: nothing more is
     /// served, so nothing is left unwritten.
     closed: bool,
+    /// A credential was refused as expired since the last tick: the clock is
+    /// persisted then, so a crash cannot bring the calendar back behind that
+    /// expiry. Not before the answer, which would time apart expired tokens.
+    expiry_seen: bool,
+    /// The stored heartbeat could not be read at start.
+    heartbeat_ignored: bool,
     /// Refused tokens that matched a credential, recorded on the next tick
     /// rather than before the answer, so how long a refusal takes never tells
     /// whoever presented a token whether it is real.
@@ -317,6 +323,7 @@ impl State {
                 floor = floor.max(ledger_last_seen(&keep, &wallet_key(pubkey, network)));
             }
         }
+        let mut heartbeat_ignored = false;
         let heartbeat = match keep.load_agent_ledger(HEARTBEAT_KEY)? {
             None => None,
             // Without it the clock resumes from the ledgers and credentials,
@@ -324,7 +331,12 @@ impl State {
             Some(bytes) => match Heartbeat::decode(&bytes) {
                 Ok(hb) => Some(hb),
                 Err(e) => {
-                    tracing::warn!(error = %e, "ignoring an unreadable clock heartbeat");
+                    tracing::error!(
+                        error = %e,
+                        "ignoring an unreadable clock heartbeat: the clocks resume from the \
+                         ledgers and credentials"
+                    );
+                    heartbeat_ignored = true;
                     None
                 }
             },
@@ -352,6 +364,8 @@ impl State {
             credential_counts: Counters::new(MAX_TRACKED_CREDENTIALS),
             journal: HashMap::new(),
             closed: false,
+            expiry_seen: false,
+            heartbeat_ignored,
             deferred: Vec::new(),
             dropped: 0,
         };
@@ -387,6 +401,11 @@ impl State {
     /// refusal counts whose window has passed.
     pub fn tick(&mut self) {
         self.record_deferred();
+        if std::mem::take(&mut self.expiry_seen) {
+            if let Err(e) = self.persist_heartbeat() {
+                tracing::error!(error = %e, "the gateway clock could not be persisted");
+            }
+        }
         let now = self.clock.now();
         if let Err(e) = self.audit.flush_expired(&mut self.keep, now) {
             tracing::error!(error = %e, "agent refusal counts could not be written");
@@ -509,7 +528,12 @@ impl State {
                             RefusedBecause::Credential(AgentRefusal::WrongUid) => {
                                 format!("presented by uid {peer_uid}")
                             }
-                            RefusedBecause::Credential(reason) => reason.to_string(),
+                            RefusedBecause::Credential(reason) => {
+                                if reason == AgentRefusal::Expired {
+                                    self.expiry_seen = true;
+                                }
+                                reason.to_string()
+                            }
                             RefusedBecause::Grant => "grant does not load".into(),
                         };
                         self.defer_refusal(cid, detail, now);
@@ -1021,6 +1045,8 @@ impl State {
             AdminRequest::Status {} => Ok(json!({
                 "clock": self.clock.now(),
                 "calendar": now,
+                "wall": clock::wall_clock().ok(),
+                "heartbeat_ignored_at_start": self.heartbeat_ignored,
                 "frozen": self.keep.agent_freeze()?,
                 "credentials": self.keep.agent_credential_ids()?.len(),
                 "wallet_budget_sats": self.settings.wallet_budget_sats,

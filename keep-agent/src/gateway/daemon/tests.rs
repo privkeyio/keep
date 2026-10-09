@@ -1134,6 +1134,8 @@ fn issue_times_hold_the_calendar_without_a_heartbeat() {
         .unwrap()
         .get("result")
         .is_some());
+    let status = g.admin_ok(json!({ "op": "status" }));
+    assert_eq!(status["heartbeat_ignored_at_start"], json!(true));
 }
 
 /// Credentials expire on the calendar clock, which a reboot does not hold
@@ -1150,6 +1152,25 @@ fn credentials_expire_on_the_calendar_across_a_reboot() {
     let mut g = g.restart(REBOOT, T0 + 2 * 3_600).unwrap();
     assert_eq!(g.state.now(), T0, "the budget clock did not move");
     assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    // The expiry was seen: the next tick persists the calendar, so even a
+    // crash right after cannot bring it back behind the expiry.
+    let stored = |g: &Gw| {
+        Heartbeat::decode(
+            &g.state
+                .keep()
+                .load_agent_ledger(HEARTBEAT_KEY)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let before = stored(&g);
+    g.boot.advance(30);
+    g.state.tick();
+    assert!(
+        stored(&g).boottime > before.boottime,
+        "persisted on the tick"
+    );
     // A wall clock behind on the next boot, or stepped back while running,
     // does not bring it back.
     let mut g = g.restart(REBOOT, 0).unwrap();
