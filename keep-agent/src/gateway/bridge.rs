@@ -82,13 +82,6 @@ pub fn vault_secret_var(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
     VAULT_SECRET_VARS.into_iter().find(|v| is_set(v))
 }
 
-/// Whether a command-line argument holds an agent token, which must then not
-/// be opened, looked up or repeated in an error.
-pub fn looks_like_token(arg: &std::ffi::OsStr) -> bool {
-    arg.to_string_lossy()
-        .contains(keep_core::agent::TOKEN_PREFIX)
-}
-
 /// An agent token, wiped when dropped and never printed.
 pub struct Token(Zeroizing<String>);
 
@@ -103,7 +96,10 @@ impl Token {
     /// `owner` and closed to everyone else. The checks are made on the file
     /// opened, so it cannot be swapped between check and read.
     pub fn read(path: &Path, owner: u32) -> Result<Self> {
-        if looks_like_token(path.as_os_str()) {
+        if path
+            .to_string_lossy()
+            .contains(keep_core::agent::TOKEN_PREFIX)
+        {
             return Err(AgentError::Other(
                 "the token file path looks like a token; pass the path of the file holding it"
                     .into(),
@@ -119,7 +115,13 @@ impl Token {
             .read(true)
             .custom_flags(flags.bits() as i32)
             .open(path)
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| {
+                if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
+                    fail("is a symlink; pass the path of the file itself".into())
+                } else {
+                    fail(e.to_string())
+                }
+            })?;
         let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
         if !meta.file_type().is_file() {
             return Err(fail("is not a regular file".into()));
@@ -621,7 +623,7 @@ mod tests {
         // A symlink is refused, even to a good token file.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(token_file(dir.path(), TOKEN, 0o600), &link).unwrap();
-        assert!(Token::read(&link, me()).is_err());
+        assert!(read_err(&link, me()).contains("is a symlink"));
         assert!(read_err(dir.path(), me()).contains("not a regular file"));
 
         // A FIFO is refused without waiting for a writer.
@@ -1010,8 +1012,9 @@ mod socket_tests {
             if peer.index != 0 {
                 return peer.serve();
             }
+            // Read the request and hold the connection open unanswered.
             peer.next();
-            std::thread::sleep(Duration::from_millis(600));
+            peer.rest();
         });
         let timing = Timing {
             answer_timeout: Duration::from_millis(200),

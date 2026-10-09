@@ -115,6 +115,19 @@ fn main() {
 
 #[tracing::instrument(skip(out), fields(request_id = %next_request_id()))]
 fn run(out: &Output) -> Result<()> {
+    // No command takes an agent token as an argument, where it would sit in
+    // process lists and logs; refused before parsing, which echoes a stray
+    // argument back in its error.
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a.to_string_lossy().contains(keep_core::agent::TOKEN_PREFIX))
+    {
+        return Err(keep_core::error::KeepError::InvalidInput(
+            "an argument holds an agent token; put the token in a file readable by its owner \
+             alone and pass that file's path with --token-file"
+                .into(),
+        ));
+    }
     let cli = Cli::parse();
     // The bridge needs neither the vault nor the configuration, and may run
     // where neither exists.

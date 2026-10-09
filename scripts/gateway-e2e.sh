@@ -391,7 +391,8 @@ assert denied["result"]["isError"] is True and "not granted" in denied["result"]
 assert garbled["error"]["code"] == -32700, garbled
 assert ping["result"] == {}, ping
 PY
-gw_admin audit --limit 200 | grep -q "sign_nostr_event kind 1 id $(cat "$WORK/bridge-event")" \
+# Captured first: under pipefail, grep -q closing the pipe early fails the writer.
+grep -q "sign_nostr_event kind 1 id $(cat "$WORK/bridge-event")" <<<"$(gw_admin audit --limit 200)" \
     || fail "the bridge's signature was not audited"
 pass "an MCP client's session through the bridge: initialize, tools, a signature and a denial"
 
@@ -516,13 +517,13 @@ pass "freeze and unfreeze apply on the next request"
 # the answer, so wait for one.
 for _ in $(seq 40); do
     AUDIT=$(gw_admin audit --limit 200)
-    echo "$AUDIT" | grep -q "presented by uid $(uid "$A2")" && break
+    grep -q "presented by uid $(uid "$A2")" <<<"$AUDIT" && break
     sleep 0.5
 done
-echo "$AUDIT" | grep -q "sign_nostr_event kind 1" || fail "no signature entry: $AUDIT"
-echo "$AUDIT" | grep -q "agent_served" || fail "no served entry"
-echo "$AUDIT" | grep -q "presented by uid $(uid "$A2")" || fail "no theft entry"
-echo "$AUDIT" | grep -q "kind 4 is not granted" || fail "no denial entry"
+grep -q "sign_nostr_event kind 1" <<<"$AUDIT" || fail "no signature entry: $AUDIT"
+grep -q "agent_served" <<<"$AUDIT" || fail "no served entry"
+grep -q "presented by uid $(uid "$A2")" <<<"$AUDIT" || fail "no theft entry"
+grep -q "kind 4 is not granted" <<<"$AUDIT" || fail "no denial entry"
 pass "audit log records signatures, served answers, denials and the stolen token"
 
 # Agent 2 may sign PSBTs from the Bitcoin key: 20,000 sats per PSBT, 50,000
@@ -542,7 +543,7 @@ echo "$ADDR" | grep -q '\\"address\\":\\"tb1p' || fail "address: $ADDR"
 [[ $(sign_psbt "$PSBT_10K") == "OK 1 10000" ]] || fail "PSBT within the grant was not signed"
 GOT=$(sign_psbt "$PSBT_60K")
 [[ $GOT == ERR*"over the 20000 sat limit per PSBT"* ]] || fail "over the per-PSBT limit: $GOT"
-gw_admin audit --limit 50 | grep -q "sign_bitcoin_psbt txid" || fail "no PSBT signature entry"
+grep -q "sign_bitcoin_psbt txid" <<<"$(gw_admin audit --limit 50)" || fail "no PSBT signature entry"
 pass "agent 2 signs a PSBT within its grant; one over the per-PSBT limit is denied"
 
 # A bridge left running across the restart below: refused nothing, sent
@@ -585,6 +586,7 @@ wait_file "$SYNC-late"
 # Both bridges are waiting, and neither can be read by the agent's own user.
 BRIDGES=$(pgrep -u "$A1" -f -- "^$KEEP agent connect" || true)
 [[ $(wc -w <<<"$BRIDGES") == 2 ]] || fail "expected two bridges running as $A1: $BRIDGES"
+as "$A1" cat /proc/self/environ >/dev/null || fail "$A1 cannot read its own dumpable process"
 for pid in $BRIDGES; do
     if as "$A1" cat "/proc/$pid/environ" >/dev/null 2>&1; then
         fail "a bridge's environment is readable by its own user"

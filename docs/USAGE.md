@@ -715,7 +715,7 @@ Then add the bridge to the client's configuration (for Claude and Cursor, under 
 
 The bridge protects the token:
 
-- It reads the token only from the file, never from an argument or an environment variable, since MCP configurations are often committed. The file must be a regular file owned by the user running the bridge, with no access for group or others (mode 0600 or 0400), and not a symlink. It refuses to run if any argument holds a token.
+- It reads the token only from the file, never from an argument or an environment variable, since MCP configurations are often committed. The file must be a regular file owned by the user running the bridge, with no access for group or others (mode 0600 or 0400), and not a symlink. Every `keep` command refuses to run if any argument holds a token.
 - Before sending anything it checks that the socket's directory belongs to the gateway's user and that no one else can write to it, and that the gateway's user is the one serving the socket. It checks again on every new connection, so the token never reaches a socket someone else put in its place. If the socket fails these checks when the bridge starts, it exits.
 - It refuses to run with any of `KEEP_PASSWORD`, `KEEP_NEW_PASSWORD`, `KEEP_HIDDEN_PASSWORD`, `KEEP_DURESS_PASSWORD`, `KEEP_NSEC`, `KEEP_STORAGE_KEY`, `KEEP_WEB_AUTH_TOKEN` or `KEEP_STATE_IDENTITY` set, or the `_FILE` form of `KEEP_PASSWORD`, `KEEP_STORAGE_KEY`, `KEEP_WEB_AUTH_TOKEN` or `KEEP_STATE_IDENTITY`, since the agent can read its own environment, and it refuses to run as root, which can hold no credential.
 - It never prints or logs the token, and keeps the process out of core dumps.
@@ -726,7 +726,7 @@ The bridge sends one request at a time over one connection. It keeps running whe
 |------------|---------|
 | `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. |
 | `-32002` | The credential is over its per-minute, per-hour or per-day request limit, or the gateway is tracking too many credentials. |
-| `-32010` | The request was not sent, or the gateway turned it away unread: the gateway is stopped or restarting, the socket failed the checks above, or the agent's uid already holds as many connections as the gateway allows (8 open connections by default; uids no credential is bound to share one pool of 8). |
+| `-32010` | The request was not sent, or the gateway turned it away unread: the gateway is stopped or restarting, the socket failed the checks above, or the agent's uid already holds as many connections as the gateway allows (8 open connections by default; uids no credential is bound to share one pool of 8), or the gateway holds its most connections in all (128 by default). |
 | `-32011` | The request was sent and no answer came: the connection closed, no part of the answer came for 150 seconds, or the answer was not for this request. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
 
 Notifications from the client are not sent to the gateway, which acts on none of them.

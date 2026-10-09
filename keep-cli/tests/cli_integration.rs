@@ -2511,26 +2511,21 @@ fn test_agent_connect_refuses_before_sending_anything() {
         refused(&connect(&mut cmd), &format!("refusing to run with {var}"));
     }
 
-    // A token pasted into an argument is refused and not repeated.
-    for pasted in [&secret, &format!("/home/agent/{secret}")] {
+    // A token pasted into any argument, even one clap would reject, is
+    // refused and not repeated.
+    let pasted_path = format!("/home/agent/{secret}");
+    for args in [
+        vec!["--token-file", &secret],
+        vec!["--token-file", &pasted_path],
+        vec!["--socket", &secret, "--token-file", "/nonexistent"],
+        vec!["--gateway-user", &secret, "--token-file", "/nonexistent"],
+        vec!["--path", &secret, "--token-file", "/nonexistent"],
+        vec!["--token-file", "/nonexistent", &secret],
+    ] {
         let mut bare = Command::new(&keep);
-        bare.env_clear();
-        refused(
-            &bridge(&mut bare, Path::new(pasted), me),
-            "an argument holds an agent token",
-        );
+        bare.env_clear().args(["agent", "connect"]).args(&args);
+        refused(&bare.output().unwrap(), "an argument holds an agent token");
     }
-    let mut bare = Command::new(&keep);
-    bare.env_clear()
-        .args([
-            "agent",
-            "connect",
-            "--gateway-user",
-            &secret,
-            "--token-file",
-        ])
-        .arg(&token);
-    refused(&bare.output().unwrap(), "an argument holds an agent token");
 
     let mut bare = Command::new(&keep);
     bare.env_clear();
