@@ -3,16 +3,15 @@
 
 //! `keep gateway`: run the agent gateway, and manage it over its admin socket.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use secrecy::ExposeSecret;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use keep_agent::gateway::daemon::{self, Config, Limits, Settings, Sockets};
+use keep_agent::gateway::daemon::{self, unlock, Config, Limits, Settings, Sockets};
 use keep_agent::policy::{BitcoinGrant, Grant, RequestLimits};
 use keep_agent::scope::Operation;
 use keep_core::error::{KeepError, Result};
@@ -20,8 +19,6 @@ use keep_core::Keep;
 
 use crate::cli::{AdminTarget, GatewayCommands, IssueArgs};
 use crate::output::Output;
-
-use super::get_password;
 
 pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: bool) -> Result<()> {
     match command {
@@ -198,13 +195,24 @@ fn serve(out: &Output, config: Config) -> Result<()> {
             "run the gateway as its own user, never root".into(),
         ));
     }
+    // A password in the environment is visible to `systemctl show`, to
+    // anything the unit's environment files reach, and to root through
+    // /proc, and is too easily left there: the gateway never reads one.
+    if std::env::var_os("KEEP_PASSWORD").is_some() {
+        return Err(KeepError::InvalidInput(format!(
+            "the gateway never reads the vault password from KEEP_PASSWORD: remove it. Under \
+             systemd the password comes from the encrypted {:?} credential; otherwise it is \
+             asked for on a terminal",
+            unlock::PASSWORD_CREDENTIAL
+        )));
+    }
     // Before the vault is unlocked: no core dump or same-uid debugger may
     // read the process from here on.
     daemon::harden().map_err(|e| KeepError::Runtime(e.to_string()))?;
     let mut keep = Keep::open(&config.vault)?;
-    let password = get_password("Enter password")?;
+    let password = vault_password()?;
     let spinner = out.spinner("Unlocking vault...");
-    keep.unlock(password.expose_secret())?;
+    keep.unlock(&password)?;
     drop(password);
     spinner.finish();
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -223,6 +231,27 @@ fn serve(out: &Output, config: Config) -> Result<()> {
             tracing::info!("stopping the agent gateway");
         }))
         .map_err(|e| KeepError::Runtime(e.to_string()))
+}
+
+/// The vault password: from the credential systemd decrypted into
+/// `$CREDENTIALS_DIRECTORY`, or else asked for on a terminal.
+fn vault_password() -> Result<Zeroizing<String>> {
+    if let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") {
+        return unlock::read_credential(
+            Path::new(&dir),
+            unlock::PASSWORD_CREDENTIAL,
+            daemon::euid(),
+        )
+        .map_err(|e| KeepError::Runtime(e.to_string()));
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(KeepError::InvalidInput(format!(
+            "no vault password: run the gateway from its systemd unit, which passes the \
+             encrypted {:?} credential, or on a terminal to be asked for it",
+            unlock::PASSWORD_CREDENTIAL
+        )));
+    }
+    super::read_password("Enter password").map(Zeroizing::new)
 }
 
 /// The gateway's answer to an admin request. The token of an issued

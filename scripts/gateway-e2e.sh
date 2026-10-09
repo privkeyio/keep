@@ -146,9 +146,18 @@ install -d -m 0750 -o "$GW" -g "$ADMINS" "$RUN/admin"
 AGENT_SOCK=$RUN/agent/agent.sock
 ADMIN_SOCK=$RUN/admin/admin.sock
 
+# The vault password as systemd hands it to the gateway: a file in a
+# directory named by CREDENTIALS_DIRECTORY, readable by the gateway alone.
+CREDS=$WORK/creds
+install -d -m 0700 -o "$GW" "$CREDS"
+printf '%s\n' "$PASS" >"$CREDS/vault-password"
+chown "$GW" "$CREDS/vault-password"
+chmod 0400 "$CREDS/vault-password"
+chmod 0500 "$CREDS"
+
 start_gateway() {
     setpriv --reuid="$GW" --regid="$(id -g "$GW")" --init-groups \
-        env -i PATH=/usr/bin:/bin HOME="$WORK" KEEP_PASSWORD=$PASS RUST_LOG=info \
+        env -i PATH=/usr/bin:/bin HOME="$WORK" CREDENTIALS_DIRECTORY="$CREDS" RUST_LOG=info \
         "$KEEP" --path "$VAULT" gateway serve \
         --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" \
         --admin-uid "$(uid "$ADMIN")" --wallet-budget-sats 100000 "$@" \
@@ -172,12 +181,35 @@ stop_gateway() {
 }
 
 # The gateway never runs as root.
-if env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" gateway serve \
+if env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" >"$WORK/root.log" 2>&1; then
     fail "the gateway ran as root"
 fi
 grep -q "never root" "$WORK/root.log" || fail "root refusal: $(cat "$WORK/root.log")"
 pass "refuses to run as root"
+
+# The password never comes from the environment, nor from a credential others
+# could read, and is never printed.
+serve_refuses() {
+    local why=$1 want=$2 msg
+    shift 2
+    if msg=$(as "$GW" "$@" "$KEEP" --path "$VAULT" gateway serve \
+        --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" </dev/null 2>&1); then
+        fail "the gateway started with $why"
+    fi
+    grep -q "$want" <<<"$msg" || fail "$why: $msg"
+    grep -q "$PASS" <<<"$msg" && fail "$why: the password was printed"
+    return 0
+}
+serve_refuses "KEEP_PASSWORD set" "never reads the vault password from KEEP_PASSWORD" \
+    env KEEP_PASSWORD=$PASS CREDENTIALS_DIRECTORY="$CREDS"
+serve_refuses "no credential and no terminal" "no vault password"
+LOOSE=$WORK/loose-creds
+install -d -m 0700 -o "$GW" "$LOOSE"
+install -m 0444 -o "$GW" "$CREDS/vault-password" "$LOOSE/vault-password"
+serve_refuses "a credential other users can read" "closed to other users" env CREDENTIALS_DIRECTORY="$LOOSE"
+[[ ! -e $AGENT_SOCK && ! -e $ADMIN_SOCK ]] || fail "a refused gateway left a socket"
+pass "the password comes only from a closed credential, never the environment, and is never printed"
 
 start_gateway
 pass "gateway running as $GW (pid $GW_PID)"
@@ -192,7 +224,7 @@ fi
 pass "process runs as $GW and is not dumpable"
 
 # A second gateway cannot take over the sockets.
-if as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" gateway serve \
+if as "$GW" env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" >"$WORK/second.log" 2>&1; then
     fail "a second gateway started"
 fi

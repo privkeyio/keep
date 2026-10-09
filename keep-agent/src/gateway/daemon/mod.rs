@@ -16,6 +16,7 @@ pub mod limits;
 pub mod server;
 pub mod state;
 pub mod tools;
+pub mod unlock;
 
 #[cfg(test)]
 mod tests;
