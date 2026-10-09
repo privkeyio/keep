@@ -167,7 +167,7 @@ pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -
         );
     } else {
         eprintln!(
-            "keep agent connect: the gateway at {} is not running yet; requests fail \
+            "keep agent connect: the gateway at {} is not reachable yet; requests fail \
              until it is",
             socket.display()
         );

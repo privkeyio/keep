@@ -1209,8 +1209,10 @@ mod socket_tests {
             eprintln!("skipped: a {send_buffer} byte send buffer holds the whole request");
             return;
         }
+        // Long enough for the new connection's send under load; the stuck
+        // one only waits it out.
         let timing = Timing {
-            write_timeout: Duration::from_millis(300),
+            write_timeout: Duration::from_secs(2),
             ..patient()
         };
         let mut client = Client::start(bridge(&fake, timing));

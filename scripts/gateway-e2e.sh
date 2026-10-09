@@ -410,7 +410,8 @@ bridge_refuses() {
     local why=$1 want=$2
     shift 2
     local msg
-    if msg=$("$@" </dev/null 2>&1); then
+    # A request ready on its input, so a bridge that ran would send it.
+    if msg=$(rpc 1 ping '{}' | "$@" 2>&1); then
         fail "the bridge ran with $why"
     fi
     echo "$msg" | grep -q "$want" || fail "$why: $msg"
@@ -427,32 +428,41 @@ bridge_refuses "a token file of another user" "is owned by uid" \
 bridge_refuses "KEEP_PASSWORD set" "refusing to run with KEEP_PASSWORD" \
     as "$A1" env KEEP_PASSWORD=$PASS "${CONNECT[@]}" "$WORK/a1/token"
 bridge_refuses "root" "root can hold no gateway credential" env -i "${CONNECT[@]}" "$WORK/a1/token"
-# Agent 2 serves a socket of its own and points agent 1 at it. (setpriv
-# directly, so $! is the server itself.)
+# Agent 2 serves a socket of its own and points agent 1 at it. It records
+# every connection, and anything sent on one, in agent 2's own directory.
+# (setpriv directly, so $! is the server itself.)
 install -d -m 0755 -o "$A2" "$RUN/impostor"
 setpriv --reuid="$A2" --regid="$(id -g "$A2")" --init-groups env -i PATH=/usr/bin:/bin python3 -c '
 import os, socket, sys
-s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); os.chmod(sys.argv[1], 0o777); s.listen(4)
+path, conns, got = sys.argv[1:4]
+s = socket.socket(socket.AF_UNIX); s.bind(path); os.chmod(path, 0o777); s.listen(4)
 while True:
-    c, _ = s.accept(); c.settimeout(2)
-    try: data = c.recv(65536)
-    except OSError: data = b""
-    open(sys.argv[2], "ab").write(data)
-' "$RUN/impostor/agent.sock" "$RUN/impostor/got" &
+    c, _ = s.accept()
+    open(conns, "a").write("connected\n")
+    c.settimeout(2)
+    try:
+        data = c.recv(65536)
+    except OSError:
+        data = b""
+    open(got, "ab").write(data)
+    c.close()
+' "$RUN/impostor/agent.sock" "$WORK/a2/impostor-connections" "$WORK/a2/impostor-got" &
 IMPOSTOR=$!
 for _ in $(seq 50); do [[ -S $RUN/impostor/agent.sock ]] && break; sleep 0.1; done
 IMPOSTOR_CONNECT=(as "$A1" "$KEEP" agent connect --socket "$RUN/impostor/agent.sock" --gateway-user "$GW"
     --token-file "$WORK/a1/token")
 bridge_refuses "an impostor's directory" "its directory is owned by uid $(uid "$A2")" "${IMPOSTOR_CONNECT[@]}"
-# Its socket in a directory of the gateway user's: the server is checked too.
+[[ ! -e $WORK/a2/impostor-connections ]] || fail "the bridge connected to a socket in the impostor's directory"
+# Its socket in a directory of the gateway user's: the bridge connects, and
+# the server is checked before anything is sent.
 chown "$GW" "$RUN/impostor"
 bridge_refuses "an impostor's socket" "served by uid $(uid "$A2")" "${IMPOSTOR_CONNECT[@]}"
-{
-    kill "$IMPOSTOR"
-    wait "$IMPOSTOR" || true
-} 2>/dev/null
+for _ in $(seq 50); do [[ -s $WORK/a2/impostor-connections ]] && break; sleep 0.1; done
+[[ -s $WORK/a2/impostor-connections ]] || fail "the bridge never reached the impostor's socket"
+kill "$IMPOSTOR" 2>/dev/null || true
+wait "$IMPOSTOR" 2>/dev/null || true
 pgrep -u "$A2" python3 >/dev/null && fail "the impostor is still running"
-[[ ! -s $RUN/impostor/got ]] || fail "the bridge sent something to the impostor"
+[[ ! -s $WORK/a2/impostor-got ]] || fail "the bridge sent something to the impostor"
 pass "the bridge refuses a loose or foreign token file, KEEP_PASSWORD, root and an impostor's socket"
 
 # Users outside the agents group cannot reach the agent socket; agents cannot
@@ -463,6 +473,14 @@ fi
 if as "$A1" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "an agent reached the admin socket"
 fi
+# The gateway's own uid reaches the admin socket but is turned away unread,
+# so its issue is not reported as possibly done.
+if MSG=$(as "$GW" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name x \
+    --uid "$(uid "$A2")" --key "$NPUB" --op get_public_key 2>&1); then
+    fail "the gateway's own uid issued a credential"
+fi
+echo "$MSG" | grep -q "may have been issued" && fail "false alarm for a refused issue: $MSG"
+echo "$MSG" | grep -q "closed the admin connection" || fail "refused issue: $MSG"
 if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "the gateway's own uid was admitted to the admin socket"
 fi
@@ -586,7 +604,7 @@ down, back = (json.loads(l) for l in lines[:-1])
 assert down["id"] == 1 and down["error"]["code"] == -32010, down
 assert back == {"jsonrpc": "2.0", "id": 2, "result": {}}, back
 PY
-grep -q "is not running yet" "$WORK/bridge.log" || fail "the bridge did not say the gateway was down"
+grep -q "is not reachable yet" "$WORK/bridge.log" || fail "the bridge did not say the gateway was down"
 pass "a bridge started while the gateway is down is served once it is back"
 grep -qE 'keep_agt_[0-9a-f]{64}' "$WORK/bridge.log" && fail "a token is in the bridge's log"
 grep -q "connected to the gateway" "$WORK/bridge.log" || fail "the bridge's log was not captured"

@@ -346,12 +346,20 @@ fn admin_answer(
         maybe_done: true,
         error,
     };
-    let line = read_answer(&stream).map_err(|e| sent(io(e)))?;
-    if line.is_empty() {
-        return Err(sent(KeepError::Runtime(
+    let closed = || {
+        KeepError::Runtime(
             "the gateway closed the admin connection: run as root or the gateway's admin uid"
                 .into(),
-        )));
+        )
+    };
+    let line = match read_answer(&stream) {
+        Ok(line) => line,
+        // Closed with the request still unread in it: never acted on.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err(closed().into()),
+        Err(e) => return Err(sent(io(e))),
+    };
+    if line.is_empty() {
+        return Err(sent(closed()));
     }
     let answer: AdminAnswer = serde_json::from_slice(&line)
         .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;
