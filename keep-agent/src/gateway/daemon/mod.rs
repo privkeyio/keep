@@ -43,6 +43,38 @@ mod dir_tests {
             super::same_directory(&a.join("x"), &root.path().join("missing").join("y")).is_err()
         );
     }
+
+    #[test]
+    fn the_admin_directory_may_not_share_a_group_with_the_agent_directory() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        let (agent, admin) = (root.path().join("agent"), root.path().join("admin"));
+        std::fs::create_dir(&agent).unwrap();
+        std::fs::create_dir(&admin).unwrap();
+        let gid = std::fs::metadata(&agent).unwrap().gid();
+        let open = |mode: u32, egid: u32| {
+            std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::admin_open_to_agents(&agent.join("a.sock"), &admin.join("b.sock"), egid).unwrap()
+        };
+        // The same group, which is not the gateway's: agents get in.
+        assert!(open(0o750, gid + 1));
+        assert!(open(0o710, gid + 1));
+        assert!(open(0o740, gid + 1));
+        // Closed to the group, or the group is the gateway's own.
+        assert!(!open(0o700, gid + 1));
+        assert!(!open(0o750, gid));
+        if rustix::process::geteuid().is_root() {
+            // A group of its own.
+            std::os::unix::fs::chown(&admin, None, Some(gid + 7)).unwrap();
+            assert!(!open(0o750, gid + 1));
+        }
+        assert!(super::admin_open_to_agents(
+            &agent.join("a.sock"),
+            &root.path().join("missing").join("b.sock"),
+            gid
+        )
+        .is_err());
+    }
 }
 
 use std::path::PathBuf;
@@ -94,6 +126,30 @@ fn same_directory(a: &std::path::Path, b: &std::path::Path) -> Result<bool> {
     Ok(dir(a)? == dir(b)?)
 }
 
+/// Whether the admin socket's directory lets in the group of the agent
+/// socket's directory: agents then reach the admin socket too, and only the
+/// gateway's check of each peer keeps them out. The gateway's own group is
+/// the exception, as no agent belongs to it.
+fn admin_open_to_agents(
+    agent: &std::path::Path,
+    admin: &std::path::Path,
+    egid: u32,
+) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = |p: &std::path::Path| {
+        let parent = p
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .ok_or_else(|| {
+                AgentError::Other(format!("{}: a socket path needs a directory", p.display()))
+            })?;
+        std::fs::metadata(parent)
+            .map_err(|e| AgentError::Other(format!("{}: {e}", parent.display())))
+    };
+    let (agent, admin) = (dir(agent)?, dir(admin)?);
+    Ok(admin.gid() == agent.gid() && agent.gid() != egid && admin.mode() & 0o050 != 0)
+}
+
 /// Serve `keep` until `shutdown` resolves.
 pub async fn run(
     keep: Keep,
@@ -109,6 +165,17 @@ pub async fn run(
     if same_directory(&sockets.agent, &sockets.admin)? {
         return Err(AgentError::Other(
             "the admin socket needs a directory of its own, which agents cannot reach".into(),
+        ));
+    }
+    if admin_open_to_agents(
+        &sockets.agent,
+        &sockets.admin,
+        rustix::process::getegid().as_raw(),
+    )? {
+        return Err(AgentError::Other(
+            "the admin socket's directory is open to the agent socket's group: give it a \
+             group agents are not in, such as keep-admins"
+                .into(),
         ));
     }
     let host = Host::detect(&vault)?;

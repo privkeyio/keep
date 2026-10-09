@@ -1,0 +1,90 @@
+# Keep agent gateway: holds the unlocked vault and serves agents over Unix
+# sockets, as its own `keep` user. Needs systemd 250 or later.
+#
+# Before the first start (see docs/USAGE.md, "Running the gateway under
+# systemd"):
+#   - the `keep` user and group, and the `keep-agents` and `keep-admins` groups;
+#   - the vault at /var/lib/keep-gateway/vault, owned by `keep`;
+#   - the vault password sealed to this machine's TPM:
+#       systemd-ask-password -n "Vault password:" | systemd-creds encrypt \
+#         --name=vault-password --with-key=tpm2 - /etc/keep/gateway/vault-password.cred
+#
+# Settings such as --admin-uid and --wallet-budget-sats go in a drop-in
+# (`systemctl edit keep-gateway`) that clears ExecStart= and sets it again.
+
+[Unit]
+Description=Keep agent gateway
+Documentation=https://github.com/privkeyio/keep/blob/main/docs/USAGE.md#running-the-gateway-under-systemd
+
+[Service]
+Type=exec
+User=keep
+Group=keep
+ExecStart=/usr/local/bin/keep --path /var/lib/keep-gateway/vault gateway serve
+Restart=on-failure
+RestartSec=5
+
+# systemd decrypts the vault password into a directory only this service can
+# read and names it in $CREDENTIALS_DIRECTORY; the gateway never reads it
+# from the environment.
+LoadCredentialEncrypted=vault-password:/etc/keep/gateway/vault-password.cred
+
+StateDirectory=keep-gateway
+StateDirectoryMode=0700
+UMask=0077
+
+# The socket directories, owned by `keep` with mode 0750: agents reach the
+# agent socket through the `keep-agents` group, the admin the admin socket
+# through `keep-admins`. RuntimeDirectory= cannot make them: it gives every
+# directory the service's own group, and sets it again on each start. So they
+# are made as root (`+`) before the gateway starts; the gateway removes its
+# sockets when it stops, and /run is emptied at boot. (The `-` lets the
+# commands that make them start before they exist.)
+ExecStartPre=+/usr/bin/install -d -m 0750 -o keep -g keep-agents /run/keep-gateway
+ExecStartPre=+/usr/bin/install -d -m 0750 -o keep -g keep-admins /run/keep-gateway-admin
+ReadWritePaths=-/run/keep-gateway -/run/keep-gateway-admin
+
+LimitCORE=0
+LimitNOFILE=1024
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# The gateway needs no network: its sockets are Unix sockets in the file
+# system, which other namespaces still reach.
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+# Not set, on purpose:
+#   PrivateUsers= would show every other user's uid to the gateway as the
+#     overflow uid, so it could not tell agents apart.
+#   ProcSubset=pid would hide /proc/sys/kernel/random/boot_id and
+#     /proc/sys/kernel/overflowuid, which the gateway reads at start.
+#   DynamicUser= would give the vault a different owner on each start.
+
+[Install]
+WantedBy=multi-user.target

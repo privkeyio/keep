@@ -211,6 +211,17 @@ serve_refuses "a credential other users can read" "closed to other users" env CR
 [[ ! -e $AGENT_SOCK && ! -e $ADMIN_SOCK ]] || fail "a refused gateway left a socket"
 pass "the password comes only from a closed credential, never the environment, and is never printed"
 
+# An admin directory agents can enter is refused before anything is bound.
+install -d -m 0750 -o "$GW" -g "$AGENTS" "$RUN/open-admin"
+if MSG=$(as "$GW" env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
+    --agent-socket "$AGENT_SOCK" --admin-socket "$RUN/open-admin/admin.sock" </dev/null 2>&1); then
+    fail "the gateway started with an admin directory open to agents"
+fi
+grep -q "open to the agent socket's group" <<<"$MSG" || fail "admin directory open to agents: $MSG"
+[[ ! -e $AGENT_SOCK && ! -e $RUN/open-admin/admin.sock ]] || fail "a refused gateway left a socket"
+rmdir "$RUN/open-admin"
+pass "an admin directory in the agents' group is refused"
+
 start_gateway
 pass "gateway running as $GW (pid $GW_PID)"
 
