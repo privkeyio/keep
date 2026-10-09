@@ -1575,6 +1575,97 @@ mod sockets {
         assert!(keep.agent_freeze().unwrap());
         assert!(keep.load_agent_ledger(HEARTBEAT_KEY).unwrap().is_some());
     }
+
+    /// An MCP client's session through `keep agent connect` and a running
+    /// gateway: served as the grant allows when this test's uid can hold a
+    /// credential, refused alike otherwise. Connections the gateway closes,
+    /// idle or after refusals, are replaced without losing a request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_mcp_session_runs_through_the_bridge() {
+        use crate::gateway::bridge::testing::{token, Client};
+        use crate::gateway::bridge::{Bridge, Timing, LOST, UNREACHABLE};
+
+        let gw = running(None).await;
+        let unknown = format!("{}{}", keep_core::agent::TOKEN_PREFIX, "5".repeat(64));
+        let held = gw.token.clone();
+        let agent = gw.agent.clone();
+        let gateway = limits();
+        let timing = Timing {
+            fresh_for: gateway.pre_auth - Duration::from_millis(100),
+            idle_for: gateway.idle - Duration::from_secs(1),
+            refusals_in_a_row: gateway.refusals_in_a_row,
+            answer: Duration::from_secs(10),
+            write: Duration::from_secs(10),
+        };
+        tokio::task::spawn_blocking(move || {
+            let me = my_uid();
+            let text = held.clone().unwrap_or(unknown.clone());
+            let bridge = Bridge::connect(&agent, me, token(&text), timing.clone()).unwrap();
+            let mut client = Client::start(bridge);
+            // Past the pre-auth deadline of the connection opened at start.
+            std::thread::sleep(Duration::from_millis(600));
+            let init = client.call(1, "initialize", json!({ "protocolVersion": "2024-11-05" }));
+            client.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+            let list = client.call(2, "tools/list", json!({}));
+            let pubkey = client.call(
+                3,
+                "tools/call",
+                json!({ "name": "get_nostr_pubkey", "arguments": {} }),
+            );
+            let signed = client.call(
+                4,
+                "tools/call",
+                json!({ "name": "sign_nostr_event",
+                "arguments": { "kind": 1, "content": "through the bridge" } }),
+            );
+            let denied = client.call(
+                5,
+                "tools/call",
+                json!({ "name": "sign_nostr_event",
+                "arguments": { "kind": 4, "content": "dm" } }),
+            );
+            let answers = [&init, &list, &pubkey, &signed, &denied];
+            for answer in answers {
+                let code = answer["error"]["code"].as_i64();
+                assert!(code != Some(LOST) && code != Some(UNREACHABLE), "{answer}");
+            }
+            if held.is_some() {
+                assert_eq!(init["result"]["serverInfo"]["name"], json!("keep-gateway"));
+                assert!(
+                    list["result"]["tools"].as_array().unwrap().len() >= 2,
+                    "{list}"
+                );
+                assert_eq!(pubkey["result"]["isError"], json!(false), "{pubkey}");
+                assert_eq!(signed["result"]["isError"], json!(false), "{signed}");
+                let event: Value =
+                    serde_json::from_str(signed["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                assert_eq!(event["content"], json!("through the bridge"));
+                assert_eq!(denied["result"]["isError"], json!(true), "{denied}");
+                // Idle past the gateway's timeout, then served again.
+                std::thread::sleep(gateway.idle + Duration::from_millis(500));
+                assert_eq!(client.call(6, "ping", json!({}))["result"], json!({}));
+            } else {
+                // Five refusals: the gateway closed the connection after
+                // three, and the bridge carried on with a new one.
+                for (i, answer) in answers.into_iter().enumerate() {
+                    assert_eq!(*answer, refused(json!(i + 1)));
+                }
+            }
+            client.finish().unwrap();
+
+            // A refused token is refused through the bridge alike.
+            let bridge = Bridge::connect(&agent, me, token(&unknown), timing).unwrap();
+            let mut client = Client::start(bridge);
+            for id in 1..=4 {
+                assert_eq!(client.call(id, "ping", json!({})), refused(json!(id)));
+            }
+            client.finish().unwrap();
+        })
+        .await
+        .unwrap();
+        gw.stop().await.0.unwrap();
+    }
 }
 
 /// A credential bound to a uid it cannot protect against, planted after

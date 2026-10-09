@@ -116,6 +116,20 @@ fn main() {
 #[tracing::instrument(skip(out), fields(request_id = %next_request_id()))]
 fn run(out: &Output) -> Result<()> {
     let cli = Cli::parse();
+    // The bridge needs neither the vault nor the configuration, and may run
+    // where neither exists.
+    #[cfg(target_os = "linux")]
+    if let Commands::Agent {
+        command:
+            AgentCommands::Connect {
+                token_file,
+                socket,
+                gateway_user,
+            },
+    } = &cli.command
+    {
+        return commands::agent::cmd_agent_connect(token_file, socket, gateway_user);
+    }
     let cfg = Config::load()?;
 
     if cli.no_mlock {
@@ -259,6 +273,12 @@ fn dispatch_agent(
             max_amount_sats,
             allow_address,
         ),
+        #[cfg(target_os = "linux")]
+        AgentCommands::Connect {
+            token_file,
+            socket,
+            gateway_user,
+        } => commands::agent::cmd_agent_connect(&token_file, &socket, &gateway_user),
     }
 }
 

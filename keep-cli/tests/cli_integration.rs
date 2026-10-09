@@ -2442,3 +2442,65 @@ fn test_wallet_sign_local_spends_the_groups_addresses() {
     assert!(!output_contains(&out, "same scripts on mainnet"));
     assert_eq!(signed_key_path_inputs(&read_psbt(&signed)), vec![0, 1]);
 }
+
+/// `keep agent connect` refuses a vault secret in its environment and a token
+/// file others can read, and never prints the token. It needs no vault, home
+/// or configuration to get that far.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_agent_connect_refuses_before_sending_anything() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token");
+    let secret = format!("keep_agt_{}", "a".repeat(64));
+    std::fs::write(&token, format!("{secret}\n")).unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let socket = dir.path().join("missing").join("agent.sock");
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").unwrap().uid()
+    };
+    let connect = |cmd: &mut Command| {
+        cmd.args(["agent", "connect", "--token-file"])
+            .arg(&token)
+            .arg("--socket")
+            .arg(&socket)
+            .args(["--gateway-user", &me.to_string()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let refused = |output: &Output, why: &str| {
+        assert_failure(output);
+        assert!(output_contains(output, why), "{why}: {output:?}");
+        assert!(!output_contains(output, &secret), "the token was printed");
+        assert!(
+            !output_contains(output, TEST_PASSWORD),
+            "the password was printed"
+        );
+    };
+
+    // KeepCmd sets KEEP_PASSWORD.
+    let output = KeepCmd::new(&keep)
+        .args(["agent", "connect", "--token-file"])
+        .args([&token])
+        .run();
+    refused(&output, "refusing to run with KEEP_PASSWORD");
+
+    let mut bare = Command::new(&keep);
+    bare.env_clear();
+    let output = connect(&mut bare);
+    if me == 0 {
+        refused(&output, "root can hold no gateway credential");
+        return;
+    }
+    refused(&output, "readable by its owner alone");
+
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut bare = Command::new(&keep);
+    bare.env_clear();
+    let output = connect(&mut bare);
+    refused(&output, "connect to the gateway");
+}

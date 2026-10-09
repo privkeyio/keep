@@ -135,6 +135,40 @@ pub fn cmd_agent_mcp(
     Ok(())
 }
 
+/// `keep agent connect`: bridge an MCP client on stdio to the gateway.
+#[cfg(target_os = "linux")]
+pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -> Result<()> {
+    use keep_agent::gateway::bridge::{self, Bridge, Timing, Token};
+    use keep_agent::gateway::daemon;
+
+    if let Some(var) = bridge::vault_secret_var(|v| std::env::var_os(v).is_some()) {
+        return Err(KeepError::InvalidInput(format!(
+            "refusing to run with {var} set: the agent can read this environment. Remove it \
+             from the MCP client's configuration; the bridge needs only its token file"
+        )));
+    }
+    let euid = daemon::euid();
+    if euid == 0 {
+        return Err(KeepError::InvalidInput(
+            "run the bridge as the agent's user; root can hold no gateway credential".into(),
+        ));
+    }
+    let runtime = |e: keep_agent::error::AgentError| KeepError::Runtime(e.to_string());
+    // No core dump may hold the token.
+    daemon::harden().map_err(runtime)?;
+    let token = Token::read(token_file, euid).map_err(runtime)?;
+    let gateway_uid = super::gateway::gateway_uid(gateway_user)?;
+    let mut bridge = Bridge::connect(socket, gateway_uid, token, Timing::default())
+        .map_err(|e| KeepError::Runtime(format!("connect to the gateway: {e}")))?;
+    eprintln!(
+        "keep agent connect: connected to the gateway at {}",
+        socket.display()
+    );
+    bridge
+        .serve(std::io::stdin().lock(), std::io::stdout().lock())
+        .map_err(runtime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

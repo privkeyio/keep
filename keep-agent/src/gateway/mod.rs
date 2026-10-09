@@ -9,6 +9,8 @@
 mod audit;
 mod credential;
 #[cfg(all(feature = "mcp", target_os = "linux"))]
+pub mod bridge;
+#[cfg(all(feature = "mcp", target_os = "linux"))]
 pub mod daemon;
 
 pub use audit::{

@@ -265,7 +265,7 @@ impl From<KeepError> for AdminFailure {
 
 /// The uid of the gateway's user, given by name or number. Names are looked
 /// up in /etc/passwd, where a system user such as `keep` is defined.
-fn gateway_uid(user: &str) -> Result<u32> {
+pub(crate) fn gateway_uid(user: &str) -> Result<u32> {
     if let Ok(uid) = user.parse() {
         return Ok(uid);
     }
