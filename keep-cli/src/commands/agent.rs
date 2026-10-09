@@ -141,6 +141,20 @@ pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -
     use keep_agent::gateway::bridge::{self, Bridge, Timing, Token};
     use keep_agent::gateway::daemon;
 
+    if [
+        token_file.as_os_str(),
+        socket.as_os_str(),
+        gateway_user.as_ref(),
+    ]
+    .into_iter()
+    .any(bridge::looks_like_token)
+    {
+        return Err(KeepError::InvalidInput(
+            "an argument holds an agent token; put the token in a file readable by its owner \
+             alone and pass that file's path with --token-file"
+                .into(),
+        ));
+    }
     if let Some(var) = bridge::vault_secret_var(|v| std::env::var_os(v).is_some()) {
         return Err(KeepError::InvalidInput(format!(
             "refusing to run with {var} set: the agent can read this environment. Remove it \

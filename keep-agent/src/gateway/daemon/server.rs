@@ -710,8 +710,10 @@ mod tests {
     fn a_client_connect_is_bounded_and_says_why_it_failed() {
         use super::{connect_verified, ConnectError};
         use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+        use std::os::unix::fs::PermissionsExt;
         use std::time::{Duration, Instant};
         let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let me = rustix::process::geteuid().as_raw();
         let path = dir.path().join("s");
         let absent = |r: Result<_, ConnectError>| matches!(r, Err(ConnectError::Absent(_)));

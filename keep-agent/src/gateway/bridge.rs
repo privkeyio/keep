@@ -59,22 +59,34 @@ pub const MAX_ANSWER: usize = 64 * 1024 * 1024;
 /// The largest token file read. A token is 73 bytes.
 const MAX_TOKEN_FILE: usize = 256;
 
-/// Variables that hold vault secrets. An agent can read its own environment,
-/// so a bridge started with any of them set has handed the agent what the
-/// gateway exists to keep from it.
-pub const VAULT_SECRET_VARS: [&str; 7] = [
+/// Variables that hold vault secrets or name the files holding them. An agent
+/// can read its own environment, so a bridge started with any of them set has
+/// handed the agent what the gateway exists to keep from it.
+pub const VAULT_SECRET_VARS: [&str; 12] = [
     "KEEP_PASSWORD",
+    "KEEP_PASSWORD_FILE",
     "KEEP_NEW_PASSWORD",
     "KEEP_HIDDEN_PASSWORD",
     "KEEP_DURESS_PASSWORD",
     "KEEP_NSEC",
     "KEEP_STORAGE_KEY",
+    "KEEP_STORAGE_KEY_FILE",
     "KEEP_WEB_AUTH_TOKEN",
+    "KEEP_WEB_AUTH_TOKEN_FILE",
+    "KEEP_STATE_IDENTITY",
+    "KEEP_STATE_IDENTITY_FILE",
 ];
 
 /// The first vault secret variable `is_set` reports, if any.
 pub fn vault_secret_var(is_set: impl Fn(&str) -> bool) -> Option<&'static str> {
     VAULT_SECRET_VARS.into_iter().find(|v| is_set(v))
+}
+
+/// Whether a command-line argument holds an agent token, which must then not
+/// be opened, looked up or repeated in an error.
+pub fn looks_like_token(arg: &std::ffi::OsStr) -> bool {
+    arg.to_string_lossy()
+        .contains(keep_core::agent::TOKEN_PREFIX)
 }
 
 /// An agent token, wiped when dropped and never printed.
@@ -91,19 +103,18 @@ impl Token {
     /// `owner` and closed to everyone else. The checks are made on the file
     /// opened, so it cannot be swapped between check and read.
     pub fn read(path: &Path, owner: u32) -> Result<Self> {
-        // A token given in place of the path is not repeated in errors.
-        let shown = if path
-            .to_string_lossy()
-            .contains(keep_core::agent::TOKEN_PREFIX)
-        {
-            "(not shown: the path looks like a token; pass the path of the file holding it)"
-                .to_string()
-        } else {
-            path.display().to_string()
-        };
-        let fail = |m: String| AgentError::Other(format!("token file {shown}: {m}"));
-        // Non-blocking, so a FIFO put in its place cannot hang the open.
-        let flags = rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY;
+        if looks_like_token(path.as_os_str()) {
+            return Err(AgentError::Other(
+                "the token file path looks like a token; pass the path of the file holding it"
+                    .into(),
+            ));
+        }
+        let fail = |m: String| AgentError::Other(format!("token file {}: {m}", path.display()));
+        // Non-blocking, so a FIFO put in its place cannot hang the open, and
+        // never through a symlink.
+        let flags = rustix::fs::OFlags::NONBLOCK
+            | rustix::fs::OFlags::NOCTTY
+            | rustix::fs::OFlags::NOFOLLOW;
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(flags.bits() as i32)
@@ -597,10 +608,20 @@ mod tests {
         let err = read_err(&token_file(dir.path(), TOKEN, 0o600), me() + 1);
         assert!(err.contains("is owned by uid"), "{err}");
         assert!(read_err(&dir.path().join("missing"), me()).contains("missing"));
-        // The token itself given as the path is not repeated.
-        let err = read_err(Path::new(TOKEN), me());
-        assert!(err.contains("not shown"), "{err}");
-        assert!(!err.contains("0123456789abcdef"), "{err}");
+        // The token itself given as the path is neither opened nor
+        // repeated, even when a file by that name holds a token.
+        let named = dir.path().join(TOKEN);
+        std::fs::write(&named, TOKEN).unwrap();
+        std::fs::set_permissions(&named, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for path in [Path::new(TOKEN), named.as_path()] {
+            let err = read_err(path, me());
+            assert!(err.contains("looks like a token"), "{err}");
+            assert!(!err.contains("0123456789abcdef"), "{err}");
+        }
+        // A symlink is refused, even to a good token file.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(token_file(dir.path(), TOKEN, 0o600), &link).unwrap();
+        assert!(Token::read(&link, me()).is_err());
         assert!(read_err(dir.path(), me()).contains("not a regular file"));
 
         // A FIFO is refused without waiting for a writer.
@@ -840,7 +861,10 @@ pub(crate) mod testing {
     impl Fake {
         /// A directory for a gateway that is not listening yet.
         pub(crate) fn empty() -> Self {
+            use std::os::unix::fs::PermissionsExt;
             let dir = tempfile::tempdir().unwrap();
+            // Writable by its owner alone, whatever the umask.
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
             let path = dir.path().join("agent.sock");
             Self {
                 dir,
@@ -973,6 +997,29 @@ mod socket_tests {
             .as_str()
             .unwrap()
             .contains("may have been carried out"));
+        assert_eq!(client.call(2, "ping", json!({}))["result"], json!({}));
+        client.finish().unwrap();
+        assert_eq!(fake.ids(), [(0, json!(1)), (1, json!(2))]);
+    }
+
+    /// A request still unanswered when the answer timeout passes may be
+    /// being signed: it is reported, never sent again.
+    #[test]
+    fn a_request_answered_too_late_is_never_sent_again() {
+        let fake = Fake::start(|mut peer| {
+            if peer.index != 0 {
+                return peer.serve();
+            }
+            peer.next();
+            std::thread::sleep(Duration::from_millis(600));
+        });
+        let timing = Timing {
+            answer_timeout: Duration::from_millis(200),
+            ..patient()
+        };
+        let mut client = Client::start(bridge(&fake, timing));
+        let lost = client.call(1, "tools/call", json!({ "name": "sign_nostr_event" }));
+        assert_eq!(code(&lost), Some(LOST), "{lost}");
         assert_eq!(client.call(2, "ping", json!({}))["result"], json!({}));
         client.finish().unwrap();
         assert_eq!(fake.ids(), [(0, json!(1)), (1, json!(2))]);

@@ -2494,17 +2494,43 @@ fn test_agent_connect_refuses_before_sending_anything() {
         .run();
     refused(&output, "refusing to run with KEEP_PASSWORD");
     for var in [
+        "KEEP_PASSWORD_FILE",
         "KEEP_NEW_PASSWORD",
         "KEEP_HIDDEN_PASSWORD",
         "KEEP_DURESS_PASSWORD",
         "KEEP_NSEC",
         "KEEP_STORAGE_KEY",
+        "KEEP_STORAGE_KEY_FILE",
         "KEEP_WEB_AUTH_TOKEN",
+        "KEEP_WEB_AUTH_TOKEN_FILE",
+        "KEEP_STATE_IDENTITY",
+        "KEEP_STATE_IDENTITY_FILE",
     ] {
         let mut cmd = Command::new(&keep);
         cmd.env_clear().env(var, TEST_PASSWORD);
         refused(&connect(&mut cmd), &format!("refusing to run with {var}"));
     }
+
+    // A token pasted into an argument is refused and not repeated.
+    for pasted in [&secret, &format!("/home/agent/{secret}")] {
+        let mut bare = Command::new(&keep);
+        bare.env_clear();
+        refused(
+            &bridge(&mut bare, Path::new(pasted), me),
+            "an argument holds an agent token",
+        );
+    }
+    let mut bare = Command::new(&keep);
+    bare.env_clear()
+        .args([
+            "agent",
+            "connect",
+            "--gateway-user",
+            &secret,
+            "--token-file",
+        ])
+        .arg(&token);
+    refused(&bare.output().unwrap(), "an argument holds an agent token");
 
     let mut bare = Command::new(&keep);
     bare.env_clear();

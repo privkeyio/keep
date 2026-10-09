@@ -582,6 +582,15 @@ chmod 0644 "$WORK/late.json"
 mcp "$A1" "$WORK/late.json" "${CONNECT[@]}" "$WORK/a1/token" >"$WORK/bridge-late" &
 LATE_CLIENT=$!
 wait_file "$SYNC-late"
+# Both bridges are waiting, and neither can be read by the agent's own user.
+BRIDGES=$(pgrep -u "$A1" -f -- "^$KEEP agent connect" || true)
+[[ $(wc -w <<<"$BRIDGES") == 2 ]] || fail "expected two bridges running as $A1: $BRIDGES"
+for pid in $BRIDGES; do
+    if as "$A1" cat "/proc/$pid/environ" >/dev/null 2>&1; then
+        fail "a bridge's environment is readable by its own user"
+    fi
+done
+pass "bridges run as the agent's user and are not dumpable"
 [[ ! -e $AGENT_SOCK && ! -e $ADMIN_SOCK ]] || fail "sockets left behind"
 pass "SIGTERM stops the gateway cleanly"
 start_gateway

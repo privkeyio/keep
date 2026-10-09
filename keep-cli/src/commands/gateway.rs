@@ -340,7 +340,8 @@ fn admin_answer(
     // The gateway turns a uid it does not admit away unread.
     let closed = || {
         KeepError::Runtime(
-            "the gateway closed the admin connection: run as root or the gateway's admin uid"
+            "the gateway closed the admin connection unread: run as root or the gateway's admin \
+             uid, or retry if it is already serving as many admin connections as it allows"
                 .into(),
         )
     };
