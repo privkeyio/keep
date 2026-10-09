@@ -4,7 +4,7 @@
 //! `keep gateway`: run the agent gateway, and manage it over its admin socket.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,16 +98,13 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             let ttl_secs = ttl_days
                 .checked_mul(24 * 60 * 60)
                 .ok_or_else(|| KeepError::InvalidInput("--ttl-days is too large".into()))?;
-            // Refuse an existing token file before anything is issued.
-            if let Some(file) = &token_out {
-                if std::fs::symlink_metadata(file).is_ok() {
-                    return Err(KeepError::InvalidInput(format!(
-                        "{} already exists",
-                        file.display()
-                    )));
-                }
-            }
-            let mut result = admin(
+            // The token file is created before anything is issued, so a token
+            // is never issued with nowhere to go.
+            let mut token_file = match &token_out {
+                Some(file) => Some(create_token_file(file)?),
+                None => None,
+            };
+            let answer = admin_answer(
                 &admin_socket,
                 json!({
                     "op": "issue",
@@ -116,24 +113,45 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     "grant": grant,
                     "ttl_secs": ttl_secs,
                 }),
-            )?;
-            let token = Zeroizing::new(
-                result
-                    .as_object_mut()
-                    .and_then(|o| o.remove("token"))
-                    .and_then(|t| t.as_str().map(str::to_string))
-                    .ok_or_else(|| KeepError::Other("the gateway returned no token".into()))?,
             );
+            let (result, token) = match answer.and_then(|a| {
+                let token = a
+                    .token
+                    .ok_or_else(|| KeepError::Other("the gateway returned no token".into()))?;
+                Ok((a.result, token))
+            }) {
+                Ok(issued) => issued,
+                Err(e) => {
+                    if let Some(file) = &token_out {
+                        let _ = std::fs::remove_file(file);
+                    }
+                    return Err(e);
+                }
+            };
             print(&result)?;
-            match token_out {
-                Some(file) => {
-                    write_token(&file, &token)?;
+            match (token_out, token_file.take()) {
+                (Some(path), Some(mut file)) => {
+                    if let Err(e) = write_token(&mut file, &token) {
+                        // Never leave a live credential whose token was lost.
+                        let id = result["id"].as_str().unwrap_or_default().to_string();
+                        let revoked = admin(&admin_socket, json!({ "op": "revoke", "id": id }));
+                        let _ = std::fs::remove_file(&path);
+                        return Err(KeepError::Runtime(format!(
+                            "the token could not be written to {} ({e}); the credential {}",
+                            path.display(),
+                            if revoked.is_ok() {
+                                "was revoked"
+                            } else {
+                                "could NOT be revoked: revoke it now"
+                            }
+                        )));
+                    }
                     out.success(&format!(
                         "Token written to {}. Give it to the agent's user; it is not shown again.",
-                        file.display()
+                        path.display()
                     ));
                 }
-                None => {
+                _ => {
                     out.warn("The token is shown once. Store it where only the agent's user can read it.");
                     println!("{}", token.as_str());
                 }
@@ -193,10 +211,6 @@ fn serve(out: &Output, config: Config) -> Result<()> {
     // Before the vault is unlocked: no core dump or same-uid debugger may
     // read the process from here on.
     daemon::harden().map_err(|e| KeepError::Runtime(e.to_string()))?;
-    let stop = Arc::new(tokio::sync::Notify::new());
-    if crate::GRACEFUL_STOP.set(stop.clone()).is_err() {
-        return Err(KeepError::Runtime("a stop handler is already set".into()));
-    }
     let mut keep = Keep::open(&config.vault)?;
     let password = get_password("Enter password")?;
     let spinner = out.spinner("Unlocking vault...");
@@ -207,6 +221,12 @@ fn serve(out: &Output, config: Config) -> Result<()> {
         .enable_all()
         .build()
         .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    // Only now does a signal stop the gateway cleanly; before, it exits at
+    // once, as for any command.
+    let stop = Arc::new(tokio::sync::Notify::new());
+    if crate::GRACEFUL_STOP.set(stop.clone()).is_err() {
+        return Err(KeepError::Runtime("a stop handler is already set".into()));
+    }
     runtime
         .block_on(daemon::run(keep, config, async move {
             stop.notified().await;
@@ -215,14 +235,29 @@ fn serve(out: &Output, config: Config) -> Result<()> {
         .map_err(|e| KeepError::Runtime(e.to_string()))
 }
 
+/// The gateway's answer to an admin request. The token of an issued
+/// credential comes beside the result, read straight into a buffer that is
+/// wiped.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminAnswer {
+    ok: bool,
+    #[serde(default)]
+    result: Value,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    token: Option<Zeroizing<String>>,
+}
+
 /// Send one request to the admin socket and return its result.
 fn admin(socket: &Path, request: Value) -> Result<Value> {
-    let stream = std::os::unix::net::UnixStream::connect(socket).map_err(|e| {
-        KeepError::Runtime(format!(
-            "connect to the gateway's admin socket {}: {e}",
-            socket.display()
-        ))
-    })?;
+    admin_answer(socket, request).map(|a| a.result)
+}
+
+fn admin_answer(socket: &Path, request: Value) -> Result<AdminAnswer> {
+    let stream = daemon::server::connect_checked(socket)
+        .map_err(|e| KeepError::Runtime(format!("connect to the gateway's admin socket: {e}")))?;
     let io = |e: std::io::Error| KeepError::Runtime(format!("admin socket: {e}"));
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
@@ -234,7 +269,8 @@ fn admin(socket: &Path, request: Value) -> Result<Value> {
     writer
         .write_all(format!("{request}\n").as_bytes())
         .map_err(io)?;
-    let mut line = Zeroizing::new(String::new());
+    // Sized so an answer carrying a token never reallocates.
+    let mut line = Zeroizing::new(String::with_capacity(64 * 1024));
     BufReader::new(&stream).read_line(&mut line).map_err(io)?;
     if line.is_empty() {
         return Err(KeepError::Runtime(
@@ -242,17 +278,14 @@ fn admin(socket: &Path, request: Value) -> Result<Value> {
                 .into(),
         ));
     }
-    let answer: Value = serde_json::from_str(&line)
+    let answer: AdminAnswer = serde_json::from_str(&line)
         .map_err(|e| KeepError::Runtime(format!("unexpected admin answer: {e}")))?;
-    if answer["ok"] == json!(true) {
-        Ok(answer["result"].clone())
+    if answer.ok {
+        Ok(answer)
     } else {
-        Err(KeepError::Runtime(
-            answer["error"]
-                .as_str()
-                .unwrap_or("the gateway refused the request")
-                .to_string(),
-        ))
+        Err(KeepError::Runtime(answer.error.unwrap_or_else(|| {
+            "the gateway refused the request".into()
+        })))
     }
 }
 
@@ -262,17 +295,23 @@ fn print(value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn write_token(file: &PathBuf, token: &str) -> Result<()> {
+/// Create the token file, new and readable by its owner alone.
+fn create_token_file(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(file)
-        .map_err(|e| KeepError::Runtime(format!("create {}: {e}", file.display())))?;
-    f.write_all(format!("{token}\n").as_bytes())
-        .and_then(|()| f.sync_all())
-        .map_err(|e| KeepError::Runtime(format!("write {}: {e}", file.display())))
+        .open(path)
+        .map_err(|e| KeepError::Runtime(format!("create {}: {e}", path.display())))
+}
+
+fn write_token(file: &mut std::fs::File, token: &str) -> std::io::Result<()> {
+    let mut line = Zeroizing::new(String::with_capacity(token.len() + 1));
+    line.push_str(token);
+    line.push('\n');
+    file.write_all(line.as_bytes())?;
+    file.sync_all()
 }
 
 struct GrantArgs {

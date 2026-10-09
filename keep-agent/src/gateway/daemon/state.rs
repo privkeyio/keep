@@ -171,8 +171,12 @@ enum Refusal {
     /// The request is malformed: a JSON-RPC error with `code`.
     Invalid { code: i64, message: String },
     /// The policy denied it, or it needs an approval: a tool error the agent
-    /// may read.
-    Policy { kind: RefusalKind, message: String },
+    /// may read, and the fuller detail the audit log keeps.
+    Policy {
+        kind: RefusalKind,
+        message: String,
+        detail: String,
+    },
     /// The gateway could not serve it (the vault or the audit log failed).
     Internal(String),
 }
@@ -186,9 +190,24 @@ impl Refusal {
     }
 
     fn denied(reason: impl std::fmt::Display) -> Self {
+        let message = format!("denied: {reason}");
         Self::Policy {
             kind: RefusalKind::Denied,
-            message: format!("denied: {reason}"),
+            detail: message.clone(),
+            message,
+        }
+    }
+
+    /// A policy denial. What the wallet has spent across every credential is
+    /// kept from the agent, which may know only its own spends.
+    fn deny(reason: DenyReason) -> Self {
+        match reason {
+            DenyReason::WalletBudgetExceeded { .. } => Self::Policy {
+                kind: RefusalKind::Denied,
+                message: "denied: this spend would exceed the wallet's budget".into(),
+                detail: format!("denied: {reason}"),
+            },
+            reason => Self::denied(reason),
         }
     }
 }
@@ -213,7 +232,25 @@ pub struct State {
     /// Set once the gateway has written out its state to stop: nothing more is
     /// served, so nothing is left unwritten.
     closed: bool,
+    /// Refused tokens that matched a credential, recorded on the next tick
+    /// rather than before the answer, so how long a refusal takes never tells
+    /// whoever presented a token whether it is real.
+    deferred: Vec<Deferred>,
+    /// Deferred refusals dropped because the queue was full, since the last
+    /// tick.
+    dropped: u64,
 }
+
+/// A refusal to record against the credential a token matched.
+struct Deferred {
+    credential: [u8; 16],
+    detail: String,
+    at: u64,
+}
+
+/// Deferred refusals held between ticks at most. Requests are rate limited
+/// per uid well below this.
+const MAX_DEFERRED: usize = 4_096;
 
 impl State {
     /// Take over an unlocked vault: check it can be served safely, then start
@@ -275,7 +312,9 @@ impl State {
         }
         let pubkeys: Vec<[u8; 32]> = keep.keyring().list().map(|s| s.pubkey).collect();
         for pubkey in &pubkeys {
-            floor = floor.max(ledger_last_seen(&keep, &wallet_key(pubkey)));
+            for network in NETWORKS {
+                floor = floor.max(ledger_last_seen(&keep, &wallet_key(pubkey, network)));
+            }
         }
         let heartbeat = match keep.load_agent_ledger(HEARTBEAT_KEY)? {
             None => None,
@@ -314,6 +353,8 @@ impl State {
             credential_counts: Counters::new(MAX_TRACKED_CREDENTIALS),
             journal: HashMap::new(),
             closed: false,
+            deferred: Vec::new(),
+            dropped: 0,
         };
         state.persist_heartbeat()?;
         tracing::info!(clock = start, frozen, "agent gateway state ready");
@@ -338,8 +379,10 @@ impl State {
         Ok(())
     }
 
-    /// Write out refusal counts whose window has passed.
+    /// Record the refusals deferred since the last tick, then write out
+    /// refusal counts whose window has passed.
     pub fn tick(&mut self) {
+        self.record_deferred();
         let now = self.clock.now();
         if let Err(e) = self.audit.flush_expired(&mut self.keep, now) {
             tracing::error!(error = %e, "agent refusal counts could not be written");
@@ -350,12 +393,46 @@ impl State {
     /// more.
     pub fn shut_down(&mut self) {
         self.closed = true;
+        self.record_deferred();
         let now = self.clock.now();
         if let Err(e) = self.audit.flush_all(&mut self.keep, now) {
             tracing::error!(error = %e, "agent refusal counts could not be written");
         }
         if let Err(e) = self.persist_heartbeat() {
             tracing::error!(error = %e, "the gateway clock could not be persisted");
+        }
+    }
+
+    fn defer_refusal(&mut self, credential: [u8; 16], detail: String, at: u64) {
+        if self.deferred.len() >= MAX_DEFERRED {
+            self.dropped += 1;
+            return;
+        }
+        self.deferred.push(Deferred {
+            credential,
+            detail,
+            at,
+        });
+    }
+
+    fn record_deferred(&mut self) {
+        for d in std::mem::take(&mut self.deferred) {
+            if let Err(e) = self.audit.record_refusal(
+                &mut self.keep,
+                &d.credential,
+                RefusalKind::Unauthenticated,
+                &d.detail,
+                d.at,
+            ) {
+                tracing::error!(error = %e, "agent refusal could not be recorded");
+            }
+        }
+        if self.dropped > 0 {
+            tracing::error!(
+                dropped = self.dropped,
+                "refused agent tokens went unrecorded: too many between ticks"
+            );
+            self.dropped = 0;
         }
     }
 
@@ -400,12 +477,22 @@ impl State {
                 authenticated: false,
             },
         };
-        if forbidden_uid(&self.host, &self.settings, peer_uid) || !bindable_uid(peer_uid) {
-            self.journal_refusal(peer_uid, now, "uid may not hold a credential");
-            return refused(id);
-        }
+        // A uid no credential may be bound to is refused whatever it presents,
+        // but its token is still matched, so a real one is recorded against
+        // its credential as the theft signal it is.
+        let forbidden =
+            forbidden_uid(&self.host, &self.settings, peer_uid) || !bindable_uid(peer_uid);
         let granted = match authenticate(&self.keep, &token, peer_uid, now) {
-            Ok(Ok(granted)) => granted,
+            Ok(Ok(granted)) if !forbidden => granted,
+            Ok(Ok(granted)) => {
+                drop(token);
+                self.defer_refusal(
+                    granted.credential.id,
+                    format!("presented by uid {peer_uid}, which may hold no credential"),
+                    now,
+                );
+                return refused(id);
+            }
             Ok(Err(refusal)) => {
                 drop(token);
                 match refusal.credential {
@@ -417,17 +504,12 @@ impl State {
                             RefusedBecause::Credential(reason) => reason.to_string(),
                             RefusedBecause::Grant => "grant does not load".into(),
                         };
-                        if let Err(e) = self.audit.record_refusal(
-                            &mut self.keep,
-                            &cid,
-                            RefusalKind::Unauthenticated,
-                            &detail,
-                            now,
-                        ) {
-                            tracing::error!(error = %e, "agent refusal could not be recorded");
-                        }
+                        self.defer_refusal(cid, detail, now);
                     }
                     None => self.journal_refusal(peer_uid, now, "unknown token"),
+                }
+                if forbidden {
+                    self.journal_refusal(peer_uid, now, "uid may not hold a credential");
                 }
                 return refused(id);
             }
@@ -450,36 +532,58 @@ impl State {
     ) -> Option<Zeroizing<String>> {
         let cid = granted.credential.id;
         if let Err(window) = self.credential_counts.hit(cid, &granted.grant.limits, now) {
-            let detail = format!("over its per-{window} limit");
+            let detail = if window == "tracker" {
+                "the gateway is tracking too many credentials".to_string()
+            } else {
+                format!("over its per-{window} limit")
+            };
             self.record_refusal(&cid, RefusalKind::RateLimited, &detail, now);
             return id.map(|id| rpc_error(id, -32002, &format!("rate limited: {detail}")));
         }
         let method = message.get("method").and_then(Value::as_str);
-        let (Some(id), Some(method)) = (id, method) else {
-            // A notification, which gets no answer, or no method at all.
-            if method.is_none() {
+        let id = match (id, method) {
+            (Some(id), Some(_)) => id,
+            // A notification, which is never answered or acted on.
+            (None, Some(_)) => return None,
+            (id, None) => {
                 self.record_refusal(&cid, RefusalKind::Invalid, "no method", now);
+                return id.map(|id| rpc_error(id, -32600, "invalid request"));
             }
-            return None;
         };
+        let method = method.unwrap_or_default();
         if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             self.record_refusal(&cid, RefusalKind::Invalid, "not JSON-RPC 2.0", now);
             return Some(rpc_error(id, -32600, "invalid request"));
         }
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         match method {
-            "initialize" | "ping" | "tools/list" => {
+            "ping" => {
+                // Returns nothing, so it is only checked against the budget.
                 if let Err(e) = self.audit.admit(&mut self.keep, &cid, now) {
                     return Some(rpc_error(id, -32603, &e.to_string()));
                 }
-                let result = match method {
-                    "initialize" => json!({
+                Some(rpc_result(id, json!({})))
+            }
+            "initialize" | "tools/list" => {
+                if let Err(e) = self
+                    .audit
+                    .record_served(&mut self.keep, &cid, method, None, now)
+                {
+                    tracing::error!(error = %e, "agent handshake could not be recorded");
+                    return Some(rpc_error(
+                        id,
+                        -32603,
+                        "the gateway could not complete the request",
+                    ));
+                }
+                let result = if method == "initialize" {
+                    json!({
                         "protocolVersion": "2024-11-05",
                         "capabilities": { "tools": {} },
                         "serverInfo": { "name": "keep-gateway", "version": env!("CARGO_PKG_VERSION") }
-                    }),
-                    "ping" => json!({}),
-                    _ => json!({ "tools": tools::list(&granted.grant) }),
+                    })
+                } else {
+                    json!({ "tools": tools::list(&granted.grant) })
                 };
                 Some(rpc_result(id, result))
             }
@@ -541,13 +645,25 @@ impl State {
                 );
                 rpc_error(id, code, &message)
             }
-            Err(Refusal::Policy { kind, message }) => {
-                self.record_refusal(&cid, kind, &format!("{label}: {message}"), now);
+            Err(Refusal::Policy {
+                kind,
+                message,
+                detail,
+            }) => {
+                self.record_refusal(&cid, kind, &format!("{label}: {detail}"), now);
                 tool_result(id, &Value::String(message), true)
             }
             Err(Refusal::Internal(message)) => {
+                // The detail stays with the owner; the agent learns only that
+                // the request failed.
                 tracing::error!(tool = label, error = %message, "agent request failed");
-                rpc_error(id, -32603, &message)
+                self.record_refusal(
+                    &cid,
+                    RefusalKind::Failed,
+                    &format!("{label}: {message}"),
+                    now,
+                );
+                rpc_error(id, -32603, "the gateway could not complete the request")
             }
         }
     }
@@ -563,7 +679,7 @@ impl State {
         };
         match evaluate(grant, key, request, &mut budgets, now) {
             Decision::Allow => Ok(Value::Null),
-            Decision::Deny(reason) => Err(Refusal::denied(reason)),
+            Decision::Deny(reason) => Err(Refusal::deny(reason)),
             Decision::RequireApproval(reason) => Err(needs_approval(reason)),
             Decision::Spend(_) => Err(Refusal::Internal(
                 "a request that spends nothing reserved a spend".into(),
@@ -715,7 +831,7 @@ impl State {
         let request = Request::SignPsbt {
             analysis: &analysis,
         };
-        let wallet = wallet_key(&key);
+        let wallet = wallet_key(&key, network);
         let wallet_window_sats = self.settings.wallet_budget_sats;
         let mut decision = None;
         // Evaluate and reserve in one durable transaction with both ledgers.
@@ -735,7 +851,7 @@ impl State {
         let reservation = match decision {
             Some(Decision::Allow) => None,
             Some(Decision::Spend(reservation)) => Some(reservation),
-            Some(Decision::Deny(reason)) => return Err(Refusal::denied(reason)),
+            Some(Decision::Deny(reason)) => return Err(Refusal::deny(reason)),
             Some(Decision::RequireApproval(reason)) => return Err(needs_approval(reason)),
             None => return Err(Refusal::Internal("no decision".into())),
         };
@@ -819,13 +935,70 @@ impl State {
     pub fn admin_request(&mut self, request: &[u8]) -> Zeroizing<String> {
         let answer = match serde_json::from_slice::<AdminRequest>(request) {
             _ if self.closed => Err(AgentError::Other("the gateway is stopping".into())),
-            Ok(request) => self.admin(request),
+            Ok(AdminRequest::Issue {
+                name,
+                uid,
+                grant,
+                ttl_secs,
+            }) => self.issue(&name, uid, grant, ttl_secs),
+            Ok(request) => self
+                .admin(request)
+                .map(|result| line(&json!({ "ok": true, "result": result }))),
             Err(e) => Err(AgentError::Other(format!("invalid admin request: {e}"))),
         };
-        match answer {
-            Ok(result) => line(&json!({ "ok": true, "result": result })),
-            Err(e) => line(&json!({ "ok": false, "error": e.to_string() })),
+        answer.unwrap_or_else(|e| line(&json!({ "ok": false, "error": e.to_string() })))
+    }
+
+    /// Issue a credential. The answer is the one line that carries its token,
+    /// written straight into a buffer that is wiped, with the token beside
+    /// the credential rather than inside a JSON value that would be freed
+    /// unwiped.
+    fn issue(
+        &mut self,
+        name: &str,
+        uid: u32,
+        grant: Value,
+        ttl_secs: Option<u64>,
+    ) -> Result<Zeroizing<String>> {
+        let now = self.clock.now();
+        if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
+            return Err(AgentError::ScopeViolation(format!(
+                "uid {uid} is root, the gateway's, the vault owner's, the admin's or the \
+                 overflow uid; a credential bound to it would stop nothing"
+            )));
         }
+        let grant: Grant = serde_json::from_value(grant)
+            .map_err(|e| AgentError::ScopeViolation(format!("invalid grant: {e}")))?;
+        for key in &grant.keys {
+            match self.keep.keyring().get(key) {
+                Some(slot) if matches!(slot.key_type, KeyType::Nostr | KeyType::Bitcoin) => {}
+                Some(_) => {
+                    return Err(AgentError::ScopeViolation(format!(
+                        "key {} is not a signing key",
+                        hex::encode(key)
+                    )))
+                }
+                None => {
+                    return Err(AgentError::ScopeViolation(format!(
+                        "key {} is not in the vault",
+                        hex::encode(key)
+                    )))
+                }
+            }
+        }
+        let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+        let (issued, token) = issue_credential(&mut self.keep, name, uid, grant, now, ttl)?;
+        let head =
+            json!({ "ok": true, "result": credential_json(&issued.credential, now) }).to_string();
+        // `head` holds no secret; the token goes only into `out`, sized so it
+        // never reallocates. Tokens are lowercase hex behind a fixed prefix,
+        // so they need no escaping.
+        let mut out = Zeroizing::new(String::with_capacity(head.len() + token.len() + 16));
+        out.push_str(&head[..head.len() - 1]);
+        out.push_str(",\"token\":\"");
+        out.push_str(&token);
+        out.push_str("\"}");
+        Ok(out)
     }
 
     fn admin(&mut self, request: AdminRequest) -> Result<Value> {
@@ -849,47 +1022,8 @@ impl State {
                 }
                 Ok(Value::Array(list))
             }
-            AdminRequest::Issue {
-                name,
-                uid,
-                grant,
-                ttl_secs,
-            } => {
-                if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
-                    return Err(AgentError::ScopeViolation(format!(
-                        "uid {uid} is root, the gateway's, the vault owner's, the admin's or the \
-                         overflow uid; a credential bound to it would stop nothing"
-                    )));
-                }
-                let grant: Grant = serde_json::from_value(grant)
-                    .map_err(|e| AgentError::ScopeViolation(format!("invalid grant: {e}")))?;
-                for key in &grant.keys {
-                    match self.keep.keyring().get(key) {
-                        Some(slot)
-                            if matches!(slot.key_type, KeyType::Nostr | KeyType::Bitcoin) => {}
-                        Some(_) => {
-                            return Err(AgentError::ScopeViolation(format!(
-                                "key {} is not a signing key",
-                                hex::encode(key)
-                            )))
-                        }
-                        None => {
-                            return Err(AgentError::ScopeViolation(format!(
-                                "key {} is not in the vault",
-                                hex::encode(key)
-                            )))
-                        }
-                    }
-                }
-                let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
-                let (issued, token) =
-                    issue_credential(&mut self.keep, &name, uid, grant, now, ttl)?;
-                // The clock must not read behind a credential's issue time after a restart.
-                self.persist_heartbeat()?;
-                let mut result = credential_json(&issued.credential, now);
-                result["token"] = Value::String(token.to_string());
-                Ok(result)
-            }
+            // Answered by `Self::issue`, which keeps the token out of values.
+            AdminRequest::Issue { .. } => Err(AgentError::Other("issue is answered apart".into())),
             AdminRequest::Revoke { id } => {
                 let id = parse_id(&id)?;
                 self.keep.revoke_agent_credential(&id)?;
@@ -1019,10 +1153,20 @@ fn ledger_last_seen(keep: &Keep, key: &[u8]) -> u64 {
     }
 }
 
-/// The ledger key of `pubkey`'s wallet: never 16 bytes, so never a
-/// credential's.
-pub fn wallet_key(pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut key = b"wallet".to_vec();
+/// Every network a wallet ledger may be kept for.
+const NETWORKS: [Network; 5] = [
+    Network::Bitcoin,
+    Network::Testnet,
+    Network::Testnet4,
+    Network::Signet,
+    Network::Regtest,
+];
+
+/// The ledger key of `pubkey`'s wallet on `network`. Each network has its own
+/// budget, so spends of test coins never use up the mainnet budget. Never 16
+/// bytes, so never a credential's.
+pub fn wallet_key(pubkey: &[u8; 32], network: Network) -> Vec<u8> {
+    let mut key = format!("wallet:{}:", network.to_core_arg()).into_bytes();
     key.extend_from_slice(pubkey);
     key
 }
@@ -1045,9 +1189,11 @@ fn withheld(e: AgentError) -> Refusal {
 }
 
 fn needs_approval(reason: crate::policy::ApprovalReason) -> Refusal {
+    let message = format!("needs approval, which this gateway cannot obtain yet: {reason}");
     Refusal::Policy {
         kind: RefusalKind::NeedsApproval,
-        message: format!("needs approval, which this gateway cannot obtain yet: {reason}"),
+        detail: message.clone(),
+        message,
     }
 }
 
