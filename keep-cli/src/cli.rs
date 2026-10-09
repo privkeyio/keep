@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "keep")]
@@ -119,6 +119,13 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: AgentCommands,
     },
+    /// The agent gateway: a daemon holding the vault that agents use through
+    /// scoped tokens, and the owner's commands to manage it
+    #[cfg(target_os = "linux")]
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommands,
+    },
     /// FROST wallet descriptors, proposals, and PSBT spend coordination
     Wallet {
         #[command(subcommand)]
@@ -184,6 +191,152 @@ pub(crate) enum Commands {
 #[derive(Subcommand)]
 pub(crate) enum MigrateCommands {
     Status,
+}
+
+/// Where the gateway's agent socket is by default.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_AGENT_SOCKET: &str = "/run/keep-gateway/agent.sock";
+
+/// Where the gateway's admin socket is by default.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_ADMIN_SOCKET: &str = "/run/keep-gateway-admin/admin.sock";
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub(crate) enum GatewayCommands {
+    /// Run the gateway: unlock the vault and serve agents until stopped.
+    /// Runs as its own user, never root; each socket's directory must already
+    /// exist, be owned by that user and be closed to others.
+    Serve {
+        #[arg(long, default_value = DEFAULT_AGENT_SOCKET)]
+        agent_socket: PathBuf,
+        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+        admin_socket: PathBuf,
+        /// The one non-root uid allowed to manage the gateway. No credential
+        /// may be bound to it.
+        #[arg(long)]
+        admin_uid: Option<u32>,
+        /// What all agents together may take out of one key's wallet in any
+        /// 24 hours, fees included. 0 (the default) refuses every spend.
+        #[arg(long, default_value_t = 0)]
+        wallet_budget_sats: u64,
+    },
+    /// Show the running gateway's state
+    Status {
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// List agent credentials (never their tokens)
+    List {
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Issue an agent credential. The token is shown once.
+    Issue(Box<IssueArgs>),
+    /// Revoke an agent credential for good
+    Revoke {
+        id: String,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Delete an agent credential and its spend ledger
+    Delete {
+        id: String,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Freeze one agent credential, or every one with --all
+    Freeze {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Unfreeze one agent credential, or lift the freeze on all with --all
+    Unfreeze {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Show the latest audit log entries
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+}
+
+/// What `keep gateway issue` is given.
+#[cfg(target_os = "linux")]
+#[derive(Args)]
+pub(crate) struct IssueArgs {
+    #[command(flatten)]
+    pub(crate) target: AdminTarget,
+    /// The owner's label for the agent
+    #[arg(long)]
+    pub(crate) name: String,
+    /// The uid the agent runs as; the token is refused from any other
+    #[arg(long)]
+    pub(crate) uid: u32,
+    /// A vault key the agent may use, as hex or npub (repeatable)
+    #[arg(long = "key", required = true)]
+    pub(crate) keys: Vec<String>,
+    /// An operation the agent may request (repeatable): get_public_key,
+    /// sign_nostr_event, get_bitcoin_address, sign_psbt
+    #[arg(long = "op", required = true)]
+    pub(crate) operations: Vec<String>,
+    /// A Nostr event kind the agent may sign (repeatable)
+    #[arg(long = "kind")]
+    pub(crate) kinds: Vec<u16>,
+    /// Bitcoin network for the Bitcoin operations
+    #[arg(long)]
+    pub(crate) network: Option<String>,
+    /// Most one PSBT may take out of the wallet, fee included
+    #[arg(long)]
+    pub(crate) per_psbt_sats: Option<u64>,
+    /// Most the agent may take out of the wallet in any 24 hours
+    #[arg(long)]
+    pub(crate) window_sats: Option<u64>,
+    /// Spends past this within 24 hours need an approval
+    #[arg(long)]
+    pub(crate) approval_above_sats: Option<u64>,
+    /// An address the agent's PSBTs may pay (repeatable); without any,
+    /// every address may be paid
+    #[arg(long = "allow-address")]
+    pub(crate) allow_addresses: Vec<String>,
+    /// Requests the agent may make per minute
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_minute)]
+    pub(crate) per_minute: u32,
+    /// Requests the agent may make per hour
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_hour)]
+    pub(crate) per_hour: u32,
+    /// Requests the agent may make per day
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_day)]
+    pub(crate) per_day: u32,
+    /// Days until the credential expires
+    #[arg(long, default_value_t = keep_agent::gateway::daemon::state::DEFAULT_TTL_SECS / 86_400)]
+    pub(crate) ttl_days: u64,
+    /// Write the token to this new file (mode 0600) instead of stdout
+    #[arg(long)]
+    pub(crate) token_out: Option<PathBuf>,
+}
+
+/// Which gateway an admin command talks to.
+#[cfg(target_os = "linux")]
+#[derive(Args)]
+pub(crate) struct AdminTarget {
+    #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+    pub admin_socket: PathBuf,
+    /// The user the gateway runs as, by name or uid. The admin socket, and the
+    /// directory it is in, must be that user's, or nothing is sent.
+    #[arg(long, default_value = "keep")]
+    pub gateway_user: String,
 }
 
 #[derive(Subcommand)]

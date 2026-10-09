@@ -608,6 +608,14 @@ impl Keep {
         self.storage.agent_credential_ids()
     }
 
+    /// The agent credential with `id`, if any, decoding only that row.
+    pub fn load_agent_credential(
+        &self,
+        id: &[u8; 16],
+    ) -> Result<Option<crate::agent::AgentCredential>> {
+        self.storage.load_agent_credential(id)
+    }
+
     fn agent_credential(&self, id: &[u8; 16]) -> Result<crate::agent::AgentCredential> {
         self.storage
             .load_agent_credential(id)?
@@ -669,6 +677,23 @@ impl Keep {
         Ok(())
     }
 
+    /// Overwrite the vault-wide agent freeze with bytes that do not decrypt,
+    /// for tests of what must fail closed when it cannot be read.
+    #[cfg(feature = "testing")]
+    pub fn corrupt_agent_freeze_for_testing(&self) -> Result<()> {
+        self.storage.put_raw(
+            crate::backend::CONFIG_TABLE,
+            b"agent_freeze",
+            b"not ciphertext",
+        )
+    }
+
+    /// Whether every agent credential is frozen. An `Err` means the flag could
+    /// not be read; the gateway then refuses to serve.
+    pub fn agent_freeze(&self) -> Result<bool> {
+        self.storage.get_agent_freeze()
+    }
+
     /// Check a token presented by `peer_uid` at Unix time `now`.
     ///
     /// Returns the credential if the token is well formed, matches exactly one
@@ -699,6 +724,9 @@ impl Keep {
         let Some(hash) = crate::agent::hash_presented_token(token) else {
             return Ok(Err(unknown));
         };
+        // Read whatever the token matches, so an unknown token costs the same
+        // reads as a real one and how long a refusal takes tells nothing.
+        let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
         let mut found = None;
         let mut matched = 0usize;
         for credential in self.storage.list_agent_credentials()? {
@@ -713,7 +741,6 @@ impl Keep {
             (1, Some(credential)) => credential,
             _ => return Ok(Err(unknown)),
         };
-        let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
         match credential.check_usable(peer_uid, now, all_frozen) {
             Ok(()) => Ok(Ok(credential)),
             Err(reason) => Ok(Err(AgentRefused {
@@ -740,34 +767,54 @@ impl Keep {
     }
 
     /// Records a request by the agent credential `id` that was refused or held
-    /// for an approval. `label` is the gateway's own fixed text (printable
-    /// ASCII, at most 64 bytes); `detail`, which may hold text the agent sent, is
-    /// capped, escaped and quoted so it cannot pose as anything else. Fails when
-    /// the entry cannot be written, and stops [`AGENT_AUDIT_HEADROOM`] short of
-    /// the most entries the log is read back with, like
-    /// [`Self::record_agent_signature`].
+    /// for an approval. `label` is the gateway's own fixed text (see
+    /// [`crate::agent::valid_audit_label`]); `detail`, which may hold text the
+    /// agent sent, is capped, escaped and quoted so it cannot pose as anything
+    /// else. Fails when the entry cannot be written, and stops
+    /// [`AGENT_AUDIT_HEADROOM`] short of the most entries the log is read back
+    /// with, like [`Self::record_agent_signature`].
     pub fn record_agent_refusal(
         &mut self,
         id: &[u8; 16],
         label: &str,
         detail: Option<&str>,
     ) -> Result<()> {
-        if label.is_empty()
-            || label.len() > 64
-            || !label.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
-        {
-            return Err(KeepError::invalid_input(
-                "an agent refusal label is 1 to 64 printable ASCII characters",
-            ));
+        self.record_agent_entry(AuditEventType::AgentRefused, id, label, detail)
+    }
+
+    /// Records what the agent credential `id` was served, other than a
+    /// signature, before it is returned, on the same terms as
+    /// [`Self::record_agent_refusal`]. Fails when the entry cannot be written,
+    /// so the caller can withhold the answer.
+    pub fn record_agent_served(
+        &mut self,
+        id: &[u8; 16],
+        label: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.record_agent_entry(AuditEventType::AgentServed, id, label, detail)
+    }
+
+    fn record_agent_entry(
+        &mut self,
+        event: AuditEventType,
+        id: &[u8; 16],
+        label: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        if !crate::agent::valid_audit_label(label) {
+            return Err(KeepError::invalid_input(format!(
+                "an agent audit label is 1 to {} printable ASCII characters",
+                crate::agent::MAX_AUDIT_LABEL
+            )));
         }
         self.check_agent_audit_room()?;
         let mut reason = format!("agent {} {label}", hex::encode(id));
         if let Some(detail) = detail {
             reason.push_str(&format!(" \"{}\"", crate::agent::audit_text(detail)));
         }
-        self.audit_event_required(AuditEventType::AgentRefused, |e| {
-            e.with_reason(&reason).with_success(false)
-        })
+        let success = event != AuditEventType::AgentRefused;
+        self.audit_event_required(event, |e| e.with_reason(&reason).with_success(success))
     }
 
     fn check_agent_audit_room(&self) -> Result<()> {
@@ -2668,10 +2715,14 @@ mod tests {
             .record_agent_refusal(&[2; 16], "over", None)
             .unwrap_err();
         assert!(err.to_string().contains("audit log is full"), "{err}");
+        let err = keep
+            .record_agent_served(&[2; 16], "over", None)
+            .unwrap_err();
+        assert!(err.to_string().contains("audit log is full"), "{err}");
         assert_eq!(
             lines(&audit),
             ceiling,
-            "the refused signature and refusal wrote nothing"
+            "the refused signature, refusal and served entry wrote nothing"
         );
         keep.audit_event_required(AuditEventType::VaultLock, |e| e)
             .unwrap();
@@ -2724,6 +2775,62 @@ mod tests {
             keep.record_agent_refusal(&[7; 16], "again", None),
             Err(KeepError::AuditWriteFailed(_))
         ));
+    }
+
+    /// What an agent was served is recorded as a success, on the same terms as
+    /// a refusal: a gateway label, the agent's text escaped, fail closed.
+    #[test]
+    fn agent_served_entries_are_recorded_fail_closed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let id = hex::encode([7u8; 16]);
+        keep.record_agent_served(&[7; 16], "get_nostr_pubkey", Some("a\"b\n"))
+            .unwrap();
+        let served: Vec<_> = keep
+            .audit_read_all()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event_type == AuditEventType::AgentServed)
+            .collect();
+        assert_eq!(served.len(), 1);
+        assert!(served[0].success);
+        assert_eq!(
+            served[0].reason.as_deref(),
+            Some(format!("agent {id} get_nostr_pubkey \"a\\\"b\\n\"").as_str())
+        );
+        for label in ["", "a\nb", &"a".repeat(crate::agent::MAX_AUDIT_LABEL + 1)] {
+            assert!(
+                keep.record_agent_served(&[7; 16], label, None).is_err(),
+                "{label:?}"
+            );
+        }
+        assert!(keep
+            .record_agent_served(&[7; 16], &"a".repeat(crate::agent::MAX_AUDIT_LABEL), None)
+            .is_ok());
+
+        let audit = path.join("audit.log");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        assert!(matches!(
+            keep.record_agent_served(&[7; 16], "again", None),
+            Err(KeepError::AuditWriteFailed(_))
+        ));
+    }
+
+    /// The vault-wide agent freeze reads back as set, and reads as unfrozen
+    /// when never set.
+    #[test]
+    fn the_agent_freeze_reads_back() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        assert!(!keep.agent_freeze().unwrap());
+        keep.set_agent_freeze(true).unwrap();
+        assert!(keep.agent_freeze().unwrap());
+        keep.set_agent_freeze(false).unwrap();
+        assert!(!keep.agent_freeze().unwrap());
+        keep.lock();
+        assert!(keep.agent_freeze().is_err(), "a locked vault cannot say");
     }
 
     /// An agent signature's context is capped and escaped like a refusal's.

@@ -50,6 +50,8 @@ pub enum RefusalKind {
     RateLimited,
     /// The request is malformed.
     Invalid,
+    /// The gateway could not complete the request.
+    Failed,
 }
 
 impl RefusalKind {
@@ -60,6 +62,7 @@ impl RefusalKind {
             Self::NeedsApproval => "needs approval",
             Self::RateLimited => "rate limited",
             Self::Invalid => "invalid",
+            Self::Failed => "failed",
         }
     }
 }
@@ -71,9 +74,10 @@ impl RefusalKind {
 /// State is held in memory. The daemon calls [`Self::flush_expired`] on a
 /// timer and [`Self::flush_all`] before it stops, since counts still open in
 /// a window are lost if the process exits; calls [`Self::reset`] after the
-/// owner unfreezes a credential; passes only the ids of credentials a token
-/// matched (accepted or refused); and passes `now` from one clock that only
-/// advances with elapsed time.
+/// owner unfreezes or deletes a credential; passes only the ids of
+/// credentials a token matched (accepted or refused); and passes `now` from
+/// one clock that only advances with elapsed time. A restart starts every
+/// budget afresh; the vault's agent ceiling still bounds the log.
 pub struct AgentAudit {
     credential_budget: u32,
     gateway_budget: u32,
@@ -142,6 +146,9 @@ impl AgentAudit {
     /// with this kind and detail in a window is written now; repeats are
     /// counted and written as one entry once the window has passed. `detail`
     /// may hold text the agent sent. Fails when the entry cannot be written.
+    ///
+    /// Nothing is written for a credential its budget froze: its budget's end
+    /// is already recorded, and it would only spend the gateway's refusals.
     pub fn record_refusal(
         &mut self,
         keep: &mut Keep,
@@ -151,6 +158,9 @@ impl AgentAudit {
         now: u64,
     ) -> Result<()> {
         self.flush_expired(keep, now)?;
+        if self.spent.get(id).is_some_and(|s| s.frozen) {
+            return Ok(());
+        }
         let key = (*id, kind, cap_text(detail).to_string());
         if let Some(window) = self.pending.get_mut(&key) {
             window.repeats = window.repeats.saturating_add(1);
@@ -194,6 +204,39 @@ impl AgentAudit {
         Ok(())
     }
 
+    /// Record what credential `id` was served, other than a signature, before
+    /// it is returned. `label` is the gateway's own text naming the request;
+    /// `detail` may hold text the agent sent. An `Err` means the answer must
+    /// be withheld.
+    pub fn record_served(
+        &mut self,
+        keep: &mut Keep,
+        id: &[u8; 16],
+        label: &str,
+        detail: Option<&str>,
+        now: u64,
+    ) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)?;
+        keep.record_agent_served(id, label, detail)?;
+        self.charge(id, false);
+        Ok(())
+    }
+
+    /// Whether credential `id` may be answered at all at `now`, for requests
+    /// that return nothing worth an entry (the protocol handshake). Writes
+    /// nothing unless a budget has just run out, so a credential over its
+    /// budget whose freeze failed is still refused, and its freeze retried.
+    pub fn admit(&mut self, keep: &mut Keep, id: &[u8; 16], now: u64) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)
+    }
+
+    /// Whether credential `id`'s budget froze it, until [`Self::reset`].
+    pub fn froze(&self, id: &[u8; 16]) -> bool {
+        self.spent.get(id).is_some_and(|s| s.frozen)
+    }
+
     /// Restore credential `id`'s budget, after the owner unfreezes it.
     pub fn reset(&mut self, id: &[u8; 16]) {
         self.spent.remove(id);
@@ -226,12 +269,10 @@ impl AgentAudit {
             if window.repeats == 0 || self.check(keep, &key.0, true, now).is_err() {
                 continue;
             }
-            let label = format!(
-                "{} x{} more since {}",
-                key.1.label(),
-                window.repeats,
-                window.opened
-            );
+            // No time in the label: the gateway's budget clock does not match
+            // the log's own timestamps. The window's first refusal is the
+            // entry just before it with the same kind and detail.
+            let label = format!("{} x{} more since the first", key.1.label(), window.repeats);
             if let Err(e) = keep.record_agent_refusal(&key.0, &label, Some(&key.2)) {
                 self.pending.insert(key, window);
                 return Err(e.into());
@@ -247,8 +288,10 @@ impl AgentAudit {
     fn check(&mut self, keep: &mut Keep, id: &[u8; 16], refusal: bool, now: u64) -> Result<()> {
         self.gateway.roll(now);
         if self.spent.len() >= MAX_TRACKED && !self.spent.contains_key(id) {
+            // A credential its budget froze stays tracked, so it is not frozen
+            // and recorded again; [`Self::reset`] drops it.
             self.spent
-                .retain(|_, s| now < s.since.saturating_add(DAY_SECS));
+                .retain(|_, s| s.frozen || now < s.since.saturating_add(DAY_SECS));
         }
         let spent = self
             .spent

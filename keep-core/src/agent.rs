@@ -125,6 +125,18 @@ pub struct AgentRefused {
     pub credential: Option<[u8; 16]>,
 }
 
+/// The longest label the gateway gives an agent audit entry: its own fixed
+/// text, printable ASCII.
+pub const MAX_AUDIT_LABEL: usize = 64;
+
+/// Whether `label` is a gateway audit label: 1 to [`MAX_AUDIT_LABEL`] bytes of
+/// printable ASCII.
+pub fn valid_audit_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= MAX_AUDIT_LABEL
+        && label.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+}
+
 /// The most bytes of caller-supplied text an agent audit entry keeps.
 pub const MAX_AUDIT_TEXT: usize = 256;
 

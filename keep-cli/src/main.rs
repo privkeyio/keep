@@ -32,6 +32,14 @@ use crate::output::Output;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Set by a command that shuts down cleanly on SIGINT or SIGTERM instead of
+/// exiting at once.
+pub(crate) static GRACEFUL_STOP: std::sync::OnceLock<std::sync::Arc<tokio::sync::Notify>> =
+    std::sync::OnceLock::new();
+
+/// Set by the first signal a graceful command receives.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn next_request_id() -> String {
     let id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     format!("req-{id:08x}")
@@ -79,6 +87,15 @@ fn main() {
     keep_frost_net::install_default_crypto_provider();
 
     ctrlc::set_handler(|| {
+        // A command that stops cleanly on a signal (the agent gateway) is told
+        // to, and exits once it has written out its state.
+        // A second signal exits at once, should stopping hang.
+        if let Some(stop) = GRACEFUL_STOP.get() {
+            if !STOP_REQUESTED.swap(true, Ordering::SeqCst) {
+                stop.notify_one();
+                return;
+            }
+        }
         // Restore raw mode, but emit LeaveAlternateScreen only if the TUI actually
         // entered the alt screen -- otherwise this signal (incl. the SIGTERM the
         // frost gate sends on a fail-closed oprf-unlock) would leak the escape onto
@@ -182,6 +199,8 @@ fn run(out: &Output) -> Result<()> {
         Commands::Enclave { command } => dispatch_enclave(out, &path, command),
         Commands::Nip46 { command } => dispatch_nip46(out, &path, command),
         Commands::Agent { command } => dispatch_agent(out, &path, command, hidden),
+        #[cfg(target_os = "linux")]
+        Commands::Gateway { command } => commands::gateway::dispatch(out, &path, command, hidden),
         Commands::Config { command } => dispatch_config(out, &cfg, command),
         Commands::Migrate { command } => dispatch_migrate(out, &path, command, hidden),
         Commands::Backup { output } => commands::vault::cmd_backup(out, &path, output.as_deref()),

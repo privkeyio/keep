@@ -112,6 +112,12 @@ jobs:
       # subprocess (the tests locate `target/release/keep`), so run them in
       # --release too. Previously only compile-checked, never executed in CI.
       - run: cargo test -p keep-cli --release --test cli_integration
+      # The agent gateway end to end in strong mode, with real users for the
+      # gateway, its admin, two agents and an outsider. Creating them needs
+      # root, so it runs under sudo, on Linux, where the gateway runs.
+      - if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep
       # A network key-path spend between two `keep` processes over an in-process
       # relay. The binary is rebuilt with `local-relay-tests` so it accepts a
       # loopback ws:// relay; this stays the last step so no later step runs it.

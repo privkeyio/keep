@@ -8,6 +8,8 @@ pub mod enclave;
 pub mod frost;
 pub mod frost_hardware;
 pub mod frost_network;
+#[cfg(target_os = "linux")]
+pub mod gateway;
 pub mod migrate;
 pub mod nip46;
 pub mod secret;
