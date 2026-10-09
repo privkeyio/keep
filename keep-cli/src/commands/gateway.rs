@@ -337,20 +337,25 @@ fn admin_answer(
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(io)?;
-    let mut writer = &stream;
-    writer
-        .write_all(format!("{request}\n").as_bytes())
-        .map_err(io)?;
-    // From here the gateway may have acted on the request.
-    let sent = |error: KeepError| AdminFailure {
-        maybe_done: true,
-        error,
-    };
+    // The gateway turns a uid it does not admit away unread.
     let closed = || {
         KeepError::Runtime(
             "the gateway closed the admin connection: run as root or the gateway's admin uid"
                 .into(),
         )
+    };
+    let mut writer = &stream;
+    // A request not written whole was never read.
+    writer
+        .write_all(format!("{request}\n").as_bytes())
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => closed(),
+            _ => io(e),
+        })?;
+    // From here the gateway may have acted on the request.
+    let sent = |error: KeepError| AdminFailure {
+        maybe_done: true,
+        error,
     };
     let line = match read_answer(&stream) {
         Ok(line) => line,
@@ -359,7 +364,9 @@ fn admin_answer(
         Err(e) => return Err(sent(io(e))),
     };
     if line.is_empty() {
-        return Err(sent(closed()));
+        return Err(sent(KeepError::Runtime(
+            "the gateway closed the admin connection without answering".into(),
+        )));
     }
     let answer: AdminAnswer = serde_json::from_slice(&line)
         .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;

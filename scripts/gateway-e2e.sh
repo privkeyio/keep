@@ -459,8 +459,11 @@ chown "$GW" "$RUN/impostor"
 bridge_refuses "an impostor's socket" "served by uid $(uid "$A2")" "${IMPOSTOR_CONNECT[@]}"
 for _ in $(seq 50); do [[ -s $WORK/a2/impostor-connections ]] && break; sleep 0.1; done
 [[ -s $WORK/a2/impostor-connections ]] || fail "the bridge never reached the impostor's socket"
-kill "$IMPOSTOR" 2>/dev/null || true
-wait "$IMPOSTOR" 2>/dev/null || true
+# (The group's redirect also silences bash's notice that the job was killed.)
+{
+    kill "$IMPOSTOR" || true
+    wait "$IMPOSTOR" || true
+} 2>/dev/null
 pgrep -u "$A2" python3 >/dev/null && fail "the impostor is still running"
 [[ ! -s $WORK/a2/impostor-got ]] || fail "the bridge sent something to the impostor"
 pass "the bridge refuses a loose or foreign token file, KEEP_PASSWORD, root and an impostor's socket"
@@ -480,7 +483,7 @@ if MSG=$(as "$GW" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-u
     fail "the gateway's own uid issued a credential"
 fi
 echo "$MSG" | grep -q "may have been issued" && fail "false alarm for a refused issue: $MSG"
-echo "$MSG" | grep -q "closed the admin connection" || fail "refused issue: $MSG"
+echo "$MSG" | grep -q "run as root or the gateway's admin uid" || fail "refused issue: $MSG"
 if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "the gateway's own uid was admitted to the admin socket"
 fi
