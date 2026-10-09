@@ -1,21 +1,21 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-//! The gateway's clock: Unix seconds that only advance with elapsed time.
+//! The gateway's clocks.
 //!
-//! While running, the clock is a start time plus `CLOCK_BOOTTIME`, which keeps
-//! counting through suspend and ignores the wall clock, so stepping the wall
-//! clock can neither age spends out of a budget early nor hold them in.
+//! The budget clock decides spend windows, rate limits and audit budgets. It
+//! is a start time plus `CLOCK_BOOTTIME`, which keeps counting through suspend
+//! and ignores the wall clock, so stepping the wall clock can neither age
+//! spends out of a budget early nor hold them in. It is persisted as a
+//! heartbeat (the boot it was taken in, the boot time and the clock): a restart
+//! within the same boot continues it by elapsed boot time, and after a reboot
+//! it resumes from the latest time the vault has seen. Time the gateway was
+//! down is never counted, so no clock, however wrong, can age out a spend: a
+//! budget is held for longer, never released early.
 //!
-//! The clock is persisted as a heartbeat (the boot it was taken in, the boot
-//! time and the clock). A restart within the same boot continues from the
-//! heartbeat by elapsed boot time alone. After a reboot the wall clock is the
-//! only source, so it is trusted only within bounds: never earlier than any
-//! time the vault has seen, and never further ahead of it than
-//! [`MAX_UNCONFIRMED_GAP_SECS`] (a budget window) unless the owner confirms
-//! the jump, so a wall clock wrongly far ahead cannot reset every budget or
-//! pin the ledgers in the future. A gateway down for longer than a day needs
-//! that confirmation to start.
+//! The calendar clock decides when credentials expire: the wall clock, but
+//! never behind the budget clock. A wall clock that runs ahead only expires
+//! credentials early.
 
 use serde::{Deserialize, Serialize};
 
@@ -24,12 +24,6 @@ use crate::error::{AgentError, Result};
 /// The ledger key the heartbeat is stored under. Never 16 bytes long, so it
 /// cannot be a credential's ledger.
 pub const HEARTBEAT_KEY: &[u8] = b"gateway-clock";
-
-/// How far past the latest time the vault has seen the wall clock may read
-/// after a reboot before the owner must confirm it: one budget window, so a
-/// clock that jumped forward while the gateway was down can at most age out
-/// what real time would have, never reset a budget outright.
-pub const MAX_UNCONFIRMED_GAP_SECS: u64 = crate::policy::BUDGET_WINDOW_SECS;
 
 /// The persisted clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,13 +48,13 @@ impl Heartbeat {
     }
 }
 
-/// What the clock is started from.
+/// What the budget clock is started from.
 #[derive(Debug, Clone)]
 pub struct Seed<'a> {
     /// The stored heartbeat, if any.
     pub heartbeat: Option<&'a Heartbeat>,
-    /// The latest time the vault has seen: the heartbeat, every ledger and
-    /// every credential's issue time.
+    /// The latest budget time the vault has seen: the heartbeat and every
+    /// ledger.
     pub floor: u64,
     /// The wall clock now, in Unix seconds.
     pub wall: u64,
@@ -68,43 +62,30 @@ pub struct Seed<'a> {
     pub boot_id: &'a str,
     /// `CLOCK_BOOTTIME` seconds now.
     pub boottime: u64,
-    /// The owner confirmed a wall clock far ahead of the floor.
-    pub accept_jump: bool,
 }
 
-/// The clock reading to start from, or why the gateway must not start.
-pub fn start_time(seed: &Seed<'_>) -> Result<u64> {
+/// The budget clock reading to start from. The wall clock is used only by a
+/// vault that has never seen any time.
+pub fn start_time(seed: &Seed<'_>) -> u64 {
     if let Some(hb) = seed.heartbeat {
         if hb.boot_id == seed.boot_id && seed.boottime >= hb.boottime {
             let elapsed = seed.boottime - hb.boottime;
-            return Ok(hb.clock.saturating_add(elapsed).max(seed.floor));
+            return hb.clock.saturating_add(elapsed).max(seed.floor);
         }
     }
-    if seed.wall < seed.floor {
-        tracing::warn!(
-            wall = seed.wall,
-            floor = seed.floor,
-            "the wall clock reads before the latest time the vault has seen; starting from that time"
-        );
-        return Ok(seed.floor);
+    if seed.floor == 0 {
+        seed.wall
+    } else {
+        seed.floor
     }
-    if seed.floor > 0 && seed.wall - seed.floor > MAX_UNCONFIRMED_GAP_SECS && !seed.accept_jump {
-        return Err(AgentError::Other(format!(
-            "the wall clock ({}) is {} seconds past the latest time the vault has seen ({}), \
-             more than {MAX_UNCONFIRMED_GAP_SECS}; fix the clock, or if it is right, start once \
-             with --accept-clock-jump",
-            seed.wall,
-            seed.wall - seed.floor,
-            seed.floor
-        )));
-    }
-    Ok(seed.wall)
 }
 
 /// Reads the kernel's clocks.
 pub trait TimeSource: Send + Sync {
     /// `CLOCK_BOOTTIME` in whole seconds.
     fn boottime(&self) -> u64;
+    /// The wall clock in Unix seconds, or 0 when it reads before 1970.
+    fn wall(&self) -> u64;
 }
 
 /// The running kernel.
@@ -114,6 +95,10 @@ impl TimeSource for Kernel {
     fn boottime(&self) -> u64 {
         let ts = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
         u64::try_from(ts.tv_sec).unwrap_or(0)
+    }
+
+    fn wall(&self) -> u64 {
+        wall_clock().unwrap_or(0)
     }
 }
 
@@ -136,7 +121,8 @@ pub fn wall_clock() -> Result<u64> {
         .map_err(|_| AgentError::Other("the wall clock reads before 1970".into()))
 }
 
-/// The gateway's clock: the start time plus boot time elapsed since start.
+/// The gateway's clocks: the budget clock is the start time plus boot time
+/// elapsed since start; the calendar clock is the wall clock, never behind it.
 pub struct Clock {
     start: u64,
     boottime_at_start: u64,
@@ -154,7 +140,13 @@ impl Clock {
         }
     }
 
-    /// Unix seconds now. Never goes back: boot time only advances.
+    /// The calendar time now, for credential expiry: the wall clock, never
+    /// behind the budget clock.
+    pub fn calendar(&self) -> u64 {
+        self.now().max(self.source.wall())
+    }
+
+    /// The budget clock now. Never goes back: boot time only advances.
     pub fn now(&self) -> u64 {
         let elapsed = self
             .source
@@ -186,19 +178,27 @@ pub(crate) mod tests {
     const BOOT: &str = "0f0e8c49-7d0d-4d47-a4b1-ad1b6c1b0a51";
     const OTHER_BOOT: &str = "1f0e8c49-7d0d-4d47-a4b1-ad1b6c1b0a51";
 
-    /// A boot time the test sets.
+    /// A boot time and a wall clock the test sets.
     #[derive(Clone, Default)]
-    pub(crate) struct FakeBoot(pub Arc<AtomicU64>);
+    pub(crate) struct FakeBoot(pub Arc<AtomicU64>, pub Arc<AtomicU64>);
 
     impl FakeBoot {
         pub(crate) fn advance(&self, secs: u64) {
             self.0.fetch_add(secs, Ordering::SeqCst);
+        }
+
+        pub(crate) fn set_wall(&self, wall: u64) {
+            self.1.store(wall, Ordering::SeqCst);
         }
     }
 
     impl TimeSource for FakeBoot {
         fn boottime(&self) -> u64 {
             self.0.load(Ordering::SeqCst)
+        }
+
+        fn wall(&self) -> u64 {
+            self.1.load(Ordering::SeqCst)
         }
     }
 
@@ -209,69 +209,52 @@ pub(crate) mod tests {
             wall,
             boot_id: boot,
             boottime: 500,
-            accept_jump: false,
         }
     }
 
     #[test]
-    fn a_restart_in_the_same_boot_ignores_the_wall_clock() {
+    fn a_restart_in_the_same_boot_continues_by_boot_time_alone() {
         let hb = Heartbeat {
             boot_id: BOOT.into(),
             boottime: 400,
             clock: T,
         };
-        for wall in [0, T - 86_400, T + 100, T + 10 * MAX_UNCONFIRMED_GAP_SECS] {
-            assert_eq!(
-                start_time(&seed(Some(&hb), T, wall, BOOT)).unwrap(),
-                T + 100
-            );
+        for wall in [0, T - 86_400, T + 100, T + 1_000 * 86_400] {
+            assert_eq!(start_time(&seed(Some(&hb), T, wall, BOOT)), T + 100);
         }
         assert_eq!(
-            start_time(&seed(Some(&hb), T + 1_000, 0, BOOT)).unwrap(),
+            start_time(&seed(Some(&hb), T + 1_000, 0, BOOT)),
             T + 1_000,
             "never before the floor"
         );
     }
 
     #[test]
-    fn a_confirmation_is_needed_past_one_budget_window() {
-        assert_eq!(MAX_UNCONFIRMED_GAP_SECS, 24 * 60 * 60);
-        assert_eq!(MAX_UNCONFIRMED_GAP_SECS, crate::policy::BUDGET_WINDOW_SECS);
-    }
-
-    #[test]
-    fn after_a_reboot_the_wall_clock_is_bounded_by_the_floor() {
+    fn after_a_reboot_the_clock_resumes_where_the_vault_left_it() {
         let hb = Heartbeat {
             boot_id: BOOT.into(),
             boottime: 400,
             clock: T,
         };
-        let s = |wall| start_time(&seed(Some(&hb), T, wall, OTHER_BOOT));
-        assert_eq!(s(T - 5).unwrap(), T, "a clock behind starts at the floor");
-        assert_eq!(s(T + 3_600).unwrap(), T + 3_600);
-        assert_eq!(
-            s(T + MAX_UNCONFIRMED_GAP_SECS).unwrap(),
-            T + MAX_UNCONFIRMED_GAP_SECS
-        );
-        let err = s(T + MAX_UNCONFIRMED_GAP_SECS + 1).unwrap_err();
-        assert!(err.to_string().contains("--accept-clock-jump"), "{err}");
-        let mut confirmed = seed(Some(&hb), T, T + 10 * MAX_UNCONFIRMED_GAP_SECS, OTHER_BOOT);
-        confirmed.accept_jump = true;
-        assert_eq!(
-            start_time(&confirmed).unwrap(),
-            T + 10 * MAX_UNCONFIRMED_GAP_SECS
-        );
+        // Whatever the wall clock says, downtime is not counted.
+        for wall in [0, T - 5, T + 3_600, T + 86_400, T + 1_000 * 86_400] {
+            assert_eq!(
+                start_time(&seed(Some(&hb), T, wall, OTHER_BOOT)),
+                T,
+                "{wall}"
+            );
+        }
         // A boot time behind the heartbeat's cannot be the same boot.
         let mut behind = seed(Some(&hb), T, T + 7, BOOT);
         behind.boottime = 399;
-        assert_eq!(start_time(&behind).unwrap(), T + 7);
+        assert_eq!(start_time(&behind), T);
+        // Without a heartbeat, the ledgers' times hold it.
+        assert_eq!(start_time(&seed(None, T, T + 86_400, OTHER_BOOT)), T);
     }
 
     #[test]
-    fn without_a_heartbeat_the_floor_still_bounds_the_wall_clock() {
-        assert_eq!(start_time(&seed(None, 0, T, BOOT)).unwrap(), T);
-        assert_eq!(start_time(&seed(None, T, T - 1, BOOT)).unwrap(), T);
-        assert!(start_time(&seed(None, T, T + MAX_UNCONFIRMED_GAP_SECS + 1, BOOT)).is_err());
+    fn a_vault_that_has_seen_no_time_starts_from_the_wall_clock() {
+        assert_eq!(start_time(&seed(None, 0, T, BOOT)), T);
     }
 
     #[test]
@@ -297,7 +280,17 @@ pub(crate) mod tests {
         );
         let mut later = seed(Some(&hb), 0, 0, BOOT);
         later.boottime = 1_100;
-        assert_eq!(start_time(&later).unwrap(), T + 100);
+        assert_eq!(start_time(&later), T + 100);
+    }
+
+    #[test]
+    fn the_calendar_is_the_wall_clock_never_behind_the_budget_clock() {
+        let boot = FakeBoot::default();
+        let clock = Clock::new(T, BOOT.into(), Box::new(boot.clone()));
+        assert_eq!(clock.calendar(), T, "a wall clock behind does not count");
+        boot.set_wall(T + 86_400);
+        assert_eq!(clock.calendar(), T + 86_400);
+        assert_eq!(clock.now(), T, "the budget clock ignores it");
     }
 
     #[test]
@@ -308,5 +301,6 @@ pub(crate) mod tests {
         assert!(a > 0);
         assert!(Kernel.boottime() >= a);
         assert!(wall_clock().unwrap() > 1_700_000_000);
+        assert!(Kernel.wall() > 1_700_000_000);
     }
 }

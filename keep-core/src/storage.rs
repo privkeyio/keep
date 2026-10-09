@@ -1783,7 +1783,7 @@ impl Storage {
     }
 
     /// Write raw bytes into a table, for tests that corrupt a stored value.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn put_raw(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
         self.backend
             .as_ref()

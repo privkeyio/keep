@@ -131,10 +131,11 @@ pub fn bind(path: &Path, euid: u32) -> Result<UnixListener> {
 }
 
 /// Connect to a gateway socket as a client, refusing unless the socket's
-/// directory is a real directory writable by its owner alone and the peer is
-/// that owner. No one else could have put a socket there, so the peer is the
-/// gateway and not an impostor collecting what clients send.
-pub fn connect_checked(path: &Path) -> Result<std::os::unix::net::UnixStream> {
+/// directory is a real directory owned by `gateway_uid` and writable by it
+/// alone, and the peer is `gateway_uid` too. No one else could have put a
+/// socket there, so the peer is the gateway and not an impostor collecting
+/// what clients send or faking what they are told.
+pub fn connect_checked(path: &Path, gateway_uid: u32) -> Result<std::os::unix::net::UnixStream> {
     let fail = |m: String| AgentError::Other(format!("{}: {m}", path.display()));
     let dir = path
         .parent()
@@ -144,6 +145,12 @@ pub fn connect_checked(path: &Path) -> Result<std::os::unix::net::UnixStream> {
         .map_err(|e| fail(format!("its directory cannot be read: {e}")))?;
     if !meta.file_type().is_dir() {
         return Err(fail("its directory is not a directory".into()));
+    }
+    if meta.uid() != gateway_uid {
+        return Err(fail(format!(
+            "its directory is owned by uid {}, not the gateway's uid {gateway_uid}",
+            meta.uid()
+        )));
     }
     if meta.mode() & 0o022 != 0 {
         return Err(fail(format!(
@@ -156,10 +163,9 @@ pub fn connect_checked(path: &Path) -> Result<std::os::unix::net::UnixStream> {
         .map_err(|e| fail(format!("SO_PEERCRED: {e}")))?
         .uid
         .as_raw();
-    if peer != meta.uid() {
+    if peer != gateway_uid {
         return Err(fail(format!(
-            "it is served by uid {peer}, not uid {} that owns its directory",
-            meta.uid()
+            "it is served by uid {peer}, not the gateway's uid {gateway_uid}"
         )));
     }
     Ok(stream)

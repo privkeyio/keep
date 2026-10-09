@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "keep")]
@@ -220,81 +220,30 @@ pub(crate) enum GatewayCommands {
         /// 24 hours, fees included. 0 (the default) refuses every spend.
         #[arg(long, default_value_t = 0)]
         wallet_budget_sats: u64,
-        /// Start even though the wall clock is far past the latest time the
-        /// vault has seen. Only when the clock is known to be right.
-        #[arg(long)]
-        accept_clock_jump: bool,
     },
     /// Show the running gateway's state
     Status {
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// List agent credentials (never their tokens)
     List {
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// Issue an agent credential. The token is shown once.
-    Issue {
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
-        /// The owner's label for the agent
-        #[arg(long)]
-        name: String,
-        /// The uid the agent runs as; the token is refused from any other
-        #[arg(long)]
-        uid: u32,
-        /// A vault key the agent may use, as hex or npub (repeatable)
-        #[arg(long = "key", required = true)]
-        keys: Vec<String>,
-        /// An operation the agent may request (repeatable): get_public_key,
-        /// sign_nostr_event, get_bitcoin_address, sign_psbt
-        #[arg(long = "op", required = true)]
-        operations: Vec<String>,
-        /// A Nostr event kind the agent may sign (repeatable)
-        #[arg(long = "kind")]
-        kinds: Vec<u16>,
-        /// Bitcoin network for the Bitcoin operations
-        #[arg(long)]
-        network: Option<String>,
-        /// Most one PSBT may take out of the wallet, fee included
-        #[arg(long)]
-        per_psbt_sats: Option<u64>,
-        /// Most the agent may take out of the wallet in any 24 hours
-        #[arg(long)]
-        window_sats: Option<u64>,
-        /// Spends past this within 24 hours need an approval
-        #[arg(long)]
-        approval_above_sats: Option<u64>,
-        /// An address the agent's PSBTs may pay (repeatable); without any,
-        /// every address may be paid
-        #[arg(long = "allow-address")]
-        allow_addresses: Vec<String>,
-        #[arg(long, default_value_t = 10)]
-        per_minute: u32,
-        #[arg(long, default_value_t = 100)]
-        per_hour: u32,
-        #[arg(long, default_value_t = 1000)]
-        per_day: u32,
-        /// Days until the credential expires
-        #[arg(long, default_value_t = 30)]
-        ttl_days: u64,
-        /// Write the token to this new file (mode 0600) instead of stdout
-        #[arg(long)]
-        token_out: Option<PathBuf>,
-    },
+    Issue(Box<IssueArgs>),
     /// Revoke an agent credential for good
     Revoke {
         id: String,
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// Delete an agent credential and its spend ledger
     Delete {
         id: String,
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// Freeze one agent credential, or every one with --all
     Freeze {
@@ -302,8 +251,8 @@ pub(crate) enum GatewayCommands {
         id: Option<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// Unfreeze one agent credential, or lift the freeze on all with --all
     Unfreeze {
@@ -311,16 +260,80 @@ pub(crate) enum GatewayCommands {
         id: Option<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
     /// Show the latest audit log entries
     Audit {
         #[arg(long, default_value_t = 100)]
         limit: usize,
-        #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
-        admin_socket: PathBuf,
+        #[command(flatten)]
+        target: AdminTarget,
     },
+}
+
+/// What `keep gateway issue` is given.
+#[cfg(target_os = "linux")]
+#[derive(Args)]
+pub(crate) struct IssueArgs {
+    #[command(flatten)]
+    pub(crate) target: AdminTarget,
+    /// The owner's label for the agent
+    #[arg(long)]
+    pub(crate) name: String,
+    /// The uid the agent runs as; the token is refused from any other
+    #[arg(long)]
+    pub(crate) uid: u32,
+    /// A vault key the agent may use, as hex or npub (repeatable)
+    #[arg(long = "key", required = true)]
+    pub(crate) keys: Vec<String>,
+    /// An operation the agent may request (repeatable): get_public_key,
+    /// sign_nostr_event, get_bitcoin_address, sign_psbt
+    #[arg(long = "op", required = true)]
+    pub(crate) operations: Vec<String>,
+    /// A Nostr event kind the agent may sign (repeatable)
+    #[arg(long = "kind")]
+    pub(crate) kinds: Vec<u16>,
+    /// Bitcoin network for the Bitcoin operations
+    #[arg(long)]
+    pub(crate) network: Option<String>,
+    /// Most one PSBT may take out of the wallet, fee included
+    #[arg(long)]
+    pub(crate) per_psbt_sats: Option<u64>,
+    /// Most the agent may take out of the wallet in any 24 hours
+    #[arg(long)]
+    pub(crate) window_sats: Option<u64>,
+    /// Spends past this within 24 hours need an approval
+    #[arg(long)]
+    pub(crate) approval_above_sats: Option<u64>,
+    /// An address the agent's PSBTs may pay (repeatable); without any,
+    /// every address may be paid
+    #[arg(long = "allow-address")]
+    pub(crate) allow_addresses: Vec<String>,
+    #[arg(long, default_value_t = 10)]
+    pub(crate) per_minute: u32,
+    #[arg(long, default_value_t = 100)]
+    pub(crate) per_hour: u32,
+    #[arg(long, default_value_t = 1000)]
+    pub(crate) per_day: u32,
+    /// Days until the credential expires
+    #[arg(long, default_value_t = 30)]
+    pub(crate) ttl_days: u64,
+    /// Write the token to this new file (mode 0600) instead of stdout
+    #[arg(long)]
+    pub(crate) token_out: Option<PathBuf>,
+}
+
+/// Which gateway an admin command talks to.
+#[cfg(target_os = "linux")]
+#[derive(Args)]
+pub(crate) struct AdminTarget {
+    #[arg(long, default_value = DEFAULT_ADMIN_SOCKET)]
+    pub admin_socket: PathBuf,
+    /// The user the gateway runs as, by name or uid. The admin socket, and the
+    /// directory it is in, must be that user's, or nothing is sent.
+    #[arg(long, default_value = "keep")]
+    pub gateway_user: String,
 }
 
 #[derive(Subcommand)]
