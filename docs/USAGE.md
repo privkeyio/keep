@@ -113,6 +113,7 @@ Run `keep <command> --help` for the full flag list of any command.
 | `keep enclave ...` | AWS Nitro Enclave operations (see [Enclaves](#aws-nitro-enclaves)) |
 | `keep agent mcp --key <n>` | Run the MCP signing server (see [Agent SDK](#agent-sdk)) |
 | `keep gateway ...` | Run and manage the agent gateway, Linux only (see [Agent Gateway](#agent-gateway-preview)) |
+| `keep agent connect --token-file <f>` | Connect an MCP client to the agent gateway, Linux only (see [Agent Gateway](#agent-gateway-preview)) |
 | `keep sign <file> --group <npub>` | Threshold-sign a file (minisign-compatible) |
 | `keep verify <file> <sig> --group <npub>` | Verify a minisign detached signature |
 
@@ -641,7 +642,7 @@ Add it to your MCP client configuration:
 }
 ```
 
-Set `KEEP_PASSWORD` in the server's environment so it can unlock the vault non-interactively.
+Set `KEEP_PASSWORD` in the server's environment so it can unlock the vault non-interactively. The agent can then read that password, and with it the whole vault. To give an agent keys it never holds, run the [agent gateway](#agent-gateway-preview) and connect the client with `keep agent connect` instead.
 
 ### Agent Gateway (preview)
 
@@ -685,7 +686,50 @@ keep gateway audit --limit 50
 
 Credentials expire after 30 days by default (`--ttl-days`). A credential may not be bound to root, the gateway's uid, the vault owner's uid, the admin uid or the overflow uid. Agents that share a uid share every grant bound to it, so give each agent its own user, and give agent users no way to reach root (no passwordless sudo, no `docker` group).
 
-Agents connect to `/run/keep-gateway/agent.sock` and send one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`). A stdio bridge for stock MCP clients and a systemd unit are planned.
+#### Connecting an MCP client
+
+`keep agent connect` lets a stock MCP client (Claude, Cursor, any client that runs a stdio server) use the gateway. It speaks MCP on stdio and passes each request to the gateway's agent socket with the agent's token. It needs no vault and no password.
+
+Give the token to the agent's user in a file only that user can read:
+
+```bash
+sudo install -m 0600 -o agent-user writer.token /home/agent-user/.config/keep/agent.token
+```
+
+Then add the bridge to the client's configuration, run as the agent's user (for Claude and Cursor, under `mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "keep": {
+      "command": "keep",
+      "args": ["agent", "connect", "--token-file", "/home/agent-user/.config/keep/agent.token"]
+    }
+  }
+}
+```
+
+`--socket` (default `/run/keep-gateway/agent.sock`) and `--gateway-user` (default `keep`) point it at another gateway.
+
+The bridge protects the token:
+
+- It reads the token only from the file, never from an argument or an environment variable, since MCP configurations are often committed. The file must be a regular file owned by the user running the bridge, with no access for group or others (mode 0600 or 0400).
+- Before sending anything it checks that the socket's directory belongs to the gateway's user and that no one else can write to it, and that the gateway's user is the one serving the socket. It checks again on every new connection, so the token never reaches a socket someone else put in its place.
+- It refuses to run with `KEEP_PASSWORD`, `KEEP_HIDDEN_PASSWORD`, `KEEP_DURESS_PASSWORD` or `KEEP_NSEC` set, since the agent can read its own environment, and it refuses to run as root, which can hold no credential.
+- It never prints or logs the token, keeps the process out of core dumps, and wipes its copies of the token when it stops.
+
+The bridge sends one request at a time and keeps running when the gateway closes the connection: after 10 idle minutes, after three refused requests in a row, or when the gateway restarts. It connects again for the next request, so the client's session survives. It never sends a request twice if the first may have been carried out:
+
+| Error code | Meaning |
+|------------|---------|
+| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or comes from the wrong uid. |
+| `-32002` | The credential is over one of its request limits. |
+| `-32010` | The gateway could not be reached (stopped, restarting, or the socket failed the checks above). The request was not sent. |
+| `-32011` | The connection closed after the request was sent and before the answer came. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
+
+Notifications from the client are not sent to the gateway, which acts on none of them.
+
+Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`). A systemd unit is planned.
 
 ---
 
