@@ -9,7 +9,7 @@
 //! The token comes from a file only its owner can read, never from an
 //! argument or the environment, which agent configurations commit and leak.
 //! It is sent only to a socket the gateway's user serves, checked on every
-//! connection, and is wiped from memory when the bridge exits.
+//! connection, and every buffer holding it is wiped when dropped.
 //!
 //! Requests go one at a time, each answered before the next is sent, so every
 //! answer belongs to the request before it. Notifications are dropped here:
@@ -19,10 +19,12 @@
 //! When the gateway closes the connection (it was idle, the token was
 //! refused three times in a row, or the gateway restarted), the bridge keeps
 //! running and connects again for the next request, so the client's session
-//! survives. A request is sent again only when it never reached the gateway
-//! whole. Once a request was sent in full, losing the connection before its
-//! answer is an error for the client, never a retry: the gateway may already
-//! have signed and recorded it.
+//! survives; it also starts when the gateway is not running yet. A request is
+//! sent again only when the gateway cannot have read it: its line was not
+//! sent whole, or the gateway closed the connection with it unread. Once the
+//! gateway may have read a request, losing the connection before its answer
+//! is an error for the client, never a retry: the gateway may already have
+//! signed and recorded it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -33,16 +35,22 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
-use super::daemon::server::{self, MAX_LINE};
+use super::daemon::server::{self, ConnectError, MAX_LINE};
 use super::daemon::state::REFUSED_CODE;
 use crate::error::{AgentError, Result};
 
-/// The gateway could not be reached, so the request was not sent.
+/// The request was not sent, or the gateway closed the connection without
+/// reading it.
 pub const UNREACHABLE: i64 = -32010;
 
-/// The connection closed after the request was sent and before its answer
-/// came, so the gateway may have carried it out.
+/// The request was sent and no answer came, so the gateway may have carried
+/// it out.
 pub const LOST: i64 = -32011;
+
+const NOT_SENT: &str = "the gateway cannot be reached; the request was not sent";
+const MAYBE_DONE: &str = "no answer came from the gateway; the request may have been carried \
+                          out, so it was not sent again";
+const TOO_LARGE: &str = "request too large for the gateway";
 
 /// The longest answer read from the gateway: far more than a signed PSBT of
 /// the largest request the gateway reads.
@@ -54,11 +62,14 @@ const MAX_TOKEN_FILE: usize = 256;
 /// Variables that hold vault secrets. An agent can read its own environment,
 /// so a bridge started with any of them set has handed the agent what the
 /// gateway exists to keep from it.
-pub const VAULT_SECRET_VARS: [&str; 4] = [
+pub const VAULT_SECRET_VARS: [&str; 7] = [
     "KEEP_PASSWORD",
+    "KEEP_NEW_PASSWORD",
     "KEEP_HIDDEN_PASSWORD",
     "KEEP_DURESS_PASSWORD",
     "KEEP_NSEC",
+    "KEEP_STORAGE_KEY",
+    "KEEP_WEB_AUTH_TOKEN",
 ];
 
 /// The first vault secret variable `is_set` reports, if any.
@@ -80,7 +91,17 @@ impl Token {
     /// `owner` and closed to everyone else. The checks are made on the file
     /// opened, so it cannot be swapped between check and read.
     pub fn read(path: &Path, owner: u32) -> Result<Self> {
-        let fail = |m: String| AgentError::Other(format!("token file {}: {m}", path.display()));
+        // A token given in place of the path is not repeated in errors.
+        let shown = if path
+            .to_string_lossy()
+            .contains(keep_core::agent::TOKEN_PREFIX)
+        {
+            "(not shown: the path looks like a token; pass the path of the file holding it)"
+                .to_string()
+        } else {
+            path.display().to_string()
+        };
+        let fail = |m: String| AgentError::Other(format!("token file {shown}: {m}"));
         // Non-blocking, so a FIFO put in its place cannot hang the open.
         let flags = rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY;
         let mut file = std::fs::OpenOptions::new()
@@ -159,10 +180,12 @@ pub struct Timing {
     /// Refused requests in a row after which the gateway closes the
     /// connection.
     pub refusals_in_a_row: u32,
+    /// How long the gateway may take to accept a connection.
+    pub connect_timeout: Duration,
     /// How long an answer may take.
-    pub answer: Duration,
+    pub answer_timeout: Duration,
     /// How long sending a request may take.
-    pub write: Duration,
+    pub write_timeout: Duration,
 }
 
 impl Default for Timing {
@@ -172,8 +195,9 @@ impl Default for Timing {
             fresh_for: gateway.pre_auth.saturating_sub(Duration::from_secs(1)),
             idle_for: gateway.idle.saturating_sub(Duration::from_secs(10)),
             refusals_in_a_row: gateway.refusals_in_a_row,
-            answer: Duration::from_secs(300),
-            write: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
+            answer_timeout: Duration::from_secs(150),
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -191,11 +215,19 @@ struct Conn {
 }
 
 impl Conn {
-    fn open(socket: &Path, gateway_uid: u32, timing: &Timing) -> Result<Self> {
-        let stream = server::connect_checked(socket, gateway_uid)?;
-        let io = |e: std::io::Error| AgentError::Other(format!("{}: {e}", socket.display()));
-        stream.set_read_timeout(Some(timing.answer)).map_err(io)?;
-        stream.set_write_timeout(Some(timing.write)).map_err(io)?;
+    fn open(
+        socket: &Path,
+        gateway_uid: u32,
+        timing: &Timing,
+    ) -> std::result::Result<Self, ConnectError> {
+        let stream = server::connect_verified(socket, gateway_uid, timing.connect_timeout)?;
+        let io = |e: std::io::Error| ConnectError::Rejected(format!("{}: {e}", socket.display()));
+        stream
+            .set_read_timeout(Some(timing.answer_timeout))
+            .map_err(io)?;
+        stream
+            .set_write_timeout(Some(timing.write_timeout))
+            .map_err(io)?;
         let reader = BufReader::with_capacity(64 * 1024, stream.try_clone().map_err(io)?);
         let now = Instant::now();
         Ok(Self {
@@ -246,15 +278,18 @@ impl Conn {
         (&mut self.reader)
             .take(MAX_ANSWER as u64 + 1)
             .read_until(b'\n', &mut line)?;
-        if line.pop() != Some(b'\n') {
-            let why = if line.len() > MAX_ANSWER {
-                "answer too long"
-            } else {
-                "the gateway closed the connection"
-            };
-            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, why));
+        if line.last() == Some(&b'\n') {
+            line.pop();
+            return Ok(line);
         }
-        Ok(line)
+        Err(if line.len() > MAX_ANSWER {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "answer too long")
+        } else {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the gateway closed the connection",
+            )
+        })
     }
 }
 
@@ -273,7 +308,7 @@ fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn sort(line: &[u8]) -> Incoming {
+fn classify(line: &[u8]) -> Incoming {
     if line.iter().all(u8::is_ascii_whitespace) {
         return Incoming::Drop;
     }
@@ -308,12 +343,17 @@ fn sort(line: &[u8]) -> Incoming {
     }
 }
 
-/// A line from the client of at most `max` bytes, `Err(())` for a longer
-/// one (read through and discarded), or `None` at the end of input.
-fn read_line(
-    input: &mut impl BufRead,
-    max: usize,
-) -> std::io::Result<Option<std::result::Result<Vec<u8>, ()>>> {
+/// A line from the client.
+#[derive(Debug, PartialEq)]
+enum Line {
+    Text(Vec<u8>),
+    /// Longer than the limit: read through and discarded.
+    TooLong,
+}
+
+/// The next line from the client of at most `max` bytes, or `None` at the
+/// end of input.
+fn read_line(input: &mut impl BufRead, max: usize) -> std::io::Result<Option<Line>> {
     let mut line = Vec::new();
     let mut too_long = false;
     loop {
@@ -324,9 +364,9 @@ fn read_line(
         };
         if buf.is_empty() {
             return Ok(match (too_long, line.is_empty()) {
-                (true, _) => Some(Err(())),
+                (true, _) => Some(Line::TooLong),
                 (false, true) => None,
-                (false, false) => Some(Ok(line)),
+                (false, false) => Some(Line::Text(line)),
             });
         }
         let (chunk, used, done) = match buf.iter().position(|&b| b == b'\n') {
@@ -344,14 +384,24 @@ fn read_line(
         input.consume(used);
         if done {
             if too_long {
-                return Ok(Some(Err(())));
+                return Ok(Some(Line::TooLong));
             }
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(Some(Ok(line)));
+            return Ok(Some(Line::Text(line)));
         }
     }
+}
+
+/// Why a request got no answer.
+enum Failure {
+    /// No connection could be made, so nothing was sent.
+    NoConnection(String),
+    /// The gateway cannot have read the request.
+    Unread(String),
+    /// The gateway may have read the request.
+    Lost(String),
 }
 
 /// The bridge: one token, one gateway, at most one connection at a time.
@@ -365,17 +415,31 @@ pub struct Bridge {
 
 impl Bridge {
     /// Connect to the gateway at `socket`, which must be served by
-    /// `gateway_uid` from a directory only that uid can write. Nothing is
-    /// sent until a request comes.
+    /// `gateway_uid` from a directory only that uid can write, or fail if
+    /// anything there is not the gateway's. A gateway that is not running
+    /// yet is connected to when the first request comes. Nothing is sent
+    /// until then.
     pub fn connect(socket: &Path, gateway_uid: u32, token: Token, timing: Timing) -> Result<Self> {
-        let conn = Conn::open(socket, gateway_uid, &timing)?;
+        let conn = match Conn::open(socket, gateway_uid, &timing) {
+            Ok(conn) => Some(conn),
+            Err(ConnectError::Absent(why)) => {
+                tracing::debug!(%why, "the gateway is not running yet");
+                None
+            }
+            Err(e @ ConnectError::Rejected(_)) => return Err(e.into()),
+        };
         Ok(Self {
             socket: socket.to_path_buf(),
             gateway_uid,
             token,
             timing,
-            conn: Some(conn),
+            conn,
         })
+    }
+
+    /// Whether a connection to the gateway is open.
+    pub fn is_connected(&self) -> bool {
+        self.conn.is_some()
     }
 
     /// Bridge `input` to the gateway and its answers to `output` until
@@ -385,12 +449,8 @@ impl Bridge {
         loop {
             let incoming = match read_line(&mut input, MAX_LINE).map_err(io)? {
                 None => return Ok(()),
-                Some(Ok(line)) => sort(&line),
-                Some(Err(())) => Incoming::Answer(rpc_error(
-                    Value::Null,
-                    -32600,
-                    "request too large for the gateway",
-                )),
+                Some(Line::Text(line)) => classify(&line),
+                Some(Line::TooLong) => Incoming::Answer(rpc_error(Value::Null, -32600, TOO_LARGE)),
             };
             let answer = match incoming {
                 Incoming::Drop => continue,
@@ -405,68 +465,59 @@ impl Bridge {
         }
     }
 
-    /// A connection the gateway will read a request from now.
-    fn ready(&mut self) -> Result<&mut Conn> {
-        let conn = match self.conn.take() {
-            Some(conn) if conn.usable(&self.timing) => conn,
-            _ => Conn::open(&self.socket, self.gateway_uid, &self.timing)?,
-        };
-        Ok(self.conn.insert(conn))
-    }
-
     /// Send one request and return the gateway's answer, or an error for the
     /// client that says whether the request may have been carried out.
     fn forward(&mut self, id: Value, message: &[u8]) -> Value {
         let line = self.token.envelope(message);
         if line.len() - 1 > MAX_LINE {
-            return rpc_error(id, -32600, "request too large for the gateway");
+            return rpc_error(id, -32600, TOO_LARGE);
         }
-        // A request whose line was not sent whole was never read, so it may
-        // go once more on a new connection.
-        for attempt in 0..2 {
-            let conn = match self.ready() {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::error!(error = %e, "the gateway cannot be reached");
-                    return rpc_error(
-                        id,
-                        UNREACHABLE,
-                        "the gateway cannot be reached; the request was not sent",
-                    );
-                }
-            };
-            if let Err(e) = conn.send(&line) {
-                self.conn = None;
-                if attempt == 0 {
-                    continue;
-                }
-                tracing::error!(error = %e, "the request could not be sent to the gateway");
-                return rpc_error(
-                    id,
-                    UNREACHABLE,
-                    "the gateway cannot be reached; the request was not sent",
-                );
+        let mut outcome = self.attempt(&line, &id);
+        // A request the gateway cannot have read goes once more, on a new
+        // connection.
+        if let Err(Failure::Unread(why)) = &outcome {
+            tracing::debug!(%why, "the request was not read; sending it again");
+            outcome = self.attempt(&line, &id);
+        }
+        match outcome {
+            Ok(answer) => answer,
+            Err(Failure::NoConnection(why) | Failure::Unread(why)) => {
+                tracing::error!(%why, "the request was not sent to the gateway");
+                rpc_error(id, UNREACHABLE, NOT_SENT)
             }
-            // Sent: from here the gateway may have acted on it.
-            let answer = conn
-                .answer()
-                .map_err(|e| e.to_string())
-                .and_then(|answer| take_answer(conn, &answer, &id));
-            return match answer {
-                Ok(answer) => answer,
-                Err(e) => {
-                    self.conn = None;
-                    tracing::error!(error = %e, "no answer from the gateway");
-                    rpc_error(
-                        id,
-                        LOST,
-                        "the connection to the gateway closed before it answered; the request \
-                         may have been carried out, so it was not sent again",
-                    )
-                }
-            };
+            Err(Failure::Lost(why)) => {
+                tracing::error!(%why, "no answer from the gateway");
+                rpc_error(id, LOST, MAYBE_DONE)
+            }
         }
-        unreachable!("the second attempt always returns")
+    }
+
+    /// Send a request line on a connection the gateway will read it from,
+    /// and take its answer.
+    fn attempt(&mut self, line: &[u8], id: &Value) -> std::result::Result<Value, Failure> {
+        let conn = match self.conn.take() {
+            Some(conn) if conn.usable(&self.timing) => conn,
+            _ => Conn::open(&self.socket, self.gateway_uid, &self.timing)
+                .map_err(|e| Failure::NoConnection(e.to_string()))?,
+        };
+        let conn = self.conn.insert(conn);
+        let outcome = match conn.send(line) {
+            Err(e) => Err(Failure::Unread(e.to_string())),
+            // Sent: from here the gateway may have acted on it.
+            Ok(()) => match conn.answer() {
+                Ok(answer) => take_answer(conn, &answer, id).map_err(Failure::Lost),
+                // The gateway closed the connection with the request still
+                // unread in it.
+                Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                    Err(Failure::Unread(e.to_string()))
+                }
+                Err(e) => Err(Failure::Lost(e.to_string())),
+            },
+        };
+        if outcome.is_err() {
+            self.conn = None;
+        }
+        outcome
     }
 }
 
@@ -504,14 +555,11 @@ fn take_answer(conn: &mut Conn, answer: &[u8], id: &Value) -> std::result::Resul
 
 #[cfg(test)]
 mod tests {
+    use super::testing::me;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
     const TOKEN: &str = "keep_agt_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    fn me() -> u32 {
-        rustix::process::geteuid().as_raw()
-    }
 
     fn token_file(dir: &Path, contents: &str, mode: u32) -> PathBuf {
         let path = dir.join(format!("token-{mode:o}-{}", contents.len()));
@@ -549,6 +597,10 @@ mod tests {
         let err = read_err(&token_file(dir.path(), TOKEN, 0o600), me() + 1);
         assert!(err.contains("is owned by uid"), "{err}");
         assert!(read_err(&dir.path().join("missing"), me()).contains("missing"));
+        // The token itself given as the path is not repeated.
+        let err = read_err(Path::new(TOKEN), me());
+        assert!(err.contains("not shown"), "{err}");
+        assert!(!err.contains("0123456789abcdef"), "{err}");
         assert!(read_err(dir.path(), me()).contains("not a regular file"));
 
         // A FIFO is refused without waiting for a writer.
@@ -604,8 +656,8 @@ mod tests {
     }
 
     #[test]
-    fn client_messages_are_sorted_into_requests_notifications_and_errors() {
-        let forward = |line: &str| match sort(line.as_bytes()) {
+    fn client_messages_are_classified_as_requests_notifications_and_errors() {
+        let forward = |line: &str| match classify(line.as_bytes()) {
             Incoming::Forward { id, message } => {
                 (id, serde_json::from_slice::<Value>(&message).unwrap())
             }
@@ -623,9 +675,9 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":3,"result":{}}"#,
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":1,"message":"x"}}"#,
         ] {
-            assert_eq!(sort(drop.as_bytes()), Incoming::Drop, "{drop}");
+            assert_eq!(classify(drop.as_bytes()), Incoming::Drop, "{drop}");
         }
-        let answer = |line: &str| match sort(line.as_bytes()) {
+        let answer = |line: &str| match classify(line.as_bytes()) {
             Incoming::Answer(a) => (a["id"].clone(), a["error"]["code"].as_i64().unwrap()),
             other => panic!("{line}: {other:?}"),
         };
@@ -644,13 +696,16 @@ mod tests {
         let mut input =
             std::io::Cursor::new([b"a\r\n".as_slice(), &[b'x'; 40], b"\nb\nlast"].concat());
         let mut next = || read_line(&mut input, 10).unwrap();
-        assert_eq!(next(), Some(Ok(b"a".to_vec())));
-        assert_eq!(next(), Some(Err(())));
-        assert_eq!(next(), Some(Ok(b"b".to_vec())));
-        assert_eq!(next(), Some(Ok(b"last".to_vec())));
+        assert_eq!(next(), Some(Line::Text(b"a".to_vec())));
+        assert_eq!(next(), Some(Line::TooLong));
+        assert_eq!(next(), Some(Line::Text(b"b".to_vec())));
+        assert_eq!(next(), Some(Line::Text(b"last".to_vec())));
         assert_eq!(next(), None);
         let mut long_at_end = std::io::Cursor::new(vec![b'y'; 11]);
-        assert_eq!(read_line(&mut long_at_end, 10).unwrap(), Some(Err(())));
+        assert_eq!(
+            read_line(&mut long_at_end, 10).unwrap(),
+            Some(Line::TooLong)
+        );
         assert_eq!(read_line(&mut long_at_end, 10).unwrap(), None);
     }
 }
@@ -783,14 +838,19 @@ pub(crate) mod testing {
     }
 
     impl Fake {
-        pub(crate) fn start(handler: impl Fn(Peer) + Send + Sync + 'static) -> Self {
+        /// A directory for a gateway that is not listening yet.
+        pub(crate) fn empty() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("agent.sock");
-            let fake = Self {
+            Self {
                 dir,
                 path,
                 log: Arc::default(),
-            };
+            }
+        }
+
+        pub(crate) fn start(handler: impl Fn(Peer) + Send + Sync + 'static) -> Self {
+            let fake = Self::empty();
             fake.listen(handler);
             fake
         }
@@ -845,8 +905,9 @@ pub(crate) mod testing {
             fresh_for: Duration::from_secs(60),
             idle_for: Duration::from_secs(60),
             refusals_in_a_row: 3,
-            answer: Duration::from_secs(10),
-            write: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            answer_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -857,6 +918,7 @@ mod socket_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
 
     const TOKEN: &str = "keep_agt_00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -952,15 +1014,19 @@ mod socket_tests {
         assert!(err.contains("is owned by uid"), "{err}");
 
         // A directory others could write, found on reconnecting.
-        let fake = Fake::start(|mut peer| {
+        let (closed, wait_closed) = mpsc::channel();
+        let fake = Fake::start(move |mut peer| {
             if peer.index != 0 {
                 return peer.serve();
             }
             let envelope = peer.next().unwrap();
             peer.ok(&envelope);
+            drop(peer);
+            closed.send(()).unwrap();
         });
         let mut client = Client::start(bridge(&fake, patient()));
         assert_eq!(client.call(1, "ping", json!({}))["result"], json!({}));
+        wait_closed.recv_timeout(Duration::from_secs(10)).unwrap();
         std::fs::set_permissions(fake.dir(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let answer = client.call(2, "ping", json!({}));
         assert_eq!(code(&answer), Some(UNREACHABLE), "{answer}");
@@ -987,13 +1053,17 @@ mod socket_tests {
     #[test]
     fn a_stopped_gateway_is_reported_and_a_restarted_one_used_again() {
         // The gateway answers one request and stops.
-        let fake = Fake::start(|mut peer| {
+        let (closed, wait_closed) = mpsc::channel();
+        let fake = Fake::start(move |mut peer| {
             if let Some(envelope) = peer.next() {
                 peer.ok(&envelope);
             }
+            drop(peer);
+            closed.send(()).unwrap();
         });
         let mut client = Client::start(bridge(&fake, patient()));
         assert_eq!(client.call(1, "ping", json!({}))["result"], json!({}));
+        wait_closed.recv_timeout(Duration::from_secs(10)).unwrap();
         fake.remove();
         let answer = client.call(2, "ping", json!({}));
         assert_eq!(code(&answer), Some(UNREACHABLE), "{answer}");
@@ -1082,6 +1152,7 @@ mod socket_tests {
     #[test]
     fn a_connection_with_unasked_data_on_it_is_not_used() {
         for delay in [None, Some(Duration::from_millis(100))] {
+            let (written, wait_written) = mpsc::channel();
             let fake = Fake::start(move |mut peer| {
                 if peer.index != 0 {
                     return peer.serve();
@@ -1098,11 +1169,12 @@ mod socket_tests {
                         peer.reply(&answer);
                     }
                 }
+                written.send(()).unwrap();
                 peer.serve();
             });
             let mut client = Client::start(bridge(&fake, patient()));
             assert_eq!(client.call(1, "ping", json!({}))["result"], json!({}));
-            std::thread::sleep(Duration::from_millis(300));
+            wait_written.recv_timeout(Duration::from_secs(10)).unwrap();
             let answer = client.call(2, "ping", json!({}));
             assert_eq!(answer["result"], json!({}), "{delay:?}: {answer}");
             client.finish().unwrap();
@@ -1127,19 +1199,24 @@ mod socket_tests {
             }
             *got.lock().unwrap() = Some(peer.rest());
         });
+        let big = "a".repeat(MAX_LINE - 1024);
+        // The request must not fit the socket's send buffer whole.
+        let send_buffer = std::fs::read_to_string("/proc/sys/net/core/wmem_default")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if send_buffer >= big.len() / 2 {
+            eprintln!("skipped: a {send_buffer} byte send buffer holds the whole request");
+            return;
+        }
         let timing = Timing {
-            write: Duration::from_millis(300),
+            write_timeout: Duration::from_millis(300),
             ..patient()
         };
         let mut client = Client::start(bridge(&fake, timing));
-        let big = "a".repeat(900 * 1024);
         let answer = client.call(1, "tools/call", json!({ "padding": big }));
-        assert_eq!(
-            answer["result"],
-            json!({}),
-            "{}",
-            &answer.to_string()[..200]
-        );
+        let shown: String = answer.to_string().chars().take(200).collect();
+        assert_eq!(answer["result"], json!({}), "{shown}");
         done.store(true, Ordering::SeqCst);
         client.finish().unwrap();
         assert_eq!(fake.ids(), [(1, json!(1))]);
@@ -1176,5 +1253,51 @@ mod socket_tests {
         assert_eq!(client.call(3, "ping", json!({}))["result"], json!({}));
         client.finish().unwrap();
         assert_eq!(fake.ids(), [(0, json!(3))]);
+    }
+
+    /// The gateway closed the connection with the request unread in it, as
+    /// it does to a uid holding too many connections: never read, so it goes
+    /// once more, and is reported as not sent if that fails too.
+    #[test]
+    fn a_request_closed_unread_is_sent_again_and_never_reported_as_lost() {
+        fn close_unread(peer: Peer) {
+            // Let the request arrive, then close without reading it.
+            std::thread::sleep(Duration::from_millis(200));
+            drop(peer);
+        }
+        let fake = Fake::start(|peer| {
+            if peer.index == 0 {
+                close_unread(peer);
+            } else {
+                peer.serve();
+            }
+        });
+        let mut client = Client::start(bridge(&fake, patient()));
+        assert_eq!(client.call(1, "ping", json!({}))["result"], json!({}));
+        client.finish().unwrap();
+        assert_eq!(fake.ids(), [(1, json!(1))]);
+
+        let fake = Fake::start(close_unread);
+        let mut client = Client::start(bridge(&fake, patient()));
+        let answer = client.call(1, "ping", json!({}));
+        assert_eq!(code(&answer), Some(UNREACHABLE), "{answer}");
+        client.finish().unwrap();
+        assert!(fake.log().is_empty());
+    }
+
+    /// A gateway that is not running yet when the bridge starts is used
+    /// once it is.
+    #[test]
+    fn the_bridge_starts_before_the_gateway() {
+        let fake = Fake::empty();
+        let bridge = Bridge::connect(&fake.path, me(), token(TOKEN), patient()).unwrap();
+        assert!(!bridge.is_connected());
+        let mut client = Client::start(bridge);
+        let answer = client.call(1, "ping", json!({}));
+        assert_eq!(code(&answer), Some(UNREACHABLE), "{answer}");
+        fake.listen(Peer::serve);
+        assert_eq!(client.call(2, "ping", json!({}))["result"], json!({}));
+        client.finish().unwrap();
+        assert_eq!(fake.ids(), [(0, json!(2))]);
     }
 }

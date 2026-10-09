@@ -7,9 +7,9 @@
 //! that keep agents from filling the audit log (see [`AgentAudit`]).
 
 mod audit;
-mod credential;
 #[cfg(all(feature = "mcp", target_os = "linux"))]
 pub mod bridge;
+mod credential;
 #[cfg(all(feature = "mcp", target_os = "linux"))]
 pub mod daemon;
 

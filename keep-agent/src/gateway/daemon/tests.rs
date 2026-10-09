@@ -1579,31 +1579,37 @@ mod sockets {
     /// An MCP client's session through `keep agent connect` and a running
     /// gateway: served as the grant allows when this test's uid can hold a
     /// credential, refused alike otherwise. Connections the gateway closes,
-    /// idle or after refusals, are replaced without losing a request.
+    /// at its deadlines or after refusals, are replaced without losing a
+    /// request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_mcp_session_runs_through_the_bridge() {
         use crate::gateway::bridge::testing::{token, Client};
         use crate::gateway::bridge::{Bridge, Timing, LOST, UNREACHABLE};
 
-        let gw = running(None).await;
+        let gateway = Limits {
+            idle: Duration::from_secs(1),
+            ..limits()
+        };
+        let gw = running_with(None, gateway.clone()).await;
         let unknown = format!("{}{}", keep_core::agent::TOKEN_PREFIX, "5".repeat(64));
         let held = gw.token.clone();
         let agent = gw.agent.clone();
-        let gateway = limits();
         let timing = Timing {
             fresh_for: gateway.pre_auth - Duration::from_millis(100),
-            idle_for: gateway.idle - Duration::from_secs(1),
+            idle_for: gateway.idle - Duration::from_millis(200),
             refusals_in_a_row: gateway.refusals_in_a_row,
-            answer: Duration::from_secs(10),
-            write: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            answer_timeout: Duration::from_secs(10),
+            write_timeout: Duration::from_secs(10),
         };
         tokio::task::spawn_blocking(move || {
             let me = my_uid();
             let text = held.clone().unwrap_or(unknown.clone());
             let bridge = Bridge::connect(&agent, me, token(&text), timing.clone()).unwrap();
             let mut client = Client::start(bridge);
-            // Past the pre-auth deadline of the connection opened at start.
-            std::thread::sleep(Duration::from_millis(600));
+            // Past the pre-auth deadline of the connection opened at start:
+            // the gateway has closed it.
+            std::thread::sleep(gateway.pre_auth + Duration::from_millis(200));
             let init = client.call(1, "initialize", json!({ "protocolVersion": "2024-11-05" }));
             client.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
             let list = client.call(2, "tools/list", json!({}));
@@ -1642,8 +1648,9 @@ mod sockets {
                         .unwrap();
                 assert_eq!(event["content"], json!("through the bridge"));
                 assert_eq!(denied["result"]["isError"], json!(true), "{denied}");
-                // Idle past the gateway's timeout, then served again.
-                std::thread::sleep(gateway.idle + Duration::from_millis(500));
+                // Idle past the gateway's timeout, so it closed the
+                // connection, then served again.
+                std::thread::sleep(gateway.idle + Duration::from_millis(300));
                 assert_eq!(client.call(6, "ping", json!({}))["result"], json!({}));
             } else {
                 // Five refusals: the gateway closed the connection after

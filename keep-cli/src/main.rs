@@ -273,12 +273,9 @@ fn dispatch_agent(
             max_amount_sats,
             allow_address,
         ),
+        // Run before the vault path is resolved, in `run`.
         #[cfg(target_os = "linux")]
-        AgentCommands::Connect {
-            token_file,
-            socket,
-            gateway_user,
-        } => commands::agent::cmd_agent_connect(&token_file, &socket, &gateway_user),
+        AgentCommands::Connect { .. } => unreachable!("keep agent connect is dispatched earlier"),
     }
 }
 

@@ -2488,6 +2488,18 @@ fn test_agent_connect_refuses_before_sending_anything() {
         .args([&token])
         .run();
     refused(&output, "refusing to run with KEEP_PASSWORD");
+    for var in [
+        "KEEP_NEW_PASSWORD",
+        "KEEP_HIDDEN_PASSWORD",
+        "KEEP_DURESS_PASSWORD",
+        "KEEP_NSEC",
+        "KEEP_STORAGE_KEY",
+        "KEEP_WEB_AUTH_TOKEN",
+    ] {
+        let mut cmd = Command::new(&keep);
+        cmd.env_clear().env(var, TEST_PASSWORD);
+        refused(&connect(&mut cmd), &format!("refusing to run with {var}"));
+    }
 
     let mut bare = Command::new(&keep);
     bare.env_clear();

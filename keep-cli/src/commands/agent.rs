@@ -160,10 +160,18 @@ pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -
     let gateway_uid = super::gateway::gateway_uid(gateway_user)?;
     let mut bridge = Bridge::connect(socket, gateway_uid, token, Timing::default())
         .map_err(|e| KeepError::Runtime(format!("connect to the gateway: {e}")))?;
-    eprintln!(
-        "keep agent connect: connected to the gateway at {}",
-        socket.display()
-    );
+    if bridge.is_connected() {
+        eprintln!(
+            "keep agent connect: connected to the gateway at {}",
+            socket.display()
+        );
+    } else {
+        eprintln!(
+            "keep agent connect: the gateway at {} is not running yet; requests fail \
+             until it is",
+            socket.display()
+        );
+    }
     bridge
         .serve(std::io::stdin().lock(), std::io::stdout().lock())
         .map_err(runtime)
