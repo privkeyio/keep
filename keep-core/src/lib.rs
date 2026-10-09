@@ -724,6 +724,9 @@ impl Keep {
         let Some(hash) = crate::agent::hash_presented_token(token) else {
             return Ok(Err(unknown));
         };
+        // Read whatever the token matches, so an unknown token costs the same
+        // reads as a real one and how long a refusal takes tells nothing.
+        let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
         let mut found = None;
         let mut matched = 0usize;
         for credential in self.storage.list_agent_credentials()? {
@@ -738,7 +741,6 @@ impl Keep {
             (1, Some(credential)) => credential,
             _ => return Ok(Err(unknown)),
         };
-        let all_frozen = self.storage.get_agent_freeze().unwrap_or(true);
         match credential.check_usable(peer_uid, now, all_frozen) {
             Ok(()) => Ok(Ok(credential)),
             Err(reason) => Ok(Err(AgentRefused {

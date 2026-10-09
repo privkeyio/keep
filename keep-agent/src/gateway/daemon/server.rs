@@ -16,7 +16,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-use super::state::State;
+use super::state::{pool, BoundUids, State, UNBOUND};
 use crate::error::{AgentError, Result};
 
 /// The longest request line read, which holds the largest PSBT keep signs.
@@ -25,8 +25,11 @@ pub const MAX_LINE: usize = 1024 * 1024;
 /// Connection limits and timeouts.
 #[derive(Debug, Clone)]
 pub struct Limits {
-    /// Open agent connections one uid may hold.
+    /// Open agent connections one uid a credential is bound to may hold.
     pub connections_per_uid: usize,
+    /// Open agent connections every uid no credential is bound to may hold
+    /// together.
+    pub unbound_connections: usize,
     /// Open agent connections in all.
     pub connections: usize,
     /// Open admin connections.
@@ -48,6 +51,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             connections_per_uid: 8,
+            unbound_connections: 8,
             connections: 128,
             admin_connections: 4,
             pre_auth: Duration::from_secs(5),
@@ -259,8 +263,9 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
     }
 }
 
-/// Logs a refused connection at most once a minute per uid, so a peer cannot
-/// flood the journal and push out what matters.
+/// Logs a refused connection at most once a minute per key (a bound uid, or
+/// [`UNBOUND`] for every other), so a peer cannot flood the journal and push
+/// out what matters.
 #[derive(Default)]
 struct Throttle(HashMap<u32, tokio::time::Instant>);
 
@@ -305,6 +310,18 @@ impl Slots {
             uid,
         })
     }
+}
+
+/// A slot for an agent connection from `uid`: its own when a credential is
+/// bound to it, otherwise one of the few every unbound uid shares.
+fn agent_slot(slots: &Slots, bound: &BoundUids, uid: u32, limits: &Limits) -> Option<Slot> {
+    let key = pool(bound, uid);
+    let per_key = if key == UNBOUND {
+        limits.unbound_connections
+    } else {
+        limits.connections_per_uid
+    };
+    slots.take(key, per_key, limits.connections)
 }
 
 impl Drop for Slot {
@@ -438,6 +455,26 @@ async fn accept_failed(e: std::io::Error) {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
+/// Record deferred refusals and passed refusal windows every 10 seconds, and
+/// persist the clock every minute. Apart from the accept loop, so a timer
+/// waiting on the state never holds up accepting connections or stopping.
+async fn timers(state: Shared, stop: watch::Sender<bool>) {
+    let mut flush = tokio::time::interval(Duration::from_secs(10));
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+    loop {
+        tokio::select! {
+            _ = flush.tick() => {
+                with_state(&state, &stop, State::tick).await;
+            }
+            _ = heartbeat.tick() => {
+                if let Some(Err(e)) = with_state(&state, &stop, State::persist_heartbeat).await {
+                    tracing::error!(error = %e, "the gateway clock could not be persisted");
+                }
+            }
+        }
+    }
+}
+
 /// Serve both sockets until `shutdown` resolves or the state becomes
 /// unusable, then write out what is held in memory.
 pub async fn serve(
@@ -449,26 +486,18 @@ pub async fn serve(
 ) -> Result<()> {
     let admin_uid = state.admin_uid();
     let is_admin = move |uid: u32| uid == 0 || admin_uid == Some(uid);
+    let bound = state.bound_uids();
     let state: Shared = Arc::new(Mutex::new(state));
     let (stop, mut stopped) = watch::channel(false);
     let agent_slots = Slots::default();
     let mut refused_log = Throttle::default();
     let admin_slots = Slots::default();
-    let mut flush = tokio::time::interval(Duration::from_secs(10));
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let timers = tokio::spawn(timers(state.clone(), stop.clone()));
     tokio::pin!(shutdown);
     let failed = loop {
         tokio::select! {
             () = &mut shutdown => break false,
             _ = stopped.changed() => break true,
-            _ = flush.tick() => {
-                with_state(&state, &stop, State::tick).await;
-            }
-            _ = heartbeat.tick() => {
-                if let Some(Err(e)) = with_state(&state, &stop, State::persist_heartbeat).await {
-                    tracing::error!(error = %e, "the gateway clock could not be persisted");
-                }
-            }
             accepted = agent.accept() => {
                 let stream = match accepted {
                     Ok((stream, _)) => stream,
@@ -479,14 +508,14 @@ pub async fn serve(
                 };
                 let Ok(cred) = stream.peer_cred() else { continue };
                 let uid = cred.uid();
-                match agent_slots.take(uid, limits.connections_per_uid, limits.connections) {
+                match agent_slot(&agent_slots, &bound, uid, &limits) {
                     Some(slot) => {
                         tokio::spawn(agent_connection(
                             stream, uid, state.clone(), limits.clone(), stop.clone(), slot,
                         ));
                     }
                     None => {
-                        if refused_log.allow(uid) {
+                        if refused_log.allow(pool(&bound, uid)) {
                             tracing::warn!(uid, "agent connection refused: too many open");
                         }
                     }
@@ -523,6 +552,8 @@ pub async fn serve(
             }
         }
     };
+    timers.abort();
+    let _ = timers.await;
     drop(agent);
     drop(admin);
     let state = state.clone();
@@ -553,7 +584,38 @@ pub fn remove_socket(path: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LineReader, Throttle};
+    use super::{agent_slot, Limits, LineReader, Slots, Throttle};
+    use crate::gateway::daemon::state::BoundUids;
+
+    /// Uids credentials are bound to get their own slots, under the total;
+    /// every other uid shares a few, so controlling many uids crowds out no
+    /// bound one.
+    #[test]
+    fn unbound_uids_share_a_few_slots_and_every_slot_counts_toward_the_total() {
+        let limits = Limits {
+            connections_per_uid: 2,
+            unbound_connections: 3,
+            connections: 6,
+            ..Limits::default()
+        };
+        let bound = BoundUids::default();
+        bound.write().unwrap().extend([10, 11]);
+        let slots = Slots::default();
+        let take = |uid| agent_slot(&slots, &bound, uid, &limits);
+        let unbound: Vec<_> = (100..103).map(|uid| take(uid).unwrap()).collect();
+        assert!(take(103).is_none(), "the unbound share is full");
+        assert!(take(u32::MAX).is_none());
+        let a = [take(10).unwrap(), take(10).unwrap()];
+        assert!(take(10).is_none(), "per bound uid");
+        let b = take(11).unwrap();
+        assert!(take(11).is_none(), "the total is reached");
+        drop(unbound);
+        assert!(take(11).is_some());
+        drop((a, b));
+        // A uid bound later gets its own slots.
+        bound.write().unwrap().insert(103);
+        assert!(take(103).is_some());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn refused_connections_are_logged_once_a_minute_per_uid() {

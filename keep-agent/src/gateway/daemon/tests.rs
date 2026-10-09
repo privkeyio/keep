@@ -963,8 +963,12 @@ fn start_refuses_what_it_cannot_serve_safely() {
         .issue_agent_credential("bad", HOST.vault_owner, grant, T0, 3_600)
         .unwrap();
     assert!(err(keep, settings(), HOST).contains(&bad.id_hex()));
-    let (mut keep, _) = vault(dir.path());
+    let (mut keep, key) = vault(dir.path());
     keep.revoke_agent_credential(&bad.id).unwrap();
+    // One that has expired serves nothing, so it does not stop a start.
+    let grant = serde_json::to_vec(&nostr_grant(key)).unwrap();
+    keep.issue_agent_credential("old", HOST.vault_owner, grant, T0 - 10_000, 3_600)
+        .unwrap();
     start(keep, settings(), &boot, BOOT).unwrap();
 }
 
@@ -1309,6 +1313,7 @@ mod sockets {
     fn limits() -> Limits {
         Limits {
             connections_per_uid: 2,
+            unbound_connections: 2,
             connections: 4,
             admin_connections: 1,
             pre_auth: Duration::from_millis(400),
@@ -1754,4 +1759,130 @@ fn a_vault_fault_during_authentication_is_a_uniform_refusal() {
         .is_some());
     g.state.keep_mut().lock();
     assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+}
+
+/// Every uid no credential is bound to shares one request allowance, so an
+/// agent controlling many uids can neither fill the uid tracker nor use up a
+/// bound uid's requests. A uid stops being bound when its credential is
+/// deleted.
+#[test]
+fn unbound_uids_share_one_allowance_and_cannot_crowd_out_a_bound_uid() {
+    let mut s = settings();
+    s.uid_limits = RequestLimits {
+        per_minute: 2,
+        per_hour: 100,
+        per_day: 1_000,
+    };
+    let mut g = Gw::with(s);
+    let (id, token) = g.issue(&nostr_grant(g.key), AGENT);
+    assert_eq!(g.send(5_000, "nope", ping()), Some(refused(json!(1))));
+    assert_eq!(g.send(5_001, "nope", ping()), Some(refused(json!(1))));
+    assert_eq!(
+        g.send(5_002, "nope", ping()),
+        Some(refused(Value::Null)),
+        "the unbound allowance is shared"
+    );
+    // One of the bound uid's two requests this minute, so a refusal below
+    // comes from the unbound allowance, not its own.
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
+    g.admin_ok(json!({ "op": "delete", "id": id }));
+    assert_eq!(
+        g.send(AGENT, "nope", ping()),
+        Some(refused(Value::Null)),
+        "unbound once its credential is deleted"
+    );
+
+    let mut s = settings();
+    s.uid_limits = RequestLimits {
+        per_minute: 100_000,
+        per_hour: 100_000,
+        per_day: 100_000,
+    };
+    let mut g = Gw::with(s);
+    let (_, token) = g.issue(&nostr_grant(g.key), AGENT);
+    for uid in 10_000..12_000 {
+        g.send(uid, "nope", ping());
+    }
+    assert!(
+        g.send(AGENT, &token, ping())
+            .unwrap()
+            .get("result")
+            .is_some(),
+        "thousands of unbound uids do not fill the tracker"
+    );
+}
+
+/// A credential over its audit budget is frozen and served nothing, not even
+/// a ping; unfreezing restores its budget.
+#[test]
+fn a_credential_over_its_audit_budget_is_served_nothing_until_unfrozen() {
+    let mut s = settings();
+    s.audit_budgets = (3, u32::MAX);
+    let mut g = Gw::with(s);
+    let (id, token) = g.issue(&nostr_grant(g.key), AGENT);
+    for _ in 0..3 {
+        assert!(!g.tool(&token, "get_nostr_pubkey", json!({})).1);
+    }
+    let over = g.rpc(&token, "tools/call", json!({ "name": "get_nostr_pubkey" }));
+    assert_eq!(over["error"]["code"], json!(-32603), "{over}");
+    assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    let listed = g.admin_ok(json!({ "op": "list" }));
+    assert_eq!(listed[0]["frozen"], json!(true), "{listed}");
+    g.admin_ok(json!({ "op": "unfreeze", "id": id }));
+    assert!(g.rpc(&token, "ping", json!({})).get("result").is_some());
+    assert!(!g.tool(&token, "get_nostr_pubkey", json!({})).1);
+}
+
+/// Stopping writes out open refusal counts and refusals still deferred.
+#[test]
+fn stopping_writes_out_refusal_counts_and_deferred_refusals() {
+    let mut g = Gw::new();
+    let (id, token) = g.issue(&nostr_grant(g.key), AGENT);
+    for _ in 0..2 {
+        assert!(
+            g.tool(
+                &token,
+                "sign_nostr_event",
+                json!({ "kind": 4, "content": "" })
+            )
+            .1
+        );
+    }
+    assert_eq!(g.send(OTHER, &token, ping()), Some(refused(json!(1))));
+    g.state.shut_down();
+    let reasons = g.reasons(AuditEventType::AgentRefused);
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.starts_with(&format!("agent {id} denied x1 more since"))),
+        "{reasons:?}"
+    );
+    assert!(
+        reasons.contains(&format!(
+            "agent {id} unauthenticated \"presented by uid {OTHER}\""
+        )),
+        "{reasons:?}"
+    );
+}
+
+/// The uids credentials are bound to are read back at start.
+#[test]
+fn bound_uids_are_known_again_after_a_restart() {
+    let mut g = Gw::new();
+    let (_, token) = g.issue(&nostr_grant(g.key), AGENT);
+    let mut g = g.restart(BOOT, T0).unwrap();
+    let per_minute = settings().uid_limits.per_minute;
+    for uid in 0..per_minute {
+        g.send(20_000 + uid, "nope", ping());
+    }
+    assert_eq!(g.send(30_000, "nope", ping()), Some(refused(Value::Null)));
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
 }

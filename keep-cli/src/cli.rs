@@ -310,14 +310,17 @@ pub(crate) struct IssueArgs {
     /// every address may be paid
     #[arg(long = "allow-address")]
     pub(crate) allow_addresses: Vec<String>,
-    #[arg(long, default_value_t = 10)]
+    /// Requests the agent may make per minute
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_minute)]
     pub(crate) per_minute: u32,
-    #[arg(long, default_value_t = 100)]
+    /// Requests the agent may make per hour
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_hour)]
     pub(crate) per_hour: u32,
-    #[arg(long, default_value_t = 1000)]
+    /// Requests the agent may make per day
+    #[arg(long, default_value_t = keep_agent::policy::RequestLimits::default().per_day)]
     pub(crate) per_day: u32,
     /// Days until the credential expires
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = keep_agent::gateway::daemon::state::DEFAULT_TTL_SECS / 86_400)]
     pub(crate) ttl_days: u64,
     /// Write the token to this new file (mode 0600) instead of stdout
     #[arg(long)]

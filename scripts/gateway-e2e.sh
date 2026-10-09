@@ -32,10 +32,30 @@ A2=${P}a2
 OUT=${P}out
 AGENTS=${P}agents
 ADMINS=${P}admins
-WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 RUN=/run/${P}
 GW_PID=
 PASS=e2e-vault-password
+CREATED_USERS=()
+CREATED_GROUPS=()
+
+# Never touch accounts or a run directory this script did not create.
+for u in $GW $ADMIN $A1 $A2 $OUT; do
+    if getent passwd "$u" >/dev/null; then
+        echo "refusing to run: user $u already exists" >&2
+        exit 2
+    fi
+done
+for g in $AGENTS $ADMINS; do
+    if getent group "$g" >/dev/null; then
+        echo "refusing to run: group $g already exists" >&2
+        exit 2
+    fi
+done
+if [[ -e $RUN ]]; then
+    echo "refusing to run: $RUN already exists" >&2
+    exit 2
+fi
+WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 
 fail() {
     echo "FAIL: $*" >&2
@@ -47,23 +67,44 @@ fail() {
 }
 pass() { echo "ok - $*"; }
 
+# Wait at most 10 seconds for `pid` to exit, then kill it.
+reap() {
+    local pid=$1 status=0
+    for _ in $(seq 100); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || status=$?
+    return "$status"
+}
+
 cleanup() {
     if [[ -n $GW_PID ]] && kill -0 "$GW_PID" 2>/dev/null; then
         kill "$GW_PID" 2>/dev/null || true
-        wait "$GW_PID" 2>/dev/null || true
+        reap "$GW_PID" || true
     fi
-    for u in $GW $ADMIN $A1 $A2 $OUT; do userdel "$u" 2>/dev/null || true; done
-    for g in $AGENTS $ADMINS; do groupdel "$g" 2>/dev/null || true; done
+    # Anything left running as these users would keep userdel from removing them.
+    for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
+    for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
+    for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
     rm -rf "$WORK" "$RUN"
 }
 trap cleanup EXIT
 
-for g in $AGENTS $ADMINS; do groupadd --system "$g"; done
-useradd --system --no-create-home --shell /usr/sbin/nologin "$GW"
-useradd --system --no-create-home --shell /usr/sbin/nologin -G "$ADMINS" "$ADMIN"
-useradd --system --no-create-home --shell /usr/sbin/nologin -G "$AGENTS" "$A1"
-useradd --system --no-create-home --shell /usr/sbin/nologin -G "$AGENTS" "$A2"
-useradd --system --no-create-home --shell /usr/sbin/nologin "$OUT"
+for g in $AGENTS $ADMINS; do
+    groupadd --system "$g"
+    CREATED_GROUPS+=("$g")
+done
+add_user() {
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$@"
+    CREATED_USERS+=("${@: -1}")
+}
+add_user "$GW"
+add_user -G "$ADMINS" "$ADMIN"
+add_user -G "$AGENTS" "$A1"
+add_user -G "$AGENTS" "$A2"
+add_user "$OUT"
 uid() { id -u "$1"; }
 
 chmod 0755 "$WORK"
@@ -122,7 +163,7 @@ start_gateway() {
 stop_gateway() {
     kill -TERM "$GW_PID"
     local status=0
-    wait "$GW_PID" || status=$?
+    reap "$GW_PID" || status=$?
     GW_PID=
     [[ $status -eq 0 ]] || fail "gateway exited $status on SIGTERM"
 }

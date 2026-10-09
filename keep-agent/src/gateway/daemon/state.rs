@@ -6,7 +6,8 @@
 //! the owner. The socket layer passes each line in with the peer's uid and
 //! writes back what this returns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 
 use keep_bitcoin::Network;
 use keep_core::agent::{bindable_uid, AgentCredential, AgentRefusal};
@@ -22,6 +23,7 @@ use super::tools;
 use crate::error::{AgentError, Result};
 use crate::gateway::{
     authenticate, issue_credential, AgentAudit, GrantedCredential, RefusalKind, RefusedBecause,
+    AUDIT_BUDGET_PER_DAY, GATEWAY_AUDIT_BUDGET_PER_DAY,
 };
 use crate::policy::{
     evaluate, Budgets, Decision, DenyReason, Grant, Ledger, Request, RequestLimits, Reservation,
@@ -46,6 +48,27 @@ const MAX_TRACKED_CREDENTIALS: usize = 1_024;
 
 /// Agent uids whose request counts are tracked at once.
 const MAX_TRACKED_UIDS: usize = 1_024;
+
+/// The uids some stored credential is bound to, revoked and expired ones
+/// included. Shared with the socket layer, which gives connections from these
+/// uids their own slots.
+pub type BoundUids = Arc<RwLock<HashSet<u32>>>;
+
+/// The one key every uid no credential is bound to is counted under, for
+/// connections and requests. No token can be served to such a uid, so all of
+/// them together get only enough room to be refused, and however many uids an
+/// agent controls, it cannot crowd out the uids credentials are bound to.
+/// Never bindable, so never a bound uid.
+pub const UNBOUND: u32 = u32::MAX;
+
+/// The key `uid` is counted under: its own when a credential is bound to it,
+/// otherwise [`UNBOUND`]. A poisoned set counts every uid as unbound.
+pub fn pool(bound: &BoundUids, uid: u32) -> u32 {
+    match bound.read() {
+        Ok(set) if set.contains(&uid) => uid,
+        _ => UNBOUND,
+    }
+}
 
 /// What the host the gateway runs on says about uids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +110,11 @@ pub struct Settings {
     /// What every credential together may take out of one key's wallet in any
     /// budget window, fees included. Zero refuses every spend.
     pub wallet_budget_sats: u64,
-    /// Requests one agent uid may make, authenticated or not.
+    /// Requests one agent uid may make, authenticated or not. Uids no
+    /// credential is bound to share one such allowance.
     pub uid_limits: RequestLimits,
+    /// Audit entries a day: one credential's, and every credential's together.
+    pub audit_budgets: (u32, u32),
 }
 
 impl Default for Settings {
@@ -101,6 +127,7 @@ impl Default for Settings {
                 per_hour: 3_000,
                 per_day: 20_000,
             },
+            audit_budgets: (AUDIT_BUDGET_PER_DAY, GATEWAY_AUDIT_BUDGET_PER_DAY),
         }
     }
 }
@@ -224,6 +251,7 @@ pub struct State {
     clock: Clock,
     settings: Settings,
     host: Host,
+    bound: BoundUids,
     uid_counts: Counters<u32>,
     credential_counts: Counters<[u8; 16]>,
     /// The minute each uid last had a refusal logged to the journal, so an
@@ -290,15 +318,18 @@ impl State {
         let mut floor = 0u64;
         let mut issued = 0u64;
         let mut bound_wrongly = Vec::new();
+        let mut bound = HashSet::new();
         for id in keep.agent_credential_ids()? {
             match load_credential(&keep, &id) {
                 // Issue times are on the calendar clock: they hold the calendar,
                 // never the budget clock.
                 Ok(Some(c)) => {
                     issued = issued.max(c.created_at);
+                    bound.insert(c.uid);
                     let forbidden = forbidden_uid(&host, &settings, c.uid);
                     if !c.revoked && forbidden {
-                        bound_wrongly.push(format!("{} (uid {})", c.id_hex(), c.uid));
+                        bound_wrongly
+                            .push((format!("{} (uid {})", c.id_hex(), c.uid), c.expires_at));
                     }
                 }
                 Ok(None) => {}
@@ -309,13 +340,6 @@ impl State {
                 ),
             }
             floor = floor.max(ledger_last_seen(&keep, &id));
-        }
-        if !bound_wrongly.is_empty() {
-            return Err(AgentError::Other(format!(
-                "credentials bound to the gateway's, the vault owner's, the admin's or the overflow \
-                 uid must be revoked first: {}",
-                bound_wrongly.join(", ")
-            )));
         }
         let pubkeys: Vec<[u8; 32]> = keep.keyring().list().map(|s| s.pubkey).collect();
         for pubkey in &pubkeys {
@@ -354,12 +378,29 @@ impl State {
         let start = clock::start_time(&seed);
         let calendar = clock::calendar_start(&seed, issued);
         let clock = Clock::new(start, calendar, boot_id, source);
+        // Expired credentials can serve nothing, so only live ones stop a start
+        // (revoking needs the running gateway).
+        let calendar_now = clock.calendar();
+        let bound_wrongly: Vec<String> = bound_wrongly
+            .into_iter()
+            .filter(|(_, expires_at)| calendar_now < *expires_at)
+            .map(|(credential, _)| credential)
+            .collect();
+        if !bound_wrongly.is_empty() {
+            return Err(AgentError::Other(format!(
+                "credentials bound to the gateway's, the vault owner's, the admin's or the overflow \
+                 uid must be revoked first: {}",
+                bound_wrongly.join(", ")
+            )));
+        }
+        let (credential_budget, gateway_budget) = settings.audit_budgets;
         let mut state = Self {
             keep,
-            audit: AgentAudit::default(),
+            audit: AgentAudit::with_budgets(credential_budget, gateway_budget),
             clock,
             settings,
             host,
+            bound: Arc::new(RwLock::new(bound)),
             uid_counts: Counters::new(MAX_TRACKED_UIDS),
             credential_counts: Counters::new(MAX_TRACKED_CREDENTIALS),
             journal: HashMap::new(),
@@ -387,6 +428,26 @@ impl State {
     /// The one non-root uid allowed on the admin socket.
     pub fn admin_uid(&self) -> Option<u32> {
         self.settings.admin_uid
+    }
+
+    /// The uids stored credentials are bound to, kept current as credentials
+    /// are issued and deleted.
+    pub fn bound_uids(&self) -> BoundUids {
+        self.bound.clone()
+    }
+
+    /// Recount the bound uids from the vault, after a credential is deleted.
+    fn refresh_bound(&mut self) -> Result<()> {
+        let mut bound = HashSet::new();
+        for id in self.keep.agent_credential_ids()? {
+            if let Ok(Some(c)) = load_credential(&self.keep, &id) {
+                bound.insert(c.uid);
+            }
+        }
+        if let Ok(mut set) = self.bound.write() {
+            *set = bound;
+        }
+        Ok(())
     }
 
     /// Persist the clock, so a restart continues it.
@@ -463,15 +524,17 @@ impl State {
         }
     }
 
-    fn journal_refusal(&mut self, peer_uid: u32, now: u64, what: &str) {
+    /// Log a refusal to the journal at most once a minute per `counted` key
+    /// (a bound uid, or [`UNBOUND`] for all the rest).
+    fn journal_refusal(&mut self, counted: u32, peer_uid: u32, now: u64, what: &str) {
         let minute = now / 60;
-        if self.journal.get(&peer_uid) == Some(&minute) {
+        if self.journal.get(&counted) == Some(&minute) {
             return;
         }
         if self.journal.len() >= MAX_TRACKED_UIDS {
             self.journal.retain(|_, m| *m == minute);
         }
-        self.journal.insert(peer_uid, minute);
+        self.journal.insert(counted, minute);
         tracing::warn!(peer_uid, what, "agent request refused");
     }
 
@@ -481,17 +544,15 @@ impl State {
             return Answer::refused(Value::Null);
         }
         let now = self.clock.now();
-        if let Err(window) = self
-            .uid_counts
-            .hit(peer_uid, &self.settings.uid_limits, now)
-        {
-            self.journal_refusal(peer_uid, now, window);
+        let counted = pool(&self.bound, peer_uid);
+        if let Err(window) = self.uid_counts.hit(counted, &self.settings.uid_limits, now) {
+            self.journal_refusal(counted, peer_uid, now, window);
             return Answer::refused(Value::Null);
         }
         let envelope: Envelope = match serde_json::from_slice(request) {
             Ok(e) => e,
             Err(_) => {
-                self.journal_refusal(peer_uid, now, "malformed envelope");
+                self.journal_refusal(counted, peer_uid, now, "malformed envelope");
                 return Answer::refused(Value::Null);
             }
         };
@@ -538,10 +599,10 @@ impl State {
                         };
                         self.defer_refusal(cid, detail, now);
                     }
-                    None => self.journal_refusal(peer_uid, now, "unknown token"),
+                    None => self.journal_refusal(counted, peer_uid, now, "unknown token"),
                 }
                 if forbidden {
-                    self.journal_refusal(peer_uid, now, "uid may not hold a credential");
+                    self.journal_refusal(counted, peer_uid, now, "uid may not hold a credential");
                 }
                 return refused(id);
             }
@@ -1026,6 +1087,9 @@ impl State {
         }
         let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
         let (issued, token) = issue_credential(&mut self.keep, name, uid, grant, now, ttl)?;
+        if let Ok(mut set) = self.bound.write() {
+            set.insert(uid);
+        }
         let head =
             json!({ "ok": true, "result": credential_json(&issued.credential, now) }).to_string();
         // `head` holds no secret; the token goes only into `out`, sized so it
@@ -1075,6 +1139,7 @@ impl State {
                 self.keep.delete_agent_credential(&id)?;
                 self.audit.reset(&id);
                 self.credential_counts.remove(&id);
+                self.refresh_bound()?;
                 Ok(json!({ "deleted": hex::encode(id) }))
             }
             AdminRequest::Freeze { id } => {

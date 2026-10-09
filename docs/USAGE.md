@@ -112,6 +112,7 @@ Run `keep <command> --help` for the full flag list of any command.
 | `keep nip46 ...` | NIP-46 client app grant management (see [Remote Signing](#remote-signing-nip-46)) |
 | `keep enclave ...` | AWS Nitro Enclave operations (see [Enclaves](#aws-nitro-enclaves)) |
 | `keep agent mcp --key <n>` | Run the MCP signing server (see [Agent SDK](#agent-sdk)) |
+| `keep gateway ...` | Run and manage the agent gateway, Linux only (see [Agent Gateway](#agent-gateway-preview)) |
 | `keep sign <file> --group <npub>` | Threshold-sign a file (minisign-compatible) |
 | `keep verify <file> <sig> --group <npub>` | Verify a minisign detached signature |
 
@@ -641,6 +642,50 @@ Add it to your MCP client configuration:
 ```
 
 Set `KEEP_PASSWORD` in the server's environment so it can unlock the vault non-interactively.
+
+### Agent Gateway (preview)
+
+`keep gateway serve` (Linux only) is a daemon that holds the unlocked vault so agents never do. It runs as its own user and refuses to run as root. Each agent gets a credential: a token bound to the uid the agent runs as, with a grant listing the keys, operations, event kinds and Bitcoin limits it may use, request rate limits and an expiry. Requests are refused unless the grant allows them. Requests that would need a human approval are refused, since approvals are not available yet. Every answer that returns data, and every signature, is recorded in the vault's audit log before it is returned. Refused tokens all get the same answer, whatever made them invalid.
+
+The owner manages credentials over a second socket, open only to root and one admin uid. While the gateway runs it holds the vault's lock, so management goes through this socket.
+
+Setup, with a `keep` user for the gateway, agents in the `keep-agents` group and the admin in `keep-admins`. Each socket directory must already exist, be owned by the gateway's user, have mode 0750 or tighter, and be separate from the other:
+
+```bash
+sudo groupadd --system keep-agents
+sudo groupadd --system keep-admins
+sudo useradd --system --create-home --shell /usr/sbin/nologin keep
+sudo usermod -aG keep-agents agent-user
+sudo usermod -aG keep-admins "$USER"
+sudo install -d -m 0750 -o keep -g keep-agents /run/keep-gateway
+sudo install -d -m 0750 -o keep -g keep-admins /run/keep-gateway-admin
+
+# As the keep user, with its vault (KEEP_PASSWORD in its environment):
+keep gateway serve --admin-uid "$(id -u "$USER")" --wallet-budget-sats 100000
+```
+
+`--wallet-budget-sats` caps what all agents together may take out of one key's wallet in any 24 hours. Mainnet has its own budget, and the test networks share one. The default, 0, refuses every spend.
+
+Managing credentials (the admin commands check that the socket belongs to `--gateway-user`, by default `keep`, before sending anything):
+
+```bash
+# A Nostr signer for the agent running as uid 1001; the token is written to a new 0600 file
+keep gateway issue --name writer --uid 1001 --key npub1... \
+  --op get_public_key --op sign_nostr_event --kind 1 --token-out writer.token
+
+# A testnet PSBT signer: 20,000 sats per PSBT, 50,000 in any 24 hours
+keep gateway issue --name payer --uid 1002 --key npub1... --network testnet \
+  --op get_bitcoin_address --op sign_psbt --per-psbt-sats 20000 --window-sats 50000
+
+keep gateway list
+keep gateway freeze <id>      # or --all; unfreeze the same way
+keep gateway revoke <id>
+keep gateway audit --limit 50
+```
+
+Credentials expire after 30 days by default (`--ttl-days`). A credential may not be bound to root, the gateway's uid, the vault owner's uid, the admin uid or the overflow uid. Agents that share a uid share every grant bound to it, so give each agent its own user, and give agent users no way to reach root (no passwordless sudo, no `docker` group).
+
+Agents connect to `/run/keep-gateway/agent.sock` and send one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`). A stdio bridge for stock MCP clients and a systemd unit are planned.
 
 ---
 

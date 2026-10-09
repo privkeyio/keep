@@ -19,8 +19,9 @@
 //! time elapsed since start, and never behind any calendar time it has read.
 //! It never goes back. A wall clock that reads behind therefore neither locks
 //! credentials out nor brings an expired one back, and lets one outlive its
-//! expiry by at most the one downtime it hides; one that runs ahead only
-//! expires them early.
+//! expiry by at most the one downtime it hides. One that runs ahead expires
+//! them early, and for good: the calendar never comes back to a corrected
+//! wall clock, so credentials it expired must be issued again.
 
 use serde::{Deserialize, Serialize};
 
