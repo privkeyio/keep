@@ -358,6 +358,25 @@ pub(crate) enum AgentCommands {
         #[arg(long = "allow-address")]
         allow_address: Vec<String>,
     },
+    /// Connect an MCP client to the agent gateway: speaks MCP on stdio and
+    /// passes each request to the gateway with the agent's token. Needs no
+    /// vault and no password, and refuses to run with KEEP_PASSWORD set.
+    #[cfg(target_os = "linux")]
+    Connect {
+        /// The file holding the agent's token, owned by the user running
+        /// the bridge and readable by it alone (chmod 600). The token is
+        /// never taken from an argument or the environment.
+        #[arg(long)]
+        token_file: PathBuf,
+        /// The gateway's agent socket.
+        #[arg(long, default_value = DEFAULT_AGENT_SOCKET)]
+        socket: PathBuf,
+        /// The user the gateway runs as, by name or uid. The token is sent
+        /// only to a socket that user serves, from a directory only it can
+        /// write.
+        #[arg(long, default_value = "keep")]
+        gateway_user: String,
+    },
 }
 
 #[derive(Subcommand)]

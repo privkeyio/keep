@@ -134,45 +134,132 @@ pub fn bind(path: &Path, euid: u32) -> Result<UnixListener> {
     Ok(listener)
 }
 
+/// How long a client waits for the gateway to accept a connection.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a client's connection to a gateway socket was not made. Nothing was
+/// sent either way.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// No gateway is there: the socket or its directory does not exist,
+    /// nothing listens on it, or it did not accept in time.
+    Absent(String),
+    /// What is there is not the gateway's, or cannot be checked.
+    Rejected(String),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent(m) | Self::Rejected(m) => f.write_str(m),
+        }
+    }
+}
+
+impl From<ConnectError> for AgentError {
+    fn from(e: ConnectError) -> Self {
+        AgentError::Other(e.to_string())
+    }
+}
+
 /// Connect to a gateway socket as a client, refusing unless the socket's
 /// directory is a real directory owned by `gateway_uid` and writable by it
 /// alone, and the peer is `gateway_uid` too. No one else could have put a
 /// socket there, so the peer is the gateway and not an impostor collecting
 /// what clients send or faking what they are told.
 pub fn connect_checked(path: &Path, gateway_uid: u32) -> Result<std::os::unix::net::UnixStream> {
-    let fail = |m: String| AgentError::Other(format!("{}: {m}", path.display()));
+    connect_verified(path, gateway_uid, CONNECT_TIMEOUT).map_err(Into::into)
+}
+
+/// [`connect_checked`], waiting at most `timeout` for the gateway to accept,
+/// and telling a gateway that is not there from one that cannot be trusted.
+pub fn connect_verified(
+    path: &Path,
+    gateway_uid: u32,
+    timeout: Duration,
+) -> std::result::Result<std::os::unix::net::UnixStream, ConnectError> {
+    let absent = |m: String| ConnectError::Absent(format!("{}: {m}", path.display()));
+    let rejected = |m: String| ConnectError::Rejected(format!("{}: {m}", path.display()));
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
-        .ok_or_else(|| fail("a socket path needs a directory".into()))?;
-    let meta = std::fs::symlink_metadata(dir)
-        .map_err(|e| fail(format!("its directory cannot be read: {e}")))?;
+        .ok_or_else(|| rejected("a socket path needs a directory".into()))?;
+    let meta = std::fs::symlink_metadata(dir).map_err(|e| {
+        let m = format!("its directory cannot be read: {e}");
+        if e.kind() == std::io::ErrorKind::NotFound {
+            absent(m)
+        } else {
+            rejected(m)
+        }
+    })?;
     if !meta.file_type().is_dir() {
-        return Err(fail("its directory is not a directory".into()));
+        return Err(rejected("its directory is not a directory".into()));
     }
     if meta.uid() != gateway_uid {
-        return Err(fail(format!(
+        return Err(rejected(format!(
             "its directory is owned by uid {}, not the gateway's uid {gateway_uid}",
             meta.uid()
         )));
     }
     if meta.mode() & 0o022 != 0 {
-        return Err(fail(format!(
+        return Err(rejected(format!(
             "its directory has mode {:o}; anyone but its owner could replace the socket",
             meta.mode() & 0o7777
         )));
     }
-    let stream = std::os::unix::net::UnixStream::connect(path).map_err(|e| fail(e.to_string()))?;
+    let stream = connect_within(path, timeout).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound
+        | std::io::ErrorKind::ConnectionRefused
+        | std::io::ErrorKind::TimedOut => absent(e.to_string()),
+        _ => rejected(e.to_string()),
+    })?;
     let peer = rustix::net::sockopt::socket_peercred(&stream)
-        .map_err(|e| fail(format!("SO_PEERCRED: {e}")))?
+        .map_err(|e| rejected(format!("SO_PEERCRED: {e}")))?
         .uid
         .as_raw();
     if peer != gateway_uid {
-        return Err(fail(format!(
+        return Err(rejected(format!(
             "it is served by uid {peer}, not the gateway's uid {gateway_uid}"
         )));
     }
     Ok(stream)
+}
+
+/// Connect, waiting at most `timeout` for room in the listener's backlog: a
+/// blocking connect would wait for as long as the gateway does not accept.
+fn connect_within(
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        None,
+    )?;
+    let addr = SocketAddrUnix::new(path)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match rustix::net::connect(&fd, &addr) {
+            Ok(()) => break,
+            Err(rustix::io::Errno::INTR) => {}
+            // A Unix socket with a full backlog refuses a non-blocking
+            // connect at once.
+            Err(rustix::io::Errno::AGAIN) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(rustix::io::Errno::AGAIN) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the gateway did not accept the connection in time",
+                ))
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    rustix::io::ioctl_fionbio(&fd, false)?;
+    Ok(std::os::unix::net::UnixStream::from(fd))
 }
 
 /// Reads newline-terminated lines of at most `max` bytes, wiping every buffer
@@ -615,6 +702,43 @@ mod tests {
         // A uid bound later gets its own slots.
         bound.write().unwrap().insert(103);
         assert!(take(103).is_some());
+    }
+
+    /// A gateway that does not accept is waited on for a bounded time, and
+    /// a missing one is told apart from one that cannot be trusted.
+    #[test]
+    fn a_client_connect_is_bounded_and_says_why_it_failed() {
+        use super::{connect_verified, ConnectError};
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let path = dir.path().join("s");
+        let absent = |r: Result<_, ConnectError>| matches!(r, Err(ConnectError::Absent(_)));
+        assert!(absent(connect_verified(&path, me, Duration::from_secs(1))));
+        assert!(absent(connect_verified(
+            &dir.path().join("missing").join("s"),
+            me,
+            Duration::from_secs(1)
+        )));
+        // A listener that never accepts, its backlog already full.
+        let listener = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        rustix::net::bind(&listener, &SocketAddrUnix::new(&path).unwrap()).unwrap();
+        rustix::net::listen(&listener, 0).unwrap();
+        let _queued = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let started = Instant::now();
+        let waited = connect_verified(&path, me, Duration::from_millis(300));
+        assert!(absent(waited), "the backlog is full");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(matches!(
+            connect_verified(&path, me + 1, Duration::from_secs(1)),
+            Err(ConnectError::Rejected(_))
+        ));
+        drop(listener);
+        // A socket nothing listens on any more.
+        assert!(absent(connect_verified(&path, me, Duration::from_secs(1))));
     }
 
     #[tokio::test(start_paused = true)]

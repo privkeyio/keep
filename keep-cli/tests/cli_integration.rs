@@ -2442,3 +2442,116 @@ fn test_wallet_sign_local_spends_the_groups_addresses() {
     assert!(!output_contains(&out, "same scripts on mainnet"));
     assert_eq!(signed_key_path_inputs(&read_psbt(&signed)), vec![0, 1]);
 }
+
+/// `keep agent connect` refuses a vault secret in its environment, a token
+/// file others can read and a socket not the gateway's, starts when the
+/// gateway is not running yet, and never prints the token. It needs no vault,
+/// home or configuration.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_agent_connect_refuses_before_sending_anything() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let token = dir.path().join("token");
+    let secret = format!("keep_agt_{}", "a".repeat(64));
+    std::fs::write(&token, format!("{secret}\n")).unwrap();
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let missing = dir.path().join("missing").join("agent.sock");
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").unwrap().uid()
+    };
+    let bridge = |cmd: &mut Command, socket: &Path, gateway_uid: u32| {
+        cmd.args(["agent", "connect", "--token-file"])
+            .arg(&token)
+            .arg("--socket")
+            .arg(socket)
+            .args(["--gateway-user", &gateway_uid.to_string()])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let connect = |cmd: &mut Command| bridge(cmd, &missing, me);
+    let printed_nothing_secret = |output: &Output| {
+        assert!(!output_contains(output, &secret), "the token was printed");
+        assert!(
+            !output_contains(output, TEST_PASSWORD),
+            "the password was printed"
+        );
+    };
+    let refused = |output: &Output, why: &str| {
+        assert_failure(output);
+        assert!(output_contains(output, why), "{why}: {output:?}");
+        printed_nothing_secret(output);
+    };
+
+    // KeepCmd sets KEEP_PASSWORD.
+    let output = KeepCmd::new(&keep)
+        .args(["agent", "connect", "--token-file"])
+        .args([&token])
+        .run();
+    refused(&output, "refusing to run with KEEP_PASSWORD");
+    for var in [
+        "KEEP_PASSWORD_FILE",
+        "KEEP_NEW_PASSWORD",
+        "KEEP_HIDDEN_PASSWORD",
+        "KEEP_DURESS_PASSWORD",
+        "KEEP_NSEC",
+        "KEEP_STORAGE_KEY",
+        "KEEP_STORAGE_KEY_FILE",
+        "KEEP_WEB_AUTH_TOKEN",
+        "KEEP_WEB_AUTH_TOKEN_FILE",
+        "KEEP_STATE_IDENTITY",
+        "KEEP_STATE_IDENTITY_FILE",
+    ] {
+        let mut cmd = Command::new(&keep);
+        cmd.env_clear().env(var, TEST_PASSWORD);
+        refused(&connect(&mut cmd), &format!("refusing to run with {var}"));
+    }
+
+    // A token pasted into any argument, even one clap would reject, is
+    // refused and not repeated.
+    let pasted_path = format!("/home/agent/{secret}");
+    for args in [
+        vec!["--token-file", &secret],
+        vec!["--token-file", &pasted_path],
+        vec!["--socket", &secret, "--token-file", "/nonexistent"],
+        vec!["--gateway-user", &secret, "--token-file", "/nonexistent"],
+        vec!["--path", &secret, "--token-file", "/nonexistent"],
+        vec!["--token-file", "/nonexistent", &secret],
+    ] {
+        let mut bare = Command::new(&keep);
+        bare.env_clear().args(["agent", "connect"]).args(&args);
+        refused(&bare.output().unwrap(), "an argument holds an agent token");
+    }
+
+    let mut bare = Command::new(&keep);
+    bare.env_clear();
+    let output = connect(&mut bare);
+    if me == 0 {
+        refused(&output, "root can hold no gateway credential");
+        return;
+    }
+    refused(&output, "readable by its owner alone");
+
+    std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A directory of another user's: refused before anything is sent.
+    let mut bare = Command::new(&keep);
+    bare.env_clear();
+    let output = bridge(&mut bare, &dir.path().join("agent.sock"), me + 1);
+    refused(&output, "connect to the gateway");
+    assert!(output_contains(&output, "is owned by uid"), "{output:?}");
+
+    // No gateway yet: the bridge starts, and stops when its input ends.
+    let mut bare = Command::new(&keep);
+    bare.env_clear();
+    let output = connect(&mut bare);
+    assert_success(&output);
+    assert!(
+        output_contains(&output, "is not reachable yet"),
+        "{output:?}"
+    );
+    printed_nothing_secret(&output);
+}

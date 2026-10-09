@@ -115,7 +115,34 @@ fn main() {
 
 #[tracing::instrument(skip(out), fields(request_id = %next_request_id()))]
 fn run(out: &Output) -> Result<()> {
+    // No command takes an agent token as an argument, where it would sit in
+    // process lists and logs; refused before parsing, which echoes a stray
+    // argument back in its error.
+    if std::env::args_os()
+        .skip(1)
+        .any(|a| a.to_string_lossy().contains(keep_core::agent::TOKEN_PREFIX))
+    {
+        return Err(keep_core::error::KeepError::InvalidInput(
+            "an argument holds an agent token; put the token in a file readable by its owner \
+             alone and pass that file's path with --token-file"
+                .into(),
+        ));
+    }
     let cli = Cli::parse();
+    // The bridge needs neither the vault nor the configuration, and may run
+    // where neither exists.
+    #[cfg(target_os = "linux")]
+    if let Commands::Agent {
+        command:
+            AgentCommands::Connect {
+                token_file,
+                socket,
+                gateway_user,
+            },
+    } = &cli.command
+    {
+        return commands::agent::cmd_agent_connect(token_file, socket, gateway_user);
+    }
     let cfg = Config::load()?;
 
     if cli.no_mlock {
@@ -259,6 +286,9 @@ fn dispatch_agent(
             max_amount_sats,
             allow_address,
         ),
+        // Run before the vault path is resolved, in `run`.
+        #[cfg(target_os = "linux")]
+        AgentCommands::Connect { .. } => unreachable!("keep agent connect is dispatched earlier"),
     }
 }
 

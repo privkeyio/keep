@@ -265,7 +265,7 @@ impl From<KeepError> for AdminFailure {
 
 /// The uid of the gateway's user, given by name or number. Names are looked
 /// up in /etc/passwd, where a system user such as `keep` is defined.
-fn gateway_uid(user: &str) -> Result<u32> {
+pub(crate) fn gateway_uid(user: &str) -> Result<u32> {
     if let Ok(uid) = user.parse() {
         return Ok(uid);
     }
@@ -337,20 +337,36 @@ fn admin_answer(
     stream
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(io)?;
+    // The gateway turns a uid it does not admit away unread.
+    let closed = || {
+        KeepError::Runtime(
+            "the gateway closed the admin connection unread: run as root or the gateway's admin \
+             uid, or retry if it is already serving as many admin connections as it allows"
+                .into(),
+        )
+    };
     let mut writer = &stream;
+    // A request not written whole was never read.
     writer
         .write_all(format!("{request}\n").as_bytes())
-        .map_err(io)?;
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => closed(),
+            _ => io(e),
+        })?;
     // From here the gateway may have acted on the request.
     let sent = |error: KeepError| AdminFailure {
         maybe_done: true,
         error,
     };
-    let line = read_answer(&stream).map_err(|e| sent(io(e)))?;
+    let line = match read_answer(&stream) {
+        Ok(line) => line,
+        // Closed with the request still unread in it: never acted on.
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err(closed().into()),
+        Err(e) => return Err(sent(io(e))),
+    };
     if line.is_empty() {
         return Err(sent(KeepError::Runtime(
-            "the gateway closed the admin connection: run as root or the gateway's admin uid"
-                .into(),
+            "the gateway closed the admin connection without answering".into(),
         )));
     }
     let answer: AdminAnswer = serde_json::from_slice(&line)

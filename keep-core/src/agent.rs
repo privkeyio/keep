@@ -284,15 +284,20 @@ impl AgentCredential {
     }
 }
 
-/// The stored hash of a well-formed token, or `None` for anything else, so a
-/// malformed or oversized token is refused before any hashing.
-pub fn hash_presented_token(token: &str) -> Option<[u8; 32]> {
-    let well_formed = token.len() == TOKEN_LEN
+/// Whether `token` has the form of an agent token: the prefix and 64
+/// lowercase hex digits.
+pub fn well_formed_token(token: &str) -> bool {
+    token.len() == TOKEN_LEN
         && token.starts_with(TOKEN_PREFIX)
         && token[TOKEN_PREFIX.len()..]
             .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
-    well_formed.then(|| token_hash(token))
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The stored hash of a well-formed token, or `None` for anything else, so a
+/// malformed or oversized token is refused before any hashing.
+pub fn hash_presented_token(token: &str) -> Option<[u8; 32]> {
+    well_formed_token(token).then(|| token_hash(token))
 }
 
 fn token_hash(token: &str) -> [u8; 32] {
