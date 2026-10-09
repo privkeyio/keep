@@ -269,12 +269,10 @@ impl AgentAudit {
             if window.repeats == 0 || self.check(keep, &key.0, true, now).is_err() {
                 continue;
             }
-            let label = format!(
-                "{} x{} more since {}",
-                key.1.label(),
-                window.repeats,
-                window.opened
-            );
+            // No time in the label: the gateway's budget clock does not match
+            // the log's own timestamps. The window's first refusal is the
+            // entry just before it with the same kind and detail.
+            let label = format!("{} x{} more since the first", key.1.label(), window.repeats);
             if let Err(e) = keep.record_agent_refusal(&key.0, &label, Some(&key.2)) {
                 self.pending.insert(key, window);
                 return Err(e.into());

@@ -207,6 +207,14 @@ fi
 [[ $(gw_admin list | grep -c '"id"') == "$BEFORE" ]] || fail "a credential was issued without its token file"
 pass "an unwritable token file issues nothing"
 
+# An issue that never reached the gateway says so, without a false alarm.
+if MSG=$(as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$A1" --name x \
+    --uid "$(uid "$A1")" --key "$NPUB" --op get_public_key 2>&1); then
+    fail "issued through a socket of the wrong user"
+fi
+echo "$MSG" | grep -q "may have been issued" && fail "false alarm: $MSG"
+pass "an issue that was never sent raises no false alarm"
+
 # Issuing to the gateway's or the admin's uid is refused.
 for u in "$GW" "$ADMIN"; do
     if as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name bad --uid "$(uid "$u")" \

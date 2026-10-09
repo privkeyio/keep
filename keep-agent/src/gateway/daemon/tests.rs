@@ -984,8 +984,8 @@ fn the_budget_clock_counts_only_running_time_whatever_the_wall_clock() {
     assert_eq!(g.state.now(), T0 + 500);
     assert_eq!(
         g.state.calendar(),
-        T0 + 500,
-        "never behind the budget clock"
+        T0 + 1_000 * 86_400,
+        "the calendar never goes back"
     );
     // A reboot resumes from what the vault saw, behind or ahead.
     let g = g.restart(REBOOT, T0).unwrap();
@@ -1074,6 +1074,68 @@ fn issue_times_never_move_the_budget_clock() {
         .is_some());
 }
 
+/// The reviewers' scenario: a credential is issued after downtime has put
+/// the budget clock behind real time, and the next boot's wall clock reads
+/// 1970. The credential is neither locked out nor kept alive past its expiry.
+#[test]
+fn a_wall_clock_behind_after_a_reboot_neither_locks_out_nor_extends_credentials() {
+    let mut g = Gw::new();
+    // Ten days down: the budget clock stays at T0, real time moves on.
+    let day = 86_400;
+    g = g.restart(REBOOT, T0 + 10 * day).unwrap();
+    assert_eq!(g.state.now(), T0);
+    let (_, token) = g.issue_for(&nostr_grant(g.key), AGENT, 2 * day);
+    let mut g = g.restart(REBOOT, 0).unwrap();
+    assert!(
+        g.send(AGENT, &token, ping())
+            .unwrap()
+            .get("result")
+            .is_some(),
+        "not locked out"
+    );
+    g.boot.advance(2 * day);
+    assert_eq!(
+        g.send(AGENT, &token, ping()),
+        Some(refused(json!(1))),
+        "expired after two days of running time"
+    );
+}
+
+/// With the heartbeat lost, issue times alone hold the calendar: a wall clock
+/// behind still does not lock credentials out.
+#[test]
+fn issue_times_hold_the_calendar_without_a_heartbeat() {
+    let mut g = Gw::new();
+    g = g.restart(REBOOT, T0 + 10 * 86_400).unwrap();
+    let (_, token) = g.issue_for(&nostr_grant(g.key), AGENT, 2 * 86_400);
+    let Gw {
+        dir,
+        boot,
+        mut state,
+        ..
+    } = g;
+    state.shut_down();
+    state
+        .keep_mut()
+        .update_agent_ledgers(&[HEARTBEAT_KEY], |_| Ok(vec![b"junk".to_vec()]))
+        .unwrap();
+    drop(state);
+    let (keep, key) = vault(dir.path());
+    boot.set_wall(0);
+    let state = start(keep, settings(), &boot, REBOOT).unwrap();
+    let mut g = Gw {
+        dir,
+        boot,
+        state,
+        key,
+    };
+    assert!(g
+        .send(AGENT, &token, ping())
+        .unwrap()
+        .get("result")
+        .is_some());
+}
+
 /// Credentials expire on the calendar clock, which a reboot does not hold
 /// back: a credential does not outlive its expiry by the gateway's downtime.
 #[test]
@@ -1087,6 +1149,12 @@ fn credentials_expire_on_the_calendar_across_a_reboot() {
         .is_some());
     let mut g = g.restart(REBOOT, T0 + 2 * 3_600).unwrap();
     assert_eq!(g.state.now(), T0, "the budget clock did not move");
+    assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    // A wall clock behind on the next boot, or stepped back while running,
+    // does not bring it back.
+    let mut g = g.restart(REBOOT, 0).unwrap();
+    assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
+    g.boot.set_wall(T0);
     assert_eq!(g.send(AGENT, &token, ping()), Some(refused(json!(1))));
     g.state.tick();
     assert!(g
@@ -1116,6 +1184,7 @@ fn a_ledger_ahead_of_the_wall_clock_holds_the_clock() {
                 boot_id: BOOT.into(),
                 boottime: 0,
                 clock: 0,
+                calendar: 0,
             }
             .encode()
             .unwrap()])
