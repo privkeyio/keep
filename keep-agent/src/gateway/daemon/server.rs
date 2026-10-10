@@ -106,6 +106,28 @@ fn prepare(path: &Path, euid: u32) -> Result<()> {
             meta.mode() & 0o7777
         ));
     }
+    // The mode bits cannot show a named ACL entry, which could let in a group
+    // the directory's own leaves out, such as the agents' into the admin
+    // directory.
+    let reader = super::unlock::Reader {
+        uid: euid,
+        gid: rustix::process::getegid().as_raw(),
+    };
+    match rustix::fs::open(
+        dir,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => {
+            if let Some(why) = super::unlock::untrusted_acl(&fd, &reader) {
+                return fail(format!("its directory {why}"));
+            }
+        }
+        Err(e) => return fail(format!("its directory cannot be read: {e}")),
+    }
     match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => fail(format!("cannot be read: {e}")),
@@ -739,6 +761,63 @@ mod tests {
         drop(listener);
         // A socket nothing listens on any more.
         assert!(absent(connect_verified(&path, me, Duration::from_secs(1))));
+    }
+
+    /// A named ACL entry for anyone but root or the gateway opens a socket
+    /// directory past its mode bits, and is refused.
+    #[test]
+    fn a_socket_directory_with_an_acl_for_anyone_else_is_refused() {
+        use rustix::io::Errno;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o750)).unwrap();
+        let me = rustix::process::geteuid().as_raw();
+        let my_group = rustix::process::getegid().as_raw();
+        let other = my_group + 7;
+        let path = dir.path().join("s");
+        // Owner rwx, owning group r-x, a named group r-x, the mask, others
+        // nothing, in the tag order the kernel takes.
+        let set = |group: u32, mask: u16| -> bool {
+            let mut acl = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in [
+                (0x01u16, 0o7u16, u32::MAX),
+                (0x04, 0o5, u32::MAX),
+                (0x08, 0o5, group),
+                (0x10, mask, u32::MAX),
+                (0x20, 0, u32::MAX),
+            ] {
+                acl.extend_from_slice(&tag.to_le_bytes());
+                acl.extend_from_slice(&perm.to_le_bytes());
+                acl.extend_from_slice(&id.to_le_bytes());
+            }
+            match rustix::fs::setxattr(
+                dir.path(),
+                "system.posix_acl_access",
+                &acl,
+                rustix::fs::XattrFlags::empty(),
+            ) {
+                Ok(()) => true,
+                Err(Errno::NOTSUP) | Err(Errno::INVAL) => false,
+                Err(e) => panic!("setxattr: {e}"),
+            }
+        };
+        if !set(other, 0o5) {
+            eprintln!("skipped: no ACLs on this file system");
+            return;
+        }
+        let Err(err) = super::prepare(&path, me) else {
+            panic!("a directory open to gid {other} was accepted");
+        };
+        assert!(
+            err.to_string().contains(&format!("lets gid {other} in")),
+            "{err}"
+        );
+        // Masked out, the entry grants nothing.
+        assert!(set(other, 0));
+        super::prepare(&path, me).unwrap();
+        // The gateway's own group.
+        assert!(set(my_group, 0o5));
+        super::prepare(&path, me).unwrap();
     }
 
     #[tokio::test(start_paused = true)]

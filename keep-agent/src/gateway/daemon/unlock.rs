@@ -77,7 +77,7 @@ fn untrusted_access(stat: &rustix::fs::Stat, reader: &Reader) -> Option<String> 
 /// Why a POSIX access ACL on `fd` gives access to someone the reader does
 /// not trust, if it does. The mode bits cannot show this: with an ACL, the
 /// group bits are only the mask over every named entry.
-fn untrusted_acl(fd: impl AsFd, reader: &Reader) -> Option<String> {
+pub(crate) fn untrusted_acl(fd: impl AsFd, reader: &Reader) -> Option<String> {
     const USER: u16 = 0x02;
     const GROUP: u16 = 0x08;
     const MASK: u16 = 0x10;
