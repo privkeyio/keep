@@ -20,7 +20,7 @@
 Description=Keep agent gateway
 Documentation=https://github.com/privkeyio/keep/blob/main/docs/USAGE.md#running-the-gateway-under-systemd
 # A gateway that cannot start (a wrong or unsealable password, KEEP_PASSWORD
-# set) stops after five tries rather than retrying for ever. Both are set
+# set) stops after five tries rather than retrying forever. Both are set
 # here, so a host's own defaults cannot change that.
 StartLimitIntervalSec=10min
 StartLimitBurst=5

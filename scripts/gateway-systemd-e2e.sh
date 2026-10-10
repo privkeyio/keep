@@ -239,6 +239,7 @@ dir_is "$STATE" "$GW:$GW 700"
 pass "socket directories: $GW:keep-agents and $GW:keep-admins, mode 0750; the vault's 0700"
 
 CREDS=/run/credentials/$UNIT
+[[ -f $CREDS/vault-password ]] || fail "no decrypted credential at $CREDS"
 if as "$AGENT" cat "$CREDS/vault-password" >/dev/null 2>&1; then fail "an agent read the credential"; fi
 if as $GW cat "$CRED" >/dev/null 2>&1; then fail "$GW read the encrypted credential file"; fi
 JOURNAL=$(journalctl -u "$UNIT" --no-pager -o cat)

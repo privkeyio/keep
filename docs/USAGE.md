@@ -661,7 +661,7 @@ The gateway keeps keys from agents only when all of these hold:
 
 #### Running the gateway under systemd
 
-`contrib/systemd/keep-gateway.service` runs the gateway as the `keep-gateway` user with its vault in `/var/lib/keep-gateway/vault`. systemd decrypts the vault password from a credential sealed to this machine and hands it to the gateway in a directory only the `keep-gateway` user can read, so the password is never stored in plaintext and never in an environment variable. It needs systemd 250 or later (Ubuntu 22.04, with 249, is too old), a TPM 2.0, and the TPM libraries systemd uses (`libtss2-*`, on most distributions already installed).
+`contrib/systemd/keep-gateway.service` runs the gateway as the `keep-gateway` user with its vault in `/var/lib/keep-gateway/vault`. systemd decrypts the vault password from a credential sealed to this machine and hands it to the gateway in a directory only the `keep-gateway` user can read, so the password is never stored in plaintext and never in an environment variable. It needs systemd 250 or later (Ubuntu 22.04, with 249, is too old), a TPM 2.0, and the TPM libraries systemd loads: `systemd-creds has-tpm2` must list `+libraries`, and on Debian and Ubuntu `sudo apt install tpm2-tools` brings in any that are missing.
 
 1. Create the users and groups. Agents reach the gateway through `keep-agents`, the admin through `keep-admins`:
 
@@ -679,8 +679,8 @@ The gateway keeps keys from agents only when all of these hold:
    sudo install -m 0755 keep /usr/local/bin/keep
    sudo install -m 0644 contrib/systemd/keep-gateway.service /etc/systemd/system/
    sudo install -d -m 0700 -o keep-gateway -g keep-gateway /var/lib/keep-gateway
-   sudo -u keep-gateway -H keep --path /var/lib/keep-gateway/vault init
-   sudo -u keep-gateway -H keep --path /var/lib/keep-gateway/vault generate --name agent
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault init
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault generate --name agent
    ```
 
 3. Seal the vault password to this machine. It is read without echo and never written in plaintext:
@@ -692,7 +692,7 @@ The gateway keeps keys from agents only when all of these hold:
      --name=vault-password --with-key=host+tpm2 --tpm2-pcrs=7 - /etc/keep/gateway/vault-password.cred
    ```
 
-   `host+tpm2` needs both this machine's TPM and its host key (`/var/lib/systemd/credential.secret`, readable by root alone) to decrypt it, so neither a copied disk nor access to the TPM is enough. `--tpm2-pcrs=7` binds it to the Secure Boot state: a firmware or Secure Boot update that changes that state stops it from decrypting, and it must be sealed again. Pass `--tpm2-pcrs=` (empty) to bind it to no state. Seal it again whenever the vault password changes.
+   `host+tpm2` needs both this machine's TPM and its host key (`/var/lib/systemd/credential.secret`, readable by root alone) to decrypt it, so neither a copied disk nor access to the TPM is enough. Whoever takes the whole machine holds both, though: on an unencrypted disk they can read the host key and boot any system Secure Boot accepts to have the TPM decrypt the password, so where theft of the machine matters, encrypt its disk. `--tpm2-pcrs=7` binds it to the Secure Boot state: a firmware or Secure Boot update that changes that state stops it from decrypting, and it must be sealed again. Pass `--tpm2-pcrs=` (empty) to bind it to no state. Seal it again whenever the vault password changes.
 
 4. Set the gateway's options in a drop-in (`sudo systemctl edit keep-gateway`), for example:
 
@@ -709,7 +709,11 @@ The gateway keeps keys from agents only when all of these hold:
    keep gateway status        # as root or the admin uid
    ```
 
-If it fails with `Decryption failed - wrong password`, the sealed password is wrong: seal it again (step 3), then `sudo systemctl reset-failed keep-gateway` and start it. A gateway that cannot start tries five times and then stays stopped rather than retrying for ever. After wrong passwords, the vault slows further unlocks for up to five minutes.
+A gateway that cannot start tries five times and then stays stopped rather than retrying forever; `journalctl -u keep-gateway` says why:
+
+- `Decryption failed - wrong password`: the sealed password is wrong. Seal it again (step 3), then `sudo systemctl reset-failed keep-gateway` and start it.
+- `Rate limited after repeated unlock failures; try again in Ns`: after repeated wrong passwords the vault refuses unlocks for a while, doubling up to five minutes, without trying the password. Wait the N seconds it names, then `reset-failed` and start it, or it will use up its five tries again.
+- `Failed to unseal secret using TPM2` (status `243/CREDENTIALS`): the Secure Boot state changed since it was sealed. Seal it again (step 3), then `reset-failed` and start it.
 
 The gateway never reads the vault password from `KEEP_PASSWORD`, and refuses to start if it is set: a variable set in a unit is shown to every user by `systemctl show`. It reads it from the `vault-password` credential in `$CREDENTIALS_DIRECTORY`. That directory and the file in it must be owned by root or `keep-gateway`, not be symlinks, be closed to other users and not writable by their group, be readable by their group only if that group is root's or `keep-gateway`, and carry no ACL entry for anyone else; the file holds the password on one line. Run outside systemd, it asks for the password on a terminal; another supervisor can set `CREDENTIALS_DIRECTORY` to a directory it controls that holds the `vault-password` file.
 
@@ -722,7 +726,7 @@ Running it by hand instead, each socket directory must exist first, owned by `ke
 ```bash
 sudo install -d -m 0750 -o keep-gateway -g keep-agents /run/keep-gateway
 sudo install -d -m 0750 -o keep-gateway -g keep-admins /run/keep-gateway-admin
-sudo -u keep-gateway -H keep --path /var/lib/keep-gateway/vault gateway serve --admin-uid "$(id -u)"
+sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault gateway serve --admin-uid "$(id -u)"
 ```
 
 `--wallet-budget-sats` caps what all agents together may take out of one key's wallet in any 24 hours. Mainnet has its own budget, and the test networks share one. The default, 0, refuses every spend.
