@@ -52,28 +52,54 @@ mod dir_tests {
         std::fs::create_dir(&agent).unwrap();
         std::fs::create_dir(&admin).unwrap();
         let gid = std::fs::metadata(&agent).unwrap().gid();
-        let open = |mode: u32, egid: u32| {
+        let open = |mode: u32| {
             std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(mode)).unwrap();
-            super::admin_open_to_agents(&agent.join("a.sock"), &admin.join("b.sock"), egid).unwrap()
+            super::admin_open_to_agents(&agent.join("a.sock"), &admin.join("b.sock")).unwrap()
         };
-        // The same group, which is not the gateway's: agents get in.
-        assert!(open(0o750, gid + 1));
-        assert!(open(0o710, gid + 1));
-        assert!(open(0o740, gid + 1));
-        // Closed to the group, or the group is the gateway's own.
-        assert!(!open(0o700, gid + 1));
-        assert!(!open(0o750, gid));
+        // The same group, whichever it is: whoever reaches one reaches both.
+        assert!(open(0o750));
+        assert!(open(0o710));
+        assert!(open(0o740));
+        // Closed to the group.
+        assert!(!open(0o700));
         if rustix::process::geteuid().is_root() {
             // A group of its own.
             std::os::unix::fs::chown(&admin, None, Some(gid + 7)).unwrap();
-            assert!(!open(0o750, gid + 1));
+            assert!(!open(0o750));
         }
         assert!(super::admin_open_to_agents(
             &agent.join("a.sock"),
             &root.path().join("missing").join("b.sock"),
-            gid
         )
         .is_err());
+    }
+
+    #[test]
+    fn readiness_reaches_a_path_or_an_abstract_notification_socket() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("notify");
+        let by_path = UnixDatagram::bind(&path).unwrap();
+        super::notify(path.as_os_str(), b"READY=1").unwrap();
+        let mut buf = [0u8; 64];
+        let n = by_path.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+
+        let name = format!("keep-notify-test-{}", std::process::id());
+        let abstract_addr = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+        let by_name = UnixDatagram::bind_addr(&abstract_addr).unwrap();
+        super::notify(std::ffi::OsStr::new(&format!("@{name}")), b"READY=1").unwrap();
+        let n = by_name.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"READY=1");
+
+        for bad in ["", "relative", "vsock:1:2"] {
+            assert!(
+                super::notify(std::ffi::OsStr::new(bad), b"READY=1").is_err(),
+                "{bad}"
+            );
+        }
+        assert!(super::notify(root.path().join("missing").as_os_str(), b"READY=1").is_err());
     }
 }
 
@@ -108,46 +134,71 @@ pub fn harden() -> Result<()> {
         .map_err(|e| AgentError::Other(format!("PR_SET_DUMPABLE: {e}")))
 }
 
+/// The metadata of a socket path's directory.
+fn socket_directory(socket: &std::path::Path) -> Result<std::fs::Metadata> {
+    let parent = socket
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| {
+            AgentError::Other(format!(
+                "{}: a socket path needs a directory",
+                socket.display()
+            ))
+        })?;
+    std::fs::metadata(parent).map_err(|e| AgentError::Other(format!("{}: {e}", parent.display())))
+}
+
 /// Whether two socket paths are in the same directory, compared by device and
 /// inode so neither `.` nor a symlink can disguise it.
 fn same_directory(a: &std::path::Path, b: &std::path::Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let dir = |p: &std::path::Path| {
-        let parent = p
-            .parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .ok_or_else(|| {
-                AgentError::Other(format!("{}: a socket path needs a directory", p.display()))
-            })?;
-        std::fs::metadata(parent)
-            .map(|m| (m.dev(), m.ino()))
-            .map_err(|e| AgentError::Other(format!("{}: {e}", parent.display())))
-    };
-    Ok(dir(a)? == dir(b)?)
+    let (a, b) = (socket_directory(a)?, socket_directory(b)?);
+    Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
 }
 
 /// Whether the admin socket's directory lets in the group of the agent
-/// socket's directory: agents then reach the admin socket too, and only the
-/// gateway's check of each peer keeps them out. The gateway's own group is
-/// the exception, as no agent belongs to it.
-fn admin_open_to_agents(
-    agent: &std::path::Path,
-    admin: &std::path::Path,
-    egid: u32,
-) -> Result<bool> {
+/// socket's directory: agents reach the agent socket through that group, so
+/// they would reach the admin socket too, and only the gateway's check of
+/// each peer would keep them out.
+fn admin_open_to_agents(agent: &std::path::Path, admin: &std::path::Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let dir = |p: &std::path::Path| {
-        let parent = p
-            .parent()
-            .filter(|d| !d.as_os_str().is_empty())
-            .ok_or_else(|| {
-                AgentError::Other(format!("{}: a socket path needs a directory", p.display()))
-            })?;
-        std::fs::metadata(parent)
-            .map_err(|e| AgentError::Other(format!("{}: {e}", parent.display())))
-    };
-    let (agent, admin) = (dir(agent)?, dir(admin)?);
-    Ok(admin.gid() == agent.gid() && agent.gid() != egid && admin.mode() & 0o050 != 0)
+    let (agent, admin) = (socket_directory(agent)?, socket_directory(admin)?);
+    Ok(admin.gid() == agent.gid() && admin.mode() & 0o050 != 0)
+}
+
+/// Tell systemd the gateway is ready, when a unit of `Type=notify` started
+/// it: the vault is unlocked and both sockets listen.
+fn notify_ready() -> Result<()> {
+    match std::env::var_os("NOTIFY_SOCKET") {
+        Some(socket) => notify(&socket, b"READY=1"),
+        None => Ok(()),
+    }
+}
+
+/// Send `message` to the systemd notification socket `socket`: a path, or an
+/// abstract name written with a leading `@`.
+fn notify(socket: &std::ffi::OsStr, message: &[u8]) -> Result<()> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+    let fail = |e: std::io::Error| AgentError::Other(format!("NOTIFY_SOCKET: {e}"));
+    let addr = match socket.as_bytes() {
+        [b'@', name @ ..] => SocketAddr::from_abstract_name(name),
+        path @ [b'/', ..] => SocketAddr::from_pathname(std::ffi::OsStr::from_bytes(path)),
+        _ => {
+            return Err(AgentError::Other(
+                "NOTIFY_SOCKET is neither a path nor an abstract socket name".into(),
+            ))
+        }
+    }
+    .map_err(fail)?;
+    let sent = UnixDatagram::unbound()
+        .and_then(|s| s.send_to_addr(message, &addr))
+        .map_err(fail)?;
+    if sent != message.len() {
+        return Err(AgentError::Other("NOTIFY_SOCKET: short send".into()));
+    }
+    Ok(())
 }
 
 /// Serve `keep` until `shutdown` resolves.
@@ -167,11 +218,7 @@ pub async fn run(
             "the admin socket needs a directory of its own, which agents cannot reach".into(),
         ));
     }
-    if admin_open_to_agents(
-        &sockets.agent,
-        &sockets.admin,
-        rustix::process::getegid().as_raw(),
-    )? {
+    if admin_open_to_agents(&sockets.agent, &sockets.admin)? {
         return Err(AgentError::Other(
             "the admin socket's directory is open to the agent socket's group: give it a \
              group agents are not in, such as keep-admins"
@@ -199,6 +246,11 @@ pub async fn run(
         admin = %sockets.admin.display(),
         "agent gateway listening"
     );
+    if let Err(e) = notify_ready() {
+        server::remove_socket(&sockets.agent);
+        server::remove_socket(&sockets.admin);
+        return Err(e);
+    }
     let result = server::serve(state, agent, admin, limits, shutdown).await;
     server::remove_socket(&sockets.agent);
     server::remove_socket(&sockets.admin);

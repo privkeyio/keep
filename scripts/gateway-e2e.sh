@@ -193,7 +193,9 @@ pass "refuses to run as root"
 serve_refuses() {
     local why=$1 want=$2 msg
     shift 2
-    if msg=$(as "$GW" "$@" "$KEEP" --path "$VAULT" gateway serve \
+    # Bounded, so a gateway that starts after all fails this check rather
+    # than hanging it.
+    if msg=$(as "$GW" timeout 20 "$@" "$KEEP" --path "$VAULT" gateway serve \
         --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" </dev/null 2>&1); then
         fail "the gateway started with $why"
     fi
@@ -213,7 +215,7 @@ pass "the password comes only from a closed credential, never the environment, a
 
 # An admin directory agents can enter is refused before anything is bound.
 install -d -m 0750 -o "$GW" -g "$AGENTS" "$RUN/open-admin"
-if MSG=$(as "$GW" env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
+if MSG=$(as "$GW" timeout 20 env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$RUN/open-admin/admin.sock" </dev/null 2>&1); then
     fail "the gateway started with an admin directory open to agents"
 fi

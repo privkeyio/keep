@@ -240,7 +240,7 @@ fn vault_password() -> Result<Zeroizing<String>> {
         return unlock::read_credential(
             Path::new(&dir),
             unlock::PASSWORD_CREDENTIAL,
-            daemon::euid(),
+            unlock::Reader::this_process(),
         )
         .map_err(|e| KeepError::Runtime(e.to_string()));
     }
@@ -293,7 +293,7 @@ impl From<KeepError> for AdminFailure {
 }
 
 /// The uid of the gateway's user, given by name or number. Names are looked
-/// up in /etc/passwd, where a system user such as `keep` is defined.
+/// up in /etc/passwd, where a system user such as `keep-gateway` is defined.
 pub(crate) fn gateway_uid(user: &str) -> Result<u32> {
     if let Ok(uid) = user.parse() {
         return Ok(uid);

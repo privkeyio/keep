@@ -7,9 +7,11 @@
 //! never at rest in plaintext and never in the environment.
 
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 
+use rustix::fs::{FileType, Mode, OFlags};
+use rustix::io::Errno;
 use zeroize::Zeroizing;
 
 use crate::error::{AgentError, Result};
@@ -20,23 +22,117 @@ pub const PASSWORD_CREDENTIAL: &str = "vault-password";
 /// The longest password read.
 pub const MAX_PASSWORD: usize = 4096;
 
-/// Whether `uid` may own the credentials directory or a credential in it:
-/// systemd creates them as root and grants the service's user access, or
-/// gives them to that user.
-fn trusted_owner(uid: u32, euid: u32) -> bool {
-    uid == 0 || uid == euid
+/// The process a credential is read for.
+#[derive(Debug, Clone, Copy)]
+pub struct Reader {
+    pub uid: u32,
+    pub gid: u32,
 }
 
-/// Read credential `name` from the credentials directory `dir`, for a
-/// process running as `euid`.
+impl Reader {
+    /// This process.
+    pub fn this_process() -> Self {
+        Self {
+            uid: rustix::process::geteuid().as_raw(),
+            gid: rustix::process::getegid().as_raw(),
+        }
+    }
+
+    /// Whether `uid` may own the credentials directory or a credential in
+    /// it: systemd creates them as root and grants the service's user
+    /// access, or gives them to that user.
+    fn trusts_user(&self, uid: u32) -> bool {
+        uid == 0 || uid == self.uid
+    }
+
+    /// Whether group `gid` may be given access: root's group, which systemd
+    /// gives them, or the reader's own.
+    fn trusts_group(&self, gid: u32) -> bool {
+        gid == 0 || gid == self.gid
+    }
+}
+
+/// Why access by someone the reader does not trust is refused, if it is:
+/// none for others, no writing for the group, and reading (or entering) for
+/// the group only when the group is trusted.
+fn untrusted_access(stat: &rustix::fs::Stat, reader: &Reader) -> Option<String> {
+    let mode = stat.st_mode & 0o7777;
+    if mode & 0o007 != 0 {
+        return Some(format!(
+            "has mode {mode:o}; it must be closed to other users"
+        ));
+    }
+    if mode & 0o020 != 0 {
+        return Some(format!("has mode {mode:o}; its group may not write to it"));
+    }
+    if mode & 0o050 != 0 && !reader.trusts_group(stat.st_gid) {
+        return Some(format!(
+            "has mode {mode:o} and group {}; only root's group or the gateway's may read it",
+            stat.st_gid
+        ));
+    }
+    None
+}
+
+/// Why a POSIX access ACL on `fd` gives access to someone the reader does
+/// not trust, if it does. The mode bits cannot show this: with an ACL, the
+/// group bits are only the mask over every named entry.
+fn untrusted_acl(fd: impl AsFd, reader: &Reader) -> Option<String> {
+    const USER: u16 = 0x02;
+    const GROUP: u16 = 0x08;
+    const MASK: u16 = 0x10;
+    let mut buf = [0u8; 4096];
+    let len = match rustix::fs::fgetxattr(fd, "system.posix_acl_access", &mut buf[..]) {
+        Ok(len) => len,
+        // No ACL, or none possible on this file system.
+        Err(Errno::NODATA) | Err(Errno::NOTSUP) => return None,
+        Err(e) => return Some(format!("its access ACL cannot be read: {e}")),
+    };
+    let acl = &buf[..len];
+    if acl.len() < 4 || (acl.len() - 4) % 8 != 0 || acl[..4] != 2u32.to_le_bytes() {
+        return Some("has an access ACL that cannot be parsed".into());
+    }
+    let entries: Vec<(u16, u16, u32)> = acl[4..]
+        .chunks_exact(8)
+        .map(|e| {
+            (
+                u16::from_le_bytes([e[0], e[1]]),
+                u16::from_le_bytes([e[2], e[3]]),
+                u32::from_le_bytes([e[4], e[5], e[6], e[7]]),
+            )
+        })
+        .collect();
+    let mask = entries
+        .iter()
+        .find(|(tag, _, _)| *tag == MASK)
+        .map_or(0o7, |(_, perm, _)| *perm);
+    entries.iter().find_map(|&(tag, perm, id)| {
+        let granted = perm & mask != 0;
+        match tag {
+            USER if granted && !reader.trusts_user(id) => {
+                Some(format!("has an access ACL that lets uid {id} in"))
+            }
+            GROUP if granted && !reader.trusts_group(id) => {
+                Some(format!("has an access ACL that lets gid {id} in"))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Read credential `name` from the credentials directory `dir` for `reader`.
 ///
-/// The directory must be a real directory owned by root or `euid` that no
-/// one else can write. The credential must be a regular file, not a symlink,
-/// owned by root or `euid`, that no one else can write or other users read,
-/// of at most [`MAX_PASSWORD`] bytes of UTF-8 on one line. One trailing
-/// newline (`\n` or `\r\n`) is dropped, as `echo` and editors add one. The
-/// file's contents are never put in an error.
-pub fn read_credential(dir: &Path, name: &str, euid: u32) -> Result<Zeroizing<String>> {
+/// The directory must be a real directory, not a symlink, owned by root or
+/// the reader, closed to other users, that its group cannot write. The
+/// credential must be a regular file in it, not a symlink, owned by root or
+/// the reader, closed to other users, that its group cannot write, of at most
+/// [`MAX_PASSWORD`] bytes of UTF-8 on one line. Either may be readable by its
+/// group only when that is root's group or the reader's, and neither may
+/// carry an ACL entry for anyone else. One trailing newline (`\n` or `\r\n`)
+/// is dropped, as `echo` and editors add one. Everything is checked on what
+/// was opened, so nothing can be swapped in between, and the file's contents
+/// are never put in an error.
+pub fn read_credential(dir: &Path, name: &str, reader: Reader) -> Result<Zeroizing<String>> {
     let fail =
         |m: String| AgentError::Other(format!("credential {name:?} in {}: {m}", dir.display()));
     if name.is_empty() || name.contains('/') || name == "." || name == ".." {
@@ -47,54 +143,52 @@ pub fn read_credential(dir: &Path, name: &str, euid: u32) -> Result<Zeroizing<St
             "the credentials directory is not an absolute path".into(),
         ));
     }
-    let meta = std::fs::symlink_metadata(dir)
-        .map_err(|e| fail(format!("the credentials directory cannot be read: {e}")))?;
-    if !meta.file_type().is_dir() {
-        return Err(fail("the credentials directory is not a directory".into()));
-    }
-    if !trusted_owner(meta.uid(), euid) {
+    let dir_fd: OwnedFd = rustix::fs::open(
+        dir,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::NOTDIR | Errno::LOOP => fail("the credentials directory is not a directory".into()),
+        e => fail(format!("the credentials directory cannot be read: {e}")),
+    })?;
+    let stat = rustix::fs::fstat(&dir_fd).map_err(|e| fail(e.to_string()))?;
+    if !reader.trusts_user(stat.st_uid) {
         return Err(fail(format!(
-            "the credentials directory is owned by uid {}, not root or uid {euid}",
-            meta.uid()
+            "the credentials directory is owned by uid {}, not root or uid {}",
+            stat.st_uid, reader.uid
         )));
     }
-    if meta.mode() & 0o022 != 0 {
-        return Err(fail(format!(
-            "the credentials directory has mode {:o}; others could replace the credential",
-            meta.mode() & 0o7777
-        )));
+    if let Some(why) = untrusted_access(&stat, &reader).or_else(|| untrusted_acl(&dir_fd, &reader))
+    {
+        return Err(fail(format!("the credentials directory {why}")));
     }
     // Not through a symlink, and non-blocking, so a FIFO in its place cannot
     // hang the open.
-    let flags =
-        rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(flags.bits() as i32)
-        .open(dir.join(name))
-        .map_err(|e| {
-            if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error()) {
-                fail("is a symlink".into())
-            } else {
-                fail(e.to_string())
-            }
-        })?;
-    let meta = file.metadata().map_err(|e| fail(e.to_string()))?;
-    if !meta.file_type().is_file() {
+    let fd = rustix::fs::openat(
+        &dir_fd,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| match e {
+        Errno::LOOP => fail("is a symlink".into()),
+        e => fail(e.to_string()),
+    })?;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| fail(e.to_string()))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
         return Err(fail("is not a regular file".into()));
     }
-    if !trusted_owner(meta.uid(), euid) {
+    if !reader.trusts_user(stat.st_uid) {
         return Err(fail(format!(
-            "is owned by uid {}, not root or uid {euid}",
-            meta.uid()
+            "is owned by uid {}, not root or uid {}",
+            stat.st_uid, reader.uid
         )));
     }
-    if meta.mode() & 0o027 != 0 {
-        return Err(fail(format!(
-            "has mode {:o}; it must be closed to other users and writable by its owner alone",
-            meta.mode() & 0o7777
-        )));
+    if let Some(why) = untrusted_access(&stat, &reader).or_else(|| untrusted_acl(&fd, &reader)) {
+        return Err(fail(why));
     }
+    let mut file = std::fs::File::from(fd);
     let mut buf = Zeroizing::new([0u8; MAX_PASSWORD + 1]);
     let mut len = 0;
     loop {
@@ -129,13 +223,13 @@ pub fn read_credential(dir: &Path, name: &str, euid: u32) -> Result<Zeroizing<St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::PathBuf;
 
     const PASSWORD: &str = "correct horse battery staple";
 
-    fn me() -> u32 {
-        rustix::process::geteuid().as_raw()
+    fn me() -> Reader {
+        Reader::this_process()
     }
 
     /// A credentials directory like the one systemd makes, holding `contents`
@@ -155,10 +249,18 @@ mod tests {
         read_credential(dir, PASSWORD_CREDENTIAL, me())
     }
 
-    fn refused(dir: &Path, why: &str) {
-        let err = read(dir).err().expect("refused").to_string();
+    fn refused_for(dir: &Path, reader: Reader, why: &str) {
+        // Not expect_err: that would print the password.
+        let Err(err) = read_credential(dir, PASSWORD_CREDENTIAL, reader) else {
+            panic!("read, not refused ({why})");
+        };
+        let err = err.to_string();
         assert!(err.contains(why), "{why}: {err}");
         assert!(!err.contains("horse"), "the contents were echoed: {err}");
+    }
+
+    fn refused(dir: &Path, why: &str) {
+        refused_for(dir, me(), why)
     }
 
     #[test]
@@ -181,58 +283,171 @@ mod tests {
 
     #[test]
     fn a_credential_others_could_read_or_replace_is_refused() {
-        for mode in [0o444, 0o404, 0o460, 0o602, 0o620, 0o664] {
+        for mode in [0o444, 0o404, 0o401, 0o664, 0o602] {
             let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, mode);
             refused(&dir, "closed to other users");
         }
-        for mode in [0o770, 0o757, 0o777, 0o720] {
+        for mode in [0o460, 0o620, 0o420] {
+            let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, mode);
+            refused(&dir, "its group may not write");
+        }
+        for mode in [0o757, 0o705, 0o701] {
             let (_root, dir) = creds(PASSWORD.as_bytes(), mode, 0o400);
-            refused(&dir, "others could replace the credential");
+            refused(&dir, "the credentials directory has mode");
         }
-        // Owned by another user: refused unless that user is root, which may
-        // own them for any service.
-        let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, 0o400);
-        let other = read_credential(&dir, PASSWORD_CREDENTIAL, me() + 1);
-        if me() == 0 {
-            assert!(other.is_ok());
+        for mode in [0o770, 0o720] {
+            let (_root, dir) = creds(PASSWORD.as_bytes(), mode, 0o400);
+            refused(&dir, "its group may not write");
+        }
+    }
+
+    /// The group may read only when it is root's or the reader's: another
+    /// supervisor's `root:agents 0440` would hand the password to agents.
+    #[test]
+    fn only_a_trusted_group_may_read_the_credential() {
+        let (_root, dir) = creds(PASSWORD.as_bytes(), 0o550, 0o440);
+        let gid = std::fs::metadata(dir.join(PASSWORD_CREDENTIAL))
+            .unwrap()
+            .gid();
+        // The reader's own group.
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, Reader { gid, ..me() }).is_ok());
+        let stranger = Reader {
+            gid: gid + 1,
+            ..me()
+        };
+        if gid == 0 {
+            // Root's group is trusted: move the file and directory to
+            // another before asking.
+            let file = dir.join(PASSWORD_CREDENTIAL);
+            std::os::unix::fs::chown(&file, None, Some(4_321)).unwrap();
+            refused_for(&dir, stranger, "only root's group or the gateway's");
+            std::os::unix::fs::chown(&file, None, Some(0)).unwrap();
+            std::os::unix::fs::chown(&dir, None, Some(4_321)).unwrap();
+            refused_for(
+                &dir,
+                stranger,
+                "the credentials directory has mode 550 and group 4321",
+            );
         } else {
-            let err = other.err().unwrap().to_string();
-            assert!(err.contains("is owned by uid"), "{err}");
+            refused_for(&dir, stranger, "only root's group or the gateway's");
+            // Closed to the group, it does not matter whose the group is.
+            let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, 0o400);
+            assert!(read_credential(&dir, PASSWORD_CREDENTIAL, stranger).is_ok());
         }
-        if me() != 0 {
+    }
+
+    /// An ACL can let a user or group in while the mode bits show only the
+    /// mask: a named entry for anyone but the reader and root is refused.
+    #[test]
+    fn an_acl_that_lets_anyone_else_read_is_refused() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            // The kernel takes entries in tag order only.
+            let mut entries = entries.to_vec();
+            entries.sort_by_key(|e| e.0);
+            let mut v = 2u32.to_le_bytes().to_vec();
+            for (tag, perm, id) in &entries {
+                v.extend_from_slice(&tag.to_le_bytes());
+                v.extend_from_slice(&perm.to_le_bytes());
+                v.extend_from_slice(&id.to_le_bytes());
+            }
+            v
+        }
+        const UNDEFINED: u32 = u32::MAX;
+        let set = |path: &Path, entries: &[(u16, u16, u32)]| -> bool {
+            match rustix::fs::setxattr(
+                path,
+                "system.posix_acl_access",
+                &acl(entries),
+                rustix::fs::XattrFlags::empty(),
+            ) {
+                Ok(()) => true,
+                Err(Errno::NOTSUP) => false,
+                Err(e) => panic!("setxattr: {e}"),
+            }
+        };
+        let reader = me();
+        let base = |user: (u16, u32), mask: u16| {
+            vec![
+                (0x01, 0o4, UNDEFINED),
+                (user.0, 0o4, user.1),
+                (0x04, 0, UNDEFINED),
+                (0x10, mask, UNDEFINED),
+                (0x20, 0, UNDEFINED),
+            ]
+        };
+        let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, 0o400);
+        let file = dir.join(PASSWORD_CREDENTIAL);
+        // The reader by name, as systemd grants the service's user.
+        if !set(&file, &base((0x02, reader.uid), 0o4)) {
+            eprintln!("skipped: no ACLs on this file system");
             return;
         }
+        assert!(read(&dir).is_ok());
+        // Another user, or another group.
+        assert!(set(&file, &base((0x02, reader.uid + 1), 0o4)));
+        refused(&dir, &format!("lets uid {} in", reader.uid + 1));
+        assert!(set(&file, &base((0x08, reader.gid + 1), 0o4)));
+        refused(&dir, &format!("lets gid {} in", reader.gid + 1));
+        // Masked out, the entry grants nothing.
+        assert!(set(&file, &base((0x02, reader.uid + 1), 0)));
+        assert!(read(&dir).is_ok());
+        // On the directory too.
+        assert!(set(&file, &base((0x02, reader.uid), 0o4)));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir_acl = vec![
+            (0x01, 0o7, UNDEFINED),
+            (0x02, 0o5, reader.uid + 1),
+            (0x04, 0, UNDEFINED),
+            (0x10, 0o5, UNDEFINED),
+            (0x20, 0, UNDEFINED),
+        ];
+        assert!(set(&dir, &dir_acl));
+        refused(
+            &dir,
+            &format!(
+                "the credentials directory has an access ACL that lets uid {} in",
+                reader.uid + 1
+            ),
+        );
+    }
+
+    #[test]
+    fn the_credential_must_belong_to_root_or_the_reader() {
+        let (_root, dir) = creds(PASSWORD.as_bytes(), 0o500, 0o400);
+        let other = Reader {
+            uid: me().uid + 1,
+            ..me()
+        };
+        if me().uid != 0 {
+            refused_for(&dir, other, "is owned by uid");
+            return;
+        }
+        // Root owns them for any service.
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, other).is_ok());
         // Only root can give them to other users: each check on its own.
-        const READER: u32 = 5_555;
-        const STRANGER: u32 = 4_321;
+        let reader = Reader {
+            uid: 5_555,
+            gid: 5_555,
+        };
         let chown = |p: &Path, uid: u32| std::os::unix::fs::chown(p, Some(uid), None).unwrap();
         let file = dir.join(PASSWORD_CREDENTIAL);
         // The reader's credential in a stranger's directory.
-        chown(&file, READER);
-        chown(&dir, STRANGER);
-        let err = read_credential(&dir, PASSWORD_CREDENTIAL, READER)
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string()
-                .contains("the credentials directory is owned by uid 4321"),
-            "{err}"
+        chown(&file, reader.uid);
+        chown(&dir, 4_321);
+        refused_for(
+            &dir,
+            reader,
+            "the credentials directory is owned by uid 4321",
         );
         // A stranger's credential in a directory of root's.
         chown(&dir, 0);
-        chown(&file, STRANGER);
-        let err = read_credential(&dir, PASSWORD_CREDENTIAL, READER)
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string().contains("is owned by uid 4321, not root"),
-            "{err}"
-        );
+        chown(&file, 4_321);
+        refused_for(&dir, reader, "is owned by uid 4321, not root");
         // Both the reader's, or the directory root's: read.
-        chown(&file, READER);
-        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, READER).is_ok());
-        chown(&dir, READER);
-        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, READER).is_ok());
+        chown(&file, reader.uid);
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, reader).is_ok());
+        chown(&dir, reader.uid);
+        assert!(read_credential(&dir, PASSWORD_CREDENTIAL, reader).is_ok());
     }
 
     #[test]
@@ -294,7 +509,10 @@ mod tests {
             format!("{PASSWORD}\0").into_bytes(),
         ] {
             let (_root, dir) = creds(&bad, 0o500, 0o400);
-            let err = read(&dir).err().expect("refused").to_string();
+            let Err(err) = read(&dir) else {
+                panic!("read {bad:?}");
+            };
+            let err = err.to_string();
             assert!(
                 err.contains("is empty") || err.contains("more than one line"),
                 "{bad:?}: {err}"

@@ -107,6 +107,8 @@ For FROST network signer (template service):
 sudo systemctl enable --now keep-frost-serve@npub1abc123.service
 ```
 
+For the agent gateway (`keep-gateway.service`), which runs as its own `keep-gateway` user, never as `keep`, and unlocks from a TPM-sealed credential, follow [Running the gateway under systemd](../docs/USAGE.md#running-the-gateway-under-systemd).
+
 ## Shell Completions
 
 **Bash:**
