@@ -316,8 +316,10 @@ mod tests {
             ..me()
         };
         if gid == 0 {
-            // Root's group is trusted: move the file and directory to
-            // another before asking.
+            // Root's group is trusted, whatever the reader's: systemd's
+            // root:root 0440 credential for the gateway's user.
+            assert!(read_credential(&dir, PASSWORD_CREDENTIAL, stranger).is_ok());
+            // Move the file and directory to another group before asking.
             let file = dir.join(PASSWORD_CREDENTIAL);
             std::os::unix::fs::chown(&file, None, Some(4_321)).unwrap();
             refused_for(&dir, stranger, "only root's group or the gateway's");
