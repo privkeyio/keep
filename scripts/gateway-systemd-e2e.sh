@@ -175,7 +175,8 @@ for want in User=$GW Group=$GW Type=notify NotifyAccess=main StartLimitBurst=5 S
     MemoryDenyWriteExecute=yes LockPersonality=yes RemoveIPC=yes KeyringMode=private \
     DevicePolicy=closed CapabilityBoundingSet= AmbientCapabilities= RestrictAddressFamilies=AF_UNIX \
     RestrictNamespaces=yes SystemCallArchitectures=native SystemCallErrorNumber=1 LimitCORE=0 \
-    UMask=0077 PrivateUsers=no 'ReadWritePaths=-/run/keep-gateway -/run/keep-gateway-admin'; do
+    UMask=0077 PrivateUsers=no 'IPAddressDeny=::/0 0.0.0.0/0' IPAddressAllow= \
+    'ReadWritePaths=-/run/keep-gateway -/run/keep-gateway-admin'; do
     grep -qxF "$want" <<<"$PROPS" || fail "the unit does not set $want: $(grep "^${want%%=*}=" <<<"$PROPS")"
 done
 grep -qx 'LoadCredentialEncrypted=vault-password:/etc/keep/gateway/vault-password.cred' <<<"$(systemctl cat "$UNIT")" \
