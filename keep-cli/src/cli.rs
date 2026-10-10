@@ -201,6 +201,11 @@ pub(crate) const DEFAULT_AGENT_SOCKET: &str = "/run/keep-gateway/agent.sock";
 #[cfg(target_os = "linux")]
 pub(crate) const DEFAULT_ADMIN_SOCKET: &str = "/run/keep-gateway-admin/admin.sock";
 
+/// The user the gateway runs as by default: its own, shared with no other
+/// keep service.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_GATEWAY_USER: &str = "keep-gateway";
+
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 pub(crate) enum GatewayCommands {
@@ -335,7 +340,7 @@ pub(crate) struct AdminTarget {
     pub admin_socket: PathBuf,
     /// The user the gateway runs as, by name or uid. The admin socket, and the
     /// directory it is in, must be that user's, or nothing is sent.
-    #[arg(long, default_value = "keep")]
+    #[arg(long, default_value = DEFAULT_GATEWAY_USER)]
     pub gateway_user: String,
 }
 
@@ -374,7 +379,7 @@ pub(crate) enum AgentCommands {
         /// The user the gateway runs as, by name or uid. The token is sent
         /// only to a socket that user serves, from a directory only it can
         /// write.
-        #[arg(long, default_value = "keep")]
+        #[arg(long, default_value = DEFAULT_GATEWAY_USER)]
         gateway_user: String,
     },
 }
@@ -1368,6 +1373,34 @@ pub(crate) enum BitcoinCommands {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// The admin commands and the bridge expect the gateway's own user, the
+    /// one its systemd unit runs it as.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gateway_user_defaults_to_keep_gateway() {
+        let cli = Cli::try_parse_from(["keep", "gateway", "status"]).unwrap();
+        let Commands::Gateway {
+            command: GatewayCommands::Status { target },
+        } = cli.command
+        else {
+            panic!("not gateway status");
+        };
+        assert_eq!(target.gateway_user, "keep-gateway");
+        let cli = Cli::try_parse_from(["keep", "agent", "connect", "--token-file", "t"]).unwrap();
+        let Commands::Agent {
+            command: AgentCommands::Connect { gateway_user, .. },
+        } = cli.command
+        else {
+            panic!("not agent connect");
+        };
+        assert_eq!(gateway_user, "keep-gateway");
+        let unit = include_str!("../../contrib/systemd/keep-gateway.service");
+        assert!(
+            unit.lines().any(|l| l == "User=keep-gateway"),
+            "the unit's user"
+        );
+    }
 
     #[test]
     fn bitcoin_sign_short_p_is_global_path_not_psbt() {

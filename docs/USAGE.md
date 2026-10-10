@@ -650,24 +650,88 @@ Set `KEEP_PASSWORD` in the server's environment so it can unlock the vault non-i
 
 The owner manages credentials over a second socket, open only to root and one admin uid. While the gateway runs it holds the vault's lock, so management goes through this socket.
 
-Setup, with a `keep` user for the gateway, agents in the `keep-agents` group and the admin in `keep-admins`. Each socket directory must already exist, be owned by the gateway's user, have mode 0750 or tighter, and be separate from the other:
+#### Strong mode
+
+The gateway keeps keys from agents only when all of these hold:
+
+- The gateway runs as its own user, `keep-gateway`, shared with no agent and no other service (`keep serve` and `keep frost serve` run as `keep`). It refuses root.
+- No agent user has an unattended way to root: no passwordless sudo, no membership in `docker`, `lxd` or `libvirt`, and no write access to the shell startup files of a user who runs sudo.
+- No agent user is in the `keep-gateway` or `keep-admins` group, or is the gateway's admin uid.
+- Each agent that must be kept apart from the others runs as its own user. A credential is bound to a uid, and every process running as that uid can use it, so agents that share a user share every grant bound to that user: their grants add up. Giving each agent its own user is optional, but it is the only way to give agents different grants that they cannot use on each other's behalf.
+
+#### Running the gateway under systemd
+
+`contrib/systemd/keep-gateway.service` runs the gateway as the `keep-gateway` user with its vault in `/var/lib/keep-gateway/vault`. systemd decrypts the vault password from a credential sealed to this machine and hands it to the gateway in a directory only the `keep-gateway` user can read, so the password is never stored in plaintext and never in an environment variable. It needs systemd 250 or later (Ubuntu 22.04, with 249, is too old), a TPM 2.0, and the TPM libraries systemd loads: `systemd-creds has-tpm2` must list `+libraries`, and on Debian and Ubuntu `sudo apt install tpm2-tools` brings in any that are missing.
+
+1. Create the users and groups. Agents reach the gateway through `keep-agents`, the admin through `keep-admins`:
+
+   ```bash
+   sudo groupadd --system keep-agents
+   sudo groupadd --system keep-admins
+   sudo useradd --system --user-group --home-dir /var/lib/keep-gateway --shell /usr/sbin/nologin keep-gateway
+   sudo useradd --system --create-home --groups keep-agents agent-writer   # one user per agent
+   sudo usermod -aG keep-admins "$USER"   # optional: manage it without sudo (log in again for it to apply)
+   ```
+
+2. Install the binary and the unit, and create the vault as `keep-gateway` (it asks for the new vault password):
+
+   ```bash
+   sudo install -m 0755 keep /usr/local/bin/keep
+   sudo install -m 0644 contrib/systemd/keep-gateway.service /etc/systemd/system/
+   sudo install -d -m 0700 -o keep-gateway -g keep-gateway /var/lib/keep-gateway
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault init
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault generate --name agent
+   ```
+
+3. Seal the vault password to this machine. It is read without echo and never written in plaintext:
+
+   ```bash
+   sudo install -d -m 0700 /etc/keep/gateway
+   sudo -v   # so sudo does not ask for its password while the vault password is typed
+   systemd-ask-password -n "Vault password:" | sudo systemd-creds encrypt \
+     --name=vault-password --with-key=host+tpm2 --tpm2-pcrs=7 - /etc/keep/gateway/vault-password.cred
+   ```
+
+   `host+tpm2` needs both this machine's TPM and its host key (`/var/lib/systemd/credential.secret`, readable by root alone) to decrypt it, so neither a copied disk nor access to the TPM is enough. Whoever takes the whole machine holds both, though: on an unencrypted disk they can read the host key and boot any system Secure Boot accepts to have the TPM decrypt the password, so where theft of the machine matters, encrypt its disk. `--tpm2-pcrs=7` binds it to the Secure Boot state: a firmware or Secure Boot update that changes that state stops it from decrypting, and it must be sealed again. Pass `--tpm2-pcrs=` (empty) to bind it to no state. Seal it again whenever the vault password changes.
+
+4. Set the gateway's options in a drop-in (`sudo systemctl edit keep-gateway`), for example:
+
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=/usr/local/bin/keep --path /var/lib/keep-gateway/vault gateway serve --admin-uid 1000 --wallet-budget-sats 100000
+   ```
+
+5. Start it, and start it at boot. `systemctl` returns once the vault is unlocked and both sockets listen, or reports the failure:
+
+   ```bash
+   sudo systemctl enable --now keep-gateway
+   keep gateway status        # as root or the admin uid
+   ```
+
+A gateway that cannot start tries five times and then stays stopped rather than retrying forever; `journalctl -u keep-gateway` says why:
+
+- `Decryption failed - wrong password`: the sealed password is wrong. Seal it again (step 3), then `sudo systemctl reset-failed keep-gateway` and start it.
+- `Rate limited after repeated unlock failures; try again in Ns`: after repeated wrong passwords the vault refuses unlocks for a while, doubling up to five minutes, without trying the password. Wait the N seconds it names, then `reset-failed` and start it, or it will use up its five tries again.
+- `Failed to unseal secret using TPM2` (status `243/CREDENTIALS`): the Secure Boot state changed since it was sealed. Seal it again (step 3), then `reset-failed` and start it.
+
+The gateway never reads the vault password from `KEEP_PASSWORD`, and refuses to start if it is set: a variable set in a unit is shown to every user by `systemctl show`. It reads it from the `vault-password` credential in `$CREDENTIALS_DIRECTORY`. That directory and the file in it must be owned by root or `keep-gateway`, not be symlinks, be closed to other users and not writable by their group, be readable by their group only if that group is root's or `keep-gateway`, and carry no ACL entry for anyone else; the file holds the password on one line. Run outside systemd, it asks for the password on a terminal; another supervisor can set `CREDENTIALS_DIRECTORY` to a directory it controls that holds the `vault-password` file.
+
+The unit creates `/run/keep-gateway` (`keep-gateway:keep-agents`) and `/run/keep-gateway-admin` (`keep-gateway:keep-admins`), both mode 0750, before each start. `RuntimeDirectory=` cannot do this, since it gives every directory the service's own group. The gateway refuses to start if either directory is not owned by `keep-gateway`, is open to other users or writable by its group, or carries an ACL entry for anyone but root or `keep-gateway`, or if the admin directory is open to the agent directory's group.
+
+The unit runs the gateway with no capabilities, no new privileges, a system call filter, no network (`PrivateNetwork=`; its sockets are in the file system), a read-only system, no access to home directories, and core dumps off; on systemd 255, `systemd-analyze security keep-gateway` rates it 0.4 (safe). It leaves out `PrivateUsers=`, which would hide the agents' uids from the gateway, and `ProcSubset=pid`, which would hide files under `/proc/sys` the gateway reads.
+
+Running it by hand instead, each socket directory must exist first, owned by `keep-gateway`, mode 0750 or tighter, and separate from the other (`/run` is emptied at boot):
 
 ```bash
-sudo groupadd --system keep-agents
-sudo groupadd --system keep-admins
-sudo useradd --system --create-home --shell /usr/sbin/nologin keep
-sudo usermod -aG keep-agents agent-user
-sudo usermod -aG keep-admins "$USER"
-sudo install -d -m 0750 -o keep -g keep-agents /run/keep-gateway
-sudo install -d -m 0750 -o keep -g keep-admins /run/keep-gateway-admin  # /run is cleared at boot: recreate both each boot
-
-# As the keep user, with its vault (KEEP_PASSWORD in its environment):
-keep gateway serve --admin-uid "$(id -u "$USER")" --wallet-budget-sats 100000
+sudo install -d -m 0750 -o keep-gateway -g keep-agents /run/keep-gateway
+sudo install -d -m 0750 -o keep-gateway -g keep-admins /run/keep-gateway-admin
+sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault gateway serve --admin-uid "$(id -u)"
 ```
 
 `--wallet-budget-sats` caps what all agents together may take out of one key's wallet in any 24 hours. Mainnet has its own budget, and the test networks share one. The default, 0, refuses every spend.
 
-Managing credentials (the admin commands check that the socket belongs to `--gateway-user`, by default `keep`, before sending anything):
+Managing credentials (the admin commands check that the socket belongs to `--gateway-user`, by default `keep-gateway`, before sending anything):
 
 ```bash
 # A Nostr signer for the agent running as uid 1001; the token is written to a new 0600 file
@@ -684,7 +748,7 @@ keep gateway revoke <id>
 keep gateway audit --limit 50
 ```
 
-Credentials expire after 30 days by default (`--ttl-days`). A credential may not be bound to root, the gateway's uid, the vault owner's uid, the admin uid or the overflow uid. Agents that share a uid share every grant bound to it, so give each agent its own user, and give agent users no way to reach root (no passwordless sudo, no `docker` group).
+Credentials expire after 30 days by default (`--ttl-days`). A credential may not be bound to root, the gateway's uid, the vault owner's uid, the admin uid or the overflow uid. Agents that share a uid share every grant bound to it (see [Strong mode](#strong-mode)).
 
 #### Connecting an MCP client
 
@@ -711,7 +775,7 @@ Then add the bridge to the client's configuration (for Claude and Cursor, under 
 }
 ```
 
-`--socket` (default `/run/keep-gateway/agent.sock`) and `--gateway-user` (default `keep`) point it at another gateway.
+`--socket` (default `/run/keep-gateway/agent.sock`) and `--gateway-user` (default `keep-gateway`) point it at another gateway.
 
 The bridge protects the token:
 
@@ -731,7 +795,7 @@ The bridge sends one request at a time over one connection. It keeps running whe
 
 Notifications from the client are not sent to the gateway, which acts on none of them.
 
-Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`). A systemd unit is planned.
+Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`).
 
 ---
 

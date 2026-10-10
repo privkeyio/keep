@@ -2555,3 +2555,80 @@ fn test_agent_connect_refuses_before_sending_anything() {
     );
     printed_nothing_secret(&output);
 }
+
+/// `keep gateway serve` never takes the vault password from KEEP_PASSWORD,
+/// reads it only from a credential closed to other users, and without one
+/// asks only on a terminal. It never prints the password.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_serve_takes_its_password_only_from_a_closed_credential() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("vault");
+    assert_success(
+        &KeepCmd::new(&keep)
+            .path(&vault)
+            .args(["init", "--size", "10"])
+            .run(),
+    );
+    let serve = |env: &[(&str, &Path)], password_env: bool| {
+        let mut cmd = Command::new(&keep);
+        cmd.env_clear().arg("--path").arg(&vault).args([
+            "gateway",
+            "serve",
+            "--agent-socket",
+            "/nonexistent/agent.sock",
+            "--admin-socket",
+            "/nonexistent-admin/admin.sock",
+        ]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        if password_env {
+            cmd.env("KEEP_PASSWORD", TEST_PASSWORD);
+        }
+        cmd.stdin(Stdio::null()).output().unwrap()
+    };
+    let refused = |output: &Output, why: &str| {
+        assert_failure(output);
+        assert!(output_contains(output, why), "{why}: {output:?}");
+        assert!(
+            !output_contains(output, TEST_PASSWORD),
+            "the password was printed"
+        );
+    };
+
+    refused(
+        &serve(&[], true),
+        "never reads the vault password from KEEP_PASSWORD",
+    );
+
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").unwrap().uid()
+    };
+    if me == 0 {
+        refused(&serve(&[], false), "never root");
+        return;
+    }
+    refused(&serve(&[], false), "no vault password");
+
+    let creds = dir.path().join("creds");
+    std::fs::create_dir(&creds).unwrap();
+    let file = creds.join("vault-password");
+    std::fs::write(&file, format!("{TEST_PASSWORD}\n")).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    refused(
+        &serve(&[("CREDENTIALS_DIRECTORY", &creds)], false),
+        "closed to other users",
+    );
+    // Closed, it unlocks the vault and goes on to the sockets, which do not
+    // exist here.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let output = serve(&[("CREDENTIALS_DIRECTORY", &creds)], false);
+    refused(&output, "/nonexistent");
+    assert!(!output_contains(&output, "Decryption failed"), "{output:?}");
+}

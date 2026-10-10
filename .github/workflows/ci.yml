@@ -118,6 +118,13 @@ jobs:
       - if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10
         run: sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep
+      # The shipped systemd unit, booted for real on the runner: it passes
+      # systemd-analyze verify, unlocks the gateway from an encrypted
+      # credential, serves an MCP client through the bridge, restarts
+      # unattended and refuses to start when misconfigured.
+      - if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: sudo KEEP_GATEWAY_SYSTEMD_E2E=1 scripts/gateway-systemd-e2e.sh target/release/keep
       # A network key-path spend between two `keep` processes over an in-process
       # relay. The binary is rebuilt with `local-relay-tests` so it accepts a
       # loopback ws:// relay; this stays the last step so no later step runs it.
