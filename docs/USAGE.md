@@ -687,6 +687,7 @@ The gateway keeps keys from agents only when all of these hold:
 
    ```bash
    sudo install -d -m 0700 /etc/keep/gateway
+   sudo -v   # so sudo does not ask for its password while the vault password is typed
    systemd-ask-password -n "Vault password:" | sudo systemd-creds encrypt \
      --name=vault-password --with-key=host+tpm2 --tpm2-pcrs=7 - /etc/keep/gateway/vault-password.cred
    ```
@@ -712,7 +713,7 @@ If it fails with `Decryption failed - wrong password`, the sealed password is wr
 
 The gateway never reads the vault password from `KEEP_PASSWORD`, and refuses to start if it is set: a variable set in a unit is shown to every user by `systemctl show`. It reads it from the `vault-password` credential in `$CREDENTIALS_DIRECTORY`. That directory and the file in it must be owned by root or `keep-gateway`, not be symlinks, be closed to other users and not writable by their group, be readable by their group only if that group is root's or `keep-gateway`, and carry no ACL entry for anyone else; the file holds the password on one line. Run outside systemd, it asks for the password on a terminal; another supervisor can set `CREDENTIALS_DIRECTORY` to a directory it controls that holds the `vault-password` file.
 
-The unit creates `/run/keep-gateway` (`keep-gateway:keep-agents`) and `/run/keep-gateway-admin` (`keep-gateway:keep-admins`), both mode 0750, before each start. `RuntimeDirectory=` cannot do this, since it gives every directory the service's own group. The gateway refuses to start if either directory is not owned by `keep-gateway`, is writable by others, or if the admin directory is open to the agent directory's group.
+The unit creates `/run/keep-gateway` (`keep-gateway:keep-agents`) and `/run/keep-gateway-admin` (`keep-gateway:keep-admins`), both mode 0750, before each start. `RuntimeDirectory=` cannot do this, since it gives every directory the service's own group. The gateway refuses to start if either directory is not owned by `keep-gateway`, is open to other users or writable by its group, or if the admin directory is open to the agent directory's group.
 
 The unit runs the gateway with no capabilities, no new privileges, a system call filter, no network (`PrivateNetwork=`; its sockets are in the file system), a read-only system, no access to home directories, and core dumps off; on systemd 255, `systemd-analyze security keep-gateway` rates it 0.4 (safe). It leaves out `PrivateUsers=`, which would hide the agents' uids from the gateway, and `ProcSubset=pid`, which would hide files under `/proc/sys` the gateway reads.
 
@@ -790,7 +791,7 @@ The bridge sends one request at a time over one connection. It keeps running whe
 
 Notifications from the client are not sent to the gateway, which acts on none of them.
 
-Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`). A systemd unit is planned.
+Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`).
 
 ---
 

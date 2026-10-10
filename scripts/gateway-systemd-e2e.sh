@@ -102,7 +102,11 @@ cleanup() {
     systemctl daemon-reload || true
     for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
     for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
-    for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
+    for g in "${CREATED_GROUPS[@]}"; do
+        # userdel may have removed a user's own group already.
+        getent group "$g" >/dev/null || continue
+        groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2
+    done
     for p in "${CREATED[@]}"; do rm -rf "$p"; done
     rm -rf /run/keep-gateway /run/keep-gateway-admin
     rm -rf "$WORK"
@@ -116,6 +120,7 @@ groupadd --system keep-admins
 CREATED_GROUPS+=(keep-admins)
 useradd --system --user-group --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin $GW
 CREATED_USERS+=($GW)
+CREATED_GROUPS+=($GW)
 add_user() {
     useradd --system --no-create-home --shell /usr/sbin/nologin "$@"
     CREATED_USERS+=("${@: -1}")
@@ -175,9 +180,14 @@ for want in User=$GW Group=$GW Type=notify NotifyAccess=main StartLimitBurst=5 S
     MemoryDenyWriteExecute=yes LockPersonality=yes RemoveIPC=yes KeyringMode=private \
     DevicePolicy=closed CapabilityBoundingSet= AmbientCapabilities= RestrictAddressFamilies=AF_UNIX \
     RestrictNamespaces=yes SystemCallArchitectures=native SystemCallErrorNumber=1 LimitCORE=0 \
-    UMask=0077 PrivateUsers=no 'IPAddressDeny=::/0 0.0.0.0/0' IPAddressAllow= \
+    UMask=0077 PrivateUsers=no IPAddressAllow= \
     'ReadWritePaths=-/run/keep-gateway -/run/keep-gateway-admin'; do
     grep -qxF "$want" <<<"$PROPS" || fail "the unit does not set $want: $(grep "^${want%%=*}=" <<<"$PROPS")"
+done
+# systemd prints the denied prefixes in no fixed order.
+DENY=$(grep '^IPAddressDeny=' <<<"$PROPS") || fail "no IPAddressDeny"
+for prefix in 0.0.0.0/0 ::/0; do
+    grep -qF " $prefix" <<<" ${DENY#IPAddressDeny=}" || fail "the unit does not deny $prefix: $DENY"
 done
 grep -qx 'LoadCredentialEncrypted=vault-password:/etc/keep/gateway/vault-password.cred' <<<"$(systemctl cat "$UNIT")" \
     || fail "the unit does not load the encrypted credential"

@@ -17,7 +17,8 @@ contrib/
 │   └── keep-web.{postinst,prerm,postrm}
 ├── systemd/
 │   ├── keep-serve.service
-│   └── keep-frost-serve@.service
+│   ├── keep-frost-serve@.service
+│   └── keep-gateway.service
 ├── nginx/
 │   └── keep.conf
 └── completions/

@@ -8,6 +8,7 @@
 #     `keep-admins` groups;
 #   - the vault at /var/lib/keep-gateway/vault, owned by `keep-gateway`;
 #   - the vault password sealed to this machine:
+#       sudo install -d -m 0700 /etc/keep/gateway && sudo -v
 #       systemd-ask-password -n "Vault password:" | sudo systemd-creds encrypt \
 #         --name=vault-password --with-key=host+tpm2 --tpm2-pcrs=7 - \
 #         /etc/keep/gateway/vault-password.cred

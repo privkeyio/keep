@@ -315,6 +315,10 @@ mod tests {
             gid: gid + 1,
             ..me()
         };
+        if gid == 0 && me().uid != 0 {
+            eprintln!("skipped: gid 0 without root, so no group can be changed or refused");
+            return;
+        }
         if gid == 0 {
             // Root's group is trusted, whatever the reader's: systemd's
             // root:root 0440 credential for the gateway's user.
@@ -363,7 +367,9 @@ mod tests {
                 rustix::fs::XattrFlags::empty(),
             ) {
                 Ok(()) => true,
-                Err(Errno::NOTSUP) => false,
+                // No ACLs on this file system, or ids this namespace
+                // cannot map.
+                Err(Errno::NOTSUP) | Err(Errno::INVAL) => false,
                 Err(e) => panic!("setxattr: {e}"),
             }
         };
@@ -386,7 +392,13 @@ mod tests {
         }
         assert!(read(&dir).is_ok());
         // Another user, or another group.
-        assert!(set(&file, &base((0x02, reader.uid + 1), 0o4)));
+        if !set(&file, &base((0x02, reader.uid + 1), 0o4)) {
+            eprintln!(
+                "skipped: uid {} cannot be named in an ACL here",
+                reader.uid + 1
+            );
+            return;
+        }
         refused(&dir, &format!("lets uid {} in", reader.uid + 1));
         assert!(set(&file, &base((0x08, reader.gid + 1), 0o4)));
         refused(&dir, &format!("lets gid {} in", reader.gid + 1));
