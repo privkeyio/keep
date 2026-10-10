@@ -181,7 +181,7 @@ stop_gateway() {
 }
 
 # The gateway never runs as root.
-if env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
+if timeout 20 env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" >"$WORK/root.log" 2>&1; then
     fail "the gateway ran as root"
 fi
@@ -237,7 +237,7 @@ fi
 pass "process runs as $GW and is not dumpable"
 
 # A second gateway cannot take over the sockets.
-if as "$GW" env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
+if as "$GW" timeout 20 env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" >"$WORK/second.log" 2>&1; then
     fail "a second gateway started"
 fi
