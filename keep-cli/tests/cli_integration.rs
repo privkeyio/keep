@@ -1317,6 +1317,110 @@ fn test_audit_verify_detects_tampering() {
     assert_failure(&out);
 }
 
+/// Overwrite `vault`'s audit log with entries in the format the release
+/// before sequence numbers wrote, chained from zero; `break_link` breaks the
+/// chain at the second entry.
+fn write_format1_audit_log(vault: &Path, break_link: bool) {
+    use base64::Engine;
+    use keep_core::audit::{AuditEntry, AuditEventType};
+    use keep_core::Keep;
+
+    let mut keep = Keep::open(vault).unwrap();
+    keep.unlock(TEST_PASSWORD).unwrap();
+    let key = keep.data_key().unwrap();
+    drop(keep);
+    let mut out = String::new();
+    let mut prev_hash = [0u8; 32];
+    for (i, event) in [AuditEventType::VaultUnlock, AuditEventType::VaultLock]
+        .into_iter()
+        .enumerate()
+    {
+        let mut entry = AuditEntry::new(event, prev_hash);
+        entry.format = 1;
+        if break_link && i == 1 {
+            entry.prev_hash = [9; 32];
+        }
+        let entry = entry.finalize();
+        prev_hash = entry.hash;
+        let mut value = serde_json::to_value(&entry).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("format");
+        object.remove("seq");
+        let encrypted =
+            keep_core::crypto::encrypt(&serde_json::to_vec(&value).unwrap(), &key).unwrap();
+        out.push_str(&base64::engine::general_purpose::STANDARD.encode(encrypted.to_bytes()));
+        out.push('\n');
+    }
+    std::fs::write(vault.join("audit.log"), out).unwrap();
+}
+
+/// A vault whose audit log predates sequence numbers is migrated the next
+/// time it opens, and `audit verify` says so and passes.
+#[test]
+fn test_audit_verify_reports_a_migration() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    write_format1_audit_log(&vault, false);
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "verified"));
+    assert!(output_contains(&out, "moved to sequence numbers"));
+    assert!(vault.join("audit.log.v1").exists());
+}
+
+/// A migration whose old log failed its chain check never stops the vault
+/// opening, but every open while the old log is kept warns, and `audit
+/// verify` fails, saying the entries before the migration cannot be trusted.
+#[test]
+fn test_audit_verify_fails_after_a_failed_migration() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    write_format1_audit_log(&vault, true);
+
+    let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&out);
+    assert!(output_contains(&out, "FAILED its chain check"));
+    let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&out);
+    assert!(output_contains(&out, "FAILED its chain check"));
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    assert!(output_contains(&out, "cannot be trusted"));
+    assert!(output_contains(&out, "audit.log.v1"));
+
+    // Once retention has removed every entry from before the migration,
+    // verify passes and only notes the failed migration.
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["audit", "retention", "--max-entries", "2", "--apply"])
+            .run(),
+    );
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "removed by retention"));
+
+    std::fs::remove_file(vault.join("audit.log.v1")).unwrap();
+    let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&out);
+    assert!(!output_contains(&out, "FAILED its chain check"));
+}
+
 /// `audit stats` reports the count of each event type; two `generate`s show as
 /// two key generations.
 #[test]

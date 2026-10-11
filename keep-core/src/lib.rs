@@ -89,7 +89,8 @@ use tracing::debug;
 use zeroize::Zeroizing;
 
 use crate::audit::{
-    AuditEntry, AuditEventType, AuditLog, RetentionPolicy, SigningAuditEntry, SigningAuditLog,
+    AuditEntry, AuditEventType, AuditLog, AuditVerification, RetentionPolicy, SigningAuditEntry,
+    SigningAuditLog,
 };
 use crate::crypto::{Argon2Params, SecretKey};
 use crate::error::{KeepError, Result};
@@ -967,8 +968,10 @@ impl Keep {
             return Err(KeepError::Locked);
         }
         let data_key = self.get_data_key()?;
-        let audit = AuditLog::open(self.storage.path(), &data_key)?;
-        audit.read_all(&data_key)
+        match &self.audit {
+            Some(audit) => audit.read_all(&data_key),
+            None => AuditLog::open(self.storage.path(), &data_key)?.read_all(&data_key),
+        }
     }
 
     /// Mutable access to the keyring.
@@ -2110,6 +2113,17 @@ impl Keep {
         if let Some(ref mut signing_audit) = self.signing_audit {
             signing_audit.reencrypt(&old_data_key, &new_data_key)?;
         }
+        // The old audit logs a migration kept come last, and a failure there
+        // does not stop the rotation: both live logs are already under the
+        // new key, and the success entry below must still be written.
+        if let Some(ref audit) = self.audit {
+            if let Err(e) = audit.reencrypt_kept_logs(&old_data_key, &new_data_key) {
+                tracing::error!(
+                    error = %e,
+                    "could not re-encrypt the old audit log a migration kept; it may no longer be readable"
+                );
+            }
+        }
 
         // Both chains are now under `new_data_key`, so record the success entry
         // before reloading the keyring (#580 fails closed). The rotation has
@@ -2190,6 +2204,22 @@ impl Keep {
     pub fn audit_verify_chain(&self) -> Result<bool> {
         let (audit, data_key) = self.audit_with_key()?;
         audit.verify_chain(&data_key)
+    }
+
+    /// Verify the audit log chain, and report the migration it records.
+    pub fn audit_verify(&self) -> Result<AuditVerification> {
+        let (audit, data_key) = self.audit_with_key()?;
+        audit.verify(&data_key)
+    }
+
+    /// Whether the migration that moved the audit log to sequence numbers
+    /// found the old log failed its chain check, while the old log is still
+    /// kept beside the new one. Frontends should warn on unlock: the entries
+    /// from before the migration cannot be trusted.
+    pub fn audit_failed_migration_kept(&self) -> bool {
+        self.audit
+            .as_ref()
+            .is_some_and(AuditLog::failed_migration_kept)
     }
 
     /// Export the audit log as JSON.
@@ -3577,6 +3607,103 @@ mod tests {
         drop(keep);
         let mut reopened = Keep::open(&path).unwrap();
         reopened.unlock("testpass").unwrap();
+    }
+
+    /// An old-format vault log migrates on unlock, the signing audit log is
+    /// left exactly as it was, and a data key change keeps the kept old log
+    /// readable under the new key.
+    #[test]
+    fn unlock_migrates_the_vault_log_and_rotation_keeps_the_old_one() {
+        use crate::audit::test_support::write_format1_log;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let data_key = {
+            let mut keep = test_keep(&path);
+            keep.signing_audit_log(
+                SigningAuditEntry::new(
+                    crate::audit::SigningRequestType::SignEvent,
+                    crate::audit::SigningDecision::Approved,
+                    false,
+                    "caller".into(),
+                    keep.signing_audit_last_hash().unwrap(),
+                )
+                .finalize(),
+            )
+            .unwrap();
+            keep.data_key().unwrap()
+        };
+        write_format1_log(
+            &path,
+            &data_key,
+            vec![
+                AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]),
+                AuditEntry::new(AuditEventType::VaultLock, [0; 32]),
+            ],
+        );
+        let signing = std::fs::read(path.join("signing_audit.log")).unwrap();
+        let old = std::fs::read(path.join("audit.log")).unwrap();
+
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert_eq!(
+            std::fs::read(path.join("signing_audit.log")).unwrap(),
+            signing
+        );
+        assert_eq!(std::fs::read(path.join("audit.log.v1")).unwrap(), old);
+        assert!(!keep.audit_failed_migration_kept());
+        let report = keep.audit_verify().unwrap();
+        assert!(report.valid);
+        assert_eq!(report.migration.map(|m| m.old_count), Some(2));
+        let entries = keep.audit_read_all().unwrap();
+        assert_eq!(entries[2].event_type, AuditEventType::AuditLogMigrated);
+        assert_eq!(
+            entries.last().unwrap().event_type,
+            AuditEventType::VaultUnlock
+        );
+        assert!(entries.iter().zip(1u64..).all(|(e, seq)| e.seq == seq));
+
+        keep.rotate_data_key("testpass").unwrap();
+        let new_key = keep.data_key().unwrap();
+        let kept = std::fs::read_to_string(path.join("audit.log.v1")).unwrap();
+        assert_eq!(kept.lines().count(), 2);
+        for line in kept.lines() {
+            let bytes =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, line).unwrap();
+            let encrypted = crypto::EncryptedData::from_bytes(&bytes).unwrap();
+            assert!(crypto::decrypt(&encrypted, &data_key).is_err());
+            assert!(crypto::decrypt(&encrypted, &new_key).is_ok());
+        }
+        assert!(keep.audit_verify_chain().unwrap());
+    }
+
+    /// A kept old log that cannot be re-encrypted does not stop a data key
+    /// rotation: both live logs move to the new key and the rotation is
+    /// recorded.
+    #[test]
+    fn rotation_survives_a_kept_log_it_cannot_reencrypt() {
+        use crate::audit::test_support::write_format1_log;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let data_key = test_keep(&path).data_key().unwrap();
+        write_format1_log(
+            &path,
+            &data_key,
+            vec![AuditEntry::new(AuditEventType::VaultUnlock, [0; 32])],
+        );
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        // A directory where a kept log would be read fails its re-encryption.
+        std::fs::create_dir(path.join("audit.log.v1.7")).unwrap();
+        keep.rotate_data_key("testpass").unwrap();
+        assert!(keep.audit_verify_chain().unwrap());
+        assert!(keep
+            .audit_read_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == AuditEventType::DataKeyRotate));
+        assert!(keep.signing_audit_verify_chain().unwrap().0);
     }
 
     /// `Keep::rotate_data_key` MUST emit a `DataKeyRotate` audit entry on

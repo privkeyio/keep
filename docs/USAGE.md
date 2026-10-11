@@ -511,6 +511,10 @@ keep audit export --output audit.json
 keep audit retention --max-days 90 --apply   # Prune old entries
 ```
 
+Each entry carries a sequence number inside its hash, one more than the entry before, counted from the first entry the log ever had. Pruning keeps every remaining entry's hash and sequence number, removes only the oldest entries, and records where the kept chain now starts in an entry of its own (counted towards `--max-entries`), so `keep audit verify` still checks the whole kept chain and fails if anything else cut it short. Changing the data key re-encrypts the log without changing a hash.
+
+A vault whose log was written before sequence numbers is migrated the first time it is opened: the old chain is checked, the log is written again with sequence numbers, a migration entry records the old log's last hash, its entry count and whether its chain checked out, and the old file is kept beside it as `audit.log.v1`. An older keep cannot verify a migrated log, and pruning or changing the data key with an older keep on a migrated log drops the sequence numbers for good: the next migration starts counting again, which looks like a rollback to anything that tracked the sequence. If the old chain failed its check, the vault still opens, but every open warns (the CLI and the gateway log an error, the desktop app shows it) while `audit.log.v1` is kept, and `keep audit verify` fails, saying the entries from before the migration cannot be trusted, for as long as the log still holds any of them; once pruning has removed them it passes and only notes the failed migration, which pruning never erases. Keep `audit.log.v1` to investigate. A data key change re-encrypts `audit.log.v1` too, so it stays readable. A log of which no entry can be read under the vault's key (or one that already holds entries in the new format but cannot be read to its end) is not migrated: the vault refuses to open, as it did before, rather than starting the log over. The signing audit log (`signing_audit.log`) is not changed.
+
 ---
 
 ## Mobile (NIP-55)

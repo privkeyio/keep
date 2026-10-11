@@ -439,6 +439,15 @@ impl App {
                 self.reconcile_kill_switch();
                 self.set_share_screen(shares);
                 self.load_config_from_vault();
+                if lock_keep(&self.keep)
+                    .as_ref()
+                    .is_some_and(keep_core::Keep::audit_failed_migration_kept)
+                {
+                    self.set_toast(
+                        "The audit log was moved to a new format, but the old log FAILED its integrity check: entries from before the move cannot be trusted. Keep audit.log.v1 in the vault folder and run `keep audit verify`.".into(),
+                        ToastKind::Error,
+                    );
+                }
                 if let Some(request) = super::take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }

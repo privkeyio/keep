@@ -683,9 +683,7 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
     if !backup.audit_entries.is_empty() {
         let data_key = keep.data_key()?;
         let mut audit = AuditLog::open(path, &data_key)?;
-        for entry in &backup.audit_entries {
-            audit.log(entry.clone(), &data_key)?;
-        }
+        audit.restore_entries(&backup.audit_entries, &data_key)?;
     }
 
     drop(keep);
@@ -808,6 +806,80 @@ mod tests {
         let result = verify_backup(&data, "any-pass");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("magic"));
+    }
+
+    /// A restored vault still reports a failed migration its source log
+    /// recorded, so a backup and restore cannot launder it.
+    #[test]
+    fn restore_keeps_a_failed_migration_reported() {
+        use crate::audit::test_support::{format1_line, write_format1_log};
+        use crate::audit::{AuditEntry, AuditEventType};
+
+        let dir = tempdir().unwrap();
+        let src_path = dir.path().join("src");
+        let data_key = {
+            let mut keep = create_test_keep(&src_path);
+            keep.unlock("test-password-123").unwrap();
+            keep.data_key().unwrap()
+        };
+        let entries: Vec<AuditEntry> = (0..3)
+            .map(|_| AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]))
+            .collect();
+        write_format1_log(&src_path, &data_key, entries);
+        let log = src_path.join("audit.log");
+        let mut text = std::fs::read_to_string(&log).unwrap();
+        let mut broken = AuditEntry::new(AuditEventType::VaultLock, [9; 32]);
+        broken.format = 1;
+        let broken = broken.finalize();
+        text.push_str(&format1_line(&broken, &data_key));
+        std::fs::write(&log, text).unwrap();
+
+        let mut keep = Keep::open(&src_path).unwrap();
+        keep.unlock("test-password-123").unwrap();
+        let failed = keep.audit_verify().unwrap().migration.unwrap();
+        assert!(!failed.old_chain_valid);
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+
+        let dst_path = dir.path().join("dst");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+        let report = restored.audit_verify().unwrap();
+        assert!(report.valid);
+        assert_eq!(report.migration.map(|m| m.old_chain_valid), Some(false));
+        assert_eq!(report.migration.map(|m| m.old_head), Some(failed.old_head));
+        assert!(report.holds_untrusted_entries());
+
+        // Once the source's untrusted entries are pruned, the restored copy
+        // no longer claims to hold any, though it still reports the failure.
+        keep.audit_set_retention(crate::audit::RetentionPolicy {
+            max_entries: Some(1),
+            max_age_days: None,
+        });
+        keep.audit_apply_retention().unwrap();
+        let source = keep.audit_verify().unwrap();
+        assert!(!source.holds_untrusted_entries());
+        let backup_data = create_backup(&keep, "backup-passphrase-ok").unwrap();
+        let dst_path = dir.path().join("dst2");
+        restore_backup(
+            &backup_data,
+            "backup-passphrase-ok",
+            &dst_path,
+            "new-password-456",
+        )
+        .unwrap();
+        let mut restored = Keep::open(&dst_path).unwrap();
+        restored.unlock("new-password-456").unwrap();
+        let report = restored.audit_verify().unwrap();
+        assert!(report.valid);
+        assert_eq!(report.migration.map(|m| m.old_chain_valid), Some(false));
+        assert!(!report.holds_untrusted_entries());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use chrono::{TimeZone, Utc};
 use secrecy::ExposeSecret;
 
-use keep_core::audit::{AuditEntry, AuditEventType, RetentionPolicy};
+use keep_core::audit::{AuditEntry, AuditEventType, AuditVerification, RetentionPolicy};
 use keep_core::error::{KeepError, Result};
 use keep_core::hidden::HiddenStorage;
 use keep_core::Keep;
@@ -50,10 +50,10 @@ impl AuditVault {
         }
     }
 
-    fn verify_chain(&self) -> Result<bool> {
+    fn verify(&self) -> Result<AuditVerification> {
         match self {
-            Self::Keep(k) => k.audit_verify_chain(),
-            Self::HiddenOuter(s) => s.audit_verify_chain(),
+            Self::Keep(k) => k.audit_verify(),
+            Self::HiddenOuter(s) => s.audit_verify(),
         }
     }
 
@@ -211,15 +211,40 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     let password = get_password("Password")?;
     let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
 
-    let valid = vault.verify_chain().map_err(map_verify_error)?;
+    let report = vault.verify().map_err(map_verify_error)?;
 
-    if valid {
-        out.success("Audit log integrity verified - hash chain is valid");
-    } else {
+    if !report.valid {
         out.error(
             "Audit log integrity check FAILED: hash chain is broken. The audit log was modified after writing. Do NOT trust this vault for anything authoritative until you investigate.",
         );
         std::process::exit(1);
+    }
+    match report.migration {
+        Some(m) if report.holds_untrusted_entries() => {
+            out.error(&format!(
+                "Audit log moved to sequence numbers, but the old log FAILED its chain check: {} entries could be read, the last with hash {}. The log still holds entries from before the migration, and they cannot be trusted. Keep the old log (audit.log.v1 in the vault directory) for investigation if you still have it. The chain since the migration is valid.",
+                m.old_count,
+                hex::encode(m.old_head),
+            ));
+            std::process::exit(1);
+        }
+        Some(m) if !m.old_chain_valid => {
+            out.success("Audit log integrity verified - hash chain is valid");
+            out.warn(&format!(
+                "An earlier migration to sequence numbers found the old log FAILED its chain check ({} entries, the last with hash {}). Those entries have since been removed by retention.",
+                m.old_count,
+                hex::encode(m.old_head),
+            ));
+        }
+        Some(m) => {
+            out.success("Audit log integrity verified - hash chain is valid");
+            out.info(&format!(
+                "The log was moved to sequence numbers from an older format: {} entries, the last with hash {}, whose chain checked out.",
+                m.old_count,
+                hex::encode(m.old_head),
+            ));
+        }
+        None => out.success("Audit log integrity verified - hash chain is valid"),
     }
 
     Ok(())
@@ -362,6 +387,7 @@ impl AuditStats {
             AuditEventType::AgentUnfreeze => self.agent_unfreeze += 1,
             AuditEventType::AgentRefused => self.agent_refused += 1,
             AuditEventType::AgentServed => self.agent_served += 1,
+            AuditEventType::AuditLogMigrated | AuditEventType::AuditRetention => {}
         }
     }
 }
