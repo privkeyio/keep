@@ -1413,7 +1413,7 @@ fn test_audit_verify_fails_after_a_failed_migration() {
         .args(["audit", "verify"])
         .run();
     assert_success(&out);
-    assert!(output_contains(&out, "removed by retention"));
+    assert!(output_contains(&out, "None of them remain"));
 
     std::fs::remove_file(vault.join("audit.log.v1")).unwrap();
     let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();

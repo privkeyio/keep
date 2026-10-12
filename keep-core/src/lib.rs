@@ -2107,11 +2107,26 @@ impl Keep {
         // since `reencrypt` is atomic and leaves the file under the old key on
         // failure), and it would misreport a rotation that already committed.
         let new_data_key = self.get_data_key()?;
-        if let Some(ref mut audit) = self.audit {
-            audit.reencrypt(&old_data_key, &new_data_key)?;
+        // Each log is re-encrypted whatever happened to the other. One that
+        // fails is still wholly under the old key, which no longer exists, so
+        // it is opened again under the new key, which sets it aside beside a
+        // new log with the failure recorded rather than locking the vault on
+        // the next unlock.
+        if let Some(Err(e)) = self
+            .audit
+            .as_mut()
+            .map(|audit| audit.reencrypt(&old_data_key, &new_data_key))
+        {
+            tracing::error!(error = %e, "could not re-encrypt the audit log; setting it aside");
+            self.audit = Some(AuditLog::open(self.storage.path(), &new_data_key)?);
         }
-        if let Some(ref mut signing_audit) = self.signing_audit {
-            signing_audit.reencrypt(&old_data_key, &new_data_key)?;
+        if let Some(Err(e)) = self
+            .signing_audit
+            .as_mut()
+            .map(|log| log.reencrypt(&old_data_key, &new_data_key))
+        {
+            tracing::error!(error = %e, "could not re-encrypt the signing audit log; setting it aside");
+            self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &new_data_key)?);
         }
         // The old audit logs a migration kept come last, and a failure there
         // does not stop the rotation: both live logs are already under the
@@ -3680,6 +3695,53 @@ mod tests {
     /// A kept old log that cannot be re-encrypted does not stop a data key
     /// rotation: both live logs move to the new key and the rotation is
     /// recorded.
+    /// A live log that cannot be re-encrypted (a damaged line the vault
+    /// opened past, or entries an older keep cannot read) is set aside under
+    /// the new key rather than left under the old one, so the rotation
+    /// completes and the next unlock still opens the vault.
+    #[test]
+    fn rotation_sets_aside_a_log_it_cannot_reencrypt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        for _ in 0..2 {
+            keep.signing_audit_log(
+                SigningAuditEntry::new(
+                    crate::audit::SigningRequestType::SignEvent,
+                    crate::audit::SigningDecision::Approved,
+                    false,
+                    "caller".into(),
+                    keep.signing_audit_last_hash().unwrap(),
+                )
+                .finalize(),
+            )
+            .unwrap();
+        }
+        let damage = |name: &str| {
+            let file = path.join(name);
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(!text.is_empty(), "{name}");
+            std::fs::write(&file, format!("bm90IGFuIGVudHJ5\n{text}")).unwrap();
+        };
+        damage("audit.log");
+        damage("signing_audit.log");
+
+        keep.rotate_data_key("testpass").unwrap();
+        assert!(keep.audit_failed_migration_kept());
+        assert!(path.join("signing_audit.log.unreadable").exists());
+        assert!(keep
+            .audit_read_all()
+            .unwrap()
+            .iter()
+            .any(|e| e.event_type == AuditEventType::DataKeyRotate));
+        drop(keep);
+
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(keep.audit_verify().unwrap().valid);
+        assert!(keep.signing_audit_verify_chain().unwrap().0);
+    }
+
     #[test]
     fn rotation_survives_a_kept_log_it_cannot_reencrypt() {
         use crate::audit::test_support::write_format1_log;
@@ -3703,6 +3765,9 @@ mod tests {
             std::os::unix::fs::PermissionsExt::from_mode(0o000),
         )
         .unwrap();
+        if std::fs::File::open(&unreadable).is_ok() {
+            return; // Root, or no permissions to drop: nothing would fail.
+        }
         keep.rotate_data_key("testpass").unwrap();
         assert!(keep.audit_verify_chain().unwrap());
         assert!(keep
