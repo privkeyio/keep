@@ -18,7 +18,8 @@
 //! to the gateway, which withdraws the request if it waits for an approver.
 //! The client's input is read while an answer is awaited, so the
 //! cancellation is seen in time; anything else it sends meanwhile waits its
-//! turn.
+//! turn (a few at most, then the input is left unread), and a cancellation
+//! of a request waiting its turn takes it out unsent.
 //!
 //! When the gateway closes the connection (it was idle, the token was
 //! refused three times in a row, or the gateway restarted), the bridge keeps
@@ -367,15 +368,22 @@ impl Inputs {
     }
 
     /// While request `id` is awaited: the cancellations of it that came,
-    /// with everything else kept for later. Other cancellations are
-    /// dropped, as there is nothing else to cancel.
+    /// with everything else kept for later, at most [`MAX_KEPT`]. A
+    /// cancellation of a request kept for later takes it out, and any other
+    /// is dropped, as there is nothing else to cancel. Once that many are
+    /// kept, the client's input is not read until they are taken.
     fn cancellations(&mut self, id: &Value) -> usize {
         let mut found = 0;
-        while let Ok(item) = self.receive.try_recv() {
+        while self.waiting.len() < MAX_KEPT {
+            let Ok(item) = self.receive.try_recv() else {
+                break;
+            };
             if let Input::Line(Line::Text(line)) = &item {
                 if let Incoming::Cancel(request) = classify(line) {
                     if &request == id {
                         found += 1;
+                    } else {
+                        self.withdraw(&request);
                     }
                     continue;
                 }
@@ -384,7 +392,19 @@ impl Inputs {
         }
         found
     }
+
+    /// Take the requests with id `request` out of what is kept for later.
+    fn withdraw(&mut self, request: &Value) {
+        self.waiting.retain(|item| {
+            !matches!(item, Input::Line(Line::Text(line))
+                if matches!(classify(line), Incoming::Forward { id, .. } if &id == request))
+        });
+    }
 }
+
+/// Client messages kept while an answer is awaited, at most: each may be as
+/// long as [`MAX_LINE`].
+const MAX_KEPT: usize = 16;
 
 /// A message from the client, sorted by what the bridge does with it.
 #[derive(Debug, PartialEq)]
@@ -425,9 +445,11 @@ fn classify(line: &[u8]) -> Incoming {
             Err(_) => Incoming::Answer(rpc_error(id, -32600, "invalid request")),
         },
         (None, true) if object.get("method") == Some(&json!("notifications/cancelled")) => {
+            // A null id names no request the gateway could tell apart from
+            // its own refusals.
             match object.get("params").and_then(|p| p.get("requestId")) {
-                Some(request) => Incoming::Cancel(request.clone()),
-                None => Incoming::Drop,
+                Some(request) if !request.is_null() => Incoming::Cancel(request.clone()),
+                _ => Incoming::Drop,
             }
         }
         // Any other notification: the gateway acts on none.
@@ -878,6 +900,51 @@ mod tests {
         assert_eq!(answer(r#"{"id":4}"#), (json!(4), -32600));
     }
 
+    /// While an answer is awaited, a cancellation of a request kept for
+    /// later takes it out, and no more than [`MAX_KEPT`] are kept: the rest
+    /// of the client's input stays unread.
+    #[test]
+    fn what_comes_while_an_answer_is_awaited_is_bounded_and_can_be_withdrawn() {
+        let (send, receive) = mpsc::sync_channel(64);
+        let text = |s: String| Input::Line(Line::Text(s.into_bytes()));
+        let request = |id: u64| text(format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"ping"}}"#));
+        let cancel = |id: u64| {
+            text(format!(
+                r#"{{"jsonrpc":"2.0","method":"notifications/cancelled","params":{{"requestId":{id}}}}}"#
+            ))
+        };
+        send.send(request(2)).unwrap();
+        send.send(cancel(2)).unwrap();
+        send.send(cancel(1)).unwrap();
+        for id in 3..(4 + MAX_KEPT as u64) {
+            send.send(request(id)).unwrap();
+        }
+        let mut inputs = Inputs {
+            receive,
+            waiting: VecDeque::new(),
+        };
+        assert_eq!(inputs.cancellations(&json!(1)), 1);
+        assert_eq!(inputs.waiting.len(), MAX_KEPT);
+        let kept: Vec<Value> = inputs
+            .waiting
+            .iter()
+            .map(|item| match item {
+                Input::Line(Line::Text(line)) => match classify(line) {
+                    Incoming::Forward { id, .. } => id,
+                    other => panic!("{other:?}"),
+                },
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            (3..3 + MAX_KEPT as u64)
+                .map(|id| json!(id))
+                .collect::<Vec<_>>()
+        );
+        assert!(inputs.receive.try_recv().is_ok(), "the rest is left unread");
+    }
+
     #[test]
     fn client_lines_are_split_and_a_long_one_is_skipped_whole() {
         let mut input =
@@ -1205,6 +1272,53 @@ mod socket_tests {
             ],
             "one cancellation, of the awaited request"
         );
+    }
+
+    /// A request still waiting its turn when the client cancels it is never
+    /// sent.
+    #[test]
+    fn a_cancellation_of_a_request_waiting_its_turn_withdraws_it() {
+        let fake = Fake::start(|mut peer| {
+            peer.next().unwrap();
+            // Time for the bridge to read what the client sends meanwhile.
+            std::thread::sleep(Duration::from_millis(600));
+            peer.reply(&json!({ "jsonrpc": "2.0", "id": 1, "result": {} }));
+            peer.serve();
+        });
+        let mut client = Client::start(bridge(&fake, patient()));
+        client.send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#);
+        client.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}"#);
+        client.send(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}"#,
+        );
+        client.send(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#);
+        assert_eq!(client.recv()["id"], json!(1));
+        assert_eq!(client.recv()["id"], json!(3));
+        client.finish().unwrap();
+        let ids: Vec<Value> = fake.ids().into_iter().map(|(_, id)| id).collect();
+        assert_eq!(ids, [json!(1), json!(3)]);
+    }
+
+    /// A cancellation naming a null id is never sent: the gateway answers
+    /// its refusals with a null id, so the request's own answer could no
+    /// longer be told apart.
+    #[test]
+    fn a_cancellation_of_a_null_id_is_never_sent() {
+        let fake = Fake::start(|mut peer| {
+            peer.next().unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            peer.reply(&json!({ "jsonrpc": "2.0", "id": null, "result": {} }));
+            peer.serve();
+        });
+        let mut client = Client::start(bridge(&fake, patient()));
+        client.send(r#"{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{}}"#);
+        client.send(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":null}}"#,
+        );
+        let answer = client.recv();
+        assert_eq!(answer["result"], json!({}), "{answer}");
+        client.finish().unwrap();
+        assert_eq!(fake.log().len(), 1, "{:?}", fake.log());
     }
 
     /// A cancellation of a request other than the one awaited withdraws
