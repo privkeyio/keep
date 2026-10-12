@@ -7,6 +7,7 @@ members = [
     "keep-enclave/host",
     "keep-bitcoin",
     "keep-agent",
+    "keep-approval",
     "keep-frost-net",
     "keep-nip46",
     "keep-mobile",

@@ -1,0 +1,618 @@
+{
+  "changes": [
+    {
+      "canonical": "{\"created_at\":\"1791580000\",\"expires_at\":\"1794172000\",\"grant\":{\"bitcoin\":{\"approval_above_sats\":\"20000\",\"network\":\"bitcoin\",\"per_psbt_sats\":\"50000\",\"window_sats\":\"100000\"},\"event_kinds\":[\"0\",\"1\"],\"keys\":[\"462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b\"],\"limits\":{\"per_day\":\"1000\",\"per_hour\":\"100\",\"per_minute\":\"10\"},\"nip44_peers\":[],\"operations\":[\"sign_nostr_event\",\"sign_psbt\"]},\"id\":\"22222222222222222222222222222222\",\"name\":\"writer\",\"type\":\"issue_credential\",\"uid\":\"1001\"}",
+      "change": {
+        "created_at": "1791580000",
+        "expires_at": "1794172000",
+        "grant": {
+          "bitcoin": {
+            "approval_above_sats": "20000",
+            "network": "bitcoin",
+            "per_psbt_sats": "50000",
+            "window_sats": "100000"
+          },
+          "event_kinds": [
+            "0",
+            "1"
+          ],
+          "keys": [
+            "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+          ],
+          "limits": {
+            "per_day": "1000",
+            "per_hour": "100",
+            "per_minute": "10"
+          },
+          "nip44_peers": [],
+          "operations": [
+            "sign_nostr_event",
+            "sign_psbt"
+          ]
+        },
+        "id": "22222222222222222222222222222222",
+        "name": "writer",
+        "type": "issue_credential",
+        "uid": "1001"
+      },
+      "sha256": "3e5603e99360298f1b9035f4c1fddf1eed841ca7042f5b5c95a72e5410995e43",
+      "type_code": 1
+    },
+    {
+      "canonical": "{\"epoch\":\"41\",\"scope\":\"all\",\"type\":\"unfreeze\"}",
+      "change": {
+        "epoch": "41",
+        "scope": "all",
+        "type": "unfreeze"
+      },
+      "sha256": "917ce143c55d5c9700542acacacacf550bf7f498c13fe7cbec83978958942161",
+      "type_code": 2
+    },
+    {
+      "canonical": "{\"epoch\":\"41\",\"scope\":{\"credential\":\"22222222222222222222222222222222\"},\"type\":\"unfreeze\"}",
+      "change": {
+        "epoch": "41",
+        "scope": {
+          "credential": "22222222222222222222222222222222"
+        },
+        "type": "unfreeze"
+      },
+      "sha256": "614d830946a179e0e33a525bba6746480466faed6b920e7c9284f72fb799c57d",
+      "type_code": 2
+    },
+    {
+      "canonical": "{\"approver\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"fingerprint\":\"d97c 01a6 1ac2 fc90 39d8\",\"label\":\"My phone\",\"transport\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"type\":\"add_approver\"}",
+      "change": {
+        "approver": "7777777777777777777777777777777777777777777777777777777777777777",
+        "fingerprint": "d97c 01a6 1ac2 fc90 39d8",
+        "label": "My phone",
+        "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+        "type": "add_approver"
+      },
+      "sha256": "28727b74b1a63f0c6030724a2c803ba999888af8fb18507d2b92ea4aaf57d174",
+      "type_code": 3
+    },
+    {
+      "canonical": "{\"approver\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"transport\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"type\":\"remove_approver\"}",
+      "change": {
+        "approver": "7777777777777777777777777777777777777777777777777777777777777777",
+        "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+        "type": "remove_approver"
+      },
+      "sha256": "6708028a69c7c7437664bedf5cdbd5a8e48ca44862acbde1bb64811327179ba8",
+      "type_code": 4
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "approve",
+      "digest": "1b870940d513a81dfd691a0ed77bbb6467253c34022a1e11f7a0e19cc27ae87d",
+      "request_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "sig": "d77ef89a93f222393764b3c2637472e9c9995e09ce1afd0ac4740bfa8363b563b3c5a5f030681e07ecaa7e6071c4c8bd039809209799563914f6b104551d235c",
+      "signer": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    },
+    {
+      "decision": "deny",
+      "digest": "1927f62b38d7e92c15dd068c42e147ee8bb4f776f6637c567ba37b1120034b11",
+      "request_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "sig": "54db5bade6dbfdc16ff22416c5dace5b0eb652f8f4fbcac83ea140b4ff54b118c563628e1118e06cb010d2945a69e040b7bf85c55a41f5b822cf76fa22396a35",
+      "signer": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    }
+  ],
+  "freezes": [
+    {
+      "action": "freeze",
+      "counter": 17,
+      "digest": "239afb7f1aeee78c2e6a5611b276e966080139206703c40771697ad993d4b6ca",
+      "epoch": 41,
+      "scope": "all",
+      "sig": "adb5432e8d8a201087f570535302b3405e87f3445f9ae840979ea0103ef4afdf70a69f9471bac6e3dedbfc6a7dc35ee34254f068e6823ecbdba69f0604e0565c",
+      "signer": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+    },
+    {
+      "action": "freeze",
+      "counter": 17,
+      "digest": "3104ddcf5ca1d1311364a9d7e8d85f609cb66ed437ee25fab69b0f93fdba527b",
+      "epoch": 41,
+      "scope": {
+        "credential": "22222222222222222222222222222222"
+      },
+      "sig": "a41f66e938bc7cdb77d347c45291cf686d14c215b1f24b89adbdf05ffe3d757769e6e6fd5740690b1fdc33772a20df827ff7920f17f7b6ed7c879f40bbdbd6fa",
+      "signer": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+    },
+    {
+      "action": "unfreeze",
+      "counter": 17,
+      "digest": "8815b271b128b4614b5fea3eb828db8487264f8e509a87ca19c146c9fa77a366",
+      "epoch": 41,
+      "scope": "all",
+      "sig": "b0e26d7f0fd4aca930dc53f1f14d7622c037797e5f857cfeed1af4ee0a616c2b07b5e431e713bbaab87d6f151f5682acb2c4ce018edf538d53da9c64766f957f",
+      "signer": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    },
+    {
+      "action": "unfreeze",
+      "counter": 17,
+      "digest": "3b17e806dffdc0ed0cdf151d692548fb5b37746dadf4029a7c789dec17c168c9",
+      "epoch": 41,
+      "scope": {
+        "credential": "22222222222222222222222222222222"
+      },
+      "sig": "77cf4c86cd3c87264f65d9b6153d0113bdca7d5a5223db96becd1de5e7abb9826d59f5373414dedb7e34c0b621ae89592d392856468e43f7573be90cd91bb81b",
+      "signer": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+    }
+  ],
+  "keys": {
+    "approver": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+    "approver_secret": "0303030303030303030303030303030303030303030303030303030303030303",
+    "channel": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+    "channel_secret": "0101010101010101010101010101010101010101010101010101010101010101",
+    "transport": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "transport_secret": "0202020202020202020202020202020202020202020202020202020202020202",
+    "vault_key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+  },
+  "pairing": {
+    "approver_digest": "f94665288c168028dc8b3d938458d10963925bf8a4166ab7be80e52c1247e5e5",
+    "approver_sig": "696fda34898979cc387ac59748562fffef7109928a57165c3db6f991daad801f91427eb9cb61306499d44811fe5ffb5af1a9c4d445256e2294782b165fdec7a8",
+    "fingerprint": "96d2 deb7 4651 a7a9 ca8d",
+    "proof": "d4b552070954358d6b7e0087ff67e1b7939161de5119d55ff1c6ec06f0cfa6ae",
+    "secret": "0707070707070707070707070707070707070707070707070707070707070707"
+  },
+  "protocol_version": 1,
+  "requests": [
+    {
+      "name": "sign_nostr_event kind 0",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444401462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0040000000044942a2a1da206ddfdab1243b5c1e0624d1c0134b132fccc1b57472cce5d65f462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "sign_nostr_event",
+        "payload": {
+          "event": {
+            "content": "{\"name\":\"agent\"}",
+            "created_at": 1791580000,
+            "kind": 0,
+            "pubkey": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+            "tags": [
+              [
+                "p",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              ]
+            ]
+          }
+        },
+        "reason": {
+          "kind": 0,
+          "type": "kind"
+        },
+        "request_hash": "b132407c9225d4534bd3377dad7021c9212d35eb79a79af9389ec1126c929f5b",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "b132407c9225d4534bd3377dad7021c9212d35eb79a79af9389ec1126c929f5b"
+    },
+    {
+      "name": "sign_psbt above threshold",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444402462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0136010000b2000000020000000201010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000002000000409c0000000000002200000051200101010101010101010101010101010101010101010101010101010101010101ffffffff7017000000000000220000005120020202020202020202020202020202020202020202020202020202020202020201000000020000000000000001000000010000000100000007000000",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": {
+          "credential_spent": 10000,
+          "credential_window": 100000,
+          "wallet_spent": 40000,
+          "wallet_window": 100000
+        },
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": "mainnet",
+        "op": "sign_psbt",
+        "payload": {
+          "change": [
+            {
+              "output": 1,
+              "path": "m/86'/0'/0'/1/7"
+            }
+          ],
+          "fee": 1000,
+          "leaving_wallet": 31000,
+          "prevouts": [
+            {
+              "amount": 40000,
+              "script": "51200101010101010101010101010101010101010101010101010101010101010101"
+            },
+            {
+              "amount": 6000,
+              "script": "51200202020202020202020202020202020202020202020202020202020202020202"
+            }
+          ],
+          "sighash": [
+            null,
+            1
+          ],
+          "signing_inputs": [
+            0,
+            1
+          ],
+          "unsigned_tx": "020000000201010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000"
+        },
+        "reason": {
+          "requested": 31000,
+          "spent": 10000,
+          "threshold": 20000,
+          "type": "above_threshold"
+        },
+        "request_hash": "4475736511cd8051259149aaaf16a3f03a2e50683d67a0efc30630bc886377f0",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "4475736511cd8051259149aaaf16a3f03a2e50683d67a0efc30630bc886377f0"
+    },
+    {
+      "name": "nip44_encrypt to own key",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444403462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0040000000462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0bc0c17b98161dc17f1c5c5dd62d8f364e33c3262453d68ef2a24ea65996e874f6",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "nip44_encrypt",
+        "payload": {
+          "peer": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+          "plaintext": "note to self"
+        },
+        "reason": {
+          "type": "encrypt_to_own_key"
+        },
+        "request_hash": "3ef2a637617903482c5119de0855f7da2d48d28bc76627298be8092f5253cf87",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "3ef2a637617903482c5119de0855f7da2d48d28bc76627298be8092f5253cf87"
+    },
+    {
+      "name": "nip44_decrypt own payload",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444404462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0060000000462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b5555555555555555555555555555555555555555555555555555555555555555d21e969ab192c859aa27c7893c52e72a6540037672ca620183f5ba9b999d505b",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "nip44_decrypt",
+        "payload": {
+          "ciphertext_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "peer": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+          "plaintext": "{\"token\":\"cashuA...\"}"
+        },
+        "reason": {
+          "type": "decrypt_own_payload"
+        },
+        "request_hash": "ccc51ae86cd924f8bd398b2df656a0c00cc5079d08dfd743f9424902dd9ad621",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "ccc51ae86cd924f8bd398b2df656a0c00cc5079d08dfd743f9424902dd9ad621"
+    },
+    {
+      "name": "management issue_credential",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2222222222222222222222222222222244444444444444444444444444444444444444444444444444444444444444441000000000000000000000000000000000000000000000000000000000000000000021000000013e5603e99360298f1b9035f4c1fddf1eed841ca7042f5b5c95a72e5410995e43",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "created_at": "1791580000",
+            "expires_at": "1794172000",
+            "grant": {
+              "bitcoin": {
+                "approval_above_sats": "20000",
+                "network": "bitcoin",
+                "per_psbt_sats": "50000",
+                "window_sats": "100000"
+              },
+              "event_kinds": [
+                "0",
+                "1"
+              ],
+              "keys": [
+                "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+              ],
+              "limits": {
+                "per_day": "1000",
+                "per_hour": "100",
+                "per_minute": "10"
+              },
+              "nip44_peers": [],
+              "operations": [
+                "sign_nostr_event",
+                "sign_psbt"
+              ]
+            },
+            "id": "22222222222222222222222222222222",
+            "name": "writer",
+            "type": "issue_credential",
+            "uid": "1001"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "54f5aea7794bf6c9f812b37bbc1f74a12e4ff6fb4563029d735149f5ae550645",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "54f5aea7794bf6c9f812b37bbc1f74a12e4ff6fb4563029d735149f5ae550645"
+    },
+    {
+      "name": "management unfreeze all",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f000000000000000000000000000000004444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000002917ce143c55d5c9700542acacacacf550bf7f498c13fe7cbec83978958942161",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "epoch": "41",
+            "scope": "all",
+            "type": "unfreeze"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "331f91e7190f831296af2f1e2260bf3e1c5849fc7e96173ab37a54aaeef366d1",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "331f91e7190f831296af2f1e2260bf3e1c5849fc7e96173ab37a54aaeef366d1"
+    },
+    {
+      "name": "management unfreeze one credential",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f222222222222222222222222222222224444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000002614d830946a179e0e33a525bba6746480466faed6b920e7c9284f72fb799c57d",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "epoch": "41",
+            "scope": {
+              "credential": "22222222222222222222222222222222"
+            },
+            "type": "unfreeze"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "b83168e64d4a71616f025320e490900db7bebb1c1a3a690d1a604cbd9826f846",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "b83168e64d4a71616f025320e490900db7bebb1c1a3a690d1a604cbd9826f846"
+    },
+    {
+      "name": "management add_approver",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f00000000000000000000000000000000444444444444444444444444444444444444444444444444444444444444444410000000000000000000000000000000000000000000000000000000000000000000210000000328727b74b1a63f0c6030724a2c803ba999888af8fb18507d2b92ea4aaf57d174",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "approver": "7777777777777777777777777777777777777777777777777777777777777777",
+            "fingerprint": "d97c 01a6 1ac2 fc90 39d8",
+            "label": "My phone",
+            "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+            "type": "add_approver"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "f03c7c268b7c821ae67ccd585dbb8d7a2f5d22f14f7246d9bef9999af29a4aa6",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "f03c7c268b7c821ae67ccd585dbb8d7a2f5d22f14f7246d9bef9999af29a4aa6"
+    },
+    {
+      "name": "management remove_approver",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0000000000000000000000000000000044444444444444444444444444444444444444444444444444444444444444441000000000000000000000000000000000000000000000000000000000000000000021000000046708028a69c7c7437664bedf5cdbd5a8e48ca44862acbde1bb64811327179ba8",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "approver": "7777777777777777777777777777777777777777777777777777777777777777",
+            "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+            "type": "remove_approver"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "a70c268c811cd7ddd7d57531cd68536465e785cb54d7a7509400f45294c3bbf8",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "a70c268c811cd7ddd7d57531cd68536465e785cb54d7a7509400f45294c3bbf8"
+    }
+  ],
+  "wrap_tags": [
+    {
+      "between": "channel and transport",
+      "content": "AjNkZXNjcmlwdGlvbg==",
+      "tag": "cd742d2fb3a45bc93ef6d123d51e01d7",
+      "wrap_pubkey": "f991f944d1e1954a7fc8b9bf62e0d78f015f4c07762d505e20e6c45260a3661b"
+    },
+    {
+      "between": "pairing secret",
+      "content": "AjNkZXNjcmlwdGlvbg==",
+      "secret": "0707070707070707070707070707070707070707070707070707070707070707",
+      "tag": "eac62c338dafb88d9c9ad1787f91e04d",
+      "wrap_pubkey": "f991f944d1e1954a7fc8b9bf62e0d78f015f4c07762d505e20e6c45260a3661b"
+    }
+  ]
+}
