@@ -346,14 +346,10 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
     // Checked before the gateway opens a session nobody could confirm.
     need_terminal()?;
     let mut session = AdminSession::open(target, PAIR_WAIT)?;
-    let answer = session.ask(&json!({ "op": "approver_pair", "label": label }))?;
-    let uri = Zeroizing::new(
-        answer.result["uri"]
-            .as_str()
-            .ok_or_else(|| KeepError::Runtime("the gateway sent no pairing code".into()))?
-            .to_string(),
-    );
-    drop(answer);
+    session
+        .write(&json!({ "op": "approver_pair", "label": label }))
+        .map_err(|f| f.error)?;
+    let uri = session.pairing_code()?;
     show_qr(&uri);
     println!("{}", uri.as_str());
     out.info("Scan the code with the phone. It is valid for ten minutes and one phone.");
@@ -665,19 +661,7 @@ impl AdminSession {
             maybe_done: true,
             error,
         };
-        let line = match read_answer(&self.stream) {
-            Ok(line) => line,
-            // Closed with the request still unread in it: never acted on.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
-                return Err(closed_unread().into())
-            }
-            Err(e) => return Err(sent(io_error(e))),
-        };
-        if line.is_empty() {
-            return Err(sent(KeepError::Runtime(
-                "the gateway closed the admin connection without answering".into(),
-            )));
-        }
+        let line = self.read_line()?;
         let answer: AdminAnswer = serde_json::from_slice(&line)
             .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;
         if answer.ok {
@@ -691,6 +675,68 @@ impl AdminSession {
                         .unwrap_or_else(|| "the gateway refused the request".into()),
                 ),
             })
+        }
+    }
+
+    /// The next answer line, in a buffer that is wiped.
+    fn read_line(&mut self) -> std::result::Result<Zeroizing<Vec<u8>>, AdminFailure> {
+        let line = match read_answer(&self.stream) {
+            Ok(line) => line,
+            // Closed with the request still unread in it: never acted on.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Err(closed_unread().into())
+            }
+            Err(e) => {
+                return Err(AdminFailure {
+                    maybe_done: true,
+                    error: io_error(e),
+                })
+            }
+        };
+        if line.is_empty() {
+            return Err(AdminFailure {
+                maybe_done: true,
+                error: KeepError::Runtime(
+                    "the gateway closed the admin connection without answering".into(),
+                ),
+            });
+        }
+        Ok(line)
+    }
+
+    /// The answer to `approver_pair`: the pairing code, which carries the
+    /// session's secret, read straight from the wiped line into a string
+    /// that is wiped, never into a JSON value.
+    fn pairing_code(&mut self) -> Result<Zeroizing<String>> {
+        #[derive(serde::Deserialize)]
+        struct Code {
+            uri: Zeroizing<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Answer {
+            ok: bool,
+            #[serde(default)]
+            result: Option<Code>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let line = self.read_line().map_err(|f| f.error)?;
+        let answer: Answer = serde_json::from_slice(&line)
+            .map_err(|e| KeepError::Runtime(format!("unexpected admin answer: {e}")))?;
+        match answer {
+            Answer {
+                ok: true,
+                result: Some(code),
+                ..
+            } => Ok(code.uri),
+            Answer { ok: true, .. } => Err(KeepError::Runtime(
+                "the gateway sent no pairing code".into(),
+            )),
+            Answer { error, .. } => {
+                Err(KeepError::Runtime(error.unwrap_or_else(|| {
+                    "the gateway refused the request".into()
+                })))
+            }
         }
     }
 
@@ -818,6 +864,23 @@ fn build_grant(args: GrantArgs) -> Result<Grant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pairing code is read from the answer line as it is, and a
+    /// refusal or a missing code is an error.
+    #[test]
+    fn the_pairing_code_is_read_from_its_answer() {
+        let code = |line: &str| {
+            let (stream, mut gateway) = std::os::unix::net::UnixStream::pair().unwrap();
+            gateway.write_all(line.as_bytes()).unwrap();
+            AdminSession { stream, sent: true }.pairing_code()
+        };
+        let uri =
+            code("{\"ok\":true,\"result\":{\"expires_in\":600,\"uri\":\"keep-approval:x\"}}\n");
+        assert_eq!(uri.unwrap().as_str(), "keep-approval:x");
+        let err = code("{\"ok\":false,\"error\":\"approvals are not set up\"}\n").unwrap_err();
+        assert!(err.to_string().contains("not set up"), "{err}");
+        assert!(code("{\"ok\":true,\"result\":{}}\n").is_err());
+    }
 
     const KEY: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
