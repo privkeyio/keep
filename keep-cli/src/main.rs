@@ -143,6 +143,15 @@ fn run(out: &Output) -> Result<()> {
     {
         return commands::agent::cmd_agent_connect(token_file, socket, gateway_user);
     }
+    // The relay helper runs as a user with no vault, and a channel key is
+    // made before any vault is involved.
+    #[cfg(target_os = "linux")]
+    if let Commands::Gateway {
+        command: command @ (GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. }),
+    } = cli.command
+    {
+        return commands::gateway::dispatch_without_vault(out, command);
+    }
     let cfg = Config::load()?;
 
     if cli.no_mlock {

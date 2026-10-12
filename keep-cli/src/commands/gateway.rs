@@ -17,7 +17,7 @@ use keep_agent::scope::Operation;
 use keep_core::error::{KeepError, Result};
 use keep_core::Keep;
 
-use crate::cli::{AdminTarget, GatewayCommands, IssueArgs};
+use crate::cli::{AdminTarget, ApproverCommands, ChannelKeyCommands, GatewayCommands, IssueArgs};
 use crate::output::Output;
 
 pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: bool) -> Result<()> {
@@ -27,6 +27,10 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             admin_socket,
             admin_uid,
             wallet_budget_sats,
+            approval_relays,
+            approval_deadline,
+            relay_socket,
+            relay_user,
         } => {
             if hidden {
                 return Err(KeepError::NotImplemented(
@@ -38,6 +42,19 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                 wallet_budget_sats,
                 ..Settings::default()
             };
+            let channel = channel_key()?;
+            if !approval_relays.is_empty() && channel.is_none() {
+                return Err(KeepError::InvalidInput(format!(
+                    "approvals need the {:?} credential: generate it with `keep gateway \
+                     channel-key new` and load it in the unit",
+                    daemon::CHANNEL_KEY_CREDENTIAL
+                )));
+            }
+            let relay_uid = if approval_relays.is_empty() {
+                None
+            } else {
+                Some(gateway_uid(&relay_user)?)
+            };
             serve(
                 out,
                 Config {
@@ -48,10 +65,20 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     },
                     settings,
                     limits: Limits::default(),
-                    approvals: daemon::ApprovalConfig::default(),
+                    approvals: daemon::ApprovalConfig {
+                        channel,
+                        relays: approval_relays,
+                        deadline_secs: approval_deadline,
+                        relay_socket: Some(relay_socket),
+                        relay_uid,
+                    },
                 },
             )
         }
+        GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. } => {
+            dispatch_without_vault(out, command)
+        }
+        GatewayCommands::Approver { command } => approver(out, path, command),
         GatewayCommands::Status { target } => print(&admin(&target, json!({ "op": "status" }))?),
         GatewayCommands::List { target } => print(&admin(&target, json!({ "op": "list" }))?),
         GatewayCommands::Issue(args) => {
@@ -190,6 +217,205 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
     }
 }
 
+/// The commands that need no vault: the relay helper, and making a channel
+/// key.
+pub fn dispatch_without_vault(out: &Output, command: GatewayCommands) -> Result<()> {
+    match command {
+        GatewayCommands::Relay {
+            relay_socket,
+            gateway_user,
+        } => relay(&relay_socket, &gateway_user),
+        GatewayCommands::ChannelKey {
+            command: ChannelKeyCommands::New,
+        } => {
+            let _ = out;
+            new_channel_key()
+        }
+        _ => Err(KeepError::Other("this command needs the vault".into())),
+    }
+}
+
+/// The channel key from the credential systemd decrypted, if it loaded one.
+fn channel_key() -> Result<Option<nostr_sdk::prelude::Keys>> {
+    let Some(dir) = std::env::var_os("CREDENTIALS_DIRECTORY") else {
+        return Ok(None);
+    };
+    let dir = Path::new(&dir);
+    if std::fs::symlink_metadata(dir.join(daemon::CHANNEL_KEY_CREDENTIAL)).is_err() {
+        return Ok(None);
+    }
+    let text = unlock::read_credential(
+        dir,
+        daemon::CHANNEL_KEY_CREDENTIAL,
+        unlock::Reader::this_process(),
+    )
+    .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    daemon::parse_channel_key(&text)
+        .map(Some)
+        .map_err(|e| KeepError::Runtime(e.to_string()))
+}
+
+/// `keep gateway channel-key new`: the secret goes only to a pipe, into
+/// `systemd-creds encrypt`, never to a terminal or a file.
+fn new_channel_key() -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let piped = std::fs::metadata("/proc/self/fd/1").is_ok_and(|m| m.file_type().is_fifo());
+    if !piped {
+        return Err(KeepError::InvalidInput(
+            "the channel key is written only to a pipe: run `keep gateway channel-key new | \
+             systemd-creds encrypt --name=channel-key --with-key=host+tpm2 --tpm2-pcrs=7 - \
+             /etc/keep/gateway/channel-key.cred`"
+                .into(),
+        ));
+    }
+    let keys = nostr_sdk::prelude::Keys::generate();
+    let mut line = Zeroizing::new(keys.secret_key().to_secret_hex());
+    line.push('\n');
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(line.as_bytes())
+        .and_then(|()| stdout.flush())
+        .map_err(|e| KeepError::Runtime(format!("write the channel key: {e}")))?;
+    drop(line);
+    use nostr_sdk::prelude::ToBech32;
+    let npub = keys
+        .public_key()
+        .to_bech32()
+        .map_err(|e| KeepError::Other(e.to_string()))?;
+    eprintln!("channel key {npub} ({})", keys.public_key().to_hex());
+    Ok(())
+}
+
+/// `keep gateway relay`: run the relay helper until stopped.
+fn relay(socket: &Path, gateway_user: &str) -> Result<()> {
+    let uid = gateway_uid(gateway_user)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    let stop = Arc::new(tokio::sync::Notify::new());
+    if crate::GRACEFUL_STOP.set(stop.clone()).is_err() {
+        return Err(KeepError::Runtime("a stop handler is already set".into()));
+    }
+    runtime
+        .block_on(daemon::helper::run_helper(socket, uid, async move {
+            stop.notified().await;
+            tracing::info!("stopping the relay helper");
+        }))
+        .map_err(|e| KeepError::Runtime(e.to_string()))
+}
+
+fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> {
+    match command {
+        ApproverCommands::List { target } => {
+            print(&admin(&target, json!({ "op": "approver_list" }))?)
+        }
+        ApproverCommands::Remove { transport, target } => {
+            let result = admin_waiting(
+                &target,
+                json!({ "op": "approver_remove", "transport": transport }),
+            )
+            .map_err(|f| f.error)?;
+            print(&result.result)
+        }
+        ApproverCommands::Reset { offline, target } => {
+            if daemon::euid() != 0 {
+                return Err(KeepError::InvalidInput(
+                    "only root may reset the approver devices".into(),
+                ));
+            }
+            if !offline {
+                return print(&admin(&target, json!({ "op": "approver_reset" }))?);
+            }
+            // The gateway is stopped (a new host, a cleared TPM): reset the
+            // vault directly, recorded in its audit log.
+            let mut keep = Keep::open(path)?;
+            let password = vault_password()?;
+            keep.unlock(&password)?;
+            drop(password);
+            let removed = daemon::state::reset_store(&mut keep)
+                .map_err(|e| KeepError::Runtime(e.to_string()))?;
+            keep.lock();
+            out.success(&format!("Removed {removed} approver device(s)"));
+            Ok(())
+        }
+        ApproverCommands::Pair { label, target } => pair(out, &label, &target),
+    }
+}
+
+/// Pair a phone over one admin connection: show the code, wait for the
+/// phone, show its fingerprint, ask the operator, and wait for the outcome.
+fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
+    let mut session = AdminSession::open(target, PAIR_WAIT)?;
+    let answer = session.ask(&json!({ "op": "approver_pair", "label": label }))?;
+    let uri = answer.result["uri"]
+        .as_str()
+        .ok_or_else(|| KeepError::Runtime("the gateway sent no pairing code".into()))?
+        .to_string();
+    show_qr(&uri);
+    println!("{uri}");
+    out.info("Scan the code with the phone. It is valid for ten minutes and one phone.");
+    let shown = session.next()?;
+    let fingerprint = shown.result["fingerprint"].as_str().unwrap_or_default();
+    let phone_label = shown.result["phone_label"].as_str().unwrap_or_default();
+    println!(
+        "Phone \"{}\" shows fingerprint:  {fingerprint}",
+        phone_label.escape_debug()
+    );
+    let confirmed = confirm("Does the phone show the same fingerprint? [y/N] ")?;
+    let op = if confirmed {
+        "approver_confirm"
+    } else {
+        "approver_reject"
+    };
+    let mut answer = session.ask(&json!({ "op": op }))?;
+    if answer.pending.is_some() {
+        out.info("Waiting for an approver device to approve adding this one...");
+        answer = session.next()?;
+    }
+    if !confirmed {
+        return Err(KeepError::InvalidInput(
+            "the fingerprints did not match: the phone was refused".into(),
+        ));
+    }
+    print(&answer.result)
+}
+
+/// How long `approver pair` waits on the phone and the operator: the
+/// pairing session, and an approver's decision after it.
+const PAIR_WAIT: Duration = Duration::from_secs(
+    daemon::approvals::PAIRING_SECS + keep_approval::binding::DEFAULT_DEADLINE_SECS + 30,
+);
+
+fn confirm(prompt: &str) -> Result<bool> {
+    if !std::io::stdin().is_terminal() {
+        return Err(KeepError::InvalidInput(
+            "the fingerprint must be confirmed on a terminal".into(),
+        ));
+    }
+    eprint!("{prompt}");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| KeepError::Runtime(e.to_string()))?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "Yes"))
+}
+
+/// Show `text` as a QR code on the terminal.
+fn show_qr(text: &str) {
+    match qrcode::QrCode::new(text.as_bytes()) {
+        Ok(code) => {
+            let image = code
+                .render::<qrcode::render::unicode::Dense1x2>()
+                .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                .build();
+            println!("{image}");
+        }
+        Err(e) => eprintln!("the pairing code cannot be shown as a QR code: {e}"),
+    }
+}
+
 fn serve(out: &Output, config: Config) -> Result<()> {
     // A password in the environment is visible to `systemctl show`, to
     // anything the unit's environment files reach, and to root through
@@ -268,6 +494,10 @@ struct AdminAnswer {
     error: Option<String>,
     #[serde(default)]
     token: Option<Zeroizing<String>>,
+    /// The change waits for an approver device: the request id, with the
+    /// outcome on the next line.
+    #[serde(default)]
+    pending: Option<String>,
 }
 
 /// Send one request to the admin socket and return its result.
@@ -353,66 +583,139 @@ fn extend_wiped(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
+/// How long an admin command waits for an answer: an approver's deadline,
+/// and a margin.
+const ADMIN_WAIT: Duration =
+    Duration::from_secs(keep_approval::binding::DEFAULT_DEADLINE_SECS + 30);
+
+/// One connection to the admin socket, for a request and the answers that
+/// follow it.
+struct AdminSession {
+    stream: std::os::unix::net::UnixStream,
+    /// Whether a request has been written, so the gateway may have acted.
+    sent: bool,
+}
+
+fn io_error(e: std::io::Error) -> KeepError {
+    KeepError::Runtime(format!("admin socket: {e}"))
+}
+
+/// The gateway turns a uid it does not admit away unread.
+fn closed_unread() -> KeepError {
+    KeepError::Runtime(
+        "the gateway closed the admin connection unread: run as root or the gateway's admin \
+         uid, or retry if it is already serving as many admin connections as it allows"
+            .into(),
+    )
+}
+
+impl AdminSession {
+    fn open(target: &AdminTarget, wait: Duration) -> Result<Self> {
+        let uid = gateway_uid(&target.gateway_user)?;
+        let stream = daemon::server::connect_checked(&target.admin_socket, uid).map_err(|e| {
+            KeepError::Runtime(format!("connect to the gateway's admin socket: {e}"))
+        })?;
+        stream.set_read_timeout(Some(wait)).map_err(io_error)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .map_err(io_error)?;
+        Ok(Self {
+            stream,
+            sent: false,
+        })
+    }
+
+    fn write(&mut self, request: &Value) -> std::result::Result<(), AdminFailure> {
+        let mut writer = &self.stream;
+        // A request not written whole was never read.
+        writer
+            .write_all(format!("{request}\n").as_bytes())
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => {
+                    AdminFailure::from(closed_unread())
+                }
+                _ => AdminFailure {
+                    maybe_done: self.sent,
+                    error: io_error(e),
+                },
+            })?;
+        self.sent = true;
+        Ok(())
+    }
+
+    /// The next answer line.
+    fn read(&mut self) -> std::result::Result<AdminAnswer, AdminFailure> {
+        let sent = |error: KeepError| AdminFailure {
+            maybe_done: true,
+            error,
+        };
+        let line = match read_answer(&self.stream) {
+            Ok(line) => line,
+            // Closed with the request still unread in it: never acted on.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                return Err(closed_unread().into())
+            }
+            Err(e) => return Err(sent(io_error(e))),
+        };
+        if line.is_empty() {
+            return Err(sent(KeepError::Runtime(
+                "the gateway closed the admin connection without answering".into(),
+            )));
+        }
+        let answer: AdminAnswer = serde_json::from_slice(&line)
+            .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;
+        if answer.ok {
+            Ok(answer)
+        } else {
+            Err(AdminFailure {
+                maybe_done: false,
+                error: KeepError::Runtime(
+                    answer
+                        .error
+                        .unwrap_or_else(|| "the gateway refused the request".into()),
+                ),
+            })
+        }
+    }
+
+    /// Send `request` and return its answer; a change that waits for an
+    /// approver device returns the outcome once it comes.
+    fn request(&mut self, request: &Value) -> std::result::Result<AdminAnswer, AdminFailure> {
+        self.write(request)?;
+        let answer = self.read()?;
+        if answer.pending.is_some() {
+            eprintln!("Waiting for an approver device to approve...");
+            return self.read();
+        }
+        Ok(answer)
+    }
+
+    /// [`Self::request`] without its failure's detail.
+    fn ask(&mut self, request: &Value) -> Result<AdminAnswer> {
+        self.write(request).map_err(|f| f.error)?;
+        self.read().map_err(|f| f.error)
+    }
+
+    /// The next answer, as [`Self::ask`] returns it.
+    fn next(&mut self) -> Result<AdminAnswer> {
+        self.read().map_err(|f| f.error)
+    }
+}
+
 fn admin_answer(
     target: &AdminTarget,
     request: Value,
 ) -> std::result::Result<AdminAnswer, AdminFailure> {
-    let uid = gateway_uid(&target.gateway_user)?;
-    let stream = daemon::server::connect_checked(&target.admin_socket, uid)
-        .map_err(|e| KeepError::Runtime(format!("connect to the gateway's admin socket: {e}")))?;
-    let io = |e: std::io::Error| KeepError::Runtime(format!("admin socket: {e}"));
-    stream
-        .set_read_timeout(Some(Duration::from_secs(60)))
-        .map_err(io)?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
-        .map_err(io)?;
-    // The gateway turns a uid it does not admit away unread.
-    let closed = || {
-        KeepError::Runtime(
-            "the gateway closed the admin connection unread: run as root or the gateway's admin \
-             uid, or retry if it is already serving as many admin connections as it allows"
-                .into(),
-        )
-    };
-    let mut writer = &stream;
-    // A request not written whole was never read.
-    writer
-        .write_all(format!("{request}\n").as_bytes())
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => closed(),
-            _ => io(e),
-        })?;
-    // From here the gateway may have acted on the request.
-    let sent = |error: KeepError| AdminFailure {
-        maybe_done: true,
-        error,
-    };
-    let line = match read_answer(&stream) {
-        Ok(line) => line,
-        // Closed with the request still unread in it: never acted on.
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return Err(closed().into()),
-        Err(e) => return Err(sent(io(e))),
-    };
-    if line.is_empty() {
-        return Err(sent(KeepError::Runtime(
-            "the gateway closed the admin connection without answering".into(),
-        )));
-    }
-    let answer: AdminAnswer = serde_json::from_slice(&line)
-        .map_err(|e| sent(KeepError::Runtime(format!("unexpected admin answer: {e}"))))?;
-    if answer.ok {
-        Ok(answer)
-    } else {
-        Err(AdminFailure {
-            maybe_done: false,
-            error: KeepError::Runtime(
-                answer
-                    .error
-                    .unwrap_or_else(|| "the gateway refused the request".into()),
-            ),
-        })
-    }
+    let mut session = AdminSession::open(target, ADMIN_WAIT)?;
+    session.request(&request)
+}
+
+/// [`admin_answer`]'s result, for a request that may wait for an approver.
+fn admin_waiting(
+    target: &AdminTarget,
+    request: Value,
+) -> std::result::Result<AdminAnswer, AdminFailure> {
+    admin_answer(target, request)
 }
 
 fn print(value: &Value) -> Result<()> {

@@ -2736,3 +2736,114 @@ fn test_gateway_serve_takes_its_password_only_from_a_closed_credential() {
     refused(&output, "/nonexistent");
     assert!(!output_contains(&output, "Decryption failed"), "{output:?}");
 }
+
+/// `keep gateway channel-key new` writes the key only into a pipe, as 64
+/// hex digits on one line, and the public key to stderr; `keep gateway
+/// serve` with relays needs that key as a credential, and checks it as it
+/// checks the password.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_channel_key_goes_only_to_a_pipe_and_approvals_need_it() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    // To a file, or nowhere: refused, nothing written.
+    let file = dir.path().join("key");
+    let output = Command::new(&keep)
+        .env_clear()
+        .args(["gateway", "channel-key", "new"])
+        .stdout(std::fs::File::create(&file).unwrap())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(output_contains(&output, "only to a pipe"), "{output:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"");
+    // Into a pipe.
+    let mut child = Command::new(&keep)
+        .env_clear()
+        .args(["gateway", "channel-key", "new"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut key = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut key)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    let key = key.strip_suffix('\n').unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("npub1"), "{stderr}");
+    assert!(!stderr.contains(key), "the secret went to stderr");
+
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").unwrap().uid()
+    };
+    if me == 0 {
+        return;
+    }
+    let vault = dir.path().join("vault");
+    assert_success(
+        &KeepCmd::new(&keep)
+            .path(&vault)
+            .args(["init", "--size", "10"])
+            .run(),
+    );
+    let creds = dir.path().join("creds");
+    std::fs::create_dir(&creds).unwrap();
+    let password = creds.join("vault-password");
+    std::fs::write(&password, format!("{TEST_PASSWORD}\n")).unwrap();
+    std::fs::set_permissions(&password, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let serve = || {
+        Command::new(&keep)
+            .env_clear()
+            .env("CREDENTIALS_DIRECTORY", &creds)
+            .arg("--path")
+            .arg(&vault)
+            .args([
+                "gateway",
+                "serve",
+                "--agent-socket",
+                "/nonexistent/agent.sock",
+                "--admin-socket",
+                "/nonexistent-admin/admin.sock",
+                "--approval-relay",
+                "wss://relay.example.com",
+                "--relay-user",
+                &me.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let output = serve();
+    assert_failure(&output);
+    assert!(output_contains(&output, "channel-key"), "{output:?}");
+    let channel = creds.join("channel-key");
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&channel, format!("{key}\n")).unwrap();
+    std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = serve();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "closed to other users"),
+        "{output:?}"
+    );
+    assert!(!output_contains(&output, key), "the key was printed");
+    // Closed, the gateway goes on to its sockets, which do not exist here.
+    std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let output = serve();
+    assert_failure(&output);
+    assert!(output_contains(&output, "/nonexistent"), "{output:?}");
+    assert!(!output_contains(&output, key), "the key was printed");
+}

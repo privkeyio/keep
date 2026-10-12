@@ -526,13 +526,8 @@ fn a_freeze_cancels_what_it_covers_and_takes_effect_from_the_phone() {
     assert_eq!(ap.store().epoch, 1);
     assert_eq!(ap.store().devices[0].counter, 1);
     let got = ap.received(&mut phone);
-    let anchor: Anchor = wire::parse(
-        &got.iter()
-            .rfind(|(k, _)| *k == kind::ANCHOR)
-            .unwrap()
-            .1,
-    )
-    .unwrap();
+    let anchor: Anchor =
+        wire::parse(&got.iter().rfind(|(k, _)| *k == kind::ANCHOR).unwrap().1).unwrap();
     assert_eq!(anchor.frozen.credentials, [cid]);
     let entries = ap.gw.reasons(AuditEventType::AgentApproverFreeze);
     assert!(entries[0].contains("freeze") && entries[0].contains(&hex::encode(phone.t())));
@@ -1152,4 +1147,121 @@ fn without_an_approver_a_request_that_needs_one_is_refused_as_before() {
     let answer = ap.gw.admin(json!({ "op": "unfreeze_all" }));
     assert_eq!(answer["ok"], json!(true), "{answer}");
     let _ = Hex64([0; 64]);
+}
+
+#[test]
+fn a_credential_revoked_or_expired_while_it_waits_signs_nothing() {
+    let (mut ap, mut phone, id, token) = paired();
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let _ = ap.requests(&mut phone);
+    ap.gw.admin_ok(json!({ "op": "revoke", "id": id }));
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error);
+    assert_eq!(text, "canceled: revoked");
+
+    // One that expires while its approver decides is refused at approval.
+    let grant = nostr_grant(ap.gw.key);
+    let conn = ap.conn();
+    let (_, issuing) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "short", "uid": AGENT, "grant": grant, "ttl_secs": 60 }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let short = reply(issuing.unwrap())["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let pending = ap.park(&short, 2, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.boot.advance(61);
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error);
+    assert_eq!(text, "canceled: revoked");
+    assert!(ap.gw.entries(AuditEventType::Sign).iter().all(|e| !e
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("approved request")));
+}
+
+#[test]
+fn a_device_whose_key_is_a_vault_key_or_already_registered_is_refused() {
+    let (mut ap, first, _, _) = paired();
+    let pair_with = |ap: &mut Ap, phone: &Phone| {
+        let conn = ap.conn();
+        let (answer, pending) =
+            ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "x" }));
+        let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+        let event = phone.pair(&uri.secret, ap.now());
+        ap.deliver(&event);
+        reply(pending.unwrap())
+    };
+    // The vault's own key as the approver key.
+    let mut vaulted = Phone::new();
+    vaulted.approver = Keys::new(SecretKey::from_slice(&super::tests::SECRET).unwrap());
+    let shown = pair_with(&mut ap, &vaulted);
+    assert_eq!(shown["ok"], json!(false));
+    assert!(
+        shown["error"].as_str().unwrap().contains("in the vault"),
+        "{shown}"
+    );
+    // A key another device holds.
+    let mut copy = Phone::new();
+    copy.approver = first.approver.clone();
+    let shown = pair_with(&mut ap, &copy);
+    assert_eq!(shown["ok"], json!(false));
+    assert!(
+        shown["error"]
+            .as_str()
+            .unwrap()
+            .contains("already registered"),
+        "{shown}"
+    );
+    // The channel key as a device key.
+    let mut channelled = Phone::new();
+    channelled.approver = channel();
+    let shown = pair_with(&mut ap, &channelled);
+    assert_eq!(shown["ok"], json!(false));
+    assert_eq!(ap.store().devices.len(), 1);
+}
+
+/// A pairing session lasts ten minutes and one phone.
+#[test]
+fn a_pairing_session_expires_and_is_used_once() {
+    let mut ap = Ap::new();
+    let conn = ap.conn();
+    let (answer, pending) = ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "x" }));
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    ap.gw.boot.advance(super::approvals::PAIRING_SECS);
+    ap.gw.state.approval_tick();
+    assert_eq!(reply(pending.unwrap())["ok"], json!(false));
+    let phone = Phone::new();
+    let event = phone.pair(&uri.secret, ap.now());
+    assert!(
+        !ap.deliver(&event),
+        "an expired session's pair is not even opened"
+    );
+    // Another connection cannot confirm someone else's session.
+    let conn = ap.conn();
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "x" }));
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    let event = phone.pair(&uri.secret, ap.now());
+    assert!(ap.deliver(&event));
+    let other = ap.conn();
+    let (answer, _) = ap.admin_from(0, other, json!({ "op": "approver_confirm" }));
+    assert_eq!(answer["ok"], json!(false));
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_confirm" }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert_eq!(ap.store().devices.len(), 1);
 }

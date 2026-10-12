@@ -275,3 +275,37 @@ async fn approvals_travel_through_the_helper_and_a_relay() {
     let _ = stop.send(());
     gateway.await.unwrap().unwrap();
 }
+
+/// The relay socket serves only the relay helper's user: anyone else is
+/// closed on, unanswered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_socket_turns_away_any_other_user() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let uid = me();
+    let dir = socket_dir(root.path(), "relay");
+    let (keep, _) = vault(root.path());
+    let boot = FakeBoot::default();
+    boot.set_wall(super::clock::wall_clock().unwrap());
+    let mut state = start(keep, Settings::default(), &boot, BOOT).unwrap();
+    state
+        .configure_approvals(Some(channel()), vec!["wss://relay.example.com".into()], 60)
+        .unwrap();
+    let link = state.take_relay_link().unwrap();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let socket = dir.join("relay.sock");
+    let listener = server::bind(&socket, uid).unwrap();
+    let task = tokio::spawn(super::relay::relay_task(
+        listener,
+        uid.wrapping_add(1),
+        link,
+        shared,
+        stop,
+    ));
+    let mut stream = UnixStream::connect(&socket).await.unwrap();
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    assert!(matches!(read, Ok(Ok(0))), "{read:?} {buf:?}");
+    task.abort();
+}
