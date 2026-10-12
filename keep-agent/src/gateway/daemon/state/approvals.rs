@@ -1346,19 +1346,15 @@ impl State {
         )
     }
 
-    /// The registration rules: two different keys, neither the channel key,
-    /// a key in the vault, or a registered device's key.
+    /// The registration rules beyond `check_pair`'s: neither key is a key
+    /// in the vault or a registered device's key.
     fn registrable(&self, device: &Device) -> std::result::Result<(), &'static str> {
         let Some(a) = self.approvals.as_ref() else {
             return Err("approvals are not set up");
         };
+        // `check_pair` already refused a device whose two keys are the
+        // same or either is the channel key.
         let keys = [device.transport, device.approver];
-        if device.transport == device.approver {
-            return Err("the device's two keys are the same");
-        }
-        if keys.contains(&a.channel_pub) {
-            return Err("a device key is the channel key");
-        }
         if keys.iter().any(|k| self.keep.keyring().get(k).is_some()) {
             return Err("a device key is a key in the vault");
         }

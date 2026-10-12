@@ -231,3 +231,26 @@ async fn from_gateway(client: &Client, line: &[u8], lines: &mpsc::Sender<Value>)
     tracing::warn!("the gateway sent a line the helper does not know");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The helper publishes gift wraps only: anything else the gateway asks
+    /// it to publish ends the connection, sent nowhere.
+    #[tokio::test]
+    async fn the_helper_publishes_nothing_but_gift_wraps() {
+        let client = Client::default();
+        let (lines, _queue) = mpsc::channel(4);
+        let keys = nostr_sdk::prelude::Keys::generate();
+        let note = nostr_sdk::prelude::EventBuilder::text_note("hello")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let line = json!({ "publish": note }).to_string();
+        let refused = from_gateway(&client, line.as_bytes(), &lines).await;
+        assert!(refused
+            .unwrap_err()
+            .to_string()
+            .contains("other than a gift wrap"),);
+    }
+}

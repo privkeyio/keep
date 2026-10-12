@@ -4021,6 +4021,11 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.event_type == AuditEventType::DataKeyRotate));
+        // The record follows the new log at once, so a stop before the next
+        // checkpoint shows no rollback either.
+        let record = keep.load_audit_record().unwrap();
+        let audit = keep.audit.as_ref().unwrap();
+        assert_eq!((record.seq, record.head), (audit.seq(), audit.last_hash()));
         drop(keep);
 
         let mut keep = Keep::open(&path).unwrap();
@@ -4190,6 +4195,13 @@ mod tests {
         };
         assert_eq!(failed(&keep).as_deref(), Some("audit.log.v1"));
         assert!(keep.audit_failed_migration_kept());
+        // As a vault migrated before the record was kept: the failure only in
+        // the marker, which is copied into the record on the next unlock.
+        let mut record = keep.load_audit_record().unwrap();
+        record.failed_migration = None;
+        keep.store_audit_record(record);
+        keep.lock();
+        keep.unlock("testpass").unwrap();
         keep.lock();
         std::fs::remove_file(path.join("audit.log.v1.failed")).unwrap();
         keep.unlock("testpass").unwrap();
@@ -4229,6 +4241,30 @@ mod tests {
             .is_err());
         keep.record_owner_event(AuditEventType::AgentApprovalDecided, "denied")
             .unwrap();
+        // Owner events stop one short of where the log could not be read back.
+        let lines = |audit: &std::path::Path| {
+            std::fs::read(audit)
+                .unwrap()
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+                .count()
+        };
+        keep.lock();
+        let before = lines(&audit);
+        keep.unlock("testpass").unwrap();
+        let added = keep.audit.as_ref().unwrap().entry_count() - before;
+        keep.lock();
+        let mut full = b"x\n".repeat(crate::audit::MAX_AUDIT_ENTRIES - 1 - added - lines(&audit));
+        full.extend_from_slice(&std::fs::read(&audit).unwrap());
+        std::fs::write(&audit, full).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert_eq!(
+            keep.audit.as_ref().unwrap().entry_count(),
+            crate::audit::MAX_AUDIT_ENTRIES - 1
+        );
+        assert!(keep
+            .record_owner_event(AuditEventType::AgentApprovalDecided, "denied")
+            .is_err());
     }
 
     #[test]

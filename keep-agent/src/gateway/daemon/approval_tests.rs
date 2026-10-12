@@ -1274,7 +1274,11 @@ fn a_decision_past_the_deadline_decides_nothing() {
     let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
     let request = ap.requests(&mut phone).pop().unwrap();
     ap.gw.boot.advance(120);
-    ap.deliver_from(&phone, kind::DECISION, &phone.decide(&request, Verdict::Approve));
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
     ap.gw.state.approval_tick();
     let (text, error) = tool_text(&reply(pending));
     assert!(error);
@@ -1295,7 +1299,11 @@ fn another_credential_cannot_withdraw_a_request() {
         json!({ "op": "issue", "name": "other", "uid": AGENT, "grant": nostr_grant(ap.gw.key) }),
     );
     let request = ap.requests(&mut phone).pop().unwrap();
-    ap.deliver_from(&phone, kind::DECISION, &phone.decide(&request, Verdict::Approve));
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
     let other_token = reply(issuing.unwrap())["token"]
         .as_str()
         .unwrap()
@@ -1306,4 +1314,411 @@ fn another_credential_cannot_withdraw_a_request() {
         json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 5 } }),
     );
     assert!(unanswered(&mut pending));
+}
+
+/// Management changes count against the same cap of 16 waiting requests.
+#[test]
+fn a_management_change_is_refused_once_sixteen_requests_wait() {
+    let mut ap = Ap::new();
+    let mut tokens = Vec::new();
+    for _ in 0..MAX_PARKED {
+        tokens.push(ap.issue(&nostr_grant(ap.gw.key)).1);
+    }
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    let _parked: Vec<Pending> = tokens
+        .iter()
+        .map(|token| ap.park(token, 1, "sign_nostr_event", kind0()))
+        .collect();
+    let conn = ap.conn();
+    let (answer, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "late", "uid": AGENT, "grant": nostr_grant(ap.gw.key) }),
+    );
+    assert!(pending.is_none());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("too many requests are waiting"),
+        "{answer}"
+    );
+    assert!(ap
+        .requests(&mut phone)
+        .iter()
+        .all(|r| r.op != keep_approval::binding::Op::Management));
+}
+
+/// A freeze of the whole gateway cancels every waiting request: agents'
+/// and management changes alike.
+#[test]
+fn a_freeze_of_everything_cancels_every_waiting_request() {
+    let (mut ap, mut phone, _id, token) = paired();
+    let agent = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let conn = ap.conn();
+    let (answer, issue) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "second", "uid": OTHER, "grant": nostr_grant(ap.gw.key) }),
+    );
+    assert!(answer["pending"].is_string(), "{answer}");
+    assert_eq!(ap.requests(&mut phone).len(), 2);
+    let freeze = phone.freeze(Scope::All, 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert_eq!(tool_text(&reply(agent)), ("canceled: frozen".into(), true));
+    let answer = reply(issue.unwrap());
+    assert_eq!(answer["error"], json!("canceled: frozen"), "{answer}");
+    let outcomes: Vec<Outcome> = ap
+        .received(&mut phone)
+        .into_iter()
+        .filter(|(k, _)| *k == kind::OUTCOME)
+        .map(|(_, t)| wire::parse(&t).unwrap())
+        .collect();
+    assert_eq!(outcomes.len(), 2);
+    assert!(outcomes.iter().all(|o| o.outcome == OutcomeKind::Canceled));
+}
+
+/// A freeze of a credential the gateway does not have is refused: no
+/// epoch, no counter, no entry.
+#[test]
+fn a_freeze_of_an_unknown_credential_is_refused() {
+    let (mut ap, mut phone, _id, _token) = paired();
+    let freeze = phone.freeze(Scope::Credential(Hex16([9; 16])), 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert_eq!(ap.store().epoch, 0);
+    assert_eq!(ap.store().devices[0].counter, 0);
+    assert!(ap
+        .gw
+        .reasons(AuditEventType::AgentApproverFreeze)
+        .is_empty());
+}
+
+/// A credential its audit budget froze has its waiting request canceled on
+/// the next tick, and the phone is shown the freeze.
+#[test]
+fn a_freeze_by_the_audit_budget_cancels_the_waiting_request() {
+    let mut gw = Gw::with(super::state::Settings {
+        audit_budgets: (4, 1000),
+        ..super::tests::settings()
+    });
+    gw.state
+        .configure_approvals(Some(channel()), vec![RELAY.into()], 120)
+        .unwrap();
+    let link = gw.state.take_relay_link().unwrap();
+    let mut ap = Ap {
+        gw,
+        link,
+        next_conn: 1,
+    };
+    let (id, token) = ap.issue(&nostr_grant(ap.gw.key));
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let _ = ap.requests(&mut phone);
+    let mut frozen = false;
+    for _ in 0..8 {
+        let answer = ap.gw.rpc(
+            &token,
+            "tools/call",
+            json!({ "name": "get_nostr_pubkey", "arguments": {} }),
+        );
+        frozen |= answer.get("error").is_some();
+    }
+    assert!(frozen, "the credential's audit budget was not used up");
+    assert!(unanswered(&mut pending));
+    ap.gw.state.approval_tick();
+    assert_eq!(
+        tool_text(&reply(pending)),
+        ("canceled: frozen".into(), true)
+    );
+    let got = ap.received(&mut phone);
+    let anchor: Anchor =
+        wire::parse(&got.iter().rfind(|(k, _)| *k == kind::ANCHOR).unwrap().1).unwrap();
+    let cid = <[u8; 16]>::try_from(hex::decode(&id).unwrap()).unwrap();
+    assert_eq!(anchor.frozen.credentials, [Hex16(cid)]);
+}
+
+/// A request is recorded before the phone is asked: when its entry cannot
+/// be written, it is withheld and the phone hears nothing.
+#[test]
+fn a_request_whose_entry_cannot_be_written_is_never_sent() {
+    let mut gw = Gw::with(super::state::Settings {
+        audit_budgets: (1, 1000),
+        ..super::tests::settings()
+    });
+    gw.state
+        .configure_approvals(Some(channel()), vec![RELAY.into()], 120)
+        .unwrap();
+    let link = gw.state.take_relay_link().unwrap();
+    let mut ap = Ap {
+        gw,
+        link,
+        next_conn: 1,
+    };
+    let (_, token) = ap.issue(&nostr_grant(ap.gw.key));
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    // The one entry of the day: a served request.
+    let (_, error) = ap.gw.tool(&token, "get_nostr_pubkey", json!({}));
+    assert!(!error);
+    let answer = ap.gw.rpc(
+        &token,
+        "tools/call",
+        json!({ "name": "sign_nostr_event", "arguments": kind0() }),
+    );
+    assert!(answer.get("error").is_some(), "{answer}");
+    assert!(ap.requests(&mut phone).is_empty());
+    assert!(ap
+        .gw
+        .reasons(AuditEventType::AgentApprovalRequested)
+        .is_empty());
+}
+
+/// An approval is evaluated again against the credential as it is when the
+/// decision comes: a grant that no longer allows the request signs nothing.
+#[test]
+fn an_approved_request_the_grant_no_longer_allows_signs_nothing() {
+    let (mut ap, mut phone, id, token) = paired();
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).remove(0);
+    // The credential's grant changes under the waiting request: the same
+    // id, now without kind 0.
+    let cid = <[u8; 16]>::try_from(hex::decode(&id).unwrap()).unwrap();
+    let mut narrower = nostr_grant(ap.gw.key);
+    narrower.event_kinds.remove(&0);
+    let keep = ap.gw.state.keep_mut();
+    keep.delete_agent_credential(&cid).unwrap();
+    keep.issue_agent_credential_with_id(
+        cid,
+        "agent",
+        AGENT,
+        serde_json::to_vec(&narrower).unwrap(),
+        T0,
+        86_400,
+    )
+    .unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error);
+    assert!(text.starts_with("denied"), "{text}");
+    assert!(!ap
+        .gw
+        .state
+        .keep()
+        .audit_read_all()
+        .unwrap()
+        .iter()
+        .any(|e| e
+            .reason
+            .as_deref()
+            .is_some_and(|r| r.contains("approved request"))));
+}
+
+/// Stop `gw`, run `between` with its vault closed, and start it again with
+/// approvals at wall time `wall`.
+fn reopen(gw: Gw, wall: u64, between: impl FnOnce(&std::path::Path)) -> Ap {
+    let path = gw.path();
+    let Gw {
+        dir,
+        boot,
+        mut state,
+        key,
+    } = gw;
+    state.shut_down();
+    drop(state);
+    between(&path);
+    let (keep, _) = super::tests::vault(dir.path());
+    boot.set_wall(wall);
+    let mut state =
+        super::tests::start(keep, super::tests::settings(), &boot, super::tests::BOOT).unwrap();
+    state
+        .configure_approvals(Some(channel()), vec![RELAY.into()], 120)
+        .unwrap();
+    let link = state.take_relay_link().unwrap();
+    Ap {
+        gw: Gw {
+            dir,
+            boot,
+            state,
+            key,
+        },
+        link,
+        next_conn: 1,
+    }
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+/// A vault put back to an earlier copy, audit log and ledgers with it, is
+/// consistent on the host; only the phone, which kept a later anchor, sees
+/// the counts go back.
+#[test]
+fn a_vault_put_back_to_an_earlier_copy_shows_on_the_phone() {
+    use keep_approval::approver::{Alert, AnchorTracker};
+    let (ap, mut phone, _id, token) = paired();
+    let backup = tempfile::tempdir().unwrap();
+    let wall = ap.gw.state.calendar();
+    // The copy, taken with the gateway stopped.
+    let mut ap = reopen(ap.gw, wall + 10, |path| copy_dir(path, backup.path()));
+    // Served after the copy: the audit log grows.
+    for _ in 0..3 {
+        let (_, error) = ap.gw.tool(&token, "get_nostr_pubkey", json!({}));
+        assert!(!error);
+    }
+    ap.gw.state.approval_tick();
+    let anchors = |ap: &mut Ap, phone: &mut Phone| -> Vec<Anchor> {
+        ap.received(phone)
+            .into_iter()
+            .filter(|(k, _)| *k == kind::ANCHOR)
+            .map(|(_, t)| wire::parse(&t).unwrap())
+            .collect()
+    };
+    let later = anchors(&mut ap, &mut phone).pop().expect("an anchor");
+    let mut tracker = AnchorTracker::default();
+    assert!(tracker
+        .observe(later.at, &later.anchor, Some(&later.frozen), 0)
+        .is_empty());
+    // The earlier copy put back, and the gateway started on it.
+    let mut ap = reopen(ap.gw, wall + 30, |path| {
+        std::fs::remove_dir_all(path).unwrap();
+        copy_dir(backup.path(), path);
+    });
+    ap.gw.state.approval_tick();
+    let restored = anchors(&mut ap, &mut phone).pop().expect("an anchor");
+    assert!(restored.at > later.at);
+    assert!(restored.anchor.seq < later.anchor.seq);
+    let alerts = tracker.observe(restored.at, &restored.anchor, Some(&restored.frozen), 1);
+    assert!(
+        alerts
+            .iter()
+            .any(|a| matches!(a, Alert::AuditCountWentBack { .. })),
+        "{alerts:?}"
+    );
+}
+
+/// A pairing session takes a plain label, is the only one open, and turns
+/// away a phone that answers once it expired, even before the timer runs.
+#[test]
+fn a_pairing_session_needs_a_plain_label_is_alone_and_ends_on_time() {
+    let mut ap = Ap::new();
+    let conn = ap.conn();
+    for label in ["Phone\u{202e}enohp", "", &"x".repeat(65)] {
+        let (answer, pending) =
+            ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": label }));
+        assert_eq!(answer["ok"], json!(false), "{label:?}: {answer}");
+        assert!(pending.is_none());
+    }
+    let (answer, pending) =
+        ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "Phone" }));
+    let mut pending = pending.unwrap();
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    let other = ap.conn();
+    let (answer, second) = ap.admin_from(
+        0,
+        other,
+        json!({ "op": "approver_pair", "label": "Tablet" }),
+    );
+    assert_eq!(
+        answer["error"],
+        json!("a pairing session is already open"),
+        "{answer}"
+    );
+    assert!(second.is_none());
+    ap.gw.boot.advance(super::approvals::PAIRING_SECS);
+    let phone = Phone::new();
+    let event = phone.pair(&uri.secret, ap.now());
+    ap.deliver(&event);
+    assert!(unanswered(&mut pending), "a late phone was shown");
+    ap.gw.state.approval_tick();
+    assert_eq!(reply(pending)["ok"], json!(false));
+    assert!(ap.store().devices.is_empty());
+}
+
+/// Once a phone has answered a pairing session, another phone's answer is
+/// ignored: the operator confirms the phone they were shown.
+#[test]
+fn a_pairing_session_takes_the_first_phone_only() {
+    let mut ap = Ap::new();
+    let conn = ap.conn();
+    let (answer, pending) =
+        ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "Phone" }));
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    let (first, second) = (Phone::new(), Phone::new());
+    assert!(ap.deliver(&first.pair(&uri.secret, ap.now())));
+    let shown = reply(pending.unwrap());
+    assert_eq!(
+        shown["result"]["fingerprint"],
+        json!(sig::fingerprint(&first.t(), &first.a()))
+    );
+    ap.deliver(&second.pair(&uri.secret, ap.now()));
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_confirm" }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let devices = ap.store().devices;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].transport.0, first.t());
+}
+
+/// Only root resets the approver devices.
+#[test]
+fn only_root_resets_the_approvers() {
+    let (mut ap, _phone, _, _) = paired();
+    let conn = ap.conn();
+    let (answer, pending) = ap.admin_from(1500, conn, json!({ "op": "approver_reset" }));
+    assert!(pending.is_none());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert_eq!(ap.store().devices.len(), 1);
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_reset" }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert!(ap.store().devices.is_empty());
+}
+
+/// A device added with an approval is checked again when the approval
+/// comes: the same phone paired twice while the first waited is registered
+/// once.
+#[test]
+fn an_added_device_is_checked_again_when_approved() {
+    let (mut ap, mut first, _, _) = paired();
+    let second = Phone::new();
+    let mut waiting = Vec::new();
+    for _ in 0..2 {
+        let conn = ap.conn();
+        let (answer, pending) =
+            ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "Tablet" }));
+        let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+        assert!(ap.deliver(&second.pair(&uri.secret, ap.now())));
+        let _ = reply(pending.unwrap());
+        let (answer, pending) = ap.admin_from(0, conn, json!({ "op": "approver_confirm" }));
+        assert!(answer["pending"].is_string(), "{answer}");
+        waiting.push(pending.unwrap());
+    }
+    let requests = ap.requests(&mut first);
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        ap.deliver_from(
+            &first,
+            kind::DECISION,
+            &first.decide(request, Verdict::Approve),
+        );
+    }
+    let answers: Vec<Value> = waiting.into_iter().map(reply).collect();
+    assert_eq!(answers[0]["ok"], json!(true), "{}", answers[0]);
+    assert_eq!(answers[1]["ok"], json!(false), "{}", answers[1]);
+    assert_eq!(ap.store().devices.len(), 2);
 }
