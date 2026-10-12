@@ -24,7 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 
 use super::approvals::{lock, RelayLink};
-use super::server::{with_state, write_line, LineReader, Shared};
+use super::server::{closed, with_state, write_line, LineReader, Shared};
 
 /// The longest line on the relay socket.
 pub const MAX_RELAY_LINE: usize = 128 * 1024;
@@ -48,10 +48,16 @@ pub(crate) async fn relay_task(
     mut link: RelayLink,
     state: Shared,
     stop: watch::Sender<bool>,
+    mut closing: watch::Receiver<bool>,
 ) {
     let mut unsent: Option<Event> = None;
     loop {
-        let stream = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = closed(&mut closing) => return,
+            accepted = listener.accept() => accepted,
+        };
+        let stream = match accepted {
             Ok((stream, _)) => stream,
             Err(e) => {
                 tracing::warn!(error = %e, "relay socket accept failed");
@@ -71,7 +77,9 @@ pub(crate) async fn relay_task(
             continue;
         }
         tracing::info!("relay helper connected");
-        serve_helper(stream, &mut link, &mut unsent, &state, &stop).await;
+        if serve_helper(stream, &mut link, &mut unsent, &state, &stop, &mut closing).await {
+            return;
+        }
         tracing::warn!("relay helper disconnected; approval messages wait for it");
     }
 }
@@ -80,13 +88,16 @@ async fn write(w: &mut tokio::net::unix::OwnedWriteHalf, value: &Value) -> bool 
     write_line(w, value.to_string().as_bytes(), WRITE_TIMEOUT).await
 }
 
+/// Serve one helper connection until it ends, or until the gateway stops,
+/// when what is queued is handed over first; `true` then.
 async fn serve_helper(
     stream: UnixStream,
     link: &mut RelayLink,
     unsent: &mut Option<Event>,
     state: &Shared,
     stop: &watch::Sender<bool>,
-) {
+    closing: &mut watch::Receiver<bool>,
+) -> bool {
     let (read, mut w) = stream.into_split();
     let mut reader = LineReader::new(read, MAX_RELAY_LINE);
     let filter = json!({
@@ -97,26 +108,35 @@ async fn serve_helper(
     if !write(&mut w, &json!({ "relays": link.relays })).await
         || !write(&mut w, &json!({ "subscribe": filter })).await
     {
-        return;
+        return false;
     }
     loop {
         if let Some(event) = unsent.take() {
             if !write(&mut w, &json!({ "publish": event })).await {
                 *unsent = Some(event);
-                return;
+                return false;
             }
         }
         tokio::select! {
+            biased;
+            () = closed(closing) => {
+                while let Some(event) = link.outbox.try_pop() {
+                    if !write(&mut w, &json!({ "publish": event })).await {
+                        break;
+                    }
+                }
+                return true;
+            }
             event = link.outbox.pop() => {
                 *unsent = Some(event);
             }
             line = reader.next_line() => {
                 let line = match line {
                     Ok(Some(line)) => line,
-                    _ => return,
+                    _ => return false,
                 };
                 if !from_helper(&line, link, state, stop).await {
-                    return;
+                    return false;
                 }
             }
         }
