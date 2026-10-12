@@ -717,6 +717,16 @@ impl State {
         now: u64,
     ) -> Option<Reply> {
         let cid = granted.credential.id;
+        let method = message.get("method").and_then(Value::as_str);
+        // The agent withdrew a request that waits for an approver: before the
+        // request limit and never counted against it, so an agent at its
+        // limit can still take back what it asked for.
+        if id.is_none() && method == Some("notifications/cancelled") {
+            if let Some(request) = message.get("params").and_then(|p| p.get("requestId")) {
+                self.cancel_agent_request(&cid, request);
+            }
+            return None;
+        }
         if let Err(window) = self.credential_counts.hit(cid, &granted.grant.limits, now) {
             let detail = if window == "tracker" {
                 "the gateway is tracking too many credentials".to_string()
@@ -727,16 +737,8 @@ impl State {
             return id
                 .map(|id| Reply::Now(rpc_error(id, -32002, &format!("rate limited: {detail}"))));
         }
-        let method = message.get("method").and_then(Value::as_str);
         let id = match (id, method) {
             (Some(id), Some(_)) => id,
-            // The agent withdrew a request that waits for an approver.
-            (None, Some("notifications/cancelled")) => {
-                if let Some(request) = message.get("params").and_then(|p| p.get("requestId")) {
-                    self.cancel_agent_request(&cid, request);
-                }
-                return None;
-            }
             // Any other notification is never answered or acted on.
             (None, Some(_)) => return None,
             (id, None) => {

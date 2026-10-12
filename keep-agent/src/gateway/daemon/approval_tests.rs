@@ -2332,3 +2332,29 @@ fn an_approval_for_a_grant_naming_a_key_reserved_since_signs_nothing() {
         ("canceled: revoked".into(), true)
     );
 }
+
+/// An agent at its request limit can still withdraw what it asked for: the
+/// cancellation is not counted against the limit, so the parked request
+/// cannot go on to be approved and signed.
+#[test]
+fn an_agent_at_its_request_limit_still_withdraws_a_request() {
+    let mut ap = Ap::new();
+    let mut grant = nostr_grant(ap.gw.key);
+    grant.limits.per_minute = 2;
+    let (_, token) = ap.issue(&grant);
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let limited = ap.gw.rpc(&token, "ping", json!({}));
+    assert!(limited.get("result").is_some(), "{limited}");
+    let limited = ap.gw.rpc(&token, "ping", json!({}));
+    assert_eq!(limited["error"]["code"], json!(-32002), "{limited}");
+    assert!(unanswered(&mut pending));
+    ap.gw.send(
+        AGENT,
+        &token,
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } }),
+    );
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error && text.starts_with("canceled"), "{text}");
+}
