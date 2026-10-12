@@ -1943,6 +1943,14 @@ impl Storage {
         self.backend.as_ref()?.get(table, key).ok()?
     }
 
+    /// Plant a rate-limit trip dated `timestamp`, as someone who can write
+    /// the vault folder can.
+    #[cfg(test)]
+    pub(crate) fn forge_trip_for_tests(&self, timestamp: u64) {
+        let hmac_key = crate::rate_limit::derive_hmac_key(&self.header.salt);
+        crate::rate_limit::forge_trip_for_tests(&self.path, &hmac_key, timestamp);
+    }
+
     /// Remove the config row `key`, as someone editing `keep.db` would.
     #[cfg(test)]
     pub(crate) fn remove_config_for_tests(&self, key: &[u8]) -> Result<bool> {
@@ -2118,16 +2126,38 @@ impl Storage {
     /// On a vault's first open by a keep that keeps the epoch (`first_open`),
     /// agents an older keep made get a seeded epoch, which no unfreeze held
     /// back from that keep can match.
-    pub(crate) fn ensure_agent_freeze_epoch(&self, first_open: bool) -> Result<()> {
+    pub(crate) fn missing_agent_freeze_epoch(&self) -> Result<Option<u64>> {
         if self.agent_freeze_epoch_row()? {
-            return Ok(());
+            return Ok(None);
         }
-        let epoch = match self.any_agent_rows()? {
+        Ok(Some(match self.any_agent_rows()? {
             false => 0,
-            true if first_open => seeded_epoch(),
-            true => return Ok(()),
-        };
-        self.set_config_bound(AGENT_FREEZE_EPOCH, &epoch.to_le_bytes())
+            true => seeded_epoch(),
+        }))
+    }
+
+    /// Store the audit record `record` (serialized), and the agent freeze
+    /// epoch `epoch` when given, in one write.
+    pub(crate) fn set_audit_record(&self, record: &[u8], epoch: Option<u64>) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let record =
+            self.encrypt_value(&bound_value(crate::audit_record::AUDIT_RECORD_KEY, record))?;
+        let epoch = epoch
+            .map(|e| self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &e.to_le_bytes())))
+            .transpose()?;
+        let mut ops = vec![AtomicOp {
+            table: CONFIG_TABLE,
+            key: crate::audit_record::AUDIT_RECORD_KEY,
+            value: Some(&record),
+        }];
+        if let Some(epoch) = &epoch {
+            ops.push(AtomicOp {
+                table: CONFIG_TABLE,
+                key: AGENT_FREEZE_EPOCH,
+                value: Some(epoch),
+            });
+        }
+        backend.write_atomic(&ops)
     }
 
     /// Whether the agent freeze epoch's row is there at all, readable or not.
@@ -2136,8 +2166,8 @@ impl Storage {
     }
 
     /// The latest `created_at` of any key, share, secret or agent credential
-    /// that can be read, in Unix seconds; a row that cannot be decrypted or
-    /// decoded is passed over. Only a failure to read the database is an
+    /// that can be read, or a secret's `updated_at`, in Unix seconds; a row
+    /// that cannot be decrypted or decoded is passed over. Only a failure to read the database is an
     /// error.
     pub(crate) fn latest_created_at(&self) -> Result<i64> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
@@ -2160,7 +2190,7 @@ impl Storage {
             if let Some(secret) =
                 open(&stored).and_then(|b| bincode_options().deserialize::<SecretRecord>(&b).ok())
             {
-                latest = latest.max(secret.created_at);
+                latest = latest.max(secret.created_at.max(secret.updated_at));
             }
         }
         for (key, stored) in backend.list(AGENT_CREDENTIALS_TABLE)? {

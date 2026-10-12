@@ -461,8 +461,6 @@ pub struct AuditLog {
     last_hash: [u8; 32],
     /// The last entry's sequence number; zero for an empty log.
     seq: u64,
-    /// The last entry's time, in Unix seconds; zero for an empty log.
-    last_timestamp: i64,
     entries: usize,
     /// Where to cut a partial line a failed write left, before the next append.
     torn: Option<u64>,
@@ -549,7 +547,6 @@ impl AuditLog {
             path: path.join("audit.log"),
             last_hash: [0u8; 32],
             seq: 0,
-            last_timestamp: 0,
             entries: 0,
             torn: None,
             on_disk: OnDisk::default(),
@@ -583,7 +580,6 @@ impl AuditLog {
                     drop_torn()?;
                     log.last_hash = last.hash;
                     log.seq = last.seq;
-                    log.last_timestamp = last.timestamp;
                     log.entries = tail.count;
                     log.on_disk = tail.on_disk();
                 }
@@ -615,9 +611,31 @@ impl AuditLog {
         self.entries
     }
 
-    /// The last entry's time, in Unix seconds; zero for an empty log.
-    pub fn last_timestamp(&self) -> i64 {
-        self.last_timestamp
+    /// The time of the last entry whose time keep set itself (any but a
+    /// rate-limit trip, whose time comes from a forgeable file), in Unix
+    /// seconds; zero when there is none. Reads the whole log, so it is for
+    /// the rare unlock that finds the record missing.
+    pub fn last_own_timestamp(&self, data_key: &SecretKey) -> Result<i64> {
+        if self.seq == 0 {
+            return Ok(0);
+        }
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let batch = crypto::BatchDecryptor::new(data_key)?;
+        let mut reader = BufReader::new(file);
+        let (mut line, mut latest) = (Vec::new(), 0);
+        while reader.read_until(b'\n', &mut line)? > 0 {
+            if let Ok(entry) = Self::decrypt_batch(line_text(&line), &batch) {
+                if entry.event_type != AuditEventType::RateLimitTripped {
+                    latest = entry.timestamp;
+                }
+            }
+            line.clear();
+        }
+        Ok(latest)
     }
 
     /// The last entry's sequence number, which counts every entry the log
@@ -794,7 +812,6 @@ impl AuditLog {
 
         self.last_hash = entry.hash;
         self.seq = entry.seq;
-        self.last_timestamp = entry.timestamp;
         self.entries += 1;
         let end = len + line.len() as u64;
         self.on_disk = OnDisk {
@@ -1155,7 +1172,11 @@ impl AuditLog {
         let (mut old, gap, decrypted) = Self::read_readable(&self.path, data_key)?;
         let complete = gap.is_none();
         let from_format1 = old.iter().any(|e| e.format == 1);
-        let old_last_timestamp = old.last().map_or(0, |e| e.timestamp);
+        let old_last_timestamp = old
+            .iter()
+            .rev()
+            .find(|e| e.event_type != AuditEventType::RateLimitTripped)
+            .map_or(0, |e| e.timestamp);
         // A log that already holds entries in a later format and has a line
         // that cannot be read keeps only what came before the damage, so no
         // entry whose sequence number was already seen is renumbered; the
@@ -1306,7 +1327,6 @@ impl AuditLog {
         let (last_hash, seq) = entries.last().map_or(([0u8; 32], 0), |e| (e.hash, e.seq));
         self.last_hash = last_hash;
         self.seq = seq;
-        self.last_timestamp = entries.last().map_or(0, |e| e.timestamp);
         self.entries = entries.len();
         self.torn = None;
         self.on_disk = OnDisk::read(&self.path).unwrap_or(OnDisk {

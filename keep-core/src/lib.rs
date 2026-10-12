@@ -249,8 +249,8 @@ impl Keep {
             signing_audit: None,
             audit_record: None,
         };
-        keep.save_audit_record(audit_record::AuditRecord::default())?;
-        keep.storage.ensure_agent_freeze_epoch(false)?;
+        let epoch = keep.storage.missing_agent_freeze_epoch()?;
+        keep.save_audit_record_with(audit_record::AuditRecord::default(), epoch)?;
         keep.audit_record = None;
         Ok(keep)
     }
@@ -304,7 +304,7 @@ impl Keep {
         // audit write loses that event at-most-once with no retry.
         let trips = self.storage.drain_pending_trips();
         for trip in trips {
-            let trip_ts = i64::try_from(trip.timestamp).unwrap_or(i64::MAX);
+            let trip_ts = trip.audit_time();
             let reason = format!(
                 "rate limit threshold reached after {} failed attempts",
                 trip.failed_attempts
@@ -366,7 +366,6 @@ impl Keep {
         let now = chrono::Utc::now().timestamp();
         let rotation = self.storage.rotation_in_progress();
         let migrated = audit.migrated_on_open().cloned();
-        let mut first_open = false;
         let mut record = match self.load_audit_record()? {
             Some(Ok(record)) => record,
             Some(Err(e)) => {
@@ -394,13 +393,15 @@ impl Keep {
                 );
                 // A migration on this open added its own entry; what counts
                 // is the last entry the old log had.
-                let logged_until = migrated
-                    .as_ref()
-                    .map_or(audit.last_timestamp(), |m| m.old_last_timestamp);
+                // Trip entries carry a time from a file anyone can forge,
+                // so the last time keep set itself counts.
+                let logged_until = match migrated.as_ref() {
+                    Some(m) => m.old_last_timestamp,
+                    None => audit.last_own_timestamp(&data_key)?,
+                };
                 let lost = noted
                     || self.storage.agent_freeze_epoch_row()?
                     || self.storage.latest_created_at()? > logged_until;
-                first_open = !lost;
                 audit_record::AuditRecord {
                     lost: lost.then_some(audit_record::RecordLost {
                         missing: true,
@@ -474,16 +475,17 @@ impl Keep {
                 breaks: chain.breaks,
             });
         }
-        if let Err(e) = self.save_audit_record(record) {
+        // The judgment above read whether the epoch's row is there; only now
+        // is a missing one written, in the same write as the record, so a
+        // stop between them cannot leave either without the other.
+        let epoch = self.storage.missing_agent_freeze_epoch()?;
+        if let Err(e) = self.save_audit_record_with(record, epoch) {
             tracing::error!(error = %e, "the record of the audit log could not be written");
         }
         if rotation {
             if let Err(e) = self.storage.set_rotation_in_progress(false) {
                 tracing::error!(error = %e, "the note of an interrupted rotation could not be cleared");
             }
-        }
-        if let Err(e) = self.storage.ensure_agent_freeze_epoch(first_open) {
-            tracing::error!(error = %e, "the agent freeze epoch could not be started");
         }
         for warning in self.audit_warnings() {
             tracing::error!("{warning}");
@@ -510,12 +512,19 @@ impl Keep {
 
     /// Keep `record` as the record, in memory at once and in `keep.db`.
     fn save_audit_record(&mut self, record: audit_record::AuditRecord) -> Result<()> {
+        self.save_audit_record_with(record, None)
+    }
+
+    /// [`Self::save_audit_record`], writing the agent freeze epoch `epoch`
+    /// in the same write when given.
+    fn save_audit_record_with(
+        &mut self,
+        record: audit_record::AuditRecord,
+        epoch: Option<u64>,
+    ) -> Result<()> {
         let stored = serde_json::to_vec(&record)
             .map_err(|e| KeepError::Other(e.to_string()))
-            .and_then(|bytes| {
-                self.storage
-                    .set_config_bound(audit_record::AUDIT_RECORD_KEY, &bytes)
-            });
+            .and_then(|bytes| self.storage.set_audit_record(&bytes, epoch));
         self.audit_record = Some(record);
         stored
     }
@@ -6166,5 +6175,121 @@ mod tests {
         assert!(warnings[0].to_string().contains("keep audit retention"));
         assert!(acknowledge(&mut keep).is_empty());
         assert_eq!(keep.audit_warnings(), [audit_record::AuditWarning::TooLong]);
+    }
+
+    /// A rate-limit trip forged with a time far in the future is entered at
+    /// most at the current time; and a log cut back to end at such a trip,
+    /// with the record and the epoch rows deleted, is still noticed, since
+    /// a trip's time is never what the creation-time test compares with.
+    #[test]
+    fn a_forged_trip_time_does_not_hide_a_deleted_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let keep =
+            Keep::create_with_params(&path, "testpass", crypto::Argon2Params::TESTING).unwrap();
+        keep.storage.forge_trip_for_tests(u64::MAX);
+        drop(keep);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        let entries = keep.audit_read_all().unwrap();
+        assert_eq!(entries[0].event_type, AuditEventType::RateLimitTripped);
+        assert!(entries[0].timestamp <= chrono::Utc::now().timestamp());
+        keep.generate_key("since").unwrap();
+        for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
+            assert!(keep.storage.remove_config_for_tests(row).unwrap());
+        }
+        drop(keep);
+        let text = std::fs::read_to_string(path.join("audit.log")).unwrap();
+        let first = text.lines().next().unwrap();
+        std::fs::write(path.join("audit.log"), format!("{first}\n")).unwrap();
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(record_lost(&keep).is_some_and(|l| l.missing));
+    }
+
+    /// A log (of either format) that already holds a trip dated in the
+    /// future, from before trip times were capped, does not pass for one
+    /// that recorded everything created: the creation-time test passes
+    /// over trips.
+    #[test]
+    fn a_trip_dated_in_the_future_is_not_the_logs_end() {
+        use crate::audit::test_support::write_format1_log;
+
+        for format1 in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("keep");
+            let data_key = {
+                let mut keep =
+                    Keep::create_with_params(&path, "testpass", crypto::Argon2Params::TESTING)
+                        .unwrap();
+                keep.generate_key("a").unwrap();
+                for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
+                    assert!(keep.storage.remove_config_for_tests(row).unwrap());
+                }
+                keep.data_key().unwrap()
+            };
+            let mut early = AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]);
+            early.timestamp -= 3600;
+            let mut trip = AuditEntry::new(AuditEventType::RateLimitTripped, [0; 32]);
+            trip.timestamp = i64::MAX;
+            if format1 {
+                write_format1_log(&path, &data_key, vec![early, trip]);
+            } else {
+                let mut log = AuditLog::open(&path, &data_key).unwrap();
+                for mut entry in [early, trip] {
+                    entry.prev_hash = log.last_hash();
+                    log.log(entry, &data_key).unwrap();
+                }
+            }
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            assert!(
+                record_lost(&keep).is_some_and(|l| l.missing),
+                "format 1: {format1}"
+            );
+        }
+    }
+
+    /// A missing freeze epoch is started again at unlock, seeded once
+    /// agents exist (never 0, which an unfreeze held back from when the
+    /// epoch was 0 would match), without taking the record for a deleted
+    /// one.
+    #[test]
+    fn a_missing_epoch_is_seeded_at_unlock_once_agents_exist() {
+        let floor = unix_now() << 24;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        assert!(keep
+            .storage
+            .remove_config_for_tests(b"agent_freeze_epoch")
+            .unwrap());
+        keep.lock();
+        keep.unlock("testpass").unwrap();
+        assert!(keep.agent_freeze_epoch().unwrap() >= floor);
+        assert!(
+            keep.audit_warnings().is_empty(),
+            "{:?}",
+            keep.audit_warnings()
+        );
+    }
+
+    /// A secret updated after it was created counts by its update time.
+    #[test]
+    fn a_secret_counts_by_its_update_time() {
+        let dir = tempdir().unwrap();
+        let keep = test_keep(&dir.path().join("keep"));
+        let mut secret = crate::secret::SecretRecord::new(
+            "s".into(),
+            crate::secret::SecretKind::Password,
+            b"v".to_vec(),
+        )
+        .unwrap();
+        secret.created_at = 1;
+        secret.updated_at = 1_000;
+        keep.storage.store_secret(&secret).unwrap();
+        assert_eq!(keep.storage.latest_created_at().unwrap(), 1_000);
     }
 }
