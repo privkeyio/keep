@@ -2358,3 +2358,45 @@ fn an_agent_at_its_request_limit_still_withdraws_a_request() {
     let (text, error) = tool_text(&reply(pending));
     assert!(error && text.starts_with("canceled"), "{text}");
 }
+
+/// Deleting a frozen credential clears its freeze like an unfreeze: the
+/// epoch moves and the anchors list it, so no phone takes the freeze
+/// vanishing for a rollback.
+#[test]
+fn deleting_a_frozen_credential_is_explained_to_the_phones() {
+    use keep_approval::approver::{AnchorTracker, CLEARED_GRACE_SECS};
+    let (mut ap, mut phone, id, _token) = paired();
+    let cid = Hex16(cid_of(&id));
+    let freeze = phone.freeze(Scope::Credential(cid), 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert_eq!(ap.epoch(), 1);
+    let anchors = |ap: &mut Ap, phone: &mut Phone| -> Vec<Anchor> {
+        ap.received(phone)
+            .into_iter()
+            .filter(|(k, _)| *k == kind::ANCHOR)
+            .map(|(_, t)| wire::parse(&t).unwrap())
+            .collect()
+    };
+    let frozen = anchors(&mut ap, &mut phone).pop().expect("an anchor");
+    assert_eq!(frozen.frozen.credentials, [cid]);
+    let mut tracker = AnchorTracker::default();
+    assert!(tracker
+        .observe(frozen.at, &frozen.anchor, Some(&frozen.frozen), 0)
+        .is_empty());
+    ap.gw.boot.advance(1);
+    let conn = ap.conn();
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "delete", "id": id }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert_eq!(ap.epoch(), 2);
+    let after = anchors(&mut ap, &mut phone).pop().expect("an anchor");
+    assert!(after.frozen.credentials.is_empty());
+    assert!(after
+        .frozen
+        .unfrozen
+        .iter()
+        .any(|u| u.scope == Scope::Credential(cid) && u.epoch == 2));
+    assert!(tracker
+        .observe(after.at, &after.anchor, Some(&after.frozen), 10)
+        .is_empty());
+    assert!(tracker.due_alerts(10 + CLEARED_GRACE_SECS).is_empty());
+}

@@ -1278,14 +1278,24 @@ impl Storage {
 
     /// Delete an agent credential and its ledger in one transaction. Errors if
     /// neither exists; a ledger left without its credential is removed too.
-    pub fn delete_agent_credential(&self, id: &[u8; 16]) -> Result<()> {
+    /// Delete agent credential `id` and its ledger. Deleting a frozen
+    /// credential clears its freeze, so it also moves the freeze epoch on by
+    /// one and stores the agent ledgers `ledgers`, in the same write, refused
+    /// when `expect_epoch` is given and is not the current epoch. Returns the
+    /// new epoch when it moved.
+    pub fn delete_agent_credential(
+        &self,
+        id: &[u8; 16],
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<Option<u64>> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none()
             && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none()
         {
             return Err(KeepError::NotFound(hex::encode(id)));
         }
-        backend.write_atomic(&[
+        let mut ops = vec![
             AtomicOp {
                 table: AGENT_CREDENTIALS_TABLE,
                 key: id,
@@ -1296,7 +1306,44 @@ impl Storage {
                 key: id,
                 value: None,
             },
-        ])
+        ];
+        let frozen = self.load_agent_credential(id)?.is_some_and(|c| c.frozen);
+        if !frozen {
+            backend.write_atomic(&ops)?;
+            return Ok(None);
+        }
+        let epoch = self.get_agent_freeze_epoch()?;
+        if expect_epoch.is_some_and(|expected| expected != epoch) {
+            return Err(KeepError::invalid_input(format!(
+                "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
+            )));
+        }
+        let next = epoch
+            .checked_add(1)
+            .ok_or_else(|| StorageError::corrupted("the agent freeze epoch is at its end"))?;
+        let epoch_value =
+            self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?;
+        let encrypted = ledgers
+            .iter()
+            .map(|(_, ledger)| self.encrypt_value(ledger))
+            .collect::<Result<Vec<_>>>()?;
+        ops.push(AtomicOp {
+            table: CONFIG_TABLE,
+            key: AGENT_FREEZE_EPOCH,
+            value: Some(&epoch_value),
+        });
+        ops.extend(
+            ledgers
+                .iter()
+                .zip(&encrypted)
+                .map(|((key, _), value)| AtomicOp {
+                    table: AGENT_LEDGERS_TABLE,
+                    key,
+                    value: Some(value),
+                }),
+        );
+        backend.write_atomic(&ops)?;
+        Ok(Some(next))
     }
 
     /// The serialized agent ledger stored under `key`, if any.

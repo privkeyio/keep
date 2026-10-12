@@ -851,7 +851,10 @@ impl Keep {
         }) {
             // Nobody holds the token, but an unaudited credential must not stay
             // live: delete it, or failing that revoke it.
-            if let Err(delete) = self.storage.delete_agent_credential(&credential.id) {
+            if let Err(delete) = self
+                .storage
+                .delete_agent_credential(&credential.id, None, &[])
+            {
                 let mut revoked = credential.clone();
                 revoked.revoked = true;
                 let revoke = self.storage.update_agent_credential(&revoked);
@@ -899,13 +902,29 @@ impl Keep {
         Ok(())
     }
 
-    /// Delete an agent credential and its ledger, freeing its slot.
+    /// Delete an agent credential and its ledger, freeing its slot. Deleting
+    /// a frozen one moves the freeze epoch, as every clear of a freeze does.
     pub fn delete_agent_credential(&mut self, id: &[u8; 16]) -> Result<()> {
-        self.storage.delete_agent_credential(id)?;
+        self.delete_agent_credential_with(id, None, &[]).map(|_| ())
+    }
+
+    /// [`Self::delete_agent_credential`], storing the agent ledgers
+    /// `ledgers` in the same write when the credential was frozen, refused
+    /// when `expect_epoch` is given and is not the current epoch. Returns
+    /// the new epoch when it moved.
+    pub fn delete_agent_credential_with(
+        &mut self,
+        id: &[u8; 16],
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<Option<u64>> {
+        let moved = self
+            .storage
+            .delete_agent_credential(id, expect_epoch, ledgers)?;
         self.audit_event(AuditEventType::AgentCredentialDelete, |e| {
             e.with_reason(&format!("agent {}", hex::encode(id)))
         });
-        Ok(())
+        Ok(moved)
     }
 
     /// Freeze or unfreeze one agent credential. Freezing is never held back by
@@ -5150,5 +5169,39 @@ mod tests {
             full.verifying_shares()
         );
         assert_eq!(completed.key_package_bytes(), single.key_package_bytes());
+    }
+
+    #[test]
+    fn deleting_a_frozen_agent_credential_moves_the_freeze_epoch() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (plain, _) = keep
+            .issue_agent_credential("plain", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        let (frozen, _) = keep
+            .issue_agent_credential("frozen", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        keep.delete_agent_credential(&plain.id).unwrap();
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), 0);
+        keep.set_agent_credential_frozen(&frozen.id, true).unwrap();
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), 1);
+        assert!(keep
+            .delete_agent_credential_with(&frozen.id, Some(0), &[])
+            .is_err());
+        assert!(keep.load_agent_credential(&frozen.id).unwrap().is_some());
+        let ledger: (&[u8], &[u8]) = (b"noted", b"value");
+        assert_eq!(
+            keep.delete_agent_credential_with(&frozen.id, Some(1), &[ledger])
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), 2);
+        assert_eq!(
+            keep.load_agent_ledger(b"noted")
+                .unwrap()
+                .as_deref()
+                .map(|v| &v[..]),
+            Some(&b"value"[..])
+        );
     }
 }

@@ -1501,7 +1501,7 @@ impl State {
             }
             AdminRequest::Delete { id } => {
                 let id = parse_id(&id)?;
-                self.keep.delete_agent_credential(&id)?;
+                self.delete_credential(&id)?;
                 self.cancel_revoked(&id);
                 self.audit.reset(&id);
                 self.credential_counts.remove(&id);

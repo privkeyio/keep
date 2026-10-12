@@ -1262,6 +1262,36 @@ impl State {
 
     /// Clear the freeze of `scope` from the admin socket, with no approver
     /// registered to ask: the epoch still moves.
+    /// Delete credential `id`. Deleting a frozen credential clears its
+    /// freeze, so the epoch moves and the clear is noted among the unfreezes
+    /// anchors list, in the same write: no phone takes the freeze vanishing
+    /// for a rollback.
+    pub(crate) fn delete_credential(&mut self, id: &[u8; 16]) -> Result<()> {
+        let frozen = load_credential(&self.keep, id)?.is_some_and(|c| c.frozen);
+        if !frozen {
+            self.keep.delete_agent_credential(id)?;
+            return Ok(());
+        }
+        let epoch = self.keep.agent_freeze_epoch()?;
+        let mut store = self.store();
+        store.denials.remove(&Hex16(*id));
+        store.note_unfrozen(
+            Scope::Credential(Hex16(*id)),
+            epoch.saturating_add(1),
+            self.clock.calendar(),
+        );
+        let bytes = store.encode()?;
+        self.keep
+            .delete_agent_credential_with(id, Some(epoch), &[(STORE_KEY, &bytes)])?;
+        if let Some(a) = self.approvals.as_mut() {
+            a.store = store;
+        }
+        if self.approvals_active() {
+            self.send_anchor(None);
+        }
+        Ok(())
+    }
+
     pub(crate) fn unfreeze_now(&mut self, scope: Scope) -> Result<()> {
         let epoch = self.keep.agent_freeze_epoch()?;
         self.unfreeze(scope, epoch, None)?;
