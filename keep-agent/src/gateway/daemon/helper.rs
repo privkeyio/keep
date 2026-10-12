@@ -19,13 +19,11 @@ use nostr_sdk::prelude::{
     Client, Event, Filter, JsonUtil, Kind, RelayOptions, RelayPoolNotification,
 };
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use zeroize::Zeroizing;
 
 use super::relay::MAX_RELAY_LINE;
-use super::server::{connect_verified, LineReader, CONNECT_TIMEOUT};
+use super::server::{connect_verified, write_line, LineReader, CONNECT_TIMEOUT};
 use crate::error::{AgentError, Result};
 
 /// The longest wait between attempts to reach the gateway.
@@ -96,15 +94,6 @@ pub(crate) async fn helper_loop(
     }
 }
 
-async fn write_line(w: &mut tokio::net::unix::OwnedWriteHalf, value: &Value) -> bool {
-    let mut line = Zeroizing::new(value.to_string().into_bytes());
-    line.push(b'\n');
-    matches!(
-        tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await,
-        Ok(Ok(()))
-    )
-}
-
 /// One connection to the gateway, with its own relay client.
 async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
     let path = socket.to_path_buf();
@@ -123,7 +112,7 @@ async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
     let (lines, mut queue) = mpsc::channel::<Value>(256);
     let writer = tokio::spawn(async move {
         while let Some(value) = queue.recv().await {
-            if !write_line(&mut write, &value).await {
+            if !write_line(&mut write, value.to_string().as_bytes(), WRITE_TIMEOUT).await {
                 return;
             }
         }

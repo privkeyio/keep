@@ -22,10 +22,9 @@ use nostr_sdk::prelude::{Event, JsonUtil};
 use serde_json::{json, Value};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
-use zeroize::Zeroizing;
 
 use super::approvals::{lock, RelayLink};
-use super::server::{with_state, LineReader, Shared};
+use super::server::{with_state, write_line, LineReader, Shared};
 
 /// The longest line on the relay socket.
 pub const MAX_RELAY_LINE: usize = 128 * 1024;
@@ -78,13 +77,7 @@ pub(crate) async fn relay_task(
 }
 
 async fn write(w: &mut tokio::net::unix::OwnedWriteHalf, value: &Value) -> bool {
-    use tokio::io::AsyncWriteExt;
-    let mut line = Zeroizing::new(value.to_string().into_bytes());
-    line.push(b'\n');
-    matches!(
-        tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&line)).await,
-        Ok(Ok(()))
-    )
+    write_line(w, value.to_string().as_bytes(), WRITE_TIMEOUT).await
 }
 
 async fn serve_helper(

@@ -468,13 +468,15 @@ pub(crate) async fn with_state<T: Send + 'static>(
     result
 }
 
-async fn write_line(
+/// Write `line` and its newline within `limit`, through a buffer that is
+/// wiped, since agent lines carry tokens and signatures.
+pub(crate) async fn write_line(
     w: &mut tokio::net::unix::OwnedWriteHalf,
-    line: &Zeroizing<String>,
+    line: &[u8],
     limit: Duration,
 ) -> bool {
     let mut out = Zeroizing::new(Vec::with_capacity(line.len() + 1));
-    out.extend_from_slice(line.as_bytes());
+    out.extend_from_slice(line);
     out.push(b'\n');
     matches!(
         tokio::time::timeout(limit, w.write_all(&out)).await,
@@ -494,7 +496,7 @@ fn writer(
     let (lines, mut queue) = tokio::sync::mpsc::channel::<Zeroizing<String>>(16);
     let task = tokio::spawn(async move {
         while let Some(line) = queue.recv().await {
-            if !write_line(&mut write, &line, limit).await {
+            if !write_line(&mut write, line.as_bytes(), limit).await {
                 return;
             }
         }
