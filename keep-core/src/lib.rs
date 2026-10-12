@@ -722,8 +722,28 @@ impl Keep {
         now: u64,
         ttl_secs: u64,
     ) -> Result<(crate::agent::AgentCredential, Zeroizing<String>)> {
+        let id = crate::entropy::try_random_bytes()?;
+        self.issue_agent_credential_with_id(id, name, uid, grant, now, ttl_secs)
+    }
+
+    /// [`Self::issue_agent_credential`] with the id chosen beforehand, as an
+    /// approver approved it. An id already in use is refused.
+    pub fn issue_agent_credential_with_id(
+        &mut self,
+        id: [u8; 16],
+        name: &str,
+        uid: u32,
+        grant: Vec<u8>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<(crate::agent::AgentCredential, Zeroizing<String>)> {
+        if self.storage.load_agent_credential(&id)?.is_some() {
+            return Err(KeepError::invalid_input(
+                "an agent credential with that id already exists",
+            ));
+        }
         let (credential, token) =
-            crate::agent::AgentCredential::issue(name, uid, grant, now, ttl_secs)?;
+            crate::agent::AgentCredential::issue_with_id(id, name, uid, grant, now, ttl_secs)?;
         self.storage.insert_agent_credential(&credential)?;
         let reason = format!(
             "agent {} uid {} expires {} grant {}",

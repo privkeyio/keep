@@ -17,6 +17,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+mod approvals;
+
+pub use approvals::{reset_store, Pending};
+
 use super::clock::{self, Clock, Heartbeat, Seed, TimeSource, HEARTBEAT_KEY};
 use super::limits::Counters;
 use super::tools;
@@ -134,12 +138,28 @@ impl Default for Settings {
 }
 
 /// What to send back for one request line.
-#[derive(Debug)]
 pub struct Answer {
     /// The line to write, if any (a notification gets none).
     pub line: Option<Zeroizing<String>>,
     /// Whether the request's token was accepted.
     pub authenticated: bool,
+    /// A request waiting for an approver: its line comes later.
+    pub pending: Option<Pending>,
+}
+
+impl std::fmt::Debug for Answer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Answer")
+            .field("authenticated", &self.authenticated)
+            .field("pending", &self.pending.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// An answer now, or one that waits for an approver.
+enum Reply {
+    Now(Zeroizing<String>),
+    Later(Pending),
 }
 
 impl Answer {
@@ -147,13 +167,27 @@ impl Answer {
         Self {
             line: Some(rpc_error(id, REFUSED_CODE, REFUSED_MESSAGE)),
             authenticated: false,
+            pending: None,
         }
     }
 
-    fn authenticated(line: Option<Zeroizing<String>>) -> Self {
-        Self {
-            line,
-            authenticated: true,
+    fn authenticated(reply: Option<Reply>) -> Self {
+        match reply {
+            Some(Reply::Later(pending)) => Self {
+                line: None,
+                authenticated: true,
+                pending: Some(pending),
+            },
+            Some(Reply::Now(line)) => Self {
+                line: Some(line),
+                authenticated: true,
+                pending: None,
+            },
+            None => Self {
+                line: None,
+                authenticated: true,
+                pending: None,
+            },
         }
     }
 }
@@ -207,6 +241,10 @@ enum Refusal {
     },
     /// The gateway could not serve it (the vault or the audit log failed).
     Internal(String),
+    /// The policy asks for an approval, which no approver can give.
+    NeedsApproval(crate::policy::ApprovalReason),
+    /// The policy asks for an approval: park it for the approvers.
+    Park(Box<approvals::ParkAsk>),
 }
 
 impl Refusal {
@@ -223,6 +261,16 @@ impl Refusal {
             kind: RefusalKind::Denied,
             detail: message.clone(),
             message,
+        }
+    }
+
+    /// A request that waits for no approval: one already pending, or too
+    /// many waiting, or too large to ask about.
+    fn refused_approval(message: &str) -> Self {
+        Self::Policy {
+            kind: RefusalKind::NeedsApproval,
+            message: message.into(),
+            detail: message.into(),
         }
     }
 
@@ -264,6 +312,8 @@ pub struct State {
     /// Set once the gateway has written out its state to stop: nothing more is
     /// served, so nothing is left unwritten.
     closed: bool,
+    /// Approvals over Nostr, when the channel key is loaded.
+    approvals: Option<approvals::Approvals>,
     /// A credential was refused as expired since the last tick: the clock is
     /// persisted then, so a crash cannot bring the calendar back behind that
     /// expiry. Not before the answer, which would time apart expired tokens.
@@ -413,6 +463,7 @@ impl State {
             journal: HashMap::new(),
             journal_lines: Vec::new(),
             closed: false,
+            approvals: None,
             expiry_seen: false,
             heartbeat_ignored,
             deferred: Vec::new(),
@@ -486,6 +537,10 @@ impl State {
     /// Write out every open refusal count and the clock, and serve nothing
     /// more.
     pub fn shut_down(&mut self) {
+        self.cancel_all("canceled: the gateway is stopping");
+        if let Err(e) = self.keep.audit_checkpoint() {
+            tracing::warn!(error = %e, "the audit log's place could not be recorded");
+        }
         self.closed = true;
         self.write_journal();
         self.record_deferred();
@@ -584,6 +639,7 @@ impl State {
             None => Answer {
                 line: None,
                 authenticated: false,
+                pending: None,
             },
         };
         // A uid no credential may be bound to is refused whatever it presents,
@@ -649,7 +705,7 @@ impl State {
         message: &Value,
         id: Option<Value>,
         now: u64,
-    ) -> Option<Zeroizing<String>> {
+    ) -> Option<Reply> {
         let cid = granted.credential.id;
         if let Err(window) = self.credential_counts.hit(cid, &granted.grant.limits, now) {
             let detail = if window == "tracker" {
@@ -658,22 +714,30 @@ impl State {
                 format!("over its per-{window} limit")
             };
             self.record_refusal(&cid, RefusalKind::RateLimited, &detail, now);
-            return id.map(|id| rpc_error(id, -32002, &format!("rate limited: {detail}")));
+            return id
+                .map(|id| Reply::Now(rpc_error(id, -32002, &format!("rate limited: {detail}"))));
         }
         let method = message.get("method").and_then(Value::as_str);
         let id = match (id, method) {
             (Some(id), Some(_)) => id,
-            // A notification, which is never answered or acted on.
+            // The agent withdrew a request that waits for an approver.
+            (None, Some("notifications/cancelled")) => {
+                if let Some(request) = message.get("params").and_then(|p| p.get("requestId")) {
+                    self.cancel_agent_request(&cid, request);
+                }
+                return None;
+            }
+            // Any other notification is never answered or acted on.
             (None, Some(_)) => return None,
             (id, None) => {
                 self.record_refusal(&cid, RefusalKind::Invalid, "no method", now);
-                return id.map(|id| rpc_error(id, -32600, "invalid request"));
+                return id.map(|id| Reply::Now(rpc_error(id, -32600, "invalid request")));
             }
         };
         let method = method.unwrap_or_default();
         if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             self.record_refusal(&cid, RefusalKind::Invalid, "not JSON-RPC 2.0", now);
-            return Some(rpc_error(id, -32600, "invalid request"));
+            return Some(Reply::Now(rpc_error(id, -32600, "invalid request")));
         }
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         match method {
@@ -681,13 +745,13 @@ impl State {
                 // Returns nothing, so it is only checked against the budget.
                 if let Err(e) = self.audit.admit(&mut self.keep, &cid, now) {
                     tracing::warn!(error = %e, "agent ping refused");
-                    return Some(rpc_error(
+                    return Some(Reply::Now(rpc_error(
                         id,
                         -32603,
                         "the gateway could not complete the request",
-                    ));
+                    )));
                 }
-                Some(rpc_result(id, json!({})))
+                Some(Reply::Now(rpc_result(id, json!({}))))
             }
             "initialize" | "tools/list" => {
                 if let Err(e) = self
@@ -695,11 +759,11 @@ impl State {
                     .record_served(&mut self.keep, &cid, method, None, now)
                 {
                     tracing::error!(error = %e, "agent handshake could not be recorded");
-                    return Some(rpc_error(
+                    return Some(Reply::Now(rpc_error(
                         id,
                         -32603,
                         "the gateway could not complete the request",
-                    ));
+                    )));
                 }
                 let result = if method == "initialize" {
                     json!({
@@ -710,12 +774,12 @@ impl State {
                 } else {
                     json!({ "tools": tools::list(&granted.grant) })
                 };
-                Some(rpc_result(id, result))
+                Some(Reply::Now(rpc_result(id, result)))
             }
             "tools/call" => Some(self.tools_call(granted, id, &params, now)),
             other => {
                 self.record_refusal(&cid, RefusalKind::Invalid, other, now);
-                Some(rpc_error(id, -32601, "method not found"))
+                Some(Reply::Now(rpc_error(id, -32601, "method not found")))
             }
         }
     }
@@ -735,7 +799,7 @@ impl State {
         id: Value,
         params: &Value,
         now: u64,
-    ) -> Zeroizing<String> {
+    ) -> Reply {
         let cid = granted.credential.id;
         let name = params.get("name").and_then(Value::as_str);
         let empty = json!({});
@@ -744,7 +808,7 @@ impl State {
             Some(a @ Value::Object(_)) => a,
             Some(_) => {
                 self.record_refusal(&cid, RefusalKind::Invalid, "arguments", now);
-                return rpc_error(id, -32602, "arguments must be an object");
+                return Reply::Now(rpc_error(id, -32602, "arguments must be an object"));
             }
         };
         let served = match name {
@@ -760,7 +824,49 @@ impl State {
         };
         let label = name.unwrap_or("no tool");
         match served {
+            Err(Refusal::Park(ask)) => {
+                let tool = match name {
+                    Some(tools::SIGN_PSBT) => tools::SIGN_PSBT,
+                    _ => tools::SIGN_EVENT,
+                };
+                match self.park_agent(granted, id.clone(), tool, *ask, now) {
+                    Ok(pending) => Reply::Later(pending),
+                    Err(refusal) => {
+                        Reply::Now(self.answer_tool(granted, id, label, Err(refusal), now))
+                    }
+                }
+            }
+            served => Reply::Now(self.answer_tool(granted, id, label, served, now)),
+        }
+    }
+
+    /// The line answering a tool call, recording a refusal first.
+    fn answer_tool(
+        &mut self,
+        granted: &GrantedCredential,
+        id: Value,
+        label: &str,
+        served: Served,
+        now: u64,
+    ) -> Zeroizing<String> {
+        let cid = granted.credential.id;
+        match served {
             Ok(content) => tool_result(id, &content, false),
+            Err(Refusal::NeedsApproval(reason)) => {
+                let message =
+                    format!("needs approval, which this gateway cannot obtain yet: {reason}");
+                self.record_refusal(
+                    &cid,
+                    RefusalKind::NeedsApproval,
+                    &format!("{label}: {message}"),
+                    now,
+                );
+                tool_result(id, &Value::String(message), true)
+            }
+            Err(Refusal::Park(_)) => {
+                tracing::error!(tool = label, "a request to park was not parked");
+                rpc_error(id, -32603, "the gateway could not complete the request")
+            }
             Err(Refusal::Invalid { code, message }) => {
                 self.record_refusal(
                     &cid,
@@ -863,7 +969,27 @@ impl State {
                 .collect::<std::result::Result<_, _>>()?,
             Some(_) => return Err(Refusal::params("tags must be an array")),
         };
-        self.decide(&granted.grant, &key, &Request::SignNostrEvent { kind }, now)?;
+        match self.decide(&granted.grant, &key, &Request::SignNostrEvent { kind }, now) {
+            Err(Refusal::NeedsApproval(reason)) if self.approvals_active() => {
+                // The exact event, its time fixed now, is what the approver
+                // is shown and what is signed.
+                let event = keep_approval::binding::UnsignedEventFields {
+                    pubkey: keep_approval::Hex32(key),
+                    created_at: self.clock.calendar(),
+                    kind,
+                    tags: tags.iter().map(|t| t.as_slice().to_vec()).collect(),
+                    content: content.to_string(),
+                };
+                return Err(Refusal::Park(Box::new(approvals::ParkAsk {
+                    object: crate::approval::ParkedObject::NostrEvent(event),
+                    reason: approvals::wire_reason(&reason),
+                    budget: None,
+                })));
+            }
+            decided => {
+                decided?;
+            }
+        }
         let secret = self.secret(&key)?;
         let keys = SecretKey::from_slice(secret.as_slice())
             .map(Keys::new)
@@ -959,6 +1085,7 @@ impl State {
         let wallet = wallet_key(&key, network);
         let wallet_window_sats = self.settings.wallet_budget_sats;
         let mut decision = None;
+        let mut wallet_spent = 0;
         // Evaluate and reserve in one durable transaction with both ledgers.
         self.keep
             .update_agent_ledgers(&[&cid, &wallet], |current| {
@@ -970,6 +1097,7 @@ impl State {
                     wallet_window_sats,
                 };
                 decision = Some(evaluate(&granted.grant, &key, &request, &mut budgets, now));
+                wallet_spent = wallet.spent(now);
                 Ok(vec![encode_ledger(&credential)?, encode_ledger(&wallet)?])
             })
             .map_err(|e| Refusal::Internal(format!("the budget ledgers cannot be updated: {e}")))?;
@@ -977,6 +1105,35 @@ impl State {
             Some(Decision::Allow) => None,
             Some(Decision::Spend(reservation)) => Some(reservation),
             Some(Decision::Deny(reason)) => return Err(Refusal::deny(reason)),
+            Some(Decision::RequireApproval(reason)) if self.approvals_active() => {
+                let crate::policy::ApprovalReason::AboveThreshold { spent, .. } = reason else {
+                    return Err(needs_approval(reason));
+                };
+                let window_sats = granted.grant.bitcoin.as_ref().map_or(0, |b| b.window_sats);
+                let mut change = Vec::new();
+                for output in analysis.outputs.iter().filter(|o| o.is_change) {
+                    let index = signer.change_index(&psbt, output.index).ok_or_else(|| {
+                        Refusal::Internal("a change output has no change index".into())
+                    })?;
+                    change.push((output.index, index));
+                }
+                drop(signer);
+                return Err(Refusal::Park(Box::new(approvals::ParkAsk {
+                    object: crate::approval::ParkedObject::Psbt {
+                        psbt: Box::new(psbt),
+                        analysis,
+                        key,
+                        change,
+                    },
+                    reason: approvals::wire_reason(&reason),
+                    budget: Some(keep_approval::messages::Budget {
+                        credential_spent: spent,
+                        credential_window: window_sats,
+                        wallet_spent,
+                        wallet_window: wallet_window_sats,
+                    }),
+                })));
+            }
             Some(Decision::RequireApproval(reason)) => return Err(needs_approval(reason)),
             None => return Err(Refusal::Internal("no decision".into())),
         };
@@ -1039,6 +1196,10 @@ impl State {
             "name": c.name,
             "expires_at": c.expires_at,
             "grant": grant_json(&granted.grant),
+            "approvals": {
+                "enabled": self.approvals_active(),
+                "deadline_secs": self.approval_deadline(),
+            },
         }))
     }
 
@@ -1055,38 +1216,116 @@ impl State {
             .map_err(withheld)
     }
 
-    /// Handle one line from the admin socket. The caller has checked the peer
-    /// is root or the admin uid.
+    /// Handle one line from the admin socket, as root on connection 0. A
+    /// request that waits for an approver answers only that it is pending.
     pub fn admin_request(&mut self, request: &[u8]) -> Zeroizing<String> {
-        let answer = match serde_json::from_slice::<AdminRequest>(request) {
-            _ if self.closed => Err(AgentError::Other("the gateway is stopping".into())),
-            Ok(AdminRequest::Issue {
-                name,
-                uid,
-                grant,
-                ttl_secs,
-            }) => self.issue(&name, uid, grant, ttl_secs),
-            Ok(request) => self
-                .admin(request)
-                .map(|result| line(&json!({ "ok": true, "result": result }))),
-            Err(e) => Err(AgentError::Other(format!("invalid admin request: {e}"))),
-        };
-        answer.unwrap_or_else(|e| line(&json!({ "ok": false, "error": e.to_string() })))
+        self.admin_request_from(0, 0, request).0
     }
 
-    /// Issue a credential. The answer is the one line that carries its token,
-    /// written straight into a buffer that is wiped, with the token beside
-    /// the credential rather than inside a JSON value that would be freed
-    /// unwiped.
-    fn issue(
+    /// Handle one line from the admin socket, from `uid` on connection
+    /// `conn`. The caller has checked the peer is root or the admin uid. A
+    /// change that gives agents more power, with an approver registered,
+    /// waits for one: the answer then says so, and the outcome comes later.
+    pub fn admin_request_from(
         &mut self,
-        name: &str,
         uid: u32,
-        grant: Value,
-        ttl_secs: Option<u64>,
-    ) -> Result<Zeroizing<String>> {
-        // Credentials live on the calendar clock, which they are checked against.
-        let now = self.clock.calendar();
+        conn: u64,
+        request: &[u8],
+    ) -> (Zeroizing<String>, Option<Pending>) {
+        let failed = |e: AgentError| line(&json!({ "ok": false, "error": e.to_string() }));
+        if self.closed {
+            return (
+                failed(AgentError::Other("the gateway is stopping".into())),
+                None,
+            );
+        }
+        let request = match serde_json::from_slice::<AdminRequest>(request) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    failed(AgentError::Other(format!("invalid admin request: {e}"))),
+                    None,
+                )
+            }
+        };
+        let approve = self.management_needs_approval();
+        match request {
+            AdminRequest::Issue {
+                name,
+                uid: agent_uid,
+                grant,
+                ttl_secs,
+            } => {
+                let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
+                if approve {
+                    match self.issuable_grant(agent_uid, grant) {
+                        Ok(grant) => self.park_issue(conn, &name, agent_uid, grant, ttl),
+                        Err(e) => (failed(e), None),
+                    }
+                } else {
+                    (
+                        self.issue(&name, agent_uid, grant, ttl_secs)
+                            .unwrap_or_else(failed),
+                        None,
+                    )
+                }
+            }
+            AdminRequest::Unfreeze { id } if approve => match parse_id(&id) {
+                Ok(id) => self.park_unfreeze(
+                    conn,
+                    keep_approval::change::Scope::Credential(keep_approval::Hex16(id)),
+                ),
+                Err(e) => (failed(e), None),
+            },
+            AdminRequest::UnfreezeAll {} if approve => {
+                self.park_unfreeze(conn, keep_approval::change::Scope::All)
+            }
+            AdminRequest::ApproverPair { label } => self.pair(uid, conn, &label),
+            AdminRequest::ApproverConfirm {} => self.confirm_pair(conn, true),
+            AdminRequest::ApproverReject {} => self.confirm_pair(conn, false),
+            AdminRequest::ApproverRemove { transport } => {
+                let mut key = [0u8; 32];
+                if hex::decode_to_slice(&transport, &mut key).is_err() {
+                    return (
+                        failed(AgentError::Other("a transport key is 64 hex digits".into())),
+                        None,
+                    );
+                }
+                if !approve {
+                    return (
+                        failed(AgentError::Other(
+                            "no approver device is registered here".into(),
+                        )),
+                        None,
+                    );
+                }
+                self.park_remove(conn, &key)
+            }
+            AdminRequest::ApproverReset {} if uid != 0 => (
+                failed(AgentError::Other(
+                    "only root may reset the approver devices".into(),
+                )),
+                None,
+            ),
+            AdminRequest::ApproverReset {} => (
+                self.reset_approvers()
+                    .map(|result| line(&json!({ "ok": true, "result": result })))
+                    .unwrap_or_else(failed),
+                None,
+            ),
+            request => (
+                self.admin(request)
+                    .map(|result| line(&json!({ "ok": true, "result": result })))
+                    .unwrap_or_else(failed),
+                None,
+            ),
+        }
+    }
+
+    /// The grant a credential for `uid` may be issued with: the uid may hold
+    /// one, the grant validates, and every key it names is a signing key in
+    /// the vault.
+    fn issuable_grant(&self, uid: u32, grant: Value) -> Result<Grant> {
         if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
             return Err(AgentError::ScopeViolation(format!(
                 "uid {uid} is root, the gateway's, the vault owner's, the admin's or the \
@@ -1112,6 +1351,23 @@ impl State {
                 }
             }
         }
+        grant.validated(&self.reserved)
+    }
+
+    /// Issue a credential. The answer is the one line that carries its token,
+    /// written straight into a buffer that is wiped, with the token beside
+    /// the credential rather than inside a JSON value that would be freed
+    /// unwiped.
+    fn issue(
+        &mut self,
+        name: &str,
+        uid: u32,
+        grant: Value,
+        ttl_secs: Option<u64>,
+    ) -> Result<Zeroizing<String>> {
+        // Credentials live on the calendar clock, which they are checked against.
+        let now = self.clock.calendar();
+        let grant = self.issuable_grant(uid, grant)?;
         let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
         let (issued, token) =
             issue_credential(&mut self.keep, name, uid, grant, &self.reserved, now, ttl)?;
@@ -1134,6 +1390,46 @@ impl State {
         Ok(out)
     }
 
+    /// Issue a credential an approver approved, with the id, issue time and
+    /// lifetime the approved change carries. The answer carries its token, as
+    /// [`Self::issue`]'s does.
+    fn issue_approved(
+        &mut self,
+        id: [u8; 16],
+        name: &str,
+        uid: u32,
+        grant: Grant,
+        created_at: u64,
+        ttl: u64,
+    ) -> Result<Zeroizing<String>> {
+        if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
+            return Err(AgentError::ScopeViolation(format!(
+                "uid {uid} may no longer hold a credential"
+            )));
+        }
+        let grant = grant.validated(&self.reserved)?;
+        let bytes =
+            serde_json::to_vec(&grant).map_err(|e| AgentError::Serialization(e.to_string()))?;
+        let (credential, token) = self
+            .keep
+            .issue_agent_credential_with_id(id, name, uid, bytes, created_at, ttl)?;
+        if let Ok(mut set) = self.bound.write() {
+            set.insert(uid);
+        }
+        let now = self.clock.calendar();
+        let head = json!({
+            "ok": true,
+            "result": credential_json(&credential, now, &self.reserved)
+        })
+        .to_string();
+        let mut out = Zeroizing::new(String::with_capacity(head.len() + token.len() + 16));
+        out.push_str(&head[..head.len() - 1]);
+        out.push_str(",\"token\":\"");
+        out.push_str(&token);
+        out.push_str("\"}");
+        Ok(out)
+    }
+
     fn admin(&mut self, request: AdminRequest) -> Result<Value> {
         let now = self.clock.calendar();
         match request {
@@ -1145,8 +1441,16 @@ impl State {
                 "frozen": self.keep.agent_freeze()?,
                 "credentials": self.keep.agent_credential_ids()?.len(),
                 "wallet_budget_sats": self.settings.wallet_budget_sats,
+                "approvals": self.approval_status(),
+                "audit_warnings": self
+                    .keep
+                    .audit_warnings()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
                 "version": env!("CARGO_PKG_VERSION"),
             })),
+            AdminRequest::ApproverList {} => Ok(self.approvers()),
             AdminRequest::List {} => {
                 let mut list = Vec::new();
                 for id in self.keep.agent_credential_ids()? {
@@ -1163,11 +1467,13 @@ impl State {
             AdminRequest::Revoke { id } => {
                 let id = parse_id(&id)?;
                 self.keep.revoke_agent_credential(&id)?;
+                self.cancel_revoked(&id);
                 Ok(json!({ "revoked": hex::encode(id) }))
             }
             AdminRequest::Delete { id } => {
                 let id = parse_id(&id)?;
                 self.keep.delete_agent_credential(&id)?;
+                self.cancel_revoked(&id);
                 self.audit.reset(&id);
                 self.credential_counts.remove(&id);
                 // The credential is gone either way; a stale bound uid only
@@ -1179,23 +1485,29 @@ impl State {
             }
             AdminRequest::Freeze { id } => {
                 let id = parse_id(&id)?;
-                self.keep.set_agent_credential_frozen(&id, true)?;
+                self.load_known(&id)?;
+                self.freeze(credential_scope(id), "the admin socket")?;
                 Ok(json!({ "frozen": hex::encode(id) }))
             }
             AdminRequest::Unfreeze { id } => {
                 let id = parse_id(&id)?;
-                self.keep.set_agent_credential_frozen(&id, false)?;
-                self.audit.reset(&id);
+                self.load_known(&id)?;
+                self.unfreeze_now(credential_scope(id))?;
                 Ok(json!({ "unfrozen": hex::encode(id) }))
             }
             AdminRequest::FreezeAll {} => {
-                self.keep.set_agent_freeze(true)?;
+                self.freeze(keep_approval::change::Scope::All, "the admin socket")?;
                 Ok(json!({ "frozen": "all" }))
             }
             AdminRequest::UnfreezeAll {} => {
-                self.keep.set_agent_freeze(false)?;
+                self.unfreeze_now(keep_approval::change::Scope::All)?;
                 Ok(json!({ "unfrozen": "all" }))
             }
+            AdminRequest::ApproverPair { .. }
+            | AdminRequest::ApproverConfirm {}
+            | AdminRequest::ApproverReject {}
+            | AdminRequest::ApproverRemove { .. }
+            | AdminRequest::ApproverReset {} => Err(AgentError::Other("answered apart".into())),
             AdminRequest::Audit { limit } => {
                 let limit = limit.unwrap_or(100).min(MAX_AUDIT_READ);
                 let entries = self.keep.read_audit_entries()?;
@@ -1266,6 +1578,23 @@ pub enum AdminRequest {
     Audit {
         limit: Option<usize>,
     },
+    /// Open a pairing session for an approver device labeled `label`.
+    ApproverPair {
+        label: String,
+    },
+    /// The fingerprint matches on both screens: register the device, or ask
+    /// an existing device to.
+    ApproverConfirm {},
+    /// The fingerprint does not match: refuse the device.
+    ApproverReject {},
+    ApproverList {},
+    /// Ask an existing device to approve removing the device with this
+    /// transport key.
+    ApproverRemove {
+        transport: String,
+    },
+    /// Remove every approver device: root only.
+    ApproverReset {},
 }
 
 /// Whether a credential must never be bound to `uid` on this host: binding it
@@ -1334,12 +1663,7 @@ fn withheld(e: AgentError) -> Refusal {
 }
 
 fn needs_approval(reason: crate::policy::ApprovalReason) -> Refusal {
-    let message = format!("needs approval, which this gateway cannot obtain yet: {reason}");
-    Refusal::Policy {
-        kind: RefusalKind::NeedsApproval,
-        detail: message.clone(),
-        message,
-    }
+    Refusal::NeedsApproval(reason)
 }
 
 fn only_args(args: &Value, allowed: &[&str]) -> std::result::Result<(), Refusal> {
@@ -1408,6 +1732,10 @@ fn network_arg(grant: &Grant, args: &Value) -> std::result::Result<Network, Refu
         }
         Some(_) => Err(Refusal::params("network must be a string")),
     }
+}
+
+fn credential_scope(id: [u8; 16]) -> keep_approval::change::Scope {
+    keep_approval::change::Scope::Credential(keep_approval::Hex16(id))
 }
 
 fn parse_id(s: &str) -> Result<[u8; 16]> {

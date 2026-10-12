@@ -172,6 +172,27 @@ impl AgentCredential {
         now: u64,
         ttl_secs: u64,
     ) -> Result<(Self, Zeroizing<String>)> {
+        Self::issue_with_id(
+            entropy::try_random_bytes()?,
+            name,
+            uid,
+            grant,
+            now,
+            ttl_secs,
+        )
+    }
+
+    /// [`Self::issue`] with the id chosen beforehand, as when an approver
+    /// approves a credential before it exists: the id, the issue time and the
+    /// lifetime it approved are exactly the credential's.
+    pub fn issue_with_id(
+        id: [u8; 16],
+        name: &str,
+        uid: u32,
+        grant: Vec<u8>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<(Self, Zeroizing<String>)> {
         if name.is_empty()
             || name.len() > MAX_NAME_LEN
             || name.trim() != name
@@ -204,7 +225,7 @@ impl AgentCredential {
             write!(token, "{byte:02x}").map_err(|e| KeepError::Other(e.to_string()))?;
         }
         let credential = Self {
-            id: entropy::try_random_bytes()?,
+            id,
             name: name.to_string(),
             token_hash: token_hash(&token),
             uid,

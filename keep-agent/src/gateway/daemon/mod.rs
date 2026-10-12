@@ -11,6 +11,7 @@
 //! admin uid, since the vault cannot be opened by anything else while the
 //! gateway holds it.
 
+pub mod approvals;
 pub mod clock;
 pub mod limits;
 pub mod server;

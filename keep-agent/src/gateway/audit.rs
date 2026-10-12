@@ -84,6 +84,8 @@ pub struct AgentAudit {
     pending: HashMap<WindowKey, Window>,
     spent: HashMap<[u8; 16], Spent>,
     gateway: Spent,
+    /// Credentials a budget froze since [`Self::take_frozen`] last ran.
+    newly_frozen: Vec<[u8; 16]>,
 }
 
 type WindowKey = ([u8; 16], RefusalKind, String);
@@ -139,7 +141,33 @@ impl AgentAudit {
             pending: HashMap::new(),
             spent: HashMap::new(),
             gateway: Spent::default(),
+            newly_frozen: Vec::new(),
         }
+    }
+
+    /// The credentials a budget froze since the last call, so the gateway can
+    /// count each freeze like any other (the freeze epoch, the requests it
+    /// cancels, the anchor that shows it).
+    pub fn take_frozen(&mut self) -> Vec<[u8; 16]> {
+        std::mem::take(&mut self.newly_frozen)
+    }
+
+    /// Record a request by credential `id` sent to the approvers, before it
+    /// is sent, charged to its budget like a request served. Fails when the
+    /// entry cannot be written, so nothing unrecorded is sent.
+    pub fn record_approval_requested(
+        &mut self,
+        keep: &mut Keep,
+        id: &[u8; 16],
+        label: &str,
+        detail: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)?;
+        keep.record_agent_approval_requested(id, label, Some(detail))?;
+        self.charge(id, false);
+        Ok(())
     }
 
     /// Record a refused request by credential `id` at `now`. The first refusal
@@ -311,7 +339,10 @@ impl AgentAudit {
             }
             if !spent.frozen {
                 match keep.set_agent_credential_frozen(id, true) {
-                    Ok(()) => spent.frozen = true,
+                    Ok(()) => {
+                        spent.frozen = true;
+                        self.newly_frozen.push(*id);
+                    }
                     Err(e) => tracing::warn!(
                         id = %hex::encode(id),
                         error = %e,
