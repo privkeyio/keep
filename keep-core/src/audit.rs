@@ -461,6 +461,8 @@ pub struct AuditLog {
     last_hash: [u8; 32],
     /// The last entry's sequence number; zero for an empty log.
     seq: u64,
+    /// The last entry's time, in Unix seconds; zero for an empty log.
+    last_timestamp: i64,
     entries: usize,
     /// Where to cut a partial line a failed write left, before the next append.
     torn: Option<u64>,
@@ -489,6 +491,9 @@ pub struct OpenedMigration {
     pub unreadable: bool,
     /// The old log was one written before sequence numbers.
     pub from_format1: bool,
+    /// The time of the old log's last readable entry, in Unix seconds;
+    /// zero when it had none.
+    pub old_last_timestamp: i64,
 }
 
 /// What [`AuditLog::verify`] found.
@@ -544,6 +549,7 @@ impl AuditLog {
             path: path.join("audit.log"),
             last_hash: [0u8; 32],
             seq: 0,
+            last_timestamp: 0,
             entries: 0,
             torn: None,
             on_disk: OnDisk::default(),
@@ -567,14 +573,19 @@ impl AuditLog {
                 None => Ok(()),
             };
             match last {
-                None => drop_torn()?,
+                None => {
+                    drop_torn()?;
+                    log.on_disk = tail.on_disk();
+                }
                 // A newer keep's entry is a line this keep cannot read: the
                 // log is set aside as a damaged one is, never refused.
                 Some(Ok(last)) if last.format != 1 && last.format <= AUDIT_FORMAT => {
                     drop_torn()?;
                     log.last_hash = last.hash;
                     log.seq = last.seq;
+                    log.last_timestamp = last.timestamp;
                     log.entries = tail.count;
+                    log.on_disk = tail.on_disk();
                 }
                 Some(Ok(last)) if last.format == 1 => {
                     drop_torn()?;
@@ -588,7 +599,6 @@ impl AuditLog {
                 Some(_) => log.migrate(data_key)?,
             }
         }
-        log.on_disk = OnDisk::read(&log.path)?;
         let kept = log.failed_migration_kept_path();
         log.failed_migration_kept = kept.is_some();
         if let Some(kept) = kept {
@@ -603,6 +613,11 @@ impl AuditLog {
     /// The number of entries in the log.
     pub fn entry_count(&self) -> usize {
         self.entries
+    }
+
+    /// The last entry's time, in Unix seconds; zero for an empty log.
+    pub fn last_timestamp(&self) -> i64 {
+        self.last_timestamp
     }
 
     /// The last entry's sequence number, which counts every entry the log
@@ -714,6 +729,13 @@ impl AuditLog {
             .any(|p| p.file_name().is_some_and(|n| n == name))
     }
 
+    /// Lower how many entries reads and checks go to, for tests of long
+    /// logs.
+    #[cfg(test)]
+    pub(crate) fn set_read_cap_for_tests(&mut self, cap: usize) {
+        self.read_cap = cap;
+    }
+
     /// Set the retention policy.
     pub fn set_retention(&mut self, policy: RetentionPolicy) {
         self.retention = policy;
@@ -772,6 +794,7 @@ impl AuditLog {
 
         self.last_hash = entry.hash;
         self.seq = entry.seq;
+        self.last_timestamp = entry.timestamp;
         self.entries += 1;
         let end = len + line.len() as u64;
         self.on_disk = OnDisk {
@@ -779,6 +802,21 @@ impl AuditLog {
             last: Some((end, line.into_bytes())),
         };
         Ok(())
+    }
+
+    /// Refuse unless `entries`, read from the file, end where this log last
+    /// left it. Behind [`AuditLog::check_on_disk`] this holds already; it is
+    /// checked again on what was actually read before it is rewritten.
+    fn check_tail(&self, entries: &[AuditEntry]) -> Result<()> {
+        let tail = entries.last().map_or((0, [0u8; 32]), |e| (e.seq, e.hash));
+        if tail == (self.seq, self.last_hash) {
+            return Ok(());
+        }
+        Err(StorageError::corrupted(format!(
+            "the audit log on disk ends at entry {}, not at entry {} where this vault left it",
+            tail.0, self.seq
+        ))
+        .into())
     }
 
     /// Refuse unless the file is as this log last left it: the same length,
@@ -815,7 +853,9 @@ impl AuditLog {
     /// Check the whole chain without holding the log, as
     /// [`AuditLog::verify`] does, counting a line that cannot be read as a
     /// break rather than failing. A log longer than [`MAX_AUDIT_ENTRIES`]
-    /// entries is checked that far and counted as broken there.
+    /// entries is checked from its start that far, since the chain's first
+    /// entry is where its rules start, and reported too long rather than
+    /// broken.
     pub fn check_chain(&self, data_key: &SecretKey) -> Result<ChainCheck> {
         let mut chain = ChainVerifier::default();
         let file = match File::open(&self.path) {
@@ -837,8 +877,8 @@ impl AuditLog {
                 continue;
             }
             entries += 1;
-            if entries > MAX_AUDIT_ENTRIES {
-                chain.unreadable(number);
+            if entries > self.read_cap {
+                chain.too_long = true;
                 break;
             }
             match Self::decrypt_batch(text, &batch) {
@@ -899,14 +939,7 @@ impl AuditLog {
         }
         self.check_on_disk()?;
         let mut entries = Self::read_entries(&self.path, data_key, usize::MAX)?;
-        let tail = entries.last().map_or((0, [0u8; 32]), |e| (e.seq, e.hash));
-        if tail != (self.seq, self.last_hash) {
-            return Err(StorageError::corrupted(format!(
-                "the audit log on disk ends at entry {}, not at entry {} where this vault left it, so it is not pruned",
-                tail.0, self.seq
-            ))
-            .into());
-        }
+        self.check_tail(&entries)?;
         let Some(last) = entries.last() else {
             return Ok(0);
         };
@@ -1122,6 +1155,7 @@ impl AuditLog {
         let (mut old, gap, decrypted) = Self::read_readable(&self.path, data_key)?;
         let complete = gap.is_none();
         let from_format1 = old.iter().any(|e| e.format == 1);
+        let old_last_timestamp = old.last().map_or(0, |e| e.timestamp);
         // A log that already holds entries in a later format and has a line
         // that cannot be read keeps only what came before the damage, so no
         // entry whose sequence number was already seen is renumbered; the
@@ -1218,6 +1252,7 @@ impl AuditLog {
             kept: kept_name,
             unreadable: decrypted == 0 && !complete,
             from_format1,
+            old_last_timestamp,
         });
         Ok(())
     }
@@ -1271,6 +1306,7 @@ impl AuditLog {
         let (last_hash, seq) = entries.last().map_or(([0u8; 32], 0), |e| (e.hash, e.seq));
         self.last_hash = last_hash;
         self.seq = seq;
+        self.last_timestamp = entries.last().map_or(0, |e| e.timestamp);
         self.entries = entries.len();
         self.torn = None;
         self.on_disk = OnDisk::read(&self.path).unwrap_or(OnDisk {
@@ -1317,17 +1353,9 @@ impl AuditLog {
         // Past the read cap too, so rotating a long log cannot strand it under
         // the old key after the new one is committed.
         let entries = Self::read_entries(&self.path, old_key, usize::MAX)?;
-        // The log on disk must end where this process left it: another log
-        // put in its place is not re-encrypted as this one, but left to be
-        // set aside.
-        let tail = entries.last().map_or((0, [0u8; 32]), |e| (e.seq, e.hash));
-        if tail != (self.seq, self.last_hash) {
-            return Err(StorageError::corrupted(format!(
-                "the audit log on disk ends at entry {}, not at entry {} where this vault left it",
-                tail.0, self.seq
-            ))
-            .into());
-        }
+        // Another log put in its place is not re-encrypted as this one, but
+        // left to be set aside.
+        self.check_tail(&entries)?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -1502,6 +1530,7 @@ struct ChainVerifier {
     breaks: Vec<u8>,
     failures: u64,
     first_failure: Option<u64>,
+    too_long: bool,
 }
 
 /// What [`ChainVerifier`] found.
@@ -1516,6 +1545,9 @@ pub struct ChainCheck {
     pub first_failure: Option<u64>,
     /// A fingerprint of every break, which only the same breaks reproduce.
     pub breaks: [u8; 32],
+    /// The log holds more than [`MAX_AUDIT_ENTRIES`] entries, and was
+    /// checked only that far.
+    pub too_long: bool,
 }
 
 impl ChainVerifier {
@@ -1571,6 +1603,7 @@ impl ChainVerifier {
             failures: self.failures,
             first_failure: self.first_failure,
             breaks: crypto::blake2b_256(&self.breaks),
+            too_long: self.too_long,
         }
     }
 }
@@ -1588,11 +1621,7 @@ impl OnDisk {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let tail = scan_tail(path)?;
-        Ok(Self {
-            len: file_len(path)?,
-            last: tail.last.map(|line| (tail.last_end, line)),
-        })
+        Ok(scan_tail(path)?.on_disk())
     }
 }
 
@@ -1606,40 +1635,49 @@ struct Tail {
     count: usize,
     /// The length of the complete lines, when a final line has no newline.
     complete: Option<u64>,
+    /// The length of the complete lines.
+    end: u64,
+}
+
+impl Tail {
+    /// The file as it is once a torn final line, if any, is dropped.
+    fn on_disk(&self) -> OnDisk {
+        OnDisk {
+            len: self.end,
+            last: self.last.clone().map(|line| (self.last_end, line)),
+        }
+    }
 }
 
 /// Scan `path` for its last complete line that is not blank, without
 /// changing it.
 fn scan_tail(path: &Path) -> std::io::Result<Tail> {
     let mut reader = BufReader::new(File::open(path)?);
-    let (mut line, mut last) = (Vec::new(), None);
+    let (mut line, mut last) = (Vec::new(), Vec::new());
     let (mut count, mut at, mut last_end) = (0, 0u64, 0u64);
-    loop {
+    let complete = loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line)?;
         if n == 0 {
-            return Ok(Tail {
-                last,
-                last_end,
-                count,
-                complete: None,
-            });
+            break None;
         }
         if line.last() != Some(&b'\n') {
-            return Ok(Tail {
-                last,
-                last_end,
-                count,
-                complete: Some(at),
-            });
+            break Some(at);
         }
         at += n as u64;
         if !line_text(&line).is_empty() {
             count += 1;
             last_end = at;
-            last = Some(line.clone());
+            std::mem::swap(&mut last, &mut line);
         }
-    }
+    };
+    Ok(Tail {
+        last: (!last.is_empty()).then_some(last),
+        last_end,
+        count,
+        complete,
+        end: at,
+    })
 }
 
 /// The length of the file at `path`; zero when there is none.

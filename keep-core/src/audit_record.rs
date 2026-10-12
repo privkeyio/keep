@@ -94,6 +94,8 @@ pub struct ChainBroken {
     pub failures: u64,
     /// The sequence number (or line number) of the first break then.
     pub first_failure: u64,
+    /// The fingerprint of those breaks: what acknowledging it covers.
+    pub breaks: [u8; 32],
 }
 
 /// The record itself found missing or unreadable.
@@ -138,6 +140,9 @@ pub struct AuditRecord {
     /// The sequence number and hash a pruning about to replace the log
     /// will leave it at, until the record follows it.
     pub retention_pending: Option<(u64, [u8; 32])>,
+    /// The log held more than the entries an unlock checks, at the latest
+    /// unlock; reported while it does, not acknowledged.
+    pub too_long: bool,
 }
 
 /// Something about the audit log the owner must be told on every unlock
@@ -168,6 +173,8 @@ pub enum AuditWarning {
     MoreSetAside(u64),
     /// The log's chain is broken in a way not acknowledged before.
     ChainBroken(ChainBroken),
+    /// The log is longer than an unlock checks.
+    TooLong,
 }
 
 const ACKNOWLEDGE: &str =
@@ -204,7 +211,10 @@ impl std::fmt::Display for AuditWarning {
                 f,
                 "the audit log was moved to sequence numbers or set aside, and the old log FAILED \
                  its chain check or held entries this keep cannot read: entries from before then \
-                 cannot be trusted; {}; {ACKNOWLEDGE}",
+                 cannot be trusted (the vault had recorded the log at entry {}, head {}); {}; \
+                 {ACKNOWLEDGE}",
+                set_aside.recorded_seq,
+                hex::encode(set_aside.recorded_head),
                 kept_text(&set_aside.kept, *missing)
             ),
             Self::RolledBack(r) => write!(
@@ -232,6 +242,12 @@ impl std::fmt::Display for AuditWarning {
             Self::MoreSetAside(count) => write!(
                 f,
                 "{count} more logs were set aside than the vault's record names; {ACKNOWLEDGE}"
+            ),
+            Self::TooLong => write!(
+                f,
+                "the audit log holds more than {} entries, so an unlock checks its chain only that \
+                 far: prune it with `keep audit retention --max-entries 10000 --apply`",
+                crate::audit::MAX_AUDIT_ENTRIES
             ),
             Self::ChainBroken(broken) => write!(
                 f,

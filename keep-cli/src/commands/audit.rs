@@ -276,12 +276,19 @@ pub fn cmd_audit_acknowledge(out: &Output, path: &Path, hidden: bool) -> Result<
             "a hidden volume's outer log keeps no record to acknowledge".into(),
         ));
     };
-    let acknowledged = keep.audit_acknowledge()?;
-    if acknowledged.is_empty() {
+    let shown = keep.audit_warnings();
+    if shown.is_empty() {
         out.info("Nothing to acknowledge: the vault reports no audit warnings");
         return Ok(());
     }
-    for warning in &acknowledged {
+    out.info("About to acknowledge, and record in the audit log:");
+    for warning in &shown {
+        out.warn(&warning.to_string());
+    }
+    if !super::get_confirm("Acknowledge these audit warnings?")? {
+        return Err(KeepError::Runtime("acknowledgement declined".into()));
+    }
+    for warning in &keep.audit_acknowledge(&shown)? {
         out.success(&format!(
             "Acknowledged, and recorded in the audit log: {warning}"
         ));

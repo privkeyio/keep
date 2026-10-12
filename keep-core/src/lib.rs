@@ -250,7 +250,7 @@ impl Keep {
             audit_record: None,
         };
         keep.save_audit_record(audit_record::AuditRecord::default())?;
-        keep.storage.ensure_agent_freeze_epoch()?;
+        keep.storage.ensure_agent_freeze_epoch(false)?;
         keep.audit_record = None;
         Ok(keep)
     }
@@ -295,9 +295,6 @@ impl Keep {
         self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
         self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &data_key)?);
         self.check_audit_record()?;
-        if let Err(e) = self.storage.ensure_agent_freeze_epoch() {
-            tracing::error!(error = %e, "the agent freeze epoch could not be started");
-        }
 
         // Flush any rate-limit trip events queued by prior failed unlocks
         // before recording this success, so the audit chain reflects the
@@ -369,6 +366,7 @@ impl Keep {
         let now = chrono::Utc::now().timestamp();
         let rotation = self.storage.rotation_in_progress();
         let migrated = audit.migrated_on_open().cloned();
+        let mut first_open = false;
         let mut record = match self.load_audit_record()? {
             Some(Ok(record)) => record,
             Some(Err(e)) => {
@@ -382,17 +380,27 @@ impl Keep {
                 }
             }
             None => {
-                // Every vault this keep creates gets a record at once, and a
-                // released vault before records gets its first one as its
-                // log migrates from format 1. A record missing otherwise,
-                // from a vault holding anything, was deleted.
-                let migrating = migrated.as_ref().is_some_and(|m| m.from_format1);
+                // A keep that keeps the record notes it in the log and writes
+                // the freeze epoch at create and every unlock; and the log
+                // records everything created. A record missing while the log
+                // notes it, the epoch is there, or something was created
+                // after the log's last entry, was deleted. Otherwise this is
+                // the vault's first open by a keep that keeps the record (an
+                // older release's or main's vault), which writes the first.
                 let noted = audit.any_entry_noting(
                     &[AuditEventType::VaultUnlock, AuditEventType::AuditRetention],
                     audit_record::RECORD_NOTE,
                     &data_key,
                 );
-                let lost = noted || (!migrating && self.holds_anything()?);
+                // A migration on this open added its own entry; what counts
+                // is the last entry the old log had.
+                let logged_until = migrated
+                    .as_ref()
+                    .map_or(audit.last_timestamp(), |m| m.old_last_timestamp);
+                let lost = noted
+                    || self.storage.agent_freeze_epoch_row()?
+                    || self.storage.latest_created_at()? > logged_until;
+                first_open = !lost;
                 audit_record::AuditRecord {
                     lost: lost.then_some(audit_record::RecordLost {
                         missing: true,
@@ -417,8 +425,9 @@ impl Keep {
                 quiet = m.unreadable;
             }
             // A set-aside the record has not seen: one from before the
-            // record, or one a crash kept from it. Noted, it explains the
-            // log being behind, and is reported until acknowledged.
+            // record, or one a crash kept from it. Noted and reported until
+            // acknowledged; the marker is a file anyone with the vault folder
+            // can write, so the log is still compared with the record.
             None => {
                 if let Some(kept) = audit.failed_migration_marked() {
                     if !record.set_asides.iter().any(|s| s.kept == kept) {
@@ -429,7 +438,6 @@ impl Keep {
                             recorded_head: record.head,
                             rotation: false,
                         });
-                        quiet = true;
                     }
                 }
             }
@@ -454,6 +462,7 @@ impl Keep {
         }
         record.retention_pending = None;
         let chain = audit.check_chain(&data_key)?;
+        record.too_long = chain.too_long;
         if chain.valid || record.chain_acknowledged == Some(chain.breaks) {
             record.chain_broken = None;
         } else {
@@ -462,6 +471,7 @@ impl Keep {
                 found_at,
                 failures: chain.failures,
                 first_failure: chain.first_failure.unwrap_or(0),
+                breaks: chain.breaks,
             });
         }
         if let Err(e) = self.save_audit_record(record) {
@@ -472,17 +482,13 @@ impl Keep {
                 tracing::error!(error = %e, "the note of an interrupted rotation could not be cleared");
             }
         }
+        if let Err(e) = self.storage.ensure_agent_freeze_epoch(first_open) {
+            tracing::error!(error = %e, "the agent freeze epoch could not be started");
+        }
         for warning in self.audit_warnings() {
             tracing::error!("{warning}");
         }
         Ok(())
-    }
-
-    /// Whether the vault holds a key, a share or a secret.
-    fn holds_anything(&self) -> Result<bool> {
-        Ok(!self.storage.list_keys()?.is_empty()
-            || !self.storage.list_shares()?.is_empty()
-            || !self.storage.list_secrets()?.is_empty())
     }
 
     /// The record of the audit log: `None` when there is none, and an inner
@@ -603,6 +609,9 @@ impl Keep {
         if let Some(broken) = record.chain_broken {
             warnings.push(AuditWarning::ChainBroken(broken));
         }
+        if record.too_long {
+            warnings.push(AuditWarning::TooLong);
+        }
         warnings
     }
 
@@ -613,24 +622,28 @@ impl Keep {
         self.audit_record.as_ref().and_then(|r| r.rollback)
     }
 
-    /// Acknowledge everything [`Self::audit_warnings`] reports, once
-    /// investigated: the audit log gets an entry naming each, so the
-    /// evidence stays in the chain, and the warnings stop. The chain's
-    /// breaks as they are now are acknowledged with them, so only new ones
-    /// are reported. Returns what was acknowledged; nothing is written when
+    /// Acknowledge the warnings [`Self::audit_warnings`] reports, once
+    /// investigated, given exactly as they were shown (`shown`): if they
+    /// changed since, nothing is acknowledged, so nothing is acknowledged
+    /// unseen. The audit log gets an entry naming each, so the evidence
+    /// stays in the chain, and the warnings stop; a broken chain is
+    /// acknowledged as the unlock found it, so a break made since is still
+    /// reported. Returns what was acknowledged; nothing is written when
     /// nothing is pending.
-    pub fn audit_acknowledge(&mut self) -> Result<Vec<audit_record::AuditWarning>> {
+    pub fn audit_acknowledge(
+        &mut self,
+        shown: &[audit_record::AuditWarning],
+    ) -> Result<Vec<audit_record::AuditWarning>> {
         let mut record = self.audit_record.clone().ok_or(KeepError::Locked)?;
         let warnings = self.audit_warnings();
+        if warnings != shown {
+            return Err(KeepError::invalid_input(
+                "the audit warnings changed since they were shown; review them again",
+            ));
+        }
         if !record.pending() {
             return Ok(Vec::new());
         }
-        let data_key = self.get_data_key()?;
-        let chain = self
-            .audit
-            .as_ref()
-            .ok_or(KeepError::Locked)?
-            .check_chain(&data_key)?;
         let reason = format!(
             "acknowledged: {}",
             warnings
@@ -646,8 +659,10 @@ impl Keep {
         if !record.set_asides.is_empty() || record.more_set_asides > 0 {
             audit.clear_failed_migration_marker()?;
         }
+        if let Some(broken) = record.chain_broken {
+            record.chain_acknowledged = Some(broken.breaks);
+        }
         record.clear_pending();
-        record.chain_acknowledged = (!chain.valid).then_some(chain.breaks);
         record.seq = audit.seq();
         record.head = audit.last_hash();
         self.save_audit_record(record)?;
@@ -1121,7 +1136,7 @@ impl Keep {
     pub fn corrupt_agent_freeze_for_testing(&self) -> Result<()> {
         self.storage.put_raw(
             crate::backend::CONFIG_TABLE,
-            b"agent_freeze",
+            crate::storage::AGENT_FREEZE,
             b"not ciphertext",
         )
     }
@@ -3088,7 +3103,7 @@ mod tests {
         keep.storage
             .put_raw(
                 crate::backend::CONFIG_TABLE,
-                b"agent_freeze",
+                crate::storage::AGENT_FREEZE,
                 b"not ciphertext",
             )
             .unwrap();
@@ -4415,6 +4430,11 @@ mod tests {
             .any(|w| matches!(w, audit_record::AuditWarning::RolledBack(_))));
     }
 
+    fn acknowledge(keep: &mut Keep) -> Vec<audit_record::AuditWarning> {
+        let shown = keep.audit_warnings();
+        keep.audit_acknowledge(&shown).unwrap()
+    }
+
     fn rolled_back(keep: &Keep) -> Option<audit_record::AuditRollback> {
         keep.audit_rollback()
     }
@@ -4465,7 +4485,7 @@ mod tests {
         keep.unlock("testpass").unwrap();
         assert_eq!(rolled_back(&keep), Some(rollback));
 
-        assert_eq!(keep.audit_acknowledge().unwrap().len(), 1);
+        assert_eq!(acknowledge(&mut keep).len(), 1);
         assert!(rolled_back(&keep).is_none());
         let last = keep.audit_read_all().unwrap().pop().unwrap();
         assert_eq!(last.event_type, AuditEventType::AuditAcknowledged);
@@ -4606,7 +4626,7 @@ mod tests {
             .to_string()
             .contains("the kept log audit.log.v1 is missing"));
 
-        let acknowledged = keep.audit_acknowledge().unwrap();
+        let acknowledged = acknowledge(&mut keep);
         assert_eq!(acknowledged.len(), 1);
         let last = keep.audit_read_all().unwrap().pop().unwrap();
         assert_eq!(last.event_type, AuditEventType::AuditAcknowledged);
@@ -4615,7 +4635,7 @@ mod tests {
         keep.lock();
         keep.unlock("testpass").unwrap();
         assert!(keep.audit_warnings().is_empty());
-        assert!(keep.audit_acknowledge().unwrap().is_empty());
+        assert!(acknowledge(&mut keep).is_empty());
     }
 
     /// Acknowledging a failed migration while its marker and kept file are
@@ -4631,7 +4651,7 @@ mod tests {
         keep.unlock("testpass").unwrap();
         assert!(path.join("audit.log.v1.failed").exists());
         assert!(set_aside(&keep).is_some());
-        keep.audit_acknowledge().unwrap();
+        acknowledge(&mut keep);
         assert!(!path.join("audit.log.v1.failed").exists());
         assert!(path.join("audit.log.v1").exists());
         keep.lock();
@@ -4698,7 +4718,7 @@ mod tests {
         );
         assert_eq!(both.count, 2);
         assert!(both.lowest_found_seq < noted.found_seq);
-        keep.audit_acknowledge().unwrap();
+        acknowledge(&mut keep);
         let last = keep.audit_read_all().unwrap().pop().unwrap();
         assert!(last
             .reason
@@ -4793,7 +4813,7 @@ mod tests {
             std::fs::write(path.join("audit.log"), &before).unwrap();
             keep.unlock("testpass").unwrap();
             assert!(rolled_back(&keep).is_some(), "{damage}: detection resumes");
-            keep.audit_acknowledge().unwrap();
+            acknowledge(&mut keep);
             assert!(keep.audit_warnings().is_empty(), "{damage}");
         }
     }
@@ -5494,7 +5514,7 @@ mod tests {
         keep.lock();
         keep.unlock("testpass").unwrap();
         assert!(chain_broken(&keep).is_some(), "until acknowledged");
-        keep.audit_acknowledge().unwrap();
+        acknowledge(&mut keep);
         keep.lock();
         keep.unlock("testpass").unwrap();
         assert!(
@@ -5629,10 +5649,9 @@ mod tests {
             let mut keep =
                 Keep::create_with_params(&path, "testpass", crypto::Argon2Params::TESTING).unwrap();
             keep.generate_key("a").unwrap();
-            assert!(keep
-                .storage
-                .remove_config_for_tests(audit_record::AUDIT_RECORD_KEY)
-                .unwrap());
+            for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
+                assert!(keep.storage.remove_config_for_tests(row).unwrap());
+            }
             keep.data_key().unwrap()
         };
         write_format1_log(
@@ -5756,11 +5775,12 @@ mod tests {
             .is_none());
     }
 
-    /// A set-aside a crash kept from the record (the log replaced, the
-    /// record not yet written) is noted from its marker at the next unlock,
-    /// and explains the log being behind: no rollback, only the set-aside.
+    /// A set-aside found only from its marker (one a crash kept from the
+    /// record, or a marker planted beside an older kept log) is noted, and
+    /// the log is still compared with the record: a log behind it is a
+    /// rollback too.
     #[test]
-    fn a_set_aside_the_record_missed_is_not_a_rollback() {
+    fn a_set_aside_found_from_its_marker_is_still_compared() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keep");
         let mut keep = test_keep(&path);
@@ -5774,13 +5794,18 @@ mod tests {
         let mut lines: Vec<&str> = text.lines().collect();
         lines.drain(1..lines.len() - 1);
         std::fs::write(path.join("audit.log"), lines.join("\n") + "\n").unwrap();
-        // The set-aside, as the crashed process ran it, without the record.
+        // The set-aside, as a crashed process or someone with the folder
+        // ran it, without the record.
         drop(AuditLog::open(&path, &data_key).unwrap());
         assert!(path.join("audit.log.v1.failed").exists());
         let mut keep = Keep::open(&path).unwrap();
         keep.unlock("testpass").unwrap();
-        assert!(rolled_back(&keep).is_none(), "{:?}", keep.audit_warnings());
-        assert!(set_aside(&keep).is_some());
+        assert!(rolled_back(&keep).is_some(), "{:?}", keep.audit_warnings());
+        let set = set_aside(&keep).unwrap();
+        assert!(set.recorded_seq > 0);
+        assert!(keep.audit_warnings()[0]
+            .to_string()
+            .contains(&format!("at entry {}", set.recorded_seq)));
     }
 
     /// A second set-aside before the owner acknowledges the first is noted
@@ -5974,5 +5999,159 @@ mod tests {
             started.elapsed()
         );
         assert!(chain_broken(&keep).is_none());
+    }
+
+    /// The kept format 1 log moved back over the log with the record
+    /// deleted migrates again from its start: noticed from the freeze
+    /// epoch's row, and with that row deleted too, from the keys created
+    /// after the old log's last entry.
+    #[test]
+    fn the_old_log_moved_back_with_the_record_deleted_is_noticed() {
+        use crate::audit::test_support::write_format1_log;
+
+        for epoch_too in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("keep");
+            let data_key = {
+                let storage =
+                    Storage::create(&path, "testpass", crypto::Argon2Params::TESTING).unwrap();
+                storage.data_key().unwrap().clone()
+            };
+            let mut old = AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]);
+            old.timestamp -= 3600;
+            write_format1_log(&path, &data_key, vec![old]);
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            assert!(
+                keep.audit_warnings().is_empty(),
+                "{:?}",
+                keep.audit_warnings()
+            );
+            keep.generate_key("since").unwrap();
+            assert!(keep
+                .storage
+                .remove_config_for_tests(audit_record::AUDIT_RECORD_KEY)
+                .unwrap());
+            if epoch_too {
+                assert!(keep
+                    .storage
+                    .remove_config_for_tests(b"agent_freeze_epoch")
+                    .unwrap());
+            }
+            drop(keep);
+            std::fs::rename(path.join("audit.log.v1"), path.join("audit.log")).unwrap();
+            let mut keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            assert!(
+                record_lost(&keep).is_some_and(|l| l.missing),
+                "epoch row deleted too: {epoch_too}"
+            );
+        }
+    }
+
+    /// A vault from a keep before the record and the epoch, with agent
+    /// credentials (as main left it), opens quietly the first time, with a
+    /// seeded epoch that reads, so anchors and pairing work at once.
+    #[test]
+    fn a_vault_from_before_the_record_with_agents_opens_quietly() {
+        let floor = unix_now() << 24;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        let data_key = keep.data_key().unwrap();
+        for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
+            assert!(keep.storage.remove_config_for_tests(row).unwrap());
+        }
+        drop(keep);
+        // Its log, without the notes this keep writes.
+        std::fs::remove_file(path.join("audit.log")).unwrap();
+        let mut log = AuditLog::open(&path, &data_key).unwrap();
+        for event in [
+            AuditEventType::VaultUnlock,
+            AuditEventType::AgentCredentialIssue,
+        ] {
+            log.log(AuditEntry::new(event, log.last_hash()), &data_key)
+                .unwrap();
+        }
+        drop(log);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(
+            keep.audit_warnings().is_empty(),
+            "{:?}",
+            keep.audit_warnings()
+        );
+        assert!(keep.agent_freeze_epoch().unwrap() >= floor);
+        keep.lock();
+        keep.unlock("testpass").unwrap();
+        assert!(keep.audit_warnings().is_empty());
+    }
+
+    /// Acknowledging takes the warnings as shown, refusing others, and
+    /// covers the chain's breaks as the unlock found them: a break made
+    /// while the vault is open is still reported at the next unlock.
+    #[test]
+    fn acknowledging_covers_only_what_was_shown() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            keep.generate_key(name).unwrap();
+        }
+        drop(keep);
+        let edit = |change: &dyn Fn(&mut Vec<String>)| {
+            let text = std::fs::read_to_string(path.join("audit.log")).unwrap();
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            change(&mut lines);
+            std::fs::write(path.join("audit.log"), lines.join("\n") + "\n").unwrap();
+        };
+        edit(&|lines| {
+            let n = lines.len();
+            lines.remove(n - 2);
+        });
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(chain_broken(&keep).is_some());
+        assert!(keep.audit_acknowledge(&[]).is_err(), "not what is shown");
+        let shown = keep.audit_warnings();
+        // While the banner is up, two entries of the same length further
+        // back swap places: the file keeps its length and last line.
+        edit(&|lines| {
+            let (i, j) = (2..lines.len() - 2)
+                .flat_map(|i| (i + 1..lines.len() - 2).map(move |j| (i, j)))
+                .find(|&(i, j)| lines[i].len() == lines[j].len())
+                .expect("two entries of the same length");
+            lines.swap(i, j);
+        });
+        keep.audit_acknowledge(&shown).unwrap();
+        drop(keep);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(chain_broken(&keep).is_some(), "the later break is new");
+    }
+
+    /// A log longer than an unlock checks is reported as too long, with
+    /// its own warning, never as broken, and acknowledging does not hide it.
+    #[test]
+    fn a_log_too_long_to_check_is_not_reported_broken() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        for name in ["a", "b", "c"] {
+            keep.generate_key(name).unwrap();
+        }
+        keep.audit.as_mut().unwrap().set_read_cap_for_tests(3);
+        keep.check_audit_record().unwrap();
+        let warnings = keep.audit_warnings();
+        assert_eq!(
+            warnings,
+            [audit_record::AuditWarning::TooLong],
+            "{warnings:?}"
+        );
+        assert!(warnings[0].to_string().contains("keep audit retention"));
+        assert!(acknowledge(&mut keep).is_empty());
+        assert_eq!(keep.audit_warnings(), [audit_record::AuditWarning::TooLong]);
     }
 }

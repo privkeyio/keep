@@ -1319,8 +1319,8 @@ fn test_audit_verify_detects_tampering() {
 
 /// Overwrite `vault`'s audit log with entries in the format the release
 /// before sequence numbers wrote, chained from zero, and remove the record of
-/// the log from `keep.db`, as that release kept none; `break_link` breaks the
-/// chain at the second entry.
+/// the log and the freeze epoch from `keep.db`, as that release kept
+/// neither; `break_link` breaks the chain at the second entry.
 fn write_format1_audit_log(vault: &Path, break_link: bool) {
     use base64::Engine;
     use keep_core::audit::{AuditEntry, AuditEventType};
@@ -1354,10 +1354,10 @@ fn write_format1_audit_log(vault: &Path, break_link: bool) {
     }
     std::fs::write(vault.join("audit.log"), out).unwrap();
     use keep_core::backend::StorageBackend;
-    keep_core::backend::RedbBackend::open(&vault.join("keep.db"))
-        .unwrap()
-        .delete(keep_core::backend::CONFIG_TABLE, b"audit_record")
-        .unwrap();
+    let db = keep_core::backend::RedbBackend::open(&vault.join("keep.db")).unwrap();
+    for row in [&b"audit_record"[..], b"agent_freeze_epoch"] {
+        db.delete(keep_core::backend::CONFIG_TABLE, row).unwrap();
+    }
 }
 
 /// A vault whose audit log predates sequence numbers is migrated the next
@@ -1488,11 +1488,27 @@ fn test_audit_verify_fails_on_a_rollback_until_acknowledged() {
     assert_failure(&out);
     assert!(output_contains(&out, "replaced or cut back"));
 
+    // Without KEEP_YES and without a terminal to confirm on, nothing is
+    // acknowledged; with it, what is acknowledged is shown first.
+    let mut unconfirmed = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"]);
+    unconfirmed.cmd.env_remove("KEEP_YES");
+    let out = unconfirmed.run();
+    assert_failure(&out);
+    assert!(output_contains(&out, "About to acknowledge"));
+    assert!(output_contains(&out, "replaced or cut back"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
     let out = KeepCmd::new(&bin)
         .path(&vault)
         .args(["audit", "acknowledge"])
         .run();
     assert_success(&out);
+    assert!(output_contains(&out, "About to acknowledge"));
     assert!(output_contains(&out, "Acknowledged"));
     let out = KeepCmd::new(&bin)
         .path(&vault)

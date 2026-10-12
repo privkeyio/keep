@@ -26,6 +26,9 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+/// The config key the freeze of every agent is stored under.
+pub(crate) const AGENT_FREEZE: &[u8] = b"agent_freeze";
+
 /// The config key the agent freeze epoch is stored under.
 const AGENT_FREEZE_EPOCH: &[u8] = b"agent_freeze_epoch";
 
@@ -1970,7 +1973,7 @@ impl Storage {
 
     /// Whether every agent credential is frozen.
     pub fn get_agent_freeze(&self) -> Result<bool> {
-        self.get_config_flag(b"agent_freeze")
+        self.get_config_flag(AGENT_FREEZE)
     }
 
     /// Write raw bytes into a table, for tests that corrupt a stored value.
@@ -2046,7 +2049,7 @@ impl Storage {
             }
             None => (
                 CONFIG_TABLE,
-                b"agent_freeze".to_vec(),
+                AGENT_FREEZE.to_vec(),
                 self.encrypt_value(&[u8::from(frozen)])?,
             ),
         };
@@ -2111,19 +2114,68 @@ impl Storage {
     /// agent was ever issued, frozen or given a ledger; after that, a missing
     /// epoch means a deleted one, which [`Storage::get_agent_freeze_epoch`]
     /// refuses to read as 0.
-    pub(crate) fn ensure_agent_freeze_epoch(&self) -> Result<()> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.get(CONFIG_TABLE, AGENT_FREEZE_EPOCH)?.is_some() || self.any_agent_rows()? {
+    ///
+    /// On a vault's first open by a keep that keeps the epoch (`first_open`),
+    /// agents an older keep made get a seeded epoch, which no unfreeze held
+    /// back from that keep can match.
+    pub(crate) fn ensure_agent_freeze_epoch(&self, first_open: bool) -> Result<()> {
+        if self.agent_freeze_epoch_row()? {
             return Ok(());
         }
-        self.set_config_bound(AGENT_FREEZE_EPOCH, &0u64.to_le_bytes())
+        let epoch = match self.any_agent_rows()? {
+            false => 0,
+            true if first_open => seeded_epoch(),
+            true => return Ok(()),
+        };
+        self.set_config_bound(AGENT_FREEZE_EPOCH, &epoch.to_le_bytes())
+    }
+
+    /// Whether the agent freeze epoch's row is there at all, readable or not.
+    pub(crate) fn agent_freeze_epoch_row(&self) -> Result<bool> {
+        Ok(self.config_row(AGENT_FREEZE_EPOCH)?.is_some())
+    }
+
+    /// The latest `created_at` of any key, share, secret or agent credential
+    /// that can be read, in Unix seconds; a row that cannot be decrypted or
+    /// decoded is passed over. Only a failure to read the database is an
+    /// error.
+    pub(crate) fn latest_created_at(&self) -> Result<i64> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let open =
+            |stored: &[u8]| -> Option<Zeroizing<Vec<u8>>> { self.decrypt_value(stored).ok() };
+        let mut latest = i64::MIN;
+        for (_, stored) in backend.list(KEYS_TABLE)? {
+            if let Some(record) =
+                open(&stored).and_then(|b| bincode_options().deserialize::<KeyRecord>(&b).ok())
+            {
+                latest = latest.max(record.created_at);
+            }
+        }
+        for (_, stored) in backend.list(SHARES_TABLE)? {
+            if let Some(share) = open(&stored).and_then(|b| deserialize_stored_share(&b).ok()) {
+                latest = latest.max(share.metadata.created_at);
+            }
+        }
+        for (_, stored) in backend.list(SECRETS_TABLE)? {
+            if let Some(secret) =
+                open(&stored).and_then(|b| bincode_options().deserialize::<SecretRecord>(&b).ok())
+            {
+                latest = latest.max(secret.created_at);
+            }
+        }
+        for (key, stored) in backend.list(AGENT_CREDENTIALS_TABLE)? {
+            if let Ok(credential) = self.decode_agent_credential(&key, &stored) {
+                latest = latest.max(i64::try_from(credential.created_at).unwrap_or(i64::MAX));
+            }
+        }
+        Ok(latest)
     }
 
     fn any_agent_rows(&self) -> Result<bool> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         Ok(!backend.list(AGENT_CREDENTIALS_TABLE)?.is_empty()
             || !backend.list(AGENT_LEDGERS_TABLE)?.is_empty()
-            || backend.get(CONFIG_TABLE, b"agent_freeze")?.is_some())
+            || backend.get(CONFIG_TABLE, AGENT_FREEZE)?.is_some())
     }
 
     /// Note that a data key rotation is under way (`true`), in a row the
