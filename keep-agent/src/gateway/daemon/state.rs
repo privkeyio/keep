@@ -921,7 +921,7 @@ impl State {
         match evaluate(grant, key, request, &mut budgets, now) {
             Decision::Allow => Ok(Value::Null),
             Decision::Deny(reason) => Err(Refusal::deny(reason)),
-            Decision::RequireApproval(reason) => Err(needs_approval(reason)),
+            Decision::RequireApproval(reason) => Err(Refusal::NeedsApproval(reason)),
             Decision::Spend(_) => Err(Refusal::Internal(
                 "a request that spends nothing reserved a spend".into(),
             )),
@@ -1117,7 +1117,7 @@ impl State {
             Some(Decision::Deny(reason)) => return Err(Refusal::deny(reason)),
             Some(Decision::RequireApproval(reason)) if self.approvals_active() => {
                 let crate::policy::ApprovalReason::AboveThreshold { spent, .. } = reason else {
-                    return Err(needs_approval(reason));
+                    return Err(Refusal::NeedsApproval(reason));
                 };
                 let window_sats = granted.grant.bitcoin.as_ref().map_or(0, |b| b.window_sats);
                 let mut change = Vec::new();
@@ -1144,7 +1144,7 @@ impl State {
                     }),
                 })));
             }
-            Some(Decision::RequireApproval(reason)) => return Err(needs_approval(reason)),
+            Some(Decision::RequireApproval(reason)) => return Err(Refusal::NeedsApproval(reason)),
             None => return Err(Refusal::Internal("no decision".into())),
         };
         let signed = signer
@@ -1228,7 +1228,8 @@ impl State {
 
     /// Handle one line from the admin socket, as root on connection 0. A
     /// request that waits for an approver answers only that it is pending.
-    pub fn admin_request(&mut self, request: &[u8]) -> Zeroizing<String> {
+    #[cfg(test)]
+    pub(crate) fn admin_request(&mut self, request: &[u8]) -> Zeroizing<String> {
         self.admin_request_from(0, 0, request).0
     }
 
@@ -1674,10 +1675,6 @@ fn encode_ledger(ledger: &Ledger) -> keep_core::error::Result<Vec<u8>> {
 
 fn withheld(e: AgentError) -> Refusal {
     Refusal::Internal(format!("withheld: it could not be recorded: {e}"))
-}
-
-fn needs_approval(reason: crate::policy::ApprovalReason) -> Refusal {
-    Refusal::NeedsApproval(reason)
 }
 
 fn only_args(args: &Value, allowed: &[&str]) -> std::result::Result<(), Refusal> {

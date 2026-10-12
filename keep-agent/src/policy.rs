@@ -57,15 +57,8 @@ fn kind_needs_approval(kind: u16) -> bool {
     APPROVAL_KINDS.contains(&kind) || APPROVAL_RANGE.contains(&kind)
 }
 
-/// The kinds of the approval protocol (24250 to 24255). An agent never signs
-/// one, under any grant, approved or not: they fall in the range grants may
-/// list, so a grant listing one is refused, and so is the request.
-pub fn is_protocol_kind(kind: u16) -> bool {
-    keep_approval::kind::is_protocol_kind(kind)
-}
-
 /// Keys no grant may name: the gateway's channel key and every registered
-/// approver device's transport and approver keys.
+/// approver device's transport key.
 pub type ReservedKeys = BTreeSet<[u8; 32]>;
 
 /// What a credential may do. Every field is an explicit allowance: an empty set
@@ -150,7 +143,11 @@ impl Grant {
                 "a grant cannot name the gateway's channel key or an approver device's key",
             );
         }
-        if self.event_kinds.iter().any(|&k| is_protocol_kind(k)) {
+        if self
+            .event_kinds
+            .iter()
+            .any(|&k| keep_approval::kind::is_protocol_kind(k))
+        {
             return refuse(
                 "kinds 24250 to 24255 belong to the approval protocol and are never granted",
             );
@@ -471,9 +468,10 @@ fn decide(
     now: u64,
     approved: bool,
 ) -> Decision {
-    // Before any other rule, whatever the grant says.
+    // Before any other rule, whatever the grant says or an approver decided:
+    // an agent never signs a message of the approval protocol.
     if let Request::SignNostrEvent { kind } = *request {
-        if is_protocol_kind(kind) {
+        if keep_approval::kind::is_protocol_kind(kind) {
             return Decision::Deny(DenyReason::ProtocolKind(kind));
         }
     }
