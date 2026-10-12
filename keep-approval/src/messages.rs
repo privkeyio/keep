@@ -506,14 +506,10 @@ mod tests {
     #[test]
     fn an_anchor_lists_at_most_sixteen_unfreezes() {
         let list = |n: usize| {
-            let entry = format!(
-                r#"{{"scope":{{"credential":"{}"}},"epoch":1}}"#,
-                "ab".repeat(16)
-            );
-            format!(
-                r#"{{"epoch":1,"all":false,"credentials":[],"unfrozen":[{}]}}"#,
-                vec![entry; n].join(",")
-            )
+            let entry =
+                serde_json::json!({ "scope": { "credential": "ab".repeat(16) }, "epoch": 1 });
+            serde_json::json!({ "epoch": 1, "all": false, "credentials": [], "unfrozen": vec![entry; n] })
+                .to_string()
         };
         assert!(serde_json::from_str::<Frozen>(&list(MAX_UNFROZEN)).is_ok());
         assert!(serde_json::from_str::<Frozen>(&list(MAX_UNFROZEN + 1)).is_err());
@@ -593,7 +589,7 @@ mod tests {
         ] {
             let text = to_text(&reason);
             assert_eq!(parse::<Reason>(&text).unwrap(), reason);
-            let extra = text.replacen('{', "{\"x\":\"y\",", 1);
+            let extra = text.replacen("{", "{\"x\":\"y\",", 1);
             assert!(parse::<Reason>(&extra).is_err(), "{extra}");
         }
         for bad in [
