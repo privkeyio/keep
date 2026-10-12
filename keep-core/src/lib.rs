@@ -3694,8 +3694,15 @@ mod tests {
         );
         let mut keep = Keep::open(&path).unwrap();
         keep.unlock("testpass").unwrap();
-        // A directory where a kept log would be read fails its re-encryption.
-        std::fs::create_dir(path.join("audit.log.v1.7")).unwrap();
+        // A kept log that cannot be read fails its re-encryption.
+        let unreadable = path.join("audit.log.v1.7");
+        std::fs::write(&unreadable, b"x\n").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &unreadable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .unwrap();
         keep.rotate_data_key("testpass").unwrap();
         assert!(keep.audit_verify_chain().unwrap());
         assert!(keep

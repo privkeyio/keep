@@ -444,7 +444,7 @@ impl App {
                     .is_some_and(keep_core::Keep::audit_failed_migration_kept)
                 {
                     self.set_toast(
-                        "The audit log was moved to a new format, but the old log FAILED its integrity check: entries from before the move cannot be trusted. Keep audit.log.v1 in the vault folder and run `keep audit verify`.".into(),
+                        "The audit log was moved to a new format, but the old log FAILED its integrity check: entries from before the move cannot be trusted. Keep the old log in the vault folder (audit.log.v1, or the name audit.log.v1.failed gives) and run `keep audit verify`.".into(),
                         ToastKind::Error,
                     );
                 }

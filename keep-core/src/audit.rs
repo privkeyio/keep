@@ -504,24 +504,25 @@ impl AuditLog {
         if log.path.exists() {
             match Self::read_tail(&log.path, data_key) {
                 Ok(None) => {}
+                Ok(Some((last, _))) if last.format > AUDIT_FORMAT => {
+                    return Err(StorageError::invalid_format(format!(
+                        "the audit log was written by a newer keep (entry format {})",
+                        last.format
+                    ))
+                    .into());
+                }
                 Ok(Some((last, count))) if last.format != 1 => {
                     log.last_hash = last.hash;
                     log.seq = last.seq;
                     log.entries = count;
                 }
                 Ok(Some(_)) => log.migrate(data_key)?,
-                // The last entry cannot be read. A log holding format 1
-                // entries is migrated with the fault recorded (one that also
-                // holds later-format entries is refused by the migration).
-                // One nothing in can be read (left under an old data key,
-                // say) refuses to open, as it always has, rather than being
-                // started over.
-                Err(e) => {
-                    if !Self::formats(&log.path, data_key)?.0 {
-                        return Err(e);
-                    }
-                    log.migrate(data_key)?;
-                }
+                // The last entry cannot be read. The log is migrated with the
+                // fault recorded, the old file kept beside it: a log holding
+                // only format 1 entries, or one nothing in can be read (left
+                // under a data key that no longer exists, say). One that
+                // holds later-format entries is refused by the migration.
+                Err(_) => log.migrate(data_key)?,
             }
         }
         let kept = log.failed_migration_kept_path();
@@ -529,7 +530,7 @@ impl AuditLog {
         if let Some(kept) = kept {
             tracing::error!(
                 kept = %kept.display(),
-                "the audit log was moved to sequence numbers, but the old log FAILED its chain check: entries from before the migration cannot be trusted; keep the old log file for investigation and run `keep audit verify`"
+                "the audit log was moved to sequence numbers, but the old log FAILED its chain check: entries from before the migration cannot be trusted; keep the old log file named here for investigation and run `keep audit verify`"
             );
         }
         Ok(log)
@@ -620,9 +621,11 @@ impl AuditLog {
         Self::read_entries(&self.path, data_key, self.read_cap)
     }
 
-    /// Verify the hash chain integrity.
+    /// Verify the hash chain integrity. False while the log still holds
+    /// entries from before a migration whose old chain failed its check.
     pub fn verify_chain(&self, data_key: &SecretKey) -> Result<bool> {
-        Ok(self.verify(data_key)?.valid)
+        let report = self.verify(data_key)?;
+        Ok(report.valid && !report.holds_untrusted_entries())
     }
 
     /// Verify the hash chain, and report the migration the log records.
@@ -638,7 +641,8 @@ impl AuditLog {
     /// that chain now starts, and carrying the latest migration record, is
     /// appended in the same rewrite. An entry too old to keep that follows a
     /// newer one is kept until everything before it is removed. The
-    /// retention entry counts towards `max_entries`.
+    /// retention entry counts toward `max_entries`. A log whose chain fails
+    /// its check is never pruned, so pruning cannot hide a cut or splice.
     pub fn apply_retention(&mut self, data_key: &SecretKey) -> Result<usize> {
         if !self.path.exists() {
             return Ok(0);
@@ -647,6 +651,12 @@ impl AuditLog {
         let Some(last) = entries.last() else {
             return Ok(0);
         };
+        if !verify_entries(&entries).valid {
+            return Err(StorageError::corrupted(
+                "the audit log fails its chain check, so it is not pruned; run `keep audit verify`",
+            )
+            .into());
+        }
         let (last_seq, last_hash) = (last.seq, last.hash);
         let now = chrono::Utc::now().timestamp();
         let max_age_secs = self.retention.max_age_days.map(|d| i64::from(d) * 86400);
@@ -760,16 +770,15 @@ impl AuditLog {
         }
         let temp = self.path.with_extension("log.tmp");
         let backup = self.path.with_extension("log.bak");
-        if !backup.exists() {
+        if !is_regular_file(&backup) {
             return Ok(());
         }
-        let from = if temp.exists() && matches!(Self::read_tail(&temp, data_key), Ok(Some(_))) {
-            temp
-        } else if backup.exists() {
-            backup
-        } else {
-            return Ok(());
-        };
+        let from =
+            if is_regular_file(&temp) && matches!(Self::read_tail(&temp, data_key), Ok(Some(_))) {
+                temp
+            } else {
+                backup
+            };
         std::fs::rename(&from, &self.path)?;
         sync_parent(&self.path);
         Ok(())
@@ -800,16 +809,16 @@ impl AuditLog {
         Ok(entries)
     }
 
-    /// Every entry up to the first that cannot be read, and whether the
-    /// whole log could be read. Only a failure to read the file is an error.
+    /// Every entry that can be read, skipping lines that cannot, and whether
+    /// every line could be read. Only a failure to read the file is an error.
     fn read_readable(path: &Path, data_key: &SecretKey) -> Result<(Vec<AuditEntry>, bool)> {
         let mut reader = BufReader::new(File::open(path)?);
-        let mut entries = Vec::new();
+        let (mut entries, mut complete) = (Vec::new(), true);
         let mut line = Vec::new();
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
-                return Ok((entries, true));
+                return Ok((entries, complete));
             }
             let text = line_text(&line);
             if text.is_empty() {
@@ -817,7 +826,7 @@ impl AuditLog {
             }
             match Self::decrypt_bytes(text, data_key) {
                 Ok(entry) => entries.push(entry),
-                Err(_) => return Ok((entries, false)),
+                Err(_) => complete = false,
             }
         }
     }
@@ -852,11 +861,16 @@ impl AuditLog {
 
     /// Move a format 1 log to sequence numbers. See [`AuditLog::open`].
     ///
-    /// The old chain counts as checked out only if the whole log could be
-    /// read, every entry is in format 1, and each links to the one before
-    /// and hashes to its stored hash. Entries in a later format (a migrated
-    /// log an older keep appended to) are kept with their records but make
-    /// the check fail.
+    /// Every readable entry is carried over; a line that cannot be read is
+    /// left out. The old chain counts as checked out only if every line could
+    /// be read and each entry links to the one before and hashes to its
+    /// stored hash. Entries already in a later format at the start (a
+    /// migrated log an older keep then appended to) must also pass
+    /// [`AuditLog::verify`]'s rules, and must not record a failed migration
+    /// of their own, which a second migration never clears. A log nothing in
+    /// can be read (one left under a data key that no longer exists) is set
+    /// aside the same way, with the failure recorded, rather than locking
+    /// the vault.
     ///
     /// The new log is written beside the old one and renamed over it last, so
     /// a crash at any point leaves either the old log, which is migrated
@@ -865,30 +879,32 @@ impl AuditLog {
     fn migrate(&mut self, data_key: &SecretKey) -> Result<()> {
         let (mut old, complete) = Self::read_readable(&self.path, data_key)?;
         // A log that already holds entries in a later format (one an older
-        // keep appended to) and cannot be read to its end is not migrated:
-        // the entries past the damage would be lost from the new log, and
-        // its sequence would go back. It refuses to open, as a damaged
-        // migrated log always does.
+        // keep appended to) and has a line that cannot be read is not
+        // migrated: renumbering around the gap would change entries whose
+        // sequence numbers were already seen. It refuses to open, as a
+        // damaged migrated log always does.
         if !complete && Self::formats(&self.path, data_key)?.1 {
             return Err(StorageError::corrupted(
                 "the audit log holds entries in the current format and cannot be read to its end",
             )
             .into());
         }
-        let mut chain_valid = complete;
-        let mut prev_hash = [0u8; 32];
-        for entry in &old {
+        // Entries already in a later format at the start (a migrated log an
+        // older keep then appended to) are kept exactly as they are, so their
+        // sequence numbers and hashes never change; only what follows is
+        // renumbered, continuing from them.
+        let kept = old.iter().take_while(|e| e.format != 1).count();
+        let prefix = verify_entries(&old[..kept]);
+        let mut chain_valid =
+            complete && prefix.valid && prefix.migration.is_none_or(|m| m.old_chain_valid);
+        let mut prev_hash = old[..kept].last().map_or([0u8; 32], |e| e.hash);
+        for entry in &old[kept..] {
             chain_valid &= entry.format == 1;
             chain_valid &= entry.verify(&prev_hash);
             prev_hash = entry.hash;
         }
         let (old_head, old_count) = (prev_hash, old.len() as u64);
 
-        // Entries already in a later format at the start (a migrated log an
-        // older keep then appended to) are kept exactly as they are, so their
-        // sequence numbers and hashes never change; only what follows is
-        // renumbered, continuing from them.
-        let kept = old.iter().take_while(|e| e.format != 1).count();
         let rest = old.split_off(kept);
         let mut entries = old;
         entries.reserve(rest.len() + 1);
@@ -968,7 +984,16 @@ impl AuditLog {
     /// The kept old log a failed migration names in the marker, while both
     /// the marker and that file exist.
     fn failed_migration_kept_path(&self) -> Option<PathBuf> {
-        let name = std::fs::read_to_string(self.marker_path()).ok()?;
+        let marker = self.marker_path();
+        if !is_regular_file(&marker) {
+            return None;
+        }
+        let mut name = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(File::open(&marker).ok()?, 255),
+            &mut name,
+        )
+        .ok()?;
         let name = name.trim();
         let path = self
             .migrated_paths()
@@ -1072,12 +1097,28 @@ impl AuditLog {
     /// backup's log did: when it did, to where the migration entry now is
     /// (or to 0 for a record carried past an entry the backup no longer
     /// held); when it did not, to 0.
+    ///
+    /// When the backup's entries fail their chain check (under the rules of
+    /// their format), an [`AuditEventType::AuditLogMigrated`] entry recording
+    /// the failure follows them, so the restored log reports them untrusted
+    /// as a failed migration would.
     pub(crate) fn restore_entries(
         &mut self,
         entries: &[AuditEntry],
         data_key: &SecretKey,
     ) -> Result<()> {
-        let untrusted = verify_entries(entries).holds_untrusted_entries();
+        let report = verify_entries(entries);
+        let untrusted = report.holds_untrusted_entries();
+        let chain_valid = if entries.iter().all(|e| e.format == 1) {
+            let mut prev_hash = [0u8; 32];
+            entries.iter().all(|e| {
+                let ok = e.verify(&prev_hash);
+                prev_hash = e.hash;
+                ok
+            })
+        } else {
+            report.valid
+        };
         let mut moved = std::collections::HashMap::new();
         for entry in entries {
             let mut entry = entry.clone();
@@ -1091,7 +1132,26 @@ impl AuditLog {
             }
             self.append(entry, data_key)?;
         }
-        Ok(())
+        if chain_valid {
+            return Ok(());
+        }
+        let migration = AuditMigration {
+            old_head: entries.last().map_or([0u8; 32], |e| e.hash),
+            old_count: entries.len() as u64,
+            old_chain_valid: false,
+            seq: self
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| StorageError::invalid_format("audit log sequence overflow"))?,
+        };
+        let mut note = AuditEntry::new(AuditEventType::AuditLogMigrated, [0u8; 32])
+            .with_success(false)
+            .with_reason(&format!(
+                "restored {} entries from a backup whose audit chain FAILED its check, so entries before this one cannot be trusted",
+                entries.len()
+            ));
+        note.migration = Some(migration);
+        self.append(note, data_key)
     }
 }
 
@@ -1099,7 +1159,7 @@ impl AuditLog {
 fn migrated_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let base = dir.join(MIGRATED_LOG);
-    if base.exists() {
+    if is_regular_file(&base) {
         paths.push(base);
     }
     let mut numbered: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)
@@ -1109,7 +1169,10 @@ fn migrated_paths(dir: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
             let n = name.strip_prefix(MIGRATED_LOG)?.strip_prefix('.')?;
-            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            if n.is_empty()
+                || !n.bytes().all(|b| b.is_ascii_digit())
+                || !is_regular_file(&entry.path())
+            {
                 return None;
             }
             Some((n.parse().ok()?, entry.path()))
@@ -1168,6 +1231,11 @@ fn verify_entries(entries: &[AuditEntry]) -> AuditVerification {
     }
 }
 
+/// Whether `path` is a regular file, without following a symlink.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
 /// A new file at `path` with mode 0600, after removing anything left there,
 /// so a stale file's permissions are never inherited.
 fn create_fresh(path: &Path) -> std::io::Result<File> {
@@ -1205,8 +1273,8 @@ fn write_marker(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// it. The copy is made under a temporary name and hard-linked into place,
 /// which never replaces a file. Where hard links are not supported (FAT,
 /// some network and FUSE file systems), it is copied straight into a name
-/// created new, which never replaces a file either; a crash then can leave
-/// a partial copy under that name, beside the intact log.
+/// created new, which never replaces a file either; a failed copy is removed,
+/// but a crash can leave a partial copy under that name, beside the intact log.
 fn keep_copy(from: &Path, dir: &Path) -> Result<PathBuf> {
     let name = |n: u32| {
         if n == 1 {
@@ -1236,8 +1304,18 @@ fn keep_copy(from: &Path, dir: &Path) -> Result<PathBuf> {
             opts.mode(0o600);
             match opts.open(name(n)) {
                 Ok(mut out) => {
-                    std::io::copy(&mut File::open(&temp)?, &mut out)?;
-                    out.sync_all()?;
+                    let copied = File::open(&temp)
+                        .and_then(|mut from| std::io::copy(&mut from, &mut out))
+                        .and_then(|_| out.sync_all());
+                    #[cfg(test)]
+                    let copied = match test_support::FAIL_COPY.with(std::cell::Cell::get) {
+                        true => Err(std::io::ErrorKind::Other.into()),
+                        false => copied,
+                    };
+                    if let Err(e) = copied {
+                        let _ = std::fs::remove_file(name(n));
+                        return Err(e);
+                    }
                     return Ok(name(n));
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => n += 1,
@@ -1801,6 +1879,8 @@ pub(crate) mod test_support {
         /// Makes this thread's migrations behave as on a file system without
         /// hard links.
         pub(crate) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes this thread's copies into a kept log's name fail.
+        pub(crate) static FAIL_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Write `entries` to `dir/audit.log` exactly as the release before
@@ -2437,8 +2517,9 @@ mod sequence_tests {
         assert_eq!(reopened.verify(&key).unwrap().migration, Some(failed));
     }
 
-    /// An old log with a line that cannot be read keeps what came before it,
-    /// records the fault, and the warning is still found on the next open.
+    /// An old log with a line that cannot be read keeps every entry that can
+    /// be read, records the fault, and the warning is still found on the
+    /// next open.
     #[test]
     fn a_partly_unreadable_old_log_migrates_what_it_can() {
         let dir = tempdir().unwrap();
@@ -2456,15 +2537,26 @@ mod sequence_tests {
 
         let log = AuditLog::open(dir.path(), &key).unwrap();
         let failed = AuditMigration {
-            old_head: readable[1].hash,
-            old_count: 2,
+            old_head: readable[3].hash,
+            old_count: 3,
             old_chain_valid: false,
-            seq: 3,
+            seq: 4,
         };
         assert!(log.failed_migration_kept());
-        assert_eq!(log.verify(&key).unwrap().migration, Some(failed));
-        assert_eq!(log.entry_count(), 3);
-        assert!(log.verify_chain(&key).unwrap());
+        let report = log.verify(&key).unwrap();
+        assert_eq!(report.migration, Some(failed));
+        assert!(report.valid);
+        assert!(!log.verify_chain(&key).unwrap());
+        let carried: Vec<_> = log.read_all(&key).unwrap()[..3]
+            .iter()
+            .map(|e| e.pubkey.clone())
+            .collect();
+        let expected: Vec<_> = [0, 1, 3]
+            .iter()
+            .map(|&i| readable[i].pubkey.clone())
+            .collect();
+        assert_eq!(carried, expected);
+        assert_eq!(log.entry_count(), 4);
         let reopened = AuditLog::open(dir.path(), &key).unwrap();
         assert!(reopened.failed_migration_kept());
     }
@@ -2550,7 +2642,7 @@ mod sequence_tests {
             assert_eq!(&*AuditLog::decrypt_raw(line, &new_key).unwrap(), plain);
         }
         assert_eq!(lines[2], "bm90IGFuIGVudHJ5");
-        assert!(log.verify_chain(&new_key).unwrap());
+        assert!(log.verify(&new_key).unwrap().valid);
         let reopened = AuditLog::open(dir.path(), &new_key).unwrap();
         assert!(reopened.failed_migration_kept());
         assert_eq!(
@@ -2961,7 +3053,7 @@ mod sequence_tests {
         assert!(log.failed_migration_kept());
         assert_eq!(
             log.verify(&key).unwrap().migration.map(|m| m.old_count),
-            Some(0)
+            Some(2)
         );
     }
 
@@ -2986,11 +3078,12 @@ mod sequence_tests {
         assert!(!dir.path().join(MIGRATED_LOG).exists());
     }
 
-    /// A migrated log an older keep appended to is migrated again, but the
-    /// later-format entries fail the old chain check, and the earlier
-    /// records they carry are kept.
+    /// A log whose first migration failed, which an older keep then
+    /// appended to, is migrated again and still fails its check: a second
+    /// migration never clears an earlier failure, and the earlier records
+    /// are kept.
     #[test]
-    fn a_log_an_older_keep_appended_to_fails_its_check() {
+    fn a_failed_migration_stays_failed_when_migrated_again() {
         let dir = tempdir().unwrap();
         let key = key();
         tampered_format1_log(dir.path(), &key, 3);
@@ -3104,6 +3197,8 @@ mod sequence_tests {
             seq: 9,
         };
         note.migration = Some(failed);
+        note.seq = 1;
+        note.hash = note.compute_hash();
         log.restore_entries(&[note], &key).unwrap();
         let report = log.verify(&key).unwrap();
         assert!(report.valid);
@@ -3185,8 +3280,15 @@ mod sequence_tests {
         source.log(sign(7), &key).unwrap();
         let all = source.read_all(&key).unwrap();
         let at = all.iter().position(|e| e.migration.is_some()).unwrap();
+        source.set_retention(RetentionPolicy {
+            max_entries: Some(all.len() - at + 1),
+            max_age_days: None,
+        });
+        assert_eq!(source.apply_retention(&key).unwrap(), at);
+        let pruned = source.read_all(&key).unwrap();
+        assert_eq!(pruned[0].seq, all[at].seq);
 
-        for (entries, untrusted) in [(&all[..], true), (&all[at..], false)] {
+        for (entries, untrusted) in [(&all[..], true), (&pruned[..], false)] {
             assert_eq!(verify_entries(entries).holds_untrusted_entries(), untrusted);
             let dir = tempdir().unwrap();
             let mut log = logged(dir.path(), &key, 2);
@@ -3198,21 +3300,34 @@ mod sequence_tests {
         }
     }
 
-    /// A log nothing in can be read under the current key (one a crash left
-    /// under an old data key, say) is never started over: it refuses to
-    /// open, and nothing is migrated.
+    /// A log nothing in can be read under the current key (one a crash or
+    /// an older keep's data key change left under a key that no longer
+    /// exists) never locks the vault: it is kept beside a new log that
+    /// starts with a record of the failure, in either format.
     #[test]
-    fn an_unreadable_log_is_never_started_over() {
-        let dir = tempdir().unwrap();
+    fn an_unreadable_log_is_set_aside_with_the_failure_recorded() {
         let old_key = key();
-        write_format1_log(dir.path(), &old_key, vec![sign(1), sign(2)]);
-        assert!(AuditLog::open(dir.path(), &key()).is_err());
-        assert!(!dir.path().join(MIGRATED_LOG).exists());
-
-        let dir = tempdir().unwrap();
-        logged(dir.path(), &old_key, 3);
-        assert!(AuditLog::open(dir.path(), &key()).is_err());
-        assert!(!dir.path().join(MIGRATED_LOG).exists());
+        let new_key = key();
+        for format1 in [true, false] {
+            let dir = tempdir().unwrap();
+            if format1 {
+                write_format1_log(dir.path(), &old_key, vec![sign(1), sign(2)]);
+            } else {
+                logged(dir.path(), &old_key, 3);
+            }
+            let old = std::fs::read(dir.path().join("audit.log")).unwrap();
+            let log = AuditLog::open(dir.path(), &new_key).unwrap();
+            assert!(log.failed_migration_kept());
+            assert_eq!(log.seq(), 1);
+            assert_eq!(std::fs::read(dir.path().join(MIGRATED_LOG)).unwrap(), old);
+            let report = log.verify(&new_key).unwrap();
+            assert!(report.valid);
+            let m = report.migration.unwrap();
+            assert_eq!(
+                (m.old_count, m.old_chain_valid, m.old_head),
+                (0, false, [0; 32])
+            );
+        }
     }
 
     /// Without hard links the old log is copied straight into a new name,
@@ -3241,7 +3356,8 @@ mod sequence_tests {
 
     /// When an older keep appended to a migrated, pruned log, the entries
     /// already in the current format keep their hashes and sequence numbers
-    /// and the rest continue from them, so the sequence never goes back.
+    /// and the rest continue from them, so the sequence never goes back. An
+    /// intact chain migrates again without a false alarm.
     #[test]
     fn migrating_again_never_sends_the_sequence_back() {
         let dir = tempdir().unwrap();
@@ -3269,6 +3385,46 @@ mod sequence_tests {
         assert_eq!(after[before.len()].seq, seq + 1);
         assert_eq!(log.seq(), seq + 2);
         assert!(log.verify_chain(&key).unwrap());
+        assert!(log.verify(&key).unwrap().migration.unwrap().old_chain_valid);
+        assert!(!log.failed_migration_kept());
+        assert!(!dir.path().join(FAILED_MIGRATION_MARKER).exists());
+
+        // The same append onto a broken chain is not taken as intact.
+        let dir = tempdir().unwrap();
+        let log = logged(dir.path(), &key, 4);
+        let mut old = sign(8);
+        old.format = 1;
+        old.prev_hash = [7; 32];
+        old.hash = old.compute_hash();
+        let mut text = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        text.push_str(&format1_line(&old, &key));
+        std::fs::write(dir.path().join("audit.log"), text).unwrap();
+        drop(log);
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert!(log.failed_migration_kept());
+        assert!(!log.verify_chain(&key).unwrap());
+
+        // So is an intact append onto current-format entries that were
+        // spliced before it.
+        let dir = tempdir().unwrap();
+        let log = logged(dir.path(), &key, 4);
+        let mut old = sign(8);
+        old.format = 1;
+        old.prev_hash = log.last_hash();
+        old.hash = old.compute_hash();
+        drop(log);
+        let path = dir.path().join("audit.log");
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.remove(1);
+        let mut text = lines.join("\n") + "\n";
+        text.push_str(&format1_line(&old, &key));
+        std::fs::write(&path, text).unwrap();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert!(log.failed_migration_kept());
         assert!(!log.verify(&key).unwrap().migration.unwrap().old_chain_valid);
     }
 
@@ -3330,13 +3486,21 @@ mod sequence_tests {
     }
 
     /// One kept log that cannot be re-encrypted does not stop the others.
+    #[cfg(unix)]
     #[test]
     fn every_kept_log_is_tried() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = tempdir().unwrap();
         let key = key();
         write_format1_log(dir.path(), &key, vec![sign(1)]);
         let log = AuditLog::open(dir.path(), &key).unwrap();
-        std::fs::create_dir(dir.path().join(format!("{MIGRATED_LOG}.2"))).unwrap();
+        let unreadable = dir.path().join(format!("{MIGRATED_LOG}.2"));
+        std::fs::write(&unreadable, b"x\n").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&unreadable).is_ok() {
+            return; // Running as root, which reads any file.
+        }
         std::fs::copy(
             dir.path().join(MIGRATED_LOG),
             dir.path().join(format!("{MIGRATED_LOG}.3")),
@@ -3397,6 +3561,201 @@ mod sequence_tests {
             std::fs::write(&path, lines).unwrap();
             let log = AuditLog::open(dir.path(), &key).unwrap();
             assert!(log.failed_migration_kept());
+        }
+    }
+
+    /// Retention never prunes a chain that fails its check, so a cut or
+    /// splice in the range it would remove stays visible.
+    #[test]
+    fn retention_refuses_a_broken_chain() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        let mut log = logged(dir.path(), &key, 6);
+        let path = dir.path().join("audit.log");
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.remove(3);
+        let text = lines.join("\n") + "\n";
+        std::fs::write(&path, &text).unwrap();
+        assert!(!log.verify_chain(&key).unwrap());
+        log.set_retention(RetentionPolicy {
+            max_entries: Some(3),
+            max_age_days: None,
+        });
+        assert!(log.apply_retention(&key).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!log.verify_chain(&key).unwrap());
+    }
+
+    /// A log whose newest entry is in a format newer than this keep writes
+    /// refuses to open rather than having older entries appended after it.
+    #[test]
+    fn a_log_from_a_newer_keep_refuses_to_open() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        let log = logged(dir.path(), &key, 2);
+        let mut next = sign(9);
+        next.format = AUDIT_FORMAT + 1;
+        next.seq = 3;
+        next.prev_hash = log.last_hash();
+        next.hash = next.compute_hash();
+        let path = dir.path().join("audit.log");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&AuditLog::encrypt_line(&next, &key).unwrap());
+        std::fs::write(&path, &text).unwrap();
+        assert!(AuditLog::open(dir.path(), &key).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    /// The marker, the kept logs and an interrupted rewrite's files are used
+    /// only when they are regular files, never through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_beside_the_log_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let key = key();
+        tampered_format1_log(dir.path(), &key, 3);
+        assert!(AuditLog::open(dir.path(), &key)
+            .unwrap()
+            .failed_migration_kept());
+        let marker = dir.path().join(FAILED_MIGRATION_MARKER);
+        let name = std::fs::read(&marker).unwrap();
+        let elsewhere = tempdir().unwrap();
+        let target = elsewhere.path().join("marker");
+        std::fs::write(&target, &name).unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        symlink(&target, &marker).unwrap();
+        assert!(!AuditLog::open(dir.path(), &key)
+            .unwrap()
+            .failed_migration_kept());
+
+        let outside = elsewhere.path().join("outside");
+        std::fs::write(&outside, b"not a kept log\n").unwrap();
+        symlink(&outside, dir.path().join(format!("{MIGRATED_LOG}.9"))).unwrap();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert!(!log
+            .migrated_paths()
+            .iter()
+            .any(|p| p.ends_with(format!("{MIGRATED_LOG}.9"))));
+        log.reencrypt_kept_logs(&key, &SecretKey::generate().unwrap())
+            .unwrap();
+        assert_eq!(std::fs::read(&outside).unwrap(), b"not a kept log\n");
+
+        // An interrupted rewrite's backup or new file behind a symlink is
+        // left alone, and the file it points at is never cut.
+        let dir = tempdir().unwrap();
+        let victim = elsewhere.path().join("victim");
+        std::fs::write(&victim, b"line\npartial").unwrap();
+        symlink(&victim, dir.path().join("audit.log.bak")).unwrap();
+        symlink(&victim, dir.path().join("audit.log.tmp")).unwrap();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.seq(), 0);
+        assert_eq!(std::fs::read(&victim).unwrap(), b"line\npartial");
+
+        let dir = tempdir().unwrap();
+        let head = logged(dir.path(), &key, 2).last_hash();
+        std::fs::rename(
+            dir.path().join("audit.log"),
+            dir.path().join("audit.log.bak"),
+        )
+        .unwrap();
+        symlink(&victim, dir.path().join("audit.log.tmp")).unwrap();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!((log.seq(), log.last_hash()), (2, head));
+        assert_eq!(std::fs::read(&victim).unwrap(), b"line\npartial");
+    }
+
+    /// Without hard links, a copy into a kept log's name that fails is
+    /// removed, so a retry never piles up partial copies.
+    #[test]
+    fn a_failed_fallback_copy_is_removed() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        write_format1_log(dir.path(), &key, vec![sign(1)]);
+        test_support::NO_HARD_LINKS.with(|c| c.set(true));
+        test_support::FAIL_COPY.with(|c| c.set(true));
+        let opened = AuditLog::open(dir.path(), &key);
+        test_support::NO_HARD_LINKS.with(|c| c.set(false));
+        test_support::FAIL_COPY.with(|c| c.set(false));
+        assert!(opened.is_err());
+        assert!(!dir.path().join(MIGRATED_LOG).exists());
+        assert!(AuditLog::open(dir.path(), &key).is_ok());
+        assert!(dir.path().join(MIGRATED_LOG).exists());
+    }
+
+    /// A current-format entry after an old-format one cannot come from any
+    /// keep, so a re-migration that finds one fails its check.
+    #[test]
+    fn interleaved_formats_fail_the_check() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        let log = logged(dir.path(), &key, 2);
+        let mut old = sign(5);
+        old.format = 1;
+        old.prev_hash = log.last_hash();
+        old.hash = old.compute_hash();
+        let mut new = sign(6);
+        new.seq = 3;
+        new.prev_hash = old.hash;
+        new.hash = new.compute_hash();
+        let mut last = sign(7);
+        last.format = 1;
+        last.prev_hash = new.hash;
+        last.hash = last.compute_hash();
+        drop(log);
+        let path = dir.path().join("audit.log");
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format1_line(&old, &key));
+        text.push_str(&AuditLog::encrypt_line(&new, &key).unwrap());
+        text.push_str(&format1_line(&last, &key));
+        std::fs::write(&path, text).unwrap();
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert!(log.failed_migration_kept());
+        assert!(!log.verify(&key).unwrap().migration.unwrap().old_chain_valid);
+    }
+
+    /// A backup whose entries fail their chain check restores with a record
+    /// of the failure after them, in either format, so restoring cannot turn
+    /// a broken chain into one that verifies; an intact one restores clean.
+    #[test]
+    fn restoring_a_broken_chain_records_it() {
+        let key = key();
+        let src = tempdir().unwrap();
+        let good = logged(src.path(), &key, 4).read_all(&key).unwrap();
+        let mut spliced = good.clone();
+        spliced.remove(2);
+        let format1: Vec<AuditEntry> = {
+            let dir = tempdir().unwrap();
+            write_format1_log(dir.path(), &key, (0..4).map(sign).collect());
+            AuditLog::read_entries(&dir.path().join("audit.log"), &key, usize::MAX).unwrap()
+        };
+        let mut format1_spliced = format1.clone();
+        format1_spliced.remove(1);
+
+        for (entries, intact) in [
+            (&good, true),
+            (&spliced, false),
+            (&format1, true),
+            (&format1_spliced, false),
+        ] {
+            let dir = tempdir().unwrap();
+            let mut log = AuditLog::open(dir.path(), &key).unwrap();
+            log.restore_entries(entries, &key).unwrap();
+            let report = log.verify(&key).unwrap();
+            assert!(report.valid);
+            assert_eq!(log.verify_chain(&key).unwrap(), intact);
+            assert_eq!(report.holds_untrusted_entries(), !intact);
+            if !intact {
+                let m = report.migration.unwrap();
+                assert_eq!(m.old_count, entries.len() as u64);
+                assert_eq!(m.old_head, entries.last().unwrap().hash);
+                assert_eq!(m.seq, log.seq());
+            }
         }
     }
 }

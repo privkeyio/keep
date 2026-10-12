@@ -222,7 +222,7 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     match report.migration {
         Some(m) if report.holds_untrusted_entries() => {
             out.error(&format!(
-                "Audit log moved to sequence numbers, but the old log FAILED its chain check: {} entries could be read, the last with hash {}. The log still holds entries from before the migration, and they cannot be trusted. Keep the old log (audit.log.v1 in the vault directory) for investigation if you still have it. The chain since the migration is valid.",
+                "The audit log records that its older entries FAILED their chain check when they were moved to sequence numbers or restored from a backup: {} entries were read, the last with hash {}. The log still holds those entries, and they cannot be trusted. After a migration, keep the old log it kept for investigation: audit.log.v1 in the vault directory, or the name audit.log.v1.failed gives. The chain since then is valid.",
                 m.old_count,
                 hex::encode(m.old_head),
             ));
@@ -231,7 +231,7 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         Some(m) if !m.old_chain_valid => {
             out.success("Audit log integrity verified - hash chain is valid");
             out.warn(&format!(
-                "An earlier migration to sequence numbers found the old log FAILED its chain check ({} entries, the last with hash {}). Those entries have since been removed by retention.",
+                "An earlier migration to sequence numbers or restore from a backup found older entries FAILED their chain check ({} entries, the last with hash {}). Those entries have since been removed by retention.",
                 m.old_count,
                 hex::encode(m.old_head),
             ));
