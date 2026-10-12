@@ -321,6 +321,9 @@ pub struct State {
     closed: bool,
     /// Approvals over Nostr, when the channel key is loaded.
     approvals: Option<approvals::Approvals>,
+    /// Whether owner entries may be owed in the vault, so the timer reads
+    /// the approval state only then. True at start, until it has looked.
+    owed_waiting: bool,
     /// A credential was refused as expired since the last tick: the clock is
     /// persisted then, so a crash cannot bring the calendar back behind that
     /// expiry. Not before the answer, which would time apart expired tokens.
@@ -490,6 +493,7 @@ impl State {
             journal_lines: Vec::new(),
             closed: false,
             approvals: None,
+            owed_waiting: true,
             expiry_seen: false,
             heartbeat_ignored,
             deferred: Vec::new(),

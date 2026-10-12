@@ -2599,6 +2599,8 @@ fn with_approvals_off_a_freeze_keeps_the_approval_state_and_owed_entries_are_wri
 fn a_device_is_registered_though_its_entry_waits_for_the_log() {
     let mut ap = Ap::new();
     let mut phone = Phone::new();
+    // Nothing owed yet: the timer stops looking until something is.
+    ap.gw.state.approval_tick();
     ap.gw.break_log(true);
     ap.pair_first(&mut phone);
     let store = ap.store();
@@ -2641,11 +2643,11 @@ fn a_removal_and_a_reset_are_made_though_their_entries_wait_for_the_log() {
     assert!(ap.store().owed.is_empty());
 }
 
-/// A freeze already in effect writes nothing (no entry, no epoch, no
-/// counter) and is answered with the state; past the rate, a device's
-/// freezes are dropped until the minute is over.
+/// A freeze already in effect is not recorded again, though it moves the
+/// epoch and saves the counter, and is answered with the state; past the
+/// rate, a device's freezes are dropped until the minute is over.
 #[test]
-fn a_freeze_already_in_effect_writes_nothing_and_a_flood_is_cut_off() {
+fn a_freeze_already_in_effect_is_not_recorded_again_and_a_flood_is_cut_off() {
     use super::approvals::FREEZES_PER_MINUTE;
     let (mut ap, mut phone, _, _) = paired();
     let freeze = phone.freeze(Scope::All, 0);
@@ -2657,8 +2659,8 @@ fn a_freeze_already_in_effect_writes_nothing_and_a_flood_is_cut_off() {
         ap.deliver_from(&phone, kind::FREEZE, &again);
     }
     assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 1);
-    assert_eq!(ap.epoch(), 1);
-    assert_eq!(ap.store().devices[0].counter, 1);
+    assert_eq!(ap.epoch(), u64::from(FREEZES_PER_MINUTE));
+    assert_eq!(ap.store().devices[0].counter, u64::from(FREEZES_PER_MINUTE));
     let anchors = ap
         .received(&mut phone)
         .iter()
@@ -2758,4 +2760,71 @@ fn an_unreadable_credential_can_be_deleted() {
         .iter()
         .any(|u| u.scope == Scope::Credential(Hex16(bad))));
     assert!(!anchor.frozen.credentials.contains(&Hex16(bad)));
+}
+
+/// A freeze of what is frozen already still moves the epoch and saves the
+/// device's counter, so an unfreeze signed before it, by that device or
+/// another, and held back until after it, is refused.
+#[test]
+fn a_held_back_unfreeze_is_refused_after_a_repeat_freeze() {
+    let (mut ap, mut first, _, _) = paired();
+    let mut second = Phone::new();
+    ap.add_device(&mut first, &mut second);
+    let freeze = first.freeze(Scope::All, 0);
+    ap.deliver_from(&first, kind::FREEZE, &freeze);
+    assert_eq!(ap.epoch(), 1);
+    let held_first = first.unfreeze(Scope::All, 1);
+    let held_second = second.unfreeze(Scope::All, 1);
+    let again = first.freeze(Scope::All, 1);
+    ap.deliver_from(&first, kind::FREEZE, &again);
+    assert_eq!(ap.epoch(), 2);
+    assert_eq!(ap.store().device(&first.t()).unwrap().counter, 3);
+    assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 1);
+    ap.deliver_from(&second, kind::FREEZE, &held_second);
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+    ap.deliver_from(&first, kind::FREEZE, &held_first);
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+}
+
+/// A reset forgets the devices in the gateway as well as in the vault: the
+/// removed phone's messages are no longer opened, and no later save brings
+/// it back.
+#[test]
+fn a_reset_forgets_the_devices_in_the_running_gateway() {
+    let (mut ap, mut phone, _, _) = paired();
+    let (answer, _) = ap.admin_from(0, 7, json!({ "op": "approver_reset" }));
+    assert_eq!(answer["result"]["removed"], json!(1), "{answer}");
+    let freeze = phone.freeze(Scope::All, 0);
+    assert!(!ap.deliver_from(&phone, kind::FREEZE, &freeze));
+    ap.gw.admin_ok(json!({ "op": "freeze_all" }));
+    assert!(ap.store().devices.is_empty());
+    let _ = ap.received(&mut phone);
+}
+
+/// A frozen credential is deleted though the epoch cannot be read: the
+/// vault seeds a new one, and the phones are told the freeze went with it.
+#[test]
+fn a_frozen_credential_is_deleted_though_the_epoch_cannot_be_read() {
+    let (mut ap, mut phone, id, _) = paired();
+    let cid = Hex16(cid_of(&id));
+    let freeze = phone.freeze(Scope::Credential(cid), 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    ap.gw
+        .state
+        .keep()
+        .corrupt_agent_freeze_epoch_for_testing()
+        .unwrap();
+    let _ = ap.received(&mut phone);
+    let answer = ap.gw.admin(json!({ "op": "delete", "id": id }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let seeded = ap.epoch();
+    let unfrozen = ap.store().recent_unfreezes(ap.now());
+    assert!(
+        unfrozen
+            .iter()
+            .any(|u| u.scope == Scope::Credential(cid) && u.epoch == seeded),
+        "{unfrozen:?} {seeded}"
+    );
+    let anchor = last_anchor(&mut ap, &mut phone).expect("an anchor");
+    assert_eq!(anchor.frozen.epoch, seeded);
 }

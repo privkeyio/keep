@@ -331,6 +331,7 @@ impl State {
     /// Write `store` to the vault and keep it, or keep the one there was.
     fn save_store(&mut self, store: Store) -> Result<()> {
         store.save(&mut self.keep)?;
+        self.owed_waiting = !store.owed.is_empty();
         if let Some(a) = self.approvals.as_mut() {
             a.store = store;
         }
@@ -495,6 +496,7 @@ impl State {
             let owed = store.owed.clone();
             if let Err(e) = self.save_store(store) {
                 tracing::error!(error = %e, "an owed approval entry could not be kept in the vault");
+                self.owed_waiting = true;
                 if let Some(a) = self.approvals.as_mut() {
                     a.store.owed = owed;
                 }
@@ -505,9 +507,16 @@ impl State {
     /// Write the owner entries owed, oldest first, stopping at the first that
     /// still fails.
     fn retry_owed(&mut self) {
+        if !self.owed_waiting {
+            return;
+        }
         let Ok(mut store) = self.store() else {
             return;
         };
+        if store.owed.is_empty() {
+            self.owed_waiting = false;
+            return;
+        }
         if store.write_owed(&mut self.keep) == 0 {
             return;
         }
@@ -1331,19 +1340,32 @@ impl State {
             self.keep.delete_agent_credential(id)?;
             return Ok(());
         }
-        let epoch = self.keep.agent_freeze_epoch()?;
+        // An epoch that cannot be read does not hold the delete back: the
+        // vault seeds a new one in the same write, and the unfreeze is
+        // noted with it in a second save.
+        let epoch = self.keep.agent_freeze_epoch().ok();
         let mut store = self.store()?;
+        let scope = Scope::Credential(Hex16(*id));
         store.denials.remove(&Hex16(*id));
-        store.note_unfrozen(
-            Scope::Credential(Hex16(*id)),
-            epoch.saturating_add(1),
-            self.clock.calendar(),
-        );
+        if let Some(epoch) = epoch {
+            store.note_unfrozen(scope, epoch.saturating_add(1), self.clock.calendar());
+        }
         let bytes = store.encode()?;
-        self.keep
-            .delete_agent_credential_with(id, Some(epoch), &[(STORE_KEY, &bytes)])?;
-        if let Some(a) = self.approvals.as_mut() {
-            a.store = store;
+        let moved = self
+            .keep
+            .delete_agent_credential_with(id, epoch, &[(STORE_KEY, &bytes)])?;
+        match (epoch, moved) {
+            (None, Some(seeded)) => {
+                store.note_unfrozen(scope, seeded, self.clock.calendar());
+                if let Err(e) = self.save_store(store) {
+                    tracing::error!(error = %e, "a deleted credential's freeze could not be noted for the anchors");
+                }
+            }
+            _ => {
+                if let Some(a) = self.approvals.as_mut() {
+                    a.store = store;
+                }
+            }
         }
         self.send_anchor(None);
         Ok(())
@@ -1453,21 +1475,12 @@ impl State {
             self.send_anchor(Some(*transport));
             return;
         }
-        if matches!(freeze.action, FreezeAction::Freeze) {
-            if !self.freeze_allowed(transport) {
-                tracing::warn!(
-                    transport = %hex(transport),
-                    "a device sent more than {FREEZES_PER_MINUTE} freezes in a minute; dropped"
-                );
-                return;
-            }
-            // Already in effect: nothing to write or record, only the
-            // state to show, so a key that needs no biometric cannot grow
-            // the log by repeating a freeze.
-            if self.frozen_now(freeze.scope) {
-                self.send_anchor(Some(*transport));
-                return;
-            }
+        if matches!(freeze.action, FreezeAction::Freeze) && !self.freeze_allowed(transport) {
+            tracing::warn!(
+                transport = %hex(transport),
+                "a device sent more than {FREEZES_PER_MINUTE} freezes in a minute; dropped"
+            );
+            return;
         }
         let what = match freeze.action {
             FreezeAction::Freeze => "freeze",
@@ -1491,6 +1504,22 @@ impl State {
                     .find(|d| d.transport.0 == *transport)
                 {
                     d.counter = freeze.counter;
+                }
+                // Already in effect: the epoch still moves and the counter
+                // is saved, in one write, so no unfreeze signed before this
+                // freeze can apply after it; only the entry is left out, so
+                // a key that needs no biometric cannot grow the log by
+                // repeating a freeze.
+                if self.frozen_now(freeze.scope) {
+                    match self.refreeze(freeze.scope, store.clone()) {
+                        Ok(()) => {
+                            self.send_anchor(Some(*transport));
+                            return;
+                        }
+                        Err(e) => {
+                            tracing::info!(error = %e, "a freeze already in effect is applied in full")
+                        }
+                    }
                 }
                 if let Err(e) = self.freeze(freeze.scope, "an approver device", store) {
                     tracing::error!(error = %e, "a freeze from an approver could not be applied");
@@ -1516,6 +1545,22 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Freeze `scope` again, frozen already: move the epoch and save `store`
+    /// in one write, with no entry.
+    fn refreeze(&mut self, scope: Scope, store: Option<Store>) -> Result<()> {
+        let bytes = store.as_ref().map(Store::encode).transpose()?;
+        let ledgers: Vec<(&[u8], &[u8])> = bytes.iter().map(|b| (STORE_KEY, &b[..])).collect();
+        let id = match scope {
+            Scope::All => None,
+            Scope::Credential(id) => Some(id.0),
+        };
+        self.keep.refreeze_agent(id.as_ref(), &ledgers)?;
+        if let (Some(a), Some(store)) = (self.approvals.as_mut(), store) {
+            a.store = store;
+        }
+        Ok(())
     }
 
     /// Count a freeze from the device with transport key `transport`, and
@@ -1909,9 +1954,10 @@ impl State {
     /// Remove every approver device: root only, recorded, and the channel
     /// key forgotten, so the next start may use another.
     pub(crate) fn reset_approvers(&mut self) -> Result<Value> {
-        let removed = reset_store(&mut self.keep)?;
+        let (store, removed) = reset(&mut self.keep)?;
+        self.owed_waiting = !store.owed.is_empty();
         if let Some(a) = self.approvals.as_mut() {
-            a.store = Store::load(&self.keep)?;
+            a.store = store;
         }
         self.refresh_expected();
         self.cancel_all("canceled: the approver devices were reset");
@@ -2222,6 +2268,11 @@ impl State {
 /// written right after; one the log cannot take yet stays owed, and the
 /// gateway writes it. Returns how many were removed.
 pub fn reset_store(keep: &mut keep_core::Keep) -> Result<usize> {
+    reset(keep).map(|(_, removed)| removed)
+}
+
+/// [`reset_store`], with the store as it was saved.
+fn reset(keep: &mut keep_core::Keep) -> Result<(Store, usize)> {
     let mut store = Store::load(keep)?;
     let removed = std::mem::take(&mut store.devices);
     if removed.is_empty() {
@@ -2246,9 +2297,10 @@ pub fn reset_store(keep: &mut keep_core::Keep) -> Result<usize> {
     if store.write_owed(keep) > 0 {
         if let Err(e) = store.save(keep) {
             tracing::warn!(error = %e, "the reset's entries were written but are still owed; they will be written again");
+            store = Store::load(keep).unwrap_or(store);
         }
     }
-    Ok(removed.len())
+    Ok((store, removed.len()))
 }
 
 /// The pairing answer, written straight into a buffer that is wiped and
