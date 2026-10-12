@@ -4582,6 +4582,53 @@ mod tests {
         keep.lock();
         keep.unlock("testpass").unwrap();
         assert!(set_aside(&keep).is_some());
+
+        // The same for the signing log: a line from the audit log there is
+        // set aside at unlock, and the owner told until acknowledged.
+        keep.lock();
+        let audit = std::fs::read_to_string(path.join("audit.log")).unwrap();
+        let mut signing = std::fs::read_to_string(path.join("signing_audit.log")).unwrap();
+        signing.push_str(audit.lines().last().unwrap());
+        signing.push('\n');
+        std::fs::write(path.join("signing_audit.log"), &signing).unwrap();
+        keep.unlock("testpass").unwrap();
+        let kept = keep.audit_warnings().into_iter().find_map(|w| match w {
+            audit_record::AuditWarning::SigningLogSetAside { kept, missing } => {
+                assert!(!missing);
+                Some(kept)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            std::fs::read_to_string(path.join(kept.expect("told"))).unwrap(),
+            signing
+        );
+    }
+
+    /// Retention that keeps none of the unlock entries still leaves a note
+    /// that a record was kept, in its own entry, so a deleted record is
+    /// still noticed.
+    #[test]
+    fn a_deleted_record_is_noticed_after_retention() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.generate_key("one").unwrap();
+        keep.audit_set_retention(RetentionPolicy {
+            max_entries: Some(1),
+            max_age_days: None,
+        });
+        assert!(keep.audit_apply_retention().unwrap() > 0);
+        let entries = keep.audit_read_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(keep
+            .storage
+            .remove_config_for_tests(audit_record::AUDIT_RECORD_KEY)
+            .unwrap());
+        drop(keep);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(record_lost(&keep).is_some_and(|l| l.missing));
     }
 
     /// A crash after a data key rotation committed but before the log was
