@@ -150,7 +150,7 @@ fn run(out: &Output) -> Result<()> {
         command: command @ (GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. }),
     } = cli.command
     {
-        return commands::gateway::dispatch_without_vault(out, command);
+        return commands::gateway::dispatch_without_vault(command);
     }
     let cfg = Config::load()?;
 

@@ -68,7 +68,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             )
         }
         GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. } => {
-            dispatch_without_vault(out, command)
+            dispatch_without_vault(command)
         }
         GatewayCommands::Approver { command } => approver(out, path, command),
         GatewayCommands::Status { target } => print(&admin(&target, json!({ "op": "status" }))?),
@@ -211,7 +211,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
 
 /// The commands that need no vault: the relay helper, and making a channel
 /// key.
-pub fn dispatch_without_vault(out: &Output, command: GatewayCommands) -> Result<()> {
+pub fn dispatch_without_vault(command: GatewayCommands) -> Result<()> {
     match command {
         GatewayCommands::Relay {
             relay_socket,
@@ -219,10 +219,7 @@ pub fn dispatch_without_vault(out: &Output, command: GatewayCommands) -> Result<
         } => relay(&relay_socket, &gateway_user),
         GatewayCommands::ChannelKey {
             command: ChannelKeyCommands::New,
-        } => {
-            let _ = out;
-            new_channel_key()
-        }
+        } => new_channel_key(),
         _ => Err(KeepError::Other("this command needs the vault".into())),
     }
 }
@@ -350,12 +347,15 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
     need_terminal()?;
     let mut session = AdminSession::open(target, PAIR_WAIT)?;
     let answer = session.ask(&json!({ "op": "approver_pair", "label": label }))?;
-    let uri = answer.result["uri"]
-        .as_str()
-        .ok_or_else(|| KeepError::Runtime("the gateway sent no pairing code".into()))?
-        .to_string();
+    let uri = Zeroizing::new(
+        answer.result["uri"]
+            .as_str()
+            .ok_or_else(|| KeepError::Runtime("the gateway sent no pairing code".into()))?
+            .to_string(),
+    );
+    drop(answer);
     show_qr(&uri);
-    println!("{uri}");
+    println!("{}", uri.as_str());
     out.info("Scan the code with the phone. It is valid for ten minutes and one phone.");
     let shown = session.next()?;
     let fingerprint = shown.result["fingerprint"].as_str().unwrap_or_default();
@@ -398,8 +398,8 @@ fn need_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Ask `prompt` on the terminal [`pair`] checked for.
 fn confirm(prompt: &str) -> Result<bool> {
-    need_terminal()?;
     eprint!("{prompt}");
     let mut answer = String::new();
     std::io::stdin()
