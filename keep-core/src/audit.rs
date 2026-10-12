@@ -129,6 +129,24 @@ pub enum AuditEventType {
     /// Retention removed old entries. Carries where the kept chain now
     /// starts, in [`AuditEntry::retention`].
     AuditRetention = 36,
+    /// An agent request was sent to the approvers: its credential, op,
+    /// reason and request hash.
+    AgentApprovalRequested = 37,
+    /// A request sent to the approvers ended: approved, denied, expired or
+    /// canceled, with the deciding device's keys and the decision's
+    /// signature when a device decided.
+    AgentApprovalDecided = 38,
+    /// A freeze or unfreeze from an approver device, with the device's
+    /// transport key, the key that signed, the counter, the epoch and the
+    /// signature.
+    AgentApproverFreeze = 39,
+    /// An approver device was registered: its label and both of its keys.
+    AgentApproverAdded = 40,
+    /// An approver device was removed: its label and both of its keys.
+    AgentApproverRemoved = 41,
+    /// The owner acknowledged that the log was found behind what the vault
+    /// recorded, with what was recorded and what was found.
+    AuditRollbackAcknowledged = 42,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -171,6 +189,12 @@ impl std::fmt::Display for AuditEventType {
             Self::AgentServed => write!(f, "agent_served"),
             Self::AuditLogMigrated => write!(f, "audit_log_migrated"),
             Self::AuditRetention => write!(f, "audit_retention"),
+            Self::AgentApprovalRequested => write!(f, "agent_approval_requested"),
+            Self::AgentApprovalDecided => write!(f, "agent_approval_decided"),
+            Self::AgentApproverFreeze => write!(f, "agent_approver_freeze"),
+            Self::AgentApproverAdded => write!(f, "agent_approver_added"),
+            Self::AgentApproverRemoved => write!(f, "agent_approver_removed"),
+            Self::AuditRollbackAcknowledged => write!(f, "audit_rollback_acknowledged"),
         }
     }
 }
@@ -444,6 +468,9 @@ pub struct AuditLog {
     /// A migration found the old log failed its chain check, and the old
     /// log is still kept beside this one.
     failed_migration_kept: bool,
+    /// The migration this open ran, if any: whether the old chain checked
+    /// out, and the name the old log was kept under.
+    migrated: Option<(bool, String)>,
 }
 
 /// What [`AuditLog::verify`] found.
@@ -504,6 +531,7 @@ impl AuditLog {
             read_cap: MAX_AUDIT_ENTRIES,
             retention: RetentionPolicy::default(),
             failed_migration_kept: false,
+            migrated: None,
         };
         log.recover_interrupted_rewrite(data_key)?;
         if log.path.exists() {
@@ -555,6 +583,29 @@ impl AuditLog {
     /// entries from before the migration cannot be trusted.
     pub fn failed_migration_kept(&self) -> bool {
         self.failed_migration_kept
+    }
+
+    /// The name of the kept old log the marker beside the log names, while
+    /// both exist: what an earlier migration that failed its check left.
+    pub fn failed_migration_marked(&self) -> Option<String> {
+        self.failed_migration_kept_path()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    /// The migration this open ran, if any: whether the old chain checked
+    /// out, and the name the old log was kept under beside the log.
+    pub fn migrated_on_open(&self) -> Option<(bool, &str)> {
+        self.migrated
+            .as_ref()
+            .map(|(valid, name)| (*valid, name.as_str()))
+    }
+
+    /// Whether a file named `name` (one a migration kept) is still beside
+    /// the log.
+    pub fn kept_log_present(&self, name: &str) -> bool {
+        self.migrated_paths()
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == name))
     }
 
     /// Set the retention policy.
@@ -949,13 +1000,16 @@ impl AuditLog {
             self.path.parent().unwrap_or(Path::new(".")),
             MIGRATED_LOG,
         );
+        let mut kept_name = String::new();
         let marked = kept.and_then(|kept| {
+            kept_name = kept
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if chain_valid {
                 return Ok(());
             }
-            let name = kept.file_name().map(|n| n.to_string_lossy().into_owned());
-            write_marker(&self.marker_path(), name.unwrap_or_default().as_bytes())
-                .map_err(Into::into)
+            write_marker(&self.marker_path(), kept_name.as_bytes()).map_err(Into::into)
         });
         if let Err(e) = marked {
             let _ = std::fs::remove_file(&temp_path);
@@ -967,6 +1021,7 @@ impl AuditLog {
         }
         sync_parent(&self.path);
         self.set_tail(&entries);
+        self.migrated = Some((chain_valid, kept_name));
         Ok(())
     }
 

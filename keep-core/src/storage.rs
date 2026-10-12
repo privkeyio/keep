@@ -1767,6 +1767,22 @@ impl Storage {
         backend.put(CONFIG_TABLE, key, &encrypted)
     }
 
+    /// The decrypted config value stored under `key`, if any.
+    pub(crate) fn get_config_bytes(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        match backend.get(CONFIG_TABLE, key)? {
+            Some(stored) => Ok(Some(self.decrypt_value(&stored)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store `value` encrypted under the config `key`.
+    pub(crate) fn set_config_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = self.encrypt_value(value)?;
+        backend.put(CONFIG_TABLE, key, &encrypted)
+    }
+
     /// Get the kill switch state from the vault.
     pub fn get_kill_switch(&self) -> Result<bool> {
         self.get_config_flag(b"kill_switch")

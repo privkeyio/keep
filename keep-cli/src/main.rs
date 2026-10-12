@@ -329,6 +329,7 @@ fn dispatch_audit(
             commands::audit::cmd_audit_export(out, path, output.as_deref(), hidden)
         }
         AuditCommands::Verify => commands::audit::cmd_audit_verify(out, path, hidden),
+        AuditCommands::Acknowledge => commands::audit::cmd_audit_acknowledge(out, path, hidden),
         AuditCommands::Retention {
             max_entries,
             max_days,

@@ -77,6 +77,18 @@ impl AuditVault {
             Self::HiddenOuter(s) => s.audit_apply_retention(),
         }
     }
+
+    /// A log found behind what the vault recorded. Only a regular vault keeps
+    /// that record.
+    fn rollback(&self) -> Option<keep_core::audit_record::AuditRollback> {
+        match self {
+            Self::Keep(k) => k.audit_warnings().into_iter().find_map(|w| match w {
+                keep_core::audit_record::AuditWarning::RolledBack(r) => Some(r),
+                _ => None,
+            }),
+            Self::HiddenOuter(_) => None,
+        }
+    }
 }
 
 fn format_timestamp(timestamp: i64) -> String {
@@ -246,7 +258,39 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         }
         None => out.success("Audit log integrity verified - hash chain is valid"),
     }
+    if let Some(rollback) = vault.rollback() {
+        out.error(&format!(
+            "{}",
+            keep_core::audit_record::AuditWarning::RolledBack(rollback)
+        ));
+        std::process::exit(1);
+    }
 
+    Ok(())
+}
+
+/// Acknowledge that the audit log was found behind what the vault recorded,
+/// once investigated: the log gets an entry with what was recorded and what
+/// was found, and the warning stops.
+pub fn cmd_audit_acknowledge(out: &Output, path: &Path, hidden: bool) -> Result<()> {
+    let password = get_password("Password")?;
+    let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
+    let AuditVault::Keep(mut keep) = vault else {
+        return Err(KeepError::InvalidInput(
+            "a hidden volume's outer log keeps no record to acknowledge".into(),
+        ));
+    };
+    let Some(rollback) = keep.audit_warnings().into_iter().find_map(|w| match w {
+        keep_core::audit_record::AuditWarning::RolledBack(r) => Some(r),
+        _ => None,
+    }) else {
+        out.info("Nothing to acknowledge: the audit log is where the vault recorded it");
+        return Ok(());
+    };
+    keep.audit_acknowledge_rollback()?;
+    out.success(&format!(
+        "Acknowledged, and recorded in the audit log: {rollback}"
+    ));
     Ok(())
 }
 
@@ -346,6 +390,11 @@ struct AuditStats {
     agent_unfreeze: u32,
     agent_refused: u32,
     agent_served: u32,
+    approval_requested: u32,
+    approval_decided: u32,
+    approver_freeze: u32,
+    approver_added: u32,
+    approver_removed: u32,
 }
 
 impl AuditStats {
@@ -387,7 +436,14 @@ impl AuditStats {
             AuditEventType::AgentUnfreeze => self.agent_unfreeze += 1,
             AuditEventType::AgentRefused => self.agent_refused += 1,
             AuditEventType::AgentServed => self.agent_served += 1,
-            AuditEventType::AuditLogMigrated | AuditEventType::AuditRetention => {}
+            AuditEventType::AgentApprovalRequested => self.approval_requested += 1,
+            AuditEventType::AgentApprovalDecided => self.approval_decided += 1,
+            AuditEventType::AgentApproverFreeze => self.approver_freeze += 1,
+            AuditEventType::AgentApproverAdded => self.approver_added += 1,
+            AuditEventType::AgentApproverRemoved => self.approver_removed += 1,
+            AuditEventType::AuditLogMigrated
+            | AuditEventType::AuditRetention
+            | AuditEventType::AuditRollbackAcknowledged => {}
         }
     }
 }
@@ -466,6 +522,19 @@ pub fn cmd_audit_stats(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     ));
     out.info(&format!("  Agent refusal entries: {}", stats.agent_refused));
     out.info(&format!("  Agent served entries: {}", stats.agent_served));
+    out.info(&format!(
+        "  Approvals requested: {}",
+        stats.approval_requested
+    ));
+    out.info(&format!("  Approvals decided: {}", stats.approval_decided));
+    out.info(&format!(
+        "  Freezes and unfreezes from approvers: {}",
+        stats.approver_freeze
+    ));
+    out.info(&format!(
+        "  Approvers added: {}, removed: {}",
+        stats.approver_added, stats.approver_removed
+    ));
     out.info(&format!(
         "  Agent credentials: {} issued / {} revoked / {} deleted, {} freezes / {} unfreezes",
         stats.agent_issue,
