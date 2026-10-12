@@ -816,36 +816,63 @@ impl Keep {
 
     /// Freeze or unfreeze one agent credential. Freezing is never held back by
     /// the audit log; unfreezing is refused unless its entry is written.
+    /// Either moves the freeze epoch (see [`Self::set_agent_frozen`]).
     pub fn set_agent_credential_frozen(&mut self, id: &[u8; 16], frozen: bool) -> Result<()> {
-        let mut credential = self.agent_credential(id)?;
-        let reason = format!("agent {}", hex::encode(id));
-        if frozen {
-            credential.frozen = true;
-            self.storage.update_agent_credential(&credential)?;
-            self.audit_event(AuditEventType::AgentFreeze, |e| e.with_reason(&reason));
-        } else {
-            self.audit_event_required(AuditEventType::AgentUnfreeze, |e| e.with_reason(&reason))?;
-            credential.frozen = false;
-            self.storage.update_agent_credential(&credential)?;
-        }
-        Ok(())
+        self.set_agent_frozen(Some(id), frozen, None, &[])
+            .map(|_| ())
     }
 
     /// Freeze or unfreeze every agent credential at once, on the same terms as
     /// [`Self::set_agent_credential_frozen`].
     pub fn set_agent_freeze(&mut self, frozen: bool) -> Result<()> {
+        self.set_agent_frozen(None, frozen, None, &[]).map(|_| ())
+    }
+
+    /// The agent freeze epoch: one more on every freeze and unfreeze, from
+    /// any source, so an unfreeze approved for an earlier state cannot undo
+    /// a later freeze. An `Err` means it could not be read.
+    pub fn agent_freeze_epoch(&self) -> Result<u64> {
+        self.storage.get_agent_freeze_epoch()
+    }
+
+    /// Freeze or unfreeze (`frozen`) agent credential `credential`, or every
+    /// agent when it is `None`, and store the agent ledgers `ledgers`, in one
+    /// durable write that also moves the freeze epoch on by one. Refused when
+    /// `expect_epoch` is given and is not the current epoch. Freezing is
+    /// never held back by the audit log; unfreezing is refused unless its
+    /// entry is written first. Returns the new epoch.
+    pub fn set_agent_frozen(
+        &mut self,
+        credential: Option<&[u8; 16]>,
+        frozen: bool,
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<u64> {
+        let reason = match credential {
+            Some(id) => {
+                // Refuse an unknown credential before any entry is written.
+                self.agent_credential(id)?;
+                format!("agent {}", hex::encode(id))
+            }
+            None => "every agent".to_string(),
+        };
         if frozen {
-            self.storage.set_agent_freeze(true)?;
-            self.audit_event(AuditEventType::AgentFreeze, |e| {
-                e.with_reason("every agent")
-            });
+            let epoch = self
+                .storage
+                .set_agent_frozen(credential, true, expect_epoch, ledgers)?;
+            self.audit_event(AuditEventType::AgentFreeze, |e| e.with_reason(&reason));
+            Ok(epoch)
         } else {
-            self.audit_event_required(AuditEventType::AgentUnfreeze, |e| {
-                e.with_reason("every agent")
-            })?;
-            self.storage.set_agent_freeze(false)?;
+            let epoch = self.storage.get_agent_freeze_epoch()?;
+            if expect_epoch.is_some_and(|expected| expected != epoch) {
+                return Err(KeepError::invalid_input(format!(
+                    "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
+                )));
+            }
+            self.audit_event_required(AuditEventType::AgentUnfreeze, |e| e.with_reason(&reason))?;
+            self.storage
+                .set_agent_frozen(credential, false, Some(epoch), ledgers)
         }
-        Ok(())
     }
 
     /// Overwrite the vault-wide agent freeze with bytes that do not decrypt,

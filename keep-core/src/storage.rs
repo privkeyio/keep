@@ -26,6 +26,9 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+/// The config key the agent freeze epoch is stored under.
+const AGENT_FREEZE_EPOCH: &[u8] = b"agent_freeze_epoch";
+
 /// Marker value stored for a pending delete-tombstone. Only the entry KEY
 /// (`"<table>:<hex record id>"`) carries information; the delete is re-published
 /// with a fresh `created_at`, so no timestamp needs to persist here.
@@ -1813,9 +1816,104 @@ impl Storage {
         self.backend.as_ref().ok_or(KeepError::Locked)?.list(table)
     }
 
-    /// Freeze or unfreeze every agent credential.
+    /// Freeze or unfreeze every agent credential, moving the freeze epoch.
     pub fn set_agent_freeze(&self, frozen: bool) -> Result<()> {
-        self.set_config_flag(b"agent_freeze", frozen)
+        self.set_agent_frozen(None, frozen, None, &[]).map(|_| ())
+    }
+
+    /// The agent freeze epoch: one more on every freeze and unfreeze, of one
+    /// credential or of every agent, so an unfreeze signed for an earlier
+    /// epoch can be told apart from one for the current state.
+    pub fn get_agent_freeze_epoch(&self) -> Result<u64> {
+        match self.get_config_bytes(AGENT_FREEZE_EPOCH)? {
+            None => Ok(0),
+            Some(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_le_bytes)
+                .map_err(|_| {
+                    StorageError::corrupted("the agent freeze epoch is not 8 bytes").into()
+                }),
+        }
+    }
+
+    /// Freeze or unfreeze (`frozen`) agent credential `credential`, or every
+    /// agent when it is `None`, move the freeze epoch on by one, and store
+    /// the agent ledgers `ledgers`, all in one durable write, so a freeze
+    /// never applies at an epoch that failed to move. Refused, with nothing
+    /// written, when `expect_epoch` is given and is not the current epoch.
+    /// Returns the new epoch.
+    pub(crate) fn set_agent_frozen(
+        &self,
+        credential: Option<&[u8; 16]>,
+        frozen: bool,
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<u64> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let epoch = self.get_agent_freeze_epoch()?;
+        if expect_epoch.is_some_and(|expected| expected != epoch) {
+            return Err(KeepError::invalid_input(format!(
+                "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
+            )));
+        }
+        let distinct: std::collections::HashSet<&[u8]> = ledgers.iter().map(|(k, _)| *k).collect();
+        if distinct.len() != ledgers.len() {
+            return Err(KeepError::invalid_input(
+                "an agent ledger update names each ledger once",
+            ));
+        }
+        let next = epoch
+            .checked_add(1)
+            .ok_or_else(|| StorageError::corrupted("the agent freeze epoch is at its end"))?;
+        let flag = match credential {
+            Some(id) => {
+                let existing = self
+                    .load_agent_credential(id)?
+                    .ok_or_else(|| KeepError::NotFound(hex::encode(id)))?;
+                let mut updated = existing.clone();
+                updated.frozen = frozen;
+                updated.check_replaces(&existing)?;
+                let serialized = Zeroizing::new(bincode_options().serialize(&updated)?);
+                (
+                    AGENT_CREDENTIALS_TABLE,
+                    id.to_vec(),
+                    self.encrypt_value(&serialized)?,
+                )
+            }
+            None => (
+                CONFIG_TABLE,
+                b"agent_freeze".to_vec(),
+                self.encrypt_value(&[u8::from(frozen)])?,
+            ),
+        };
+        let epoch_value = self.encrypt_value(&next.to_le_bytes())?;
+        let encrypted = ledgers
+            .iter()
+            .map(|(_, ledger)| self.encrypt_value(ledger))
+            .collect::<Result<Vec<_>>>()?;
+        let mut ops = vec![
+            AtomicOp {
+                table: flag.0,
+                key: &flag.1,
+                value: Some(&flag.2),
+            },
+            AtomicOp {
+                table: CONFIG_TABLE,
+                key: AGENT_FREEZE_EPOCH,
+                value: Some(&epoch_value),
+            },
+        ];
+        ops.extend(
+            ledgers
+                .iter()
+                .zip(&encrypted)
+                .map(|((key, _), value)| AtomicOp {
+                    table: AGENT_LEDGERS_TABLE,
+                    key,
+                    value: Some(value),
+                }),
+        );
+        backend.write_atomic(&ops)?;
+        Ok(next)
     }
 
     /// Get the proxy configuration from the vault.
