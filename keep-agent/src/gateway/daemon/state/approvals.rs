@@ -717,6 +717,15 @@ impl State {
         self.end_where(|| End::Withdrawn, |w| w.parked.request_id() == id);
     }
 
+    /// Whether an agent's request with JSON-RPC id `request` is parked.
+    pub(crate) fn parks_agent_request(&self, request: &Value) -> bool {
+        self.approvals.as_ref().is_some_and(|a| {
+            a.parked
+                .values()
+                .any(|w| matches!(&w.waiter, Waiter::Agent { id, .. } if id == request))
+        })
+    }
+
     /// Withdraw the parked request of credential `cid` whose JSON-RPC id is
     /// `request`, as the agent's `notifications/cancelled` asks.
     pub(crate) fn cancel_agent_request(&mut self, cid: &[u8; 16], request: &Value) {

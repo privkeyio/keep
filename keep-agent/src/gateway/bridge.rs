@@ -668,10 +668,9 @@ fn await_answer(
     loop {
         let before = line.len();
         match conn.poll_answer(&mut line) {
-            // The gateway answers a notification it refuses before reading
-            // it with a null id; once the cancellation is sent, a null id is
-            // that refusal, not the request's answer.
-            Ok(Some(answer)) if canceled && null_id(&answer) => last = Instant::now(),
+            // The gateway never answers a notification, the cancellation
+            // included, so any answer is the request's: a null id is its
+            // refusal before it was read.
             Ok(Some(answer)) => return take_answer(conn, &answer, id).map_err(Failure::Lost),
             Ok(None) => {
                 if line.len() > before {
@@ -709,10 +708,6 @@ fn await_answer(
             }
         }
     }
-}
-
-fn null_id(answer: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(answer).is_ok_and(|a| a.get("id") == Some(&Value::Null))
 }
 
 /// Check that an answer is for the request sent, and note what it says about
@@ -1213,9 +1208,8 @@ mod socket_tests {
 
     /// The client's cancellation of the request being awaited goes to the
     /// gateway, as a notification of its own, and the request's answer still
-    /// comes back; the gateway's refusal of the notification is not taken
-    /// for it. Cancellations of anything else, and other notifications, stay
-    /// here, and what the client sends meanwhile waits its turn.
+    /// comes back. Cancellations of anything else, and other notifications,
+    /// stay here, and what the client sends meanwhile waits its turn.
     #[test]
     fn a_cancellation_of_the_awaited_request_reaches_the_gateway() {
         let fake = Fake::start(|mut peer| {
@@ -1231,7 +1225,6 @@ mod socket_tests {
                     "params": { "requestId": 1 },
                 })
             );
-            peer.reply(&json!({ "jsonrpc": "2.0", "id": null, "error": { "code": REFUSED_CODE, "message": "refused" } }));
             peer.reply(&json!({ "jsonrpc": "2.0", "id": 1, "result": { "isError": true } }));
             peer.serve();
         });
@@ -1297,6 +1290,35 @@ mod socket_tests {
         client.finish().unwrap();
         let ids: Vec<Value> = fake.ids().into_iter().map(|(_, id)| id).collect();
         assert_eq!(ids, [json!(1), json!(3)]);
+    }
+
+    /// A request the gateway refused before reading it (its uid at its
+    /// limit, say) is answered with that refusal at once, even after the
+    /// client canceled it: the gateway never answers the cancellation, so the
+    /// null id is the request's.
+    #[test]
+    fn a_request_refused_unread_after_its_cancellation_gets_the_refusal() {
+        let fake = Fake::start(|mut peer| {
+            peer.next().unwrap();
+            let cancel = peer.next().unwrap();
+            assert_eq!(
+                cancel["message"]["method"],
+                json!("notifications/cancelled")
+            );
+            peer.reply(&json!({ "jsonrpc": "2.0", "id": null, "error": { "code": REFUSED_CODE, "message": "request refused" } }));
+            peer.serve();
+        });
+        let mut client = Client::start(bridge(&fake, patient()));
+        client.send(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#);
+        client.send(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}}"#,
+        );
+        let started = Instant::now();
+        let answer = client.recv();
+        assert_eq!(answer["id"], json!(1), "{answer}");
+        assert_eq!(code(&answer), Some(REFUSED_CODE), "{answer}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        client.finish().unwrap();
     }
 
     /// A cancellation naming a null id is never sent: the gateway answers

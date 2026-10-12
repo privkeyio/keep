@@ -2400,3 +2400,60 @@ fn deleting_a_frozen_credential_is_explained_to_the_phones() {
         .is_empty());
     assert!(tracker.due_alerts(10 + CLEARED_GRACE_SECS).is_empty());
 }
+
+/// An agent its uid's request limit refuses can still withdraw a parked
+/// request with its token: the cancellation is neither refused by that limit
+/// nor counted against it. One naming nothing parked is refused as before.
+#[test]
+fn an_agent_at_its_uids_request_limit_still_withdraws_a_request() {
+    let mut gw = Gw::with(super::state::Settings {
+        uid_limits: crate::policy::RequestLimits {
+            per_minute: 3,
+            per_hour: 1_000,
+            per_day: 10_000,
+        },
+        ..super::tests::settings()
+    });
+    gw.state
+        .configure_approvals(Some(channel()), vec![RELAY.into()], 120)
+        .unwrap();
+    let link = gw.state.take_relay_link().unwrap();
+    let mut ap = Ap {
+        gw,
+        link,
+        next_conn: 1,
+    };
+    let (_, token) = ap.issue(&nostr_grant(ap.gw.key));
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    for _ in 0..2 {
+        assert!(ap.gw.rpc(&token, "ping", json!({})).get("result").is_some());
+    }
+    let limited = ap.gw.rpc(&token, "ping", json!({}));
+    assert_eq!(
+        limited["error"]["code"],
+        json!(super::state::REFUSED_CODE),
+        "{limited}"
+    );
+    let cancel = |id: u64| json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id } });
+    // Refused unanswered, as a notification: nothing of it can be taken for
+    // the parked request's answer.
+    assert_eq!(ap.gw.send(AGENT, &token, cancel(9)), None);
+    assert!(unanswered(&mut pending));
+    // Another token is refused, and withdraws nothing.
+    assert_eq!(ap.gw.send(AGENT, "nope", cancel(1)), None);
+    assert!(unanswered(&mut pending));
+    let limited = ap.gw.rpc(&token, "ping", json!({}));
+    assert_eq!(
+        limited["error"]["code"],
+        json!(super::state::REFUSED_CODE),
+        "{limited}"
+    );
+    // So is the token from a uid that may hold none.
+    ap.gw.send(super::tests::ADMIN, &token, cancel(1));
+    assert!(unanswered(&mut pending));
+    assert!(ap.gw.send(AGENT, &token, cancel(1)).is_none());
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error && text.starts_with("canceled"), "{text}");
+}

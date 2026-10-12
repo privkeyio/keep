@@ -643,13 +643,16 @@ impl State {
     /// Handle one line from the agent socket, sent by `peer_uid`.
     pub fn agent_request(&mut self, peer_uid: u32, request: &[u8]) -> Answer {
         if self.closed {
-            return Answer::refused(Value::Null);
+            return refused_unread(request);
         }
         let now = self.clock.now();
+        if let Some(answer) = self.withdrawal(peer_uid, request) {
+            return answer;
+        }
         let counted = pool(&self.bound, peer_uid);
         if let Err(window) = self.uid_counts.hit(counted, &self.settings.uid_limits, now) {
             self.journal_refusal(peer_uid, now, window);
-            return Answer::refused(Value::Null);
+            return refused_unread(request);
         }
         let envelope: Envelope = match serde_json::from_slice(request) {
             Ok(e) => e,
@@ -722,6 +725,39 @@ impl State {
         };
         drop(token);
         Answer::authenticated(self.serve(&granted, &message, id, now))
+    }
+
+    /// A `notifications/cancelled` with an accepted token for a request that
+    /// is parked: withdrawn here, neither refused by the uid's request limit
+    /// nor counted against it, so an agent at its limit can still take back
+    /// what it asked for. Anything else, a token that is not accepted
+    /// included, goes the counted way, which refuses and records it; only a
+    /// line naming a parked request costs a token check before the limit.
+    fn withdrawal(&mut self, peer_uid: u32, request: &[u8]) -> Option<Answer> {
+        let Envelope { token, message } = serde_json::from_slice(request).ok()?;
+        if message.get("id").is_some()
+            || message.get("method").and_then(Value::as_str) != Some("notifications/cancelled")
+        {
+            return None;
+        }
+        let parked = message.get("params")?.get("requestId")?;
+        if !self.parks_agent_request(parked)
+            || forbidden_uid(&self.host, &self.settings, peer_uid)
+            || !bindable_uid(peer_uid)
+        {
+            return None;
+        }
+        let granted = authenticate(
+            &self.keep,
+            &token,
+            peer_uid,
+            self.clock.calendar(),
+            &self.reserved,
+        )
+        .ok()?
+        .ok()?;
+        self.cancel_agent_request(&granted.credential.id, parked);
+        Some(Answer::authenticated(None))
     }
 
     /// Serve an authenticated request.
@@ -1640,6 +1676,24 @@ fn forbidden_uid(host: &Host, settings: &Settings, uid: u32) -> bool {
         || uid == host.overflow_uid
         || settings.admin_uid == Some(uid)
         || settings.relay_uid == Some(uid)
+}
+
+/// The answer to a line refused before it is read: the refusal with a null
+/// id, except for a notification, which is never answered, so a client
+/// waiting on a request never takes the refusal of its cancellation for the
+/// request's own.
+fn refused_unread(request: &[u8]) -> Answer {
+    let notification = serde_json::from_slice::<Envelope>(request)
+        .is_ok_and(|envelope| envelope.message.get("id").is_none());
+    if notification {
+        Answer {
+            line: None,
+            authenticated: false,
+            pending: None,
+        }
+    } else {
+        Answer::refused(Value::Null)
+    }
 }
 
 fn load_credential(keep: &Keep, id: &[u8; 16]) -> Result<Option<AgentCredential>> {
