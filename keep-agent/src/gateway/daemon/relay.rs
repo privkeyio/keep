@@ -10,7 +10,7 @@
 //!
 //! - to the helper: `{"relays": [urls]}`, `{"subscribe": filter}` and
 //!   `{"publish": event}`;
-//! - from the helper: `{"event": event}` and `{"published": id, "ok": bool}`.
+//! - from the helper: `{"event": event}`.
 //!
 //! The helper only ever handles finished gift wraps, so it sees no more than
 //! a relay does; a helper that misbehaves is a hostile relay, which the
@@ -174,13 +174,6 @@ async fn from_helper(
             {
                 return false;
             }
-        }
-        return true;
-    }
-    if let Some(id) = value.get("published") {
-        let ok = value.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if !ok {
-            tracing::warn!(%id, "no relay took an approval message");
         }
         return true;
     }

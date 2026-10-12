@@ -12,7 +12,7 @@
 //! subscription the gateway asks for. It never sees inside a wrap, so a
 //! compromised helper is no more than a hostile relay.
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,7 +25,6 @@ use tokio::net::UnixStream;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio::time::Instant;
 
 use super::relay::MAX_RELAY_LINE;
 use super::server::{connect_verified, write_line, LineReader, CONNECT_TIMEOUT};
@@ -47,12 +46,13 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// still goes out; then they are dropped and the helper connects again.
 const PUBLISH_FLUSH: Duration = Duration::from_secs(3);
 
-/// Wraps one relay may pass on at once, and how many more each second after:
-/// far above what approvals need, so a relay flooding the channel key uses
-/// up only its own share, and what the other relays deliver still gets
-/// through.
-const RELAY_BURST: f64 = 512.0;
-const RELAY_PER_SEC: f64 = 32.0;
+/// The most one relay's wraps waiting for the gateway may take, in bytes of
+/// their lines. Wraps go to the gateway as fast as it reads them, so a queue
+/// fills only while the gateway is behind.
+const RELAY_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Lines on their way to the gateway's socket, past the relays' queues.
+const GATEWAY_QUEUE: usize = 16;
 
 /// The relay options keep-frost-net's nodes use: reconnect with a ping so a
 /// dropped link recovers, a relay that changes what it says it is dropped,
@@ -111,27 +111,36 @@ pub(crate) async fn helper_loop(
     }
 }
 
-/// What the helper passes on from the relays: gift wraps only, each relay
-/// within its own share, and only lines the gateway reads.
+/// What the helper passes on from the relays: gift wraps the gateway can
+/// read, each relay's in a queue of its own, taken in turn as fast as the
+/// gateway reads them. Nothing is dropped for coming fast: the gateway turns
+/// away a wrap without a valid tag with a few HMACs, and a valid one may be
+/// a decision that is never sent again. Only when a relay's queue is full,
+/// because the gateway is behind, does that relay lose its oldest wrap, the
+/// one longest past its time: decisions are live, while a flood replays a
+/// relay's stored backlog. A relay flooding fills only its own queue, so the
+/// others' wraps still get their turn.
 #[derive(Default)]
 struct Intake {
-    /// Each relay's share left, and when it was last topped up.
-    relays: HashMap<RelayUrl, (f64, Instant)>,
+    /// Each relay's queue: its lines, oldest first, and their bytes.
+    relays: Vec<(RelayUrl, VecDeque<String>, usize)>,
+    /// The relay whose turn is next.
+    turn: usize,
     dropped: u64,
 }
 
 /// What to do with one relay notification.
 #[derive(Debug)]
 enum Step {
-    Forward(String),
-    Skip,
+    Go,
     End(Result<()>),
 }
 
 impl Intake {
-    /// Every copy a relay delivers is counted against that relay, not only
-    /// the first one seen: otherwise a relay could pass on a wrap first, past
-    /// its share, and keep the other relays' copies from ever counting.
+    /// Every copy a relay delivers goes to that relay's queue, not only the
+    /// first one seen: otherwise a relay could pass on a wrap first, then
+    /// lose it from its full queue, and keep the other relays' copies from
+    /// ever counting.
     fn step(
         &mut self,
         notification: std::result::Result<RelayPoolNotification, RecvError>,
@@ -140,12 +149,12 @@ impl Intake {
             Ok(RelayPoolNotification::Message {
                 relay_url,
                 message: RelayMessage::Event { event, .. },
-            }) if event.kind == Kind::GiftWrap => match self.line(&relay_url, &event) {
-                Some(line) => Step::Forward(line),
-                None => Step::Skip,
-            },
+            }) if event.kind == Kind::GiftWrap => {
+                self.push(&relay_url, &event);
+                Step::Go
+            }
             Ok(RelayPoolNotification::Shutdown) | Err(RecvError::Closed) => Step::End(Ok(())),
-            Ok(_) => Step::Skip,
+            Ok(_) => Step::Go,
             // A fresh session subscribes again, and the relays send what was
             // missed.
             Err(RecvError::Lagged(n)) => Step::End(Err(AgentError::Other(format!(
@@ -154,29 +163,57 @@ impl Intake {
         }
     }
 
-    /// The line for `event` from `relay`, or `None` when `relay` used up its
-    /// share or the line is longer than the gateway reads, which would end
-    /// the connection every time the relay sent it again.
-    fn line(&mut self, relay: &RelayUrl, event: &Event) -> Option<String> {
-        let now = Instant::now();
-        let (share, topped) = self
-            .relays
-            .entry(relay.clone())
-            .or_insert((RELAY_BURST, now));
-        *share =
-            (*share + now.duration_since(*topped).as_secs_f64() * RELAY_PER_SEC).min(RELAY_BURST);
-        *topped = now;
-        if *share < 1.0 {
-            self.dropped(relay, "the relay sent more than its share");
-            return None;
-        }
-        *share -= 1.0;
+    /// Queue `event` from `relay`, unless its line is longer than the
+    /// gateway reads, which would end the connection every time the relay
+    /// sent it again.
+    fn push(&mut self, relay: &RelayUrl, event: &Event) {
         let line = json!({ "event": event }).to_string();
         if line.len() > MAX_RELAY_LINE {
             self.dropped(relay, "the wrap is larger than the gateway reads");
-            return None;
+            return;
         }
-        Some(line)
+        let at = match self.relays.iter().position(|(url, _, _)| url == relay) {
+            Some(at) => at,
+            None => {
+                self.relays.push((relay.clone(), VecDeque::new(), 0));
+                self.relays.len() - 1
+            }
+        };
+        let mut lost = 0;
+        let (_, queue, bytes) = &mut self.relays[at];
+        while *bytes + line.len() > RELAY_QUEUE_BYTES {
+            let Some(oldest) = queue.pop_front() else {
+                break;
+            };
+            *bytes -= oldest.len();
+            lost += 1;
+        }
+        *bytes += line.len();
+        queue.push_back(line);
+        for _ in 0..lost {
+            self.dropped(
+                relay,
+                "the gateway is behind and the relay's queue is full: its oldest wrap went",
+            );
+        }
+    }
+
+    /// The next line for the gateway, from each relay in turn.
+    fn pop(&mut self) -> Option<String> {
+        for _ in 0..self.relays.len() {
+            let at = self.turn % self.relays.len();
+            self.turn = at + 1;
+            let (_, queue, bytes) = &mut self.relays[at];
+            if let Some(line) = queue.pop_front() {
+                *bytes -= line.len();
+                return Some(line);
+            }
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.relays.iter().all(|(_, queue, _)| queue.is_empty())
     }
 
     fn dropped(&mut self, relay: &RelayUrl, why: &str) {
@@ -202,7 +239,7 @@ async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
     tracing::info!("connected to the gateway's relay socket");
     let (read, mut write) = stream.into_split();
     let mut reader = LineReader::new(read, MAX_RELAY_LINE);
-    let (lines, mut queue) = mpsc::channel::<String>(256);
+    let (lines, mut queue) = mpsc::channel::<String>(GATEWAY_QUEUE);
     let writer = tokio::spawn(async move {
         while let Some(line) = queue.recv().await {
             if !write_line(&mut write, line.as_bytes(), WRITE_TIMEOUT).await {
@@ -219,7 +256,7 @@ async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
             line = reader.next_line() => {
                 match line {
                     Ok(Some(line)) => {
-                        if let Err(e) = from_gateway(&client, &line, &lines, &mut publishes).await {
+                        if let Err(e) = from_gateway(&client, &line, &mut publishes).await {
                             break Err(e);
                         }
                     }
@@ -229,14 +266,17 @@ async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
             }
             Some(_) = publishes.join_next(), if !publishes.is_empty() => {}
             notification = notifications.recv() => {
-                match intake.step(notification) {
-                    Step::Forward(line) => {
-                        if lines.send(line).await.is_err() {
-                            break Ok(());
-                        }
-                    }
-                    Step::Skip => {}
-                    Step::End(result) => break result,
+                if let Step::End(result) = intake.step(notification) {
+                    break result;
+                }
+            }
+            // As fast as the gateway reads, never waiting on it here: the
+            // notifications go on being taken meanwhile.
+            permit = lines.reserve(), if !intake.is_empty() => {
+                match (permit, intake.pop()) {
+                    (Ok(permit), Some(line)) => permit.send(line),
+                    (Ok(_), None) => {}
+                    (Err(_), _) => break Ok(()),
                 }
             }
         }
@@ -255,12 +295,7 @@ async fn session(socket: &Path, gateway_uid: u32) -> Result<()> {
 }
 
 /// Handle one line from the gateway.
-async fn from_gateway(
-    client: &Client,
-    line: &[u8],
-    lines: &mpsc::Sender<String>,
-    publishes: &mut JoinSet<()>,
-) -> Result<()> {
+async fn from_gateway(client: &Client, line: &[u8], publishes: &mut JoinSet<()>) -> Result<()> {
     let value: Value = serde_json::from_slice(line)
         .map_err(|_| AgentError::Other("the gateway sent a line that is not JSON".into()))?;
     if let Some(relays) = value.get("relays").and_then(Value::as_array) {
@@ -299,28 +334,26 @@ async fn from_gateway(
         // Sent apart, so a slow relay holds up nothing else, and tried again
         // while no relay takes it, as long as a receiver could still accept
         // it.
-        let (client, lines) = (client.clone(), lines.clone());
+        let client = client.clone();
         publishes.spawn(async move {
             let id = event.id.to_hex();
             let mut wait = Duration::from_secs(1);
             let give_up = tokio::time::Instant::now() + PUBLISH_RETRY_FOR;
-            let ok = loop {
+            loop {
                 match client.send_event(&event).await {
-                    Ok(output) if !output.success.is_empty() => break true,
+                    Ok(output) if !output.success.is_empty() => return,
                     Ok(_) => tracing::warn!(%id, "no relay took an approval message yet"),
                     Err(e) => {
                         tracing::warn!(%id, error = %e, "an approval message was not published yet")
                     }
                 }
                 if tokio::time::Instant::now() + wait > give_up {
-                    break false;
+                    tracing::warn!(%id, "no relay took an approval message; giving up");
+                    return;
                 }
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(MAX_BACKOFF);
-            };
-            let _ = lines
-                .send(json!({ "published": id, "ok": ok }).to_string())
-                .await;
+            }
         });
         return Ok(());
     }
@@ -337,14 +370,13 @@ mod tests {
     #[tokio::test]
     async fn the_helper_publishes_nothing_but_gift_wraps() {
         let client = Client::default();
-        let (lines, _queue) = mpsc::channel(4);
         let mut publishes = JoinSet::new();
         let keys = nostr_sdk::prelude::Keys::generate();
         let note = nostr_sdk::prelude::EventBuilder::text_note("hello")
             .sign_with_keys(&keys)
             .unwrap();
         let line = json!({ "publish": note }).to_string();
-        let refused = from_gateway(&client, line.as_bytes(), &lines, &mut publishes).await;
+        let refused = from_gateway(&client, line.as_bytes(), &mut publishes).await;
         assert!(refused
             .unwrap_err()
             .to_string()
@@ -372,56 +404,90 @@ mod tests {
         })
     }
 
+    fn drain(intake: &mut Intake) -> Vec<String> {
+        std::iter::from_fn(|| intake.pop()).collect()
+    }
+
     /// A wrap whose line the gateway would refuse as too long is dropped
     /// here: passed on, it would end the connection, and the relay would
     /// send it again on every new subscription.
-    #[tokio::test]
-    async fn a_wrap_too_long_for_the_gateway_is_dropped() {
+    #[test]
+    fn a_wrap_too_long_for_the_gateway_is_dropped() {
         let mut intake = Intake::default();
         let relay = "wss://a.example.com";
-        let Step::Forward(line) = intake.step(delivered(relay, wrap("fits"))) else {
-            panic!("a small wrap is passed on");
-        };
-        assert!(line.contains("fits"));
         let overhead = json!({ "event": wrap("") }).to_string().len();
-        let most = wrap(&"x".repeat(MAX_RELAY_LINE - overhead));
-        assert!(
-            matches!(intake.step(delivered(relay, most)), Step::Forward(l) if l.len() == MAX_RELAY_LINE)
-        );
-        let over = wrap(&"x".repeat(MAX_RELAY_LINE - overhead + 1));
-        assert!(matches!(intake.step(delivered(relay, over)), Step::Skip));
+        for event in [
+            wrap("fits"),
+            wrap(&"x".repeat(MAX_RELAY_LINE - overhead)),
+            wrap(&"x".repeat(MAX_RELAY_LINE - overhead + 1)),
+        ] {
+            assert!(matches!(intake.step(delivered(relay, event)), Step::Go));
+        }
         let note = nostr_sdk::prelude::EventBuilder::text_note("hello")
             .sign_with_keys(&nostr_sdk::prelude::Keys::generate())
             .unwrap();
-        assert!(matches!(intake.step(delivered(relay, note)), Step::Skip));
+        intake.step(delivered(relay, note));
+        let lines: Vec<usize> = drain(&mut intake).iter().map(String::len).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[1], MAX_RELAY_LINE);
     }
 
-    /// A relay flooding the channel key uses up its own share only: another
-    /// relay's wraps still go through, and the flooding relay's share comes
-    /// back with time.
-    #[tokio::test(start_paused = true)]
-    async fn one_relay_flooding_uses_up_only_its_own_share() {
+    /// A flood through every relay, however fast, loses nothing while the
+    /// gateway keeps up: a valid wrap among it still gets through. Each relay
+    /// gets its turn, so one flooding still cannot crowd out another's copy,
+    /// and only once a relay's own queue is full does it lose its oldest.
+    #[test]
+    fn a_flood_loses_nothing_while_the_gateway_keeps_up_and_each_relay_gets_its_turn() {
+        let relays = [
+            "wss://a.example.com",
+            "wss://b.example.com",
+            "wss://c.example.com",
+        ];
+        // Large enough that 3,000 overflow a relay's queue.
+        let pad = "x".repeat(2_000);
+        let junk: Vec<Event> = (0..3_000)
+            .map(|i| wrap(&format!("junk {i} {pad}")))
+            .collect();
+        let is = |line: &str, i: usize| line.contains(&format!("\"junk {i} "));
+        let valid = wrap("a decision");
         let mut intake = Intake::default();
-        let (a, b) = ("wss://a.example.com", "wss://b.example.com");
-        let event = wrap("x");
-        let forwarded = |intake: &mut Intake, relay: &str, n: usize| {
-            (0..n)
-                .filter(|_| {
-                    matches!(
-                        intake.step(delivered(relay, event.clone())),
-                        Step::Forward(_)
-                    )
-                })
-                .count()
-        };
-        assert_eq!(forwarded(&mut intake, a, 2_000), RELAY_BURST as usize);
-        assert_eq!(
-            forwarded(&mut intake, b, 10),
-            10,
-            "another relay is unaffected"
-        );
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(forwarded(&mut intake, a, 2_000), RELAY_PER_SEC as usize);
+        let mut through = 0;
+        let mut found = false;
+        for (i, event) in junk.iter().enumerate() {
+            for relay in relays {
+                intake.step(delivered(relay, event.clone()));
+            }
+            if i == 2_000 {
+                intake.step(delivered(relays[1], valid.clone()));
+            }
+            // The gateway reads as fast as the wraps come.
+            for _ in 0..4 {
+                if let Some(line) = intake.pop() {
+                    through += 1;
+                    found |= line.contains("a decision");
+                }
+            }
+        }
+        through += drain(&mut intake).len();
+        assert!(found, "the valid wrap got through");
+        assert_eq!(through, 3 * junk.len() + 1, "nothing was dropped");
+        assert_eq!(intake.dropped, 0);
+
+        // One relay floods past its queue while the gateway is behind: it
+        // loses its own oldest, and the other relay's copy comes next.
+        let mut intake = Intake::default();
+        for event in &junk {
+            intake.step(delivered(relays[0], event.clone()));
+        }
+        assert!(intake.dropped > 0, "the queue filled");
+        let kept = intake.relays[0].1.len();
+        assert!(is(intake.relays[0].1.back().unwrap(), junk.len() - 1));
+        intake.step(delivered(relays[1], valid.clone()));
+        let first = intake.pop().unwrap();
+        assert!(is(&first, junk.len() - kept), "the oldest went");
+        assert!(intake.pop().unwrap().contains("a decision"));
+        let full = intake.relays[0].2;
+        assert!(full <= RELAY_QUEUE_BYTES && full + 2 * first.len() > RELAY_QUEUE_BYTES);
     }
 
     /// Relay events missed because the helper fell behind end the session,
@@ -534,6 +600,105 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
+        let _ = stop.send(());
+        helper.await.unwrap().unwrap();
+    }
+
+    /// Through real relays, a flood through every relay far faster than any
+    /// fixed rate (thousands of wraps a second) still lets a valid wrap
+    /// through to a gateway that reads as fast as they come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_flood_through_every_relay_still_lets_a_valid_wrap_through() {
+        use nostr_relay_builder::builder::RateLimit;
+        use nostr_relay_builder::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
+        use tokio::io::AsyncBufReadExt;
+        const PER_RELAY: usize = 3_000;
+        let relay = || async {
+            let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+                max_reqs: 500,
+                notes_per_minute: 100_000_000,
+            }));
+            relay.run().await.unwrap();
+            relay
+        };
+        // Kept to the end: a relay dropped stops serving subscriptions.
+        let relays = [relay().await, relay().await];
+        let urls = [
+            relays[0].url().await.to_string(),
+            relays[1].url().await.to_string(),
+        ];
+        let channel = Keys::generate().public_key();
+        let gift = |content: String| {
+            EventBuilder::new(Kind::GiftWrap, content)
+                .tag(Tag::public_key(channel))
+                .sign_with_keys(&Keys::generate())
+                .unwrap()
+        };
+        let junk: Vec<Event> = (0..PER_RELAY).map(|i| gift(format!("junk {i}"))).collect();
+        let valid = gift("a decision".into());
+
+        let dir = socket_dir();
+        let path = dir.path().join("relay.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (stop, helper) = run(&path);
+        let (mut gateway, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        send(&mut gateway, json!({ "relays": urls })).await;
+        send(
+            &mut gateway,
+            json!({ "subscribe": { "kinds": [1059], "#p": [channel.to_hex()] } }),
+        )
+        .await;
+        let want = valid.id.to_hex();
+        let (read, _write) = gateway.into_split();
+        let reader = tokio::spawn(async move {
+            let mut lines = tokio::io::BufReader::new(read).lines();
+            let mut seen = 0usize;
+            while let Ok(Some(line)) = lines.next_line().await {
+                seen += 1;
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value["event"]["id"].as_str() == Some(want.as_str()) {
+                    return Some(seen);
+                }
+            }
+            None
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let started = std::time::Instant::now();
+        let mut floods = JoinSet::new();
+        for (r, url) in urls.iter().enumerate() {
+            for part in junk.chunks(PER_RELAY / 8) {
+                let (url, part) = (url.clone(), part.to_vec());
+                let valid = (r == 1 && part[0] == junk[PER_RELAY / 2]).then(|| valid.clone());
+                floods.spawn(async move {
+                    let client = Client::default();
+                    client.add_relay(&url).await.unwrap();
+                    client.connect().await;
+                    client.wait_for_connection(Duration::from_secs(5)).await;
+                    for event in &part {
+                        client.send_event(event).await.unwrap();
+                    }
+                    if let Some(valid) = valid {
+                        client.send_event(&valid).await.unwrap();
+                    }
+                    client.shutdown().await;
+                });
+            }
+        }
+        while let Some(done) = floods.join_next().await {
+            done.unwrap();
+        }
+        let rate = (2 * PER_RELAY) as f64 / started.elapsed().as_secs_f64();
+        eprintln!("flooded {} wraps at {rate:.0} a second", 2 * PER_RELAY);
+        let seen = tokio::time::timeout(Duration::from_secs(30), reader)
+            .await
+            .expect("the valid wrap reached the gateway in time")
+            .unwrap();
+        assert!(seen.is_some(), "the valid wrap reached the gateway");
         let _ = stop.send(());
         helper.await.unwrap().unwrap();
     }

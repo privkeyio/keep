@@ -588,3 +588,88 @@ async fn the_relay_socket_serves_one_helper_at_a_time() {
     assert!(line(&mut second).await.get("relays").is_some());
     task.abort();
 }
+
+/// How fast the gateway takes junk wraps off the relay socket: wraps for the
+/// channel key carrying a well-formed tag of no expected sender, the most a
+/// flood can make it do short of a device's tag key. Each costs a parse and
+/// one HMAC per device before it is dropped. The helper's queues drain at
+/// this rate, so a flood slower than it loses nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gateway_turns_away_junk_wraps_quickly() {
+    use nostr_sdk::prelude::{EventBuilder, Keys, Tag, TagKind};
+    const JUNK: usize = 20_000;
+    let root = tempfile::tempdir().unwrap();
+    let uid = me();
+    let dir = socket_dir(root.path(), "relay");
+    let (keep, _) = vault(root.path());
+    let mut phone = Phone::new();
+    let boot = FakeBoot::default();
+    boot.set_wall(super::clock::wall_clock().unwrap());
+    let mut state = start(keep, Settings::default(), &boot, BOOT).unwrap();
+    Store {
+        channel: Some(Hex32(channel().public_key().to_bytes())),
+        devices: vec![StoredDevice {
+            transport: Hex32(phone.t()),
+            alg: keep_approval::sig::Alg::P256,
+            approver: keep_approval::Hex33(phone.a()),
+            label: "Phone".into(),
+            counter: 0,
+        }],
+        ..Store::default()
+    }
+    .save(state.keep_mut())
+    .unwrap();
+    state
+        .configure_approvals(Some(channel()), vec!["wss://relay.example.com".into()], 60)
+        .unwrap();
+    let epoch = state.keep().agent_freeze_epoch().unwrap();
+    let link = state.take_relay_link().unwrap();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let (_closing, closed) = tokio::sync::watch::channel(false);
+    let socket = dir.join("relay.sock");
+    let listener = server::bind(&socket, uid).unwrap();
+    let task = tokio::spawn(super::relay::relay_task(
+        listener, uid, link, shared, stop, closed,
+    ));
+    let (read, mut write) = UnixStream::connect(&socket).await.unwrap().into_split();
+    let mut helper = BufReader::new(read).lines();
+    assert!(line(&mut helper).await.get("relays").is_some());
+    assert!(line(&mut helper).await.get("subscribe").is_some());
+
+    let content = "A".repeat(1_200);
+    let keys = Keys::generate();
+    let mut lines = Vec::with_capacity(JUNK + 1);
+    for _ in 0..JUNK {
+        let tag = hex::encode(rand::random::<[u8; 16]>());
+        let junk = EventBuilder::new(Kind::GiftWrap, &content)
+            .tags([
+                Tag::public_key(channel().public_key()),
+                Tag::custom(TagKind::custom(keep_approval::wrap::TAG_NAME), [tag]),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        lines.push(json!({ "event": junk }).to_string() + "\n");
+    }
+    let freeze = phone.freeze(Scope::All, epoch);
+    let freeze = phone.wrap(kind::FREEZE, &freeze, super::clock::wall_clock().unwrap());
+    lines.push(json!({ "event": freeze }).to_string() + "\n");
+
+    let started = std::time::Instant::now();
+    let writer = tokio::spawn(async move {
+        for line in lines {
+            write.write_all(line.as_bytes()).await.unwrap();
+        }
+        write
+    });
+    // The freeze at the end is answered with an anchor once every junk wrap
+    // before it was read and turned away.
+    let anchor = line(&mut helper).await;
+    let elapsed = started.elapsed();
+    assert!(anchor.get("publish").is_some(), "{anchor}");
+    let rate = JUNK as f64 / elapsed.as_secs_f64();
+    eprintln!("the gateway turned away {JUNK} junk wraps in {elapsed:?}: {rate:.0} a second");
+    assert!(rate > 1_000.0, "{rate:.0} a second");
+    drop(writer.await.unwrap());
+    task.abort();
+}
