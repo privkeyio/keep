@@ -4089,6 +4089,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keep");
         let mut keep = test_keep(&path);
+        // Enough entries that the new log starts well behind them.
+        for name in ["a", "b", "c", "d"] {
+            keep.generate_key(name).unwrap();
+        }
         for _ in 0..2 {
             keep.signing_audit_log(
                 SigningAuditEntry::new(
@@ -4361,6 +4365,31 @@ mod tests {
         keep.unlock("testpass").unwrap();
         assert!(keep.audit_warnings().is_empty());
         assert!(keep.audit_acknowledge().unwrap().is_empty());
+    }
+
+    /// Acknowledging a failed migration while its marker and kept file are
+    /// still there removes the marker, so the next unlock does not raise the
+    /// warning again from it; the kept file stays for investigation.
+    #[test]
+    fn acknowledging_a_failed_migration_removes_its_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        keep.lock();
+        std::fs::write(path.join("audit.log"), "bm90IGFuIGVudHJ5\n").unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(path.join("audit.log.v1.failed").exists());
+        assert!(set_aside(&keep).is_some());
+        keep.audit_acknowledge().unwrap();
+        assert!(!path.join("audit.log.v1.failed").exists());
+        assert!(path.join("audit.log.v1").exists());
+        keep.lock();
+        keep.unlock("testpass").unwrap();
+        assert!(
+            keep.audit_warnings().is_empty(),
+            "{:?}",
+            keep.audit_warnings()
+        );
     }
 
     /// The latest session's entries cut off the log, by a process that never
