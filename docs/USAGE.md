@@ -770,7 +770,7 @@ Some requests need a person to approve them:
 
 Without approvals these are refused. With them, the gateway asks the owner's phone and waits for its decision. The phone runs an approver app paired with the gateway; the two exchange end-to-end encrypted Nostr messages (NIP-59 gift wraps) over relays, so relays see only that the gateway and the phone are talking. The gateway seals its messages with a channel key kept apart from the vault. The phone holds two keys of its own: a transport key that opens messages and sends freezes, and an approver key that signs decisions.
 
-The phone shows the request in full: the event, or the PSBT with its change outputs marked, which the phone checks against the wallet, and what the credential has already spent of its budget. A decision is a signature by the approver key over a hash of exactly that request, and the gateway checks it against the request it is holding before it signs anything, so an approval cannot be moved to another request or to a changed one. Each request takes one decision, the first to arrive.
+The phone shows the request in full: the event, or the PSBT with its fee, what leaves the wallet, and the outputs the gateway found to be its own change, each with its derivation path, and what the credential has already spent of its budget. The phone works out the fee from the transaction itself, but it cannot re-derive change addresses, so for which outputs are change, and so for what leaves the wallet, it takes the gateway's word, which no agent can influence. A decision is a signature by the approver key over a hash of exactly that request, and the gateway checks it against the request it is holding before it signs anything, so an approval cannot be moved to another request or to a changed one. Each request takes one decision, the first to arrive.
 
 What waits for an approval:
 
@@ -830,7 +830,7 @@ The gateway itself has no network. A relay helper, `keep gateway relay`, runs as
    sudo keep gateway approver pair --label "Phone"
    ```
 
-   It shows a pairing code, as a QR code and as text, valid for ten minutes and for one phone. Scan it with the approver app; the command then shows the fingerprint the phone shows. Answer `y` only if the two match. From then on the requests above wait for the phone, and `keep gateway status` shows the approvals and the paired phones.
+   It shows a pairing code, as a QR code and as text, valid for ten minutes and for one phone. Scan it with the approver app; the command then shows the fingerprint the phone shows. Answer `y` only if the two match. From then on the requests above wait for the phone. `keep gateway status` shows whether approvals are on and how many phones are paired; `keep gateway approver list` lists them.
 
 Once a phone is paired, the gateway refuses to start without the same channel key, since the phone trusts no other. A lost channel key is handled like a lost phone, below.
 
@@ -856,7 +856,7 @@ Then generate a new channel key (step 2), start the gateway and pair again.
 
 ##### What the agent sees
 
-`get_session_info` tells the agent whether approvals are on and the deadline: `"approvals": {"enabled": true, "deadline_secs": 120}`. A request that waits is answered like any other, only later, so the MCP client must let a tool call run longer than the deadline: about 130 seconds with the default deadline (`keep agent connect` itself waits 150 seconds). Claude Code waits that long for a stdio server unless `MCP_TOOL_TIMEOUT` (in milliseconds) is set lower. Some clients give up on a tool call after 60 seconds and cannot be set longer; for those, shorten the deadline with `--approval-deadline 50`. A client that gives up and sends `notifications/cancelled` withdraws the request, and the bridge passes that on; one that gives up without it leaves the request waiting, and an approval then still signs it, with the answer going nowhere. A request that is not approved is answered with a tool error (`isError`) whose text says why:
+`get_session_info` tells the agent whether approvals are on and the deadline: `"approvals": {"enabled": true, "deadline_secs": 120}`. A request that waits is answered like any other, only later, so the MCP client must let a tool call run longer than the deadline: about 130 seconds with the default deadline (`keep agent connect` itself waits 150 seconds). Client timeouts are not well documented; what follows comes from user reports, not vendor documentation, so check your client. Claude Code is reported to wait that long for a stdio server unless `MCP_TOOL_TIMEOUT` (in milliseconds) is set lower. Some clients are reported to give up on a tool call after 60 seconds with no setting to wait longer; for those, shorten the deadline with `--approval-deadline 50`. A client that gives up and sends `notifications/cancelled` withdraws the request, and the bridge passes that on; one that gives up without it leaves the request waiting, and an approval then still signs it, with the answer going nowhere. A request that is not approved is answered with a tool error (`isError`) whose text says why:
 
 | Text | Meaning |
 |------|---------|
