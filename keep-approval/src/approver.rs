@@ -25,7 +25,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::change::Scope;
 use crate::messages::{AnchorState, Frozen, Request};
-use crate::wrap::WINDOW_PAST_SECS;
+use crate::wrap::{WINDOW_FUTURE_SECS, WINDOW_PAST_SECS};
+
+/// How long an id is remembered to refuse a replay: as long as a wrap
+/// carrying it can still be accepted, one dated up to the future limit
+/// included.
+const REPLAY_KEEP_SECS: u64 = WINDOW_PAST_SECS + WINDOW_FUTURE_SECS;
 use crate::{invalid, Hex32, Result};
 
 /// How long without a newer anchor before the approver alerts. Anchors come
@@ -158,7 +163,7 @@ fn listed(old: &Frozen, new: &Frozen, scope: Scope) -> bool {
 /// Whether `request_id` is new to `seen`, which forgets ids older than the
 /// wrap time window; notes it if so.
 fn first_time(seen: &mut BTreeMap<Hex32, u64>, request_id: Hex32, local_now: u64) -> bool {
-    seen.retain(|_, at| local_now.saturating_sub(*at) <= WINDOW_PAST_SECS);
+    seen.retain(|_, at| local_now.saturating_sub(*at) <= REPLAY_KEEP_SECS);
     if seen.contains_key(&request_id) {
         return false;
     }
@@ -379,7 +384,7 @@ impl RequestGate {
         local_now: u64,
     ) -> Result<()> {
         self.seen
-            .retain(|_, at| local_now.saturating_sub(*at) <= WINDOW_PAST_SECS);
+            .retain(|_, at| local_now.saturating_sub(*at) <= REPLAY_KEEP_SECS);
         if self.seen.contains_key(&request.request_id) {
             return Err(invalid("request already seen"));
         }
@@ -990,10 +995,15 @@ mod tests {
             [Alert::FreezeCleared { scope: Scope::All }]
         );
         // Remembered for the wrap time window, then forgotten.
+        // Still remembered while a wrap carrying it could be accepted.
         t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10 + WINDOW_PAST_SECS + 1);
-        assert!(t
+        assert!(!t
             .unfreezes
             .contains(&(Scope::All, 10 + WINDOW_PAST_SECS + 1)));
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10 + REPLAY_KEEP_SECS + 1);
+        assert!(t
+            .unfreezes
+            .contains(&(Scope::All, 10 + REPLAY_KEEP_SECS + 1)));
     }
 
     /// Taking an outcome with `outcome_seen` first does not make its
@@ -1260,7 +1270,10 @@ mod tests {
         assert!(gate.admit(&request(3, 880, 120), &t, 1).is_ok());
         // Seen ids are forgotten after the window, so the set stays bounded.
         assert!(gate
-            .admit(&request(1, 2_000, 120), &t, WINDOW_PAST_SECS + 1)
+            .admit(&request(1, 2_000, 120), &t, REPLAY_KEEP_SECS)
+            .is_err());
+        assert!(gate
+            .admit(&request(1, 2_000, 120), &t, REPLAY_KEEP_SECS + 1)
             .is_ok());
     }
 }
