@@ -406,9 +406,13 @@ impl Keep {
                     Some(m) => m.old_last_timestamp,
                     None => audit.last_own_timestamp(&data_key)?,
                 };
+                // A log with no entry of keep's own beside rows its making
+                // would have logged was deleted or cut to nothing, whether
+                // or not those rows can still be read.
                 let lost = noted
                     || self.storage.agent_freeze_epoch_row()?
-                    || self.storage.latest_created_at()? > logged_until;
+                    || self.storage.latest_created_at()? > logged_until
+                    || (logged_until == 0 && self.storage.holds_logged_rows()?);
                 first_open = !lost;
                 audit_record::AuditRecord {
                     lost: lost.then_some(audit_record::RecordLost {
@@ -473,7 +477,8 @@ impl Keep {
         let chain = audit.check_chain(&data_key)?;
         // A clock stepped back since an entry was written: a seeded epoch
         // still goes above the latest time the log recorded.
-        self.storage.set_seed_floor(chain.latest_time);
+        self.storage
+            .set_seed_floor(chain.latest_time.max(audit.own_time()));
         record.too_long = chain.too_long;
         if chain.valid || record.chain_acknowledged == Some(chain.breaks) {
             record.chain_broken = None;
@@ -489,21 +494,29 @@ impl Keep {
         // The judgment above read whether the epoch's row is there; only now
         // is a missing one written, in the same write as the record, so a
         // stop between them cannot leave either without the other.
-        let epoch = self.storage.missing_agent_freeze_epoch()?;
+        // Unwritten when it cannot be made (a failed read or RNG draw): the
+        // row stays missing, so a freeze seeds one and an unfreeze is refused.
+        let epoch = self.storage.missing_agent_freeze_epoch().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "a missing agent freeze epoch could not be started again");
+            None
+        });
         // Outside a vault's first open the row was written when the vault
         // was created and at every unlock since, so a missing one was
         // deleted: told to the owner until acknowledged, and noted in the
         // unlock's own entry.
         let reseeded = epoch.filter(|_| !first_open);
         if let Some(epoch) = reseeded {
-            record.epoch_reseeded = Some(audit_record::EpochReseeded {
-                epoch,
-                found_at: now,
-            });
+            let found_at = record.epoch_reseeded.map_or(now, |r| r.found_at);
+            record.epoch_reseeded = Some(audit_record::EpochReseeded { epoch, found_at });
         }
-        if let Err(e) = self.save_audit_record_with(record, epoch) {
-            tracing::error!(error = %e, "the record of the audit log could not be written");
-        }
+        // The unlock's entry names a reseed only once it is written.
+        let reseeded = match self.save_audit_record_with(record, epoch) {
+            Ok(()) => reseeded,
+            Err(e) => {
+                tracing::error!(error = %e, "the record of the audit log could not be written");
+                None
+            }
+        };
         if rotation {
             if let Err(e) = self.storage.set_rotation_in_progress(false) {
                 tracing::error!(error = %e, "the note of an interrupted rotation could not be cleared");
@@ -6404,6 +6417,62 @@ mod tests {
             .set_agent_frozen(Some(&one.id), true, None, &[])
             .unwrap();
         assert!(seeded >= (later as u64) << 24, "{seeded}");
+    }
+
+    /// An epoch at its end still lets a freeze through, leaving it there,
+    /// and refuses every unfreeze; a seed always leaves room to count.
+    #[test]
+    fn a_freeze_goes_ahead_at_the_epochs_end() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (one, _) = keep
+            .issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        keep.storage
+            .set_config_bound(b"agent_freeze_epoch", &u64::MAX.to_le_bytes())
+            .unwrap();
+        assert_eq!(
+            keep.set_agent_frozen(Some(&one.id), true, None, &[])
+                .unwrap(),
+            u64::MAX
+        );
+        assert!(keep.load_agent_credential(&one.id).unwrap().unwrap().frozen);
+        assert!(keep
+            .set_agent_frozen(Some(&one.id), false, Some(u64::MAX), &[])
+            .is_err());
+        assert!(keep.load_agent_credential(&one.id).unwrap().unwrap().frozen);
+        keep.storage.set_seed_floor(i64::MAX);
+        let seed = keep.storage.missing_or_seeded_for_tests();
+        assert_eq!(seed >> 24, (u64::MAX >> 24) - 1, "{seed}");
+        assert!(seed.checked_add(1 << 23).is_some(), "{seed}");
+    }
+
+    /// A log deleted beside rows its making would have logged is noticed,
+    /// though those rows cannot be read and the record and epoch rows are
+    /// gone too.
+    #[test]
+    fn a_deleted_log_beside_unreadable_rows_is_noticed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let mut keep = test_keep(&path);
+        let (one, _) = keep
+            .issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        keep.storage
+            .put_raw(
+                crate::backend::AGENT_CREDENTIALS_TABLE,
+                &one.id,
+                b"unreadable",
+            )
+            .unwrap();
+        for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
+            assert!(keep.storage.remove_config_for_tests(row).unwrap());
+        }
+        drop(keep);
+        std::fs::remove_file(path.join("audit.log")).unwrap();
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert!(record_lost(&keep).is_some_and(|l| l.missing));
     }
 
     /// A wallet descriptor counts by its creation time.

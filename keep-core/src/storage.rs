@@ -52,9 +52,12 @@ const SEEDED_EPOCH_SHIFT: u32 = 24;
 /// back past the log's last entry, meet only when 23 random bits do.
 fn seeded_epoch(floor_secs: i64) -> Result<u64> {
     let now = chrono::Utc::now().timestamp();
-    let secs = u64::try_from(now.max(floor_secs).max(1)).unwrap_or(1);
+    // Capped so a seed always leaves room to count up from it.
+    let secs = u64::try_from(now.max(floor_secs).max(1))
+        .unwrap_or(1)
+        .min((u64::MAX >> SEEDED_EPOCH_SHIFT) - 1);
     let low = u32::from_le_bytes(crypto::try_random_bytes::<4>()?) & ((1 << 23) - 1);
-    Ok(secs.saturating_mul(1 << SEEDED_EPOCH_SHIFT) | u64::from(low))
+    Ok((secs << SEEDED_EPOCH_SHIFT) | u64::from(low))
 }
 
 /// The freeze epoch moved by a freeze or a clear of one.
@@ -2099,10 +2102,18 @@ impl Storage {
                         "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
                     )));
                 }
-                let next = epoch.checked_add(1).ok_or_else(|| {
-                    StorageError::corrupted("the agent freeze epoch is at its end")
-                })?;
-                (next, false)
+                match epoch.checked_add(1) {
+                    Some(next) => (next, false),
+                    // At the end no unfreeze can apply, since one would have
+                    // to move the epoch on; a freeze still goes ahead and
+                    // leaves it there, so a freeze never fails open.
+                    None if may_seed => (epoch, false),
+                    None => {
+                        return Err(
+                            StorageError::corrupted("the agent freeze epoch is at its end").into(),
+                        )
+                    }
+                }
             }
             Err(e) if may_seed => {
                 tracing::error!(error = %e, "the agent freeze epoch cannot be read; the freeze goes ahead with a new one");
@@ -2173,6 +2184,26 @@ impl Storage {
     /// Whether the agent freeze epoch's row is there at all, readable or not.
     pub(crate) fn agent_freeze_epoch_row(&self) -> Result<bool> {
         Ok(self.config_row(AGENT_FREEZE_EPOCH)?.is_some())
+    }
+
+    /// Whether the vault holds any key, share, secret, wallet descriptor,
+    /// agent credential or ledger, or the global agent freeze, readable or
+    /// not: something whose making the audit log would have recorded.
+    pub(crate) fn holds_logged_rows(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        for table in [
+            KEYS_TABLE,
+            SHARES_TABLE,
+            SECRETS_TABLE,
+            DESCRIPTORS_TABLE,
+            AGENT_CREDENTIALS_TABLE,
+            AGENT_LEDGERS_TABLE,
+        ] {
+            if !backend.list(table)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(self.config_row(AGENT_FREEZE)?.is_some())
     }
 
     /// The latest `created_at` of any key, share, secret, wallet descriptor
