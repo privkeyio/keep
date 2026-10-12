@@ -173,7 +173,10 @@ pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -
         );
     }
     bridge
-        .serve(std::io::stdin().lock(), std::io::stdout().lock())
+        .serve(
+            std::io::BufReader::new(std::io::stdin()),
+            std::io::stdout().lock(),
+        )
         .map_err(runtime)
 }
 
