@@ -418,10 +418,14 @@ EOF
     PROPS=$(systemctl show --all "$RELAY_UNIT")
     for want in User=$RELAY_USER Group=$RELAY_USER NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes \
         PrivateTmp=yes PrivateDevices=yes ProtectProc=invisible ProcSubset=pid CapabilityBoundingSet= \
-        MemoryDenyWriteExecute=yes RestrictNamespaces=yes LimitCORE=0 UMask=0077 PrivateUsers=no \
-        'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6'; do
+        MemoryDenyWriteExecute=yes RestrictNamespaces=yes LimitCORE=0 UMask=0077 PrivateUsers=no; do
         grep -qxF "$want" <<<"$PROPS" || fail "the relay unit does not set $want: $(grep "^${want%%=*}=" <<<"$PROPS")"
     done
+    # The relays and the gateway's socket, and no other family; systemd
+    # prints them in its own order.
+    FAMILIES=$(grep '^RestrictAddressFamilies=' <<<"$PROPS") || fail "no RestrictAddressFamilies"
+    [[ $(tr ' ' '\n' <<<"${FAMILIES#*=}" | sort | tr '\n' ' ') == "AF_INET AF_INET6 AF_UNIX " ]] \
+        || fail "the relay unit allows $FAMILIES"
     systemctl restart "$UNIT" || fail "the gateway did not start with approvals"
     systemctl start "$RELAY_UNIT" || fail "the relay helper did not start"
     dir_is /run/keep-gateway-relay "$GW:$RELAY_USER 750"
@@ -462,7 +466,7 @@ def until(pattern, secs):
         buf += chunk
     sys.exit("timed out waiting for %r; got %r" % (pattern, buf[-2000:]))
 open(uri_out, "w").write(until(rb"(keep-approver:v1\?[^\s]+)", 30).group(1).decode())
-shown = until(rb"shows fingerprint:\s+(\S+)", 120).group(1).decode()
+shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)", 120).group(1).decode()
 for _ in range(600):
     if os.path.exists(phone_fp) and os.path.getsize(phone_fp):
         break
@@ -486,7 +490,7 @@ PY
     "$PEER" phone "$(cat "$WORK/uri")" </dev/null >"$WORK/phone.log" 2>&1 &
     PHONE=$!
     for _ in $(seq 300); do grep -q '^fingerprint ' "$WORK/phone.log" && break; sleep 0.1; done
-    awk '/^fingerprint / {print $2; exit}' "$WORK/phone.log" >"$WORK/phone.fp.tmp"
+    awk '/^fingerprint / {sub(/^fingerprint /, ""); print; exit}' "$WORK/phone.log" >"$WORK/phone.fp.tmp"
     mv "$WORK/phone.fp.tmp" "$WORK/phone.fp"
     wait "$PAIR" || fail "pairing: $(cat "$WORK/pair.out")"
     for _ in $(seq 300); do grep -q '^paired$' "$WORK/phone.log" && break; sleep 0.1; done
@@ -497,16 +501,18 @@ PY
     pass "a phone paired through the gateway in its sandbox, with no network of its own, and the helper"
 
     # Once a phone is paired, the gateway needs its channel key.
+    # The approvals set-up taken out: the drop-in and the relays.
     mv "$DROPIN/approvals.conf" "$WORK/approvals.conf"
-    cat >"$DROPIN/relay-dir.conf" <<EOF
+    mv "$DROPIN/admin.conf" "$WORK/admin.conf"
+    cat >"$DROPIN/admin.conf" <<EOF
 [Service]
-ExecStartPre=+/usr/bin/install -d -m 0750 -o $GW -g $RELAY_USER /run/keep-gateway-relay
-ReadWritePaths=-/run/keep-gateway-relay
+ExecStart=
+ExecStart=$BIN --path $VAULT gateway serve --admin-uid $(uid "$ADMIN")
 EOF
     refuses_to_start "no channel key" "needs its channel-key credential"
     systemctl stop "$UNIT" >/dev/null 2>&1 || true
     systemctl reset-failed "$UNIT" 2>/dev/null || true
-    rm "$DROPIN/relay-dir.conf"
+    mv "$WORK/admin.conf" "$DROPIN/admin.conf"
     mv "$WORK/approvals.conf" "$DROPIN/approvals.conf"
     systemctl daemon-reload
     systemctl start "$UNIT" || fail "did not start again with the channel key"

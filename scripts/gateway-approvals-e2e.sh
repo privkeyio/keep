@@ -255,10 +255,10 @@ stop_gateway() {
 # A gateway that must refuse to start, and why.
 refuses_start() {
     local creds=$1 want=$2 msg
+    shift 2
     if msg=$(as "$GW" timeout 20 env CREDENTIALS_DIRECTORY="$creds" "$KEEP" --path "$VAULT" gateway serve \
         --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" --admin-uid "$(uid "$ADMIN")" \
-        --approval-relay "$RELAY_URL" --relay-socket "$RELAY_SOCK" --relay-user "$RELAY_USER" \
-        </dev/null 2>&1); then
+        --relay-socket "$RELAY_SOCK" --relay-user "$RELAY_USER" "$@" </dev/null 2>&1); then
         fail "the gateway started, though: $want"
     fi
     grep -q -- "$want" <<<"$msg" || fail "expected \"$want\": $msg"
@@ -401,9 +401,9 @@ def until(pattern, secs):
 uri = until(rb"(keep-approver:v1\?[^\s]+)", 30).group(1).decode()
 open(uri_out + ".tmp", "w").write(uri)
 os.rename(uri_out + ".tmp", uri_out)
-shown = until(rb"shows fingerprint:\s+(\S+)", 120).group(1).decode()
+shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)", 120).group(1).decode()
 for _ in range(600):
-    if os.path.exists(phone_fp):
+    if os.path.exists(phone_fp) and os.path.getsize(phone_fp):
         break
     time.sleep(0.1)
 same = open(phone_fp).read().strip() == shown
@@ -435,7 +435,8 @@ PHONE_PID=$!
 exec 7>"$WORK/phone.in"
 phone() { printf '%s\n' "$1" >&7; }
 wait_for "$WORK/phone.log" "^fingerprint " 1 30
-awk '/^fingerprint / {print $2; exit}' "$WORK/phone.log" >"$WORK/phone.fp"
+awk '/^fingerprint / {sub(/^fingerprint /, ""); print; exit}' "$WORK/phone.log" >"$WORK/phone.fp.tmp"
+mv "$WORK/phone.fp.tmp" "$WORK/phone.fp"
 wait "$PAIR_PID" || fail "pairing: $(cat "$WORK/pair.out")"
 [[ $(cat "$WORK/pair.answer") == same ]] || fail "the fingerprints differ"
 wait_for "$WORK/phone.log" "^paired$" 1 30
@@ -464,8 +465,10 @@ n=$(requests)
 printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_bitcoin_psbt","arguments":{"psbt":"%s"}}}\n' \
     "$PSBT_10K" | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/btc" >"$WORK/psbt.out" 2>&1 &
 AGENT_PID=$!
-wait_for "$WORK/phone.log" '^request .*sign_psbt.*above_threshold' $((n + 1)) 30
-grep -q '"requested":10000' "$WORK/phone.log" || fail "the phone was not shown the spend: $(tail -1 "$WORK/phone.log")"
+wait_for "$WORK/phone.log" "^request " $((n + 1)) 30
+grep '^request ' "$WORK/phone.log" | tail -1 >"$WORK/psbt.request"
+grep -q '"sign_psbt" {"type":"above_threshold","requested":10000,"spent":0,"threshold":5000}' "$WORK/psbt.request" \
+    || fail "the phone was not shown the spend: $(cat "$WORK/psbt.request")"
 phone approve
 wait "$AGENT_PID" || true
 python3 -c 'import json,sys
@@ -542,8 +545,9 @@ pass "the phone freezes and unfreezes the gateway"
 
 # Issuing waits for the phone: approved, denied, and withdrawn by the admin
 # going away.
+# Run in the background, so exec: $! is then the command itself.
 issue() {
-    "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name "$1" --uid "$(uid "$A1")" \
+    exec "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name "$1" --uid "$(uid "$A1")" \
         --key "$NPUB" --op get_public_key --token-out "$WORK/root-out/$1.token"
 }
 count_credentials() {
@@ -585,7 +589,8 @@ pass "the audit log records requests, decisions, freezes and the pairing"
 # A gateway with a paired phone needs the same channel key to start.
 stop_gateway
 refuses_start "$NO_KEY" "needs its channel-key"
-refuses_start "$OTHER_KEY" "not the one the approver devices were paired with"
+refuses_start "$NO_KEY" "approvals need the \"channel-key\" credential" --approval-relay "$RELAY_URL"
+refuses_start "$OTHER_KEY" "not the one the approver devices were paired with" --approval-relay "$RELAY_URL"
 pass "the gateway refuses to start without the paired channel key, or with another"
 
 # Restarted, it serves approvals again once the helper reconnects.
@@ -599,6 +604,41 @@ phone approve
 wait "$AGENT_PID" || true
 is_signed "$WORK/restarted.out" || fail "after the restart: $(cat "$WORK/restarted.out")"
 pass "after a restart the helper reconnects and approvals work"
+
+# An MCP client that gives up sends notifications/cancelled; the bridge
+# passes it on and the request is withdrawn, while the bridge still answers.
+cat >"$WORK/cancel.py" <<'PY'
+import json, os, select, subprocess, sys, time
+phone_log, seen = sys.argv[1], int(sys.argv[2])
+server = subprocess.Popen(sys.argv[3:], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def send(message):
+    server.stdin.write((json.dumps(message) + "\n").encode())
+    server.stdin.flush()
+def answer():
+    ready, _, _ = select.select([server.stdout], [], [], 60)
+    return server.stdout.readline().decode().strip() if ready else "NO ANSWER"
+send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e", "version": "1"}}})
+answer()
+send({"jsonrpc": "2.0", "id": 21, "method": "tools/call", "params": {"name": "sign_nostr_event", "arguments": {"kind": 0, "content": "{}"}}})
+for _ in range(300):
+    lines = [l for l in open(phone_log) if l.startswith("request ")]
+    if len(lines) > seen:
+        break
+    time.sleep(0.1)
+send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 21, "reason": "gave up"}})
+print(answer(), flush=True)
+server.stdin.close()
+server.wait(timeout=10)
+PY
+chmod 0644 "$WORK/cancel.py"
+n=$(requests)
+c=$(grep -c '^outcome .*"canceled"' "$WORK/phone.log" || true)
+as "$A1" python3 "$WORK/cancel.py" "$WORK/phone.log" "$n" "$KEEP" agent connect --token-file "$WORK/a1/token" \
+    --socket "$AGENT_SOCK" --gateway-user "$GW" >"$WORK/cancel.out" 2>"$WORK/cancel.err" || true
+grep -q '"id":21' "$WORK/cancel.out" || fail "no answer to the cancelled request: $(cat "$WORK/cancel.out")"
+grep -q "canceled: the request was withdrawn" "$WORK/cancel.out" || fail "cancelled: $(cat "$WORK/cancel.out")"
+wait_for "$WORK/phone.log" '^outcome .*"canceled"' $((c + 1)) 30
+pass "a client's notifications/cancelled withdraws its request through the bridge"
 
 if [[ -n $OLD ]]; then
     # The old bridge against the new gateway: a request that waits is
@@ -618,12 +658,13 @@ PY
     init='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"1"}}}'
     n=$(requests)
     printf '%s\n' "$init" "$(sign 14 0)" | as "$A1" python3 "$WORK/mcp.py" "$OLD" agent connect \
-        --token-file "$WORK/a1/token" --socket "$AGENT_SOCK" --gateway-user "$GW" >"$WORK/old-bridge.out" 2>&1 &
+        --token-file "$WORK/a1/token" --socket "$AGENT_SOCK" --gateway-user "$GW" \
+        >"$WORK/old-bridge.out" 2>"$WORK/old-bridge.err" &
     MCP_PID=$!
     wait_for "$WORK/phone.log" "^request " $((n + 1)) 30
     phone approve
     wait "$MCP_PID" || true
-    tail -1 "$WORK/old-bridge.out" >"$WORK/old-bridge.last"
+    grep '"id":14' "$WORK/old-bridge.out" >"$WORK/old-bridge.last" || true
     is_signed "$WORK/old-bridge.last" || fail "old bridge: $(cat "$WORK/old-bridge.out")"
     pass "the old bridge is answered after an approval"
 
@@ -681,9 +722,10 @@ if [[ -n $OLD ]]; then
         >/dev/null 2>&1 || fail "issue on the old gateway"
     install -m 0600 -o "$A1" "$WORK/root-out/old-gw.token" "$WORK/a1/old-gw.token"
     printf '%s\n' "$init" "$(sign 16 1)" "$(sign 17 0)" | as "$A1" python3 "$WORK/mcp.py" "$KEEP" agent connect \
-        --token-file "$WORK/a1/old-gw.token" --socket "$AGENT_SOCK" --gateway-user "$GW" >"$WORK/new-bridge.out" 2>&1
-    sed -n 2p "$WORK/new-bridge.out" >"$WORK/new-bridge.1"
-    sed -n 3p "$WORK/new-bridge.out" >"$WORK/new-bridge.0"
+        --token-file "$WORK/a1/old-gw.token" --socket "$AGENT_SOCK" --gateway-user "$GW" \
+        >"$WORK/new-bridge.out" 2>"$WORK/new-bridge.err"
+    grep '"id":16' "$WORK/new-bridge.out" >"$WORK/new-bridge.1" || true
+    grep '"id":17' "$WORK/new-bridge.out" >"$WORK/new-bridge.0" || true
     is_signed "$WORK/new-bridge.1" || fail "new bridge, old gateway: $(cat "$WORK/new-bridge.out")"
     grep -q "needs approval" "$WORK/new-bridge.0" || fail "new bridge, old gateway, kind 0: $(cat "$WORK/new-bridge.out")"
     stop_pid "$OLD_GW_PID"
