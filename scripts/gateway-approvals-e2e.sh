@@ -318,12 +318,25 @@ grep -q "cannot obtain yet" <<<"$(error_text "$WORK/kind0-off.out")" \
     || fail "kind 0 with no phone: $(cat "$WORK/kind0-off.out")"
 pass "a request that needs approval is refused while no phone is paired"
 
-# Only root pairs the first phone.
-if msg=$(as "$ADMIN" "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" \
+# Pairing needs a terminal to confirm the fingerprint on, checked before
+# the gateway is asked.
+if msg=$("$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" \
+    --gateway-user "$GW" </dev/null 2>&1); then
+    fail "pairing went ahead without a terminal"
+fi
+grep -q "confirmed on a terminal" <<<"$msg" || fail "pairing without a terminal: $msg"
+pass "pairing without a terminal is refused before the gateway is asked"
+
+# Only root pairs the first phone: the admin uid, on a terminal, is refused
+# by the gateway.
+if msg=$(as "$ADMIN" timeout 20 python3 -c 'import os, pty, sys
+sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' \
+    "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" \
     --gateway-user "$GW" </dev/null 2>&1); then
     fail "the admin uid paired the first phone"
 fi
 grep -q "only root may pair the first" <<<"$msg" || fail "admin pairing first: $msg"
+pass "only root pairs the first phone"
 
 # Pairing on a terminal: the driver runs `keep gateway approver pair` on a
 # pty, hands the pairing code to the phone, and answers the fingerprint
