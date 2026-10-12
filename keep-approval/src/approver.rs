@@ -19,6 +19,7 @@
 //! All of it is plain data the approver persists between runs.
 
 use std::collections::BTreeMap;
+use unicode_normalization::char::{canonical_combining_class, is_combining_mark};
 
 use serde::{Deserialize, Serialize};
 
@@ -417,16 +418,6 @@ pub struct Shown {
 /// the lines around it.
 pub const MAX_COMBINING_RUN: usize = 4;
 
-/// The combining diacritical mark blocks, where stacked marks come from.
-fn is_combining(c: char) -> bool {
-    matches!(c,
-        '\u{0300}'..='\u{036f}'
-        | '\u{1ab0}'..='\u{1aff}'
-        | '\u{1dc0}'..='\u{1dff}'
-        | '\u{20d0}'..='\u{20ff}'
-        | '\u{fe20}'..='\u{fe2f}')
-}
-
 /// `text` as an approver shows it, in at most `limit` characters: every
 /// hidden character (see [`is_hidden`]) and every combining mark past
 /// [`MAX_COMBINING_RUN`] on one character removed first and counted, then a
@@ -444,7 +435,7 @@ pub fn shown(text: &str, limit: usize) -> Shown {
             removed += 1;
             continue;
         }
-        run = if is_combining(c) { run + 1 } else { 0 };
+        run = if is_combining_mark(c) { run + 1 } else { 0 };
         if run > MAX_COMBINING_RUN {
             removed += 1;
             continue;
@@ -486,10 +477,12 @@ pub fn agent_text(text: &str) -> Shown {
 /// (Cc), every format character (Cf, bidi controls among them), the line
 /// and paragraph separators (Zl, Zp), the other default-ignorable
 /// characters that render as nothing (fillers, variation selectors,
-/// unassigned default-ignorables), and the combining overlays that strike
-/// through or slash the character before them.
+/// unassigned default-ignorables), the enclosing marks, and the combining
+/// overlays (canonical combining class 1) that strike through or slash the
+/// character before them.
 pub fn is_hidden(c: char) -> bool {
     c.is_control()
+        || canonical_combining_class(c) == 1
         || matches!(c,
             // Cf
             '\u{00ad}'                     // soft hyphen
@@ -520,7 +513,12 @@ pub fn is_hidden(c: char) -> bool {
             | '\u{3164}'                   // Hangul filler
             | '\u{fe00}'..='\u{fe0f}'     // variation selectors
             | '\u{ffa0}'                   // halfwidth Hangul filler
-            // Combining overlays
+            // Enclosing marks, which draw around or over the character before
+            | '\u{0488}'..='\u{0489}'
+            | '\u{1abe}'
+            | '\u{20dd}'..='\u{20e0}'
+            | '\u{20e2}'..='\u{20e4}'
+            | '\u{a670}'..='\u{a672}'
             // Combining overlays: every mark of canonical combining class 1
             | '\u{0334}'..='\u{0338}'     // tilde, stroke and solidus overlays
             | '\u{1cd4}'                   // Vedic tone midline svarita
@@ -1216,6 +1214,21 @@ mod tests {
             100,
         );
         assert_eq!(s.text, format!("a{}", "\u{0301}".repeat(MAX_COMBINING_RUN)));
+        // Marks from every block count, mixed or alone.
+        let mixed = format!("a{}", "\u{0301}\u{0483}\u{0592}".repeat(10));
+        assert_eq!(
+            shown(&mixed, 100).text.chars().count(),
+            1 + MAX_COMBINING_RUN
+        );
+        let cyrillic = format!("a{}", "\u{0483}".repeat(50));
+        assert_eq!(
+            shown(&cyrillic, 100).text.chars().count(),
+            1 + MAX_COMBINING_RUN
+        );
+        // Enclosing marks are hidden.
+        for c in ['\u{20e0}', '\u{20dd}', '\u{1abe}', '\u{0488}', '\u{a670}'] {
+            assert!(is_hidden(c), "{c:?}");
+        }
     }
 
     #[test]

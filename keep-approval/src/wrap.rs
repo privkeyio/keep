@@ -96,8 +96,9 @@ impl std::fmt::Debug for TagKey {
 impl TagKey {
     /// HKDF-SHA256 (RFC 5869) with salt [`TAG_SALT`], empty info and a
     /// 32-byte output, which is the first expand block. Written with HMAC,
-    /// whose state and output are wiped when dropped, so neither the
-    /// pseudorandom key nor the tag key is left in memory.
+    /// whose states and outputs are wiped when dropped (the hmac crate's own
+    /// key setup leaves a masked copy on the stack, as the `hkdf` crate
+    /// would too).
     fn from_ikm(ikm: &[u8], send: Direction) -> Self {
         let mut extract =
             <Hmac<Sha256> as KeyInit>::new_from_slice(TAG_SALT).expect("HMAC takes any key length");
@@ -1023,12 +1024,19 @@ mod tests {
             open(&p.gateway, &forged, &candidates, &mut seen, NOW).unwrap_err(),
             Error::NotOurs
         );
-        // A copy whose id does not match its content is refused as such.
+        // A copy whose id does not match what it covers (here its time,
+        // which the tag does not cover) is refused as such.
         let mut renamed = event.clone();
-        renamed.content.push(' ');
+        renamed.created_at = Timestamp::from_secs(event.created_at.as_secs() + 1);
         assert!(matches!(
-            open(&p.gateway, &renamed, &candidates, &mut seen, NOW),
-            Err(Error::Invalid(_) | Error::NotOurs)
+            open(
+                &p.gateway,
+                &renamed,
+                &candidates,
+                &mut SeenWraps::default(),
+                NOW
+            ),
+            Err(Error::Invalid(_))
         ));
     }
 

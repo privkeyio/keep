@@ -48,7 +48,7 @@ impl std::fmt::Debug for PairingUri {
 }
 
 /// Check a relay URL: `wss://` or `ws://`, a host, at most
-/// [`MAX_RELAY_LEN`] bytes, and only letters, digits and `-._~:/[]@`.
+/// [`MAX_RELAY_LEN`] bytes, and only letters, digits and `-._~:/[]`.
 pub fn check_relay(url: &str) -> Result<()> {
     let rest = url
         .strip_prefix("wss://")
