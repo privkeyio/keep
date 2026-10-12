@@ -695,6 +695,30 @@ mod tests {
         ));
     }
 
+    /// Owed entries stop growing at the cap: more of a type already owed
+    /// are counted on its newest, and say so when written.
+    #[test]
+    fn owed_entries_are_capped_and_repeats_counted() {
+        let mut store = Store::default();
+        for i in 0..MAX_OWED + 5 {
+            store.owe(AuditEventType::AgentApproverFreeze, format!("freeze {i}"));
+        }
+        store.owe(AuditEventType::AgentApproverRemoved, "removed".into());
+        store.owe(AuditEventType::AgentApproverRemoved, "removed again".into());
+        assert_eq!(store.owed.len(), MAX_OWED + 1);
+        let newest_freeze = &store.owed[MAX_OWED - 1];
+        assert_eq!(newest_freeze.more, 5);
+        assert!(
+            newest_freeze
+                .text()
+                .starts_with(&format!("freeze {} (and 5 more", MAX_OWED - 1)),
+            "{}",
+            newest_freeze.text()
+        );
+        assert_eq!(store.owed[MAX_OWED].more, 1);
+        assert_eq!(store.owed[0].text(), "freeze 0");
+    }
+
     /// A request whose rumor would not fit a wrap is refused as too large to
     /// approve.
     #[test]
