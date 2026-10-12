@@ -2118,6 +2118,7 @@ impl Keep {
             .map(|audit| audit.reencrypt(&old_data_key, &new_data_key))
         {
             tracing::error!(error = %e, "could not re-encrypt the audit log; setting it aside");
+            self.audit = None;
             self.audit = Some(AuditLog::open(self.storage.path(), &new_data_key)?);
         }
         if let Some(Err(e)) = self
@@ -2126,6 +2127,7 @@ impl Keep {
             .map(|log| log.reencrypt(&old_data_key, &new_data_key))
         {
             tracing::error!(error = %e, "could not re-encrypt the signing audit log; setting it aside");
+            self.signing_audit = None;
             self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &new_data_key)?);
         }
         // The old audit logs a migration kept come last, and a failure there
@@ -2136,6 +2138,14 @@ impl Keep {
                 tracing::error!(
                     error = %e,
                     "could not re-encrypt the old audit log a migration kept; it may no longer be readable"
+                );
+            }
+        }
+        if let Some(ref signing_audit) = self.signing_audit {
+            if let Err(e) = signing_audit.reencrypt_kept_logs(&old_data_key, &new_data_key) {
+                tracing::error!(
+                    error = %e,
+                    "could not re-encrypt a signing audit log that was set aside; it may no longer be readable"
                 );
             }
         }
@@ -2405,7 +2415,7 @@ mod tests {
             AgentRefusal::Unknown
         );
         let (_, other) = keep
-            .issue_agent_credential("other", 1000, Vec::new(), unix_now(), 3600)
+            .issue_agent_credential("other", 1000, Vec::new(), now, 3600)
             .unwrap();
         assert_ne!(accepted(&keep, &other, 1000, now).id, credential.id);
         let issued = agent_entries(&keep, AuditEventType::AgentCredentialIssue);
@@ -3726,9 +3736,28 @@ mod tests {
         damage("audit.log");
         damage("signing_audit.log");
 
+        let old_key = keep.data_key().unwrap();
         keep.rotate_data_key("testpass").unwrap();
+        let new_key = keep.data_key().unwrap();
         assert!(keep.audit_failed_migration_kept());
-        assert!(path.join("signing_audit.log.unreadable").exists());
+        // The set-aside copies hold their readable lines under the new key,
+        // and the damaged line as it was.
+        for kept in ["audit.log.v1", "signing_audit.log.unreadable"] {
+            let text = std::fs::read_to_string(path.join(kept)).unwrap();
+            let mut lines = text.lines();
+            assert_eq!(lines.next(), Some("bm90IGFuIGVudHJ5"), "{kept}");
+            let mut rest = 0;
+            for line in lines {
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, line)
+                        .unwrap();
+                let encrypted = crypto::EncryptedData::from_bytes(&bytes).unwrap();
+                assert!(crypto::decrypt(&encrypted, &old_key).is_err(), "{kept}");
+                assert!(crypto::decrypt(&encrypted, &new_key).is_ok(), "{kept}");
+                rest += 1;
+            }
+            assert!(rest >= 1, "{kept}");
+        }
         assert!(keep
             .audit_read_all()
             .unwrap()

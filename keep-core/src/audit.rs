@@ -790,9 +790,10 @@ impl AuditLog {
         Ok(entries)
     }
 
-    /// Every entry that can be read, skipping lines that cannot, and how
-    /// many were read before the first line that cannot, if one could not.
-    /// Only a failure to read the file is an error.
+    /// Every entry that can be read, skipping lines that cannot be decrypted,
+    /// and how many were read before the first such line, if there is one.
+    /// A failure to read the file, or a line that decrypts but does not
+    /// parse, is an error.
     fn read_readable(
         path: &Path,
         data_key: &SecretKey,
@@ -809,9 +810,20 @@ impl AuditLog {
             if text.is_empty() {
                 continue;
             }
-            match Self::decrypt_bytes(text, data_key) {
-                Ok(entry) => entries.push(entry),
-                Err(_) => {
+            // A line that does not decrypt is damage. One that decrypts but
+            // does not parse was written under this key by a keep that knows
+            // more entry types (a newer one), so the log is refused rather
+            // than cut there.
+            let plaintext = std::str::from_utf8(text)
+                .ok()
+                .and_then(|text| Self::decrypt_raw(text, data_key).ok());
+            match plaintext {
+                Some(plaintext) => entries.push(serde_json::from_slice(&plaintext).map_err(|e| {
+                    StorageError::invalid_format(format!(
+                        "the audit log holds an entry this keep cannot read, likely written by a newer keep: {e}"
+                    ))
+                })?),
+                None => {
                     before_gap.get_or_insert(entries.len());
                 }
             }
@@ -965,7 +977,7 @@ impl AuditLog {
     /// The old logs migrations kept, oldest first: `audit.log.v1`, then
     /// `audit.log.v1.2` and so on.
     fn migrated_paths(&self) -> Vec<PathBuf> {
-        migrated_paths(self.path.parent().unwrap_or(Path::new(".")))
+        kept_paths(self.path.parent().unwrap_or(Path::new(".")), MIGRATED_LOG)
     }
 
     /// The kept old log a failed migration names in the marker, while both
@@ -1142,12 +1154,13 @@ impl AuditLog {
     }
 }
 
-/// The old logs migrations kept in `dir`, oldest first.
-fn migrated_paths(dir: &Path) -> Vec<PathBuf> {
+/// The files [`keep_copy`] kept in `dir` under `base`, oldest first: `base`,
+/// then `base.2` and so on.
+fn kept_paths(dir: &Path, base: &str) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    let base = dir.join(MIGRATED_LOG);
-    if is_regular_file(&base) {
-        paths.push(base);
+    let first = dir.join(base);
+    if is_regular_file(&first) {
+        paths.push(first);
     }
     let mut numbered: Vec<(u32, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
@@ -1155,7 +1168,7 @@ fn migrated_paths(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().into_string().ok()?;
-            let n = name.strip_prefix(MIGRATED_LOG)?.strip_prefix('.')?;
+            let n = name.strip_prefix(base)?.strip_prefix('.')?;
             if n.is_empty()
                 || !n.bytes().all(|b| b.is_ascii_digit())
                 || !is_regular_file(&entry.path())
@@ -1223,6 +1236,45 @@ fn verify_entries(entries: &[AuditEntry]) -> AuditVerification {
         valid,
         migration,
         first_seq: first.seq,
+    }
+}
+
+/// Cut a final line without its newline, an append a crash cut short.
+fn drop_torn_tail(path: &Path) -> std::io::Result<()> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let (mut line, mut complete) = (Vec::new(), 0u64);
+    loop {
+        line.clear();
+        let n = reader.read_until(b'\n', &mut line)?;
+        if n == 0 {
+            return Ok(());
+        }
+        if line.last() != Some(&b'\n') {
+            return truncate(path, complete);
+        }
+        complete += n as u64;
+    }
+}
+
+/// Whether any non-empty line of `path` fails to decrypt under `data_key`.
+fn has_undecryptable_line(path: &Path, data_key: &SecretKey) -> std::io::Result<bool> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(false);
+        }
+        let text = line_text(&line);
+        if text.is_empty() {
+            continue;
+        }
+        let decrypts = std::str::from_utf8(text)
+            .ok()
+            .is_some_and(|text| AuditLog::decrypt_raw(text, data_key).is_ok());
+        if !decrypts {
+            return Ok(true);
+        }
     }
 }
 
@@ -1576,27 +1628,29 @@ pub struct SigningAuditLog {
 }
 
 impl SigningAuditLog {
-    /// Open or create a signing audit log at the given path. A log that
-    /// cannot be read under `data_key` (one left under a data key that no
-    /// longer exists, say) is kept beside it as
-    /// `signing_audit.log.unreadable` and a new one started, with an error
-    /// logged, rather than locking the vault.
+    /// Open or create a signing audit log at the given path. A final line
+    /// cut short by a crash is dropped. A log with lines that cannot be
+    /// decrypted under `data_key` (one left under a data key that no longer
+    /// exists, say) is kept beside it as `signing_audit.log.unreadable` and a
+    /// new one started, with an error logged, rather than locking the vault.
     pub fn open(path: &Path, data_key: &SecretKey) -> Result<Self> {
         let audit_path = path.join("signing_audit.log");
         let last_hash = if audit_path.exists() {
+            drop_torn_tail(&audit_path)?;
             match Self::read_last_hash(&audit_path, data_key) {
                 Ok(hash) => hash,
-                Err(e) => {
+                Err(e) if has_undecryptable_line(&audit_path, data_key)? => {
                     let kept = keep_copy(&audit_path, path, UNREADABLE_SIGNING_LOG)?;
                     std::fs::remove_file(&audit_path)?;
                     sync_parent(&audit_path);
                     tracing::error!(
                         error = %e,
                         kept = %kept.display(),
-                        "the signing audit log could not be read under the vault's key; it was kept under the name here and a new one started"
+                        "the signing audit log has lines that cannot be decrypted under the vault's key; it was kept under the name here and a new one started"
                     );
                     [0u8; 32]
                 }
+                Err(e) => return Err(e),
             }
         } else {
             [0u8; 32]
@@ -1769,6 +1823,17 @@ impl SigningAuditLog {
             return Ok(());
         }
         self.rewrite(&entries, new_key)
+    }
+
+    /// Re-encrypt the unreadable logs [`SigningAuditLog::open`] kept with a
+    /// new data key, line for line the same plaintext; a line that does not
+    /// decrypt under `old_key` is kept as it is.
+    pub fn reencrypt_kept_logs(&self, old_key: &SecretKey, new_key: &SecretKey) -> Result<()> {
+        let dir = self.path.parent().unwrap_or(Path::new("."));
+        for path in kept_paths(dir, UNREADABLE_SIGNING_LOG) {
+            reencrypt_as_is(&path, old_key, new_key)?;
+        }
+        Ok(())
     }
 
     fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
@@ -3852,5 +3917,79 @@ mod sequence_tests {
             std::fs::read(dir.path().join(UNREADABLE_SIGNING_LOG)).unwrap(),
             old
         );
+    }
+
+    /// Encrypt `json` as one log line under `key`, as a keep that knows more
+    /// entry types than this one would write it.
+    fn foreign_line(json: &str, key: &SecretKey) -> String {
+        let encrypted = crypto::encrypt(json.as_bytes(), key).unwrap();
+        format!("{}\n", STANDARD.encode(encrypted.to_bytes()))
+    }
+
+    /// A line that decrypts but does not parse came from a newer keep, so a
+    /// log that would otherwise be migrated around it (an old log holding
+    /// one anywhere, a current-format log ending in one) refuses to open
+    /// rather than being cut.
+    #[test]
+    fn an_entry_from_a_newer_keep_refuses_rather_than_cuts() {
+        let key = key();
+        let entry = serde_json::to_value(sign(9)).unwrap();
+        let mut newer = entry.clone();
+        newer["event_type"] = "SomethingNewer".into();
+        let newer = foreign_line(&newer.to_string(), &key);
+        for format1 in [true, false] {
+            let dir = tempdir().unwrap();
+            if format1 {
+                write_format1_log(dir.path(), &key, vec![sign(1), sign(2)]);
+            } else {
+                logged(dir.path(), &key, 2);
+            }
+            let path = dir.path().join("audit.log");
+            let mut text = std::fs::read_to_string(&path).unwrap();
+            if format1 {
+                text.insert_str(0, &newer);
+            } else {
+                text.push_str(&newer);
+            }
+            std::fs::write(&path, &text).unwrap();
+            assert!(AuditLog::open(dir.path(), &key).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert!(!dir.path().join(MIGRATED_LOG).exists());
+        }
+    }
+
+    /// A signing log whose last line a crash cut short drops that line, and
+    /// one holding an entry this keep cannot parse refuses to open; neither
+    /// is set aside.
+    #[test]
+    fn the_signing_log_is_set_aside_only_for_lines_that_do_not_decrypt() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        log.log(
+            SigningAuditEntry::new(
+                SigningRequestType::SignEvent,
+                SigningDecision::Approved,
+                false,
+                "caller".into(),
+                log.last_hash(),
+            )
+            .finalize(),
+            &key,
+        )
+        .unwrap();
+        let head = log.last_hash();
+        let path = dir.path().join("signing_audit.log");
+        let whole = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{whole}{}", &whole[..20])).unwrap();
+        let log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.last_hash(), head);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), whole);
+
+        let newer = foreign_line(r#"{"unknown":"entry"}"#, &key);
+        std::fs::write(&path, format!("{whole}{newer}")).unwrap();
+        assert!(SigningAuditLog::open(dir.path(), &key).is_err());
+        assert!(path.exists());
+        assert!(!dir.path().join(UNREADABLE_SIGNING_LOG).exists());
     }
 }
