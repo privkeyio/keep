@@ -875,6 +875,37 @@ impl HiddenStorage {
         audit.verify_chain(data_key)
     }
 
+    /// Verify the outer-volume audit log's chain and report the migration it
+    /// records. Hidden-active sessions have no log of their own and get a
+    /// vacuously valid report.
+    pub fn audit_verify(&self) -> Result<crate::audit::AuditVerification> {
+        match self.active_volume {
+            Some(VolumeType::Outer) => {}
+            Some(VolumeType::Hidden) => {
+                return Ok(crate::audit::AuditVerification {
+                    valid: true,
+                    migration: None,
+                    first_seq: 0,
+                })
+            }
+            None => return Err(KeepError::Locked),
+        }
+        let (data_key, audit) = self.outer_audit_handles()?;
+        audit.verify(data_key)
+    }
+
+    /// Whether the migration that moved the outer-volume audit log to
+    /// sequence numbers found the old log failed its chain check, while the
+    /// old log is still kept beside it. Always false on a hidden-active
+    /// session.
+    pub fn audit_failed_migration_kept(&self) -> bool {
+        matches!(self.active_volume, Some(VolumeType::Outer))
+            && self
+                .outer_audit
+                .as_ref()
+                .is_some_and(crate::audit::AuditLog::failed_migration_kept)
+    }
+
     /// Resolve the outer data key and audit log for an outer-active session.
     /// A `None` `outer_audit` despite an unlocked outer volume means
     /// `attach_outer_audit` failed to open the on-disk audit log earlier and
@@ -1528,6 +1559,53 @@ mod tests {
             "got {msg}"
         );
         assert!(msg.contains("#422"), "got {msg}");
+    }
+
+    /// A hidden-volume vault's outer log migrates the first time the outer
+    /// volume is unlocked, like a regular vault's.
+    #[test]
+    fn hidden_outer_log_migrates_on_unlock() {
+        use crate::audit::{test_support::write_format1_log, AuditEntry, AuditEventType};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault-migrate");
+        HiddenStorage::create(
+            &path,
+            "outer-password",
+            None,
+            10 * 1024 * 1024,
+            0.0,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+        let outer_key = {
+            let mut storage = HiddenStorage::open(&path).unwrap();
+            storage.unlock_outer("outer-password").unwrap();
+            storage.outer_key.clone().unwrap()
+        };
+        write_format1_log(
+            &path,
+            &outer_key,
+            vec![
+                AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]),
+                AuditEntry::new(AuditEventType::KeyGenerate, [0; 32]),
+            ],
+        );
+        let old = std::fs::read(path.join("audit.log")).unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer-password").unwrap();
+        assert_eq!(std::fs::read(path.join("audit.log.v1")).unwrap(), old);
+        assert!(!storage.audit_failed_migration_kept());
+        let report = storage.audit_verify().unwrap();
+        assert!(report.valid);
+        assert_eq!(
+            report.migration.map(|m| (m.old_count, m.old_chain_valid)),
+            Some((2, true))
+        );
+        let entries = storage.audit_read_all().unwrap();
+        assert_eq!(entries[2].event_type, AuditEventType::AuditLogMigrated);
+        assert!(entries.iter().zip(1u64..).all(|(e, seq)| e.seq == seq));
     }
 
     /// #520 end-to-end on the hidden-vault outer path: trip the rate limiter
