@@ -37,23 +37,16 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     "the gateway does not serve hidden volumes".into(),
                 ));
             }
-            let settings = Settings {
-                admin_uid,
-                wallet_budget_sats,
-                ..Settings::default()
-            };
-            let channel = channel_key()?;
-            if !approval_relays.is_empty() && channel.is_none() {
-                return Err(KeepError::InvalidInput(format!(
-                    "approvals need the {:?} credential: generate it with `keep gateway \
-                     channel-key new` and load it in the unit",
-                    daemon::CHANNEL_KEY_CREDENTIAL
-                )));
-            }
             let relay_uid = if approval_relays.is_empty() {
                 None
             } else {
                 Some(gateway_uid(&relay_user)?)
+            };
+            let settings = Settings {
+                admin_uid,
+                relay_uid,
+                wallet_budget_sats,
+                ..Settings::default()
             };
             serve(
                 out,
@@ -66,11 +59,10 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     settings,
                     limits: Limits::default(),
                     approvals: daemon::ApprovalConfig {
-                        channel,
+                        channel: None,
                         relays: approval_relays,
                         deadline_secs: approval_deadline,
-                        relay_socket: Some(relay_socket),
-                        relay_uid,
+                        relay_socket,
                     },
                 },
             )
@@ -431,7 +423,7 @@ fn show_qr(text: &str) {
     }
 }
 
-fn serve(out: &Output, config: Config) -> Result<()> {
+fn serve(out: &Output, mut config: Config) -> Result<()> {
     // A password in the environment is visible to `systemctl show`, to
     // anything the unit's environment files reach, and to root through
     // /proc, and is too easily left there: the gateway never reads one.
@@ -451,6 +443,16 @@ fn serve(out: &Output, config: Config) -> Result<()> {
     // Before the vault is unlocked: no core dump or same-uid debugger may
     // read the process from here on.
     daemon::harden().map_err(|e| KeepError::Runtime(e.to_string()))?;
+    // The channel key is a secret like the password: read only now, under
+    // the same checks.
+    config.approvals.channel = channel_key()?;
+    if !config.approvals.relays.is_empty() && config.approvals.channel.is_none() {
+        return Err(KeepError::InvalidInput(format!(
+            "approvals need the {:?} credential: generate it with `keep gateway channel-key \
+             new` and load it in the unit",
+            daemon::CHANNEL_KEY_CREDENTIAL
+        )));
+    }
     let mut keep = Keep::open(&config.vault)?;
     let password = vault_password()?;
     let spinner = out.spinner("Unlocking vault...");

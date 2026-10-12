@@ -972,6 +972,57 @@ fn start_refuses_what_it_cannot_serve_safely() {
     start(keep, settings(), &boot, BOOT).unwrap();
 }
 
+/// The relay helper's user is one of its own: never root, the gateway's, the
+/// vault owner's, the overflow uid or the admin's. No credential may be bound
+/// to it, so no agent can take the helper's one connection, and a credential
+/// already bound to it stops a start.
+#[test]
+fn the_relay_helpers_user_is_its_own_and_holds_no_credential() {
+    const RELAY_UID: u32 = 1700;
+    let dir = tempfile::tempdir().unwrap();
+    let relay = |uid| Settings {
+        relay_uid: Some(uid),
+        ..settings()
+    };
+    let err = |keep, settings: Settings| {
+        State::start(
+            keep,
+            settings,
+            HOST,
+            Box::new(FakeBoot::default()),
+            BOOT.into(),
+        )
+        .err()
+        .unwrap()
+        .to_string()
+    };
+    for uid in [0, HOST.euid, HOST.vault_owner, HOST.overflow_uid, ADMIN] {
+        let (keep, _) = vault(dir.path());
+        assert!(
+            err(keep, relay(uid)).contains("relay helper's user"),
+            "{uid}"
+        );
+    }
+
+    let mut g = Gw::with(relay(RELAY_UID));
+    let answer = g.admin(json!({
+        "op": "issue", "name": "agent", "uid": RELAY_UID, "grant": nostr_grant(g.key),
+    }));
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["error"].as_str().unwrap().contains("relay helper's"),
+        "{answer}"
+    );
+    g.issue(&nostr_grant(g.key), AGENT);
+
+    let (mut keep, key) = vault(dir.path());
+    let grant = serde_json::to_vec(&nostr_grant(key)).unwrap();
+    let (bound, _) = keep
+        .issue_agent_credential("bound", RELAY_UID, grant, T0, 3_600)
+        .unwrap();
+    assert!(err(keep, relay(RELAY_UID)).contains(&bound.id_hex()));
+}
+
 #[test]
 fn the_budget_clock_counts_only_running_time_whatever_the_wall_clock() {
     let g = Gw::new();

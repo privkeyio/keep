@@ -2907,6 +2907,29 @@ fn test_gateway_channel_key_goes_only_to_a_pipe_and_approvals_need_it() {
         "{output:?}"
     );
     assert!(!output_contains(&output, key), "the key was printed");
+    // The key is read only after the gateway's own refusals.
+    let output = Command::new(&keep)
+        .env_clear()
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .env("KEEP_PASSWORD", TEST_PASSWORD)
+        .arg("--path")
+        .arg(&vault)
+        .args([
+            "gateway",
+            "serve",
+            "--approval-relay",
+            "wss://relay.example.com",
+            "--relay-user",
+            &me.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "never reads the vault password from KEEP_PASSWORD"),
+        "{output:?}"
+    );
     // Closed, the gateway goes on to its sockets, which do not exist here.
     std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o400)).unwrap();
     let output = serve();

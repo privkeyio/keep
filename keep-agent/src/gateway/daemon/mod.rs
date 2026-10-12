@@ -83,6 +83,55 @@ mod dir_tests {
         .is_err());
     }
 
+    /// The relay socket needs a directory of its own however its path is
+    /// written: agents reach the agent socket's directory, and anyone there
+    /// could otherwise reach the relay socket too.
+    #[tokio::test]
+    async fn the_relay_socket_needs_a_directory_of_its_own_however_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str, mode: u32| {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            dir
+        };
+        let (agent, admin) = (dir("agent", 0o750), dir("admin", 0o700));
+        std::fs::create_dir(root.path().join("vault")).unwrap();
+        for relay_socket in [
+            agent.join(".").join("relay.sock"),
+            admin.join("..").join("admin").join("relay.sock"),
+        ] {
+            let (keep, _) = super::tests::vault(&root.path().join("vault"));
+            let config = super::Config {
+                vault: root.path().join("vault").join("keep"),
+                sockets: super::Sockets {
+                    agent: agent.join("agent.sock"),
+                    admin: admin.join("admin.sock"),
+                },
+                settings: super::Settings {
+                    relay_uid: Some(4_242),
+                    ..super::Settings::default()
+                },
+                limits: super::Limits::default(),
+                approvals: super::ApprovalConfig {
+                    channel: Some(super::approval_tests::channel()),
+                    relays: vec!["wss://relay.example.com".into()],
+                    deadline_secs: 60,
+                    relay_socket: relay_socket.clone(),
+                },
+            };
+            let Err(err) = super::run(keep, config, async {}).await else {
+                panic!("{} was accepted", relay_socket.display());
+            };
+            assert!(
+                err.to_string()
+                    .contains("the relay socket needs a directory of its own"),
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn readiness_reaches_a_path_or_an_abstract_notification_socket() {
         use std::os::linux::net::SocketAddrExt;
@@ -134,26 +183,13 @@ pub struct Config {
 
 /// Approvals over Nostr: the channel key, read from its own credential
 /// (never from the vault), the relays, the deadline, and the relay helper's
-/// socket and user.
+/// socket. The helper's user is [`Settings::relay_uid`].
 #[derive(Debug, Clone)]
 pub struct ApprovalConfig {
     pub channel: Option<nostr_sdk::prelude::Keys>,
     pub relays: Vec<String>,
     pub deadline_secs: u64,
-    pub relay_socket: Option<PathBuf>,
-    pub relay_uid: Option<u32>,
-}
-
-impl Default for ApprovalConfig {
-    fn default() -> Self {
-        Self {
-            channel: None,
-            relays: Vec::new(),
-            deadline_secs: keep_approval::binding::DEFAULT_DEADLINE_SECS,
-            relay_socket: None,
-            relay_uid: None,
-        }
-    }
+    pub relay_socket: PathBuf,
 }
 
 /// The name of the credential holding the channel key.
@@ -277,6 +313,7 @@ pub async fn run(
         ));
     }
     let host = Host::detect(&vault)?;
+    let relay_uid = settings.relay_uid;
     let mut state = State::start(
         keep,
         settings,
@@ -286,19 +323,20 @@ pub async fn run(
     )?;
     let with_channel = approvals.channel.is_some();
     state.configure_approvals(approvals.channel, approvals.relays, approvals.deadline_secs)?;
-    let relay_at = match (with_channel, approvals.relay_socket, approvals.relay_uid) {
-        (false, _, _) => None,
-        (true, Some(path), Some(uid)) => {
-            if path.parent() == sockets.agent.parent() || path.parent() == sockets.admin.parent() {
+    let relay_at = match (with_channel, relay_uid) {
+        (false, _) => None,
+        (true, Some(uid)) => {
+            let path = approvals.relay_socket;
+            if same_directory(&path, &sockets.agent)? || same_directory(&path, &sockets.admin)? {
                 return Err(AgentError::Other(
                     "the relay socket needs a directory of its own".into(),
                 ));
             }
             Some((path, uid))
         }
-        (true, _, _) => {
+        (true, None) => {
             return Err(AgentError::Other(
-                "approvals need the relay helper's socket and user".into(),
+                "approvals need the relay helper's user".into(),
             ))
         }
     };

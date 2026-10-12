@@ -112,6 +112,9 @@ impl Host {
 pub struct Settings {
     /// The one non-root uid allowed on the admin socket.
     pub admin_uid: Option<u32>,
+    /// The relay helper's user, when approvals are on: the only uid the
+    /// relay socket serves, so no credential may be bound to it.
+    pub relay_uid: Option<u32>,
     /// What every credential together may take out of one key's wallet in any
     /// budget window, fees included. Zero refuses every spend.
     pub wallet_budget_sats: u64,
@@ -126,6 +129,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             admin_uid: None,
+            relay_uid: None,
             wallet_budget_sats: 0,
             uid_limits: RequestLimits {
                 per_minute: 120,
@@ -378,6 +382,21 @@ impl State {
                 )));
             }
         }
+        // An agent sharing the helper's uid could take its one connection
+        // and cut the phones off.
+        if let Some(relay) = settings.relay_uid {
+            if relay == 0
+                || relay == host.euid
+                || relay == host.vault_owner
+                || relay == host.overflow_uid
+                || settings.admin_uid == Some(relay)
+            {
+                return Err(AgentError::Other(format!(
+                    "uid {relay} cannot be the relay helper's user: give it a user of its own, \
+                     not root, the gateway's, the vault owner's or the admin's"
+                )));
+            }
+        }
         // Read before anything is served: an unreadable freeze refuses to start.
         let frozen = keep
             .agent_freeze()
@@ -455,8 +474,8 @@ impl State {
             .collect();
         if !bound_wrongly.is_empty() {
             return Err(AgentError::Other(format!(
-                "credentials bound to the gateway's, the vault owner's, the admin's or the overflow \
-                 uid must be revoked first: {}",
+                "credentials bound to the gateway's, the vault owner's, the admin's, the relay \
+                 helper's or the overflow uid must be revoked first: {}",
                 bound_wrongly.join(", ")
             )));
         }
@@ -1341,8 +1360,8 @@ impl State {
     fn issuable_grant(&self, uid: u32, grant: Value) -> Result<Grant> {
         if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
             return Err(AgentError::ScopeViolation(format!(
-                "uid {uid} is root, the gateway's, the vault owner's, the admin's or the \
-                 overflow uid; a credential bound to it would stop nothing"
+                "uid {uid} is root, the gateway's, the vault owner's, the admin's, the relay \
+                 helper's or the overflow uid; a credential bound to it would stop nothing"
             )));
         }
         let grant: Grant = serde_json::from_value(grant)
@@ -1616,12 +1635,14 @@ pub enum AdminRequest {
 
 /// Whether a credential must never be bound to `uid` on this host: binding it
 /// to the gateway's own uid, the vault owner's, the admin's or the overflow
-/// uid would stop nothing.
+/// uid would stop nothing, and an agent with the relay helper's could take
+/// the helper's connection.
 fn forbidden_uid(host: &Host, settings: &Settings, uid: u32) -> bool {
     uid == host.euid
         || uid == host.vault_owner
         || uid == host.overflow_uid
         || settings.admin_uid == Some(uid)
+        || settings.relay_uid == Some(uid)
 }
 
 fn load_credential(keep: &Keep, id: &[u8; 16]) -> Result<Option<AgentCredential>> {
