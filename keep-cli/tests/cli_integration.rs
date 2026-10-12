@@ -2737,6 +2737,42 @@ fn test_gateway_serve_takes_its_password_only_from_a_closed_credential() {
     assert!(!output_contains(&output, "Decryption failed"), "{output:?}");
 }
 
+/// An offline reset of the approvers runs only as the vault's owner, so no
+/// file in the gateway's vault comes to belong to anyone else; root is no
+/// exception.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_offline_reset_runs_only_as_the_vaults_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let me = std::fs::metadata("/proc/self").unwrap().uid();
+    // A vault directory someone else owns: root makes one; anyone else is
+    // pointed at one root owns.
+    let vault = if me == 0 {
+        let vault = dir.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::os::unix::fs::chown(&vault, Some(65534), Some(65534)).unwrap();
+        vault
+    } else {
+        std::path::PathBuf::from("/")
+    };
+    let output = Command::new(&keep)
+        .env_clear()
+        .arg("--path")
+        .arg(&vault)
+        .args(["gateway", "approver", "reset", "--offline"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "as the vault's owner"),
+        "{output:?}"
+    );
+}
+
 /// `keep gateway channel-key new` writes the key only into a pipe, as 64
 /// hex digits on one line, and the public key to stderr; `keep gateway
 /// serve` with relays needs that key as a credential, and checks it as it

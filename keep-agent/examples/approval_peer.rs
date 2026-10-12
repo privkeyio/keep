@@ -11,7 +11,8 @@
 //!                              relays, then follow commands on stdin
 //! ```
 //!
-//! The phone reads one command per line: `approve` or `deny` (the oldest
+//! The phone reads one command per line, and keeps running when its input
+//! ends: `approve` or `deny` (the oldest
 //! request not yet decided), `freeze all`, `freeze <credential id>`,
 //! `unfreeze all`, `unfreeze <credential id>` (at the latest anchor's
 //! epoch), or `quit`. It reports one line per event on stdout:
@@ -95,15 +96,8 @@ impl Phone {
 
     async fn send(&self, kind: u16, content: &str) {
         let tag = TagKey::for_peer(&self.transport, &self.channel).expect("a tag key");
-        let event = wrap::wrap(
-            &self.transport,
-            &self.channel,
-            &tag,
-            kind,
-            content,
-            now(),
-        )
-        .expect("a wrap");
+        let event =
+            wrap::wrap(&self.transport, &self.channel, &tag, kind, content, now()).expect("a wrap");
         if let Err(e) = self.client.send_event(&event).await {
             say(&format!("send-failed {e}"));
         }
@@ -148,8 +142,7 @@ impl Phone {
             }
             kind::OUTCOME => {
                 if let Ok(outcome) = wire::parse::<Outcome>(content) {
-                    self.requests
-                        .retain(|r| r.request_id != outcome.request_id);
+                    self.requests.retain(|r| r.request_id != outcome.request_id);
                     say(&format!(
                         "outcome {} {}",
                         outcome.request_id.to_hex(),
@@ -281,11 +274,20 @@ async fn phone(uri: &str) {
     client.send_event(&event).await.expect("the pairing sent");
     say(&format!("fingerprint {}", sig::fingerprint(&t, &a)));
 
-    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    // Without commands (stdin ended) it goes on reporting until killed.
+    let mut stdin = Some(tokio::io::BufReader::new(tokio::io::stdin()).lines());
     loop {
         tokio::select! {
-            line = stdin.next_line() => {
-                let Ok(Some(line)) = line else { break };
+            line = async {
+                match stdin.as_mut() {
+                    Some(lines) => lines.next_line().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Ok(Some(line)) = line else {
+                    stdin = None;
+                    continue;
+                };
                 let mut words = line.split_whitespace();
                 match (words.next(), words.next()) {
                     (Some("approve"), None) => phone.decide(Verdict::Approve).await,

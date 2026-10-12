@@ -310,25 +310,33 @@ fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> 
         ApproverCommands::List { target } => {
             print(&admin(&target, json!({ "op": "approver_list" }))?)
         }
-        ApproverCommands::Remove { transport, target } => {
-            let result = admin_waiting(
-                &target,
-                json!({ "op": "approver_remove", "transport": transport }),
-            )
-            .map_err(|f| f.error)?;
-            print(&result.result)
-        }
+        ApproverCommands::Remove { transport, target } => print(&admin(
+            &target,
+            json!({ "op": "approver_remove", "transport": transport }),
+        )?),
         ApproverCommands::Reset { offline, target } => {
-            if daemon::euid() != 0 {
-                return Err(KeepError::InvalidInput(
-                    "only root may reset the approver devices".into(),
-                ));
-            }
             if !offline {
+                if daemon::euid() != 0 {
+                    return Err(KeepError::InvalidInput(
+                        "only root may reset the approver devices".into(),
+                    ));
+                }
                 return print(&admin(&target, json!({ "op": "approver_reset" }))?);
             }
             // The gateway is stopped (a new host, a cleared TPM): reset the
-            // vault directly, recorded in its audit log.
+            // vault directly, recorded in its audit log. The vault password is
+            // the authority here, and the vault's own user runs it, so no file
+            // in the vault comes to belong to anyone else.
+            use std::os::unix::fs::MetadataExt;
+            let owner = std::fs::metadata(path)
+                .map_err(|e| KeepError::Runtime(format!("{}: {e}", path.display())))?
+                .uid();
+            if daemon::euid() != owner {
+                return Err(KeepError::InvalidInput(format!(
+                    "run the offline reset as the vault's owner, uid {owner} (for the gateway, \
+                     `sudo -u keep-gateway`)"
+                )));
+            }
             let mut keep = Keep::open(path)?;
             let password = vault_password()?;
             keep.unlock(&password)?;
@@ -708,14 +716,6 @@ fn admin_answer(
 ) -> std::result::Result<AdminAnswer, AdminFailure> {
     let mut session = AdminSession::open(target, ADMIN_WAIT)?;
     session.request(&request)
-}
-
-/// [`admin_answer`]'s result, for a request that may wait for an approver.
-fn admin_waiting(
-    target: &AdminTarget,
-    request: Value,
-) -> std::result::Result<AdminAnswer, AdminFailure> {
-    admin_answer(target, request)
 }
 
 fn print(value: &Value) -> Result<()> {
