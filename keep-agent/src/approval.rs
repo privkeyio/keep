@@ -317,6 +317,8 @@ pub struct Parked {
 impl Parked {
     /// Build the request for `object` as the gateway `channel` sends it, with
     /// every check an approver runs and the size limit, and its hash.
+    // Only the gateway daemon, which runs on Linux alone, builds one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn new(object: ParkedObject, info: ParkRequest, channel: &[u8; 32]) -> Result<Self> {
         let refuse = |e: keep_approval::Error| match e {
             keep_approval::Error::TooLarge(_) => {
@@ -433,6 +435,8 @@ impl Approval {
     /// device's approver key over the gateway's `channel` key, the approver
     /// key, that hash and the verdict. Anything else hands the parked request
     /// back with the reason.
+    // Only the gateway daemon, which runs on Linux alone, builds one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn verify(
         decision: &SignedDecision,
         channel: &[u8; 32],
