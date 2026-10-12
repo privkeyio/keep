@@ -6152,8 +6152,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keep");
         let mut keep = test_keep(&path);
-        for name in ["a", "b", "c", "d", "e", "f"] {
-            keep.generate_key(name).unwrap();
+        // Enough entries that two are surely of the same length: a hash is
+        // written as an array of numbers, so lengths vary.
+        for n in 0..40 {
+            keep.generate_key(&format!("k{n}")).unwrap();
         }
         drop(keep);
         let edit = |change: &dyn Fn(&mut Vec<String>)| {
