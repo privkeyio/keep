@@ -61,32 +61,17 @@ RELAY_USER=keep-gateway-relay
 RELAY_UNIT=keep-gateway-relay.service
 RELAY_UNIT_FILE=/etc/systemd/system/$RELAY_UNIT
 RELAY_PID=
+PAIR_PID=
+PHONE_PID=
 PASS=systemd-e2e-vault-password
-CREATED_USERS=()
-CREATED_GROUPS=()
 CREATED=()
 UNIT_INSTALLED=
+. "$(dirname "$0")/lib/gateway-e2e.sh"
 
-# Never touch what this script did not create.
-for u in $GW $AGENT $ADMIN $OUT $RELAY_USER; do
-    if getent passwd "$u" >/dev/null; then
-        echo "refusing to run: user $u already exists" >&2
-        exit 2
-    fi
-done
-for g in $GW keep-agents keep-admins $RELAY_USER; do
-    if getent group "$g" >/dev/null; then
-        echo "refusing to run: group $g already exists" >&2
-        exit 2
-    fi
-done
-for p in "$UNIT_FILE" "$DROPIN" "$RELAY_UNIT_FILE" "$BIN" /etc/keep "$STATE" /run/keep-gateway \
-    /run/keep-gateway-admin /run/keep-gateway-relay; do
-    if [[ -e $p ]]; then
-        echo "refusing to run: $p already exists" >&2
-        exit 2
-    fi
-done
+refuse_users $GW $AGENT $ADMIN $OUT $RELAY_USER
+refuse_groups $GW keep-agents keep-admins $AGENT $ADMIN $OUT $RELAY_USER
+refuse_paths "$UNIT_FILE" "$DROPIN" "$RELAY_UNIT_FILE" "$BIN" /etc/keep "$STATE" /run/keep-gateway \
+    /run/keep-gateway-admin /run/keep-gateway-relay
 for u in "$UNIT" "$RELAY_UNIT"; do
     if systemctl cat "$u" >/dev/null 2>&1; then
         echo "refusing to run: a $u unit is already installed" >&2
@@ -98,19 +83,16 @@ done
 [[ -e $HOST_SECRET ]] || CREATED+=("$HOST_SECRET")
 WORK=$(mktemp -d /var/tmp/kgsd.XXXXXX)
 
-fail() {
-    echo "FAIL: $*" >&2
-    echo "--- journal ---" >&2
-    journalctl -u "$UNIT" --no-pager -n 40 -o cat >&2 || true
-    exit 1
+fail_context() {
+    echo "--- journal ---"
+    journalctl -u "$UNIT" --no-pager -n 40 -o cat
 }
-pass() { echo "ok - $*"; }
 
 cleanup() {
     systemctl stop "$RELAY_UNIT" >/dev/null 2>&1 || true
     systemctl reset-failed "$RELAY_UNIT" >/dev/null 2>&1 || true
     rm -f "$RELAY_UNIT_FILE"
-    if [[ -n $RELAY_PID ]]; then kill "$RELAY_PID" 2>/dev/null || true; fi
+    stop_pid "$PAIR_PID" "$PHONE_PID" "$RELAY_PID"
     if [[ -n $UNIT_INSTALLED ]]; then
         systemctl stop "$UNIT" >/dev/null 2>&1 || true
         systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
@@ -118,13 +100,7 @@ cleanup() {
     rm -rf "$DROPIN"
     rm -f "$UNIT_FILE"
     systemctl daemon-reload || true
-    for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
-    for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
-    for g in "${CREATED_GROUPS[@]}"; do
-        # userdel may have removed a user's own group already.
-        getent group "$g" >/dev/null || continue
-        groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2
-    done
+    remove_created_accounts
     for p in "${CREATED[@]}"; do rm -rf "$p"; done
     rm -rf /run/keep-gateway /run/keep-gateway-admin /run/keep-gateway-relay
     rm -rf "$WORK"
@@ -139,20 +115,9 @@ CREATED_GROUPS+=(keep-admins)
 useradd --system --user-group --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin $GW
 CREATED_USERS+=($GW)
 CREATED_GROUPS+=($GW)
-add_user() {
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$@"
-    CREATED_USERS+=("${@: -1}")
-}
 add_user -G keep-agents "$AGENT"
 add_user -G keep-admins "$ADMIN"
 add_user "$OUT"
-uid() { id -u "$1"; }
-as() {
-    local user=$1
-    shift
-    setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups \
-        env -i PATH=/usr/bin:/bin HOME="$WORK" "$@"
-}
 
 install -m 0755 "$BIN_SRC" "$BIN"
 CREATED+=("$BIN")
@@ -443,59 +408,24 @@ EOF
     pass "the gateway runs with the approvals drop-in and the helper's unit connects as $RELAY_USER"
 
     # Pair a phone on a terminal, as root does the first time.
-    cat >"$WORK/pair.py" <<'PY'
-import os, pty, re, sys, time
-uri_out, phone_fp = sys.argv[1], sys.argv[2]
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(sys.argv[3], sys.argv[3:])
-buf = b""
-def until(pattern, secs):
-    global buf
-    deadline = time.time() + secs
-    while time.time() < deadline:
-        m = re.search(pattern, buf)
-        if m:
-            return m
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    sys.exit("timed out waiting for %r; got %r" % (pattern, buf[-2000:]))
-open(uri_out, "w").write(until(rb"(keep-approver:v1\?[^\s]+)", 30).group(1).decode())
-shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)", 120).group(1).decode()
-for _ in range(600):
-    if os.path.exists(phone_fp) and os.path.getsize(phone_fp):
-        break
-    time.sleep(0.1)
-os.write(fd, b"y\n" if open(phone_fp).read().strip() == shown else b"n\n")
-while True:
-    try:
-        chunk = os.read(fd, 4096)
-    except OSError:
-        break
-    if not chunk:
-        break
-_, status = os.waitpid(pid, 0)
-sys.exit(os.waitstatus_to_exitcode(status))
-PY
-    python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$BIN" gateway approver pair --label Phone \
-        >"$WORK/pair.out" 2>&1 &
-    PAIR=$!
+    write_pair_driver "$WORK/pair.py"
+    python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$WORK/pair.answer" "$BIN" gateway approver pair \
+        --label Phone >"$WORK/pair.out" 2>&1 &
+    PAIR_PID=$!
     for _ in $(seq 300); do [[ -s $WORK/uri ]] && break; sleep 0.1; done
     [[ -s $WORK/uri ]] || fail "no pairing code: $(cat "$WORK/pair.out")"
     "$PEER" phone "$(cat "$WORK/uri")" </dev/null >"$WORK/phone.log" 2>&1 &
-    PHONE=$!
+    PHONE_PID=$!
     for _ in $(seq 300); do grep -q '^fingerprint ' "$WORK/phone.log" && break; sleep 0.1; done
     awk '/^fingerprint / {sub(/^fingerprint /, ""); print; exit}' "$WORK/phone.log" >"$WORK/phone.fp.tmp"
     mv "$WORK/phone.fp.tmp" "$WORK/phone.fp"
-    wait "$PAIR" || fail "pairing: $(cat "$WORK/pair.out")"
+    wait "$PAIR_PID" || fail "pairing: $(cat "$WORK/pair.out")"
+    PAIR_PID=
+    [[ $(cat "$WORK/pair.answer") == same ]] || fail "the fingerprints differ"
     for _ in $(seq 300); do grep -q '^paired$' "$WORK/phone.log" && break; sleep 0.1; done
     grep -q '^paired$' "$WORK/phone.log" || fail "the phone was not told it is paired: $(cat "$WORK/phone.log")"
-    kill "$PHONE" 2>/dev/null || true
+    stop_pid "$PHONE_PID"
+    PHONE_PID=
     [[ $("$BIN" gateway status | python3 -c 'import json,sys; print(json.load(sys.stdin)["approvals"]["approvers"])') == 1 ]] \
         || fail "no approver registered"
     pass "a phone paired through the gateway in its sandbox, with no network of its own, and the helper"

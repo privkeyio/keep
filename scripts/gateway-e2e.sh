@@ -35,49 +35,19 @@ ADMINS=${P}admins
 RUN=/run/${P}
 GW_PID=
 PASS=e2e-vault-password
-CREATED_USERS=()
-CREATED_GROUPS=()
 CREATED_RUN=
+. "$(dirname "$0")/lib/gateway-e2e.sh"
 
-# Never touch accounts or a run directory this script did not create.
-for u in $GW $ADMIN $A1 $A2 $OUT; do
-    if getent passwd "$u" >/dev/null; then
-        echo "refusing to run: user $u already exists" >&2
-        exit 2
-    fi
-done
-for g in $AGENTS $ADMINS; do
-    if getent group "$g" >/dev/null; then
-        echo "refusing to run: group $g already exists" >&2
-        exit 2
-    fi
-done
-if [[ -e $RUN ]]; then
-    echo "refusing to run: $RUN already exists" >&2
-    exit 2
-fi
+refuse_users $GW $ADMIN $A1 $A2 $OUT
+refuse_groups $AGENTS $ADMINS
+refuse_paths "$RUN"
 WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 
-fail() {
-    echo "FAIL: $*" >&2
+fail_context() {
     if [[ -f $WORK/gateway.log ]]; then
-        echo "--- gateway log ---" >&2
-        tail -50 "$WORK/gateway.log" >&2
+        echo "--- gateway log ---"
+        tail -50 "$WORK/gateway.log"
     fi
-    exit 1
-}
-pass() { echo "ok - $*"; }
-
-# Wait at most 10 seconds for `pid` to exit, then kill it.
-reap() {
-    local pid=$1 status=0
-    for _ in $(seq 100); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || status=$?
-    return "$status"
 }
 
 cleanup() {
@@ -85,10 +55,7 @@ cleanup() {
         kill "$GW_PID" 2>/dev/null || true
         reap "$GW_PID" || true
     fi
-    # Anything left running as these users would keep userdel from removing them.
-    for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
-    for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
-    for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
+    remove_created_accounts
     rm -rf "$WORK"
     if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
 }
@@ -98,28 +65,15 @@ for g in $AGENTS $ADMINS; do
     groupadd --system "$g"
     CREATED_GROUPS+=("$g")
 done
-add_user() {
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$@"
-    CREATED_USERS+=("${@: -1}")
-}
 add_user "$GW"
 add_user -G "$ADMINS" "$ADMIN"
 add_user -G "$AGENTS" "$A1"
 add_user -G "$AGENTS" "$A2"
 add_user "$OUT"
-uid() { id -u "$1"; }
 
 chmod 0755 "$WORK"
 install -m 0755 "$BIN_SRC" "$WORK/keep"
 KEEP=$WORK/keep
-# Run as `user` with its own groups. setpriv execs the command, so a
-# backgrounded call's $! is the command itself.
-as() {
-    local user=$1
-    shift
-    setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups \
-        env -i PATH=/usr/bin:/bin HOME="$WORK" "$@"
-}
 
 # The vault, owned by the gateway's user and closed to everyone else.
 install -d -m 0700 -o "$GW" -g "$GW" "$WORK/vault-home"

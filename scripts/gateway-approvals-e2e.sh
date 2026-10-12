@@ -47,65 +47,31 @@ HELPER_PID=
 RELAY_PID=
 PHONE_PID=
 OLD_GW_PID=
-CREATED_USERS=()
-CREATED_GROUPS=()
+PAIR_PID=
+AGENT_PID=
+CLI_PID=
+MCP_PID=
 CREATED_RUN=
+. "$(dirname "$0")/lib/gateway-e2e.sh"
 
-for u in $GW $RELAY_USER $ADMIN $A1; do
-    if getent passwd "$u" >/dev/null; then
-        echo "refusing to run: user $u already exists" >&2
-        exit 2
-    fi
-done
-for g in $GW $RELAY_USER $AGENTS $ADMINS; do
-    if getent group "$g" >/dev/null; then
-        echo "refusing to run: group $g already exists" >&2
-        exit 2
-    fi
-done
-if [[ -e $RUN ]]; then
-    echo "refusing to run: $RUN already exists" >&2
-    exit 2
-fi
+refuse_users $GW $RELAY_USER $ADMIN $A1
+refuse_groups $GW $RELAY_USER $ADMIN $A1 $AGENTS $ADMINS
+refuse_paths "$RUN"
 WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 
-fail() {
-    echo "FAIL: $*" >&2
+fail_context() {
     for log in gateway helper phone; do
         if [[ -f $WORK/$log.log ]]; then
-            echo "--- $log log ---" >&2
-            tail -40 "$WORK/$log.log" >&2
+            echo "--- $log log ---"
+            tail -40 "$WORK/$log.log"
         fi
     done
-    exit 1
-}
-pass() { echo "ok - $*"; }
-
-reap() {
-    local pid=$1 status=0
-    for _ in $(seq 100); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || status=$?
-    return "$status"
-}
-
-stop_pid() {
-    local pid=$1
-    if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        reap "$pid" || true
-    fi
 }
 
 cleanup() {
     exec 7>&- 2>/dev/null || true
-    for pid in "$PHONE_PID" "$HELPER_PID" "$GW_PID" "$OLD_GW_PID" "$RELAY_PID"; do stop_pid "$pid"; done
-    for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
-    for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
-    for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
+    stop_pid "$PAIR_PID" "$CLI_PID" "$MCP_PID" "$AGENT_PID" "$PHONE_PID" "$HELPER_PID" "$GW_PID" "$OLD_GW_PID" "$RELAY_PID"
+    remove_created_accounts
     rm -rf "$WORK"
     if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
 }
@@ -115,16 +81,10 @@ for g in $AGENTS $ADMINS; do
     groupadd --system "$g"
     CREATED_GROUPS+=("$g")
 done
-add_user() {
-    useradd --system --user-group --no-create-home --shell /usr/sbin/nologin "$@"
-    CREATED_USERS+=("${@: -1}")
-    CREATED_GROUPS+=("${@: -1}")
-}
-add_user "$GW"
-add_user "$RELAY_USER"
-add_user -G "$ADMINS" "$ADMIN"
-add_user -G "$AGENTS" "$A1"
-uid() { id -u "$1"; }
+add_user --user-group "$GW"
+add_user --user-group "$RELAY_USER"
+add_user --user-group -G "$ADMINS" "$ADMIN"
+add_user --user-group -G "$AGENTS" "$A1"
 
 chmod 0755 "$WORK"
 install -m 0755 "$BIN_SRC" "$WORK/keep"
@@ -136,13 +96,6 @@ if [[ -n $OLD_SRC ]]; then
     install -m 0755 "$OLD_SRC" "$WORK/old-keep"
     OLD=$WORK/old-keep
 fi
-as() {
-    local user=$1
-    shift
-    setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups \
-        env -i PATH=/usr/bin:/bin HOME="$WORK" "$@"
-}
-
 # Wait at most `secs` seconds for `file` to hold `count` lines matching
 # `pattern`. grep reads the file itself: nothing is piped into grep -q.
 wait_for() {
@@ -375,53 +328,7 @@ grep -q "only root may pair the first" <<<"$msg" || fail "admin pairing first: $
 # Pairing on a terminal: the driver runs `keep gateway approver pair` on a
 # pty, hands the pairing code to the phone, and answers the fingerprint
 # question with whether the phone shows the same.
-cat >"$WORK/pair.py" <<'PY'
-import os, pty, re, sys, time
-uri_out, phone_fp, answer_out = sys.argv[1], sys.argv[2], sys.argv[3]
-argv = sys.argv[4:]
-pid, fd = pty.fork()
-if pid == 0:
-    os.execvp(argv[0], argv)
-buf = b""
-def until(pattern, secs):
-    global buf
-    deadline = time.time() + secs
-    while time.time() < deadline:
-        m = re.search(pattern, buf)
-        if m:
-            return m
-        try:
-            chunk = os.read(fd, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        buf += chunk
-    sys.exit("timed out waiting for %r; got %r" % (pattern, buf[-2000:]))
-uri = until(rb"(keep-approver:v1\?[^\s]+)", 30).group(1).decode()
-open(uri_out + ".tmp", "w").write(uri)
-os.rename(uri_out + ".tmp", uri_out)
-shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)", 120).group(1).decode()
-for _ in range(600):
-    if os.path.exists(phone_fp) and os.path.getsize(phone_fp):
-        break
-    time.sleep(0.1)
-same = open(phone_fp).read().strip() == shown
-open(answer_out, "w").write("same" if same else "different")
-os.write(fd, b"y\n" if same else b"n\n")
-while True:
-    try:
-        chunk = os.read(fd, 4096)
-    except OSError:
-        break
-    if not chunk:
-        break
-    buf += chunk
-_, status = os.waitpid(pid, 0)
-sys.stdout.write(buf.decode(errors="replace"))
-sys.exit(os.waitstatus_to_exitcode(status))
-PY
-chmod 0644 "$WORK/pair.py"
+write_pair_driver "$WORK/pair.py"
 
 python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$WORK/pair.answer" \
     "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" \
