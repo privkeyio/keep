@@ -910,7 +910,7 @@ The bridge sends one request at a time over one connection. It keeps running whe
 
 | Error code | Meaning |
 |------------|---------|
-| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. |
+| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. A notification (a message with no `id`, such as `notifications/cancelled`) is never answered, refused or not. |
 | `-32002` | The credential is over its per-minute, per-hour or per-day request limit, or the gateway is tracking too many credentials. |
 | `-32010` | The request was not sent, or the gateway turned it away unread: the gateway is stopped or restarting, the socket failed the checks above, or the agent's uid already holds as many connections as the gateway allows (8 open connections by default; uids no credential is bound to share one pool of 8), or the gateway holds its most connections in all (128 by default). |
 | `-32011` | The request was sent and no answer came: the connection closed, no part of the answer came for 150 seconds, or the answer was not for this request. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
