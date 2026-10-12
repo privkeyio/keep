@@ -1083,6 +1083,38 @@ impl Keep {
         }
     }
 
+    /// Freeze again `credential`, or every agent when it is `None`, which is
+    /// frozen already: move the freeze epoch on by one and store the agent
+    /// ledgers `ledgers`, in one durable write, so an unfreeze approved for
+    /// the state before can no longer apply. Nothing changes but the epoch,
+    /// so no entry is written unless the epoch had to be seeded. Refused
+    /// when the scope is not frozen. Returns the new epoch.
+    pub fn refreeze_agent(
+        &mut self,
+        credential: Option<&[u8; 16]>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<u64> {
+        let frozen = match credential {
+            Some(id) => self.agent_credential(id)?.frozen,
+            None => self.storage.get_agent_freeze()?,
+        };
+        if !frozen {
+            return Err(KeepError::invalid_input("not frozen: freeze it instead"));
+        }
+        let moved = self
+            .storage
+            .set_agent_frozen(credential, true, None, ledgers)?;
+        if moved.seeded {
+            let reason = match credential {
+                Some(id) => format!("agent {} again", hex::encode(id)),
+                None => "every agent again".to_string(),
+            };
+            let reason = format!("{reason}{}", seeded_note(Some(moved)));
+            self.audit_event(AuditEventType::AgentFreeze, |e| e.with_reason(&reason));
+        }
+        Ok(moved.epoch)
+    }
+
     /// Overwrite the vault-wide agent freeze with bytes that do not decrypt,
     /// for tests of what must fail closed when it cannot be read.
     #[cfg(feature = "testing")]
@@ -1090,6 +1122,17 @@ impl Keep {
         self.storage.put_raw(
             crate::backend::CONFIG_TABLE,
             b"agent_freeze",
+            b"not ciphertext",
+        )
+    }
+
+    /// Overwrite the agent freeze epoch with bytes that do not decrypt, for
+    /// tests of what must go ahead without it.
+    #[cfg(feature = "testing")]
+    pub fn corrupt_agent_freeze_epoch_for_testing(&self) -> Result<()> {
+        self.storage.put_raw(
+            crate::backend::CONFIG_TABLE,
+            b"agent_freeze_epoch",
             b"not ciphertext",
         )
     }
@@ -3095,6 +3138,35 @@ mod tests {
         let ids = keep.agent_credential_ids().unwrap();
         assert!(ids.contains(&[0xff; 16]) && ids.contains(&credential.id));
         assert!(keep.authenticate_agent(&token, 1000, unix_now()).is_err());
+    }
+
+    /// Freezing again what is frozen moves the epoch with no entry, and is
+    /// refused for what is not frozen.
+    #[test]
+    fn a_refreeze_moves_the_epoch_without_an_entry() {
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let (credential, _) = keep
+            .issue_agent_credential("claude", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        assert!(keep.refreeze_agent(None, &[]).is_err());
+        assert!(keep.refreeze_agent(Some(&credential.id), &[]).is_err());
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), 0);
+        keep.set_agent_credential_frozen(&credential.id, true)
+            .unwrap();
+        keep.set_agent_freeze(true).unwrap();
+        let entries = keep.audit_read_all().unwrap().len();
+        assert_eq!(keep.refreeze_agent(Some(&credential.id), &[]).unwrap(), 3);
+        assert_eq!(keep.refreeze_agent(None, &[(b"ledger", b"x")]).unwrap(), 4);
+        assert_eq!(keep.audit_read_all().unwrap().len(), entries);
+        assert_eq!(
+            keep.load_agent_ledger(b"ledger")
+                .unwrap()
+                .unwrap()
+                .as_slice(),
+            b"x"
+        );
+        assert!(keep.agent_freeze().unwrap());
     }
 
     /// Without a writable audit log, nothing is issued and nothing is
