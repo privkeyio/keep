@@ -357,23 +357,15 @@ pub fn freeze(
     scope: Scope,
 ) -> Freeze {
     let signer = SignerKey::Transport(Hex32(xonly(transport)));
-    let digest = freeze_digest(
+    signed_freeze(
         channel,
-        &signer,
+        signer,
         counter,
         epoch,
         FreezeAction::Freeze,
         scope,
-    );
-    Freeze {
-        v: V1,
-        action: FreezeAction::Freeze,
-        scope,
-        counter,
-        epoch,
-        signer,
-        sig: sign_bip340(transport, &digest),
-    }
+        |d| sign_bip340(transport, d),
+    )
 }
 
 /// A phone's unfreeze, signed by its approver key.
@@ -385,22 +377,35 @@ pub fn unfreeze(
     scope: Scope,
 ) -> Freeze {
     let signer = SignerKey::Approver(Hex33(approver_key(approver)));
-    let digest = freeze_digest(
+    signed_freeze(
         channel,
-        &signer,
+        signer,
         counter,
         epoch,
         FreezeAction::Unfreeze,
         scope,
-    );
+        |d| sign_p256(approver, d),
+    )
+}
+
+fn signed_freeze(
+    channel: &[u8; 32],
+    signer: SignerKey,
+    counter: u64,
+    epoch: u64,
+    action: FreezeAction,
+    scope: Scope,
+    sign: impl FnOnce(&[u8; 32]) -> Hex64,
+) -> Freeze {
+    let digest = freeze_digest(channel, &signer, counter, epoch, action, scope);
     Freeze {
         v: V1,
-        action: FreezeAction::Unfreeze,
+        action,
         scope,
         counter,
         epoch,
         signer,
-        sig: sign_p256(approver, &digest),
+        sig: sign(&digest),
     }
 }
 

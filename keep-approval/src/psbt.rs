@@ -64,7 +64,7 @@ fn accepted_sighash(sighash: Option<u32>) -> bool {
 
 /// Whether `script` is a P2TR output script: `OP_1 <32 bytes>`.
 fn is_p2tr(script: &[u8]) -> bool {
-    script.len() == 34 && script[0] == 0x51 && script[1] == 0x20
+    bitcoin::Script::from_bytes(script).is_p2tr()
 }
 
 /// `PSBT_IN_SIGHASH_TYPE` unset, as the request hash encodes it.
