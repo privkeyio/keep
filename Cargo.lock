@@ -4535,6 +4535,7 @@ dependencies = [
  "keep-approval",
  "keep-bitcoin",
  "keep-core",
+ "nostr-relay-builder",
  "nostr-sdk",
  "rand 0.10.3",
  "rustix 1.1.4",

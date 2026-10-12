@@ -17,21 +17,21 @@ use super::state::{wallet_key, Host, Settings, State, REFUSED_CODE};
 use crate::policy::{BitcoinGrant, Grant, RequestLimits};
 use crate::scope::Operation;
 
-const T0: u64 = 1_800_000_000;
-const AGENT: u32 = 1000;
-const OTHER: u32 = 1001;
-const ADMIN: u32 = 1500;
+pub(super) const T0: u64 = 1_800_000_000;
+pub(super) const AGENT: u32 = 1000;
+pub(super) const OTHER: u32 = 1001;
+pub(super) const ADMIN: u32 = 1500;
 const HOST: Host = Host {
     euid: 900,
     overflow_uid: 65_534,
     vault_owner: 901,
 };
-const BOOT: &str = "0f0e8c49-7d0d-4d47-a4b1-ad1b6c1b0a51";
+pub(super) const BOOT: &str = "0f0e8c49-7d0d-4d47-a4b1-ad1b6c1b0a51";
 const REBOOT: &str = "2f0e8c49-7d0d-4d47-a4b1-ad1b6c1b0a51";
-const SECRET: [u8; 32] = [7; 32];
-const NETWORK: keep_bitcoin::Network = keep_bitcoin::Network::Testnet;
+pub(super) const SECRET: [u8; 32] = [7; 32];
+pub(super) const NETWORK: keep_bitcoin::Network = keep_bitcoin::Network::Testnet;
 
-fn settings() -> Settings {
+pub(super) fn settings() -> Settings {
     Settings {
         admin_uid: Some(ADMIN),
         wallet_budget_sats: 100_000,
@@ -39,14 +39,14 @@ fn settings() -> Settings {
     }
 }
 
-struct Gw {
-    dir: tempfile::TempDir,
-    boot: FakeBoot,
-    state: State,
-    key: [u8; 32],
+pub(super) struct Gw {
+    pub(super) dir: tempfile::TempDir,
+    pub(super) boot: FakeBoot,
+    pub(super) state: State,
+    pub(super) key: [u8; 32],
 }
 
-fn vault(dir: &std::path::Path) -> (Keep, [u8; 32]) {
+pub(super) fn vault(dir: &std::path::Path) -> (Keep, [u8; 32]) {
     let path = dir.join("keep");
     if !path.exists() {
         keep_core::storage::Storage::create(
@@ -68,7 +68,7 @@ fn vault(dir: &std::path::Path) -> (Keep, [u8; 32]) {
 }
 
 /// Start a gateway whose clocks read `boot` (boot time and wall clock).
-fn start(
+pub(super) fn start(
     keep: Keep,
     settings: Settings,
     boot: &FakeBoot,
@@ -78,11 +78,11 @@ fn start(
 }
 
 impl Gw {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self::with(settings())
     }
 
-    fn with(settings: Settings) -> Self {
+    pub(super) fn with(settings: Settings) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let (keep, key) = vault(dir.path());
         let boot = FakeBoot::default();
@@ -99,7 +99,7 @@ impl Gw {
 
     /// Stop this gateway and start another on the same vault, in boot
     /// `boot_id` with the wall clock at `wall`.
-    fn restart(self, boot_id: &str, wall: u64) -> crate::error::Result<Gw> {
+    pub(super) fn restart(self, boot_id: &str, wall: u64) -> crate::error::Result<Gw> {
         let Gw {
             dir,
             boot,
@@ -119,27 +119,27 @@ impl Gw {
         })
     }
 
-    fn path(&self) -> PathBuf {
+    pub(super) fn path(&self) -> PathBuf {
         self.dir.path().join("keep")
     }
 
-    fn admin(&mut self, request: Value) -> Value {
+    pub(super) fn admin(&mut self, request: Value) -> Value {
         let answer = self.state.admin_request(request.to_string().as_bytes());
         serde_json::from_str(&answer).unwrap()
     }
 
-    fn admin_ok(&mut self, request: Value) -> Value {
+    pub(super) fn admin_ok(&mut self, request: Value) -> Value {
         let answer = self.admin(request.clone());
         assert_eq!(answer["ok"], json!(true), "{request} -> {answer}");
         answer["result"].clone()
     }
 
-    fn issue(&mut self, grant: &Grant, uid: u32) -> (String, String) {
+    pub(super) fn issue(&mut self, grant: &Grant, uid: u32) -> (String, String) {
         self.issue_for(grant, uid, 3_600)
     }
 
     /// Issue a credential; the token comes beside the result, never in it.
-    fn issue_for(&mut self, grant: &Grant, uid: u32, ttl_secs: u64) -> (String, String) {
+    pub(super) fn issue_for(&mut self, grant: &Grant, uid: u32, ttl_secs: u64) -> (String, String) {
         let answer = self.admin(json!({
             "op": "issue",
             "name": "test agent",
@@ -155,7 +155,7 @@ impl Gw {
         )
     }
 
-    fn raw(&mut self, uid: u32, line: &str) -> (Option<Value>, bool) {
+    pub(super) fn raw(&mut self, uid: u32, line: &str) -> (Option<Value>, bool) {
         let answer = self.state.agent_request(uid, line.as_bytes());
         (
             answer
@@ -165,12 +165,12 @@ impl Gw {
         )
     }
 
-    fn send(&mut self, uid: u32, token: &str, message: Value) -> Option<Value> {
+    pub(super) fn send(&mut self, uid: u32, token: &str, message: Value) -> Option<Value> {
         let line = json!({ "token": token, "message": message }).to_string();
         self.raw(uid, &line).0
     }
 
-    fn rpc(&mut self, token: &str, method: &str, params: Value) -> Value {
+    pub(super) fn rpc(&mut self, token: &str, method: &str, params: Value) -> Value {
         self.send(
             AGENT,
             token,
@@ -181,7 +181,7 @@ impl Gw {
 
     /// A tool call's result: its text parsed as JSON when it is, and whether
     /// it is an error.
-    fn tool(&mut self, token: &str, name: &str, args: Value) -> (Value, bool) {
+    pub(super) fn tool(&mut self, token: &str, name: &str, args: Value) -> (Value, bool) {
         let answer = self.rpc(
             token,
             "tools/call",
@@ -194,7 +194,7 @@ impl Gw {
         (content, result["isError"].as_bool().unwrap())
     }
 
-    fn entries(&self, event: AuditEventType) -> Vec<AuditEntry> {
+    pub(super) fn entries(&self, event: AuditEventType) -> Vec<AuditEntry> {
         self.state
             .keep()
             .audit_read_all()
@@ -204,14 +204,14 @@ impl Gw {
             .collect()
     }
 
-    fn reasons(&self, event: AuditEventType) -> Vec<String> {
+    pub(super) fn reasons(&self, event: AuditEventType) -> Vec<String> {
         self.entries(event)
             .into_iter()
             .filter_map(|e| e.reason)
             .collect()
     }
 
-    fn break_log(&self, broken: bool) {
+    pub(super) fn break_log(&self, broken: bool) {
         let log = self.path().join("audit.log");
         if broken {
             std::fs::rename(&log, log.with_extension("bak")).unwrap();
@@ -222,7 +222,7 @@ impl Gw {
         }
     }
 
-    fn spent(&self, ledger: &[u8]) -> u64 {
+    pub(super) fn spent(&self, ledger: &[u8]) -> u64 {
         self.state
             .keep()
             .load_agent_ledger(ledger)
@@ -233,7 +233,7 @@ impl Gw {
     }
 }
 
-fn nostr_grant(key: [u8; 32]) -> Grant {
+pub(super) fn nostr_grant(key: [u8; 32]) -> Grant {
     Grant {
         keys: [key].into(),
         operations: [Operation::GetPublicKey, Operation::SignNostrEvent].into(),
@@ -244,7 +244,7 @@ fn nostr_grant(key: [u8; 32]) -> Grant {
     }
 }
 
-fn bitcoin_grant(key: [u8; 32]) -> Grant {
+pub(super) fn bitcoin_grant(key: [u8; 32]) -> Grant {
     Grant {
         keys: [key].into(),
         operations: [Operation::GetBitcoinAddress, Operation::SignPsbt].into(),
@@ -276,7 +276,7 @@ fn ping() -> Value {
 
 /// A testnet PSBT spending one of the key's own receive outputs of `in_sats`:
 /// `pay_sats` to an outside address and the rest, less `fee`, to its change.
-fn psbt(pay_sats: u64, in_sats: u64, fee: u64) -> String {
+pub(super) fn psbt(pay_sats: u64, in_sats: u64, fee: u64) -> String {
     use bitcoin::{
         absolute::LockTime, hashes::Hash, transaction::Version, Amount, OutPoint, Psbt, ScriptBuf,
         Sequence, Transaction, TxIn, TxOut, Txid, Witness,
@@ -1373,6 +1373,7 @@ mod sockets {
             state,
             agent_listener,
             admin_listener,
+            None,
             limits,
             async {
                 let _ = stopped.await;

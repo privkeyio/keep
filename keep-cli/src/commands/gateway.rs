@@ -48,6 +48,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     },
                     settings,
                     limits: Limits::default(),
+                    approvals: daemon::ApprovalConfig::default(),
                 },
             )
         }

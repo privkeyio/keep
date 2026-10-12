@@ -13,7 +13,9 @@
 
 pub mod approvals;
 pub mod clock;
+pub mod helper;
 pub mod limits;
+pub mod relay;
 pub mod server;
 pub mod state;
 pub mod tools;
@@ -21,6 +23,12 @@ pub mod unlock;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod approval_tests;
+
+#[cfg(test)]
+mod relay_tests;
 
 #[cfg(test)]
 mod dir_tests {
@@ -121,6 +129,47 @@ pub struct Config {
     pub sockets: Sockets,
     pub settings: Settings,
     pub limits: Limits,
+    pub approvals: ApprovalConfig,
+}
+
+/// Approvals over Nostr: the channel key, read from its own credential
+/// (never from the vault), the relays, the deadline, and the relay helper's
+/// socket and user.
+#[derive(Debug, Clone)]
+pub struct ApprovalConfig {
+    pub channel: Option<nostr_sdk::prelude::Keys>,
+    pub relays: Vec<String>,
+    pub deadline_secs: u64,
+    pub relay_socket: Option<PathBuf>,
+    pub relay_uid: Option<u32>,
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            channel: None,
+            relays: Vec::new(),
+            deadline_secs: keep_approval::binding::DEFAULT_DEADLINE_SECS,
+            relay_socket: None,
+            relay_uid: None,
+        }
+    }
+}
+
+/// The name of the credential holding the channel key.
+pub const CHANNEL_KEY_CREDENTIAL: &str = "channel-key";
+
+/// The channel key from the text of its credential: 64 hex digits.
+pub fn parse_channel_key(text: &str) -> Result<nostr_sdk::prelude::Keys> {
+    let mut secret = zeroize::Zeroizing::new([0u8; 32]);
+    if text.len() != 64 || hex::decode_to_slice(text, secret.as_mut()).is_err() {
+        return Err(AgentError::Other(
+            "the channel-key credential holds 64 hex digits".into(),
+        ));
+    }
+    nostr_sdk::prelude::SecretKey::from_slice(secret.as_ref())
+        .map(nostr_sdk::prelude::Keys::new)
+        .map_err(|_| AgentError::Other("the channel-key credential is not a key".into()))
 }
 
 /// This process's effective uid.
@@ -213,6 +262,7 @@ pub async fn run(
         sockets,
         settings,
         limits,
+        approvals,
     } = config;
     if same_directory(&sockets.agent, &sockets.admin)? {
         return Err(AgentError::Other(
@@ -227,13 +277,31 @@ pub async fn run(
         ));
     }
     let host = Host::detect(&vault)?;
-    let state = State::start(
+    let mut state = State::start(
         keep,
         settings,
         host,
         Box::new(clock::Kernel),
         clock::boot_id()?,
     )?;
+    let with_channel = approvals.channel.is_some();
+    state.configure_approvals(approvals.channel, approvals.relays, approvals.deadline_secs)?;
+    let relay_at = match (with_channel, approvals.relay_socket, approvals.relay_uid) {
+        (false, _, _) => None,
+        (true, Some(path), Some(uid)) => {
+            if path.parent() == sockets.agent.parent() || path.parent() == sockets.admin.parent() {
+                return Err(AgentError::Other(
+                    "the relay socket needs a directory of its own".into(),
+                ));
+            }
+            Some((path, uid))
+        }
+        (true, _, _) => {
+            return Err(AgentError::Other(
+                "approvals need the relay helper's socket and user".into(),
+            ))
+        }
+    };
     let agent = server::bind(&sockets.agent, host.euid)?;
     let admin = match server::bind(&sockets.admin, host.euid) {
         Ok(admin) => admin,
@@ -242,18 +310,34 @@ pub async fn run(
             return Err(e);
         }
     };
+    let relay = match &relay_at {
+        None => None,
+        Some((path, uid)) => match server::bind(path, host.euid) {
+            Ok(listener) => Some((listener, *uid)),
+            Err(e) => {
+                server::remove_socket(&sockets.agent);
+                server::remove_socket(&sockets.admin);
+                return Err(e);
+            }
+        },
+    };
     tracing::info!(
         agent = %sockets.agent.display(),
         admin = %sockets.admin.display(),
         "agent gateway listening"
     );
-    if let Err(e) = notify_ready() {
+    let remove_all = || {
         server::remove_socket(&sockets.agent);
         server::remove_socket(&sockets.admin);
+        if let Some((path, _)) = &relay_at {
+            server::remove_socket(path);
+        }
+    };
+    if let Err(e) = notify_ready() {
+        remove_all();
         return Err(e);
     }
-    let result = server::serve(state, agent, admin, limits, shutdown).await;
-    server::remove_socket(&sockets.agent);
-    server::remove_socket(&sockets.admin);
+    let result = server::serve(state, agent, admin, relay, limits, shutdown).await;
+    remove_all();
     result
 }

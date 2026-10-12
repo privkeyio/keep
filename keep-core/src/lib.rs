@@ -989,15 +989,16 @@ impl Keep {
     }
 
     /// Records something the owner did through the agent gateway or an
-    /// approver device: an approval decided, a freeze from a device, a device
-    /// added or removed. Charged to no agent's budget, so agents cannot use up
+    /// approver device: a management change sent to the approvers, an
+    /// approval decided, a freeze from a device, a device added or removed. Charged to no agent's budget, so agents cannot use up
     /// the room the owner needs; it may use the headroom agents leave, and
     /// stops only where the log could no longer be read back. Fails when the
     /// entry cannot be written.
     pub fn record_owner_event(&mut self, event: AuditEventType, reason: &str) -> Result<()> {
         if !matches!(
             event,
-            AuditEventType::AgentApprovalDecided
+            AuditEventType::AgentApprovalRequested
+                | AuditEventType::AgentApprovalDecided
                 | AuditEventType::AgentApproverFreeze
                 | AuditEventType::AgentApproverAdded
                 | AuditEventType::AgentApproverRemoved

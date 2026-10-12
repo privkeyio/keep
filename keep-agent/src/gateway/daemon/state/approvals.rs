@@ -698,8 +698,13 @@ impl State {
             End::Canceled(why) => (*why).to_string(),
         };
         match waiting.waiter {
-            Waiter::Agent { credential, id, .. } => {
-                let _ = self.reply_agent(id, &message);
+            Waiter::Agent {
+                credential,
+                id,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(self.reply_agent(id, &message));
                 if matches!(end, End::Denied { .. }) {
                     self.note_denial(credential);
                 }

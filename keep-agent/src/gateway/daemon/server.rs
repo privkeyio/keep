@@ -73,7 +73,7 @@ pub struct Sockets {
 /// The state every connection shares. A poisoned lock (a request that
 /// panicked) stops the gateway rather than serving from state a request left
 /// half changed.
-type Shared = Arc<Mutex<State>>;
+pub(crate) type Shared = Arc<Mutex<State>>;
 
 /// Check a socket's directory and clear a stale socket from an earlier run.
 /// The directory must already exist, be a real directory owned by the gateway
@@ -448,7 +448,7 @@ impl Drop for Slot {
 
 /// Run `f` on the state off the async threads. `None` means the lock is
 /// poisoned: the caller refuses and the gateway stops.
-async fn with_state<T: Send + 'static>(
+pub(crate) async fn with_state<T: Send + 'static>(
     state: &Shared,
     stop: &watch::Sender<bool>,
     f: impl FnOnce(&mut State) -> T + Send + 'static,
@@ -482,6 +482,65 @@ async fn write_line(
     )
 }
 
+/// A connection's writer: lines answered now and lines an approver's
+/// decision answers later go out through it, one at a time.
+fn writer(
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    limit: Duration,
+) -> (
+    tokio::sync::mpsc::Sender<Zeroizing<String>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (lines, mut queue) = tokio::sync::mpsc::channel::<Zeroizing<String>>(16);
+    let task = tokio::spawn(async move {
+        while let Some(line) = queue.recv().await {
+            if !write_line(&mut write, &line, limit).await {
+                return;
+            }
+        }
+    });
+    (lines, task)
+}
+
+/// The requests a connection waits on an approver for, so they are canceled
+/// if it goes away first.
+#[derive(Clone, Default)]
+struct Waiting(Arc<Mutex<std::collections::HashSet<[u8; 32]>>>);
+
+impl Waiting {
+    /// Write `pending`'s line through `lines` once it comes.
+    fn wait(
+        &self,
+        pending: super::state::Pending,
+        lines: &tokio::sync::mpsc::Sender<Zeroizing<String>>,
+    ) {
+        let super::state::Pending { request_id, reply } = pending;
+        if let (Some(id), Ok(mut set)) = (request_id, self.0.lock()) {
+            set.insert(id);
+        }
+        let (waiting, lines) = (self.clone(), lines.clone());
+        tokio::spawn(async move {
+            if let Ok(line) = reply.await {
+                let _ = lines.send(line).await;
+            }
+            if let (Some(id), Ok(mut set)) = (request_id, waiting.0.lock()) {
+                set.remove(&id);
+            }
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.lock().map_or(true, |set| set.is_empty())
+    }
+
+    fn take(&self) -> Vec<[u8; 32]> {
+        self.0
+            .lock()
+            .map(|mut set| set.drain().collect())
+            .unwrap_or_default()
+    }
+}
+
 async fn agent_connection(
     stream: UnixStream,
     uid: u32,
@@ -490,27 +549,33 @@ async fn agent_connection(
     stop: watch::Sender<bool>,
     _slot: Slot,
 ) {
-    let (read, mut write) = stream.into_split();
+    let (read, write) = stream.into_split();
+    let (lines, writing) = writer(write, limits.write);
     let mut reader = LineReader::new(read, MAX_LINE);
     let deadline = tokio::time::Instant::now() + limits.pre_auth;
     let mut authenticated = false;
+    let waiting = Waiting::default();
     // Refused requests since the last accepted one.
     let mut refusals = 0u32;
     loop {
-        let next = if authenticated {
+        // A request waiting on an approver keeps the connection open past
+        // the idle limit; the approval deadline bounds it.
+        let next = if !authenticated {
+            tokio::time::timeout_at(deadline, reader.next_line()).await
+        } else if waiting.is_empty() {
             tokio::time::timeout(limits.idle, reader.next_line()).await
         } else {
-            tokio::time::timeout_at(deadline, reader.next_line()).await
+            Ok(reader.next_line().await)
         };
         let request = match next {
             Ok(Ok(Some(line))) => line,
-            _ => return,
+            _ => break,
         };
         // Blank lines are requests too: refused and counted like any other,
         // so they cannot be sent for free.
         let Some(answer) = with_state(&state, &stop, move |s| s.agent_request(uid, &request)).await
         else {
-            return;
+            break;
         };
         if answer.authenticated {
             authenticated = true;
@@ -518,43 +583,79 @@ async fn agent_connection(
         } else {
             refusals += 1;
         }
-        if let Some(line) = &answer.line {
-            if !write_line(&mut write, line, limits.write).await {
-                return;
+        if let Some(line) = answer.line {
+            if lines.send(line).await.is_err() {
+                break;
             }
+        }
+        if let Some(pending) = answer.pending {
+            waiting.wait(pending, &lines);
         }
         // Refused requests in a row end the connection, before or after a
         // token was accepted on it.
         if refusals >= limits.refusals_in_a_row {
-            return;
+            break;
         }
         tokio::task::yield_now().await;
     }
+    // Whatever still waits on an approver is withdrawn with the connection.
+    for id in waiting.take() {
+        with_state(&state, &stop, move |s| s.cancel_parked(id)).await;
+    }
+    drop(lines);
+    let _ = writing.await;
 }
+
+/// A number for each admin connection, so what it waits for is tied to it.
+static ADMIN_CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 async fn admin_connection(
     stream: UnixStream,
+    uid: u32,
     state: Shared,
     limits: Limits,
     stop: watch::Sender<bool>,
     _slot: Slot,
 ) {
-    let (read, mut write) = stream.into_split();
+    let conn = ADMIN_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (read, write) = stream.into_split();
+    let (lines, writing) = writer(write, limits.write);
     let mut reader = LineReader::new(read, MAX_LINE);
+    let waiting = Waiting::default();
+    let mut paired = false;
     loop {
-        let request = match tokio::time::timeout(limits.admin_idle, reader.next_line()).await {
+        // While a change waits on an approver, or a pairing session on the
+        // phone, the connection stays open; the deadline and the session's
+        // expiry bound it.
+        let next = if waiting.is_empty() && !paired {
+            tokio::time::timeout(limits.admin_idle, reader.next_line()).await
+        } else {
+            Ok(reader.next_line().await)
+        };
+        let request = match next {
             Ok(Ok(Some(line))) => line,
-            _ => return,
+            _ => break,
         };
-        let Some(answer) = with_state(&state, &stop, move |s| s.admin_request(&request)).await
+        let Some((answer, pending)) = with_state(&state, &stop, move |s| {
+            s.admin_request_from(uid, conn, &request)
+        })
+        .await
         else {
-            return;
+            break;
         };
-        if !write_line(&mut write, &answer, limits.write).await {
-            return;
+        if lines.send(answer).await.is_err() {
+            break;
+        }
+        if let Some(pending) = pending {
+            paired |= pending.request_id.is_none();
+            waiting.wait(pending, &lines);
         }
         tokio::task::yield_now().await;
     }
+    let _ = waiting.take();
+    with_state(&state, &stop, move |s| s.admin_gone(conn)).await;
+    drop(lines);
+    let _ = writing.await;
 }
 
 /// An accept that failed (out of descriptors, say) is retried after a pause,
@@ -570,8 +671,13 @@ async fn accept_failed(e: std::io::Error) {
 async fn timers(state: Shared, stop: watch::Sender<bool>) {
     let mut flush = tokio::time::interval(Duration::from_secs(10));
     let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let mut approvals = tokio::time::interval(Duration::from_secs(1));
+    approvals.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = approvals.tick() => {
+                with_state(&state, &stop, State::approval_tick).await;
+            }
             _ = flush.tick() => {
                 with_state(&state, &stop, State::tick).await;
             }
@@ -587,21 +693,33 @@ async fn timers(state: Shared, stop: watch::Sender<bool>) {
 /// Serve both sockets until `shutdown` resolves or the state becomes
 /// unusable, then write out what is held in memory.
 pub async fn serve(
-    state: State,
+    mut state: State,
     agent: UnixListener,
     admin: UnixListener,
+    relay: Option<(UnixListener, u32)>,
     limits: Limits,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let admin_uid = state.admin_uid();
     let is_admin = move |uid: u32| uid == 0 || admin_uid == Some(uid);
     let bound = state.bound_uids();
+    let link = state.take_relay_link();
     let state: Shared = Arc::new(Mutex::new(state));
     let (stop, mut stopped) = watch::channel(false);
     let agent_slots = Slots::default();
     let mut refused_log = Throttle::default();
     let admin_slots = Slots::default();
     let timers = tokio::spawn(timers(state.clone(), stop.clone()));
+    let relay = match (relay, link) {
+        (Some((listener, uid)), Some(link)) => Some(tokio::spawn(super::relay::relay_task(
+            listener,
+            uid,
+            link,
+            state.clone(),
+            stop.clone(),
+        ))),
+        _ => None,
+    };
     tokio::pin!(shutdown);
     let failed = loop {
         tokio::select! {
@@ -649,7 +767,7 @@ pub async fn serve(
                 match admin_slots.take(0, limits.admin_connections, limits.admin_connections) {
                     Some(slot) => {
                         tokio::spawn(admin_connection(
-                            stream, state.clone(), limits.clone(), stop.clone(), slot,
+                            stream, uid, state.clone(), limits.clone(), stop.clone(), slot,
                         ));
                     }
                     None => {
@@ -663,6 +781,10 @@ pub async fn serve(
     };
     timers.abort();
     let _ = timers.await;
+    if let Some(relay) = relay {
+        relay.abort();
+        let _ = relay.await;
+    }
     drop(agent);
     drop(admin);
     let state = state.clone();
