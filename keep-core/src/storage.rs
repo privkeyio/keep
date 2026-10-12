@@ -1909,7 +1909,7 @@ impl Storage {
     }
 
     /// Every raw row of a table, for tests that copy a stored value.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn list_raw(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.backend.as_ref().ok_or(KeepError::Locked)?.list(table)
     }

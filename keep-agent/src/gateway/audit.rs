@@ -52,10 +52,6 @@ pub enum RefusalKind {
     Invalid,
     /// The gateway could not complete the request.
     Failed,
-    /// A request sent to the approvers had no decision in time.
-    ApprovalExpired,
-    /// The agent withdrew a request sent to the approvers, or went away.
-    ApprovalWithdrawn,
 }
 
 impl RefusalKind {
@@ -67,8 +63,6 @@ impl RefusalKind {
             Self::RateLimited => "rate limited",
             Self::Invalid => "invalid",
             Self::Failed => "failed",
-            Self::ApprovalExpired => "approval expired",
-            Self::ApprovalWithdrawn => "approval withdrawn",
         }
     }
 }
@@ -172,6 +166,26 @@ impl AgentAudit {
         self.flush_expired(keep, now)?;
         self.check(keep, id, false, now)?;
         keep.record_agent_approval_requested(id, label, Some(detail))?;
+        self.charge(id, false);
+        Ok(())
+    }
+
+    /// Record how a request by credential `id` sent to the approvers ended
+    /// without an approval (`label`: it expired, or the agent withdrew it),
+    /// charged to its budget like the request. Fails when the budget is used
+    /// up (which freezes it) or the entry cannot be written; the caller then
+    /// writes it as the owner's, so the log still shows the end.
+    pub fn record_approval_ended(
+        &mut self,
+        keep: &mut Keep,
+        id: &[u8; 16],
+        label: &str,
+        detail: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)?;
+        keep.record_agent_approval_decided(id, label, Some(detail))?;
         self.charge(id, false);
         Ok(())
     }

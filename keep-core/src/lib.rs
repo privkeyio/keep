@@ -999,6 +999,25 @@ impl Keep {
         )
     }
 
+    /// Store credential `from`'s row again under id `to`, where it does not
+    /// load, for tests of what must not stop on an unreadable credential.
+    #[cfg(feature = "testing")]
+    pub fn misplace_agent_credential_for_testing(
+        &self,
+        from: &[u8; 16],
+        to: &[u8; 16],
+    ) -> Result<()> {
+        let table = crate::backend::AGENT_CREDENTIALS_TABLE;
+        let row = self
+            .storage
+            .list_raw(table)?
+            .into_iter()
+            .find(|(id, _)| id.as_slice() == from)
+            .ok_or_else(|| KeepError::NotFound(hex::encode(from)))?
+            .1;
+        self.storage.put_raw(table, to, &row)
+    }
+
     /// Whether every agent credential is frozen. An `Err` means the flag could
     /// not be read; the gateway then refuses to serve.
     pub fn agent_freeze(&self) -> Result<bool> {
@@ -1174,6 +1193,18 @@ impl Keep {
         detail: Option<&str>,
     ) -> Result<()> {
         self.record_agent_entry(AuditEventType::AgentApprovalRequested, id, label, detail)
+    }
+
+    /// Records how an agent request sent to the approvers ended without an
+    /// approval (it expired, or the agent withdrew it), on the same terms as
+    /// [`Self::record_agent_refusal`]: charged to the agent.
+    pub fn record_agent_approval_decided(
+        &mut self,
+        id: &[u8; 16],
+        label: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        self.record_agent_entry(AuditEventType::AgentApprovalDecided, id, label, detail)
     }
 
     fn check_agent_audit_room(&self) -> Result<()> {
