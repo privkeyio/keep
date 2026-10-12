@@ -176,22 +176,15 @@ impl Answer {
     }
 
     fn authenticated(reply: Option<Reply>) -> Self {
-        match reply {
-            Some(Reply::Later(pending)) => Self {
-                line: None,
-                authenticated: true,
-                pending: Some(pending),
-            },
-            Some(Reply::Now(line)) => Self {
-                line: Some(line),
-                authenticated: true,
-                pending: None,
-            },
-            None => Self {
-                line: None,
-                authenticated: true,
-                pending: None,
-            },
+        let (line, pending) = match reply {
+            Some(Reply::Now(line)) => (Some(line), None),
+            Some(Reply::Later(pending)) => (None, Some(pending)),
+            None => (None, None),
+        };
+        Self {
+            line,
+            authenticated: true,
+            pending,
         }
     }
 }
@@ -1387,18 +1380,25 @@ impl State {
         }
     }
 
-    /// The grant a credential for `uid` may be issued with: the uid may hold
-    /// one, the grant validates, and every key it names is a signing key in
-    /// the vault.
+    /// The grant a credential for `uid` may be issued with, parsed from
+    /// `grant`: see [`Self::checked_grant`].
     fn issuable_grant(&self, uid: u32, grant: Value) -> Result<Grant> {
+        let grant: Grant = serde_json::from_value(grant)
+            .map_err(|e| AgentError::ScopeViolation(format!("invalid grant: {e}")))?;
+        self.checked_grant(uid, grant)
+    }
+
+    /// `grant`, if a credential for `uid` may be issued with it now: the uid
+    /// may hold one, the grant validates, and every key it names is a
+    /// signing key in the vault. Checked again when an approved issue is
+    /// carried out, since keys and uids may change while it waits.
+    fn checked_grant(&self, uid: u32, grant: Grant) -> Result<Grant> {
         if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
             return Err(AgentError::ScopeViolation(format!(
                 "uid {uid} is root, the gateway's, the vault owner's, the admin's, the relay \
                  helper's or the overflow uid; a credential bound to it would stop nothing"
             )));
         }
-        let grant: Grant = serde_json::from_value(grant)
-            .map_err(|e| AgentError::ScopeViolation(format!("invalid grant: {e}")))?;
         for key in &grant.keys {
             match self.keep.keyring().get(key) {
                 Some(slot) if matches!(slot.key_type, KeyType::Nostr | KeyType::Bitcoin) => {}
@@ -1436,23 +1436,29 @@ impl State {
         let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
         let (issued, token) =
             issue_credential(&mut self.keep, name, uid, grant, &self.reserved, now, ttl)?;
+        Ok(self.issued_line(&issued.credential, &token))
+    }
+
+    /// Note credential `credential`'s uid as bound, and the answer that
+    /// carries it and its token. `head` holds no secret; the token goes only
+    /// into the answer, sized so it never reallocates. Tokens are lowercase
+    /// hex behind a fixed prefix, so they need no escaping.
+    fn issued_line(&mut self, credential: &AgentCredential, token: &str) -> Zeroizing<String> {
         if let Ok(mut set) = self.bound.write() {
-            set.insert(uid);
+            set.insert(credential.uid);
         }
+        let now = self.clock.calendar();
         let head = json!({
             "ok": true,
-            "result": credential_json(&issued.credential, now, &self.reserved)
+            "result": credential_json(credential, now, &self.reserved)
         })
         .to_string();
-        // `head` holds no secret; the token goes only into `out`, sized so it
-        // never reallocates. Tokens are lowercase hex behind a fixed prefix,
-        // so they need no escaping.
         let mut out = Zeroizing::new(String::with_capacity(head.len() + token.len() + 16));
         out.push_str(&head[..head.len() - 1]);
         out.push_str(",\"token\":\"");
-        out.push_str(&token);
+        out.push_str(token);
         out.push_str("\"}");
-        Ok(out)
+        out
     }
 
     /// Issue a credential an approver approved, with the id, issue time and
@@ -1467,32 +1473,13 @@ impl State {
         created_at: u64,
         ttl: u64,
     ) -> Result<Zeroizing<String>> {
-        if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
-            return Err(AgentError::ScopeViolation(format!(
-                "uid {uid} may no longer hold a credential"
-            )));
-        }
-        let grant = grant.validated(&self.reserved)?;
+        let grant = self.checked_grant(uid, grant)?;
         let bytes =
             serde_json::to_vec(&grant).map_err(|e| AgentError::Serialization(e.to_string()))?;
         let (credential, token) = self
             .keep
             .issue_agent_credential_with_id(id, name, uid, bytes, created_at, ttl)?;
-        if let Ok(mut set) = self.bound.write() {
-            set.insert(uid);
-        }
-        let now = self.clock.calendar();
-        let head = json!({
-            "ok": true,
-            "result": credential_json(&credential, now, &self.reserved)
-        })
-        .to_string();
-        let mut out = Zeroizing::new(String::with_capacity(head.len() + token.len() + 16));
-        out.push_str(&head[..head.len() - 1]);
-        out.push_str(",\"token\":\"");
-        out.push_str(&token);
-        out.push_str("\"}");
-        Ok(out)
+        Ok(self.issued_line(&credential, &token))
     }
 
     fn admin(&mut self, request: AdminRequest) -> Result<Value> {
@@ -1553,7 +1540,7 @@ impl State {
             AdminRequest::Freeze { id } => {
                 let id = parse_id(&id)?;
                 self.load_known(&id)?;
-                self.freeze(credential_scope(id), "the admin socket", self.store())?;
+                self.freeze(credential_scope(id), "the admin socket", self.store().ok())?;
                 Ok(json!({ "frozen": hex::encode(id) }))
             }
             AdminRequest::Unfreeze { id } => {
@@ -1566,7 +1553,7 @@ impl State {
                 self.freeze(
                     keep_approval::change::Scope::All,
                     "the admin socket",
-                    self.store(),
+                    self.store().ok(),
                 )?;
                 Ok(json!({ "frozen": "all" }))
             }
