@@ -292,13 +292,9 @@ pub fn parse_change_path(network: Network, path: &str) -> Result<u32> {
     let index = path
         .strip_prefix(&prefix)
         .ok_or_else(|| invalid("a change path is not on this network's change chain"))?;
-    let digits = !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit());
-    if !digits || (index.len() > 1 && index.starts_with('0')) {
-        return Err(invalid("a change path's index is not a plain number"));
-    }
-    let index: u32 = index
-        .parse()
-        .map_err(|_| invalid("change index out of range"))?;
+    let index = crate::codec::parse_decimal(index)
+        .ok_or_else(|| invalid("a change path's index is not a plain number"))?;
+    let index = u32::try_from(index).map_err(|_| invalid("change index out of range"))?;
     if index >= 0x8000_0000 {
         return Err(invalid("a change index must not be hardened"));
     }
@@ -312,7 +308,7 @@ fn sum(mut amounts: impl Iterator<Item = u64>) -> Result<u64> {
 }
 
 fn strictly_ascending(list: &[u32], what: &str) -> Result<()> {
-    if list.windows(2).all(|w| w[0] < w[1]) {
+    if crate::codec::strictly_ascending(list) {
         Ok(())
     } else {
         Err(invalid(format!("{what} must be strictly ascending")))

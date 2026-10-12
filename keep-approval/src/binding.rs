@@ -235,18 +235,16 @@ impl Payload {
     pub fn parse(op: Op, value: &Value) -> Result<Self> {
         let typed = |e: serde_json::Error| malformed(format!("payload: {e}"));
         Ok(match op {
-            Op::SignNostrEvent => {
-                Payload::Nostr(serde_json::from_value(value.clone()).map_err(typed)?)
-            }
-            Op::SignPsbt => Payload::Psbt(serde_json::from_value(value.clone()).map_err(typed)?),
+            Op::SignNostrEvent => Payload::Nostr(Deserialize::deserialize(value).map_err(typed)?),
+            Op::SignPsbt => Payload::Psbt(Deserialize::deserialize(value).map_err(typed)?),
             Op::Nip44Encrypt => {
-                Payload::Nip44Encrypt(serde_json::from_value(value.clone()).map_err(typed)?)
+                Payload::Nip44Encrypt(Deserialize::deserialize(value).map_err(typed)?)
             }
             Op::Nip44Decrypt => {
-                Payload::Nip44Decrypt(serde_json::from_value(value.clone()).map_err(typed)?)
+                Payload::Nip44Decrypt(Deserialize::deserialize(value).map_err(typed)?)
             }
             Op::Management => {
-                let wire: ManagementWire = serde_json::from_value(value.clone()).map_err(typed)?;
+                let wire = ManagementWire::deserialize(value).map_err(typed)?;
                 Payload::Management(Change::parse(&wire.change)?)
             }
         })
@@ -381,7 +379,7 @@ impl RequestDraft {
         check_request(&request, channel)?;
         crate::wrap::check_rumor_size(
             crate::kind::REQUEST,
-            &crate::messages::to_text(&request),
+            &zeroize::Zeroizing::new(crate::messages::to_text(&request)),
             request.created_at,
         )?;
         Ok((request, hash))

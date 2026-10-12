@@ -108,6 +108,10 @@ pub struct AnchorTracker {
     /// when each arrived; kept for the wrap time window, so a replayed
     /// outcome counts once.
     outcomes: BTreeMap<Hex32, u64>,
+    /// The same for `approved` unfreeze outcomes, apart from `outcomes` so
+    /// taking an outcome with [`Self::outcome_seen`] first never makes its
+    /// unfreeze look replayed.
+    unfreeze_outcomes: BTreeMap<Hex32, u64>,
     /// Unfreezes approved through a request, whose outcome reached the
     /// phone and no anchor has shown yet, with the approver's clock when
     /// each arrived.
@@ -150,6 +154,17 @@ fn listed(old: &Frozen, new: &Frozen, scope: Scope) -> bool {
         .any(|u| u.scope == scope && u.epoch > old.epoch && u.epoch <= new.epoch)
 }
 
+/// Whether `request_id` is new to `seen`, which forgets ids older than the
+/// wrap time window; notes it if so.
+fn first_time(seen: &mut BTreeMap<Hex32, u64>, request_id: Hex32, local_now: u64) -> bool {
+    seen.retain(|_, at| local_now.saturating_sub(*at) <= WINDOW_PAST_SECS);
+    if seen.contains_key(&request_id) {
+        return false;
+    }
+    seen.insert(request_id, local_now);
+    true
+}
+
 impl AnchorTracker {
     /// Keep the anchor a `paired` message carries, which has no time of its
     /// own, as the first one: every later anchor is compared with it. Taken
@@ -181,20 +196,14 @@ impl AnchorTracker {
     /// Take the outcome of request `request_id`, arriving at `local_now`:
     /// whether it is the first time. A replayed outcome is taken once.
     pub fn outcome_seen(&mut self, request_id: Hex32, local_now: u64) -> bool {
-        self.outcomes
-            .retain(|_, at| local_now.saturating_sub(*at) <= WINDOW_PAST_SECS);
-        if self.outcomes.contains_key(&request_id) {
-            return false;
-        }
-        self.outcomes.insert(request_id, local_now);
-        true
+        first_time(&mut self.outcomes, request_id, local_now)
     }
 
     /// Note the `approved` outcome of request `request_id`, an `unfreeze`
     /// of `scope`, reaching the phone: it explains a freeze of that scope
     /// seen cleared, before or after. A replayed outcome explains nothing.
     pub fn unfreeze_seen(&mut self, request_id: Hex32, scope: Scope, local_now: u64) {
-        if !self.outcome_seen(request_id, local_now) {
+        if !first_time(&mut self.unfreeze_outcomes, request_id, local_now) {
             return;
         }
         let before = self.cleared.len();
@@ -404,8 +413,23 @@ pub struct Shown {
     pub truncated: bool,
 }
 
+/// The most combining marks shown on one character; more would draw over
+/// the lines around it.
+pub const MAX_COMBINING_RUN: usize = 4;
+
+/// The combining diacritical mark blocks, where stacked marks come from.
+fn is_combining(c: char) -> bool {
+    matches!(c,
+        '\u{0300}'..='\u{036f}'
+        | '\u{1ab0}'..='\u{1aff}'
+        | '\u{1dc0}'..='\u{1dff}'
+        | '\u{20d0}'..='\u{20ff}'
+        | '\u{fe20}'..='\u{fe2f}')
+}
+
 /// `text` as an approver shows it, in at most `limit` characters: every
-/// hidden character (see [`is_hidden`]) removed first and counted, then a
+/// hidden character (see [`is_hidden`]) and every combining mark past
+/// [`MAX_COMBINING_RUN`] on one character removed first and counted, then a
 /// backslash doubled and newlines, carriage returns and tabs shown as
 /// visible escapes, then cut to the limit, each escape counting as the
 /// characters it shows. Used for every string from the gateway, and for
@@ -413,9 +437,15 @@ pub struct Shown {
 pub fn shown(text: &str, limit: usize) -> Shown {
     let mut out = String::new();
     let (mut used, mut chars, mut removed, mut truncated) = (0, 0, 0, false);
+    let mut run = 0;
     for c in text.chars() {
         chars += 1;
         if is_hidden(c) && !matches!(c, '\n' | '\r' | '\t') {
+            removed += 1;
+            continue;
+        }
+        run = if is_combining(c) { run + 1 } else { 0 };
+        if run > MAX_COMBINING_RUN {
             removed += 1;
             continue;
         }
@@ -491,9 +521,18 @@ pub fn is_hidden(c: char) -> bool {
             | '\u{fe00}'..='\u{fe0f}'     // variation selectors
             | '\u{ffa0}'                   // halfwidth Hangul filler
             // Combining overlays
+            // Combining overlays: every mark of canonical combining class 1
             | '\u{0334}'..='\u{0338}'     // tilde, stroke and solidus overlays
+            | '\u{1cd4}'                   // Vedic tone midline svarita
+            | '\u{1ce2}'..='\u{1ce8}'     // Vedic overlay signs
             | '\u{20d2}'..='\u{20d3}'     // long and short vertical line overlays
+            | '\u{20d8}'..='\u{20da}'     // ring overlays
             | '\u{20e5}'..='\u{20e6}'     // reverse solidus and double vertical stroke overlays
+            | '\u{20ea}'..='\u{20eb}'     // leftwards arrow and long double solidus overlays
+            | '\u{10a39}'                  // Kharoshthi cauda
+            | '\u{16af0}'..='\u{16af4}'   // Bassa Vah combining marks
+            | '\u{1bc9e}'                  // Duployan double mark
+            | '\u{1d167}'..='\u{1d169}'   // musical tremolos
         )
 }
 
@@ -952,9 +991,88 @@ mod tests {
             t.due_alerts(2_020 + CLEARED_GRACE_SECS),
             [Alert::FreezeCleared { scope: Scope::All }]
         );
-        assert!(!t.outcome_seen(Hex32([1; 32]), 2_100));
         // Remembered for the wrap time window, then forgotten.
-        assert!(t.outcome_seen(Hex32([1; 32]), 10 + WINDOW_PAST_SECS + 1));
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10 + WINDOW_PAST_SECS + 1);
+        assert!(t
+            .unfreezes
+            .contains(&(Scope::All, 10 + WINDOW_PAST_SECS + 1)));
+    }
+
+    /// Taking an outcome with `outcome_seen` first does not make its
+    /// unfreeze look replayed.
+    #[test]
+    fn an_outcome_taken_first_still_explains_its_unfreeze() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(
+            100,
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[])),
+            0,
+        );
+        assert!(t.outcome_seen(Hex32([1; 32]), 10));
+        assert!(!t.outcome_seen(Hex32([1; 32]), 11));
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 20);
+        assert!(t.due_alerts(20 + CLEARED_GRACE_SECS).is_empty());
+    }
+
+    /// An unfreeze in the anchor's list explains only a clear of its own
+    /// scope, applied after the kept anchor and not after the new one.
+    #[test]
+    fn a_listed_unfreeze_explains_only_its_scope_and_epochs() {
+        for (unfrozen, explained) in [
+            (
+                Unfrozen {
+                    scope: Scope::All,
+                    epoch: 6,
+                },
+                true,
+            ),
+            (
+                Unfrozen {
+                    scope: c(7),
+                    epoch: 6,
+                },
+                false,
+            ),
+            (
+                Unfrozen {
+                    scope: Scope::All,
+                    epoch: 5,
+                },
+                false,
+            ),
+            (
+                Unfrozen {
+                    scope: Scope::All,
+                    epoch: 7,
+                },
+                false,
+            ),
+        ] {
+            let mut g = Gateway::default();
+            let mut t = AnchorTracker::default();
+            t.observe(
+                100,
+                &g.anchor(1, 1, &[]),
+                Some(&frozen_with(5, true, &[])),
+                0,
+            );
+            let mut after = frozen(6);
+            after.unfrozen = vec![unfrozen];
+            t.observe(101, &g.anchor(2, 1, &[]), Some(&after), 10);
+            let alerts = t.due_alerts(10 + CLEARED_GRACE_SECS);
+            if explained {
+                assert!(alerts.is_empty(), "{unfrozen:?}");
+            } else {
+                assert_eq!(
+                    alerts,
+                    [Alert::FreezeCleared { scope: Scope::All }],
+                    "{unfrozen:?}"
+                );
+            }
+        }
     }
 
     /// An unfreeze sent by another phone reaches this one only as the
@@ -1073,6 +1191,33 @@ mod tests {
     /// Hidden characters are removed before the limit is applied, and the
     /// escapes count inside it: 2,000 zero-width spaces cannot push what
     /// follows out of view, and backslashes cannot double the text shown.
+    #[test]
+    fn overlays_are_hidden_and_stacked_marks_capped() {
+        for c in [
+            '\u{0338}',
+            '\u{20eb}',
+            '\u{20d8}',
+            '\u{1ce2}',
+            '\u{1d167}',
+            '\u{16af0}',
+        ] {
+            assert!(is_hidden(c), "{c:?}");
+        }
+        assert!(!is_hidden('\u{0301}'));
+        let s = shown(&format!("a{}b\u{0301}", "\u{0301}".repeat(9)), 100);
+        assert_eq!(
+            s.text,
+            format!("a{}b\u{0301}", "\u{0301}".repeat(MAX_COMBINING_RUN))
+        );
+        assert_eq!(s.removed, 9 - MAX_COMBINING_RUN);
+        // A hidden character does not break up a run.
+        let s = shown(
+            &format!("a{}\u{200b}{}", "\u{0301}".repeat(3), "\u{0301}".repeat(3)),
+            100,
+        );
+        assert_eq!(s.text, format!("a{}", "\u{0301}".repeat(MAX_COMBINING_RUN)));
+    }
+
     #[test]
     fn hidden_characters_cannot_push_text_out_of_view() {
         let text = format!(

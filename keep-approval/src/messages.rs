@@ -266,7 +266,24 @@ pub struct Frozen {
     /// The unfreezes applied within the wrap time window, oldest first, at
     /// most [`MAX_UNFROZEN`], so every phone can tell a freeze cleared by an
     /// unfreeze (another phone's included) from one cleared by a rollback.
+    #[serde(deserialize_with = "bounded_unfrozen")]
     pub unfrozen: Vec<Unfrozen>,
+}
+
+fn checked_label<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<String, D::Error> {
+    let label = String::deserialize(d)?;
+    crate::change::check_label(&label, "label").map_err(serde::de::Error::custom)?;
+    Ok(label)
+}
+
+fn bounded_unfrozen<'de, D: Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Vec<Unfrozen>, D::Error> {
+    let list = Vec::<Unfrozen>::deserialize(d)?;
+    if list.len() > MAX_UNFROZEN {
+        return Err(serde::de::Error::custom("too many unfreezes listed"));
+    }
+    Ok(list)
 }
 
 /// An approval request (kind 24250). `payload` depends on `op`; see
@@ -429,6 +446,7 @@ pub enum Pairing {
     /// From the phone, sealed by its transport key.
     Pair {
         v: V1,
+        #[serde(deserialize_with = "checked_label")]
         label: String,
         /// The approver key's type: `"p256"` is the only one.
         alg: Alg,
@@ -486,6 +504,22 @@ mod tests {
     }
 
     #[test]
+    fn an_anchor_lists_at_most_sixteen_unfreezes() {
+        let list = |n: usize| {
+            let entry = format!(
+                r#"{{"scope":{{"credential":"{}"}},"epoch":1}}"#,
+                "ab".repeat(16)
+            );
+            format!(
+                r#"{{"epoch":1,"all":false,"credentials":[],"unfrozen":[{}]}}"#,
+                vec![entry; n].join(",")
+            )
+        };
+        assert!(serde_json::from_str::<Frozen>(&list(MAX_UNFROZEN)).is_ok());
+        assert!(serde_json::from_str::<Frozen>(&list(MAX_UNFROZEN + 1)).is_err());
+    }
+
+    #[test]
     fn messages_parse_strictly() {
         let d: Decision = parse(&decision_text()).unwrap();
         assert_eq!(d.decision, Verdict::Approve);
@@ -523,6 +557,17 @@ mod tests {
         }
         let missing = text.replace("\"alg\":\"p256\",", "");
         assert!(parse::<Pairing>(&missing).is_err(), "{missing}");
+        // The label follows the label rules before anything shows it.
+        for label in [
+            String::new(),
+            "   ".into(),
+            "a".repeat(crate::change::MAX_LABEL_CHARS + 1),
+            "\u{1b}[2Jphone".into(),
+            "pho\u{202e}ne".into(),
+        ] {
+            let bad = text.replace("My phone", &label.replace('\u{1b}', "\\u001b"));
+            assert!(parse::<Pairing>(&bad).is_err(), "{bad}");
+        }
         let refused = r#"{"type":"refused","v":1,"reason":"expired"}"#;
         assert!(matches!(
             parse::<Pairing>(refused).unwrap(),

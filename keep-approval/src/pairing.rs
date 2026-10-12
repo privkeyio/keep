@@ -59,7 +59,7 @@ pub fn check_relay(url: &str) -> Result<()> {
     }
     if !rest
         .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-._~:/[]@".contains(&b))
+        .all(|b| b.is_ascii_alphanumeric() || b"-._~:/[]".contains(&b))
     {
         return Err(malformed(
             "a relay URL holds a character a URI would escape",
@@ -77,7 +77,7 @@ impl PairingUri {
             .map_err(|_| malformed("gateway key"))?
             .to_bech32()
             .map_err(|_| malformed("gateway key"))?;
-        let secret = Zeroizing::new(hex::encode(*self.secret));
+        let secret = Zeroizing::new(hex::encode(&self.secret[..]));
         let mut uri = Zeroizing::new(String::with_capacity(
             PREFIX.len()
                 + gateway.len()
@@ -269,6 +269,10 @@ mod tests {
             uri.replace("wss://relay.example.com", "wss://relay.example.com/?a=b"),
             uri.replace("wss://relay.example.com", "wss://relay.example.com/a%20b"),
             uri.replace("wss://relay.example.com", "wss://relay.example.com#x"),
+            uri.replace(
+                "wss://relay.example.com",
+                "wss://relay.example.com@evil.example",
+            ),
             uri.replace(
                 "wss://relay.example.com",
                 &format!("wss://{}", "a".repeat(MAX_RELAY_LEN)),

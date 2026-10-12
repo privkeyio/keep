@@ -4555,7 +4555,6 @@ version = "0.11.0"
 dependencies = [
  "bitcoin",
  "hex",
- "hkdf 0.13.0",
  "hmac 0.13.0",
  "nostr",
  "p256",

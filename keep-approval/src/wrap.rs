@@ -26,7 +26,6 @@
 
 use std::collections::HashMap;
 
-use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use nostr::nips::nip44;
 use nostr::{
@@ -56,7 +55,7 @@ pub const WINDOW_FUTURE_SECS: u64 = 600;
 
 /// Which way a wrap travels; the tag covers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
+pub(crate) enum Direction {
     /// From the gateway to a device.
     ToDevice,
     /// From a device to the gateway.
@@ -65,7 +64,7 @@ pub enum Direction {
 
 impl Direction {
     /// The byte the tag's HMAC covers.
-    pub fn code(self) -> u8 {
+    fn code(self) -> u8 {
         match self {
             Direction::ToDevice => 1,
             Direction::ToGateway => 2,
@@ -95,11 +94,20 @@ impl std::fmt::Debug for TagKey {
 }
 
 impl TagKey {
+    /// HKDF-SHA256 (RFC 5869) with salt [`TAG_SALT`], empty info and a
+    /// 32-byte output, which is the first expand block. Written with HMAC,
+    /// whose state and output are wiped when dropped, so neither the
+    /// pseudorandom key nor the tag key is left in memory.
     fn from_ikm(ikm: &[u8], send: Direction) -> Self {
+        let mut extract =
+            <Hmac<Sha256> as KeyInit>::new_from_slice(TAG_SALT).expect("HMAC takes any key length");
+        extract.update(ikm);
+        let prk = extract.finalize();
+        let mut expand = <Hmac<Sha256> as KeyInit>::new_from_slice(prk.as_bytes())
+            .expect("HMAC takes any key length");
+        expand.update(&[1]);
         let mut key = Zeroizing::new([0u8; 32]);
-        Hkdf::<Sha256>::new(Some(TAG_SALT), ikm)
-            .expand(&[], key.as_mut())
-            .expect("32 bytes is a valid HKDF output length");
+        key.copy_from_slice(expand.finalize().as_bytes());
         Self { key, send }
     }
 
@@ -190,9 +198,25 @@ fn rumor(author: PublicKey, kind: u16, content: &str, created_at: u64) -> Unsign
 pub fn check_rumor_size(kind: u16, content: &str, created_at: u64) -> Result<()> {
     // Any valid key: the rumor's length is the same for every author.
     let author = Keys::new(nostr::SecretKey::from_slice(&[1; 32]).expect("valid secret key"));
-    let len = rumor(author.public_key(), kind, content, created_at)
-        .as_json()
-        .len();
+    fits(rumor_json(author.public_key(), kind, content, created_at).len())
+}
+
+/// The rumor's JSON, with the rumor's own copy of `content` wiped.
+fn rumor_json(author: PublicKey, kind: u16, content: &str, created_at: u64) -> Zeroizing<String> {
+    let rumor = WipedRumor(rumor(author, kind, content, created_at));
+    Zeroizing::new(rumor.0.as_json())
+}
+
+/// A rumor whose content is wiped when it goes, on every path.
+struct WipedRumor(UnsignedEvent);
+
+impl Drop for WipedRumor {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0.content);
+    }
+}
+
+fn fits(len: usize) -> Result<()> {
     if len > MAX_RUMOR_BYTES {
         return Err(Error::TooLarge(format!(
             "a message of {len} bytes exceeds {MAX_RUMOR_BYTES}"
@@ -220,13 +244,8 @@ pub fn wrap(
         return Err(malformed("not a protocol kind"));
     }
     let receiver = PublicKey::from_slice(receiver).map_err(|_| malformed("receiver key"))?;
-    let rumor_json = Zeroizing::new(rumor(sender.public_key(), kind, content, now).as_json());
-    if rumor_json.len() > MAX_RUMOR_BYTES {
-        return Err(Error::TooLarge(format!(
-            "a message of {} bytes exceeds {MAX_RUMOR_BYTES}",
-            rumor_json.len()
-        )));
-    }
+    let rumor_json = rumor_json(sender.public_key(), kind, content, now);
+    fits(rumor_json.len())?;
     let sealed = nip44::encrypt(
         sender.secret_key(),
         &receiver,
@@ -392,7 +411,9 @@ pub fn open<T: Clone>(
     if rumor_json.len() > MAX_RUMOR_BYTES {
         return Err(Error::TooLarge("rumor".into()));
     }
-    let rumor = UnsignedEvent::from_json(rumor_json.as_str()).map_err(|_| malformed("rumor"))?;
+    let mut rumor =
+        WipedRumor(UnsignedEvent::from_json(rumor_json.as_str()).map_err(|_| malformed("rumor"))?);
+    let rumor = &mut rumor.0;
     if rumor.pubkey != seal.pubkey {
         return Err(invalid("the rumor's author is not the seal's signer"));
     }
@@ -401,7 +422,7 @@ pub fn open<T: Clone>(
     if !kind::is_protocol_kind(kind) || !rumor.tags.is_empty() {
         return Err(invalid("not a protocol message"));
     }
-    let content = Zeroizing::new(rumor.content);
+    let content = Zeroizing::new(std::mem::take(&mut rumor.content));
     if matches!(candidate, Candidate::Pairing { .. })
         && (kind != kind::PAIRING
             || !matches!(

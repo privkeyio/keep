@@ -73,7 +73,24 @@ hex_bytes!(Hex64, 64);
 
 /// Whether `s` is lowercase hex of exactly `len` bytes.
 pub(crate) fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len * 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    s.len() == len * 2 && lower_hex_chars(s)
+}
+
+fn lower_hex_chars(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A decimal number written as plain digits with no leading zero.
+pub(crate) fn parse_decimal(s: &str) -> Option<u64> {
+    let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits || (s.len() > 1 && s.starts_with('0')) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+pub(crate) fn strictly_ascending<T: Ord>(list: &[T]) -> bool {
+    list.windows(2).all(|w| w[0] < w[1])
 }
 
 /// A byte string of any length, carried as lowercase hex.
@@ -86,7 +103,7 @@ pub(crate) mod hex_vec {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        if s.len() % 2 != 0 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        if s.len() % 2 != 0 || !super::lower_hex_chars(&s) {
             return Err(serde::de::Error::custom("expected lowercase hex"));
         }
         hex::decode(s.as_ref()).map_err(serde::de::Error::custom)
@@ -106,5 +123,26 @@ mod tests {
         assert!(Hex16::parse(&format!("{}zz", "ab".repeat(15))).is_err());
         assert!(serde_json::from_str::<Hex32>(&format!("\"{}\"", "0".repeat(64))).is_ok());
         assert!(serde_json::from_str::<Hex32>("1").is_err());
+    }
+
+    #[test]
+    fn byte_strings_are_lowercase_hex_only() {
+        #[derive(serde::Deserialize)]
+        struct B(#[serde(with = "hex_vec")] Vec<u8>);
+        assert_eq!(
+            serde_json::from_str::<B>("\"0aff\"").unwrap().0,
+            [0x0a, 0xff]
+        );
+        assert!(serde_json::from_str::<B>("\"0AFF\"").is_err());
+        assert!(serde_json::from_str::<B>("\"0af\"").is_err());
+    }
+
+    #[test]
+    fn decimals_are_plain_digits() {
+        assert_eq!(parse_decimal("0"), Some(0));
+        assert_eq!(parse_decimal("120"), Some(120));
+        for bad in ["", "01", "+1", "-1", "1.0", " 1", "18446744073709551616"] {
+            assert_eq!(parse_decimal(bad), None, "{bad}");
+        }
     }
 }

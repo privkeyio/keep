@@ -158,13 +158,9 @@ impl Serialize for Decimal {
 impl<'de> Deserialize<'de> for Decimal {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let s = <std::borrow::Cow<'de, str>>::deserialize(d)?;
-        let digits = !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-        if !digits || (s.len() > 1 && s.starts_with('0')) {
-            return Err(serde::de::Error::custom("expected a decimal string"));
-        }
-        s.parse()
+        crate::codec::parse_decimal(&s)
             .map(Decimal)
-            .map_err(|_| serde::de::Error::custom("decimal out of range"))
+            .ok_or_else(|| serde::de::Error::custom("expected a decimal string in range"))
     }
 }
 
@@ -273,6 +269,15 @@ impl ChangeGrant {
         if self.event_kinds.iter().any(|k| k.0 > u64::from(u16::MAX)) {
             return Err(malformed("event kind out of range"));
         }
+        if self
+            .event_kinds
+            .iter()
+            .any(|k| crate::kind::is_protocol_kind(k.0 as u16))
+        {
+            return Err(malformed(
+                "a grant cannot list the approval protocol's kinds",
+            ));
+        }
         if let Some(b) = &self.bitcoin {
             if !NETWORKS.contains(&b.network.as_str()) {
                 return Err(malformed(format!("unknown network {:?}", b.network)));
@@ -330,7 +335,7 @@ fn check_address(address: &str, network: &str) -> Result<()> {
 }
 
 fn ascending<T: Ord>(list: &[T], what: &str) -> Result<()> {
-    if list.windows(2).all(|w| w[0] < w[1]) {
+    if crate::codec::strictly_ascending(list) {
         Ok(())
     } else {
         Err(malformed(format!("{what} must be strictly ascending")))
@@ -421,7 +426,7 @@ pub fn parse_without_duplicates(text: &str) -> Result<Value> {
 /// RFC 8785 canonical JSON of a value holding only strings, arrays and
 /// objects: object members sorted by the UTF-16 code units of their names,
 /// no whitespace, strings escaped as ECMAScript's `JSON.stringify` does.
-pub fn canonical_json(value: &Value) -> Result<Vec<u8>> {
+pub(crate) fn canonical_json(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     write_canonical(value, &mut out)?;
     Ok(out)
@@ -572,6 +577,11 @@ mod tests {
         let mut v = issue();
         v["grant"]["event_kinds"] = json!(["1", "1"]);
         bad.push(v);
+        for kind in ["24250", "24255"] {
+            let mut v = issue();
+            v["grant"]["event_kinds"] = json!(["1", kind]);
+            bad.push(v);
+        }
         let mut v = issue();
         v["grant"]["keys"] = json!(["22".repeat(32), "11".repeat(32)]);
         bad.push(v);
