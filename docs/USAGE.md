@@ -791,6 +791,8 @@ The gateway itself has no network. A relay helper, `keep gateway relay`, runs as
    sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin keep-gateway-relay
    ```
 
+   It must be a user of its own. The gateway refuses to start when the relay user is root, the gateway's own user, the vault's owner or the admin uid, or when a credential is bound to it, and refuses to issue a credential bound to it: an agent running as the relay user could take the single relay connection and cut the gateway off from the phone.
+
 2. Generate the channel key and seal it to this machine, as the vault password is. It is written only to a pipe, never to a terminal or a file, and its public key is printed on stderr:
 
    ```bash
