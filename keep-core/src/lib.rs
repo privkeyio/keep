@@ -6003,8 +6003,8 @@ mod tests {
 
     /// The kept format 1 log moved back over the log with the record
     /// deleted migrates again from its start: noticed from the freeze
-    /// epoch's row, and with that row deleted too, from the keys created
-    /// after the old log's last entry.
+    /// epoch's row when nothing was created since, and with that row
+    /// deleted too, from a key created after the old log's last entry.
     #[test]
     fn the_old_log_moved_back_with_the_record_deleted_is_noticed() {
         use crate::audit::test_support::write_format1_log;
@@ -6027,7 +6027,9 @@ mod tests {
                 "{:?}",
                 keep.audit_warnings()
             );
-            keep.generate_key("since").unwrap();
+            if epoch_too {
+                keep.generate_key("since").unwrap();
+            }
             assert!(keep
                 .storage
                 .remove_config_for_tests(audit_record::AUDIT_RECORD_KEY)
@@ -6061,6 +6063,17 @@ mod tests {
         keep.issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
             .unwrap();
         let data_key = keep.data_key().unwrap();
+        // A credential row that cannot be read is passed over, not fatal.
+        let (other, _) = keep
+            .issue_agent_credential("two", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        let row = keep
+            .storage
+            .raw_row_for_tests(crate::backend::AGENT_CREDENTIALS_TABLE, &other.id)
+            .unwrap();
+        keep.storage
+            .put_raw(crate::backend::AGENT_CREDENTIALS_TABLE, &[9; 16], &row)
+            .unwrap();
         for row in [audit_record::AUDIT_RECORD_KEY, b"agent_freeze_epoch"] {
             assert!(keep.storage.remove_config_for_tests(row).unwrap());
         }
