@@ -115,7 +115,7 @@ as() {
 #   python3 <driver> <uri> <phone fp> <answer> keep gateway approver pair ...
 write_pair_driver() {
     cat >"$1" <<'PY'
-import os, pty, re, sys, time
+import os, pty, re, select, sys, time
 uri_out, phone_fp, answer_out = sys.argv[1], sys.argv[2], sys.argv[3]
 argv = sys.argv[4:]
 pid, fd = pty.fork()
@@ -125,10 +125,15 @@ buf = b""
 def until(pattern, secs):
     global buf
     deadline = time.time() + secs
-    while time.time() < deadline:
+    while True:
         m = re.search(pattern, buf)
         if m:
             return m
+        left = deadline - time.time()
+        # Wait for output no longer than the deadline, so a command that
+        # stops printing cannot hang the driver.
+        if left <= 0 or not select.select([fd], [], [], left)[0]:
+            break
         try:
             chunk = os.read(fd, 4096)
         except OSError:

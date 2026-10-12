@@ -1375,7 +1375,7 @@ impl State {
     /// registered to ask: the epoch still moves.
     pub(crate) fn unfreeze_now(&mut self, scope: Scope) -> Result<()> {
         let epoch = self.keep.agent_freeze_epoch()?;
-        self.unfreeze(scope, epoch, None)?;
+        self.unfreeze(scope, epoch, None, None)?;
         self.send_anchor(None);
         Ok(())
     }
@@ -1410,16 +1410,22 @@ impl State {
 
     /// Clear the freeze of `scope` if `epoch` is still current, from the
     /// device with transport key and counter `counter` if any. The vault
-    /// writes the entry first, then clears the freeze, moves the epoch and
-    /// saves the store (the device's counter, the credential's denials
-    /// dropped, the unfreeze noted for the anchors) in one write.
+    /// writes its own unfreeze entry first, then clears the freeze, moves the
+    /// epoch and saves the store (the device's counter, the credential's
+    /// denials dropped, the unfreeze noted for the anchors, and `entry`, the
+    /// device's signed unfreeze, owed) in one write; the owed entry is
+    /// written right after, so a stop between cannot lose it.
     fn unfreeze(
         &mut self,
         scope: Scope,
         epoch: u64,
         counter: Option<([u8; 32], u64)>,
+        entry: Option<(AuditEventType, String)>,
     ) -> Result<()> {
         let mut store = self.store()?;
+        if let Some((event, reason)) = entry {
+            store.owe(event, reason);
+        }
         if let Some((transport, counter)) = counter {
             if let Some(d) = store
                 .devices
@@ -1440,12 +1446,14 @@ impl State {
         let bytes = store.encode()?;
         self.keep
             .set_agent_frozen(id.as_ref(), false, Some(epoch), &[(STORE_KEY, &bytes)])?;
+        self.owed_waiting |= !store.owed.is_empty();
         if let Some(a) = self.approvals.as_mut() {
             a.store = store;
         }
         if let Some(id) = id {
             self.audit.reset(&id);
         }
+        self.retry_owed();
         Ok(())
     }
 
@@ -1533,9 +1541,9 @@ impl State {
                     freeze.scope,
                     freeze.epoch,
                     Some((*transport, freeze.counter)),
+                    Some((AuditEventType::AgentApproverFreeze, entry)),
                 ) {
                     Ok(()) => {
-                        self.owner_entry(AuditEventType::AgentApproverFreeze, entry);
                         self.send_anchor(None);
                     }
                     Err(e) => {
@@ -2159,7 +2167,7 @@ impl State {
                 }
             }
             (Change::Unfreeze { scope, epoch }, Effect::Unfreeze) => {
-                self.unfreeze(scope, epoch.0, None).map(|()| {
+                self.unfreeze(scope, epoch.0, None, None).map(|()| {
                     self.send_anchor(None);
                     admin_ok(json!({ "unfrozen": scope_text(&scope) }))
                 })

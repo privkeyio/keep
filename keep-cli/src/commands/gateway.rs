@@ -449,6 +449,11 @@ fn serve(out: &Output, mut config: Config) -> Result<()> {
             daemon::CHANNEL_KEY_CREDENTIAL
         )));
     }
+    if config.approvals.relays.is_empty() && config.approvals.channel.is_some() {
+        return Err(KeepError::InvalidInput(
+            "approvals need at least one relay: pass --approval-relay".into(),
+        ));
+    }
     let mut keep = Keep::open(&config.vault)?;
     let password = vault_password()?;
     let spinner = out.spinner("Unlocking vault...");
@@ -562,27 +567,35 @@ pub(crate) fn gateway_uid(user: &str) -> Result<u32> {
 
 /// Read one answer line straight into a buffer that is wiped, never through
 /// an intermediate buffer that would be freed holding a token.
-fn read_answer(mut stream: &std::os::unix::net::UnixStream) -> std::io::Result<Zeroizing<Vec<u8>>> {
+/// The next line from `stream`, keeping what was read past it in `rest`
+/// for the next call; at the end of the stream, whatever is left.
+fn read_answer(
+    mut stream: &std::os::unix::net::UnixStream,
+    rest: &mut Zeroizing<Vec<u8>>,
+) -> std::io::Result<Zeroizing<Vec<u8>>> {
     use std::io::Read;
     const MAX: usize = 64 * 1024 * 1024;
-    let mut line = Zeroizing::new(Vec::with_capacity(64 * 1024));
     let mut chunk = Zeroizing::new([0u8; 8192]);
     loop {
+        if let Some(end) = rest.iter().position(|&b| b == b'\n') {
+            let mut line = Zeroizing::new(Vec::with_capacity(end));
+            line.extend_from_slice(&rest[..end]);
+            let mut left = Zeroizing::new(Vec::with_capacity(rest.len() - end - 1));
+            left.extend_from_slice(&rest[end + 1..]);
+            *rest = left;
+            return Ok(line);
+        }
         let n = stream.read(&mut chunk[..])?;
         if n == 0 {
-            return Ok(line);
+            return Ok(std::mem::take(rest));
         }
-        if let Some(end) = chunk[..n].iter().position(|&b| b == b'\n') {
-            extend_wiped(&mut line, &chunk[..end]);
-            return Ok(line);
-        }
-        if line.len() + n > MAX {
+        if rest.len() + n > MAX {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "admin answer too long",
             ));
         }
-        extend_wiped(&mut line, &chunk[..n]);
+        extend_wiped(rest, &chunk[..n]);
     }
 }
 
@@ -606,6 +619,8 @@ struct AdminSession {
     stream: std::os::unix::net::UnixStream,
     /// Whether a request has been written, so the gateway may have acted.
     sent: bool,
+    /// What was read past the last answer line.
+    rest: Zeroizing<Vec<u8>>,
 }
 
 fn io_error(e: std::io::Error) -> KeepError {
@@ -634,6 +649,7 @@ impl AdminSession {
         Ok(Self {
             stream,
             sent: false,
+            rest: Zeroizing::new(Vec::new()),
         })
     }
 
@@ -680,7 +696,7 @@ impl AdminSession {
 
     /// The next answer line, in a buffer that is wiped.
     fn read_line(&mut self) -> std::result::Result<Zeroizing<Vec<u8>>, AdminFailure> {
-        let line = match read_answer(&self.stream) {
+        let line = match read_answer(&self.stream, &mut self.rest) {
             Ok(line) => line,
             // Closed with the request still unread in it: never acted on.
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
@@ -865,6 +881,30 @@ fn build_grant(args: GrantArgs) -> Result<Grant> {
 mod tests {
     use super::*;
 
+    /// Answers that arrive in one read are each taken in turn.
+    #[test]
+    fn answers_read_together_are_each_kept() {
+        let (stream, mut gateway) = std::os::unix::net::UnixStream::pair().unwrap();
+        gateway
+            .write_all(b"{\"ok\":true,\"pending\":true}\n{\"ok\":true,\"result\":1}\n")
+            .unwrap();
+        drop(gateway);
+        let mut session = AdminSession {
+            stream,
+            sent: true,
+            rest: Zeroizing::new(Vec::new()),
+        };
+        assert_eq!(
+            &session.read_line().ok().unwrap()[..],
+            b"{\"ok\":true,\"pending\":true}"
+        );
+        assert_eq!(
+            &session.read_line().ok().unwrap()[..],
+            b"{\"ok\":true,\"result\":1}"
+        );
+        assert!(session.read_line().is_err());
+    }
+
     /// The pairing code is read from the answer line as it is, and a
     /// refusal or a missing code is an error.
     #[test]
@@ -872,7 +912,12 @@ mod tests {
         let code = |line: &str| {
             let (stream, mut gateway) = std::os::unix::net::UnixStream::pair().unwrap();
             gateway.write_all(line.as_bytes()).unwrap();
-            AdminSession { stream, sent: true }.pairing_code()
+            AdminSession {
+                stream,
+                sent: true,
+                rest: Zeroizing::new(Vec::new()),
+            }
+            .pairing_code()
         };
         let uri =
             code("{\"ok\":true,\"result\":{\"expires_in\":600,\"uri\":\"keep-approval:x\"}}\n");
