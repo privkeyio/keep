@@ -2457,3 +2457,19 @@ fn an_agent_at_its_uids_request_limit_still_withdraws_a_request() {
     let (text, error) = tool_text(&reply(pending));
     assert!(error && text.starts_with("canceled"), "{text}");
 }
+
+/// A revoke or a delete that fails still cancels what the credential waits
+/// for, so nothing of it can be approved and signed afterwards.
+#[test]
+fn a_failed_revoke_or_delete_still_cancels_what_the_credential_waits_for() {
+    for op in ["revoke", "delete"] {
+        let (mut ap, _phone, id, token) = paired();
+        let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+        assert!(unanswered(&mut pending));
+        ap.gw.state.keep_mut().lock();
+        let answer = ap.gw.admin(json!({ "op": op, "id": id }));
+        assert_eq!(answer["ok"], json!(false), "{op}: {answer}");
+        let (text, error) = tool_text(&reply(pending));
+        assert!(error && text.starts_with("canceled"), "{op}: {text}");
+    }
+}

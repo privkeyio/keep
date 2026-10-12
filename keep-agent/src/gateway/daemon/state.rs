@@ -1531,14 +1531,16 @@ impl State {
             AdminRequest::Issue { .. } => Err(AgentError::Other("issue is answered apart".into())),
             AdminRequest::Revoke { id } => {
                 let id = parse_id(&id)?;
-                self.keep.revoke_agent_credential(&id)?;
+                // Canceled first, so a revoke that fails leaves nothing of
+                // the credential's to be approved and signed.
                 self.cancel_revoked(&id);
+                self.keep.revoke_agent_credential(&id)?;
                 Ok(json!({ "revoked": hex::encode(id) }))
             }
             AdminRequest::Delete { id } => {
                 let id = parse_id(&id)?;
-                self.delete_credential(&id)?;
                 self.cancel_revoked(&id);
+                self.delete_credential(&id)?;
                 self.audit.reset(&id);
                 self.credential_counts.remove(&id);
                 // The credential is gone either way; a stale bound uid only
