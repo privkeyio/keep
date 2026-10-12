@@ -2705,3 +2705,29 @@ fn an_approved_issue_of_a_key_deleted_meanwhile_issues_nothing() {
         "{answer}"
     );
 }
+
+/// A credential row that cannot be read can be deleted, as a frozen one:
+/// the epoch moves and the phones are told why the freeze went.
+#[test]
+fn an_unreadable_credential_can_be_deleted() {
+    let (mut ap, mut phone, id, _) = paired();
+    let bad = [0xee; 16];
+    ap.gw
+        .state
+        .keep()
+        .misplace_agent_credential_for_testing(&cid_of(&id), &bad)
+        .unwrap();
+    let _ = ap.received(&mut phone);
+    let answer = ap
+        .gw
+        .admin(json!({ "op": "delete", "id": hex::encode(bad) }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert_eq!(ap.epoch(), 1);
+    let anchor = last_anchor(&mut ap, &mut phone).expect("an anchor");
+    assert!(anchor
+        .frozen
+        .unfrozen
+        .iter()
+        .any(|u| u.scope == Scope::Credential(Hex16(bad))));
+    assert!(!anchor.frozen.credentials.contains(&Hex16(bad)));
+}
