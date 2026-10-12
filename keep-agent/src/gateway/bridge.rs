@@ -697,9 +697,19 @@ fn await_answer(
                 "params": { "requestId": id },
             });
             if let Ok(message) = serde_json::to_vec(&notification) {
-                // A line cut short would spoil the connection: it ends
-                // instead, which withdraws the request just the same.
-                if let Err(e) = conn.send(&token.envelope(&message)) {
+                // A line cut short would spoil the connection, and one the
+                // gateway would not take for a cancellation could be refused
+                // as if it were the request: the connection ends instead,
+                // which withdraws the request just the same.
+                let line = token.envelope(&message);
+                if line.len() - 1 > crate::gateway::daemon::state::MAX_CANCELLATION_LINE {
+                    return Err(Failure::Lost(
+                        "the cancellation is too long to send; the connection was closed to \
+                         withdraw the request"
+                            .into(),
+                    ));
+                }
+                if let Err(e) = conn.send(&line) {
                     return Err(Failure::Lost(format!(
                         "the cancellation could not be sent: {e}"
                     )));
@@ -1318,6 +1328,35 @@ mod socket_tests {
         assert_eq!(answer["id"], json!(1), "{answer}");
         assert_eq!(code(&answer), Some(REFUSED_CODE), "{answer}");
         assert!(started.elapsed() < Duration::from_secs(5));
+        client.finish().unwrap();
+    }
+
+    /// A cancellation too long for the gateway to take for one is never
+    /// sent: the connection is closed instead, which withdraws the request.
+    #[test]
+    fn a_cancellation_too_long_to_send_closes_the_connection() {
+        let (seen, saw) = mpsc::channel();
+        let fake = Fake::start(move |mut peer| {
+            peer.next().unwrap();
+            let _ = seen.send(peer.next().is_none());
+        });
+        let mut client = Client::start(bridge(&fake, patient()));
+        let id = "i".repeat(5_000);
+        client.send(
+            &json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {} })
+                .to_string(),
+        );
+        client.send(
+            &json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id } })
+                .to_string(),
+        );
+        let answer = client.recv();
+        assert_eq!(answer["id"], json!(id));
+        assert_eq!(code(&answer), Some(LOST), "{answer}");
+        assert!(
+            saw.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "the connection closed with no cancellation sent"
+        );
         client.finish().unwrap();
     }
 

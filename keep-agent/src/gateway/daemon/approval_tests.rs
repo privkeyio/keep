@@ -2430,9 +2430,13 @@ fn deleting_a_frozen_credential_is_explained_to_the_phones() {
     assert!(tracker.due_alerts(10 + CLEARED_GRACE_SECS).is_empty());
 }
 
-/// An agent its uid's request limit refuses can still withdraw a parked
+/// An agent its uid's request limit refuses can still withdraw its parked
 /// request with its token: the cancellation is neither refused by that limit
-/// nor counted against it. One naming nothing parked is refused as before.
+/// nor counted against it. Anything else past the limit is refused and
+/// counted, at most one credential row read and never every credential
+/// checked: another uid naming the request's id, the right uid with another
+/// token, a cancellation of nothing, and one on a line too long (which the
+/// bridge never sends).
 #[test]
 fn an_agent_at_its_uids_request_limit_still_withdraws_a_request() {
     let mut gw = Gw::with(super::state::Settings {
@@ -2453,11 +2457,16 @@ fn an_agent_at_its_uids_request_limit_still_withdraws_a_request() {
         next_conn: 1,
     };
     let (_, token) = ap.issue(&nostr_grant(ap.gw.key));
+    let (_, other) = ap.gw.issue(&nostr_grant(ap.gw.key), OTHER);
     let mut phone = Phone::new();
     ap.pair_first(&mut phone);
     let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
-    for _ in 0..2 {
-        assert!(ap.gw.rpc(&token, "ping", json!({})).get("result").is_some());
+    for uid_token in [&token, &other] {
+        for _ in 0..3 {
+            let line = json!({ "token": uid_token, "message": { "jsonrpc": "2.0", "id": 7, "method": "ping" } });
+            let uid = if uid_token == &token { AGENT } else { OTHER };
+            ap.gw.raw(uid, &line.to_string());
+        }
     }
     let limited = ap.gw.rpc(&token, "ping", json!({}));
     assert_eq!(
@@ -2465,24 +2474,43 @@ fn an_agent_at_its_uids_request_limit_still_withdraws_a_request() {
         json!(super::state::REFUSED_CODE),
         "{limited}"
     );
-    let cancel = |id: u64| json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id } });
-    // Refused unanswered, as a notification: nothing of it can be taken for
-    // the parked request's answer.
-    assert_eq!(ap.gw.send(AGENT, &token, cancel(9)), None);
-    assert!(unanswered(&mut pending));
-    // Another token is refused, and withdraws nothing.
-    assert_eq!(ap.gw.send(AGENT, "nope", cancel(1)), None);
-    assert!(unanswered(&mut pending));
-    let limited = ap.gw.rpc(&token, "ping", json!({}));
+    let cancel = |token: &str, id: u64| {
+        json!({ "token": token, "message": {
+            "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": id }
+        }})
+        .to_string()
+    };
+    // Refused, unanswered as a notification is, and not authenticated, so
+    // a connection's refusals in a row still count it.
+    let refused = |ap: &mut Ap, uid: u32, line: &str| {
+        assert_eq!(ap.gw.raw(uid, line), (None, false), "{line}");
+    };
+    refused(&mut ap, OTHER, &cancel(&other, 1));
+    refused(&mut ap, AGENT, &cancel(&token, 9));
     assert_eq!(
-        limited["error"]["code"],
-        json!(super::state::REFUSED_CODE),
-        "{limited}"
+        ap.gw.state.withdrawal_checks,
+        (0, 0),
+        "no credential was read"
     );
-    // So is the token from a uid that may hold none.
-    ap.gw.send(super::tests::ADMIN, &token, cancel(1));
+    refused(&mut ap, AGENT, &cancel(&other, 1));
+    refused(&mut ap, AGENT, &cancel("nope", 1));
+    assert_eq!(ap.gw.state.withdrawal_checks, (1, 0), "one row, no scan");
+    let long = json!({ "token": token, "message": {
+        "jsonrpc": "2.0", "method": "notifications/cancelled",
+        "params": { "requestId": 1, "reason": "x".repeat(5_000) }
+    }})
+    .to_string();
+    // Too long to be taken for one, so refused as any line is.
+    let (answer, authenticated) = ap.gw.raw(AGENT, &long);
+    assert_eq!(
+        answer.unwrap()["error"]["code"],
+        json!(super::state::REFUSED_CODE)
+    );
+    assert!(!authenticated);
     assert!(unanswered(&mut pending));
-    assert!(ap.gw.send(AGENT, &token, cancel(1)).is_none());
+
+    assert_eq!(ap.gw.raw(AGENT, &cancel(&token, 1)), (None, true));
+    assert_eq!(ap.gw.state.withdrawal_checks, (2, 1));
     let (text, error) = tool_text(&reply(pending));
     assert!(error && text.starts_with("canceled"), "{text}");
 }

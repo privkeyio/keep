@@ -62,6 +62,8 @@ pub(crate) struct ParkAsk {
 enum Waiter {
     Agent {
         credential: [u8; 16],
+        /// The uid the credential is bound to, which alone presents it.
+        uid: u32,
         id: Value,
         tool: &'static str,
         reply: oneshot::Sender<Zeroizing<String>>,
@@ -648,6 +650,7 @@ impl State {
             parked,
             Waiter::Agent {
                 credential: cid,
+                uid: granted.credential.uid,
                 id,
                 tool,
                 reply,
@@ -733,13 +736,22 @@ impl State {
         self.end_where(|| End::Withdrawn, |w| w.parked.request_id() == id);
     }
 
-    /// Whether an agent's request with JSON-RPC id `request` is parked.
-    pub(crate) fn parks_agent_request(&self, request: &Value) -> bool {
-        self.approvals.as_ref().is_some_and(|a| {
-            a.parked
-                .values()
-                .any(|w| matches!(&w.waiter, Waiter::Agent { id, .. } if id == request))
-        })
+    /// The credential of the agent request uid `uid` has parked with
+    /// JSON-RPC id `request`, if there is one.
+    pub(crate) fn parked_agent_request(&self, uid: u32, request: &Value) -> Option<[u8; 16]> {
+        self.approvals
+            .as_ref()?
+            .parked
+            .values()
+            .find_map(|w| match &w.waiter {
+                Waiter::Agent {
+                    credential,
+                    uid: by,
+                    id,
+                    ..
+                } if *by == uid && id == request => Some(*credential),
+                _ => None,
+            })
     }
 
     /// Withdraw the parked request of credential `cid` whose JSON-RPC id is
@@ -983,6 +995,7 @@ impl State {
                 id: rpc,
                 tool,
                 reply,
+                ..
             } => {
                 let line = self.carry_out_agent(approval, credential, rpc, tool);
                 let _ = reply.send(line);

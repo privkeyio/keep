@@ -337,6 +337,10 @@ pub struct State {
     /// Keys no grant may name: the channel key and every registered approver
     /// device's keys.
     reserved: ReservedKeys,
+    /// Tests only: how many withdrawals got as far as reading a credential
+    /// row, and as far as checking the token against every credential.
+    #[cfg(test)]
+    pub(crate) withdrawal_checks: (usize, usize),
 }
 
 /// A refusal to record against the credential a token matched.
@@ -491,6 +495,8 @@ impl State {
             deferred: Vec::new(),
             dropped: 0,
             reserved: ReservedKeys::new(),
+            #[cfg(test)]
+            withdrawal_checks: (0, 0),
         };
         state.persist_heartbeat()?;
         tracing::info!(clock = start, frozen, "agent gateway state ready");
@@ -635,24 +641,42 @@ impl State {
 
     /// Handle one line from the agent socket, sent by `peer_uid`.
     pub fn agent_request(&mut self, peer_uid: u32, request: &[u8]) -> Answer {
+        let cancellation = cancellation(request);
+        // A line refused before it is read is answered with a null id, except
+        // a cancellation, a notification, which is never answered: a client
+        // waiting on a request never takes that refusal for the request's.
+        let unread = |cancellation: &Option<Envelope>| match cancellation {
+            Some(_) => Answer {
+                line: None,
+                authenticated: false,
+                pending: None,
+            },
+            None => Answer::refused(Value::Null),
+        };
         if self.closed {
-            return refused_unread(request);
+            return unread(&cancellation);
         }
         let now = self.clock.now();
-        if let Some(answer) = self.withdrawal(peer_uid, request) {
+        if let Some(answer) = cancellation
+            .as_ref()
+            .and_then(|envelope| self.withdrawal(peer_uid, envelope))
+        {
             return answer;
         }
         let counted = pool(&self.bound, peer_uid);
         if let Err(window) = self.uid_counts.hit(counted, &self.settings.uid_limits, now) {
             self.journal_refusal(peer_uid, now, window);
-            return refused_unread(request);
+            return unread(&cancellation);
         }
-        let envelope: Envelope = match serde_json::from_slice(request) {
-            Ok(e) => e,
-            Err(_) => {
-                self.journal_refusal(peer_uid, now, "malformed envelope");
-                return Answer::refused(Value::Null);
-            }
+        let envelope: Envelope = match cancellation {
+            Some(envelope) => envelope,
+            None => match serde_json::from_slice(request) {
+                Ok(e) => e,
+                Err(_) => {
+                    self.journal_refusal(peer_uid, now, "malformed envelope");
+                    return Answer::refused(Value::Null);
+                }
+            },
         };
         let Envelope { token, message } = envelope;
         let id = message.get("id").cloned();
@@ -720,36 +744,42 @@ impl State {
         Answer::authenticated(self.serve(&granted, &message, id, now))
     }
 
-    /// A `notifications/cancelled` with an accepted token for a request that
-    /// is parked: withdrawn here, neither refused by the uid's request limit
-    /// nor counted against it, so an agent at its limit can still take back
-    /// what it asked for. Anything else, a token that is not accepted
-    /// included, goes the counted way, which refuses and records it; only a
-    /// line naming a parked request costs a token check before the limit.
-    fn withdrawal(&mut self, peer_uid: u32, request: &[u8]) -> Option<Answer> {
-        let Envelope { token, message } = serde_json::from_slice(request).ok()?;
-        if message.get("id").is_some()
-            || message.get("method").and_then(Value::as_str) != Some("notifications/cancelled")
+    /// A cancellation of a request this uid parked, with the token of the
+    /// credential that parked it: withdrawn here, neither refused by the
+    /// uid's request limit nor counted against it, so an agent at its limit
+    /// can still take back what it asked for. Anything else goes the counted
+    /// way, which refuses and records it. Before the limit, a line costs at
+    /// most a look at the uid's own parked requests and one credential row;
+    /// only a token that row matches is checked in full.
+    fn withdrawal(&mut self, peer_uid: u32, envelope: &Envelope) -> Option<Answer> {
+        let parked = envelope.message.get("params")?.get("requestId")?;
+        let credential = self.parked_agent_request(peer_uid, parked)?;
+        let hash = keep_core::agent::hash_presented_token(&envelope.token)?;
+        #[cfg(test)]
+        {
+            self.withdrawal_checks.0 += 1;
+        }
+        if !load_credential(&self.keep, &credential)
+            .ok()??
+            .matches_hash(&hash)
         {
             return None;
         }
-        let parked = message.get("params")?.get("requestId")?;
-        if !self.parks_agent_request(parked)
-            || forbidden_uid(&self.host, &self.settings, peer_uid)
-            || !bindable_uid(peer_uid)
+        #[cfg(test)]
         {
-            return None;
+            self.withdrawal_checks.1 += 1;
         }
-        let granted = authenticate(
+        // The rest of what a token must be: live, unfrozen, its uid's.
+        authenticate(
             &self.keep,
-            &token,
+            &envelope.token,
             peer_uid,
             self.clock.calendar(),
             &self.reserved,
         )
         .ok()?
         .ok()?;
-        self.cancel_agent_request(&granted.credential.id, parked);
+        self.cancel_agent_request(&credential, parked);
         Some(Answer::authenticated(None))
     }
 
@@ -1667,22 +1697,25 @@ fn forbidden_uid(host: &Host, settings: &Settings, uid: u32) -> bool {
         || settings.relay_uid == Some(uid)
 }
 
-/// The answer to a line refused before it is read: the refusal with a null
-/// id, except for a notification, which is never answered, so a client
-/// waiting on a request never takes the refusal of its cancellation for the
-/// request's own.
-fn refused_unread(request: &[u8]) -> Answer {
-    let notification = serde_json::from_slice::<Envelope>(request)
-        .is_ok_and(|envelope| envelope.message.get("id").is_none());
-    if notification {
-        Answer {
-            line: None,
-            authenticated: false,
-            pending: None,
-        }
-    } else {
-        Answer::refused(Value::Null)
+/// The longest line taken for a cancellation before the uid's request limit:
+/// a longer one is refused as any line is, with a null id, so the bridge
+/// never sends one.
+pub const MAX_CANCELLATION_LINE: usize = 4 * 1024;
+
+/// `request` as a `notifications/cancelled` envelope, when it is one. Only a
+/// short line that names the method is parsed, so a line refused by the
+/// uid's limit is not parsed first.
+fn cancellation(request: &[u8]) -> Option<Envelope> {
+    const METHOD: &[u8] = b"notifications/cancelled";
+    if request.len() > MAX_CANCELLATION_LINE || !request.windows(METHOD.len()).any(|w| w == METHOD)
+    {
+        return None;
     }
+    let envelope: Envelope = serde_json::from_slice(request).ok()?;
+    (envelope.message.get("id").is_none()
+        && envelope.message.get("method").and_then(Value::as_str)
+            == Some("notifications/cancelled"))
+    .then_some(envelope)
 }
 
 fn load_credential(keep: &Keep, id: &[u8; 16]) -> Result<Option<AgentCredential>> {
