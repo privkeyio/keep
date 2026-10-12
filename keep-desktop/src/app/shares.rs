@@ -439,24 +439,19 @@ impl App {
                 self.reconcile_kill_switch();
                 self.set_share_screen(shares);
                 self.load_config_from_vault();
-                let warnings = lock_keep(&self.keep)
+                self.audit_warnings = lock_keep(&self.keep)
                     .as_ref()
                     .map(keep_core::Keep::audit_warnings)
-                    .unwrap_or_default();
-                if !warnings.is_empty() {
-                    let text = warnings
-                        .iter()
-                        .map(|w| {
-                            let mut text = w.to_string();
-                            if let Some(first) = text.get_mut(..1) {
-                                first.make_ascii_uppercase();
-                            }
-                            text
-                        })
-                        .collect::<Vec<_>>()
-                        .join(". ");
-                    self.set_toast(format!("{text}."), ToastKind::Error);
-                }
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|w| {
+                        let mut text = w.to_string();
+                        if let Some(first) = text.get_mut(..1) {
+                            first.make_ascii_uppercase();
+                        }
+                        format!("{text}.")
+                    })
+                    .collect();
                 if let Some(request) = super::take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }

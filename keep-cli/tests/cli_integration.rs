@@ -1318,7 +1318,8 @@ fn test_audit_verify_detects_tampering() {
 }
 
 /// Overwrite `vault`'s audit log with entries in the format the release
-/// before sequence numbers wrote, chained from zero; `break_link` breaks the
+/// before sequence numbers wrote, chained from zero, and remove the record of
+/// the log from `keep.db`, as that release kept none; `break_link` breaks the
 /// chain at the second entry.
 fn write_format1_audit_log(vault: &Path, break_link: bool) {
     use base64::Engine;
@@ -1352,6 +1353,11 @@ fn write_format1_audit_log(vault: &Path, break_link: bool) {
         out.push('\n');
     }
     std::fs::write(vault.join("audit.log"), out).unwrap();
+    use keep_core::backend::StorageBackend;
+    keep_core::backend::RedbBackend::open(&vault.join("keep.db"))
+        .unwrap()
+        .delete(keep_core::backend::CONFIG_TABLE, b"audit_record")
+        .unwrap();
 }
 
 /// A vault whose audit log predates sequence numbers is migrated the next
@@ -1400,8 +1406,9 @@ fn test_audit_verify_fails_after_a_failed_migration() {
     assert!(output_contains(&out, "cannot be trusted"));
     assert!(output_contains(&out, "audit.log.v1"));
 
-    // Once retention has removed every entry from before the migration,
-    // verify passes and only notes the failed migration.
+    // Once retention has removed every entry from before the migration, the
+    // chain itself checks out and only notes the failed migration, but verify
+    // still fails while the warning waits for the owner's acknowledgement.
     assert_success(
         &KeepCmd::new(&bin)
             .path(&vault)
@@ -1412,13 +1419,97 @@ fn test_audit_verify_fails_after_a_failed_migration() {
         .path(&vault)
         .args(["audit", "verify"])
         .run();
-    assert_success(&out);
+    assert_failure(&out);
+    assert!(output_contains(&out, "hash chain is valid"));
     assert!(output_contains(&out, "None of them remain"));
 
+    // Deleting the kept old log does not silence the warning; it says the
+    // kept log is missing until the owner acknowledges it.
     std::fs::remove_file(vault.join("audit.log.v1")).unwrap();
     let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
     assert_success(&out);
+    assert!(output_contains(&out, "FAILED its chain check"));
+    assert!(output_contains(&out, "audit.log.v1 is missing"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Acknowledged"));
+    let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&out);
     assert!(!output_contains(&out, "FAILED its chain check"));
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["audit", "verify"])
+            .run(),
+    );
+}
+
+/// The latest session cut off the audit log is reported on every unlock,
+/// `audit verify` exits 1 until the owner acknowledges it, and the
+/// acknowledgement is itself recorded.
+#[test]
+fn test_audit_verify_fails_on_a_rollback_until_acknowledged() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k1"])
+            .run(),
+    );
+    let before = std::fs::read(vault.join("audit.log")).unwrap();
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k2"])
+            .run(),
+    );
+    std::fs::write(vault.join("audit.log"), before).unwrap();
+
+    for _ in 0..2 {
+        let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+        assert_success(&out);
+        assert!(output_contains(&out, "replaced or cut back"));
+    }
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    assert!(output_contains(&out, "replaced or cut back"));
+
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Acknowledged"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Nothing to acknowledge"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_success(&out);
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "stats"])
+        .run();
+    assert_success(&out);
 }
 
 /// `audit stats` reports the count of each event type; two `generate`s show as

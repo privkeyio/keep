@@ -567,9 +567,6 @@ impl State {
     /// more.
     pub fn shut_down(&mut self) {
         self.cancel_all("canceled: the gateway is stopping");
-        if let Err(e) = self.keep.audit_checkpoint() {
-            tracing::warn!(error = %e, "the audit log's place could not be recorded");
-        }
         self.closed = true;
         self.write_journal();
         self.record_deferred();

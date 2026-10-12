@@ -78,15 +78,12 @@ impl AuditVault {
         }
     }
 
-    /// A log found behind what the vault recorded. Only a regular vault keeps
-    /// that record.
-    fn rollback(&self) -> Option<keep_core::audit_record::AuditRollback> {
+    /// What the vault's record of the audit log says the owner must be told.
+    /// Only a regular vault keeps that record.
+    fn warnings(&self) -> Vec<keep_core::audit_record::AuditWarning> {
         match self {
-            Self::Keep(k) => k.audit_warnings().into_iter().find_map(|w| match w {
-                keep_core::audit_record::AuditWarning::RolledBack(r) => Some(r),
-                _ => None,
-            }),
-            Self::HiddenOuter(_) => None,
+            Self::Keep(k) => k.audit_warnings(),
+            Self::HiddenOuter(_) => Vec::new(),
         }
     }
 }
@@ -258,20 +255,19 @@ pub fn cmd_audit_verify(out: &Output, path: &Path, hidden: bool) -> Result<()> {
         }
         None => out.success("Audit log integrity verified - hash chain is valid"),
     }
-    if let Some(rollback) = vault.rollback() {
-        out.error(&format!(
-            "{}",
-            keep_core::audit_record::AuditWarning::RolledBack(rollback)
-        ));
+    let warnings = vault.warnings();
+    for warning in &warnings {
+        out.error(&warning.to_string());
+    }
+    if !warnings.is_empty() {
         std::process::exit(1);
     }
 
     Ok(())
 }
 
-/// Acknowledge that the audit log was found behind what the vault recorded,
-/// once investigated: the log gets an entry with what was recorded and what
-/// was found, and the warning stops.
+/// Acknowledge the audit warnings the vault reports, once investigated: the
+/// log gets an entry naming each, and the warnings stop.
 pub fn cmd_audit_acknowledge(out: &Output, path: &Path, hidden: bool) -> Result<()> {
     let password = get_password("Password")?;
     let vault = AuditVault::open_unlock(path, hidden, password.expose_secret())?;
@@ -280,17 +276,16 @@ pub fn cmd_audit_acknowledge(out: &Output, path: &Path, hidden: bool) -> Result<
             "a hidden volume's outer log keeps no record to acknowledge".into(),
         ));
     };
-    let Some(rollback) = keep.audit_warnings().into_iter().find_map(|w| match w {
-        keep_core::audit_record::AuditWarning::RolledBack(r) => Some(r),
-        _ => None,
-    }) else {
-        out.info("Nothing to acknowledge: the audit log is where the vault recorded it");
+    let acknowledged = keep.audit_acknowledge()?;
+    if acknowledged.is_empty() {
+        out.info("Nothing to acknowledge: the vault reports no audit warnings");
         return Ok(());
-    };
-    keep.audit_acknowledge_rollback()?;
-    out.success(&format!(
-        "Acknowledged, and recorded in the audit log: {rollback}"
-    ));
+    }
+    for warning in &acknowledged {
+        out.success(&format!(
+            "Acknowledged, and recorded in the audit log: {warning}"
+        ));
+    }
     Ok(())
 }
 
@@ -443,7 +438,7 @@ impl AuditStats {
             AuditEventType::AgentApproverRemoved => self.approver_removed += 1,
             AuditEventType::AuditLogMigrated
             | AuditEventType::AuditRetention
-            | AuditEventType::AuditRollbackAcknowledged => {}
+            | AuditEventType::AuditAcknowledged => {}
         }
     }
 }

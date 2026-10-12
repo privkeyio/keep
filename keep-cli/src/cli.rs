@@ -536,8 +536,8 @@ pub(crate) enum AuditCommands {
         output: Option<String>,
     },
     Verify,
-    /// Acknowledge that the audit log was found behind what the vault
-    /// recorded, once investigated; the acknowledgement is itself audited.
+    /// Acknowledge the audit warnings the vault reports on unlock, once
+    /// investigated; the acknowledgement is itself audited.
     Acknowledge,
     Retention {
         #[arg(long, help = "Maximum entries to keep")]

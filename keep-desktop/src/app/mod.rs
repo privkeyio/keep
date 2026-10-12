@@ -163,6 +163,8 @@ pub struct App {
     last_import_attempt: Option<Instant>,
     cached_share_count: usize,
     cached_nsec_count: usize,
+    /// What the vault says about its audit logs, shown until acknowledged.
+    audit_warnings: Vec<String>,
 }
 
 impl App {
@@ -245,6 +247,7 @@ impl App {
             last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
+            audit_warnings: Vec::new(),
             settings,
             kill_switch,
             tray,
@@ -708,6 +711,29 @@ impl App {
         } else {
             screen
         };
+        let screen = if self.audit_warnings.is_empty() {
+            screen
+        } else {
+            let warnings = self
+                .audit_warnings
+                .iter()
+                .fold(column![].spacing(theme::space::XS), |col, w| {
+                    col.push(text(w).size(theme::size::SMALL).color(iced::Color::WHITE))
+                });
+            let banner = container(
+                column![
+                    text("Audit log warning")
+                        .size(theme::size::BODY)
+                        .color(iced::Color::WHITE),
+                    warnings,
+                ]
+                .spacing(theme::space::XS),
+            )
+            .style(theme::kill_switch_banner_style)
+            .padding(theme::space::MD)
+            .width(Length::Fill);
+            column![banner, screen].into()
+        };
         let Some(toast) = &self.toast else {
             return screen;
         };
@@ -839,6 +865,7 @@ impl App {
             last_import_attempt: None,
             cached_share_count: 0,
             cached_nsec_count: 0,
+            audit_warnings: Vec::new(),
             settings,
             kill_switch,
             tray: None,

@@ -29,6 +29,21 @@ use zeroize::Zeroizing;
 /// The config key the agent freeze epoch is stored under.
 const AGENT_FREEZE_EPOCH: &[u8] = b"agent_freeze_epoch";
 
+/// What a value [`Storage::set_config_bound`] stores starts with: the key and
+/// a zero byte.
+fn bound_prefix(key: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut prefix = Zeroizing::new(Vec::with_capacity(key.len() + 1));
+    prefix.extend_from_slice(key);
+    prefix.push(0);
+    prefix
+}
+
+fn bound_value(key: &[u8], value: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut bound = bound_prefix(key);
+    bound.extend_from_slice(value);
+    bound
+}
+
 /// Marker value stored for a pending delete-tombstone. Only the entry KEY
 /// (`"<table>:<hex record id>"`) carries information; the delete is re-published
 /// with a fresh `created_at`, so no timestamp needs to persist here.
@@ -1786,6 +1801,42 @@ impl Storage {
         backend.put(CONFIG_TABLE, key, &encrypted)
     }
 
+    /// The config value stored under `key` with [`Storage::set_config_bound`],
+    /// if any. A value stored under another key, or without its key, is
+    /// refused as corrupted.
+    pub(crate) fn get_config_bound(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let Some(stored) = self.get_config_bytes(key)? else {
+            return Ok(None);
+        };
+        let prefix = bound_prefix(key);
+        match stored.strip_prefix(prefix.as_slice()) {
+            Some(value) => Ok(Some(Zeroizing::new(value.to_vec()))),
+            None => Err(StorageError::corrupted(format!(
+                "config {} holds a value stored under another key",
+                String::from_utf8_lossy(key)
+            ))
+            .into()),
+        }
+    }
+
+    /// Remove the config row `key`, as someone editing `keep.db` would.
+    #[cfg(test)]
+    pub(crate) fn remove_config_for_tests(&self, key: &[u8]) -> Result<bool> {
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .delete(CONFIG_TABLE, key)
+    }
+
+    /// Store `value` encrypted under the config `key`, with the key inside
+    /// the encrypted value, so it cannot be moved under another key. The
+    /// value is one opaque blob under the data key, which rotation carries
+    /// as it carries every config row; only keys no older keep reads are
+    /// stored this way.
+    pub(crate) fn set_config_bound(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.set_config_bytes(key, &bound_value(key, value))
+    }
+
     /// Get the kill switch state from the vault.
     pub fn get_kill_switch(&self) -> Result<bool> {
         self.get_config_flag(b"kill_switch")
@@ -1825,7 +1876,7 @@ impl Storage {
     /// credential or of every agent, so an unfreeze signed for an earlier
     /// epoch can be told apart from one for the current state.
     pub fn get_agent_freeze_epoch(&self) -> Result<u64> {
-        match self.get_config_bytes(AGENT_FREEZE_EPOCH)? {
+        match self.get_config_bound(AGENT_FREEZE_EPOCH)? {
             None => Ok(0),
             Some(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_le_bytes)
@@ -1885,7 +1936,8 @@ impl Storage {
                 self.encrypt_value(&[u8::from(frozen)])?,
             ),
         };
-        let epoch_value = self.encrypt_value(&next.to_le_bytes())?;
+        let epoch_value =
+            self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?;
         let encrypted = ledgers
             .iter()
             .map(|(_, ledger)| self.encrypt_value(ledger))
