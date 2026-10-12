@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 //! Fixed test vectors (`vectors/v1.json`), shared with the approver's own
-//! implementation. Every value is recomputed here and compared, except the
-//! BIP-340 signatures (which use fresh auxiliary randomness), which are
-//! verified instead.
+//! implementation. Every value is recomputed here and compared, the P-256
+//! signatures included (RFC 6979 nonces make them deterministic), except
+//! the BIP-340 freeze signatures, which use fresh auxiliary randomness and
+//! are verified instead.
 //!
 //! Regenerate with `KEEP_APPROVAL_WRITE_VECTORS=1 cargo test -p keep-approval
 //! --test vectors`; a change to any deterministic value is a protocol change.
@@ -19,12 +20,13 @@ use keep_approval::binding::{
 };
 use keep_approval::change::{Change, ChangeBitcoin, ChangeGrant, ChangeLimits, Decimal, Scope};
 use keep_approval::messages::{
-    AnchorState, Budget, CredentialRef, FreezeAction, Reason, Request, Verdict, WalletAnchor,
+    AnchorState, Budget, CredentialRef, FreezeAction, LogPoint, Reason, Request, SignerKey,
+    Verdict, WalletAnchor, WalletName,
 };
 use keep_approval::psbt::PsbtPayload;
-use keep_approval::sig::{self, xonly};
+use keep_approval::sig::{self, xonly, ApproverSigningKey};
 use keep_approval::wrap::TagKey;
-use keep_approval::{Hex16, Hex32, Hex64};
+use keep_approval::{Hex16, Hex32, Hex33, Hex64};
 use nostr::{Keys, SecretKey};
 use serde_json::{json, Value};
 
@@ -32,16 +34,23 @@ fn keys(byte: u8) -> Keys {
     Keys::new(SecretKey::from_slice(&[byte; 32]).unwrap())
 }
 
-fn psbt() -> Psbt {
+fn approver_key() -> ApproverSigningKey {
+    ApproverSigningKey::from_slice(&[0x03; 32]).unwrap()
+}
+
+/// A PSBT spending two taproot inputs, and with `third`, a third input the
+/// gateway does not sign: a P2WPKH output with a sighash the signer refuses.
+fn psbt(third: bool) -> Psbt {
     let script = |b: u8| {
         let mut s = vec![0x51, 0x20];
         s.extend_from_slice(&[b; 32]);
         ScriptBuf::from_bytes(s)
     };
+    let inputs = if third { 3u8 } else { 2 };
     let tx = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
-        input: (0..2u8)
+        input: (0..inputs)
             .map(|i| TxIn {
                 previous_output: OutPoint {
                     txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(
@@ -75,6 +84,15 @@ fn psbt() -> Psbt {
         script_pubkey: script(0x02),
     });
     psbt.inputs[1].sighash_type = Some(PsbtSighashType::from_u32(1));
+    if third {
+        let mut wpkh = vec![0x00, 0x14];
+        wpkh.extend_from_slice(&[0x03; 20]);
+        psbt.inputs[2].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: ScriptBuf::from_bytes(wpkh),
+        });
+        psbt.inputs[2].sighash_type = Some(PsbtSighashType::from_u32(0x83));
+    }
     psbt
 }
 
@@ -87,8 +105,12 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
     let anchor = AnchorState {
         seq: 4210,
         head: Hex32([0x33; 32]),
+        prev: Some(LogPoint {
+            seq: 4170,
+            head: Hex32([0x32; 32]),
+        }),
         wallets: vec![WalletAnchor {
-            wallet: format!("main:{}", hex::encode(key)),
+            wallet: WalletName::new(true, &key),
             seq: 88,
             spent: 40_000,
             window: 100_000,
@@ -143,13 +165,59 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
                 Some(credential.clone()),
             ),
         ),
+        (
+            "sign_nostr_event with control, separator and astral characters",
+            draft(
+                Payload::Nostr(NostrPayload {
+                    event: UnsignedEventFields {
+                        pubkey: Hex32(key),
+                        created_at: 1_791_580_000,
+                        kind: 0,
+                        tags: vec![vec![
+                            "t".into(),
+                            "a\u{1}b\u{1f}c\u{7f}\u{2028}d\u{1f600}".into(),
+                        ]],
+                        content: "\"q\"\\\n\t\u{0}\u{8}\u{c}\u{2028}\u{2029}\u{1f600}\u{10ffff}é"
+                            .into(),
+                    },
+                }),
+                Reason::Kind { kind: 0 },
+                Some(key),
+                None,
+                Some(credential.clone()),
+            ),
+        ),
         ("sign_psbt above threshold", {
             let mut d = draft(
                 Payload::Psbt(
-                    PsbtPayload::from_psbt(&psbt(), &[0, 1], &[(1, 7)], Network::Mainnet).unwrap(),
+                    PsbtPayload::from_psbt(&psbt(false), &[0, 1], &[(1, 7)], Network::Mainnet)
+                        .unwrap(),
                 ),
                 Reason::AboveThreshold {
                     requested: 31_000,
+                    spent: 10_000,
+                    threshold: 20_000,
+                },
+                Some(key),
+                Some(Network::Mainnet),
+                Some(credential.clone()),
+            );
+            d.budget = Some(Budget {
+                credential_spent: 10_000,
+                credential_window: 100_000,
+                wallet_spent: 40_000,
+                wallet_window: 100_000,
+            });
+            d
+        }),
+        ("sign_psbt with an input the gateway does not sign", {
+            let mut d = draft(
+                Payload::Psbt(
+                    PsbtPayload::from_psbt(&psbt(true), &[0, 1], &[(1, 7)], Network::Mainnet)
+                        .unwrap(),
+                ),
+                Reason::AboveThreshold {
+                    requested: 33_000,
                     spent: 10_000,
                     threshold: 20_000,
                 },
@@ -240,9 +308,9 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
             draft(
                 Payload::Management(Change::AddApprover {
                     transport: Hex32([0x66; 32]),
-                    approver: Hex32([0x77; 32]),
-                    label: "My phone".into(),
-                    fingerprint: sig::fingerprint(&[0x66; 32], &[0x77; 32]),
+                    approver: Hex33(sig::approver_key(&approver_key())),
+                    label: "Kyle\u{2019}s téléphone \u{1f4f1}".into(),
+                    fingerprint: sig::fingerprint(&[0x66; 32], &sig::approver_key(&approver_key())),
                 }),
                 Reason::Management,
                 None,
@@ -255,7 +323,7 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
             draft(
                 Payload::Management(Change::RemoveApprover {
                     transport: Hex32([0x66; 32]),
-                    approver: Hex32([0x77; 32]),
+                    approver: Hex33(sig::approver_key(&approver_key())),
                 }),
                 Reason::Management,
                 None,
@@ -266,15 +334,15 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
     ]
 }
 
-/// Every vector, with fresh signatures.
+/// Every vector, with fresh BIP-340 signatures.
 fn vectors() -> Value {
     let channel = keys(0x01);
     let transport = keys(0x02);
-    let approver = keys(0x03);
+    let approver = approver_key();
     let vault_key = xonly(&keys(0x04));
     let c = xonly(&channel);
     let t = xonly(&transport);
-    let a = xonly(&approver);
+    let a = sig::approver_key(&approver);
 
     let mut requests = Vec::new();
     let mut changes = Vec::new();
@@ -296,83 +364,105 @@ fn vectors() -> Value {
                 "sha256": hex::encode(change.digest()),
             }));
         }
+        let mut extra = json!({});
+        match &draft.payload {
+            Payload::Nostr(p) => {
+                extra["event_id"] = hex::encode(p.event.event_id().unwrap()).into()
+            }
+            Payload::Psbt(p) => {
+                extra["txid"] = p.check(Network::Mainnet).unwrap().txid.into();
+            }
+            _ => {}
+        }
         let (request, hash) = draft.finish(&c).unwrap();
-        requests.push(json!({
+        let mut item = json!({
             "name": name,
             "request": serde_json::to_value(&request).unwrap(),
             "preimage": hex::encode(preimage),
             "request_hash": hex::encode(hash),
-        }));
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            item[k] = v.clone();
+        }
+        requests.push(item);
     }
 
-    let hash = [0x5a; 32];
+    let hash = Hex32([0x5a; 32]);
     let decisions: Vec<Value> = [Verdict::Approve, Verdict::Deny]
         .into_iter()
         .map(|verdict| {
-            let digest = sig::decision_digest(&c, &a, &hash, verdict);
+            let digest = sig::decision_digest(&c, &a, &hash.0, verdict);
+            let decision = sig::decision(&approver, &c, Hex32([0x44; 32]), hash, verdict);
             json!({
-                "request_hash": hex::encode(hash),
+                "request_hash": hash,
                 "decision": verdict,
                 "signer": hex::encode(a),
                 "digest": hex::encode(digest),
-                "sig": sig::sign(&approver, &digest),
+                "sig": decision.sig,
             })
         })
         .collect();
-    let freezes: Vec<Value> = [
-        (FreezeAction::Freeze, Scope::All, &transport, t),
-        (
-            FreezeAction::Freeze,
-            Scope::Credential(Hex16([0x22; 16])),
-            &transport,
-            t,
-        ),
-        (FreezeAction::Unfreeze, Scope::All, &approver, a),
-        (
-            FreezeAction::Unfreeze,
-            Scope::Credential(Hex16([0x22; 16])),
-            &approver,
-            a,
-        ),
-    ]
-    .into_iter()
-    .map(|(action, scope, signer, pubkey)| {
-        let digest = sig::freeze_digest(&c, &pubkey, 17, 41, action, scope);
-        json!({
-            "action": action,
+    let scopes = [Scope::All, Scope::Credential(Hex16([0x22; 16]))];
+    let mut freezes: Vec<Value> = Vec::new();
+    for scope in scopes {
+        let f = sig::freeze(&transport, &c, 17, 41, scope);
+        freezes.push(json!({
+            "action": FreezeAction::Freeze,
             "scope": scope,
             "counter": 17,
             "epoch": 41,
-            "signer": hex::encode(pubkey),
-            "digest": hex::encode(digest),
-            "sig": sig::sign(signer, &digest),
-        })
-    })
-    .collect();
+            "signer": f.signer,
+            "digest": hex::encode(sig::freeze_digest(&c, &f.signer, 17, 41, FreezeAction::Freeze, scope)),
+            "sig": f.sig,
+        }));
+    }
+    for scope in scopes {
+        let f = sig::unfreeze(&approver, &c, 17, 41, scope);
+        freezes.push(json!({
+            "action": FreezeAction::Unfreeze,
+            "scope": scope,
+            "counter": 17,
+            "epoch": 41,
+            "signer": f.signer,
+            "digest": hex::encode(sig::freeze_digest(&c, &f.signer, 17, 41, FreezeAction::Unfreeze, scope)),
+            "sig": f.sig,
+        }));
+    }
     let secret = [0x07u8; 32];
     let pair_digest = sig::pair_approver_digest(&c, &t, &a);
+    let pair = sig::pair(&t, &approver, &c, &secret, "My phone");
     let pairing = json!({
         "secret": hex::encode(secret),
         "proof": sig::pair_proof(&secret, &c, &t, &a),
         "fingerprint": sig::fingerprint(&t, &a),
         "approver_digest": hex::encode(pair_digest),
-        "approver_sig": sig::sign(&approver, &pair_digest),
+        "approver_sig": sig::sign_p256(&approver, &pair_digest),
+        "message": serde_json::to_value(&pair).unwrap(),
     });
     let wrap_pubkey = xonly(&keys(0x08));
     let content = "AjNkZXNjcmlwdGlvbg==";
     let wrap_tags = json!([
         {
-            "between": "channel and transport",
+            "between": "channel key to transport key",
+            "direction": 1,
             "wrap_pubkey": hex::encode(wrap_pubkey),
             "content": content,
-            "tag": hex::encode(TagKey::for_peer(&channel, &t).unwrap().tag(&wrap_pubkey, content)),
+            "tag": hex::encode(TagKey::gateway(&channel, &t).unwrap().tag(&wrap_pubkey, content)),
         },
         {
-            "between": "pairing secret",
+            "between": "transport key to channel key",
+            "direction": 2,
+            "wrap_pubkey": hex::encode(wrap_pubkey),
+            "content": content,
+            "tag": hex::encode(TagKey::device(&transport, &c).unwrap().tag(&wrap_pubkey, content)),
+        },
+        {
+            "between": "pairing secret, phone to gateway",
+            "direction": 2,
             "secret": hex::encode(secret),
             "wrap_pubkey": hex::encode(wrap_pubkey),
             "content": content,
-            "tag": hex::encode(TagKey::for_pairing(&secret).tag(&wrap_pubkey, content)),
+            "tag": hex::encode(TagKey::pairing_phone(&secret).tag(&wrap_pubkey, content)),
         }
     ]);
     json!({
@@ -382,6 +472,7 @@ fn vectors() -> Value {
             "channel": hex::encode(c),
             "transport_secret": hex::encode([0x02u8; 32]),
             "transport": hex::encode(t),
+            "approver_alg": "p256",
             "approver_secret": hex::encode([0x03u8; 32]),
             "approver": hex::encode(a),
             "vault_key": hex::encode(vault_key),
@@ -395,14 +486,13 @@ fn vectors() -> Value {
     })
 }
 
-/// The vectors with every signature removed, for comparing.
-fn without_sigs(mut v: Value) -> Value {
-    for list in ["decisions", "freezes"] {
-        for item in v[list].as_array_mut().unwrap() {
+/// The vectors with the BIP-340 signatures removed, for comparing.
+fn without_bip340_sigs(mut v: Value) -> Value {
+    for item in v["freezes"].as_array_mut().unwrap() {
+        if item["action"] == "freeze" {
             item.as_object_mut().unwrap().remove("sig");
         }
     }
-    v["pairing"].as_object_mut().unwrap().remove("approver_sig");
     v
 }
 
@@ -420,48 +510,73 @@ fn vectors_match() {
     }
     let stored: Value = serde_json::from_str(&std::fs::read_to_string(path()).unwrap()).unwrap();
     assert_eq!(
-        without_sigs(stored.clone()),
-        without_sigs(fresh),
+        without_bip340_sigs(stored.clone()),
+        without_bip340_sigs(fresh),
         "a deterministic vector changed"
     );
 
     // The stored signatures verify, each under its own key and digest only.
     let hex32 = |v: &Value| -> [u8; 32] { Hex32::parse(v.as_str().unwrap()).unwrap().0 };
+    let hex33 = |v: &Value| -> [u8; 33] { Hex33::parse(v.as_str().unwrap()).unwrap().0 };
     let hex64 = |v: &Value| Hex64::parse(v.as_str().unwrap()).unwrap();
-    for item in stored["decisions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(stored["freezes"].as_array().unwrap())
-    {
+    for item in stored["decisions"].as_array().unwrap() {
         let (signer, digest, s) = (
-            hex32(&item["signer"]),
+            hex33(&item["signer"]),
             hex32(&item["digest"]),
             hex64(&item["sig"]),
         );
-        sig::verify(&signer, &digest, &s).unwrap();
+        sig::verify_p256(&signer, &digest, &s).unwrap();
         let mut other = digest;
         other[0] ^= 1;
-        assert!(sig::verify(&signer, &other, &s).is_err());
+        assert!(sig::verify_p256(&signer, &other, &s).is_err());
+    }
+    for item in stored["freezes"].as_array().unwrap() {
+        let digest = hex32(&item["digest"]);
+        let s = hex64(&item["sig"]);
+        let signer: SignerKey = serde_json::from_value(item["signer"].clone()).unwrap();
+        let mut other = digest;
+        other[0] ^= 1;
+        match signer {
+            SignerKey::Transport(k) => {
+                assert_eq!(item["action"], "freeze");
+                sig::verify_bip340(&k.0, &digest, &s).unwrap();
+                assert!(sig::verify_bip340(&k.0, &other, &s).is_err());
+            }
+            SignerKey::Approver(k) => {
+                assert_eq!(item["action"], "unfreeze");
+                sig::verify_p256(&k.0, &digest, &s).unwrap();
+                assert!(sig::verify_p256(&k.0, &other, &s).is_err());
+            }
+        }
     }
     let p = &stored["pairing"];
-    let a = hex32(&stored["keys"]["approver"]);
-    sig::verify(
+    let a = hex33(&stored["keys"]["approver"]);
+    sig::verify_p256(
         &a,
         &hex32(&p["approver_digest"]),
         &hex64(&p["approver_sig"]),
     )
     .unwrap();
 
-    // Every stored request checks out from its JSON alone.
+    // Every stored request checks out from its JSON alone, with its event
+    // id and txid recomputed.
     let channel = hex32(&stored["keys"]["channel"]);
     for item in stored["requests"].as_array().unwrap() {
         let request: Request =
             keep_approval::messages::parse(&item["request"].to_string()).unwrap();
-        check_request(&request, &channel).unwrap();
+        let checked = check_request(&request, &channel).unwrap();
         assert_eq!(
             request.request_hash.to_hex(),
             item["request_hash"].as_str().unwrap()
         );
+        if let Payload::Nostr(p) = &checked.payload {
+            assert_eq!(
+                hex::encode(p.event.event_id().unwrap()),
+                item["event_id"].as_str().unwrap()
+            );
+        }
+        if let Some(view) = checked.psbt {
+            assert_eq!(view.txid, item["txid"].as_str().unwrap());
+        }
     }
 }

@@ -15,7 +15,7 @@ macro_rules! hex_bytes {
         impl $name {
             /// Parse lowercase hex of exactly the right length.
             pub fn parse(s: &str) -> crate::Result<Self> {
-                if s.len() != $len * 2 || !s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                if !is_lower_hex(s, $len) {
                     return Err(crate::malformed(concat!(
                         "expected ",
                         stringify!($len),
@@ -68,7 +68,13 @@ macro_rules! hex_bytes {
 
 hex_bytes!(Hex16, 16);
 hex_bytes!(Hex32, 32);
+hex_bytes!(Hex33, 33);
 hex_bytes!(Hex64, 64);
+
+/// Whether `s` is lowercase hex of exactly `len` bytes.
+pub(crate) fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len * 2 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// A byte string of any length, carried as lowercase hex.
 pub(crate) mod hex_vec {

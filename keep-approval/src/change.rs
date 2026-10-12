@@ -15,7 +15,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::{malformed, sha256, Hex16, Hex32, Result};
+use crate::{malformed, sha256, Hex16, Hex32, Hex33, Result};
 
 /// A management change, as a request carries it in `payload.change`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,12 +37,12 @@ pub enum Change {
     /// Register a paired device.
     AddApprover {
         transport: Hex32,
-        approver: Hex32,
+        approver: Hex33,
         label: String,
         fingerprint: String,
     },
     /// Remove a device.
-    RemoveApprover { transport: Hex32, approver: Hex32 },
+    RemoveApprover { transport: Hex32, approver: Hex33 },
 }
 
 /// What a freeze or unfreeze covers.
@@ -189,13 +189,6 @@ impl Change {
         Ok(change)
     }
 
-    /// Parse a change from JSON text, refusing duplicate names, which a
-    /// parsed [`Value`] would already have collapsed.
-    pub fn parse_text(text: &str) -> Result<Self> {
-        let value = parse_without_duplicates(text)?;
-        Self::parse(&value)
-    }
-
     /// The change as a JSON value, ready to send.
     pub fn to_value(&self) -> Value {
         serde_json::to_value(self).expect("a change always serializes")
@@ -229,22 +222,11 @@ impl Change {
                 fingerprint,
             } => {
                 check_label(label, "label")?;
-                if transport == approver {
-                    return Err(malformed("the transport and approver keys are the same"));
-                }
                 if *fingerprint != crate::sig::fingerprint(&transport.0, &approver.0) {
                     return Err(malformed("the fingerprint is not the device's"));
                 }
             }
-            Change::RemoveApprover {
-                transport,
-                approver,
-            } => {
-                if transport == approver {
-                    return Err(malformed("the transport and approver keys are the same"));
-                }
-            }
-            Change::Unfreeze { .. } => {}
+            Change::RemoveApprover { .. } | Change::Unfreeze { .. } => {}
         }
         Ok(())
     }
@@ -297,6 +279,9 @@ impl ChangeGrant {
             }
             if let Some(list) = &b.address_allowlist {
                 ascending(list, "address_allowlist")?;
+                for address in list {
+                    check_address(address, &b.network)?;
+                }
             }
         }
         for limit in [
@@ -310,6 +295,38 @@ impl ChangeGrant {
         }
         Ok(())
     }
+}
+
+/// The longest address a grant's allowlist may hold: a 40-byte witness
+/// program in bech32m on the longest prefix fits in far less.
+pub const MAX_ADDRESS_CHARS: usize = 90;
+
+/// Check an allowlisted address, which an approver shows as the gateway's
+/// word: at most [`MAX_ADDRESS_CHARS`] ASCII letters and digits, and a valid
+/// address on the grant's network.
+fn check_address(address: &str, network: &str) -> Result<()> {
+    if address.is_empty()
+        || address.len() > MAX_ADDRESS_CHARS
+        || !address.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(malformed(
+            "an allowlisted address holds letters and digits only",
+        ));
+    }
+    let network = match network {
+        "bitcoin" => bitcoin::Network::Bitcoin,
+        "testnet" => bitcoin::Network::Testnet,
+        "testnet4" => bitcoin::Network::Testnet4,
+        "signet" => bitcoin::Network::Signet,
+        _ => bitcoin::Network::Regtest,
+    };
+    let parsed: bitcoin::Address<bitcoin::address::NetworkUnchecked> = address
+        .parse()
+        .map_err(|_| malformed("an allowlisted address does not parse"))?;
+    if !parsed.is_valid_for_network(network) {
+        return Err(malformed("an allowlisted address is for another network"));
+    }
+    Ok(())
 }
 
 fn ascending<T: Ord>(list: &[T], what: &str) -> Result<()> {
@@ -506,9 +523,9 @@ mod tests {
         json!({
             "type": "add_approver",
             "transport": "33".repeat(32),
-            "approver": "44".repeat(32),
+            "approver": "02".repeat(33),
             "label": "My phone",
-            "fingerprint": crate::sig::fingerprint(&[0x33; 32], &[0x44; 32]),
+            "fingerprint": crate::sig::fingerprint(&[0x33; 32], &[0x02; 33]),
         })
     }
 
@@ -519,7 +536,7 @@ mod tests {
             json!({"type": "unfreeze", "scope": "all", "epoch": "41"}),
             json!({"type": "unfreeze", "scope": {"credential": "22".repeat(16)}, "epoch": "41"}),
             add_approver(),
-            json!({"type": "remove_approver", "transport": "33".repeat(32), "approver": "44".repeat(32)}),
+            json!({"type": "remove_approver", "transport": "33".repeat(32), "approver": "02".repeat(33)}),
         ];
         for (code, value) in [1u8, 2, 2, 3, 4].into_iter().zip(changes) {
             let change = Change::parse(&value).unwrap();
@@ -600,19 +617,30 @@ mod tests {
         bad.push(json!({"type": "unfreeze", "scope": "some", "epoch": "1"}));
         bad.push(json!({"type": "unfreeze", "scope": {"credential": "22".repeat(16), "x": "y"}, "epoch": "1"}));
         bad.push(json!({"type": "freeze", "scope": "all", "epoch": "1"}));
-        // A device change: a fingerprint not the keys', the same key twice,
-        // a label too long, empty or hiding text.
+        // A device change: a fingerprint not the keys', an approver key of
+        // another length, a label too long, empty or hiding text.
         let mut v = add_approver();
-        v["fingerprint"] = json!(crate::sig::fingerprint(&[0x44; 32], &[0x33; 32]));
+        v["fingerprint"] = json!(crate::sig::fingerprint(&[0x34; 32], &[0x02; 33]));
         bad.push(v);
         let mut v = add_approver();
         v["fingerprint"] = json!(v["fingerprint"].as_str().unwrap().replace(' ', ""));
         bad.push(v);
         let mut v = add_approver();
         v["approver"] = json!("33".repeat(32));
-        v["fingerprint"] = json!(crate::sig::fingerprint(&[0x33; 32], &[0x33; 32]));
         bad.push(v);
         bad.push(json!({"type": "remove_approver", "transport": "33".repeat(32), "approver": "33".repeat(32)}));
+        // An allowlisted address that is not one, is for another network, or
+        // could hide text.
+        for list in [
+            json!(["bc1q2"]),
+            json!(["tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx"]),
+            json!(["bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\u{200b}"]),
+            json!([format!("bc1q{}", "q".repeat(MAX_ADDRESS_CHARS))]),
+        ] {
+            let mut v = issue();
+            v["grant"]["bitcoin"]["address_allowlist"] = list;
+            bad.push(v);
+        }
         for label in [
             "",
             " ",
@@ -633,6 +661,16 @@ mod tests {
     }
 
     #[test]
+    fn allowlisted_addresses_on_the_grants_network_are_fine() {
+        let mut v = issue();
+        v["grant"]["bitcoin"]["address_allowlist"] = json!([
+            "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr",
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        ]);
+        assert!(Change::parse(&v).is_ok());
+    }
+
+    #[test]
     fn labels_up_to_the_limit_are_fine() {
         for label in ["a", "My phone", &"é".repeat(MAX_LABEL_CHARS)] {
             let mut v = add_approver();
@@ -644,10 +682,10 @@ mod tests {
     #[test]
     fn duplicate_names_are_refused() {
         let text = r#"{"type":"unfreeze","scope":"all","epoch":"1","epoch":"2"}"#;
-        assert!(Change::parse_text(text).is_err());
+        assert!(parse_without_duplicates(text).is_err());
         let text = r#"{"type":"unfreeze","scope":"all","epoch":"1"}"#;
-        assert!(Change::parse_text(text).is_ok());
-        assert!(Change::parse_text(&format!("{text} x")).is_err());
+        assert!(Change::parse(&parse_without_duplicates(text).unwrap()).is_ok());
+        assert!(parse_without_duplicates(&format!("{text} x")).is_err());
     }
 
     /// RFC 8785: members sorted by UTF-16 code units (so an astral

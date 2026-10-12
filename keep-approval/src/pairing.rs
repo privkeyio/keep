@@ -15,7 +15,8 @@ use nostr::nips::nip19::{FromBech32, ToBech32};
 use nostr::PublicKey;
 use zeroize::Zeroizing;
 
-use crate::{malformed, Hex32, Result};
+use crate::messages::{AnchorState, Frozen, Pairing};
+use crate::{invalid, malformed, Hex32, Result};
 
 /// What every pairing URI starts with.
 pub const PREFIX: &str = "keep-approver:v1?";
@@ -68,17 +69,26 @@ pub fn check_relay(url: &str) -> Result<()> {
 }
 
 impl PairingUri {
-    /// The URI, after checking the relays.
-    pub fn to_uri(&self) -> Result<String> {
+    /// The URI, after checking the relays. It holds the secret, so it is
+    /// wiped when dropped.
+    pub fn to_uri(&self) -> Result<Zeroizing<String>> {
         check_relays(&self.relays)?;
         let gateway = PublicKey::from_slice(&self.gateway)
             .map_err(|_| malformed("gateway key"))?
             .to_bech32()
             .map_err(|_| malformed("gateway key"))?;
-        let mut uri = format!(
-            "{PREFIX}gateway={gateway}&secret={}",
-            hex::encode(*self.secret)
-        );
+        let secret = Zeroizing::new(hex::encode(*self.secret));
+        let mut uri = Zeroizing::new(String::with_capacity(
+            PREFIX.len()
+                + gateway.len()
+                + 80
+                + self.relays.iter().map(|r| r.len() + 7).sum::<usize>(),
+        ));
+        uri.push_str(PREFIX);
+        uri.push_str("gateway=");
+        uri.push_str(&gateway);
+        uri.push_str("&secret=");
+        uri.push_str(&secret);
         for relay in &self.relays {
             uri.push_str("&relay=");
             uri.push_str(relay);
@@ -110,7 +120,12 @@ impl PairingUri {
         let gateway = PublicKey::from_bech32(gateway)
             .map_err(|_| malformed("the gateway is not an npub"))?
             .to_bytes();
-        let secret = Zeroizing::new(Hex32::parse(next("secret")?)?.0);
+        let hex = next("secret")?;
+        if !crate::codec::is_lower_hex(hex, 32) {
+            return Err(malformed("the secret is 32 bytes of lowercase hex"));
+        }
+        let mut secret = Zeroizing::new([0u8; 32]);
+        hex::decode_to_slice(hex, secret.as_mut()).map_err(|_| malformed("secret"))?;
         let mut relays: Vec<String> = Vec::new();
         for param in params {
             match param? {
@@ -124,6 +139,57 @@ impl PairingUri {
             secret,
             relays,
         })
+    }
+}
+
+/// What a phone takes from the gateway's `paired` message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Paired {
+    pub relays: Vec<String>,
+    pub deadline_secs: u64,
+    pub anchor: AnchorState,
+    pub frozen: Frozen,
+}
+
+/// Check the gateway's answer to a phone's `pair`: a `paired` naming the
+/// phone's own two keys, one to [`MAX_RELAYS`] distinct relays that pass
+/// [`check_relay`], and a deadline the protocol allows. A `refused` is an
+/// error carrying its reason, which the phone shows through
+/// [`crate::approver::shown`].
+pub fn check_paired(
+    message: &Pairing,
+    transport: &[u8; 32],
+    approver: &[u8; 33],
+) -> Result<Paired> {
+    match message {
+        Pairing::Paired {
+            transport: t,
+            approver: a,
+            relays,
+            deadline_secs,
+            anchor,
+            frozen,
+            ..
+        } => {
+            if t.0 != *transport || a.0 != *approver {
+                return Err(invalid("paired names another device's keys"));
+            }
+            check_relays(relays)?;
+            if !crate::binding::DEADLINE_SECS.contains(deadline_secs) {
+                return Err(invalid("paired names a deadline out of range"));
+            }
+            Ok(Paired {
+                relays: relays.clone(),
+                deadline_secs: *deadline_secs,
+                anchor: anchor.clone(),
+                frozen: frozen.clone(),
+            })
+        }
+        Pairing::Refused { reason, .. } => Err(invalid(format!(
+            "pairing refused: {}",
+            crate::approver::shown(reason, crate::approver::GATEWAY_TEXT_CHARS).text
+        ))),
+        Pairing::Pair { .. } => Err(invalid("not the gateway's answer")),
     }
 }
 
@@ -161,7 +227,7 @@ mod tests {
     #[test]
     fn a_uri_round_trips() {
         let p = sample();
-        let uri = p.to_uri().unwrap();
+        let uri = p.to_uri().unwrap().to_string();
         assert!(uri.starts_with("keep-approver:v1?gateway=npub1"), "{uri}");
         assert!(uri.contains(&format!("&secret={}&relay=wss://", "07".repeat(32))));
         assert_eq!(PairingUri::parse(&uri).unwrap(), p);
@@ -171,7 +237,7 @@ mod tests {
 
     #[test]
     fn anything_else_is_refused() {
-        let uri = sample().to_uri().unwrap();
+        let uri = sample().to_uri().unwrap().to_string();
         let (head, relays) = uri.split_once("&relay=").unwrap();
         let bad = [
             uri.replace("keep-approver:v1?", "keep-approver:v2?"),
@@ -221,5 +287,61 @@ mod tests {
         let mut none = sample();
         none.relays.clear();
         assert!(none.to_uri().is_err());
+    }
+
+    /// A phone takes a `paired` only for its own two keys, with relays it
+    /// would accept and a deadline in range; a `refused` is an error
+    /// carrying its reason, shown without hidden characters.
+    #[test]
+    fn a_paired_message_is_checked() {
+        use crate::messages::{AnchorState, Frozen, V1};
+        use crate::{Hex32, Hex33};
+        let paired = |relays: Vec<&str>, deadline: u64| Pairing::Paired {
+            v: V1,
+            transport: Hex32([1; 32]),
+            approver: Hex33([2; 33]),
+            relays: relays.into_iter().map(String::from).collect(),
+            deadline_secs: deadline,
+            anchor: AnchorState {
+                seq: 1,
+                head: Hex32([0; 32]),
+                prev: None,
+                wallets: vec![],
+            },
+            frozen: Frozen {
+                epoch: 0,
+                all: false,
+                credentials: vec![],
+                unfrozen: vec![],
+            },
+        };
+        let ok = check_paired(&paired(vec!["wss://r.example"], 120), &[1; 32], &[2; 33]).unwrap();
+        assert_eq!(ok.relays, ["wss://r.example"]);
+        for (message, transport, approver) in [
+            (paired(vec!["wss://r.example"], 120), [9; 32], [2; 33]),
+            (paired(vec!["wss://r.example"], 120), [1; 32], [9; 33]),
+            (paired(vec![], 120), [1; 32], [2; 33]),
+            (paired(vec!["https://r.example"], 120), [1; 32], [2; 33]),
+            (
+                paired(vec!["wss://r.example", "wss://r.example"], 120),
+                [1; 32],
+                [2; 33],
+            ),
+            (paired(vec!["wss://r.example"], 29), [1; 32], [2; 33]),
+            (paired(vec!["wss://r.example"], 121), [1; 32], [2; 33]),
+        ] {
+            assert!(
+                check_paired(&message, &transport, &approver).is_err(),
+                "{message:?}"
+            );
+        }
+        let refused = Pairing::Refused {
+            v: V1,
+            reason: "expired\u{202e}gnirap".into(),
+        };
+        let err = check_paired(&refused, &[1; 32], &[2; 33])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expiredgnirap"), "{err}");
     }
 }

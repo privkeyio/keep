@@ -4,17 +4,19 @@
 //! What an approver keeps between messages, and the alerts it raises.
 //!
 //! - [`AnchorTracker`]: the last anchor seen. Anchors arrive out of order and
-//!   can be replayed, so only one whose `at` is later than the last kept is
-//!   compared; it alerts when the audit log's count goes down, or stays with
-//!   another head, when a wallet ledger's count goes down or the ledger
+//!   can be replayed, so only one later than the last kept, by `(at, seq)`,
+//!   is compared; it alerts when the audit log's count goes down, or stays
+//!   with another head, when the anchor before it (`prev`) is older than the
+//!   one kept, when a wallet ledger's count goes down or the ledger
 //!   disappears, and when the freeze epoch goes down. It also tracks
 //!   silence (no newer anchor for an hour), the phone's own freezes until an
-//!   anchor shows them, and freezes cleared with no `unfreeze` reaching the
-//!   phone.
+//!   anchor shows them, and freezes cleared with no unfreeze to explain them.
 //! - [`RequestGate`]: drops a request already seen, and one the gateway has
 //!   already expired by the latest gateway time the approver holds.
+//! - [`shown`]: every string from the gateway or an agent, as a phone shows
+//!   it.
 //!
-//! Both are plain data the approver persists between runs.
+//! All of it is plain data the approver persists between runs.
 
 use std::collections::BTreeMap;
 
@@ -39,9 +41,9 @@ pub const FREEZE_SHOWN_SECS: u64 = 120;
 /// How often the phone resends a freeze no anchor has shown yet.
 pub const FREEZE_RESEND_SECS: u64 = 15;
 
-/// How long a freeze seen cleared waits for the `unfreeze` that explains it
-/// before the phone alerts. The outcome and the anchor are separate wraps,
-/// which relays can deliver in either order.
+/// How long a freeze seen cleared waits for the `unfreeze` outcome that
+/// explains it before the phone alerts. The outcome and the anchor are
+/// separate wraps, which relays can deliver in either order.
 pub const CLEARED_GRACE_SECS: u64 = 120;
 
 /// Something the approver must show the owner, prominently.
@@ -51,6 +53,15 @@ pub enum Alert {
     AuditCountWentBack { from: u64, to: u64 },
     /// The audit log's count stayed but its head changed: a rewrite.
     AuditHeadChanged { seq: u64 },
+    /// The anchor the gateway says it sent before this one is older than
+    /// the one kept: the vault or `keep.db` was put back to an earlier copy
+    /// and written past the kept count since.
+    PrevWentBack { kept: u64, prev: u64 },
+    /// The anchor before this one has the kept count but another head.
+    PrevHeadChanged { seq: u64 },
+    /// An anchor names no anchor before it, after one was kept: the record
+    /// of anchors sent is gone.
+    PrevMissing,
     /// A wallet ledger's count went down: a rolled-back ledger.
     WalletCountWentBack { wallet: String, from: u64, to: u64 },
     /// A wallet ledger the gateway reported before is gone.
@@ -60,7 +71,7 @@ pub enum Alert {
     /// The phone's own freeze has not shown in an anchor after
     /// [`FREEZE_SHOWN_SECS`]: a relay may be withholding it.
     OwnFreezeNotShown { scope: Scope },
-    /// A freeze was cleared and no `unfreeze` reached the phone.
+    /// A freeze was cleared and no unfreeze explains it.
     FreezeCleared { scope: Scope },
 }
 
@@ -93,19 +104,26 @@ pub struct AnchorTracker {
     latest_gateway_time: u64,
     /// The phone's own freezes no anchor has shown yet.
     sent_freezes: Vec<SentFreeze>,
-    /// Unfreezes that reached the phone and no anchor has shown yet, with
-    /// the approver's clock when each arrived.
+    /// The outcomes already taken, by request id, with the approver's clock
+    /// when each arrived; kept for the wrap time window, so a replayed
+    /// outcome counts once.
+    outcomes: BTreeMap<Hex32, u64>,
+    /// Unfreezes approved through a request, whose outcome reached the
+    /// phone and no anchor has shown yet, with the approver's clock when
+    /// each arrived.
     unfreezes: Vec<(Scope, u64)>,
-    /// Freezes seen cleared with no unfreeze yet, with the approver's clock
-    /// when each was seen.
+    /// Freezes seen cleared with nothing to explain them yet, with the
+    /// approver's clock when each was seen.
     cleared: Vec<(Scope, u64)>,
 }
 
-/// Whether `frozen` freezes `scope`.
+/// Whether `frozen` shows `scope` frozen: the gateway's global freeze, or
+/// that credential in its list. A credential's own freeze is shown only by
+/// the list, since unfreezing everything clears only the global freeze.
 fn freezes(frozen: &Frozen, scope: Scope) -> bool {
     match scope {
         Scope::All => frozen.all,
-        Scope::Credential(id) => frozen.all || frozen.credentials.contains(&id),
+        Scope::Credential(id) => frozen.credentials.contains(&id),
     }
 }
 
@@ -123,10 +141,13 @@ fn cleared(old: &Frozen, new: &Frozen) -> Vec<Scope> {
     out
 }
 
-/// Whether an unfreeze of `unfrozen` explains `scope` being cleared: an
-/// unfreeze of the whole gateway clears every freeze.
-fn explains(unfrozen: Scope, scope: Scope) -> bool {
-    unfrozen == Scope::All || unfrozen == scope
+/// Whether `new` lists an unfreeze of `scope` applied after `old`'s epoch:
+/// the gateway's own word that the freeze was lifted, whichever phone or
+/// approval lifted it.
+fn listed(old: &Frozen, new: &Frozen, scope: Scope) -> bool {
+    new.unfrozen
+        .iter()
+        .any(|u| u.scope == scope && u.epoch > old.epoch && u.epoch <= new.epoch)
 }
 
 impl AnchorTracker {
@@ -157,12 +178,27 @@ impl AnchorTracker {
         self.sent_freezes.iter().map(|f| f.scope).collect()
     }
 
-    /// Note an unfreeze of `scope` reaching the phone: an `approved` outcome
-    /// of an `unfreeze` request, or the phone's own unfreeze accepted. It
-    /// explains a freeze of that scope seen cleared, before or after.
-    pub fn unfreeze_seen(&mut self, scope: Scope, local_now: u64) {
+    /// Take the outcome of request `request_id`, arriving at `local_now`:
+    /// whether it is the first time. A replayed outcome is taken once.
+    pub fn outcome_seen(&mut self, request_id: Hex32, local_now: u64) -> bool {
+        self.outcomes
+            .retain(|_, at| local_now.saturating_sub(*at) <= WINDOW_PAST_SECS);
+        if self.outcomes.contains_key(&request_id) {
+            return false;
+        }
+        self.outcomes.insert(request_id, local_now);
+        true
+    }
+
+    /// Note the `approved` outcome of request `request_id`, an `unfreeze`
+    /// of `scope`, reaching the phone: it explains a freeze of that scope
+    /// seen cleared, before or after. A replayed outcome explains nothing.
+    pub fn unfreeze_seen(&mut self, request_id: Hex32, scope: Scope, local_now: u64) {
+        if !self.outcome_seen(request_id, local_now) {
+            return;
+        }
         let before = self.cleared.len();
-        self.cleared.retain(|(c, _)| !explains(scope, *c));
+        self.cleared.retain(|(c, _)| *c != scope);
         if self.cleared.len() == before {
             self.unfreezes.push((scope, local_now));
         }
@@ -197,16 +233,10 @@ impl AnchorTracker {
         let Some(old) = old else {
             return;
         };
-        let cleared = cleared(old, new);
-        if cleared.is_empty() {
-            return;
-        }
-        // An unfreeze of everything explains every freeze cleared with it.
-        if let Some(i) = self.unfreezes.iter().position(|(u, _)| *u == Scope::All) {
-            self.unfreezes.remove(i);
-            return;
-        }
-        for scope in cleared {
+        for scope in cleared(old, new) {
+            if listed(old, new, scope) {
+                continue;
+            }
             if let Some(i) = self.unfreezes.iter().position(|(u, _)| *u == scope) {
                 self.unfreezes.remove(i);
             } else {
@@ -217,8 +247,8 @@ impl AnchorTracker {
 
     /// Note an anchor taken at gateway time `at`, from an anchor message
     /// (with `frozen`) or a request (without), arriving at the approver's
-    /// `local_now`. An anchor not later than the last one kept is ignored,
-    /// and does not reset the silence timer.
+    /// `local_now`. An anchor not later than the last one kept, by `at` and
+    /// then by `seq`, is ignored, and does not reset the silence timer.
     pub fn observe(
         &mut self,
         at: u64,
@@ -229,7 +259,7 @@ impl AnchorTracker {
         self.latest_gateway_time = self.latest_gateway_time.max(at);
         let mut alerts = Vec::new();
         if let Some(kept) = &self.kept {
-            if at <= kept.at {
+            if (at, anchor.seq) <= (kept.at, kept.anchor.seq) {
                 return alerts;
             }
             let last = &kept.anchor;
@@ -241,16 +271,29 @@ impl AnchorTracker {
             } else if anchor.seq == last.seq && anchor.head != last.head {
                 alerts.push(Alert::AuditHeadChanged { seq: anchor.seq });
             }
+            match anchor.prev {
+                Some(prev) if prev.seq < last.seq => alerts.push(Alert::PrevWentBack {
+                    kept: last.seq,
+                    prev: prev.seq,
+                }),
+                Some(prev) if prev.seq == last.seq && prev.head != last.head => {
+                    alerts.push(Alert::PrevHeadChanged { seq: prev.seq })
+                }
+                // Higher: anchors were missed in between; the counts above
+                // are all there is to check.
+                Some(_) => {}
+                None => alerts.push(Alert::PrevMissing),
+            }
             for old in &last.wallets {
                 match anchor.wallets.iter().find(|w| w.wallet == old.wallet) {
                     Some(new) if new.seq < old.seq => alerts.push(Alert::WalletCountWentBack {
-                        wallet: old.wallet.clone(),
+                        wallet: old.wallet.to_string(),
                         from: old.seq,
                         to: new.seq,
                     }),
                     Some(_) => {}
                     None => alerts.push(Alert::WalletMissing {
-                        wallet: old.wallet.clone(),
+                        wallet: old.wallet.to_string(),
                     }),
                 }
             }
@@ -342,31 +385,79 @@ impl RequestGate {
 /// The most characters of agent-written text an approver shows.
 pub const AGENT_TEXT_CHARS: usize = 2_000;
 
-/// Agent-written text as an approver shows it, apart from everything else:
-/// escaped (a backslash doubled, newlines, carriage returns and tabs as
-/// visible escapes), with control, format, bidi and invisible characters
-/// removed, truncated to [`AGENT_TEXT_CHARS`], with the full length in
-/// characters stated.
-pub fn agent_text(text: &str) -> (String, usize) {
-    let full = text.chars().count();
+/// The most characters of any other gateway string an approver shows (a
+/// refusal's reason, say). Names and labels are held to
+/// [`crate::change::MAX_LABEL_CHARS`] before they get here.
+pub const GATEWAY_TEXT_CHARS: usize = 256;
+
+/// A string as an approver shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shown {
+    /// The text to show: hidden characters removed, escaped, cut to the
+    /// limit with the escapes counted in it.
+    pub text: String,
+    /// The original's length in characters.
+    pub chars: usize,
+    /// How many hidden characters were removed, which the phone states.
+    pub removed: usize,
+    /// Whether the text was cut short.
+    pub truncated: bool,
+}
+
+/// `text` as an approver shows it, in at most `limit` characters: every
+/// hidden character (see [`is_hidden`]) removed first and counted, then a
+/// backslash doubled and newlines, carriage returns and tabs shown as
+/// visible escapes, then cut to the limit, each escape counting as the
+/// characters it shows. Used for every string from the gateway, and for
+/// agent-written text with [`AGENT_TEXT_CHARS`].
+pub fn shown(text: &str, limit: usize) -> Shown {
     let mut out = String::new();
-    for c in text.chars().take(AGENT_TEXT_CHARS) {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if is_hidden(c) => {}
-            c => out.push(c),
+    let (mut used, mut chars, mut removed, mut truncated) = (0, 0, 0, false);
+    for c in text.chars() {
+        chars += 1;
+        if is_hidden(c) && !matches!(c, '\n' | '\r' | '\t') {
+            removed += 1;
+            continue;
+        }
+        let piece: &str = match c {
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            _ => "",
+        };
+        let width = if piece.is_empty() { 1 } else { 2 };
+        if truncated || used + width > limit {
+            truncated = true;
+            continue;
+        }
+        used += width;
+        if piece.is_empty() {
+            out.push(c);
+        } else {
+            out.push_str(piece);
         }
     }
-    (out, full)
+    Shown {
+        text: out,
+        chars,
+        removed,
+        truncated,
+    }
+}
+
+/// Agent-written text as an approver shows it, apart from everything else:
+/// [`shown`] with [`AGENT_TEXT_CHARS`].
+pub fn agent_text(text: &str) -> Shown {
+    shown(text, AGENT_TEXT_CHARS)
 }
 
 /// Characters that could hide or reorder what the owner reads: controls
 /// (Cc), every format character (Cf, bidi controls among them), the line
-/// and paragraph separators (Zl, Zp), and the other default-ignorable
-/// characters that render as nothing (fillers, variation selectors).
+/// and paragraph separators (Zl, Zp), the other default-ignorable
+/// characters that render as nothing (fillers, variation selectors,
+/// unassigned default-ignorables), and the combining overlays that strike
+/// through or slash the character before them.
 pub fn is_hidden(c: char) -> bool {
     c.is_control()
         || matches!(c,
@@ -378,13 +469,13 @@ pub fn is_hidden(c: char) -> bool {
             | '\u{070f}'                   // Syriac abbreviation mark
             | '\u{0890}'..='\u{0891}'     // Arabic pound and piastre marks above
             | '\u{08e2}'                   // Arabic disputed end of ayah
-            | '\u{180e}'                   // Mongolian vowel separator
+            | '\u{180b}'..='\u{180f}'     // Mongolian free variation selectors, vowel separator
             | '\u{200b}'..='\u{200f}'     // zero-width spaces and joiners, LRM, RLM
             | '\u{202a}'..='\u{202e}'     // bidi embeddings and overrides
-            | '\u{2060}'..='\u{2064}'     // word joiner and invisible operators
-            | '\u{2066}'..='\u{206f}'     // bidi isolates, deprecated format characters
+            | '\u{2060}'..='\u{206f}'     // word joiner, invisible operators, bidi isolates,
+                                           // deprecated format characters, U+2065
             | '\u{feff}'                   // byte order mark
-            | '\u{fff9}'..='\u{fffb}'     // interlinear annotations
+            | '\u{fff0}'..='\u{fffb}'     // unassigned default-ignorables, interlinear annotations
             | '\u{110bd}' | '\u{110cd}'   // Kaithi number signs
             | '\u{13430}'..='\u{1343f}'   // Egyptian hieroglyph format controls
             | '\u{1bca0}'..='\u{1bca3}'   // shorthand format controls
@@ -399,22 +490,42 @@ pub fn is_hidden(c: char) -> bool {
             | '\u{3164}'                   // Hangul filler
             | '\u{fe00}'..='\u{fe0f}'     // variation selectors
             | '\u{ffa0}'                   // halfwidth Hangul filler
+            // Combining overlays
+            | '\u{0334}'..='\u{0338}'     // tilde, stroke and solidus overlays
+            | '\u{20d2}'..='\u{20d3}'     // long and short vertical line overlays
+            | '\u{20e5}'..='\u{20e6}'     // reverse solidus and double vertical stroke overlays
         )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::WalletAnchor;
+    use crate::messages::{LogPoint, Unfrozen, WalletAnchor, WalletName};
 
-    fn anchor(seq: u64, head: u8, wallets: &[(&str, u64)]) -> AnchorState {
+    /// `main:aa` stands for `main:` and `aa` repeated to 64 characters.
+    fn w(name: &str) -> String {
+        let (prefix, byte) = name.split_once(':').unwrap();
+        format!("{prefix}:{}", byte.repeat(32))
+    }
+
+    /// An anchor whose `prev` is `prev`.
+    fn anchor_after(
+        prev: Option<(u64, u8)>,
+        seq: u64,
+        head: u8,
+        wallets: &[(&str, u64)],
+    ) -> AnchorState {
         AnchorState {
             seq,
             head: Hex32([head; 32]),
+            prev: prev.map(|(seq, head)| LogPoint {
+                seq,
+                head: Hex32([head; 32]),
+            }),
             wallets: wallets
                 .iter()
-                .map(|(w, s)| WalletAnchor {
-                    wallet: (*w).into(),
+                .map(|(name, s)| WalletAnchor {
+                    wallet: WalletName::parse(&w(name)).unwrap(),
                     seq: *s,
                     spent: 0,
                     window: 0,
@@ -423,44 +534,92 @@ mod tests {
         }
     }
 
-    fn frozen(epoch: u64) -> Frozen {
+    /// A gateway's anchors in order, each naming the one before it.
+    #[derive(Default)]
+    struct Gateway {
+        last: Option<(u64, u8)>,
+    }
+
+    impl Gateway {
+        fn anchor(&mut self, seq: u64, head: u8, wallets: &[(&str, u64)]) -> AnchorState {
+            let a = anchor_after(self.last, seq, head, wallets);
+            self.last = Some((seq, head));
+            a
+        }
+    }
+
+    fn frozen_with(epoch: u64, all: bool, credentials: &[u8]) -> Frozen {
         Frozen {
             epoch,
-            all: false,
-            credentials: vec![],
+            all,
+            credentials: credentials.iter().map(|b| crate::Hex16([*b; 16])).collect(),
+            unfrozen: vec![],
         }
+    }
+
+    fn frozen(epoch: u64) -> Frozen {
+        frozen_with(epoch, false, &[])
+    }
+
+    fn c(b: u8) -> Scope {
+        Scope::Credential(crate::Hex16([b; 16]))
     }
 
     #[test]
     fn only_newer_anchors_are_compared() {
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
-        assert!(t
-            .observe(100, &anchor(10, 1, &[]), Some(&frozen(3)), 1000)
-            .is_empty());
+        let first = g.anchor(10, 1, &[]);
+        assert!(t.observe(100, &first, Some(&frozen(3)), 1000).is_empty());
         // An older anchor with a lower count, replayed: ignored.
         assert!(t
-            .observe(90, &anchor(5, 2, &[]), Some(&frozen(1)), 1001)
+            .observe(90, &anchor_after(None, 5, 2, &[]), Some(&frozen(1)), 1001)
             .is_empty());
         // A newer one with a lower count: a rollback.
         assert_eq!(
-            t.observe(110, &anchor(9, 3, &[]), None, 1002),
+            t.observe(110, &anchor_after(Some((10, 1)), 9, 3, &[]), None, 1002),
             [Alert::AuditCountWentBack { from: 10, to: 9 }]
         );
     }
 
+    /// Anchors are ordered by their time and then their count: one with the
+    /// same time and a higher count is newer, and its freeze state is kept.
+    #[test]
+    fn anchors_with_the_same_time_are_ordered_by_count() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(100, &g.anchor(10, 1, &[]), Some(&frozen(3)), 0);
+        let later = g.anchor(11, 2, &[]);
+        assert!(t
+            .observe(100, &later, Some(&frozen_with(4, true, &[])), 1)
+            .is_empty());
+        assert_eq!(t.frozen().map(|f| f.all), Some(true));
+        // The same time and count again: not newer, ignored.
+        assert!(t
+            .observe(
+                100,
+                &anchor_after(Some((10, 1)), 11, 9, &[]),
+                Some(&frozen(5)),
+                2
+            )
+            .is_empty());
+        assert_eq!(t.epoch(), Some(4));
+    }
+
     #[test]
     fn each_rollback_alerts() {
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
         t.observe(
             100,
-            &anchor(10, 1, &[("main:aa", 5), ("test:bb", 2)]),
+            &g.anchor(10, 1, &[("main:aa", 5), ("test:bb", 2)]),
             Some(&frozen(3)),
             0,
         );
         assert_eq!(
             t.observe(
                 101,
-                &anchor(10, 2, &[("main:aa", 5), ("test:bb", 2)]),
+                &g.anchor(10, 2, &[("main:aa", 5), ("test:bb", 2)]),
                 None,
                 0
             ),
@@ -469,31 +628,36 @@ mod tests {
         assert_eq!(
             t.observe(
                 102,
-                &anchor(11, 2, &[("main:aa", 4), ("test:bb", 2)]),
+                &g.anchor(11, 2, &[("main:aa", 4), ("test:bb", 2)]),
                 None,
                 0
             ),
             [Alert::WalletCountWentBack {
-                wallet: "main:aa".into(),
+                wallet: w("main:aa"),
                 from: 5,
                 to: 4
             }]
         );
         assert_eq!(
-            t.observe(103, &anchor(12, 2, &[("main:aa", 4)]), None, 0),
+            t.observe(103, &g.anchor(12, 2, &[("main:aa", 4)]), None, 0),
             [Alert::WalletMissing {
-                wallet: "test:bb".into()
+                wallet: w("test:bb")
             }]
         );
         assert_eq!(
-            t.observe(104, &anchor(13, 2, &[("main:aa", 4)]), Some(&frozen(2)), 0),
+            t.observe(
+                104,
+                &g.anchor(13, 2, &[("main:aa", 4)]),
+                Some(&frozen(2)),
+                0
+            ),
             [Alert::EpochWentBack { from: 3, to: 2 }]
         );
         // Counts going up and a new wallet are fine.
         assert!(t
             .observe(
                 105,
-                &anchor(14, 9, &[("main:aa", 6), ("test:cc", 1)]),
+                &g.anchor(14, 9, &[("main:aa", 6), ("test:cc", 1)]),
                 Some(&frozen(4)),
                 0
             )
@@ -501,30 +665,60 @@ mod tests {
         assert_eq!(t.epoch(), Some(4));
     }
 
+    /// A vault put back to an earlier copy and then written past the count
+    /// the phone kept shows only in `prev`: the copy's record of the anchor
+    /// before is older than the one the phone kept. Missed anchors (a
+    /// higher `prev`) are fine, a missing `prev` after one was kept is not.
+    #[test]
+    fn prev_catches_a_rollback_written_past_the_kept_count() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(100, &g.anchor(10, 1, &[]), Some(&frozen(3)), 0);
+        t.observe(200, &g.anchor(20, 2, &[]), Some(&frozen(3)), 0);
+        // The copy from seq 10, written up to 25: its prev is (10, 1).
+        assert_eq!(
+            t.observe(300, &anchor_after(Some((10, 1)), 25, 3, &[]), None, 0),
+            [Alert::PrevWentBack { kept: 20, prev: 10 }]
+        );
+        // The kept count with another head.
+        assert_eq!(
+            t.observe(301, &anchor_after(Some((25, 7)), 26, 3, &[]), None, 0),
+            [Alert::PrevHeadChanged { seq: 25 }]
+        );
+        // Anchors the phone missed: prev ahead of the kept one.
+        let mut t = AnchorTracker::default();
+        t.observe(100, &anchor_after(None, 10, 1, &[]), None, 0);
+        assert!(t
+            .observe(200, &anchor_after(Some((15, 4)), 20, 2, &[]), None, 0)
+            .is_empty());
+        assert_eq!(
+            t.observe(300, &anchor_after(None, 30, 3, &[]), None, 0),
+            [Alert::PrevMissing]
+        );
+        // The first anchor kept may have no prev.
+        let mut t = AnchorTracker::default();
+        assert!(t
+            .observe(100, &anchor_after(None, 1, 1, &[]), None, 0)
+            .is_empty());
+    }
+
     #[test]
     fn silence_counts_from_the_last_newer_anchor() {
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
         assert!(!t.silent(10_000));
-        t.observe(100, &anchor(1, 1, &[]), None, 1_000);
+        t.observe(100, &g.anchor(1, 1, &[]), None, 1_000);
         assert!(!t.silent(1_000 + SILENCE_SECS - 1));
         assert!(t.silent(1_000 + SILENCE_SECS));
         // A replayed older anchor does not reset the timer.
-        t.observe(50, &anchor(1, 1, &[]), None, 4_000);
+        t.observe(50, &anchor_after(None, 1, 1, &[]), None, 4_000);
         assert!(t.silent(1_000 + SILENCE_SECS));
         // A newer one does.
-        t.observe(200, &anchor(2, 2, &[]), None, 4_000);
+        t.observe(200, &g.anchor(2, 2, &[]), None, 4_000);
         assert!(!t.silent(4_000 + SILENCE_SECS - 1));
         assert!(t.silent(4_000 + SILENCE_SECS));
         assert!(clock_skew(1000, 1000 + SKEW_WARNING_SECS + 1));
         assert!(!clock_skew(1000, 1000 + SKEW_WARNING_SECS));
-    }
-
-    fn frozen_with(epoch: u64, all: bool, credentials: &[u8]) -> Frozen {
-        Frozen {
-            epoch,
-            all,
-            credentials: credentials.iter().map(|b| crate::Hex16([*b; 16])).collect(),
-        }
     }
 
     /// The anchor in `paired`, which has no time, is the first kept, and
@@ -532,15 +726,15 @@ mod tests {
     #[test]
     fn the_paired_anchor_is_the_baseline() {
         let mut t = AnchorTracker::default();
-        t.baseline(&anchor(10, 1, &[]), &frozen(3), 1_000);
+        t.baseline(&anchor_after(None, 10, 1, &[]), &frozen(3), 1_000);
         assert_eq!(t.epoch(), Some(3));
         assert!(!t.silent(1_000 + SILENCE_SECS - 1));
         assert_eq!(
-            t.observe(1, &anchor(9, 1, &[]), None, 1_001),
+            t.observe(1, &anchor_after(Some((10, 1)), 9, 1, &[]), None, 1_001),
             [Alert::AuditCountWentBack { from: 10, to: 9 }]
         );
         // A second baseline changes nothing.
-        t.baseline(&anchor(1, 1, &[]), &frozen(1), 1_002);
+        t.baseline(&anchor_after(None, 1, 1, &[]), &frozen(1), 1_002);
         assert_eq!(t.epoch(), Some(3));
     }
 
@@ -549,14 +743,9 @@ mod tests {
     /// minutes the phone alerts, once.
     #[test]
     fn an_own_freeze_alerts_until_an_anchor_shows_it() {
-        let c = |b: u8| Scope::Credential(crate::Hex16([b; 16]));
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
-        t.observe(
-            100,
-            &anchor(1, 1, &[]),
-            Some(&frozen_with(5, false, &[])),
-            0,
-        );
+        t.observe(100, &g.anchor(1, 1, &[]), Some(&frozen(5)), 0);
         t.freeze_sent(Scope::All, 5, 1_000);
         t.freeze_sent(Scope::All, 5, 1_015);
         assert_eq!(t.freezes_to_resend(), [Scope::All]);
@@ -565,13 +754,13 @@ mod tests {
         // one, does not show it.
         t.observe(
             101,
-            &anchor(2, 1, &[]),
+            &g.anchor(2, 1, &[]),
             Some(&frozen_with(5, false, &[7])),
             1_050,
         );
         t.observe(
             102,
-            &anchor(3, 1, &[]),
+            &g.anchor(3, 1, &[]),
             Some(&frozen_with(6, false, &[7])),
             1_060,
         );
@@ -581,65 +770,67 @@ mod tests {
             [Alert::OwnFreezeNotShown { scope: Scope::All }]
         );
         assert!(t.due_alerts(1_000 + FREEZE_SHOWN_SECS + 1).is_empty());
-        // A credential's freeze shows once that credential, or everything,
-        // is frozen at a later epoch.
+        // A credential's freeze shows once that credential is listed at a
+        // later epoch; everything frozen does not show it, since unfreezing
+        // everything would leave it unfrozen.
         t.freeze_sent(c(8), 6, 1_100);
         t.observe(
             103,
-            &anchor(4, 1, &[]),
+            &g.anchor(4, 1, &[]),
             Some(&frozen_with(7, true, &[7])),
             1_110,
+        );
+        assert_eq!(t.freezes_to_resend(), [c(8)]);
+        t.observe(
+            104,
+            &g.anchor(5, 1, &[]),
+            Some(&frozen_with(8, true, &[7, 8])),
+            1_120,
         );
         assert!(t.freezes_to_resend().is_empty());
         assert!(t.due_alerts(5_000).is_empty());
 
         // An anchor freezing the scope, but at the freeze's own epoch, is
         // from before the freeze and does not show it.
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
-        t.observe(
-            100,
-            &anchor(1, 1, &[]),
-            Some(&frozen_with(5, false, &[])),
-            0,
-        );
+        t.observe(100, &g.anchor(1, 1, &[]), Some(&frozen(5)), 0);
         t.freeze_sent(c(9), 5, 0);
         t.observe(
             101,
-            &anchor(2, 1, &[]),
+            &g.anchor(2, 1, &[]),
             Some(&frozen_with(5, false, &[9])),
             10,
         );
         assert_eq!(t.freezes_to_resend(), [c(9)]);
         t.observe(
             102,
-            &anchor(3, 1, &[]),
+            &g.anchor(3, 1, &[]),
             Some(&frozen_with(6, false, &[9])),
             20,
         );
         assert!(t.freezes_to_resend().is_empty());
     }
 
-    /// A freeze seen cleared needs an unfreeze reaching the phone, before
-    /// the anchor or within the grace after it; otherwise the phone alerts.
+    /// A freeze seen cleared needs an unfreeze: an approved `unfreeze`
+    /// outcome reaching the phone before the anchor or within the grace
+    /// after it, or the anchor's own list of unfreezes; otherwise the phone
+    /// alerts.
     #[test]
     fn a_freeze_cleared_without_an_unfreeze_alerts() {
-        let c = |b: u8| Scope::Credential(crate::Hex16([b; 16]));
+        let id = |b: u8| Hex32([b; 32]);
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
         t.observe(
             100,
-            &anchor(1, 1, &[]),
+            &g.anchor(1, 1, &[]),
             Some(&frozen_with(5, true, &[7, 8])),
             0,
         );
         // The unfreeze of credential 7 arrives first; everything else is
         // cleared with nothing to explain it.
-        t.unfreeze_seen(c(7), 10);
-        t.observe(
-            101,
-            &anchor(2, 1, &[]),
-            Some(&frozen_with(6, false, &[])),
-            20,
-        );
+        t.unfreeze_seen(id(1), c(7), 10);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 20);
         assert!(t.due_alerts(20 + CLEARED_GRACE_SECS - 1).is_empty());
         let mut due = t.due_alerts(20 + CLEARED_GRACE_SECS);
         due.sort_by_key(|a| format!("{a:?}"));
@@ -651,79 +842,162 @@ mod tests {
             ]
         );
         // An unfreeze arriving after the anchor, within the grace, explains
-        // it; an unfreeze of everything explains every freeze.
+        // it.
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
         t.observe(
             100,
-            &anchor(1, 1, &[]),
-            Some(&frozen_with(5, true, &[7])),
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[])),
             0,
         );
-        t.observe(
-            101,
-            &anchor(2, 1, &[]),
-            Some(&frozen_with(6, false, &[])),
-            20,
-        );
-        t.unfreeze_seen(Scope::All, 30);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 20);
+        t.unfreeze_seen(id(2), Scope::All, 30);
         assert!(t.due_alerts(1_000).is_empty());
-        // Before the anchor, too.
+        // Before the anchor, too; and it is used up: a later clear alerts.
         t.observe(
             102,
-            &anchor(3, 1, &[]),
-            Some(&frozen_with(7, true, &[7])),
+            &g.anchor(3, 1, &[]),
+            Some(&frozen_with(7, true, &[])),
             1_000,
         );
-        t.unfreeze_seen(Scope::All, 1_010);
-        t.observe(
-            103,
-            &anchor(4, 1, &[]),
-            Some(&frozen_with(8, false, &[])),
-            1_020,
-        );
+        t.unfreeze_seen(id(3), Scope::All, 1_010);
+        t.observe(103, &g.anchor(4, 1, &[]), Some(&frozen(8)), 1_020);
         assert!(t.due_alerts(2_000).is_empty());
-        // The unfreeze is used up: a later clear alerts.
         t.observe(
             104,
-            &anchor(5, 1, &[]),
+            &g.anchor(5, 1, &[]),
             Some(&frozen_with(9, true, &[])),
             2_000,
         );
-        t.observe(
-            105,
-            &anchor(6, 1, &[]),
-            Some(&frozen_with(10, false, &[])),
-            2_010,
-        );
+        t.observe(105, &g.anchor(6, 1, &[]), Some(&frozen(10)), 2_010);
         assert_eq!(
             t.due_alerts(2_010 + CLEARED_GRACE_SECS),
             [Alert::FreezeCleared { scope: Scope::All }]
         );
         // An unfreeze explains only its own scope.
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
         t.observe(
             100,
-            &anchor(1, 1, &[]),
+            &g.anchor(1, 1, &[]),
             Some(&frozen_with(5, false, &[7, 8])),
             0,
         );
-        t.observe(
-            101,
-            &anchor(2, 1, &[]),
-            Some(&frozen_with(6, false, &[])),
-            10,
-        );
-        t.unfreeze_seen(c(7), 20);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 10);
+        t.unfreeze_seen(id(4), c(7), 20);
         assert_eq!(
             t.due_alerts(10 + CLEARED_GRACE_SECS),
             [Alert::FreezeCleared { scope: c(8) }]
         );
         // An anchor from a request, with no freeze state, clears nothing.
+        let mut g = Gateway::default();
         let mut t = AnchorTracker::default();
-        t.observe(100, &anchor(1, 1, &[]), Some(&frozen_with(5, true, &[])), 0);
-        t.observe(101, &anchor(2, 1, &[]), None, 10);
+        t.observe(
+            100,
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[])),
+            0,
+        );
+        t.observe(101, &g.anchor(2, 1, &[]), None, 10);
         assert!(t.due_alerts(1_000).is_empty());
         assert_eq!(t.frozen().map(|f| f.all), Some(true));
+    }
+
+    /// Unfreezing everything clears only the global freeze, as the gateway
+    /// does: it explains no credential's freeze cleared with it.
+    #[test]
+    fn an_unfreeze_of_everything_explains_no_credential() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(
+            100,
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[7])),
+            0,
+        );
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 20);
+        assert_eq!(
+            t.due_alerts(20 + CLEARED_GRACE_SECS),
+            [Alert::FreezeCleared { scope: c(7) }]
+        );
+    }
+
+    /// An outcome is taken once by its request id: a replayed old
+    /// `approved` outcome cannot explain a later clear.
+    #[test]
+    fn a_replayed_outcome_explains_nothing() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(
+            100,
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[])),
+            0,
+        );
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 10);
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&frozen(6)), 20);
+        assert!(t.due_alerts(1_000).is_empty());
+        // Frozen again, then cleared with only the old outcome replayed.
+        t.observe(
+            102,
+            &g.anchor(3, 1, &[]),
+            Some(&frozen_with(7, true, &[])),
+            2_000,
+        );
+        t.unfreeze_seen(Hex32([1; 32]), Scope::All, 2_010);
+        t.observe(103, &g.anchor(4, 1, &[]), Some(&frozen(8)), 2_020);
+        assert_eq!(
+            t.due_alerts(2_020 + CLEARED_GRACE_SECS),
+            [Alert::FreezeCleared { scope: Scope::All }]
+        );
+        assert!(!t.outcome_seen(Hex32([1; 32]), 2_100));
+        // Remembered for the wrap time window, then forgotten.
+        assert!(t.outcome_seen(Hex32([1; 32]), 10 + WINDOW_PAST_SECS + 1));
+    }
+
+    /// An unfreeze sent by another phone reaches this one only as the
+    /// anchor's list of unfreezes, which explains the freeze it cleared,
+    /// and only an unfreeze applied since the last anchor kept.
+    #[test]
+    fn another_phones_unfreeze_is_explained_by_the_anchor() {
+        let mut g = Gateway::default();
+        let mut t = AnchorTracker::default();
+        t.observe(
+            100,
+            &g.anchor(1, 1, &[]),
+            Some(&frozen_with(5, true, &[7])),
+            0,
+        );
+        let mut after = frozen_with(7, false, &[]);
+        after.unfrozen = vec![
+            Unfrozen {
+                scope: Scope::All,
+                epoch: 6,
+            },
+            Unfrozen {
+                scope: c(7),
+                epoch: 7,
+            },
+        ];
+        t.observe(101, &g.anchor(2, 1, &[]), Some(&after), 10);
+        assert!(t.due_alerts(10 + CLEARED_GRACE_SECS).is_empty());
+        // An unfreeze listed from before the kept anchor's epoch explains
+        // nothing new.
+        t.observe(
+            102,
+            &g.anchor(3, 1, &[]),
+            Some(&frozen_with(8, true, &[])),
+            20,
+        );
+        let mut stale = frozen_with(9, false, &[]);
+        stale.unfrozen = after.unfrozen.clone();
+        t.observe(103, &g.anchor(4, 1, &[]), Some(&stale), 30);
+        assert_eq!(
+            t.due_alerts(30 + CLEARED_GRACE_SECS),
+            [Alert::FreezeCleared { scope: Scope::All }]
+        );
     }
 
     fn request(id: u8, created_at: u64, deadline: u64) -> Request {
@@ -740,38 +1014,51 @@ mod tests {
             reason: crate::messages::Reason::Management,
             payload: serde_json::Value::Null,
             budget: None,
-            anchor: anchor(1, 1, &[]),
+            anchor: anchor_after(None, 1, 1, &[]),
         }
     }
 
     #[test]
-    fn agent_text_is_stripped_and_truncated() {
-        let (shown, full) = agent_text("pay\u{202e}lla\u{200b}\u{0007}\nok\u{2066}");
-        assert_eq!(shown, "paylla\\nok");
-        assert_eq!(full, 13);
+    fn agent_text_is_stripped_escaped_and_truncated() {
+        let s = agent_text("pay\u{202e}lla\u{200b}\u{0007}\nok\u{2066}");
+        assert_eq!(s.text, "paylla\\nok");
+        assert_eq!((s.chars, s.removed, s.truncated), (13, 4, false));
         let long = "é".repeat(AGENT_TEXT_CHARS + 5);
-        let (shown, full) = agent_text(&long);
-        assert_eq!(shown.chars().count(), AGENT_TEXT_CHARS);
-        assert_eq!(full, AGENT_TEXT_CHARS + 5);
+        let s = agent_text(&long);
+        assert_eq!(s.text.chars().count(), AGENT_TEXT_CHARS);
+        assert_eq!((s.chars, s.truncated), (AGENT_TEXT_CHARS + 5, true));
         // A backslash is escaped, so a literal "\n" cannot pass for a newline.
-        assert_eq!(agent_text("a\\nb\r").0, "a\\\\nb\\r");
+        assert_eq!(agent_text("a\\nb\r").text, "a\\\\nb\\r");
         for c in [
             '\u{00ad}',
             '\u{0600}',
             '\u{061c}',
+            '\u{180b}',
+            '\u{180c}',
+            '\u{180d}',
             '\u{180e}',
+            '\u{180f}',
             '\u{200b}',
             '\u{200f}',
             '\u{202a}',
             '\u{2028}',
             '\u{2029}',
+            '\u{2065}',
             '\u{2069}',
             '\u{206f}',
             '\u{034f}',
+            '\u{0334}',
+            '\u{0338}',
+            '\u{20d2}',
+            '\u{20d3}',
+            '\u{20e5}',
+            '\u{20e6}',
             '\u{115f}',
             '\u{3164}',
             '\u{fe0f}',
             '\u{feff}',
+            '\u{fff0}',
+            '\u{fff8}',
             '\u{ffa0}',
             '\u{1d173}',
             '\u{e0041}',
@@ -779,15 +1066,36 @@ mod tests {
             '\u{1b}',
             '\u{85}',
         ] {
-            assert_eq!(agent_text(&format!("a{c}b")).0, "ab", "{:x}", c as u32);
+            assert_eq!(agent_text(&format!("a{c}b")).text, "ab", "{:x}", c as u32);
         }
+    }
+
+    /// Hidden characters are removed before the limit is applied, and the
+    /// escapes count inside it: 2,000 zero-width spaces cannot push what
+    /// follows out of view, and backslashes cannot double the text shown.
+    #[test]
+    fn hidden_characters_cannot_push_text_out_of_view() {
+        let text = format!(
+            "{}{{\"lud16\":\"attacker@example.com\"}}",
+            "\u{200b}".repeat(AGENT_TEXT_CHARS)
+        );
+        let s = agent_text(&text);
+        assert_eq!(s.text, "{\"lud16\":\"attacker@example.com\"}");
+        assert_eq!(s.removed, AGENT_TEXT_CHARS);
+        assert!(!s.truncated);
+        let s = agent_text(&"\\".repeat(AGENT_TEXT_CHARS));
+        assert_eq!(s.text.chars().count(), AGENT_TEXT_CHARS);
+        assert!(s.truncated);
+        // A short limit, as for a gateway string.
+        let s = shown("abc\ndef", 4);
+        assert_eq!((s.text.as_str(), s.truncated), ("abc", true));
     }
 
     #[test]
     fn the_gate_drops_repeats_and_expired_requests() {
         let mut gate = RequestGate::default();
         let mut t = AnchorTracker::default();
-        t.observe(1_000, &anchor(1, 1, &[]), None, 0);
+        t.observe(1_000, &anchor_after(None, 1, 1, &[]), None, 0);
         assert!(gate.admit(&request(1, 900, 120), &t, 0).is_ok());
         assert!(gate.admit(&request(1, 900, 120), &t, 1).is_err());
         assert!(gate.admit(&request(2, 870, 120), &t, 1).is_err());

@@ -62,6 +62,11 @@ fn accepted_sighash(sighash: Option<u32>) -> bool {
     matches!(sighash, None | Some(0) | Some(1))
 }
 
+/// Whether `script` is a P2TR output script: `OP_1 <32 bytes>`.
+fn is_p2tr(script: &[u8]) -> bool {
+    script.len() == 34 && script[0] == 0x51 && script[1] == 0x20
+}
+
 /// `PSBT_IN_SIGHASH_TYPE` unset, as the request hash encodes it.
 pub const NO_SIGHASH: u32 = 0xFFFF_FFFF;
 
@@ -172,6 +177,14 @@ impl PsbtPayload {
                     "input {i} uses a sighash the signer refuses"
                 )));
             }
+            // The figures below are the signature's only because the signer
+            // is taproot key path over every prevout: a signing input that
+            // spent anything else would not commit to the others' amounts.
+            if !is_p2tr(&self.prevouts[i as usize].script) {
+                return Err(invalid(format!(
+                    "input {i} does not spend a taproot output"
+                )));
+            }
         }
         let outputs: Vec<u32> = self.change.iter().map(|c| c.output).collect();
         strictly_ascending(&outputs, "change")?;
@@ -187,9 +200,7 @@ impl PsbtPayload {
                 "the fee or the total leaving the wallet does not add up",
             ));
         }
-        let btc_network = network
-            .bitcoin()
-            .ok_or_else(|| invalid("a PSBT needs a network"))?;
+        let btc_network = network.bitcoin();
         let outputs = tx
             .output
             .iter()
@@ -380,6 +391,19 @@ pub(crate) mod tests {
         PsbtPayload::from_psbt(&sample_psbt(), &[1, 0], &[(1, 7)], Network::Mainnet).unwrap()
     }
 
+    /// An input the gateway does not sign may spend anything, with any
+    /// sighash: only signing inputs are pinned to taproot key path.
+    #[test]
+    fn an_input_not_signed_may_spend_anything() {
+        let mut p = sample_payload();
+        p.signing_inputs = vec![0];
+        p.prevouts[1].script = vec![
+            0x00, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        ];
+        p.sighash[1] = Some(0x83);
+        assert!(p.check(Network::Mainnet).is_ok());
+    }
+
     #[test]
     fn figures_are_recomputed() {
         let p = sample_payload();
@@ -430,6 +454,18 @@ pub(crate) mod tests {
             ("signing range", Box::new(|p| p.signing_inputs = vec![0, 2])),
             ("nothing to sign", Box::new(|p| p.signing_inputs.clear())),
             ("sighash refused", Box::new(|p| p.sighash[1] = Some(0x83))),
+            (
+                "signing input not taproot",
+                Box::new(|p| {
+                    let mut wpkh = vec![0x00, 0x14];
+                    wpkh.extend_from_slice(&[7; 20]);
+                    p.prevouts[0].script = wpkh;
+                }),
+            ),
+            (
+                "signing input with a short taproot-looking script",
+                Box::new(|p| p.prevouts[1].script.truncate(33)),
+            ),
             (
                 "unset sighash as a number",
                 Box::new(|p| p.sighash[1] = Some(NO_SIGHASH)),

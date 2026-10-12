@@ -89,14 +89,14 @@ impl Network {
     }
 
     /// The bitcoin crate's network.
-    pub fn bitcoin(self) -> Option<bitcoin::Network> {
-        Some(match self {
+    pub fn bitcoin(self) -> bitcoin::Network {
+        match self {
             Network::Mainnet => bitcoin::Network::Bitcoin,
             Network::Testnet3 => bitcoin::Network::Testnet,
             Network::Testnet4 => bitcoin::Network::Testnet4,
             Network::Signet => bitcoin::Network::Signet,
             Network::Regtest => bitcoin::Network::Regtest,
-        })
+        }
     }
 
     /// From the bitcoin crate's network.
@@ -157,6 +157,18 @@ pub struct NostrPayload {
 pub struct Nip44EncryptPayload {
     pub peer: Hex32,
     pub plaintext: String,
+}
+
+impl Drop for Nip44EncryptPayload {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.plaintext);
+    }
+}
+
+impl Drop for Nip44DecryptPayload {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.plaintext);
+    }
 }
 
 impl std::fmt::Debug for Nip44EncryptPayload {
@@ -447,6 +459,9 @@ pub fn check_request(request: &Request, channel: &[u8; 32]) -> Result<CheckedReq
     if request.op != Op::Management && request.credential.is_none() {
         return Err(invalid("an agent request names its credential"));
     }
+    if let Some(c) = &request.credential {
+        crate::change::check_label(&c.name, "credential name")?;
+    }
     let hash = Binding {
         channel: *channel,
         credential: request.credential.as_ref().map(|c| c.id.0),
@@ -499,8 +514,8 @@ fn check_management(change: &Change, credential: &Option<CredentialRef>) -> Resu
 pub(crate) mod tests {
     use super::*;
     use crate::change::{ChangeBitcoin, ChangeGrant, ChangeLimits, Decimal, Scope};
-    use crate::messages::WalletAnchor;
-    use crate::{Hex16, Hex32};
+    use crate::messages::{LogPoint, WalletAnchor, WalletName};
+    use crate::{Hex16, Hex32, Hex33};
 
     pub const CHANNEL: [u8; 32] = [0x11; 32];
     pub const KEY: [u8; 32] = [
@@ -521,8 +536,12 @@ pub(crate) mod tests {
         AnchorState {
             seq: 4210,
             head: Hex32([0x33; 32]),
+            prev: Some(LogPoint {
+                seq: 4170,
+                head: Hex32([0x32; 32]),
+            }),
             wallets: vec![WalletAnchor {
-                wallet: format!("main:{}", hex::encode(KEY)),
+                wallet: WalletName::new(true, &KEY),
                 seq: 88,
                 spent: 40_000,
                 window: 100_000,
@@ -660,9 +679,9 @@ pub(crate) mod tests {
             base(
                 Payload::Management(Change::AddApprover {
                     transport: Hex32([0x66; 32]),
-                    approver: Hex32([0x77; 32]),
+                    approver: Hex33([0x02; 33]),
                     label: "My phone".into(),
-                    fingerprint: crate::sig::fingerprint(&[0x66; 32], &[0x77; 32]),
+                    fingerprint: crate::sig::fingerprint(&[0x66; 32], &[0x02; 33]),
                 }),
                 Reason::Management,
                 None,
@@ -672,7 +691,7 @@ pub(crate) mod tests {
             base(
                 Payload::Management(Change::RemoveApprover {
                     transport: Hex32([0x66; 32]),
-                    approver: Hex32([0x77; 32]),
+                    approver: Hex33([0x02; 33]),
                 }),
                 Reason::Management,
                 None,
@@ -822,7 +841,7 @@ pub(crate) mod tests {
         let add = &requests[7];
         assert!(
             breaks(add, |r| r.payload["change"]["approver"] =
-                "88".repeat(32).into()),
+                "03".repeat(33).into()),
             "approver"
         );
     }
@@ -981,7 +1000,7 @@ pub(crate) mod tests {
         let (request, _) = with(fits).unwrap();
         let device = nostr::Keys::generate();
         let gateway = nostr::Keys::generate();
-        let key = crate::wrap::TagKey::for_peer(&gateway, &device.public_key().to_bytes()).unwrap();
+        let key = crate::wrap::TagKey::gateway(&gateway, &device.public_key().to_bytes()).unwrap();
         assert!(crate::wrap::wrap(
             &gateway,
             &device.public_key().to_bytes(),
@@ -1056,6 +1075,88 @@ pub(crate) mod tests {
             let mut v = requests[i].payload.clone();
             v["extra"] = "x".into();
             assert!(Payload::parse(op, &v).is_err(), "{op:?}");
+        }
+    }
+
+    /// A null key or credential hashes as all zeros, so it is
+    /// `check_request`, not the hash, that fixes which nullable fields each
+    /// op carries: the all-zero form of a field the op lacks is refused, and
+    /// so is a missing field the op has.
+    #[test]
+    fn the_op_fixes_which_nullable_fields_are_present() {
+        let drafts = drafts();
+        let management = &drafts[5];
+        let with = |key: Option<[u8; 32]>, credential: Option<[u8; 16]>| {
+            Binding {
+                channel: CHANNEL,
+                credential,
+                request_id: management.request_id,
+                key,
+                network: None,
+                payload: &management.payload,
+            }
+            .hash()
+            .unwrap()
+        };
+        assert_eq!(with(None, None), with(Some([0; 32]), None));
+        assert_eq!(with(None, None), with(None, Some([0; 16])));
+        let (request, _) = management.clone().finish(&CHANNEL).unwrap();
+        let mut zero_key = request.clone();
+        zero_key.key = Some(Hex32([0; 32]));
+        assert_eq!(
+            check_request(&zero_key, &CHANNEL).unwrap_err(),
+            invalid("the key does not fit the op")
+        );
+        let mut zero_credential = request.clone();
+        zero_credential.credential = Some(CredentialRef {
+            id: Hex16([0; 16]),
+            name: "zero".into(),
+            uid: 0,
+        });
+        assert!(check_request(&zero_credential, &CHANNEL).is_err());
+        // Each op's fields, in turn: the key, the network and the budget are
+        // present exactly when the op has them.
+        for draft in drafts {
+            let op = draft.payload.op();
+            let (request, _) = draft.finish(&CHANNEL).unwrap();
+            let mut r = request.clone();
+            r.key = if r.key.is_some() {
+                None
+            } else {
+                Some(Hex32([0; 32]))
+            };
+            assert!(check_request(&r, &CHANNEL).is_err(), "{op:?} key");
+            let mut r = request.clone();
+            r.network = if r.network.is_some() {
+                None
+            } else {
+                Some(Network::Mainnet)
+            };
+            assert!(check_request(&r, &CHANNEL).is_err(), "{op:?} network");
+            let mut r = request.clone();
+            r.budget = if r.budget.is_some() {
+                None
+            } else {
+                Some(Budget {
+                    credential_spent: 0,
+                    credential_window: 0,
+                    wallet_spent: 0,
+                    wallet_window: 0,
+                })
+            };
+            assert!(check_request(&r, &CHANNEL).is_err(), "{op:?} budget");
+        }
+    }
+
+    /// A credential's name is shown as the gateway's word, so it follows
+    /// the label rules.
+    #[test]
+    fn a_credential_name_that_could_hide_text_is_refused() {
+        let (request, _) = drafts().remove(0).finish(&CHANNEL).unwrap();
+        for name in ["", "writer\u{202e}", &"x".repeat(65)] {
+            let mut r = request.clone();
+            r.credential.as_mut().unwrap().name = name.to_string();
+            assert!(check_request(&r, &CHANNEL).is_err(), "{name:?}");
         }
     }
 

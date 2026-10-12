@@ -34,7 +34,7 @@ pub mod psbt;
 pub mod sig;
 pub mod wrap;
 
-pub use codec::{Hex16, Hex32, Hex64};
+pub use codec::{Hex16, Hex32, Hex33, Hex64};
 
 /// The protocol version every message carries as `"v"`.
 pub const VERSION: u8 = 1;

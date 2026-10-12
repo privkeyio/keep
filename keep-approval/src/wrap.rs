@@ -11,14 +11,18 @@
 //! recipient checks with one HMAC first:
 //!
 //! ```text
-//! tag     = HMAC-SHA256(tag_key, wrap_pubkey || SHA256(wrap_content)), first 16 bytes
+//! tag     = HMAC-SHA256(tag_key, u8 direction || wrap_pubkey || SHA256(wrap_content)),
+//!           first 16 bytes
 //! tag_key = HKDF-SHA256(salt = "keep/approval/wrap-tag/v1",
 //!                       ikm = x of ECDH(channel key, transport key))
 //!           or, for `pair`, ikm = the pairing secret
+//! direction = 1 from the gateway to a device, 2 from a device to the gateway
 //! ```
 //!
-//! A wrap with no tag matching an expected sender, or outside the time
-//! window, is dropped unopened.
+//! Both sides derive the same tag key, so the direction byte is what makes a
+//! party's own wrap, reflected back to it by a relay, fail the tag check
+//! before anything is decrypted. A wrap with no tag matching an expected
+//! sender, or outside the time window, is dropped unopened.
 
 use std::collections::HashMap;
 
@@ -50,8 +54,39 @@ pub const WINDOW_PAST_SECS: u64 = 3 * 86_400;
 /// How far in the future a wrap's `created_at` may be.
 pub const WINDOW_FUTURE_SECS: u64 = 600;
 
-/// The key a wrap tag is computed with.
-pub struct TagKey(Zeroizing<[u8; 32]>);
+/// Which way a wrap travels; the tag covers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// From the gateway to a device.
+    ToDevice,
+    /// From a device to the gateway.
+    ToGateway,
+}
+
+impl Direction {
+    /// The byte the tag's HMAC covers.
+    pub fn code(self) -> u8 {
+        match self {
+            Direction::ToDevice => 1,
+            Direction::ToGateway => 2,
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Direction::ToDevice => Direction::ToGateway,
+            Direction::ToGateway => Direction::ToDevice,
+        }
+    }
+}
+
+/// The key a wrap tag is computed with, and the direction its holder sends
+/// in: it tags what it sends with that direction and accepts only the
+/// other.
+pub struct TagKey {
+    key: Zeroizing<[u8; 32]>,
+    send: Direction,
+}
 
 impl std::fmt::Debug for TagKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,58 +95,76 @@ impl std::fmt::Debug for TagKey {
 }
 
 impl TagKey {
-    fn from_ikm(ikm: &[u8]) -> Self {
-        let mut okm = Zeroizing::new([0u8; 32]);
+    fn from_ikm(ikm: &[u8], send: Direction) -> Self {
+        let mut key = Zeroizing::new([0u8; 32]);
         Hkdf::<Sha256>::new(Some(TAG_SALT), ikm)
-            .expand(&[], okm.as_mut())
+            .expand(&[], key.as_mut())
             .expect("32 bytes is a valid HKDF output length");
-        Self(okm)
+        Self { key, send }
     }
 
-    /// The tag key between `ours` and `peer`: the gateway's channel key and
-    /// a device's transport key, from either side.
-    pub fn for_peer(ours: &Keys, peer: &[u8; 32]) -> Result<Self> {
+    fn shared(ours: &Keys, peer: &[u8; 32], send: Direction) -> Result<Self> {
         let peer = PublicKey::from_slice(peer).map_err(|_| malformed("peer key"))?;
         let shared = Zeroizing::new(
             nostr::util::generate_shared_key(ours.secret_key(), &peer)
                 .map_err(|_| invalid("ECDH"))?,
         );
-        Ok(Self::from_ikm(shared.as_ref()))
+        Ok(Self::from_ikm(shared.as_ref(), send))
     }
 
-    /// The tag key of a pairing session.
-    pub fn for_pairing(secret: &[u8; 32]) -> Self {
-        Self::from_ikm(secret)
+    /// The gateway's tag key with the device whose transport key is
+    /// `transport`.
+    pub fn gateway(channel: &Keys, transport: &[u8; 32]) -> Result<Self> {
+        Self::shared(channel, transport, Direction::ToDevice)
     }
 
-    fn mac(&self, wrap_pubkey: &[u8; 32], content_hash: &[u8; 32]) -> Hmac<Sha256> {
-        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.0.as_ref())
+    /// A device's tag key with the gateway whose channel key is `channel`.
+    pub fn device(transport: &Keys, channel: &[u8; 32]) -> Result<Self> {
+        Self::shared(transport, channel, Direction::ToGateway)
+    }
+
+    /// The tag key a phone sends `pair` with, for the session with `secret`.
+    pub fn pairing_phone(secret: &[u8; 32]) -> Self {
+        Self::from_ikm(secret, Direction::ToGateway)
+    }
+
+    /// The tag key the gateway accepts `pair` with, for the session with
+    /// `secret`.
+    pub fn pairing_gateway(secret: &[u8; 32]) -> Self {
+        Self::from_ikm(secret, Direction::ToDevice)
+    }
+
+    fn mac(
+        &self,
+        direction: Direction,
+        wrap_pubkey: &[u8; 32],
+        content_hash: &[u8; 32],
+    ) -> Hmac<Sha256> {
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(self.key.as_ref())
             .expect("HMAC takes any key length");
+        mac.update(&[direction.code()]);
         mac.update(wrap_pubkey);
         mac.update(content_hash);
         mac
     }
 
-    /// The tag of a wrap with ephemeral key `wrap_pubkey` and `content`.
+    /// The tag of a wrap this key's holder sends, with ephemeral key
+    /// `wrap_pubkey` and `content`.
     pub fn tag(&self, wrap_pubkey: &[u8; 32], content: &str) -> [u8; 16] {
         let full = self
-            .mac(wrap_pubkey, &sha256(content.as_bytes()))
-            .finalize()
-            .into_bytes();
+            .mac(self.send, wrap_pubkey, &sha256(content.as_bytes()))
+            .finalize();
         let mut tag = [0u8; 16];
-        tag.copy_from_slice(&full[..16]);
+        tag.copy_from_slice(&full.as_bytes()[..16]);
         tag
     }
 
-    /// Whether `tag` is this key's tag of the wrap, in constant time.
-    pub fn matches(&self, wrap_pubkey: &[u8; 32], content: &str, tag: &[u8]) -> bool {
-        self.matches_hash(wrap_pubkey, &sha256(content.as_bytes()), tag)
-    }
-
+    /// Whether `tag` is the tag of a wrap sent to this key's holder, in
+    /// constant time.
     fn matches_hash(&self, wrap_pubkey: &[u8; 32], content_hash: &[u8; 32], tag: &[u8]) -> bool {
         tag.len() == 16
             && self
-                .mac(wrap_pubkey, content_hash)
+                .mac(self.send.opposite(), wrap_pubkey, content_hash)
                 .verify_truncated_left(tag)
                 .is_ok()
     }
@@ -167,7 +220,7 @@ pub fn wrap(
         return Err(malformed("not a protocol kind"));
     }
     let receiver = PublicKey::from_slice(receiver).map_err(|_| malformed("receiver key"))?;
-    let rumor_json = rumor(sender.public_key(), kind, content, now).as_json();
+    let rumor_json = Zeroizing::new(rumor(sender.public_key(), kind, content, now).as_json());
     if rumor_json.len() > MAX_RUMOR_BYTES {
         return Err(Error::TooLarge(format!(
             "a message of {} bytes exceeds {MAX_RUMOR_BYTES}",
@@ -177,7 +230,7 @@ pub fn wrap(
     let sealed = nip44::encrypt(
         sender.secret_key(),
         &receiver,
-        &rumor_json,
+        rumor_json.as_str(),
         nip44::Version::V2,
     )
     .map_err(|e| invalid(format!("seal: {e}")))?;
@@ -206,17 +259,40 @@ pub fn wrap(
 
 /// A sender the recipient expects, with the tag key its wraps carry.
 #[derive(Debug)]
-pub struct Candidate<T> {
-    /// The caller's name for the sender (a device, a pairing session).
-    pub id: T,
-    pub tag_key: TagKey,
-    /// The key the seal must be signed by, when known (a registered device's
-    /// transport key, the paired channel key); `None` for a pairing session,
-    /// whose sender is the new device and whose only message is `pair`.
-    pub sender: Option<[u8; 32]>,
+pub enum Candidate<T> {
+    /// A known peer (a registered device's transport key, the paired channel
+    /// key): its seals must be signed by `sender`.
+    Peer {
+        /// The caller's name for the sender.
+        id: T,
+        tag_key: TagKey,
+        sender: [u8; 32],
+    },
+    /// A pairing session open on the gateway: its sender is the new device,
+    /// unknown until now, and its one message is a `pair`.
+    Pairing {
+        /// The caller's name for the session.
+        id: T,
+        tag_key: TagKey,
+    },
 }
 
-/// A message opened from a wrap. Its `Debug` leaves out the content.
+impl<T> Candidate<T> {
+    fn tag_key(&self) -> &TagKey {
+        match self {
+            Candidate::Peer { tag_key, .. } | Candidate::Pairing { tag_key, .. } => tag_key,
+        }
+    }
+
+    fn id(&self) -> &T {
+        match self {
+            Candidate::Peer { id, .. } | Candidate::Pairing { id, .. } => id,
+        }
+    }
+}
+
+/// A message opened from a wrap. Its `Debug` leaves out the content, which
+/// is wiped when dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Opened<T> {
     /// Which candidate's tag the wrap carried.
@@ -224,7 +300,7 @@ pub struct Opened<T> {
     /// The key that signed the seal and authored the rumor.
     pub sender: [u8; 32],
     pub kind: u16,
-    pub content: String,
+    pub content: Zeroizing<String>,
     pub wrap_id: [u8; 32],
     pub wrap_created_at: u64,
 }
@@ -264,14 +340,16 @@ pub fn match_tag<'a, T>(
         return Err(Error::NotOurs);
     };
     let tag = match tag.as_slice() {
-        [_, value] => hex::decode(value).map_err(|_| Error::NotOurs)?,
+        [_, value] if crate::codec::is_lower_hex(value, 16) => {
+            hex::decode(value).map_err(|_| Error::NotOurs)?
+        }
         _ => return Err(Error::NotOurs),
     };
     let wrap_pubkey = event.pubkey.to_bytes();
     let content_hash = sha256(event.content.as_bytes());
     candidates
         .iter()
-        .find(|c| c.tag_key.matches_hash(&wrap_pubkey, &content_hash, &tag))
+        .find(|c| c.tag_key().matches_hash(&wrap_pubkey, &content_hash, &tag))
         .ok_or(Error::NotOurs)
 }
 
@@ -279,9 +357,9 @@ pub fn match_tag<'a, T>(
 /// the wrap's signature must check out and the wrap must not be in `seen`
 /// (a replay is [`Error::NotOurs`], dropped before any decryption), then
 /// the seal (kind 13, signed, untagged, by the expected sender) and the
-/// rumor (one of the protocol's kinds, `pair` from a pairing session,
-/// authored by the seal's signer, untagged, within the size limit) must all
-/// check out.
+/// rumor (one of the protocol's kinds, authored by the seal's signer,
+/// untagged, within the size limit, and a `pair` and nothing else from a
+/// pairing session) must all check out.
 pub fn open<T: Clone>(
     recipient: &Keys,
     event: &Event,
@@ -294,23 +372,27 @@ pub fn open<T: Clone>(
     if !seen.first_time(event.id.to_bytes(), event.created_at.as_secs(), now) {
         return Err(Error::NotOurs);
     }
-    let seal_json = nip44::decrypt(recipient.secret_key(), &event.pubkey, &event.content)
-        .map_err(|_| invalid("wrap"))?;
-    let seal = Event::from_json(&seal_json).map_err(|_| malformed("seal"))?;
+    let seal_json = Zeroizing::new(
+        nip44::decrypt(recipient.secret_key(), &event.pubkey, &event.content)
+            .map_err(|_| invalid("wrap"))?,
+    );
+    let seal = Event::from_json(seal_json.as_str()).map_err(|_| malformed("seal"))?;
     if seal.kind != Kind::Seal || !seal.tags.is_empty() {
         return Err(invalid("not a seal"));
     }
     seal.verify().map_err(|_| invalid("seal signature"))?;
     let sender = seal.pubkey.to_bytes();
-    if candidate.sender.is_some_and(|expected| expected != sender) {
+    if matches!(candidate, Candidate::Peer { sender: expected, .. } if *expected != sender) {
         return Err(invalid("sealed by another key"));
     }
-    let rumor_json = nip44::decrypt(recipient.secret_key(), &seal.pubkey, &seal.content)
-        .map_err(|_| invalid("seal"))?;
+    let rumor_json = Zeroizing::new(
+        nip44::decrypt(recipient.secret_key(), &seal.pubkey, &seal.content)
+            .map_err(|_| invalid("seal"))?,
+    );
     if rumor_json.len() > MAX_RUMOR_BYTES {
         return Err(Error::TooLarge("rumor".into()));
     }
-    let rumor = UnsignedEvent::from_json(&rumor_json).map_err(|_| malformed("rumor"))?;
+    let rumor = UnsignedEvent::from_json(rumor_json.as_str()).map_err(|_| malformed("rumor"))?;
     if rumor.pubkey != seal.pubkey {
         return Err(invalid("the rumor's author is not the seal's signer"));
     }
@@ -319,14 +401,21 @@ pub fn open<T: Clone>(
     if !kind::is_protocol_kind(kind) || !rumor.tags.is_empty() {
         return Err(invalid("not a protocol message"));
     }
-    if candidate.sender.is_none() && kind != kind::PAIRING {
+    let content = Zeroizing::new(rumor.content);
+    if matches!(candidate, Candidate::Pairing { .. })
+        && (kind != kind::PAIRING
+            || !matches!(
+                crate::messages::parse(&content),
+                Ok(crate::messages::Pairing::Pair { .. })
+            ))
+    {
         return Err(invalid("a pairing session carries only pair"));
     }
     Ok(Opened {
-        from: candidate.id.clone(),
+        from: candidate.id().clone(),
         sender,
         kind,
-        content: rumor.content,
+        content,
         wrap_id: event.id.to_bytes(),
         wrap_created_at: event.created_at.as_secs(),
     })
@@ -357,16 +446,6 @@ impl SeenWraps {
         }
         self.seen.insert(wrap_id, created_at).is_none()
     }
-
-    /// How many wraps are held.
-    pub fn len(&self) -> usize {
-        self.seen.len()
-    }
-
-    /// Whether none are held.
-    pub fn is_empty(&self) -> bool {
-        self.seen.is_empty()
-    }
 }
 
 #[cfg(test)]
@@ -388,15 +467,34 @@ mod tests {
     }
 
     fn device_candidates(p: &Pair) -> Vec<Candidate<&'static str>> {
-        vec![Candidate {
+        vec![Candidate::Peer {
             id: "phone",
-            tag_key: TagKey::for_peer(&p.gateway, &p.device.public_key().to_bytes()).unwrap(),
-            sender: Some(p.device.public_key().to_bytes()),
+            tag_key: TagKey::gateway(&p.gateway, &p.device.public_key().to_bytes()).unwrap(),
+            sender: p.device.public_key().to_bytes(),
         }]
     }
 
+    fn pairing_candidates(secret: &[u8; 32]) -> Vec<Candidate<&'static str>> {
+        vec![Candidate::Pairing {
+            id: "pairing",
+            tag_key: TagKey::pairing_gateway(secret),
+        }]
+    }
+
+    /// A `pair` message's text, as a phone sends it.
+    fn pair_text(p: &Pair, secret: &[u8; 32]) -> String {
+        let approver = crate::sig::tests::approver_signing_key(9);
+        crate::messages::to_text(&crate::sig::pair(
+            &p.device.public_key().to_bytes(),
+            &approver,
+            &p.gateway.public_key().to_bytes(),
+            secret,
+            "phone",
+        ))
+    }
+
     fn from_device(p: &Pair, content: &str) -> Event {
-        let key = TagKey::for_peer(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
+        let key = TagKey::device(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
         wrap(
             &p.device,
             &p.gateway.public_key().to_bytes(),
@@ -423,7 +521,7 @@ mod tests {
         assert_eq!(opened.from, "phone");
         assert_eq!(opened.sender, p.device.public_key().to_bytes());
         assert_eq!(opened.kind, kind::DECISION);
-        assert_eq!(opened.content, "{\"x\":1}");
+        assert_eq!(opened.content.as_str(), "{\"x\":1}");
         assert!(within_window(event.created_at.as_secs(), NOW));
         assert!(event.created_at.as_secs() <= NOW);
     }
@@ -455,12 +553,15 @@ mod tests {
         );
         // The same tag and key, other content: rebuild with the original
         // ephemeral key is impossible, so check the HMAC directly.
-        let key = &candidates[0].tag_key;
-        let t = key.tag(&event.pubkey.to_bytes(), &event.content);
-        assert!(key.matches(&event.pubkey.to_bytes(), &event.content, &t));
-        assert!(!key.matches(&event.pubkey.to_bytes(), "other", &t));
-        assert!(!key.matches(&[1; 32], &event.content, &t));
-        assert!(!key.matches(&event.pubkey.to_bytes(), &event.content, &t[..15]));
+        let key = candidates[0].tag_key();
+        let sender = TagKey::device(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
+        let w = event.pubkey.to_bytes();
+        let t = sender.tag(&w, &event.content);
+        let h = sha256(event.content.as_bytes());
+        assert!(key.matches_hash(&w, &h, &t));
+        assert!(!key.matches_hash(&w, &sha256(b"other"), &t));
+        assert!(!key.matches_hash(&[1; 32], &h, &t));
+        assert!(!key.matches_hash(&w, &h, &t[..15]));
         // No tag, two tags.
         let untagged = EventBuilder::new(Kind::GiftWrap, event.content.clone())
             .tags([Tag::public_key(p.gateway.public_key())])
@@ -506,7 +607,7 @@ mod tests {
     fn the_seal_must_come_from_the_expected_sender() {
         let p = pair();
         let mallory = Keys::generate();
-        let key = TagKey::for_peer(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
+        let key = TagKey::device(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
         let event = wrap(
             &mallory,
             &p.gateway.public_key().to_bytes(),
@@ -527,17 +628,13 @@ mod tests {
         .is_err());
         // With no expected sender (pairing), the sender is reported.
         let secret = [5u8; 32];
-        let pairing = vec![Candidate {
-            id: "pairing",
-            tag_key: TagKey::for_pairing(&secret),
-            sender: None,
-        }];
+        let pairing = pairing_candidates(&secret);
         let event = wrap(
             &mallory,
             &p.gateway.public_key().to_bytes(),
-            &TagKey::for_pairing(&secret),
+            &TagKey::pairing_phone(&secret),
             kind::PAIRING,
-            "{}",
+            &pair_text(&p, &secret),
             NOW,
         )
         .unwrap();
@@ -552,7 +649,7 @@ mod tests {
     #[test]
     fn size_and_kind_limits() {
         let p = pair();
-        let key = TagKey::for_peer(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
+        let key = TagKey::device(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
         let big = "x".repeat(MAX_RUMOR_BYTES);
         assert!(matches!(
             wrap(
@@ -633,7 +730,7 @@ mod tests {
             )
             .unwrap()
         });
-        let key = TagKey::for_peer(&p.device, &receiver.to_bytes()).unwrap();
+        let key = TagKey::device(&p.device, &receiver.to_bytes()).unwrap();
         let tag = key.tag(&ephemeral.public_key().to_bytes(), &wrapped);
         EventBuilder::new(Kind::GiftWrap, wrapped)
             .tags([
@@ -815,7 +912,7 @@ mod tests {
         let build = |kind: Kind, copies: usize| {
             let ephemeral = Keys::generate();
             let content = "AAAA".to_string();
-            let key = TagKey::for_peer(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
+            let key = TagKey::device(&p.device, &p.gateway.public_key().to_bytes()).unwrap();
             let tag = Tag::custom(
                 TagKind::custom(TAG_NAME),
                 [hex::encode(
@@ -886,34 +983,108 @@ mod tests {
         assert!(open(&p.gateway, &event, &candidates, &mut seen, NOW).is_ok());
     }
 
-    /// A pairing session, whose sender is not known yet, opens only `pair`.
+    /// A pairing session, whose sender is not known yet, opens only a
+    /// `pair` message: not another kind, nor a `paired` or `refused`.
     #[test]
     fn a_pairing_session_opens_only_pair() {
         let p = pair();
         let secret = [5u8; 32];
-        let pairing = vec![Candidate {
-            id: "pairing",
-            tag_key: TagKey::for_pairing(&secret),
-            sender: None,
-        }];
-        for (kind, ok) in [
-            (kind::PAIRING, true),
-            (kind::DECISION, false),
-            (kind::FREEZE, false),
-            (kind::REQUEST, false),
+        let pairing = pairing_candidates(&secret);
+        let paired = crate::messages::to_text(&crate::messages::Pairing::Refused {
+            v: crate::messages::V1,
+            reason: "no".into(),
+        });
+        let pair_message = pair_text(&p, &secret);
+        for (kind, content, ok) in [
+            (kind::PAIRING, pair_message.as_str(), true),
+            (kind::PAIRING, paired.as_str(), false),
+            (kind::PAIRING, "{}", false),
+            (kind::DECISION, pair_message.as_str(), false),
+            (kind::FREEZE, "{}", false),
+            (kind::REQUEST, "{}", false),
         ] {
             let event = wrap(
                 &p.device,
                 &p.gateway.public_key().to_bytes(),
-                &TagKey::for_pairing(&secret),
+                &TagKey::pairing_phone(&secret),
                 kind,
-                "{}",
+                content,
                 NOW,
             )
             .unwrap();
             let opened = open(&p.gateway, &event, &pairing, &mut SeenWraps::default(), NOW);
-            assert_eq!(opened.is_ok(), ok, "{kind}");
+            assert_eq!(opened.is_ok(), ok, "{kind} {content}");
         }
+    }
+
+    /// Both sides share one tag key, so the direction byte is what refuses a
+    /// party's own wrap reflected back to it, before any decryption: the
+    /// gateway's wrap to a device, and a device's wrap to the gateway.
+    #[test]
+    fn a_reflected_wrap_fails_the_tag_check() {
+        let p = pair();
+        let device = p.device.public_key().to_bytes();
+        let gateway = p.gateway.public_key().to_bytes();
+        let to_device = wrap(
+            &p.gateway,
+            &device,
+            &TagKey::gateway(&p.gateway, &device).unwrap(),
+            kind::ANCHOR,
+            "{}",
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            match_tag(&to_device, &device_candidates(&p), NOW).unwrap_err(),
+            Error::NotOurs
+        );
+        let phone_candidates = vec![Candidate::Peer {
+            id: "gateway",
+            tag_key: TagKey::device(&p.device, &gateway).unwrap(),
+            sender: gateway,
+        }];
+        assert!(match_tag(&to_device, &phone_candidates, NOW).is_ok());
+        let to_gateway = from_device(&p, "{}");
+        assert_eq!(
+            match_tag(&to_gateway, &phone_candidates, NOW).unwrap_err(),
+            Error::NotOurs
+        );
+        // The pairing secret's two directions differ too.
+        let secret = [5u8; 32];
+        let a = TagKey::pairing_phone(&secret).tag(&[1; 32], "x");
+        let b = TagKey::pairing_gateway(&secret).tag(&[1; 32], "x");
+        assert_ne!(a, b);
+    }
+
+    /// The tag is read as lowercase hex only.
+    #[test]
+    fn an_uppercase_tag_is_not_ours() {
+        let p = pair();
+        let event = from_device(&p, "{}");
+        let tag = event
+            .tags
+            .iter()
+            .find(|t| t.kind() == TagKind::custom(TAG_NAME))
+            .unwrap()
+            .as_slice()[1]
+            .clone();
+        assert!(tag.bytes().any(|b| b.is_ascii_lowercase()), "{tag}");
+        let mut tags: Vec<Tag> = event
+            .tags
+            .iter()
+            .filter(|t| t.kind() != TagKind::custom(TAG_NAME))
+            .cloned()
+            .collect();
+        tags.push(Tag::custom(TagKind::custom(TAG_NAME), [tag.to_uppercase()]));
+        // Re-signed by a fresh key would change the wrap key the tag covers,
+        // so the check is made on the tag alone.
+        let mut upper = event.clone();
+        upper.tags = nostr::Tags::from_list(tags);
+        assert_eq!(
+            match_tag(&upper, &device_candidates(&p), NOW).unwrap_err(),
+            Error::NotOurs
+        );
+        assert!(match_tag(&event, &device_candidates(&p), NOW).is_ok());
     }
 
     #[test]
@@ -939,8 +1110,8 @@ mod tests {
         assert!(seen.first_time([1; 32], NOW, NOW));
         assert!(!seen.first_time([1; 32], NOW, NOW));
         assert!(!seen.first_time([2; 32], NOW - WINDOW_PAST_SECS - 1, NOW));
-        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.seen.len(), 1);
         assert!(seen.first_time([3; 32], NOW + 1, NOW + WINDOW_PAST_SECS + 1));
-        assert_eq!(seen.len(), 1);
+        assert_eq!(seen.seen.len(), 1);
     }
 }

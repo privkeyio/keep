@@ -10,9 +10,10 @@ description = "Agent approvals over Nostr: the encodings, hashes, signatures and
 [dependencies]
 nostr = { version = "0.44", default-features = false, features = ["std", "nip44", "nip59"] }
 bitcoin = { workspace = true }
-sha2 = "0.11"
-hmac = "0.13"
+sha2 = { version = "0.11", features = ["zeroize"] }
+hmac = { version = "0.13", features = ["zeroize"] }
 hkdf = "0.13"
+p256 = { version = "0.13", features = ["ecdsa"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
