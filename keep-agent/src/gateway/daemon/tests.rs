@@ -1680,7 +1680,12 @@ mod sockets {
 #[test]
 fn a_credential_bound_to_a_forbidden_uid_is_refused_per_request() {
     let mut g = Gw::new();
-    let grant = serde_json::to_vec(&nostr_grant(g.key).validated().unwrap()).unwrap();
+    let grant = serde_json::to_vec(
+        &nostr_grant(g.key)
+            .validated(&crate::policy::ReservedKeys::new())
+            .unwrap(),
+    )
+    .unwrap();
     for uid in [HOST.euid, HOST.vault_owner, ADMIN] {
         let (_, token) = g
             .state

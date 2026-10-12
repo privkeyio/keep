@@ -6,7 +6,7 @@ use keep_core::Keep;
 use zeroize::Zeroizing;
 
 use crate::error::{AgentError, Result};
-use crate::policy::Grant;
+use crate::policy::{Grant, ReservedKeys};
 
 /// A credential with its grant decoded and validated.
 #[derive(Debug, Clone)]
@@ -16,17 +16,19 @@ pub struct GrantedCredential {
 }
 
 impl GrantedCredential {
-    /// Decode and validate a stored credential's grant. A grant that does not
-    /// decode (unknown fields included), fails validation, or does not decode
-    /// to what validation leaves is refused, so nothing but a validated grant
-    /// is ever enforced.
-    pub fn new(credential: AgentCredential) -> Result<Self> {
+    /// Decode and validate a stored credential's grant against the keys no
+    /// grant may name. A grant that does not decode (unknown fields included),
+    /// fails validation (one issued before approvals were enabled, or before a
+    /// key it names became an approver device's), or does not decode to what
+    /// validation leaves is refused, so nothing but a validated grant is ever
+    /// enforced.
+    pub fn new(credential: AgentCredential, reserved: &ReservedKeys) -> Result<Self> {
         let refuse = |why: String| {
             AgentError::ScopeViolation(format!("agent {} grant {why}", credential.id_hex()))
         };
         let stored: Grant = serde_json::from_slice(&credential.grant)
             .map_err(|e| refuse(format!("does not decode: {e}")))?;
-        let grant = stored.clone().validated()?;
+        let grant = stored.clone().validated(reserved)?;
         if grant != stored {
             return Err(refuse("is not in validated form".into()));
         }
@@ -34,17 +36,19 @@ impl GrantedCredential {
     }
 }
 
-/// Issue a credential carrying `grant`, validated first, valid from `now` (the
-/// gateway's clock) for `ttl_secs`. Returns it with the token for the agent.
+/// Issue a credential carrying `grant`, validated first against the keys no
+/// grant may name, valid from `now` (the gateway's clock) for `ttl_secs`.
+/// Returns it with the token for the agent.
 pub fn issue_credential(
     keep: &mut Keep,
     name: &str,
     uid: u32,
     grant: Grant,
+    reserved: &ReservedKeys,
     now: u64,
     ttl_secs: u64,
 ) -> Result<(GrantedCredential, Zeroizing<String>)> {
-    let grant = grant.validated()?;
+    let grant = grant.validated(reserved)?;
     let bytes = serde_json::to_vec(&grant).map_err(|e| AgentError::Serialization(e.to_string()))?;
     let (credential, token) = keep.issue_agent_credential(name, uid, bytes, now, ttl_secs)?;
     Ok((GrantedCredential { credential, grant }, token))
@@ -67,19 +71,21 @@ pub struct Refused {
     pub credential: Option<[u8; 16]>,
 }
 
-/// Authenticate a token presented by `peer_uid` at `now` and load its grant.
-/// An `Err` (a vault fault) is as much a refusal as an `Ok(Err(_))`; the
-/// gateway answers the agent the same way for every refusal.
+/// Authenticate a token presented by `peer_uid` at `now` and load its grant,
+/// refusing one that names a `reserved` key or a protocol kind. An `Err` (a
+/// vault fault) is as much a refusal as an `Ok(Err(_))`; the gateway answers
+/// the agent the same way for every refusal.
 pub fn authenticate(
     keep: &Keep,
     token: &str,
     peer_uid: u32,
     now: u64,
+    reserved: &ReservedKeys,
 ) -> Result<std::result::Result<GrantedCredential, Refused>> {
     match keep.authenticate_agent(token, peer_uid, now)? {
         Ok(credential) => {
             let id = credential.id;
-            match GrantedCredential::new(credential) {
+            match GrantedCredential::new(credential, reserved) {
                 Ok(granted) => Ok(Ok(granted)),
                 Err(e) => {
                     tracing::warn!(id = %hex::encode(id), error = %e, "agent credential grant does not load");

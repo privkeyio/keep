@@ -498,7 +498,9 @@ fn build_grant(args: GrantArgs) -> Result<Grant> {
         bitcoin,
         limits: args.limits,
     };
-    grant.validated().map_err(|e| invalid(e.to_string()))
+    grant
+        .validated(&keep_agent::policy::ReservedKeys::new())
+        .map_err(|e| invalid(e.to_string()))
 }
 
 #[cfg(test)]

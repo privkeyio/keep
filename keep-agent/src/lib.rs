@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approval;
 pub mod attestation;
 pub mod client;
 pub mod entropy;

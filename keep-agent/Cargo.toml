@@ -14,6 +14,7 @@ enclave = ["dep:aws-nitro-enclaves-nsm-api"]
 [dependencies]
 keep-core = { path = "../keep-core" }
 keep-bitcoin = { path = "../keep-bitcoin" }
+keep-approval = { path = "../keep-approval" }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

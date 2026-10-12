@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::error::AgentError;
-use crate::policy::{BitcoinGrant, Grant};
+use crate::policy::{BitcoinGrant, Grant, ReservedKeys};
 use crate::scope::Operation;
 use keep_core::agent::{AgentCredential, AgentRefusal};
 use keep_core::audit::{AuditEntry, AuditEventType};
@@ -67,7 +67,16 @@ impl Vault {
     }
 
     fn issue(&mut self, ttl: u64) -> (GrantedCredential, zeroize::Zeroizing<String>) {
-        issue_credential(&mut self.keep, "agent", 1000, grant(), NOW, ttl).unwrap()
+        issue_credential(
+            &mut self.keep,
+            "agent",
+            1000,
+            grant(),
+            &ReservedKeys::new(),
+            NOW,
+            ttl,
+        )
+        .unwrap()
     }
 }
 
@@ -92,11 +101,16 @@ fn grant() -> Grant {
 fn an_issued_grant_comes_back_validated_and_refusals_name_their_credential() {
     let mut v = Vault::new();
     let (issued, token) = v.issue(3600);
-    let loaded = authenticate(&v.keep, &token, 1000, NOW).unwrap().unwrap();
-    assert_eq!(loaded.grant, grant().validated().unwrap());
+    let loaded = authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        loaded.grant,
+        grant().validated(&ReservedKeys::new()).unwrap()
+    );
     assert_eq!(loaded.credential, issued.credential);
     assert_eq!(
-        authenticate(&v.keep, &token, 1001, NOW)
+        authenticate(&v.keep, &token, 1001, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err(),
         Refused {
@@ -105,7 +119,7 @@ fn an_issued_grant_comes_back_validated_and_refusals_name_their_credential() {
         }
     );
     assert_eq!(
-        authenticate(&v.keep, &token[1..], 1000, NOW)
+        authenticate(&v.keep, &token[1..], 1000, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err()
             .credential,
@@ -114,7 +128,16 @@ fn an_issued_grant_comes_back_validated_and_refusals_name_their_credential() {
 
     let mut invalid = grant();
     invalid.keys.clear();
-    assert!(issue_credential(&mut v.keep, "bad", 1000, invalid, NOW, 3600).is_err());
+    assert!(issue_credential(
+        &mut v.keep,
+        "bad",
+        1000,
+        invalid,
+        &ReservedKeys::new(),
+        NOW,
+        3600
+    )
+    .is_err());
     assert_eq!(
         v.keep.agent_credentials().unwrap().len(),
         1,
@@ -126,7 +149,7 @@ fn an_issued_grant_comes_back_validated_and_refusals_name_their_credential() {
         .issue_agent_credential("broken", 1000, b"not json".to_vec(), NOW, 3600)
         .unwrap();
     assert_eq!(
-        authenticate(&v.keep, &broken_token, 1000, NOW)
+        authenticate(&v.keep, &broken_token, 1000, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err(),
         Refused {
@@ -140,7 +163,9 @@ fn an_issued_grant_comes_back_validated_and_refusals_name_their_credential() {
 fn a_grant_that_is_not_validated_as_stored_does_not_load() {
     let stored = |bytes: Vec<u8>| {
         let (credential, _) = AgentCredential::issue("agent", 1000, bytes, NOW, 3600).unwrap();
-        GrantedCredential::new(credential).unwrap_err().to_string()
+        GrantedCredential::new(credential, &ReservedKeys::new())
+            .unwrap_err()
+            .to_string()
     };
     assert!(stored(b"not json".to_vec()).contains("does not decode"));
     let mut extra = serde_json::to_value(grant()).unwrap();
@@ -160,7 +185,48 @@ fn a_grant_that_is_not_validated_as_stored_does_not_load() {
         3600,
     )
     .unwrap();
-    assert!(GrantedCredential::new(credential).is_ok());
+    assert!(GrantedCredential::new(credential, &ReservedKeys::new()).is_ok());
+}
+
+/// A credential issued before a key it names became reserved (the channel
+/// key, an approver device's key), or before its kinds were hard-denied, is
+/// refused at authentication, like a token that matches nothing usable.
+#[test]
+fn a_stored_grant_naming_a_reserved_key_or_protocol_kind_is_refused() {
+    let mut v = Vault::new();
+    let (issued, token) = v.issue(3600);
+    let reserved: ReservedKeys = [KEY].into();
+    assert_eq!(
+        authenticate(&v.keep, &token, 1000, NOW, &reserved)
+            .unwrap()
+            .unwrap_err(),
+        Refused {
+            because: RefusedBecause::Grant,
+            credential: Some(issued.credential.id),
+        }
+    );
+    assert!(issue_credential(&mut v.keep, "again", 1000, grant(), &reserved, NOW, 3600).is_err());
+    let mut with_kind = grant();
+    with_kind.event_kinds.insert(24_251);
+    let (credential, token) = v
+        .keep
+        .issue_agent_credential(
+            "old",
+            1000,
+            serde_json::to_vec(&with_kind).unwrap(),
+            NOW,
+            3600,
+        )
+        .unwrap();
+    assert_eq!(
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
+            .unwrap()
+            .unwrap_err(),
+        Refused {
+            because: RefusedBecause::Grant,
+            credential: Some(credential.id),
+        }
+    );
 }
 
 #[test]
@@ -237,7 +303,11 @@ fn a_write_that_fails_does_not_spend_the_budget() {
             .record_signature(&mut v.keep, &id, &KEY, b"m", "sign", NOW)
             .unwrap();
     }
-    assert!(authenticate(&v.keep, &token, 1000, NOW).unwrap().is_ok());
+    assert!(
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
+            .unwrap()
+            .is_ok()
+    );
 }
 
 #[test]
@@ -283,7 +353,7 @@ fn a_spent_budget_is_recorded_once_and_freezes_the_credential_once() {
     assert_eq!(v.entries(AuditEventType::Sign).len(), 2);
     assert_eq!(v.entries(AuditEventType::AgentFreeze).len(), 1);
     assert_eq!(
-        authenticate(&v.keep, &token, 1000, NOW)
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err()
             .because,
@@ -307,7 +377,7 @@ fn a_spent_budget_is_recorded_once_and_freezes_the_credential_once() {
         .record_signature(&mut v.keep, &id, &KEY, b"m", "next day", NOW + DAY)
         .unwrap();
     assert_eq!(
-        authenticate(&v.keep, &token, 1000, NOW + DAY)
+        authenticate(&v.keep, &token, 1000, NOW + DAY, &ReservedKeys::new())
             .unwrap()
             .unwrap_err()
             .because,
@@ -351,7 +421,11 @@ fn the_gateway_budget_spans_credentials_without_freezing_them() {
         hex::encode([0u8; 16])
     )));
     assert!(v.entries(AuditEventType::AgentFreeze).is_empty());
-    assert!(authenticate(&v.keep, &token, 1000, NOW).unwrap().is_ok());
+    assert!(
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
+            .unwrap()
+            .is_ok()
+    );
     audit
         .record_signature(&mut v.keep, &b, &KEY, b"m", "next day", NOW + DAY)
         .unwrap();
@@ -472,7 +546,7 @@ fn a_credential_over_budget_is_frozen_when_the_gateway_is_too() {
         .record_signature(&mut v.keep, &id, &KEY, b"m", "2", NOW)
         .is_err());
     assert_eq!(
-        authenticate(&v.keep, &token, 1000, NOW)
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err()
             .because,
@@ -721,7 +795,7 @@ fn served_answers_and_admission_are_budgeted() {
     assert!(audit.admit(&mut v.keep, &id, NOW).is_err());
     assert_eq!(v.reasons(AuditEventType::AgentServed).len(), 1);
     assert_eq!(
-        authenticate(&v.keep, &token, 1000, NOW)
+        authenticate(&v.keep, &token, 1000, NOW, &ReservedKeys::new())
             .unwrap()
             .unwrap_err()
             .because,

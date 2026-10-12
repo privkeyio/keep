@@ -77,6 +77,12 @@ impl BitcoinSigner {
         self.psbt_signer.analyze(psbt)
     }
 
+    /// The change chain index of output `index` when it is change: see
+    /// [`crate::psbt::PsbtSigner::change_index`].
+    pub fn change_index(&self, psbt: &Psbt, index: usize) -> Option<u32> {
+        self.psbt_signer.change_index(psbt, index)
+    }
+
     pub fn check_policy(&self, analysis: &PsbtAnalysis) -> Result<()> {
         let policy = match &self.policy {
             Some(p) => p,

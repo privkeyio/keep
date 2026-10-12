@@ -27,6 +27,7 @@ use crate::gateway::{
 };
 use crate::policy::{
     evaluate, Budgets, Decision, DenyReason, Grant, Ledger, Request, RequestLimits, Reservation,
+    ReservedKeys,
 };
 use crate::scope::Operation;
 
@@ -276,6 +277,9 @@ pub struct State {
     /// Deferred refusals dropped because the queue was full, since the last
     /// tick.
     dropped: u64,
+    /// Keys no grant may name: the channel key and every registered approver
+    /// device's keys.
+    reserved: ReservedKeys,
 }
 
 /// A refusal to record against the credential a token matched.
@@ -413,6 +417,7 @@ impl State {
             heartbeat_ignored,
             deferred: Vec::new(),
             dropped: 0,
+            reserved: ReservedKeys::new(),
         };
         state.persist_heartbeat()?;
         tracing::info!(clock = start, frozen, "agent gateway state ready");
@@ -586,7 +591,13 @@ impl State {
         // its credential as the theft signal it is.
         let forbidden =
             forbidden_uid(&self.host, &self.settings, peer_uid) || !bindable_uid(peer_uid);
-        let granted = match authenticate(&self.keep, &token, peer_uid, self.clock.calendar()) {
+        let granted = match authenticate(
+            &self.keep,
+            &token,
+            peer_uid,
+            self.clock.calendar(),
+            &self.reserved,
+        ) {
             Ok(Ok(granted)) if !forbidden => granted,
             Ok(Ok(granted)) => {
                 drop(token);
@@ -1102,12 +1113,16 @@ impl State {
             }
         }
         let ttl = ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
-        let (issued, token) = issue_credential(&mut self.keep, name, uid, grant, now, ttl)?;
+        let (issued, token) =
+            issue_credential(&mut self.keep, name, uid, grant, &self.reserved, now, ttl)?;
         if let Ok(mut set) = self.bound.write() {
             set.insert(uid);
         }
-        let head =
-            json!({ "ok": true, "result": credential_json(&issued.credential, now) }).to_string();
+        let head = json!({
+            "ok": true,
+            "result": credential_json(&issued.credential, now, &self.reserved)
+        })
+        .to_string();
         // `head` holds no secret; the token goes only into `out`, sized so it
         // never reallocates. Tokens are lowercase hex behind a fixed prefix,
         // so they need no escaping.
@@ -1136,7 +1151,7 @@ impl State {
                 let mut list = Vec::new();
                 for id in self.keep.agent_credential_ids()? {
                     list.push(match load_credential(&self.keep, &id) {
-                        Ok(Some(c)) => credential_json(&c, now),
+                        Ok(Some(c)) => credential_json(&c, now, &self.reserved),
                         Ok(None) => continue,
                         Err(e) => json!({ "id": hex::encode(id), "unreadable": e.to_string() }),
                     });
@@ -1413,8 +1428,8 @@ fn grant_json(grant: &Grant) -> Value {
     })
 }
 
-fn credential_json(c: &AgentCredential, now: u64) -> Value {
-    let grant = crate::gateway::GrantedCredential::new(c.clone())
+fn credential_json(c: &AgentCredential, now: u64, reserved: &ReservedKeys) -> Value {
+    let grant = crate::gateway::GrantedCredential::new(c.clone(), reserved)
         .map(|g| grant_json(&g.grant))
         .unwrap_or_else(|e| json!({ "unreadable": e.to_string() }));
     json!({
