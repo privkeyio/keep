@@ -2773,6 +2773,37 @@ fn test_gateway_offline_reset_runs_only_as_the_vaults_owner() {
     );
 }
 
+/// `keep gateway approver pair` without a terminal to confirm the
+/// fingerprint on is refused before the gateway is asked for a session.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_pairing_needs_a_terminal_before_it_asks_the_gateway() {
+    use std::os::unix::fs::MetadataExt;
+
+    let keep = require_binary!();
+    let me = std::fs::metadata("/proc/self").unwrap().uid();
+    let output = Command::new(&keep)
+        .env_clear()
+        .args(["--path", "/"])
+        .args([
+            "gateway",
+            "approver",
+            "pair",
+            "--label",
+            "Phone",
+            "--admin-socket",
+            "/nonexistent-admin/admin.sock",
+            "--gateway-user",
+            &me.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(output_contains(&output, "on a terminal"), "{output:?}");
+    assert!(!output_contains(&output, "admin socket"), "{output:?}");
+}
+
 /// `keep gateway channel-key new` writes the key only into a pipe, as 64
 /// hex digits on one line, and the public key to stderr; `keep gateway
 /// serve` with relays needs that key as a credential, and checks it as it

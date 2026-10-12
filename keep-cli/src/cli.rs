@@ -238,7 +238,7 @@ pub(crate) enum GatewayCommands {
         #[arg(long = "approval-relay")]
         approval_relays: Vec<String>,
         /// How long an approver has to decide, 30 to 120 seconds
-        #[arg(long, default_value_t = 120)]
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(30..=120))]
         approval_deadline: u64,
         /// Where the relay helper connects
         #[arg(long, default_value = DEFAULT_RELAY_SOCKET)]
@@ -1491,6 +1491,19 @@ mod tests {
             unit.lines().any(|l| l == "User=keep-gateway"),
             "the unit's user"
         );
+    }
+
+    #[test]
+    fn gateway_serve_takes_an_approval_deadline_of_30_to_120_seconds() {
+        let serve = |deadline: &str| {
+            Cli::try_parse_from(["keep", "gateway", "serve", "--approval-deadline", deadline])
+        };
+        for deadline in ["29", "121", "0"] {
+            assert!(serve(deadline).is_err(), "{deadline}");
+        }
+        for deadline in ["30", "120"] {
+            assert!(serve(deadline).is_ok(), "{deadline}");
+        }
     }
 
     #[test]

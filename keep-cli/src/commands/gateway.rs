@@ -354,6 +354,8 @@ fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> 
 /// Pair a phone over one admin connection: show the code, wait for the
 /// phone, show its fingerprint, ask the operator, and wait for the outcome.
 fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
+    // Checked before the gateway opens a session nobody could confirm.
+    need_terminal()?;
     let mut session = AdminSession::open(target, PAIR_WAIT)?;
     let answer = session.ask(&json!({ "op": "approver_pair", "label": label }))?;
     let uri = answer.result["uri"]
@@ -390,17 +392,22 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
 }
 
 /// How long `approver pair` waits on the phone and the operator: the
-/// pairing session, and an approver's decision after it.
+/// pairing session, and the longest deadline an approver may be given.
 const PAIR_WAIT: Duration = Duration::from_secs(
-    daemon::approvals::PAIRING_SECS + keep_approval::binding::DEFAULT_DEADLINE_SECS + 30,
+    daemon::approvals::PAIRING_SECS + *keep_approval::binding::DEADLINE_SECS.end() + 30,
 );
 
-fn confirm(prompt: &str) -> Result<bool> {
+fn need_terminal() -> Result<()> {
     if !std::io::stdin().is_terminal() {
         return Err(KeepError::InvalidInput(
             "the fingerprint must be confirmed on a terminal".into(),
         ));
     }
+    Ok(())
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    need_terminal()?;
     eprint!("{prompt}");
     let mut answer = String::new();
     std::io::stdin()
@@ -591,10 +598,9 @@ fn extend_wiped(buf: &mut Zeroizing<Vec<u8>>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
-/// How long an admin command waits for an answer: an approver's deadline,
-/// and a margin.
-const ADMIN_WAIT: Duration =
-    Duration::from_secs(keep_approval::binding::DEFAULT_DEADLINE_SECS + 30);
+/// How long an admin command waits for an answer: the longest deadline the
+/// gateway may give an approver, whatever it was started with, and a margin.
+const ADMIN_WAIT: Duration = Duration::from_secs(*keep_approval::binding::DEADLINE_SECS.end() + 30);
 
 /// One connection to the admin socket, for a request and the answers that
 /// follow it.
