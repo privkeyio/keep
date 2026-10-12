@@ -1,0 +1,814 @@
+{
+  "changes": [
+    {
+      "canonical": "{\"created_at\":\"1791580000\",\"expires_at\":\"1794172000\",\"grant\":{\"bitcoin\":{\"approval_above_sats\":\"20000\",\"network\":\"bitcoin\",\"per_psbt_sats\":\"50000\",\"window_sats\":\"100000\"},\"event_kinds\":[\"0\",\"1\"],\"keys\":[\"462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b\"],\"limits\":{\"per_day\":\"1000\",\"per_hour\":\"100\",\"per_minute\":\"10\"},\"nip44_peers\":[],\"operations\":[\"sign_nostr_event\",\"sign_psbt\"]},\"id\":\"22222222222222222222222222222222\",\"name\":\"writer\",\"type\":\"issue_credential\",\"uid\":\"1001\"}",
+      "change": {
+        "created_at": "1791580000",
+        "expires_at": "1794172000",
+        "grant": {
+          "bitcoin": {
+            "approval_above_sats": "20000",
+            "network": "bitcoin",
+            "per_psbt_sats": "50000",
+            "window_sats": "100000"
+          },
+          "event_kinds": [
+            "0",
+            "1"
+          ],
+          "keys": [
+            "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+          ],
+          "limits": {
+            "per_day": "1000",
+            "per_hour": "100",
+            "per_minute": "10"
+          },
+          "nip44_peers": [],
+          "operations": [
+            "sign_nostr_event",
+            "sign_psbt"
+          ]
+        },
+        "id": "22222222222222222222222222222222",
+        "name": "writer",
+        "type": "issue_credential",
+        "uid": "1001"
+      },
+      "sha256": "3e5603e99360298f1b9035f4c1fddf1eed841ca7042f5b5c95a72e5410995e43",
+      "type_code": 1
+    },
+    {
+      "canonical": "{\"epoch\":\"41\",\"scope\":\"all\",\"type\":\"unfreeze\"}",
+      "change": {
+        "epoch": "41",
+        "scope": "all",
+        "type": "unfreeze"
+      },
+      "sha256": "917ce143c55d5c9700542acacacacf550bf7f498c13fe7cbec83978958942161",
+      "type_code": 2
+    },
+    {
+      "canonical": "{\"epoch\":\"41\",\"scope\":{\"credential\":\"22222222222222222222222222222222\"},\"type\":\"unfreeze\"}",
+      "change": {
+        "epoch": "41",
+        "scope": {
+          "credential": "22222222222222222222222222222222"
+        },
+        "type": "unfreeze"
+      },
+      "sha256": "614d830946a179e0e33a525bba6746480466faed6b920e7c9284f72fb799c57d",
+      "type_code": 2
+    },
+    {
+      "canonical": "{\"approver\":\"02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf\",\"fingerprint\":\"7afb cfcc c77a 7bb8 11af\",\"label\":\"Kyle’s téléphone 📱\",\"transport\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"type\":\"add_approver\"}",
+      "change": {
+        "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+        "fingerprint": "7afb cfcc c77a 7bb8 11af",
+        "label": "Kyle’s téléphone 📱",
+        "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+        "type": "add_approver"
+      },
+      "sha256": "9482a15bf8909c69d09e9446e8a0147c2d9eab5f82e677d4316f4439ab4ce8b0",
+      "type_code": 3
+    },
+    {
+      "canonical": "{\"approver\":\"02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf\",\"transport\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"type\":\"remove_approver\"}",
+      "change": {
+        "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+        "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+        "type": "remove_approver"
+      },
+      "sha256": "b5262a1b69776513698f84316643423221eae2678eeaf4b60c71e57415729496",
+      "type_code": 4
+    }
+  ],
+  "decisions": [
+    {
+      "decision": "approve",
+      "digest": "564adc733e081b664c647bb741146602f730e05d886533385f61057000e723b3",
+      "request_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "sig": "a0e8c16fdc03b109826b420cd0635607a6b7d3a1aeee62a0137aef5f5771143669787bfd94765f7a32d21ea3b05987f23bd66e51544b846456f0c180ae364e1b",
+      "signer": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf"
+    },
+    {
+      "decision": "deny",
+      "digest": "2c6ed97dd60a3efd04efa3ad95644af229d7e2ae11d73ee3f3d36980611fd30c",
+      "request_hash": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "sig": "39d9bf225449cd28da969f15af3a1cddc133692d2675a1ddd757d4ae499e81de0f3b9c2c3696f1b02765e5bf5cedc5507484ed4619e7f5468f8b3d23a866bb32",
+      "signer": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf"
+    }
+  ],
+  "freezes": [
+    {
+      "action": "freeze",
+      "counter": 17,
+      "digest": "239afb7f1aeee78c2e6a5611b276e966080139206703c40771697ad993d4b6ca",
+      "epoch": 41,
+      "scope": "all",
+      "sig": "ec6d43bad57d3ed286ad3236df8dffde933f3777c41be457ec79ae648ec5d857d8f75ba8ff9863c08007e30f85695e2a0edc0f0ee69b930ae6ec5cd401aeb28d",
+      "signer": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+    },
+    {
+      "action": "freeze",
+      "counter": 17,
+      "digest": "3104ddcf5ca1d1311364a9d7e8d85f609cb66ed437ee25fab69b0f93fdba527b",
+      "epoch": 41,
+      "scope": {
+        "credential": "22222222222222222222222222222222"
+      },
+      "sig": "61a45cf95c42bf2417ccf4b504affe309158793dd9071cd8b720915ff60b38f876ad75ad58bbd5bd2d8b96010c63c6a92ab8b7df0772ec872dce7501328a015e",
+      "signer": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+    },
+    {
+      "action": "unfreeze",
+      "counter": 17,
+      "digest": "e7a3687fd3f5ab82452fbcd94e20b3b1dc934cad60c570e0e31c727cbb741a33",
+      "epoch": 41,
+      "scope": "all",
+      "sig": "efe5803572b78e8002eeeb78bdbc35e22d93538ba3b3d5476b048e32b03339dc5d1a993aa61250468bab03a82b5055acf6347dc0ad44dec63d52d2ac07ca79d8",
+      "signer": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf"
+    },
+    {
+      "action": "unfreeze",
+      "counter": 17,
+      "digest": "8d6984ebc0143d4eebe6314c6704ec3a68b0ad661d4c93406441596c36ec55f2",
+      "epoch": 41,
+      "scope": {
+        "credential": "22222222222222222222222222222222"
+      },
+      "sig": "384b1d8efd88aa04940bb37987ea1a2ac80e6856d51121c1d0bc5c8ef86ebe0245edc921f281e9810a4e3b9f7cf1ffd3762cd3af4ae4f5fe62245929fe813903",
+      "signer": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf"
+    }
+  ],
+  "keys": {
+    "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+    "approver_alg": "p256",
+    "approver_secret": "0303030303030303030303030303030303030303030303030303030303030303",
+    "channel": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+    "channel_secret": "0101010101010101010101010101010101010101010101010101010101010101",
+    "transport": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+    "transport_secret": "0202020202020202020202020202020202020202020202020202020202020202",
+    "vault_key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+  },
+  "pairing": {
+    "approver_digest": "93576d8803d758cca1502ac7370a868d42ee3e02c090db3efde28946c154a85e",
+    "approver_sig": "8d5e6800316d89d8b7b59cdcb7b8262d8d1403114a81115ce583b7d2f7d05e1502e3db511e9d158a7068e18e2470b773b2b2bb10044865c8cee48ac6592e3c42",
+    "fingerprint": "2b14 0ed1 feb5 e3e2 623a",
+    "message": {
+      "alg": "p256",
+      "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+      "approver_sig": "8d5e6800316d89d8b7b59cdcb7b8262d8d1403114a81115ce583b7d2f7d05e1502e3db511e9d158a7068e18e2470b773b2b2bb10044865c8cee48ac6592e3c42",
+      "label": "My phone",
+      "proof": "18a29b2a75750a995ca500ad238a67aa9ba8230641a5e9b5cd93ea9fea6390ee",
+      "type": "pair",
+      "v": 1
+    },
+    "proof": "18a29b2a75750a995ca500ad238a67aa9ba8230641a5e9b5cd93ea9fea6390ee",
+    "secret": "0707070707070707070707070707070707070707070707070707070707070707"
+  },
+  "protocol_version": 1,
+  "requests": [
+    {
+      "event_id": "044942a2a1da206ddfdab1243b5c1e0624d1c0134b132fccc1b57472cce5d65f",
+      "name": "sign_nostr_event kind 0",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444401462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0040000000044942a2a1da206ddfdab1243b5c1e0624d1c0134b132fccc1b57472cce5d65f462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "sign_nostr_event",
+        "payload": {
+          "event": {
+            "content": "{\"name\":\"agent\"}",
+            "created_at": 1791580000,
+            "kind": 0,
+            "pubkey": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+            "tags": [
+              [
+                "p",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              ]
+            ]
+          }
+        },
+        "reason": {
+          "kind": 0,
+          "type": "kind"
+        },
+        "request_hash": "b132407c9225d4534bd3377dad7021c9212d35eb79a79af9389ec1126c929f5b",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "b132407c9225d4534bd3377dad7021c9212d35eb79a79af9389ec1126c929f5b"
+    },
+    {
+      "event_id": "45e434248f25d92c1f824fb4ce695b678d5f24f9489cbe9e391366f13aefd057",
+      "name": "sign_nostr_event with control, separator and astral characters",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444401462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b004000000045e434248f25d92c1f824fb4ce695b678d5f24f9489cbe9e391366f13aefd057462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "sign_nostr_event",
+        "payload": {
+          "event": {
+            "content": "\"q\"\\\n\t\u0000\b\f  😀􏿿é",
+            "created_at": 1791580000,
+            "kind": 0,
+            "pubkey": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+            "tags": [
+              [
+                "t",
+                "a\u0001b\u001fc d😀"
+              ]
+            ]
+          }
+        },
+        "reason": {
+          "kind": 0,
+          "type": "kind"
+        },
+        "request_hash": "a89110c41c492cde4837d528394b30a93912ccf146c92d4f18038dd8b81316e3",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "a89110c41c492cde4837d528394b30a93912ccf146c92d4f18038dd8b81316e3"
+    },
+    {
+      "name": "sign_psbt above threshold",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444402462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0136010000b2000000020000000201010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000002000000409c0000000000002200000051200101010101010101010101010101010101010101010101010101010101010101ffffffff7017000000000000220000005120020202020202020202020202020202020202020202020202020202020202020201000000020000000000000001000000010000000100000007000000",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": {
+          "credential_spent": 10000,
+          "credential_window": 100000,
+          "wallet_spent": 40000,
+          "wallet_window": 100000
+        },
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": "mainnet",
+        "op": "sign_psbt",
+        "payload": {
+          "change": [
+            {
+              "output": 1,
+              "path": "m/86'/0'/0'/1/7"
+            }
+          ],
+          "fee": 1000,
+          "leaving_wallet": 31000,
+          "prevouts": [
+            {
+              "amount": 40000,
+              "script": "51200101010101010101010101010101010101010101010101010101010101010101"
+            },
+            {
+              "amount": 6000,
+              "script": "51200202020202020202020202020202020202020202020202020202020202020202"
+            }
+          ],
+          "sighash": [
+            null,
+            1
+          ],
+          "signing_inputs": [
+            0,
+            1
+          ],
+          "unsigned_tx": "020000000201010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000"
+        },
+        "reason": {
+          "requested": 31000,
+          "spent": 10000,
+          "threshold": 20000,
+          "type": "above_threshold"
+        },
+        "request_hash": "4475736511cd8051259149aaaf16a3f03a2e50683d67a0efc30630bc886377f0",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "4475736511cd8051259149aaaf16a3f03a2e50683d67a0efc30630bc886377f0",
+      "txid": "608b887920cc2e0c2f2fe9edb0480c524df970fe865dbbe0bd9e2b6b7e914369"
+    },
+    {
+      "name": "sign_psbt with an input the gateway does not sign",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444402462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0185010000db000000020000000301010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff03030303030303030303030303030303030303030303030303030303030303030200000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb0000000003000000409c0000000000002200000051200101010101010101010101010101010101010101010101010101010101010101ffffffff7017000000000000220000005120020202020202020202020202020202020202020202020202020202020202020201000000d007000000000000160000000014030303030303030303030303030303030303030383000000020000000000000001000000010000000100000007000000",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": {
+          "credential_spent": 10000,
+          "credential_window": 100000,
+          "wallet_spent": 40000,
+          "wallet_window": 100000
+        },
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": "mainnet",
+        "op": "sign_psbt",
+        "payload": {
+          "change": [
+            {
+              "output": 1,
+              "path": "m/86'/0'/0'/1/7"
+            }
+          ],
+          "fee": 3000,
+          "leaving_wallet": 33000,
+          "prevouts": [
+            {
+              "amount": 40000,
+              "script": "51200101010101010101010101010101010101010101010101010101010101010101"
+            },
+            {
+              "amount": 6000,
+              "script": "51200202020202020202020202020202020202020202020202020202020202020202"
+            },
+            {
+              "amount": 2000,
+              "script": "00140303030303030303030303030303030303030303"
+            }
+          ],
+          "sighash": [
+            null,
+            1,
+            131
+          ],
+          "signing_inputs": [
+            0,
+            1
+          ],
+          "unsigned_tx": "020000000301010101010101010101010101010101010101010101010101010101010101010000000000fdffffff02020202020202020202020202020202020202020202020202020202020202020100000000fdffffff03030303030303030303030303030303030303030303030303030303030303030200000000fdffffff023075000000000000225120aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa983a000000000000225120bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb00000000"
+        },
+        "reason": {
+          "requested": 33000,
+          "spent": 10000,
+          "threshold": 20000,
+          "type": "above_threshold"
+        },
+        "request_hash": "697dd2062a2c56811ca64b226c39664a0f6b8ff0f13e501130b495652e3e4039",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "697dd2062a2c56811ca64b226c39664a0f6b8ff0f13e501130b495652e3e4039",
+      "txid": "7647875eeceb2f76d33aaa5fe2c12bb7d38110ac01ec8fc402df93e61ac53750"
+    },
+    {
+      "name": "nip44_encrypt to own key",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444403462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0040000000462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0bc0c17b98161dc17f1c5c5dd62d8f364e33c3262453d68ef2a24ea65996e874f6",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "nip44_encrypt",
+        "payload": {
+          "peer": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+          "plaintext": "note to self"
+        },
+        "reason": {
+          "type": "encrypt_to_own_key"
+        },
+        "request_hash": "3ef2a637617903482c5119de0855f7da2d48d28bc76627298be8092f5253cf87",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "3ef2a637617903482c5119de0855f7da2d48d28bc76627298be8092f5253cf87"
+    },
+    {
+      "name": "nip44_decrypt own payload",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f22222222222222222222222222222222444444444444444444444444444444444444444444444444444444444444444404462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b0060000000462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b5555555555555555555555555555555555555555555555555555555555555555d21e969ab192c859aa27c7893c52e72a6540037672ca620183f5ba9b999d505b",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+        "network": null,
+        "op": "nip44_decrypt",
+        "payload": {
+          "ciphertext_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "peer": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+          "plaintext": "{\"token\":\"cashuA...\"}"
+        },
+        "reason": {
+          "type": "decrypt_own_payload"
+        },
+        "request_hash": "ccc51ae86cd924f8bd398b2df656a0c00cc5079d08dfd743f9424902dd9ad621",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "ccc51ae86cd924f8bd398b2df656a0c00cc5079d08dfd743f9424902dd9ad621"
+    },
+    {
+      "name": "management issue_credential",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f2222222222222222222222222222222244444444444444444444444444444444444444444444444444444444444444441000000000000000000000000000000000000000000000000000000000000000000021000000013e5603e99360298f1b9035f4c1fddf1eed841ca7042f5b5c95a72e5410995e43",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "created_at": "1791580000",
+            "expires_at": "1794172000",
+            "grant": {
+              "bitcoin": {
+                "approval_above_sats": "20000",
+                "network": "bitcoin",
+                "per_psbt_sats": "50000",
+                "window_sats": "100000"
+              },
+              "event_kinds": [
+                "0",
+                "1"
+              ],
+              "keys": [
+                "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b"
+              ],
+              "limits": {
+                "per_day": "1000",
+                "per_hour": "100",
+                "per_minute": "10"
+              },
+              "nip44_peers": [],
+              "operations": [
+                "sign_nostr_event",
+                "sign_psbt"
+              ]
+            },
+            "id": "22222222222222222222222222222222",
+            "name": "writer",
+            "type": "issue_credential",
+            "uid": "1001"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "54f5aea7794bf6c9f812b37bbc1f74a12e4ff6fb4563029d735149f5ae550645",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "54f5aea7794bf6c9f812b37bbc1f74a12e4ff6fb4563029d735149f5ae550645"
+    },
+    {
+      "name": "management unfreeze all",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f000000000000000000000000000000004444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000002917ce143c55d5c9700542acacacacf550bf7f498c13fe7cbec83978958942161",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "epoch": "41",
+            "scope": "all",
+            "type": "unfreeze"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "331f91e7190f831296af2f1e2260bf3e1c5849fc7e96173ab37a54aaeef366d1",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "331f91e7190f831296af2f1e2260bf3e1c5849fc7e96173ab37a54aaeef366d1"
+    },
+    {
+      "name": "management unfreeze one credential",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f222222222222222222222222222222224444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000002614d830946a179e0e33a525bba6746480466faed6b920e7c9284f72fb799c57d",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "22222222222222222222222222222222",
+          "name": "writer",
+          "uid": 1001
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "epoch": "41",
+            "scope": {
+              "credential": "22222222222222222222222222222222"
+            },
+            "type": "unfreeze"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "b83168e64d4a71616f025320e490900db7bebb1c1a3a690d1a604cbd9826f846",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "b83168e64d4a71616f025320e490900db7bebb1c1a3a690d1a604cbd9826f846"
+    },
+    {
+      "name": "management add_approver",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f0000000000000000000000000000000044444444444444444444444444444444444444444444444444444444444444441000000000000000000000000000000000000000000000000000000000000000000021000000039482a15bf8909c69d09e9446e8a0147c2d9eab5f82e677d4316f4439ab4ce8b0",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+            "fingerprint": "7afb cfcc c77a 7bb8 11af",
+            "label": "Kyle’s téléphone 📱",
+            "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+            "type": "add_approver"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "fb74352bb505ca6dff6b3f0f97248e6c1ec9dad2fd347d53d9041583c883a6e8",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "fb74352bb505ca6dff6b3f0f97248e6c1ec9dad2fd347d53d9041583c883a6e8"
+    },
+    {
+      "name": "management remove_approver",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f000000000000000000000000000000004444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000004b5262a1b69776513698f84316643423221eae2678eeaf4b60c71e57415729496",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": null,
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
+            "transport": "6666666666666666666666666666666666666666666666666666666666666666",
+            "type": "remove_approver"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "12becb349f956bb392d5f4711f3a79c275590d570b795008f729649f24514dd8",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "12becb349f956bb392d5f4711f3a79c275590d570b795008f729649f24514dd8"
+    }
+  ],
+  "wrap_tags": [
+    {
+      "between": "channel key to transport key",
+      "content": "AjNkZXNjcmlwdGlvbg==",
+      "direction": 1,
+      "tag": "e3beeab663149c99cff212e83fb49f7a",
+      "wrap_pubkey": "f991f944d1e1954a7fc8b9bf62e0d78f015f4c07762d505e20e6c45260a3661b"
+    },
+    {
+      "between": "transport key to channel key",
+      "content": "AjNkZXNjcmlwdGlvbg==",
+      "direction": 2,
+      "tag": "ddeb3a78daed5fb9c9def4f3960bda8a",
+      "wrap_pubkey": "f991f944d1e1954a7fc8b9bf62e0d78f015f4c07762d505e20e6c45260a3661b"
+    },
+    {
+      "between": "pairing secret, phone to gateway",
+      "content": "AjNkZXNjcmlwdGlvbg==",
+      "direction": 2,
+      "secret": "0707070707070707070707070707070707070707070707070707070707070707",
+      "tag": "c10c1f314d30f1f62bb3feaee0963cd3",
+      "wrap_pubkey": "f991f944d1e1954a7fc8b9bf62e0d78f015f4c07762d505e20e6c45260a3661b"
+    }
+  ]
+}

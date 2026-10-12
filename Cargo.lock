@@ -1036,6 +1036,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cdd35008169921d80bc60d3d0ab416eecb028c4cd653352907921d95084790be"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -2350,6 +2351,7 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+ "zeroize",
 ]
 
 [[package]]
@@ -4544,6 +4546,23 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "keep-approval"
+version = "0.11.0"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "hmac 0.13.0",
+ "nostr",
+ "p256",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "unicode-normalization",
  "zeroize",
 ]
 
