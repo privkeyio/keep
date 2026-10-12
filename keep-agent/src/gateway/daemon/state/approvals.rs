@@ -158,6 +158,10 @@ pub(crate) struct Approvals {
     inbox: Arc<Mutex<Inbox>>,
     /// When the next anchor is due, on the budget clock.
     next_anchor: u64,
+    /// Tests only: an approval's second check fails, which nothing else
+    /// can make happen.
+    #[cfg(test)]
+    reverify_fails: bool,
 }
 
 use hex::encode as hex;
@@ -250,6 +254,8 @@ impl State {
             outbox,
             inbox,
             next_anchor: self.clock.now(),
+            #[cfg(test)]
+            reverify_fails: false,
         });
         tracing::info!(
             channel = %hex(channel_pub),
@@ -898,6 +904,12 @@ impl State {
                 else {
                     return;
                 };
+                #[cfg(test)]
+                let channel = if self.approvals.as_ref().is_some_and(|a| a.reverify_fails) {
+                    [0; 32]
+                } else {
+                    channel
+                };
                 match Approval::verify(&decision, &channel, &device, waiting.parked) {
                     Ok(approval) => self.approved(approval, waiting.waiter),
                     Err((parked, why)) => {
@@ -1225,7 +1237,8 @@ impl State {
     /// Freeze `scope` now, from `source`, saving `store` with it: the vault
     /// applies the freeze and moves the freeze epoch in one write, so an
     /// unfreeze held back from before can never undo it. Parked requests it
-    /// covers are canceled and every device is shown the new state.
+    /// covers are canceled, even when the freeze cannot be written, and
+    /// every device is shown the new state.
     pub(crate) fn freeze(&mut self, scope: Scope, source: &str, store: Store) -> Result<()> {
         let bytes = store.encode()?;
         let id = match scope {
@@ -1237,6 +1250,7 @@ impl State {
             .set_agent_frozen(id.as_ref(), true, None, &[(STORE_KEY, &bytes)])
         {
             tracing::error!(error = %e, source, "a freeze could not be applied");
+            self.cancel_covered(scope);
             return Err(e.into());
         }
         if let Some(a) = self.approvals.as_mut() {
@@ -1258,10 +1272,19 @@ impl State {
     }
 
     /// What follows a freeze already applied: parked requests canceled and
-    /// the anchor. A freeze of everything leaves a waiting `remove_approver`
-    /// alone, so a stolen phone cannot hold off its own removal by freezing.
+    /// the anchor.
     fn after_freeze(&mut self, scope: Scope, source: &str) {
         tracing::warn!(?scope, source, "agents frozen");
+        self.cancel_covered(scope);
+        if self.approvals_active() {
+            self.send_anchor(None);
+        }
+    }
+
+    /// Cancel the parked requests a freeze of `scope` covers. A freeze of
+    /// everything leaves a waiting `remove_approver` alone, so a stolen phone
+    /// cannot hold off its own removal by freezing.
+    fn cancel_covered(&mut self, scope: Scope) {
         match scope {
             Scope::All => self.cancel_where("canceled: frozen", |w| {
                 !matches!(
@@ -1275,9 +1298,6 @@ impl State {
             Scope::Credential(id) => {
                 self.cancel_where("canceled: frozen", |w| w.parked.credential() == Some(id.0))
             }
-        }
-        if self.approvals_active() {
-            self.send_anchor(None);
         }
     }
 
@@ -2028,6 +2048,33 @@ impl State {
         }
     }
 
+    /// Make the next approval's second check fail.
+    #[cfg(test)]
+    pub(crate) fn fail_reverify_for_testing(&mut self) {
+        if let Some(a) = self.approvals.as_mut() {
+            a.reverify_fails = true;
+        }
+    }
+
+    /// Change the grant every waiting `issue_credential` would issue, so it
+    /// is no longer the one its approver is shown.
+    #[cfg(test)]
+    pub(crate) fn change_waiting_grants_for_testing(&mut self, change: impl Fn(&mut Grant)) {
+        for w in self
+            .approvals
+            .iter_mut()
+            .flat_map(|a| a.parked.values_mut())
+        {
+            if let Waiter::Admin {
+                effect: Effect::Issue { grant },
+                ..
+            } = &mut w.waiter
+            {
+                change(grant);
+            }
+        }
+    }
+
     /// Cancel what admin connection `conn` was waiting for, once it is gone:
     /// an `issue_credential` is never approved with nobody to receive the
     /// token.
@@ -2120,5 +2167,31 @@ pub(crate) fn wire_reason(reason: &ApprovalReason) -> Reason {
             spent,
             threshold,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::super::tests::{psbt, Gw, NETWORK};
+    use super::Refusal;
+
+    /// A PSBT none of whose inputs the key signs is refused rather than
+    /// handed back as signed.
+    #[test]
+    fn a_psbt_the_key_signs_no_input_of_is_refused() {
+        let mut gw = Gw::new();
+        let other = gw
+            .state
+            .keep_mut()
+            .import_secret_bytes(&mut [8; 32], "other key")
+            .unwrap();
+        let mut unsigned =
+            keep_bitcoin::psbt::parse_psbt_base64(&psbt(10_000, 50_000, 500)).unwrap();
+        let refused = gw.state.sign_psbt_exactly(&other, NETWORK, &mut unsigned);
+        assert!(
+            matches!(&refused, Err(Refusal::Internal(m)) if m.contains("no input")),
+            "{:?}",
+            refused.map_err(|r| r.owner_text())
+        );
     }
 }

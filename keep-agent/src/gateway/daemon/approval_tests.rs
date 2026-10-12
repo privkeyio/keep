@@ -334,6 +334,47 @@ impl Ap {
     fn store(&self) -> Store {
         Store::load(self.gw.state.keep()).unwrap()
     }
+
+    /// Whether credential `id` (hex) is frozen itself.
+    fn frozen(&mut self, id: &str) -> bool {
+        let listed = self.gw.admin_ok(json!({ "op": "list" }));
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .unwrap()["frozen"]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// The outcomes `phone` received since the last call.
+    fn outcomes(&mut self, phone: &mut Phone) -> Vec<Outcome> {
+        self.received(phone)
+            .into_iter()
+            .filter(|(k, _)| *k == kind::OUTCOME)
+            .map(|(_, t)| wire::parse(&t).unwrap())
+            .collect()
+    }
+
+    /// Pair `second` as root once `first` approves adding it.
+    fn add_device(&mut self, first: &mut Phone, second: &mut Phone) {
+        let conn = self.conn();
+        let (answer, pending) =
+            self.admin_from(0, conn, json!({ "op": "approver_pair", "label": "Tablet" }));
+        let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+        assert!(self.deliver(&second.pair(&uri.secret, self.now())));
+        let _ = reply(pending.unwrap());
+        let (_, pending) = self.admin_from(0, conn, json!({ "op": "approver_confirm" }));
+        let request = self.requests(first).pop().unwrap();
+        self.deliver_from(
+            first,
+            kind::DECISION,
+            &first.decide(&request, Verdict::Approve),
+        );
+        assert_eq!(reply(pending.unwrap())["ok"], json!(true));
+        let _ = self.received(second);
+    }
 }
 
 /// The line a pending request was answered with, parsed.
@@ -602,6 +643,12 @@ fn each_action_has_one_signer() {
     borrowed.sig = unfreeze.sig;
     ap.deliver_from(&phone, kind::DECISION, &wire::to_text(&borrowed));
     assert!(unanswered(&mut pending));
+    // Nor does the transport key's signature over a freeze.
+    let freeze: Freeze =
+        wire::parse(&phone.freeze_as(&t, FreezeAction::Freeze, Scope::All, 0)).unwrap();
+    borrowed.sig = freeze.sig;
+    ap.deliver_from(&phone, kind::DECISION, &wire::to_text(&borrowed));
+    assert!(unanswered(&mut pending));
     // A decision sealed by this phone but signed by another device's key.
     let other = Phone::new();
     ap.deliver_from(
@@ -752,8 +799,19 @@ fn a_racer_uses_up_the_session_and_the_operator_rejects_it() {
         shown["result"]["fingerprint"],
         json!(sig::fingerprint(&racer.t(), &racer.a()))
     );
+    let mut real = real;
     let event = real.pair(&uri.secret, ap.now());
-    ap.deliver(&event);
+    assert!(ap.deliver(&event));
+    // The real phone is told the code was used, so its owner knows.
+    let got = ap.received(&mut real);
+    assert!(
+        got.iter().any(|(k, t)| *k == kind::PAIRING
+            && matches!(
+                wire::parse::<Pairing>(t).unwrap(),
+                Pairing::Refused { reason, .. } if reason.contains("already used")
+            )),
+        "{got:?}"
+    );
     let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_reject" }));
     assert_eq!(answer["ok"], json!(true));
     assert!(ap.store().devices.is_empty());
@@ -1475,6 +1533,14 @@ fn a_freeze_by_the_audit_budget_cancels_the_waiting_request() {
         wire::parse(&got.iter().rfind(|(k, _)| *k == kind::ANCHOR).unwrap().1).unwrap();
     let cid = <[u8; 16]>::try_from(hex::decode(&id).unwrap()).unwrap();
     assert_eq!(anchor.frozen.credentials, [Hex16(cid)]);
+    // The budget's freeze moved the epoch, so an unfreeze signed before it
+    // and held back until now is refused.
+    assert_eq!(ap.epoch(), 1);
+    assert_eq!(anchor.frozen.epoch, 1);
+    let held_back = phone.unfreeze(Scope::Credential(Hex16(cid)), 0);
+    ap.deliver_from(&phone, kind::FREEZE, &held_back);
+    assert!(ap.frozen(&id));
+    assert_eq!(ap.epoch(), 1);
 }
 
 /// A request is recorded before the phone is asked: when its entry cannot
@@ -1758,4 +1824,511 @@ fn an_added_device_is_checked_again_when_approved() {
     assert_eq!(answers[0]["ok"], json!(true), "{}", answers[0]);
     assert_eq!(answers[1]["ok"], json!(false), "{}", answers[1]);
     assert_eq!(ap.store().devices.len(), 2);
+}
+
+fn cid_of(id: &str) -> [u8; 16] {
+    <[u8; 16]>::try_from(hex::decode(id).unwrap()).unwrap()
+}
+
+/// A gateway with approvals and `budgets` (per credential, for the
+/// gateway), one approver paired, and a credential that may sign kind 0.
+fn paired_with_budgets(budgets: (u32, u32)) -> (Ap, Phone, String, String) {
+    let mut gw = Gw::with(super::state::Settings {
+        audit_budgets: budgets,
+        ..super::tests::settings()
+    });
+    gw.state
+        .configure_approvals(Some(channel()), vec![RELAY.into()], 120)
+        .unwrap();
+    let link = gw.state.take_relay_link().unwrap();
+    let mut ap = Ap {
+        gw,
+        link,
+        next_conn: 1,
+    };
+    let (id, token) = ap.issue(&nostr_grant(ap.gw.key));
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    (ap, phone, id, token)
+}
+
+/// A freeze the vault cannot write applies nothing, neither the freeze nor
+/// the epoch nor the device's counter, so the phone's retry of the same
+/// message is taken; what it covers is canceled all the same.
+#[test]
+fn a_freeze_that_cannot_be_written_applies_nothing_and_its_retry_is_taken() {
+    let (mut ap, mut phone, _id, token) = paired();
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let _ = ap.requests(&mut phone);
+    let freeze = phone.freeze(Scope::All, 0);
+    ap.gw.state.keep_mut().lock();
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert_eq!(
+        tool_text(&reply(pending)),
+        ("canceled: frozen".into(), true)
+    );
+    ap.gw.state.keep_mut().unlock("testpass").unwrap();
+    assert!(!ap.gw.state.keep().agent_freeze().unwrap());
+    assert_eq!(ap.epoch(), 0);
+    assert_eq!(ap.store().devices[0].counter, 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+    assert_eq!(ap.epoch(), 1);
+    assert_eq!(ap.store().devices[0].counter, 1);
+}
+
+/// An unfreeze of a credential drops its denials in the same write, so
+/// they do not come back after a restart and freeze it again early.
+#[test]
+fn an_unfreeze_drops_the_credentials_denials_for_good() {
+    let (mut ap, mut phone, id, token) = paired();
+    for round in 0..2 {
+        let pending = ap.park(&token, round, "sign_nostr_event", kind0());
+        let request = ap.requests(&mut phone).pop().unwrap();
+        ap.deliver_from(
+            &phone,
+            kind::DECISION,
+            &phone.decide(&request, Verdict::Deny),
+        );
+        let _ = reply(pending);
+    }
+    assert_eq!(ap.store().denials.len(), 1);
+    let cid = Hex16(cid_of(&id));
+    let freeze = phone.freeze(Scope::Credential(cid), 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    let unfreeze = phone.unfreeze(Scope::Credential(cid), 1);
+    ap.deliver_from(&phone, kind::FREEZE, &unfreeze);
+    assert!(!ap.frozen(&id));
+    assert!(ap.store().denials.is_empty());
+    // After a restart one more denial is one, not the third.
+    let wall = ap.now();
+    let mut ap = reopen(ap.gw, wall + 10, |_| {});
+    let pending = ap.park(&token, 9, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Deny),
+    );
+    let _ = reply(pending);
+    assert!(!ap.frozen(&id));
+}
+
+/// An approval whose signature cannot be recorded (the gateway's audit
+/// budget spent) signs nothing, is recorded as not carried out, and is
+/// announced canceled, not approved.
+#[test]
+fn an_approval_whose_signature_cannot_be_recorded_is_announced_canceled() {
+    let (mut ap, mut phone, _id, token) = paired_with_budgets((1_000, 3));
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    for _ in 0..2 {
+        let (_, error) = ap.gw.tool(&token, "get_nostr_pubkey", json!({}));
+        assert!(!error);
+    }
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending);
+    let refused =
+        answer.get("error").is_some() || answer["result"]["isError"].as_bool() == Some(true);
+    assert!(refused, "{answer}");
+    let outcomes = ap.outcomes(&mut phone);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].request_id, request.request_id);
+    assert_eq!(outcomes[0].outcome, OutcomeKind::Canceled);
+    assert_eq!(outcomes[0].by, None);
+    let decided = ap.gw.reasons(AuditEventType::AgentApprovalDecided);
+    assert!(
+        decided
+            .iter()
+            .any(|r| r.contains("approved but not carried out")
+                && r.contains(&request.request_hash.to_hex())),
+        "{decided:?}"
+    );
+    assert!(!decided.iter().any(|r| r.contains("approved and signed")));
+    assert!(ap.gw.entries(AuditEventType::Sign).iter().all(|e| !e
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("approved request")));
+}
+
+/// An unfreeze approved after something froze again names an epoch gone:
+/// nothing is unfrozen, the approval is recorded as not carried out and
+/// announced canceled, and the admin is told.
+#[test]
+fn an_unfreeze_approved_after_the_epoch_moved_is_recorded_as_not_carried_out() {
+    let (mut ap, mut phone, id, _token) = paired();
+    let freeze = phone.freeze(Scope::All, 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(0, conn, json!({ "op": "unfreeze_all" }));
+    let request = ap.requests(&mut phone).pop().unwrap();
+    // Another freeze moves the epoch before the approval comes.
+    let refreeze = phone.freeze(Scope::Credential(Hex16(cid_of(&id))), 1);
+    ap.deliver_from(&phone, kind::FREEZE, &refreeze);
+    assert_eq!(ap.epoch(), 2);
+    let _ = ap.received(&mut phone);
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending.unwrap());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+    let outcomes = ap.outcomes(&mut phone);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].outcome, OutcomeKind::Canceled);
+    assert_eq!(outcomes[0].by, None);
+    let decided = ap.gw.reasons(AuditEventType::AgentApprovalDecided);
+    assert!(
+        decided
+            .iter()
+            .any(|r| r.contains("approved but not carried out")
+                && r.contains(&request.request_hash.to_hex())),
+        "{decided:?}"
+    );
+}
+
+/// An approval that fails its second check (which nothing but the test
+/// hook can cause) carries out nothing: the agent gets an internal error,
+/// the entry says why, and the phones are told it was canceled.
+#[test]
+fn an_approval_that_fails_its_second_check_carries_out_nothing() {
+    let (mut ap, mut phone, _id, token) = paired();
+    let pending = ap.park(&token, 4, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.state.fail_reverify_for_testing();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending);
+    assert_eq!(answer["error"]["code"], json!(-32603), "{answer}");
+    let outcomes = ap.outcomes(&mut phone);
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].outcome, OutcomeKind::Canceled);
+    assert!(ap
+        .gw
+        .reasons(AuditEventType::AgentApprovalDecided)
+        .iter()
+        .any(|r| r.contains("did not verify again")));
+    assert!(ap.gw.entries(AuditEventType::Sign).iter().all(|e| !e
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("approved request")));
+}
+
+/// An owner entry the log cannot take is kept in the vault and written
+/// once it can be, even after a restart.
+#[test]
+fn an_owed_owner_entry_survives_a_restart_and_is_written() {
+    let (mut ap, mut phone, _id, _token) = paired();
+    ap.gw.break_log(true);
+    let freeze = phone.freeze(Scope::All, 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+    assert_eq!(ap.store().owed.len(), 1);
+    let wall = ap.now();
+    let mut ap = reopen(ap.gw, wall + 10, |path| {
+        let log = path.join("audit.log");
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::rename(log.with_extension("bak"), &log).unwrap();
+    });
+    assert!(ap
+        .gw
+        .reasons(AuditEventType::AgentApproverFreeze)
+        .is_empty());
+    ap.gw.state.approval_tick();
+    let entries = ap.gw.reasons(AuditEventType::AgentApproverFreeze);
+    assert_eq!(entries.len(), 1);
+    assert!(entries[0].starts_with("freeze all"), "{}", entries[0]);
+    assert!(ap.store().owed.is_empty());
+}
+
+/// A reset with no approver registered is recorded too.
+#[test]
+fn a_reset_with_no_approver_is_recorded() {
+    let mut ap = Ap::new();
+    let conn = ap.conn();
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_reset" }));
+    assert_eq!(answer["result"]["removed"], json!(0), "{answer}");
+    assert_eq!(
+        ap.gw.reasons(AuditEventType::AgentApproverRemoved),
+        ["reset: no approver device was registered"]
+    );
+}
+
+/// A management change sent to the approvers is recorded with its type and
+/// the credential it is about.
+#[test]
+fn a_management_request_is_recorded_with_its_type_and_credential() {
+    let (mut ap, mut phone, id, _token) = paired();
+    let conn = ap.conn();
+    let (_, _unfreeze) = ap.admin_from(0, conn, json!({ "op": "unfreeze", "id": id }));
+    let conn = ap.conn();
+    let (_, _issue) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "new", "uid": OTHER, "grant": nostr_grant(ap.gw.key) }),
+    );
+    let requests = ap.requests(&mut phone);
+    let issued = keep_approval::change::Change::parse(&requests[1].payload["change"]).unwrap();
+    let keep_approval::change::Change::IssueCredential { id: new_id, .. } = issued else {
+        panic!("not an issue change");
+    };
+    let requested = ap.gw.reasons(AuditEventType::AgentApprovalRequested);
+    assert!(
+        requested[0].ends_with(&format!("type unfreeze credential {id}")),
+        "{requested:?}"
+    );
+    assert!(
+        requested[1].ends_with(&format!(
+            "type issue_credential credential {}",
+            new_id.to_hex()
+        )),
+        "{requested:?}"
+    );
+}
+
+/// The agent's own requests that expire or that it withdraws are charged to
+/// its audit budget: spending it that way freezes it like any other entry.
+#[test]
+fn expired_and_withdrawn_requests_count_against_the_agents_audit_budget() {
+    let (mut ap, mut phone, id, token) = paired_with_budgets((3, 1_000));
+    let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let _ = ap.requests(&mut phone);
+    ap.gw.boot.advance(120);
+    ap.gw.state.approval_tick();
+    assert!(!unanswered(&mut pending));
+    assert!(ap.gw.entries(AuditEventType::AgentRefused).iter().any(|e| e
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("approval expired")));
+    assert!(!ap.frozen(&id));
+    let pending = ap.park(&token, 2, "sign_nostr_event", kind0());
+    ap.gw.state.cancel_parked(pending.request_id.unwrap());
+    assert!(ap.frozen(&id), "the withdrawal was not charged");
+    assert_eq!(ap.epoch(), 1);
+}
+
+/// A freeze of everything, from the device being removed or any other,
+/// leaves a waiting `remove_approver` in place, so a stolen phone cannot
+/// hold off its own removal.
+#[test]
+fn a_freeze_of_everything_leaves_a_waiting_removal_of_an_approver() {
+    let (mut ap, mut first, _, _) = paired();
+    let mut second = Phone::new();
+    ap.add_device(&mut first, &mut second);
+    let conn = ap.conn();
+    let (_, mut pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "approver_remove", "transport": hex::encode(first.t()) }),
+    );
+    let request = ap.requests(&mut second).pop().unwrap();
+    for _ in 0..3 {
+        let freeze = first.freeze(Scope::All, ap.epoch());
+        ap.deliver_from(&first, kind::FREEZE, &freeze);
+    }
+    assert!(ap.gw.state.keep().agent_freeze().unwrap());
+    assert!(unanswered(pending.as_mut().unwrap()));
+    ap.deliver_from(
+        &second,
+        kind::DECISION,
+        &second.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(true));
+    let devices = ap.store().devices;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].transport.0, second.t());
+}
+
+/// The grant an approved `issue_credential` issues is the one its approver
+/// was shown, or nothing is issued.
+#[test]
+fn an_issue_whose_grant_is_not_the_one_shown_issues_nothing() {
+    let (mut ap, mut phone, _, _) = paired();
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "swapped", "uid": OTHER, "grant": nostr_grant(ap.gw.key) }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.state.change_waiting_grants_for_testing(|g| {
+        g.event_kinds.insert(30_023);
+    });
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending.unwrap());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(answer["error"]
+        .as_str()
+        .unwrap()
+        .contains("not the one approved"));
+    let listed = ap.gw.admin_ok(json!({ "op": "list" }));
+    assert!(!listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["name"] == json!("swapped")));
+    assert_eq!(ap.outcomes(&mut phone)[0].outcome, OutcomeKind::Canceled);
+}
+
+/// A decision counts only under the approver key of the device whose
+/// transport key sealed it, even when the signing key is another registered
+/// device's.
+#[test]
+fn a_decision_counts_only_under_the_sealing_devices_approver_key() {
+    let (mut ap, mut first, _, token) = paired();
+    let mut second = Phone::new();
+    ap.add_device(&mut first, &mut second);
+    let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut first).pop().unwrap();
+    ap.deliver_from(
+        &first,
+        kind::DECISION,
+        &first.decide_as(&second.approver, &request, Verdict::Approve),
+    );
+    ap.deliver_from(
+        &second,
+        kind::DECISION,
+        &second.decide_as(&first.approver, &request, Verdict::Approve),
+    );
+    assert!(unanswered(&mut pending));
+    ap.deliver_from(
+        &second,
+        kind::DECISION,
+        &second.decide(&request, Verdict::Approve),
+    );
+    assert!(!tool_text(&reply(pending)).1);
+}
+
+/// An unfreeze of everything clears the gateway-wide freeze only: a
+/// credential frozen on its own stays frozen.
+#[test]
+fn an_unfreeze_of_everything_leaves_credential_freezes_in_place() {
+    let (mut ap, mut phone, id, token) = paired();
+    let cid = Hex16(cid_of(&id));
+    for (scope, epoch) in [(Scope::Credential(cid), 0), (Scope::All, 1)] {
+        let freeze = phone.freeze(scope, epoch);
+        ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    }
+    let unfreeze = phone.unfreeze(Scope::All, 2);
+    ap.deliver_from(&phone, kind::FREEZE, &unfreeze);
+    assert!(!ap.gw.state.keep().agent_freeze().unwrap());
+    assert!(ap.frozen(&id));
+    let answer = ap.gw.rpc(
+        &token,
+        "tools/call",
+        json!({ "name": "get_nostr_pubkey", "arguments": {} }),
+    );
+    assert!(answer.get("error").is_some(), "{answer}");
+}
+
+/// The last approver may be removed through `remove_approver`, approved by
+/// itself: approvals are then off, and requests that need one are refused
+/// as before.
+#[test]
+fn the_last_approver_approves_its_own_removal() {
+    let (mut ap, mut phone, _, token) = paired();
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "approver_remove", "transport": hex::encode(phone.t()) }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(true));
+    let store = ap.store();
+    assert!(store.devices.is_empty());
+    assert_eq!(store.channel, None);
+    assert!(!ap.gw.state.approvals_active());
+    let (text, error) = ap.gw.tool(&token, "sign_nostr_event", kind0());
+    assert!(error);
+    assert!(text.as_str().unwrap().contains("needs approval"), "{text}");
+}
+
+/// With two approvers, the one being removed may approve its own removal.
+#[test]
+fn a_device_approves_its_own_removal() {
+    let (mut ap, mut first, _, _) = paired();
+    let mut second = Phone::new();
+    ap.add_device(&mut first, &mut second);
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "approver_remove", "transport": hex::encode(first.t()) }),
+    );
+    let request = ap.requests(&mut first).pop().unwrap();
+    ap.deliver_from(
+        &first,
+        kind::DECISION,
+        &first.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(true));
+    let devices = ap.store().devices;
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].transport.0, second.t());
+}
+
+/// An approval is checked against the gateway-wide freeze as it is when
+/// the decision comes, however that freeze was set.
+#[test]
+fn an_approval_after_a_freeze_of_everything_signs_nothing() {
+    let (mut ap, mut phone, _, token) = paired();
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.state.keep_mut().set_agent_freeze(true).unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(
+        tool_text(&reply(pending)),
+        ("canceled: frozen".into(), true)
+    );
+}
+
+/// An approval is checked against the keys reserved when the decision
+/// comes: a grant that names a device registered since signs nothing.
+#[test]
+fn an_approval_for_a_grant_naming_a_key_reserved_since_signs_nothing() {
+    let mut ap = Ap::new();
+    let mut first = Phone::new();
+    let mut second = Phone::new();
+    let mut grant = nostr_grant(ap.gw.key);
+    grant.nip44_peers.insert(second.t());
+    let (_, token) = ap.issue(&grant);
+    ap.pair_first(&mut first);
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut first).pop().unwrap();
+    ap.add_device(&mut first, &mut second);
+    ap.deliver_from(
+        &first,
+        kind::DECISION,
+        &first.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(
+        tool_text(&reply(pending)),
+        ("canceled: revoked".into(), true)
+    );
 }

@@ -341,6 +341,66 @@ mod tests {
         }
     }
 
+    /// A full outbox makes room by dropping requests past their deadline,
+    /// then the oldest request; a request never displaces anything else, and
+    /// when nothing else is queued the oldest message goes.
+    #[test]
+    fn a_full_outbox_drops_stale_requests_first_and_never_an_anchor_for_one() {
+        use nostr_sdk::prelude::EventBuilder;
+        let keys = Keys::generate();
+        let event = |text: &str| EventBuilder::text_note(text).sign_with_keys(&keys).unwrap();
+        let now = 1_000;
+        let live = Carries::Request { expires: now + 100 };
+        let filler = event("filler");
+        // A full outbox that starts with `first`, then `push`ed, drained.
+        let after = |first: &[(&str, Carries)], push: (&str, Carries)| {
+            let outbox = Outbox::default();
+            for (text, carries) in first {
+                outbox.push(event(text), *carries, now);
+            }
+            while outbox.len() < OUTBOX_CAPACITY {
+                outbox.push(filler.clone(), Carries::Other, now);
+            }
+            outbox.push(event(push.0), push.1, now);
+            let mut kept = Vec::new();
+            while let Some(e) = outbox.try_pop() {
+                kept.push(e.content);
+            }
+            assert_eq!(kept.len(), OUTBOX_CAPACITY);
+            kept
+        };
+        // A request past its deadline goes first, though an older one waits.
+        let kept = after(
+            &[
+                ("anchor", Carries::Other),
+                ("old request", live),
+                ("expired request", Carries::Request { expires: now }),
+            ],
+            ("new request", live),
+        );
+        assert_eq!(kept[..2], ["anchor", "old request"]);
+        assert_eq!(kept.last().unwrap(), "new request");
+        // Then the oldest request, never the anchor before it.
+        let kept = after(
+            &[
+                ("anchor", Carries::Other),
+                ("old request", live),
+                ("live request", live),
+            ],
+            ("outcome", Carries::Other),
+        );
+        assert_eq!(kept[..2], ["anchor", "live request"]);
+        assert_eq!(kept.last().unwrap(), "outcome");
+        // A request does not displace an anchor or an outcome.
+        let kept = after(&[("anchor", Carries::Other)], ("request", live));
+        assert_eq!(kept[0], "anchor");
+        assert!(!kept.iter().any(|k| k == "request"));
+        // Anything else displaces the oldest message.
+        let kept = after(&[("anchor", Carries::Other)], ("outcome", Carries::Other));
+        assert_ne!(kept[0], "anchor");
+        assert_eq!(kept.last().unwrap(), "outcome");
+    }
+
     #[test]
     fn three_denials_in_a_day_freeze_and_start_afresh() {
         let mut store = Store::default();
