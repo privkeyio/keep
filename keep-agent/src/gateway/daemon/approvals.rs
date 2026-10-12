@@ -3,35 +3,35 @@
 
 //! What the gateway keeps for approvals over Nostr: the approver devices and
 //! the freeze epoch in the vault, the wraps it opens outside its state lock,
-//! and the link to the relay helper.
+//! the queue of wraps waiting for the relay helper, and the link to it.
 //!
 //! The approver devices, their freeze counters, the freeze epoch and recent
-//! denials live in the vault under [`STORE_KEY`], beside the agent ledgers.
-//! The channel key never does: it is a credential of its own, sealed to the
-//! host, and the vault records only its public key, so a gateway started
-//! with another key, or none, is refused while an approver is registered.
+//! denials live in the vault under [`STORE_KEY`], beside the agent ledgers
+//! (see [`crate::approval::Store`]). The channel key never does: it is a
+//! credential of its own, sealed to the host, and the vault records only its
+//! public key, so a gateway started with another key, or none, is refused
+//! while an approver is registered.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use keep_approval::sig::Device;
 use keep_approval::wrap::{self, Candidate, Opened, SeenWraps, TagKey};
-use keep_approval::{Hex16, Hex32};
-use keep_core::Keep;
+use keep_approval::Hex32;
 use nostr_sdk::prelude::{Event, Keys};
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
-use crate::error::{AgentError, Result};
-use crate::policy::ReservedKeys;
-use crate::scope::Operation;
-
-/// The ledger key the approval state is stored under: neither a credential's
-/// id (16 bytes) nor a wallet's.
-pub const STORE_KEY: &[u8] = b"approvals";
+pub use crate::approval::{
+    OwedEntry, RegisteredDevice, Store, StoredDevice, DENIALS_TO_FREEZE, DENIAL_WINDOW_SECS,
+    STORE_KEY,
+};
 
 /// The most requests parked at once, across every credential.
 pub const MAX_PARKED: usize = 16;
+
+/// Of [`MAX_PARKED`], how many only management changes may take, so agents
+/// re-parking cannot lock the owner out of issuing, unfreezing and changing
+/// who approves.
+pub const MANAGEMENT_RESERVED: usize = 2;
 
 /// How long a pairing session lasts.
 pub const PAIRING_SECS: u64 = 600;
@@ -39,108 +39,16 @@ pub const PAIRING_SECS: u64 = 600;
 /// How often an anchor goes to every approver.
 pub const ANCHOR_EVERY_SECS: u64 = 900;
 
-/// Denials of one credential's requests within [`DENIAL_WINDOW_SECS`] that
-/// freeze it.
-pub const DENIALS_TO_FREEZE: usize = 3;
-
-/// The window denials are counted in.
-pub const DENIAL_WINDOW_SECS: u64 = 24 * 60 * 60;
-
-/// Wraps waiting for the relay helper at most; past it the oldest are
-/// dropped, which a relay could do anyway.
+/// Wraps waiting for the relay helper at most.
 pub const OUTBOX_CAPACITY: usize = 4_096;
 
-/// A registered approver device.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StoredDevice {
-    pub transport: Hex32,
-    pub approver: Hex32,
-    pub label: String,
-    /// The last freeze or unfreeze counter accepted from the device.
-    pub counter: u64,
-}
-
-impl StoredDevice {
-    pub fn device(&self) -> Device {
-        Device {
-            transport: self.transport.0,
-            approver: self.approver.0,
-        }
-    }
-
-    pub fn fingerprint(&self) -> String {
-        keep_approval::sig::fingerprint(&self.transport.0, &self.approver.0)
-    }
-}
-
-/// The approval state the vault holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Store {
-    /// The channel public key, recorded when the first approver is
-    /// registered and cleared with the last.
-    pub channel: Option<Hex32>,
-    pub devices: Vec<StoredDevice>,
-    /// One more on every freeze and unfreeze, from any source.
-    pub epoch: u64,
-    /// When each credential's requests were last denied, on the budget clock,
-    /// within the denial window.
-    pub denials: BTreeMap<Hex16, Vec<u64>>,
-}
-
-impl Store {
-    /// The store in the vault; empty when there is none.
-    pub fn load(keep: &Keep) -> Result<Self> {
-        match keep.load_agent_ledger(STORE_KEY)? {
-            None => Ok(Self::default()),
-            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
-                AgentError::Other(format!(
-                    "the approval state in the vault does not decode: {e}"
-                ))
-            }),
-        }
-    }
-
-    /// Write the store to the vault, durably.
-    pub fn save(&self, keep: &mut Keep) -> Result<()> {
-        let bytes =
-            serde_json::to_vec(self).map_err(|e| AgentError::Serialization(e.to_string()))?;
-        keep.update_agent_ledgers(&[STORE_KEY], |_| Ok(vec![bytes]))?;
-        Ok(())
-    }
-
-    /// The device whose transport key is `transport`.
-    pub fn device(&self, transport: &[u8; 32]) -> Option<&StoredDevice> {
-        self.devices.iter().find(|d| d.transport.0 == *transport)
-    }
-
-    /// Every device key, and the channel key when one is given: the keys no
-    /// grant may name.
-    pub fn reserved(&self, channel: Option<[u8; 32]>) -> ReservedKeys {
-        self.devices
-            .iter()
-            .flat_map(|d| [d.transport.0, d.approver.0])
-            .chain(channel)
-            .collect()
-    }
-
-    /// Note a denial of credential `id` at `now`, and say whether it makes
-    /// [`DENIALS_TO_FREEZE`] within the window, which then starts afresh.
-    pub fn note_denial(&mut self, id: [u8; 16], now: u64) -> bool {
-        let list = self.denials.entry(Hex16(id)).or_default();
-        list.retain(|&at| now.saturating_sub(at) < DENIAL_WINDOW_SECS);
-        list.push(now);
-        let freeze = list.len() >= DENIALS_TO_FREEZE;
-        if freeze {
-            self.denials.remove(&Hex16(id));
-        }
-        self.denials.retain(|_, l| {
-            l.iter()
-                .any(|&at| now.saturating_sub(at) < DENIAL_WINDOW_SECS)
-        });
-        freeze
-    }
+/// Lock `mutex`, taking its value even if a thread panicked holding it: the
+/// inbox and the outbox hold nothing a half-done update could make unsafe
+/// to use, and approvals must not stop because of it.
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Where a wrap came from, by the tag it carried.
@@ -174,20 +82,19 @@ impl Inbox {
     pub(crate) fn expect(&mut self, devices: &[StoredDevice], secret: Option<&[u8; 32]>) {
         let mut candidates = Vec::with_capacity(devices.len() + 1);
         for d in devices {
-            match TagKey::for_peer(&self.channel, &d.transport.0) {
-                Ok(tag_key) => candidates.push(Candidate {
+            match TagKey::gateway(&self.channel, &d.transport.0) {
+                Ok(tag_key) => candidates.push(Candidate::Peer {
                     id: Source::Device(d.transport.0),
                     tag_key,
-                    sender: Some(d.transport.0),
+                    sender: d.transport.0,
                 }),
                 Err(e) => tracing::error!(error = %e, "an approver device's key is not usable"),
             }
         }
         if let Some(secret) = secret {
-            candidates.push(Candidate {
+            candidates.push(Candidate::Pairing {
                 id: Source::Pairing,
-                tag_key: TagKey::for_pairing(secret),
-                sender: None,
+                tag_key: TagKey::pairing_gateway(secret),
             });
         }
         self.candidates = candidates;
@@ -208,10 +115,90 @@ impl Inbox {
     }
 }
 
+/// What a queued wrap carries, for choosing what to drop when the queue is
+/// full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Carries {
+    /// A request, worthless once its deadline passes (gateway calendar
+    /// time).
+    Request { expires: u64 },
+    /// Anything else: an anchor, an outcome, a pairing answer.
+    Other,
+}
+
+/// The wraps waiting for the relay helper, oldest first. When full, a new
+/// wrap first displaces a request already past its deadline, then the
+/// oldest request; an anchor or an outcome is never dropped to make room for
+/// a request, and when only such wraps are queued the oldest goes.
+#[derive(Default)]
+pub struct Outbox {
+    queue: Mutex<VecDeque<(Event, Carries)>>,
+    ready: Notify,
+}
+
+impl Outbox {
+    /// Queue `event`, by the gateway's calendar time `now`.
+    pub fn push(&self, event: Event, carries: Carries, now: u64) {
+        let mut queue = lock(&self.queue);
+        if queue.len() >= OUTBOX_CAPACITY {
+            queue.retain(|(_, c)| !matches!(c, Carries::Request { expires } if *expires <= now));
+        }
+        if queue.len() >= OUTBOX_CAPACITY {
+            let oldest_request = queue
+                .iter()
+                .position(|(_, c)| matches!(c, Carries::Request { .. }));
+            match (oldest_request, carries) {
+                (Some(i), _) => {
+                    queue.remove(i);
+                }
+                (None, Carries::Request { .. }) => {
+                    tracing::warn!(
+                        "a request to the approvers was dropped: the relay queue is full"
+                    );
+                    return;
+                }
+                (None, Carries::Other) => {
+                    queue.pop_front();
+                }
+            }
+            tracing::warn!("the relay queue is full: the stalest message was dropped");
+        }
+        queue.push_back((event, carries));
+        drop(queue);
+        self.ready.notify_one();
+    }
+
+    /// The next wrap, waiting for one.
+    pub async fn pop(&self) -> Event {
+        loop {
+            let notified = self.ready.notified();
+            if let Some((event, _)) = lock(&self.queue).pop_front() {
+                return event;
+            }
+            notified.await;
+        }
+    }
+
+    /// The next wrap, if one is queued.
+    pub fn try_pop(&self) -> Option<Event> {
+        lock(&self.queue).pop_front().map(|(event, _)| event)
+    }
+
+    /// How many wraps are queued.
+    pub fn len(&self) -> usize {
+        lock(&self.queue).len()
+    }
+
+    /// Whether none are.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// What the relay connection needs from the gateway: the wraps to publish,
 /// the inbox to open what arrives, and what to tell the helper.
 pub struct RelayLink {
-    pub outbox: mpsc::Receiver<Event>,
+    pub outbox: Arc<Outbox>,
     pub inbox: Arc<Mutex<Inbox>>,
     pub relays: Vec<String>,
     /// The channel public key, which the subscription asks for wraps to.
@@ -220,38 +207,55 @@ pub struct RelayLink {
 
 /// The grant an `issue_credential` change carries: the gateway's grant with
 /// every number a decimal string and every list in ascending order, so it
-/// has one form.
+/// has one form. Every field is named, so a field added to the grant fails
+/// to compile here until the change carries it.
 pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::ChangeGrant {
     use keep_approval::change::{ChangeBitcoin, ChangeGrant, ChangeLimits, Decimal};
-    let mut operations: Vec<String> = grant
-        .operations
+    let crate::policy::Grant {
+        keys,
+        operations,
+        event_kinds,
+        nip44_peers,
+        bitcoin,
+        limits,
+    } = grant;
+    let crate::policy::RequestLimits {
+        per_minute,
+        per_hour,
+        per_day,
+    } = limits;
+    let mut operations: Vec<String> = operations
         .iter()
-        .map(|op: &Operation| op.as_str().to_string())
+        .map(|op: &crate::scope::Operation| op.as_str().to_string())
         .collect();
     operations.sort();
     ChangeGrant {
-        keys: grant.keys.iter().copied().map(Hex32).collect(),
+        keys: keys.iter().copied().map(Hex32).collect(),
         operations,
-        event_kinds: grant
-            .event_kinds
-            .iter()
-            .map(|&k| Decimal(u64::from(k)))
-            .collect(),
-        nip44_peers: grant.nip44_peers.iter().copied().map(Hex32).collect(),
-        bitcoin: grant.bitcoin.as_ref().map(|b| ChangeBitcoin {
-            network: b.network.to_string(),
-            per_psbt_sats: Decimal(b.per_psbt_sats),
-            window_sats: Decimal(b.window_sats),
-            approval_above_sats: b.approval_above_sats.map(Decimal),
-            address_allowlist: b
-                .address_allowlist
-                .as_ref()
-                .map(|a| a.iter().cloned().collect()),
+        event_kinds: event_kinds.iter().map(|&k| Decimal(u64::from(k))).collect(),
+        nip44_peers: nip44_peers.iter().copied().map(Hex32).collect(),
+        bitcoin: bitcoin.as_ref().map(|b| {
+            let crate::policy::BitcoinGrant {
+                network,
+                per_psbt_sats,
+                window_sats,
+                approval_above_sats,
+                address_allowlist,
+            } = b;
+            ChangeBitcoin {
+                network: network.to_string(),
+                per_psbt_sats: Decimal(*per_psbt_sats),
+                window_sats: Decimal(*window_sats),
+                approval_above_sats: approval_above_sats.map(Decimal),
+                address_allowlist: address_allowlist
+                    .as_ref()
+                    .map(|a| a.iter().cloned().collect()),
+            }
         }),
         limits: ChangeLimits {
-            per_minute: Decimal(u64::from(grant.limits.per_minute)),
-            per_hour: Decimal(u64::from(grant.limits.per_hour)),
-            per_day: Decimal(u64::from(grant.limits.per_day)),
+            per_minute: Decimal(u64::from(*per_minute)),
+            per_hour: Decimal(u64::from(*per_hour)),
+            per_day: Decimal(u64::from(*per_day)),
         },
     }
 }
@@ -259,8 +263,10 @@ pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::Chan
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{BitcoinGrant, Grant, RequestLimits};
+    use crate::policy::{BitcoinGrant, Grant, RequestLimits, ReservedKeys};
+    use crate::scope::Operation;
     use keep_approval::change::{Change, OPERATIONS};
+    use keep_approval::Hex16;
     use keep_bitcoin::Network;
 
     /// Every operation the gateway knows is one an approver accepts.
@@ -324,8 +330,13 @@ mod tests {
                 expires_at: keep_approval::change::Decimal(2),
                 grant: change_grant(&grant),
             };
-            let parsed = Change::parse_text(&serde_json::to_string(&change.to_value()).unwrap())
-                .unwrap_or_else(|e| panic!("{network}: {e}"));
+            let parsed = Change::parse(
+                &keep_approval::change::parse_without_duplicates(
+                    &serde_json::to_string(&change.to_value()).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("{network}: {e}"));
             assert_eq!(parsed, change);
         }
     }

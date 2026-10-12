@@ -10,6 +10,11 @@
 //! the approver's signed decision over that request's id and hash, and it
 //! carries the parked request, so [`crate::policy::evaluate_approved`]
 //! evaluates exactly what was approved, and only once.
+//!
+//! The approver devices live in the vault as a [`Store`]. Only the store
+//! issues a [`RegisteredDevice`], and [`Approval::verify`] takes one, so an
+//! approval's type proves that a device registered in the vault approved
+//! the request.
 
 use keep_approval::binding::{
     Network as WireNetwork, NostrPayload, Payload, RequestDraft, UnsignedEventFields,
@@ -19,14 +24,193 @@ use keep_approval::messages::{
     AnchorState, Budget, CredentialRef, Decision as SignedDecision, Reason, Request as WireRequest,
     Verdict,
 };
+use keep_approval::messages::{LogPoint, Unfrozen, MAX_UNFROZEN};
 use keep_approval::psbt::PsbtPayload;
-use keep_approval::sig::{self, Device};
-use keep_approval::Hex64;
+use keep_approval::sig::{self, Alg, Device};
+use keep_approval::{Hex16, Hex32, Hex33, Hex64};
 use keep_bitcoin::bitcoin::Psbt;
 use keep_bitcoin::PsbtAnalysis;
+use keep_core::audit::AuditEventType;
+use keep_core::Keep;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::error::{AgentError, Result};
-use crate::policy::Request;
+use crate::policy::{Request, ReservedKeys};
+
+/// The ledger key the approval state is stored under: neither a credential's
+/// id (16 bytes) nor a wallet's.
+pub const STORE_KEY: &[u8] = b"approvals";
+
+/// Denials of one credential's requests within [`DENIAL_WINDOW_SECS`] that
+/// freeze it.
+pub const DENIALS_TO_FREEZE: usize = 3;
+
+/// The window denials are counted in.
+pub const DENIAL_WINDOW_SECS: u64 = 24 * 60 * 60;
+
+/// A registered approver device, as the vault holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredDevice {
+    pub transport: Hex32,
+    /// The approver key's type, from the device's `pair`.
+    pub alg: Alg,
+    pub approver: Hex33,
+    pub label: String,
+    /// The last freeze or unfreeze counter accepted from the device.
+    pub counter: u64,
+}
+
+impl StoredDevice {
+    pub fn device(&self) -> Device {
+        Device {
+            transport: self.transport.0,
+            approver: self.approver.0,
+        }
+    }
+
+    pub fn fingerprint(&self) -> String {
+        sig::fingerprint(&self.transport.0, &self.approver.0)
+    }
+}
+
+/// A device the store holds as registered, as only [`Store::registered`]
+/// gives one out: what [`Approval::verify`] checks a decision against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisteredDevice {
+    device: Device,
+}
+
+impl RegisteredDevice {
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+}
+
+/// An owner entry that could not be written yet, kept with the store so a
+/// restart does not lose it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwedEntry {
+    pub event: AuditEventType,
+    pub reason: String,
+}
+
+/// The approval state the vault holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Store {
+    /// The channel public key, recorded when the first approver is
+    /// registered and cleared with the last.
+    pub channel: Option<Hex32>,
+    pub devices: Vec<StoredDevice>,
+    /// When each credential's requests were last denied, on the budget clock,
+    /// within the denial window.
+    pub denials: BTreeMap<Hex16, Vec<u64>>,
+    /// The audit log's place in the last anchor sent, to any device in any
+    /// message: the next anchor's `prev`.
+    pub last_anchor: Option<LogPoint>,
+    /// The unfreezes applied lately, with the gateway calendar time of each,
+    /// newest last: what anchors list so every phone can explain a freeze
+    /// cleared.
+    pub unfrozen: Vec<(Unfrozen, u64)>,
+    /// Owner entries not written yet.
+    pub owed: Vec<OwedEntry>,
+}
+
+impl Store {
+    /// The store in the vault; empty when there is none.
+    pub fn load(keep: &Keep) -> Result<Self> {
+        match keep.load_agent_ledger(STORE_KEY)? {
+            None => Ok(Self::default()),
+            Some(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                AgentError::Other(format!(
+                    "the approval state in the vault does not decode: {e}"
+                ))
+            }),
+        }
+    }
+
+    /// The store as the bytes the vault keeps.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|e| AgentError::Serialization(e.to_string()))
+    }
+
+    /// Write the store to the vault, durably.
+    pub fn save(&self, keep: &mut Keep) -> Result<()> {
+        let bytes = self.encode()?;
+        keep.update_agent_ledgers(&[STORE_KEY], |_| Ok(vec![bytes]))?;
+        Ok(())
+    }
+
+    /// The device whose transport key is `transport`.
+    pub fn device(&self, transport: &[u8; 32]) -> Option<&StoredDevice> {
+        self.devices.iter().find(|d| d.transport.0 == *transport)
+    }
+
+    /// The device whose transport key is `transport`, as the registered
+    /// device a decision from it is verified against.
+    pub fn registered(&self, transport: &[u8; 32]) -> Option<RegisteredDevice> {
+        self.device(transport)
+            .map(|d| RegisteredDevice { device: d.device() })
+    }
+
+    /// The keys no grant may name: every device's transport key, and the
+    /// channel key when one is given. Approver keys are P-256, which no
+    /// grant can name.
+    pub fn reserved(&self, channel: Option<[u8; 32]>) -> ReservedKeys {
+        self.devices
+            .iter()
+            .map(|d| d.transport.0)
+            .chain(channel)
+            .collect()
+    }
+
+    /// Note a denial of credential `id` at `now`, and say whether it makes
+    /// [`DENIALS_TO_FREEZE`] within the window, which then starts afresh.
+    pub fn note_denial(&mut self, id: [u8; 16], now: u64) -> bool {
+        let list = self.denials.entry(Hex16(id)).or_default();
+        list.retain(|&at| now.saturating_sub(at) < DENIAL_WINDOW_SECS);
+        list.push(now);
+        let freeze = list.len() >= DENIALS_TO_FREEZE;
+        if freeze {
+            self.denials.remove(&Hex16(id));
+        }
+        self.denials.retain(|_, l| {
+            l.iter()
+                .any(|&at| now.saturating_sub(at) < DENIAL_WINDOW_SECS)
+        });
+        freeze
+    }
+
+    /// Note an unfreeze of `scope` that moved the epoch to `epoch` at
+    /// gateway time `at`, keeping those inside the wrap time window, at most
+    /// [`MAX_UNFROZEN`].
+    pub fn note_unfrozen(&mut self, scope: keep_approval::change::Scope, epoch: u64, at: u64) {
+        self.unfrozen.push((Unfrozen { scope, epoch }, at));
+        self.prune_unfrozen(at);
+    }
+
+    fn prune_unfrozen(&mut self, now: u64) {
+        self.unfrozen
+            .retain(|(_, at)| now.saturating_sub(*at) <= keep_approval::wrap::WINDOW_PAST_SECS);
+        let excess = self.unfrozen.len().saturating_sub(MAX_UNFROZEN);
+        self.unfrozen.drain(..excess);
+    }
+
+    /// The unfreezes an anchor taken at gateway time `now` lists.
+    pub fn recent_unfreezes(&self, now: u64) -> Vec<Unfrozen> {
+        let recent: Vec<Unfrozen> = self
+            .unfrozen
+            .iter()
+            .filter(|(_, at)| now.saturating_sub(*at) <= keep_approval::wrap::WINDOW_PAST_SECS)
+            .map(|(u, _)| *u)
+            .collect();
+        let excess = recent.len().saturating_sub(MAX_UNFROZEN);
+        recent[excess..].to_vec()
+    }
+}
 
 /// What a parked request signs or applies once approved, exactly.
 pub enum ParkedObject {
@@ -82,7 +266,7 @@ pub struct Parked {
 impl Parked {
     /// Build the request for `object` as the gateway `channel` sends it, with
     /// every check an approver runs and the size limit, and its hash.
-    pub fn new(object: ParkedObject, info: ParkRequest, channel: &[u8; 32]) -> Result<Self> {
+    pub(crate) fn new(object: ParkedObject, info: ParkRequest, channel: &[u8; 32]) -> Result<Self> {
         let refuse = |e: keep_approval::Error| match e {
             keep_approval::Error::TooLarge(_) => {
                 AgentError::PolicyDenied("the request is too large to approve".into())
@@ -192,28 +376,29 @@ pub struct Approved {
 }
 
 impl Approval {
-    /// Make the approval of `parked` from `decision`, sealed by `device`'s
-    /// transport key: it must name the parked request's id and hash, say
-    /// approve, and carry a signature by the device's approver key over the
-    /// gateway's `channel` key, the approver key, that hash and the verdict.
-    /// Anything else hands the parked request back with the reason.
-    pub fn verify(
+    /// Make the approval of `parked` from `decision`, sealed by the
+    /// registered `device`'s transport key: it must name the parked
+    /// request's id and hash, say approve, and carry a signature by the
+    /// device's approver key over the gateway's `channel` key, the approver
+    /// key, that hash and the verdict. Anything else hands the parked request
+    /// back with the reason.
+    pub(crate) fn verify(
         decision: &SignedDecision,
         channel: &[u8; 32],
-        device: &Device,
+        device: &RegisteredDevice,
         parked: Parked,
     ) -> std::result::Result<Self, (Parked, String)> {
         match sig::check_decision(
             decision,
             channel,
-            device,
+            &device.device,
             &parked.request_id(),
             &parked.hash,
         ) {
             Ok(Verdict::Approve) => Ok(Self {
                 approved: Box::new(Approved {
                     parked,
-                    device: *device,
+                    device: device.device,
                     sig: decision.sig,
                 }),
             }),
@@ -238,6 +423,16 @@ impl Approval {
     /// The parked request this approves.
     pub fn parked(&self) -> &Parked {
         &self.approved.parked
+    }
+
+    /// The device whose approver key signed the approval.
+    pub fn device(&self) -> &Device {
+        &self.approved.device
+    }
+
+    /// The decision's signature.
+    pub fn signature(&self) -> &Hex64 {
+        &self.approved.sig
     }
 }
 
@@ -269,24 +464,31 @@ mod tests {
     };
     use crate::scope::Operation;
     use keep_approval::messages::V1;
-    use keep_approval::Hex32;
+    use keep_approval::sig::ApproverSigningKey;
     use nostr_sdk::prelude::Keys;
 
     struct Fixture {
         channel: [u8; 32],
         transport: Keys,
-        approver: Keys,
-        device: Device,
+        approver: ApproverSigningKey,
+        device: RegisteredDevice,
         key: [u8; 32],
     }
 
     fn fixture() -> Fixture {
         let transport = Keys::generate();
-        let approver = Keys::generate();
-        let device = Device {
-            transport: transport.public_key().to_bytes(),
-            approver: approver.public_key().to_bytes(),
-        };
+        let approver = ApproverSigningKey::from_slice(&rand::random::<[u8; 32]>()).unwrap();
+        let mut store = Store::default();
+        store.devices.push(StoredDevice {
+            transport: Hex32(transport.public_key().to_bytes()),
+            alg: Alg::P256,
+            approver: Hex33(sig::approver_key(&approver)),
+            label: "phone".into(),
+            counter: 0,
+        });
+        let device = store
+            .registered(&transport.public_key().to_bytes())
+            .unwrap();
         Fixture {
             channel: Keys::generate().public_key().to_bytes(),
             transport,
@@ -311,6 +513,7 @@ mod tests {
             anchor: AnchorState {
                 seq: 1,
                 head: Hex32([0; 32]),
+                prev: None,
                 wallets: vec![],
             },
         }
@@ -326,15 +529,19 @@ mod tests {
         })
     }
 
-    fn decision(f: &Fixture, signer: &Keys, parked: &Parked, verdict: Verdict) -> SignedDecision {
-        let digest = sig::decision_digest(&f.channel, &sig::xonly(signer), &parked.hash(), verdict);
-        SignedDecision {
-            v: V1,
-            request_id: Hex32(parked.request_id()),
-            request_hash: Hex32(parked.hash()),
-            decision: verdict,
-            sig: sig::sign(signer, &digest),
-        }
+    fn decision(
+        f: &Fixture,
+        signer: &ApproverSigningKey,
+        parked: &Parked,
+        verdict: Verdict,
+    ) -> SignedDecision {
+        sig::decision(
+            signer,
+            &f.channel,
+            Hex32(parked.request_id()),
+            Hex32(parked.hash()),
+            verdict,
+        )
     }
 
     fn grant(f: &Fixture) -> Grant {
@@ -356,10 +563,20 @@ mod tests {
         let parked = Parked::new(event(&f, "{}"), info(1), &f.channel).unwrap();
         let other = Parked::new(event(&f, "{}"), info(2), &f.channel).unwrap();
         // The transport key, another request's decision, a denial.
-        let by_transport = decision(&f, &f.transport, &parked, Verdict::Approve);
+        let mut by_transport = decision(&f, &f.approver, &parked, Verdict::Approve);
+        by_transport.sig = sig::sign_bip340(
+            &f.transport,
+            &sig::decision_digest(
+                &f.channel,
+                &f.device.device().approver,
+                &parked.hash(),
+                Verdict::Approve,
+            ),
+        );
         let (parked, why) =
             Approval::verify(&by_transport, &f.channel, &f.device, parked).unwrap_err();
         assert!(why.contains("signature"), "{why}");
+        let _ = V1;
         let for_other = decision(&f, &f.approver, &other, Verdict::Approve);
         let (parked, _) = Approval::verify(&for_other, &f.channel, &f.device, parked).unwrap_err();
         let deny = decision(&f, &f.approver, &parked, Verdict::Deny);
@@ -379,7 +596,7 @@ mod tests {
         let (decision, approved) = evaluate_approved(approval, &grant(&f), &mut budgets, 0);
         assert_eq!(decision, Decision::Allow);
         assert_eq!(approved.signature(), &approve.sig);
-        assert_eq!(approved.device(), &f.device);
+        assert_eq!(approved.device(), f.device.device());
         assert!(matches!(
             approved.into_parked().object(),
             ParkedObject::NostrEvent(e) if e.content == "{}"

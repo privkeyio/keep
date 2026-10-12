@@ -26,12 +26,12 @@ use std::io::Write;
 use keep_approval::binding::check_request;
 use keep_approval::change::Scope;
 use keep_approval::messages::{
-    self as wire, Anchor, Decision, Freeze, FreezeAction, Outcome, Pairing, Request, Verdict, V1,
+    self as wire, Anchor, FreezeAction, Outcome, Pairing, Request, Verdict,
 };
-use keep_approval::pairing::PairingUri;
-use keep_approval::sig;
+use keep_approval::pairing::{check_paired, PairingUri};
+use keep_approval::sig::{self, ApproverSigningKey};
 use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey};
-use keep_approval::{kind, Hex16, Hex32};
+use keep_approval::{kind, Hex16};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
 use nostr_sdk::prelude::{Client, Event, Filter, Keys, Kind, PublicKey, RelayPoolNotification};
 use tokio::io::AsyncBufReadExt;
@@ -40,6 +40,15 @@ fn say(line: &str) {
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
+}
+
+/// A fresh P-256 approver key. A real phone keeps it in its Keystore.
+fn approver_key() -> ApproverSigningKey {
+    loop {
+        if let Ok(key) = ApproverSigningKey::from_slice(&rand::random::<[u8; 32]>()) {
+            return key;
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -80,7 +89,7 @@ async fn main() {
 
 struct Phone {
     transport: Keys,
-    approver: Keys,
+    approver: ApproverSigningKey,
     channel: [u8; 32],
     seen: SeenWraps,
     counter: u64,
@@ -95,7 +104,7 @@ impl Phone {
     }
 
     async fn send(&self, kind: u16, content: &str) {
-        let tag = TagKey::for_peer(&self.transport, &self.channel).expect("a tag key");
+        let tag = TagKey::device(&self.transport, &self.channel).expect("a tag key");
         let event =
             wrap::wrap(&self.transport, &self.channel, &tag, kind, content, now()).expect("a wrap");
         if let Err(e) = self.client.send_event(&event).await {
@@ -104,25 +113,30 @@ impl Phone {
     }
 
     fn open(&mut self, event: &Event) -> Option<(u16, String)> {
-        let candidates = [Candidate {
+        let candidates = [Candidate::Peer {
             id: (),
-            tag_key: TagKey::for_peer(&self.transport, &self.channel).ok()?,
-            sender: Some(self.channel),
+            tag_key: TagKey::device(&self.transport, &self.channel).ok()?,
+            sender: self.channel,
         }];
         wrap::open(&self.transport, event, &candidates, &mut self.seen, now())
             .ok()
-            .map(|o| (o.kind, o.content))
+            .map(|o| (o.kind, o.content.to_string()))
     }
 
     fn received(&mut self, kind: u16, content: &str) {
         match kind {
             kind::PAIRING => match wire::parse::<Pairing>(content) {
-                Ok(Pairing::Paired { frozen, .. }) => {
-                    self.epoch = frozen.epoch;
-                    say("paired");
-                }
                 Ok(Pairing::Refused { reason, .. }) => say(&format!("refused {reason}")),
-                _ => say("bad-pairing"),
+                Ok(message) => {
+                    match check_paired(&message, &self.t(), &sig::approver_key(&self.approver)) {
+                        Ok(paired) => {
+                            self.epoch = paired.frozen.epoch;
+                            say("paired");
+                        }
+                        Err(e) => say(&format!("bad-pairing {e}")),
+                    }
+                }
+                Err(e) => say(&format!("bad-pairing {e}")),
             },
             kind::REQUEST => {
                 let request: Request = match wire::parse(content) {
@@ -167,19 +181,13 @@ impl Phone {
         let Some(request) = self.requests.pop_front() else {
             return say("no-request");
         };
-        let digest = sig::decision_digest(
+        let decision = wire::to_text(&sig::decision(
+            &self.approver,
             &self.channel,
-            &sig::xonly(&self.approver),
-            &request.request_hash.0,
+            request.request_id,
+            request.request_hash,
             verdict,
-        );
-        let decision = wire::to_text(&Decision {
-            v: V1,
-            request_id: request.request_id,
-            request_hash: request.request_hash,
-            decision: verdict,
-            sig: sig::sign(&self.approver, &digest),
-        });
+        ));
         self.send(kind::DECISION, &decision).await;
     }
 
@@ -194,28 +202,24 @@ impl Phone {
             Scope::Credential(Hex16(id))
         };
         // A freeze is the transport key's, an unfreeze the approver key's.
-        let signer = match action {
-            FreezeAction::Freeze => self.transport.clone(),
-            FreezeAction::Unfreeze => self.approver.clone(),
-        };
         self.counter += 1;
-        let digest = sig::freeze_digest(
-            &self.channel,
-            &sig::xonly(&signer),
-            self.counter,
-            self.epoch,
-            action,
-            scope,
-        );
-        let freeze = wire::to_text(&Freeze {
-            v: V1,
-            action,
-            scope,
-            counter: self.counter,
-            epoch: self.epoch,
-            signer: Hex32(sig::xonly(&signer)),
-            sig: sig::sign(&signer, &digest),
-        });
+        let freeze = match action {
+            FreezeAction::Freeze => sig::freeze(
+                &self.transport,
+                &self.channel,
+                self.counter,
+                self.epoch,
+                scope,
+            ),
+            FreezeAction::Unfreeze => sig::unfreeze(
+                &self.approver,
+                &self.channel,
+                self.counter,
+                self.epoch,
+                scope,
+            ),
+        };
+        let freeze = wire::to_text(&freeze);
         self.send(kind::FREEZE, &freeze).await;
     }
 }
@@ -232,7 +236,7 @@ async fn phone(uri: &str) {
         .await;
     let mut phone = Phone {
         transport: Keys::generate(),
-        approver: Keys::generate(),
+        approver: approver_key(),
         channel: uri.gateway,
         seen: SeenWraps::default(),
         counter: 0,
@@ -240,7 +244,7 @@ async fn phone(uri: &str) {
         requests: VecDeque::new(),
         client: client.clone(),
     };
-    let (t, a) = (phone.t(), sig::xonly(&phone.approver));
+    let (t, a) = (phone.t(), sig::approver_key(&phone.approver));
     let mut events = client.notifications();
     client
         .subscribe(
@@ -251,17 +255,14 @@ async fn phone(uri: &str) {
         )
         .await
         .expect("a subscription");
-    let pair = Pairing::Pair {
-        v: V1,
-        label: "e2e phone".into(),
-        approver: Hex32(a),
-        proof: sig::pair_proof(&uri.secret, &phone.channel, &t, &a),
-        approver_sig: sig::sign(
-            &phone.approver,
-            &sig::pair_approver_digest(&phone.channel, &t, &a),
-        ),
-    };
-    let tag = TagKey::for_pairing(&uri.secret);
+    let pair = sig::pair(
+        &t,
+        &phone.approver,
+        &phone.channel,
+        &uri.secret,
+        "e2e phone",
+    );
+    let tag = TagKey::pairing_phone(&uri.secret);
     let event = wrap::wrap(
         &phone.transport,
         &phone.channel,

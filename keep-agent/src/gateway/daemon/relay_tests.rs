@@ -141,12 +141,12 @@ async fn approvals_travel_through_the_helper_and_a_relay() {
         channel: Some(Hex32(channel().public_key().to_bytes())),
         devices: vec![StoredDevice {
             transport: Hex32(phone.t()),
-            approver: Hex32(phone.a()),
+            alg: keep_approval::sig::Alg::P256,
+            approver: keep_approval::Hex33(phone.a()),
             label: "Phone".into(),
             counter: 0,
         }],
-        epoch: 0,
-        denials: Default::default(),
+        ..Store::default()
     }
     .save(state.keep_mut())
     .unwrap();

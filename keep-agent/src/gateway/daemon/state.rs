@@ -248,6 +248,16 @@ enum Refusal {
 }
 
 impl Refusal {
+    /// What the owner's entry about a request that was not carried out says.
+    fn owner_text(&self) -> String {
+        match self {
+            Self::Invalid { message, .. } | Self::Internal(message) => message.clone(),
+            Self::Policy { detail, .. } => detail.clone(),
+            Self::NeedsApproval(reason) => format!("needs approval again: {reason:?}"),
+            Self::Park(_) => "asked for an approval again".into(),
+        }
+    }
+
     fn params(message: impl Into<String>) -> Self {
         Self::Invalid {
             code: -32602,
@@ -1248,7 +1258,7 @@ impl State {
                 )
             }
         };
-        let approve = self.management_needs_approval();
+        let approve = self.approvals_active();
         match request {
             AdminRequest::Issue {
                 name,
@@ -1486,7 +1496,7 @@ impl State {
             AdminRequest::Freeze { id } => {
                 let id = parse_id(&id)?;
                 self.load_known(&id)?;
-                self.freeze(credential_scope(id), "the admin socket")?;
+                self.freeze(credential_scope(id), "the admin socket", self.store())?;
                 Ok(json!({ "frozen": hex::encode(id) }))
             }
             AdminRequest::Unfreeze { id } => {
@@ -1496,7 +1506,11 @@ impl State {
                 Ok(json!({ "unfrozen": hex::encode(id) }))
             }
             AdminRequest::FreezeAll {} => {
-                self.freeze(keep_approval::change::Scope::All, "the admin socket")?;
+                self.freeze(
+                    keep_approval::change::Scope::All,
+                    "the admin socket",
+                    self.store(),
+                )?;
                 Ok(json!({ "frozen": "all" }))
             }
             AdminRequest::UnfreezeAll {} => {

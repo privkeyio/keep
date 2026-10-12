@@ -52,6 +52,10 @@ pub enum RefusalKind {
     Invalid,
     /// The gateway could not complete the request.
     Failed,
+    /// A request sent to the approvers had no decision in time.
+    ApprovalExpired,
+    /// The agent withdrew a request sent to the approvers, or went away.
+    ApprovalWithdrawn,
 }
 
 impl RefusalKind {
@@ -63,6 +67,8 @@ impl RefusalKind {
             Self::RateLimited => "rate limited",
             Self::Invalid => "invalid",
             Self::Failed => "failed",
+            Self::ApprovalExpired => "approval expired",
+            Self::ApprovalWithdrawn => "approval withdrawn",
         }
     }
 }

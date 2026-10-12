@@ -10,18 +10,18 @@
 use keep_approval::binding::check_request;
 use keep_approval::change::Scope;
 use keep_approval::messages::{
-    self as wire, Anchor, Decision, Freeze, FreezeAction, Outcome, OutcomeKind, Pairing, Request,
+    self as wire, Anchor, Freeze, FreezeAction, Outcome, OutcomeKind, Pairing, Request, SignerKey,
     Verdict, V1,
 };
 use keep_approval::pairing::PairingUri;
-use keep_approval::sig;
+use keep_approval::sig::{self, ApproverSigningKey};
 use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey};
-use keep_approval::{kind, Hex16, Hex32, Hex64};
+use keep_approval::{kind, Hex16, Hex32, Hex33, Hex64};
 use keep_core::audit::AuditEventType;
 use nostr_sdk::prelude::{Event, Keys, SecretKey};
 use serde_json::{json, Value};
 
-use super::approvals::{RelayLink, Store, MAX_PARKED};
+use super::approvals::{RelayLink, Store, MANAGEMENT_RESERVED, MAX_PARKED};
 use super::state::Pending;
 use super::tests::{bitcoin_grant, nostr_grant, psbt, Gw, AGENT, OTHER, T0};
 use crate::policy::Grant;
@@ -35,17 +35,32 @@ pub(super) fn channel() -> Keys {
 /// An approver phone: its two keys, what it has opened, and its counter.
 pub(super) struct Phone {
     pub(super) transport: Keys,
-    pub(super) approver: Keys,
+    pub(super) approver: ApproverSigningKey,
     pub(super) channel: [u8; 32],
     seen: SeenWraps,
     counter: u64,
+}
+
+/// A fresh P-256 approver key.
+pub(super) fn approver_key() -> ApproverSigningKey {
+    loop {
+        if let Ok(key) = ApproverSigningKey::from_slice(&rand::random::<[u8; 32]>()) {
+            return key;
+        }
+    }
+}
+
+/// The key a freeze or unfreeze is signed with in a test.
+pub(super) enum Signer {
+    Transport(Keys),
+    Approver(ApproverSigningKey),
 }
 
 impl Phone {
     pub(super) fn new() -> Self {
         Self {
             transport: Keys::generate(),
-            approver: Keys::generate(),
+            approver: approver_key(),
             channel: channel().public_key().to_bytes(),
             seen: SeenWraps::default(),
             counter: 0,
@@ -56,112 +71,125 @@ impl Phone {
         sig::xonly(&self.transport)
     }
 
-    pub(super) fn a(&self) -> [u8; 32] {
-        sig::xonly(&self.approver)
+    pub(super) fn a(&self) -> [u8; 33] {
+        sig::approver_key(&self.approver)
     }
 
     /// A wrap of `content` to the gateway, sealed by the transport key and
     /// tagged for the channel key.
     pub(super) fn wrap(&self, kind: u16, content: &str, now: u64) -> Event {
-        let tag = TagKey::for_peer(&self.transport, &self.channel).unwrap();
+        let tag = TagKey::device(&self.transport, &self.channel).unwrap();
         wrap::wrap(&self.transport, &self.channel, &tag, kind, content, now).unwrap()
     }
 
     /// What the gateway sent this phone, opened, in order.
     pub(super) fn open(&mut self, events: &[Event], now: u64) -> Vec<(u16, String)> {
-        let candidates = [Candidate {
+        let candidates = [Candidate::Peer {
             id: (),
-            tag_key: TagKey::for_peer(&self.transport, &self.channel).unwrap(),
-            sender: Some(self.channel),
+            tag_key: TagKey::device(&self.transport, &self.channel).unwrap(),
+            sender: self.channel,
         }];
         events
             .iter()
             .filter_map(|e| wrap::open(&self.transport, e, &candidates, &mut self.seen, now).ok())
-            .map(|o| (o.kind, o.content))
+            .map(|o| (o.kind, o.content.to_string()))
             .collect()
     }
 
-    /// The `pair` message for a pairing session with `secret`.
-    pub(super) fn pair(&self, secret: &[u8; 32], now: u64) -> Event {
-        let (t, a) = (self.t(), self.a());
-        let message = Pairing::Pair {
-            v: V1,
-            label: "My phone".into(),
-            approver: Hex32(a),
-            proof: sig::pair_proof(secret, &self.channel, &t, &a),
-            approver_sig: sig::sign(
-                &self.approver,
-                &sig::pair_approver_digest(&self.channel, &t, &a),
-            ),
-        };
-        let tag = TagKey::for_pairing(secret);
+    /// A pairing wrap of `message` for the session with `secret`.
+    pub(super) fn pairing_wrap(&self, secret: &[u8; 32], message: &Pairing, now: u64) -> Event {
+        self.pairing_wrap_text(secret, &wire::to_text(message), now)
+    }
+
+    /// A pairing wrap of `text` for the session with `secret`.
+    pub(super) fn pairing_wrap_text(&self, secret: &[u8; 32], text: &str, now: u64) -> Event {
+        let tag = TagKey::pairing_phone(secret);
         wrap::wrap(
             &self.transport,
             &self.channel,
             &tag,
             kind::PAIRING,
-            &wire::to_text(&message),
+            text,
             now,
         )
         .unwrap()
     }
 
+    /// The `pair` message for a pairing session with `secret`.
+    pub(super) fn pair(&self, secret: &[u8; 32], now: u64) -> Event {
+        let message = sig::pair(&self.t(), &self.approver, &self.channel, secret, "My phone");
+        self.pairing_wrap(secret, &message, now)
+    }
+
     /// A decision on `request`, signed by `signer`.
-    pub(super) fn decide_as(&self, signer: &Keys, request: &Request, verdict: Verdict) -> String {
-        let digest = sig::decision_digest(
+    pub(super) fn decide_as(
+        &self,
+        signer: &ApproverSigningKey,
+        request: &Request,
+        verdict: Verdict,
+    ) -> String {
+        wire::to_text(&sig::decision(
+            signer,
             &self.channel,
-            &sig::xonly(signer),
-            &request.request_hash.0,
+            request.request_id,
+            request.request_hash,
             verdict,
-        );
-        wire::to_text(&Decision {
-            v: V1,
-            request_id: request.request_id,
-            request_hash: request.request_hash,
-            decision: verdict,
-            sig: sig::sign(signer, &digest),
-        })
+        ))
     }
 
     pub(super) fn decide(&self, request: &Request, verdict: Verdict) -> String {
         self.decide_as(&self.approver, request, verdict)
     }
 
-    /// A freeze or unfreeze with the next counter, signed by `signer`.
+    /// A freeze or unfreeze with the next counter, signed by `signer`,
+    /// whichever action it is.
     pub(super) fn freeze_as(
         &mut self,
-        signer: &Keys,
+        signer: &Signer,
         action: FreezeAction,
         scope: Scope,
         epoch: u64,
     ) -> String {
         self.counter += 1;
-        let digest = sig::freeze_digest(
-            &self.channel,
-            &sig::xonly(signer),
-            self.counter,
-            epoch,
-            action,
-            scope,
-        );
+        self.freeze_with_counter(signer, action, scope, epoch, self.counter)
+    }
+
+    /// A freeze or unfreeze with `counter`, signed by `signer`.
+    pub(super) fn freeze_with_counter(
+        &self,
+        signer: &Signer,
+        action: FreezeAction,
+        scope: Scope,
+        epoch: u64,
+        counter: u64,
+    ) -> String {
+        let key = match signer {
+            Signer::Transport(k) => SignerKey::Transport(Hex32(sig::xonly(k))),
+            Signer::Approver(k) => SignerKey::Approver(Hex33(sig::approver_key(k))),
+        };
+        let digest = sig::freeze_digest(&self.channel, &key, counter, epoch, action, scope);
+        let sig = match signer {
+            Signer::Transport(k) => sig::sign_bip340(k, &digest),
+            Signer::Approver(k) => sig::sign_p256(k, &digest),
+        };
         wire::to_text(&Freeze {
             v: V1,
             action,
             scope,
-            counter: self.counter,
+            counter,
             epoch,
-            signer: Hex32(sig::xonly(signer)),
-            sig: sig::sign(signer, &digest),
+            signer: key,
+            sig,
         })
     }
 
     pub(super) fn freeze(&mut self, scope: Scope, epoch: u64) -> String {
-        let t = self.transport.clone();
+        let t = Signer::Transport(self.transport.clone());
         self.freeze_as(&t, FreezeAction::Freeze, scope, epoch)
     }
 
     pub(super) fn unfreeze(&mut self, scope: Scope, epoch: u64) -> String {
-        let a = self.approver.clone();
+        let a = Signer::Approver(self.approver.clone());
         self.freeze_as(&a, FreezeAction::Unfreeze, scope, epoch)
     }
 }
@@ -194,7 +222,7 @@ impl Ap {
     /// Every wrap the gateway queued since the last call.
     fn sent(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
-        while let Ok(e) = self.link.outbox.try_recv() {
+        while let Some(e) = self.link.outbox.try_pop() {
             events.push(e);
         }
         events
@@ -299,6 +327,10 @@ impl Ap {
             .collect()
     }
 
+    fn epoch(&self) -> u64 {
+        self.gw.state.keep().agent_freeze_epoch().unwrap()
+    }
+
     fn store(&self) -> Store {
         Store::load(self.gw.state.keep()).unwrap()
     }
@@ -383,7 +415,7 @@ fn an_approved_event_is_signed_exactly_as_the_phone_saw_it() {
         .unwrap();
     let outcome: Outcome = wire::parse(&outcome.1).unwrap();
     assert_eq!(outcome.outcome, OutcomeKind::Approved);
-    assert_eq!(outcome.by, Some(Hex32(phone.a())));
+    assert_eq!(outcome.by, Some(Hex33(phone.a())));
     // The same decision again is for a consumed request: ignored.
     assert!(ap.deliver_from(
         &phone,
@@ -420,8 +452,7 @@ fn a_denial_answers_the_agent_and_three_in_a_day_freeze_the_credential() {
         .unwrap();
     assert_eq!(credential["frozen"], json!(true));
     // The freeze moved the epoch and every phone was shown it.
-    let store = ap.store();
-    assert_eq!(store.epoch, 1);
+    assert_eq!(ap.epoch(), 1);
     let anchor = ap
         .received(&mut phone)
         .into_iter()
@@ -444,7 +475,7 @@ fn a_denial_answers_the_agent_and_three_in_a_day_freeze_the_credential() {
     );
     let answer = reply(pending.unwrap());
     assert_eq!(answer["ok"], json!(true), "{answer}");
-    assert_eq!(ap.store().epoch, 2);
+    assert_eq!(ap.epoch(), 2);
     let mut pending = ap.park(&token, 7, "sign_nostr_event", kind0());
     assert!(unanswered(&mut pending), "served again after the unfreeze");
 }
@@ -483,10 +514,11 @@ fn the_deadline_expires_a_request_on_the_budget_clock() {
 }
 
 #[test]
-fn one_request_waits_per_credential_and_sixteen_in_all() {
+fn one_request_waits_per_credential_and_agents_leave_room_for_management() {
+    let agents = MAX_PARKED - MANAGEMENT_RESERVED;
     let mut ap = Ap::new();
     let mut tokens = Vec::new();
-    for _ in 0..=MAX_PARKED {
+    for _ in 0..=agents {
         tokens.push(ap.issue(&nostr_grant(ap.gw.key)).1);
     }
     let mut phone = Phone::new();
@@ -501,15 +533,21 @@ fn one_request_waits_per_credential_and_sixteen_in_all() {
         )
     );
     let mut parked = Vec::new();
-    for token in &tokens[1..MAX_PARKED] {
+    for token in &tokens[1..agents] {
         parked.push(ap.park(token, 1, "sign_nostr_event", kind0()));
     }
-    let (text, error) = ap.gw.tool(&tokens[MAX_PARKED], "sign_nostr_event", kind0());
+    let (text, error) = ap.gw.tool(&tokens[agents], "sign_nostr_event", kind0());
     assert!(error);
     assert!(
         text.as_str().unwrap().contains("too many requests"),
         "{text}"
     );
+    // The owner can still ask for an unfreeze, twice over.
+    for _ in 0..MANAGEMENT_RESERVED {
+        let conn = ap.conn();
+        let (answer, pending) = ap.admin_from(0, conn, json!({ "op": "unfreeze_all" }));
+        assert!(pending.is_some(), "{answer}");
+    }
 }
 
 #[test]
@@ -523,7 +561,7 @@ fn a_freeze_cancels_what_it_covers_and_takes_effect_from_the_phone() {
     let (text, error) = tool_text(&reply(pending));
     assert!(error);
     assert_eq!(text, "canceled: frozen");
-    assert_eq!(ap.store().epoch, 1);
+    assert_eq!(ap.epoch(), 1);
     assert_eq!(ap.store().devices[0].counter, 1);
     let got = ap.received(&mut phone);
     let anchor: Anchor =
@@ -545,22 +583,24 @@ fn a_freeze_cancels_what_it_covers_and_takes_effect_from_the_phone() {
 fn each_action_has_one_signer() {
     let (mut ap, mut phone, _, token) = paired();
     // A freeze signed by the approver key, an unfreeze by the transport key.
-    let a = phone.approver.clone();
-    let t = phone.transport.clone();
+    let a = Signer::Approver(phone.approver.clone());
+    let t = Signer::Transport(phone.transport.clone());
     let bad_freeze = phone.freeze_as(&a, FreezeAction::Freeze, Scope::All, 0);
     ap.deliver_from(&phone, kind::FREEZE, &bad_freeze);
-    assert_eq!(ap.store().epoch, 0);
+    assert_eq!(ap.epoch(), 0);
     let bad_unfreeze = phone.freeze_as(&t, FreezeAction::Unfreeze, Scope::All, 0);
     ap.deliver_from(&phone, kind::FREEZE, &bad_unfreeze);
-    assert_eq!(ap.store().epoch, 0);
-    // A decision signed by the transport key.
+    assert_eq!(ap.epoch(), 0);
+    // A decision carrying the approver key's signature over an unfreeze: a
+    // signature over one digest never verifies over another.
     let mut pending = ap.park(&token, 1, "sign_nostr_event", kind0());
     let request = ap.requests(&mut phone).pop().unwrap();
-    ap.deliver_from(
-        &phone,
-        kind::DECISION,
-        &phone.decide_as(&t, &request, Verdict::Approve),
-    );
+    let unfreeze: Freeze =
+        wire::parse(&phone.freeze_as(&a, FreezeAction::Unfreeze, Scope::All, 0)).unwrap();
+    let mut borrowed: keep_approval::messages::Decision =
+        wire::parse(&phone.decide(&request, Verdict::Approve)).unwrap();
+    borrowed.sig = unfreeze.sig;
+    ap.deliver_from(&phone, kind::DECISION, &wire::to_text(&borrowed));
     assert!(unanswered(&mut pending));
     // A decision sealed by this phone but signed by another device's key.
     let other = Phone::new();
@@ -619,7 +659,7 @@ fn an_unfreeze_from_an_old_epoch_is_refused_and_the_retry_is_taken() {
     let retry = phone.unfreeze(Scope::All, anchor.frozen.epoch);
     ap.deliver_from(&phone, kind::FREEZE, &retry);
     assert!(!ap.gw.state.keep().agent_freeze().unwrap());
-    assert_eq!(ap.store().epoch, 2);
+    assert_eq!(ap.epoch(), 2);
     // Replayed later, after another freeze: refused.
     let refreeze = phone.freeze(Scope::All, 2);
     ap.deliver_from(&phone, kind::FREEZE, &refreeze);
@@ -642,79 +682,51 @@ fn pairing_needs_both_proofs_and_two_keys() {
     };
     // No approver signature: one by another key.
     let shown = try_pair(&mut ap, &|phone, secret, now| {
-        let (t, a) = (phone.t(), phone.a());
-        let message = Pairing::Pair {
-            v: V1,
-            label: "x".into(),
-            approver: Hex32(a),
-            proof: sig::pair_proof(secret, &phone.channel, &t, &a),
-            approver_sig: sig::sign(
-                &Keys::generate(),
-                &sig::pair_approver_digest(&phone.channel, &t, &a),
-            ),
-        };
-        let tag = TagKey::for_pairing(secret);
-        wrap::wrap(
-            &phone.transport,
-            &phone.channel,
-            &tag,
-            kind::PAIRING,
-            &wire::to_text(&message),
-            now,
-        )
-        .unwrap()
+        let mut message = sig::pair(&phone.t(), &phone.approver, &phone.channel, secret, "x");
+        if let Pairing::Pair { approver_sig, .. } = &mut message {
+            *approver_sig = sig::sign_p256(
+                &approver_key(),
+                &sig::pair_approver_digest(&phone.channel, &phone.t(), &phone.a()),
+            );
+        }
+        phone.pairing_wrap(secret, &message, now)
     });
     assert_eq!(shown["ok"], json!(false), "{shown}");
     // A signature over other keys.
     let shown = try_pair(&mut ap, &|phone, secret, now| {
-        let (t, a) = (phone.t(), phone.a());
-        let message = Pairing::Pair {
-            v: V1,
-            label: "x".into(),
-            approver: Hex32(a),
-            proof: sig::pair_proof(secret, &phone.channel, &t, &a),
-            approver_sig: sig::sign(
+        let mut message = sig::pair(&phone.t(), &phone.approver, &phone.channel, secret, "x");
+        if let Pairing::Pair { approver_sig, .. } = &mut message {
+            *approver_sig = sig::sign_p256(
                 &phone.approver,
-                &sig::pair_approver_digest(&phone.channel, &[9; 32], &a),
-            ),
-        };
-        let tag = TagKey::for_pairing(secret);
-        wrap::wrap(
-            &phone.transport,
-            &phone.channel,
-            &tag,
-            kind::PAIRING,
-            &wire::to_text(&message),
-            now,
-        )
-        .unwrap()
+                &sig::pair_approver_digest(&phone.channel, &[9; 32], &phone.a()),
+            );
+        }
+        phone.pairing_wrap(secret, &message, now)
     });
     assert_eq!(shown["ok"], json!(false));
-    // The same key twice.
+    // A proof by another session's secret.
     let shown = try_pair(&mut ap, &|phone, secret, now| {
-        let t = phone.t();
-        let message = Pairing::Pair {
-            v: V1,
-            label: "x".into(),
-            approver: Hex32(t),
-            proof: sig::pair_proof(secret, &phone.channel, &t, &t),
-            approver_sig: sig::sign(
-                &phone.transport,
-                &sig::pair_approver_digest(&phone.channel, &t, &t),
-            ),
-        };
-        let tag = TagKey::for_pairing(secret);
-        wrap::wrap(
-            &phone.transport,
-            &phone.channel,
-            &tag,
-            kind::PAIRING,
-            &wire::to_text(&message),
-            now,
-        )
-        .unwrap()
+        let message = sig::pair(&phone.t(), &phone.approver, &phone.channel, &[7; 32], "x");
+        phone.pairing_wrap(secret, &message, now)
     });
     assert_eq!(shown["ok"], json!(false));
+    // An approver key of another type is not even opened as a `pair`: the
+    // session goes on waiting.
+    let conn = ap.conn();
+    let (answer, pending) = ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "x" }));
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    let phone = Phone::new();
+    let message = sig::pair(
+        &phone.t(),
+        &phone.approver,
+        &phone.channel,
+        &uri.secret,
+        "x",
+    );
+    let text = wire::to_text(&message).replace("\"p256\"", "\"bip340\"");
+    assert!(!ap.deliver(&phone.pairing_wrap_text(&uri.secret, &text, ap.now())));
+    assert!(unanswered(&mut pending.unwrap()));
+    ap.gw.state.admin_gone(conn);
     assert!(ap.store().devices.is_empty());
     // Only root pairs the first device.
     let conn = ap.conn();
@@ -755,7 +767,7 @@ fn untagged_and_wrongly_tagged_wraps_are_dropped_and_a_freeze_gets_through_a_flo
     let now = ap.now();
     for i in 0..200 {
         // Tagged for another pair of keys, or carrying no tag at all.
-        let tag = TagKey::for_peer(&stranger, &channel_pub).unwrap();
+        let tag = TagKey::device(&stranger, &channel_pub).unwrap();
         let event = wrap::wrap(
             &stranger,
             &channel_pub,
@@ -765,6 +777,17 @@ fn untagged_and_wrongly_tagged_wraps_are_dropped_and_a_freeze_gets_through_a_flo
             now,
         )
         .unwrap();
+        let event = if i % 2 == 0 {
+            event
+        } else {
+            use nostr_sdk::prelude::{EventBuilder, Kind, PublicKey, Tag};
+            EventBuilder::new(Kind::GiftWrap, event.content.clone())
+                .tag(Tag::public_key(
+                    PublicKey::from_slice(&channel_pub).unwrap(),
+                ))
+                .sign_with_keys(&Keys::generate())
+                .unwrap()
+        };
         assert!(!ap.deliver(&event));
     }
     let freeze = phone.freeze(Scope::All, 0);
@@ -807,8 +830,10 @@ fn a_freeze_and_an_approval_work_with_the_agents_audit_budget_used_up() {
     ap.deliver_from(&phone, kind::FREEZE, &freeze);
     assert!(ap.gw.state.keep().agent_freeze().unwrap());
     assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 1);
-    // A management change is still approved and recorded.
-    let unfreeze = phone.unfreeze(Scope::All, 1);
+    // A management change is still approved and recorded. The budget's own
+    // freeze of the credential moved the epoch too.
+    assert_eq!(ap.epoch(), 2);
+    let unfreeze = phone.unfreeze(Scope::All, 2);
     ap.deliver_from(&phone, kind::FREEZE, &unfreeze);
     assert!(!ap.gw.state.keep().agent_freeze().unwrap());
     assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 2);
@@ -966,7 +991,7 @@ fn a_second_device_is_added_with_the_first_ones_approval_and_removed_the_same_wa
         .any(|(k, t)| *k == kind::PAIRING && t.contains("paired")));
     // A grant may no longer name either of its keys.
     let mut grant = nostr_grant(ap.gw.key);
-    grant.nip44_peers.insert(second.a());
+    grant.nip44_peers.insert(second.t());
     let answer = ap
         .gw
         .admin(json!({ "op": "issue", "name": "x", "uid": OTHER, "grant": grant }));
@@ -1045,7 +1070,10 @@ fn a_spend_above_the_threshold_is_approved_with_its_budget_context() {
     assert_eq!(anchor.anchor.wallets.len(), 1);
     assert_eq!(anchor.anchor.wallets[0].seq, 1);
     assert_eq!(anchor.anchor.wallets[0].spent, 10_500);
-    assert!(anchor.anchor.wallets[0].wallet.starts_with("test:"));
+    assert!(anchor.anchor.wallets[0]
+        .wallet
+        .as_str()
+        .starts_with("test:"));
     let (seq, head) = ap.gw.state.keep().audit_anchor().unwrap();
     assert!(anchor.anchor.seq <= seq);
     assert_ne!(head, [0; 32]);
@@ -1207,16 +1235,16 @@ fn a_device_whose_key_is_a_vault_key_or_already_registered_is_refused() {
         ap.deliver(&event);
         reply(pending.unwrap())
     };
-    // The vault's own key as the approver key.
+    // The vault's own key as the transport key.
     let mut vaulted = Phone::new();
-    vaulted.approver = Keys::new(SecretKey::from_slice(&super::tests::SECRET).unwrap());
+    vaulted.transport = Keys::new(SecretKey::from_slice(&super::tests::SECRET).unwrap());
     let shown = pair_with(&mut ap, &vaulted);
     assert_eq!(shown["ok"], json!(false));
     assert!(
         shown["error"].as_str().unwrap().contains("in the vault"),
         "{shown}"
     );
-    // A key another device holds.
+    // A key another device holds, either one.
     let mut copy = Phone::new();
     copy.approver = first.approver.clone();
     let shown = pair_with(&mut ap, &copy);
@@ -1228,9 +1256,13 @@ fn a_device_whose_key_is_a_vault_key_or_already_registered_is_refused() {
             .contains("already registered"),
         "{shown}"
     );
-    // The channel key as a device key.
+    let mut copy = Phone::new();
+    copy.transport = first.transport.clone();
+    let shown = pair_with(&mut ap, &copy);
+    assert_eq!(shown["ok"], json!(false));
+    // The channel key as the transport key.
     let mut channelled = Phone::new();
-    channelled.approver = channel();
+    channelled.transport = channel();
     let shown = pair_with(&mut ap, &channelled);
     assert_eq!(shown["ok"], json!(false));
     assert_eq!(ap.store().devices.len(), 1);
@@ -1319,9 +1351,10 @@ fn another_credential_cannot_withdraw_a_request() {
 /// Management changes count against the same cap of 16 waiting requests.
 #[test]
 fn a_management_change_is_refused_once_sixteen_requests_wait() {
+    let agents = MAX_PARKED - MANAGEMENT_RESERVED;
     let mut ap = Ap::new();
     let mut tokens = Vec::new();
-    for _ in 0..MAX_PARKED {
+    for _ in 0..agents {
         tokens.push(ap.issue(&nostr_grant(ap.gw.key)).1);
     }
     let mut phone = Phone::new();
@@ -1330,6 +1363,13 @@ fn a_management_change_is_refused_once_sixteen_requests_wait() {
         .iter()
         .map(|token| ap.park(token, 1, "sign_nostr_event", kind0()))
         .collect();
+    let mut waiting = Vec::new();
+    for _ in 0..MANAGEMENT_RESERVED {
+        let conn = ap.conn();
+        let (_, pending) = ap.admin_from(0, conn, json!({ "op": "unfreeze_all" }));
+        waiting.push(pending.unwrap());
+    }
+    let _ = ap.requests(&mut phone);
     let conn = ap.conn();
     let (answer, pending) = ap.admin_from(
         0,
@@ -1345,10 +1385,7 @@ fn a_management_change_is_refused_once_sixteen_requests_wait() {
             .contains("too many requests are waiting"),
         "{answer}"
     );
-    assert!(ap
-        .requests(&mut phone)
-        .iter()
-        .all(|r| r.op != keep_approval::binding::Op::Management));
+    assert!(ap.requests(&mut phone).is_empty());
 }
 
 /// A freeze of the whole gateway cancels every waiting request: agents'
@@ -1387,7 +1424,7 @@ fn a_freeze_of_an_unknown_credential_is_refused() {
     let (mut ap, mut phone, _id, _token) = paired();
     let freeze = phone.freeze(Scope::Credential(Hex16([9; 16])), 0);
     ap.deliver_from(&phone, kind::FREEZE, &freeze);
-    assert_eq!(ap.store().epoch, 0);
+    assert_eq!(ap.epoch(), 0);
     assert_eq!(ap.store().devices[0].counter, 0);
     assert!(ap
         .gw

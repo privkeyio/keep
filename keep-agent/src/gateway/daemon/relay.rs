@@ -24,7 +24,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-use super::approvals::RelayLink;
+use super::approvals::{lock, RelayLink};
 use super::server::{with_state, LineReader, Shared};
 
 /// The longest line on the relay socket.
@@ -114,8 +114,7 @@ async fn serve_helper(
             }
         }
         tokio::select! {
-            event = link.outbox.recv() => {
-                let Some(event) = event else { return };
+            event = link.outbox.pop() => {
                 *unsent = Some(event);
             }
             line = reader.next_line() => {
@@ -151,15 +150,10 @@ async fn from_helper(
         // decrypted again.
         let inbox = link.inbox.clone();
         let now = wall();
-        let opened = tokio::task::spawn_blocking(move || {
-            inbox
-                .lock()
-                .ok()
-                .and_then(|mut inbox| inbox.open(&event, now))
-        })
-        .await
-        .ok()
-        .flatten();
+        let opened = tokio::task::spawn_blocking(move || lock(&inbox).open(&event, now))
+            .await
+            .ok()
+            .flatten();
         if let Some(opened) = opened {
             if with_state(state, stop, move |s| s.approval_message(opened))
                 .await
