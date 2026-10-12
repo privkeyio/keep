@@ -1265,3 +1265,45 @@ fn a_pairing_session_expires_and_is_used_once() {
     assert_eq!(answer["ok"], json!(true), "{answer}");
     assert_eq!(ap.store().devices.len(), 1);
 }
+
+/// The gateway's deadline counts, not the timer: a decision that arrives
+/// past it, before the timer has run, decides nothing.
+#[test]
+fn a_decision_past_the_deadline_decides_nothing() {
+    let (mut ap, mut phone, _, token) = paired();
+    let pending = ap.park(&token, 1, "sign_nostr_event", kind0());
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.boot.advance(120);
+    ap.deliver_from(&phone, kind::DECISION, &phone.decide(&request, Verdict::Approve));
+    ap.gw.state.approval_tick();
+    let (text, error) = tool_text(&reply(pending));
+    assert!(error);
+    assert_eq!(text, "no approval within 120 seconds");
+}
+
+/// Only the credential that asked may withdraw its request.
+#[test]
+fn another_credential_cannot_withdraw_a_request() {
+    let (mut ap, mut phone, _, token) = paired();
+    let mut pending = ap.park(&token, 5, "sign_nostr_event", kind0());
+    let _ = ap.requests(&mut phone);
+    // A second credential, issued with the phone's approval.
+    let conn = ap.conn();
+    let (_, issuing) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "other", "uid": AGENT, "grant": nostr_grant(ap.gw.key) }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.deliver_from(&phone, kind::DECISION, &phone.decide(&request, Verdict::Approve));
+    let other_token = reply(issuing.unwrap())["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    ap.gw.send(
+        AGENT,
+        &other_token,
+        json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 5 } }),
+    );
+    assert!(unanswered(&mut pending));
+}

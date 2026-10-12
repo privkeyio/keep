@@ -1,0 +1,67 @@
+# Keep agent gateway relay helper: carries the gateway's sealed approval
+# messages between its relay socket and the relays, as its own
+# `keep-gateway-relay` user. It holds no vault, key or credential, and can
+# open none of the messages it carries. Needs systemd 250 or later.
+#
+# Before the first start (see docs/USAGE.md, "Approvals"):
+#   - the `keep-gateway-relay` user and group;
+#   - the gateway running with the approvals drop-in
+#     (keep-gateway-approvals.conf) and at least one --approval-relay.
+
+[Unit]
+Description=Keep agent gateway relay helper
+Documentation=https://github.com/privkeyio/keep/blob/main/docs/USAGE.md#approvals
+Wants=network-online.target
+After=network-online.target keep-gateway.service
+
+[Service]
+User=keep-gateway-relay
+Group=keep-gateway-relay
+# The socket, and its directory, must belong to the gateway's user.
+ExecStart=/usr/local/bin/keep gateway relay --gateway-user keep-gateway
+# Its connections to the gateway and the relays, in the journal. It never
+# sees a key or what a message says.
+Environment=RUST_LOG=info
+# It reconnects to the gateway and the relays by itself; this covers a crash.
+Restart=always
+RestartSec=5
+
+UMask=0077
+LimitCORE=0
+LimitNOFILE=1024
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# The relays, and the gateway's socket; nothing else.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RemoveIPC=yes
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+# Not set, on purpose: PrivateUsers= would show the gateway's uid as the
+# overflow uid, so the helper could not check that the socket is the
+# gateway's.
+
+[Install]
+WantedBy=multi-user.target
