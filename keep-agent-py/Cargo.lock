@@ -1368,6 +1368,7 @@ version = "0.11.0"
 dependencies = [
  "chrono",
  "hex",
+ "keep-approval",
  "keep-bitcoin",
  "keep-core",
  "nostr-sdk",
@@ -1397,6 +1398,22 @@ dependencies = [
  "pyo3",
  "serde_json",
  "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "keep-approval"
+version = "0.11.0"
+dependencies = [
+ "bitcoin",
+ "hex",
+ "hkdf 0.13.0",
+ "hmac 0.13.0",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.17",
  "zeroize",
 ]
 
