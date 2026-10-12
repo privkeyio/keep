@@ -88,6 +88,10 @@ impl RegisteredDevice {
     }
 }
 
+/// Owner entries kept owed at most; past it, more of a type already owed
+/// are only counted.
+pub const MAX_OWED: usize = 64;
+
 /// An owner entry that could not be written yet, kept with the store so a
 /// restart does not lose it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,6 +99,24 @@ impl RegisteredDevice {
 pub struct OwedEntry {
     pub event: AuditEventType,
     pub reason: String,
+    /// Entries of the same type owed once [`MAX_OWED`] was reached, whose
+    /// text was not kept.
+    #[serde(default)]
+    pub more: u64,
+}
+
+impl OwedEntry {
+    /// The entry's text as written, saying how many more were not kept.
+    pub fn text(&self) -> String {
+        match self.more {
+            0 => self.reason.clone(),
+            more => format!(
+                "{} (and {more} more {} entries whose text was not kept while the log could \
+                 not be written)",
+                self.reason, self.event
+            ),
+        }
+    }
 }
 
 /// The approval state the vault holds.
@@ -142,6 +164,35 @@ impl Store {
         let bytes = self.encode()?;
         keep.update_agent_ledgers(&[STORE_KEY], |_| Ok(vec![bytes]))?;
         Ok(())
+    }
+
+    /// Owe owner entry `reason` of type `event`. Past [`MAX_OWED`], one of
+    /// a type already owed is counted on the newest of that type, so a flood
+    /// cannot grow the store without bound.
+    pub fn owe(&mut self, event: AuditEventType, reason: String) {
+        if self.owed.len() >= MAX_OWED {
+            if let Some(last) = self.owed.iter_mut().rev().find(|o| o.event == event) {
+                last.more = last.more.saturating_add(1);
+                return;
+            }
+        }
+        self.owed.push(OwedEntry {
+            event,
+            reason,
+            more: 0,
+        });
+    }
+
+    /// Write the owed entries to `keep`'s log, oldest first, stopping at the
+    /// first that still fails, and drop those written. Returns how many.
+    pub fn write_owed(&mut self, keep: &mut Keep) -> usize {
+        let written = self
+            .owed
+            .iter()
+            .take_while(|o| keep.record_owner_event(o.event, &o.text()).is_ok())
+            .count();
+        self.owed.drain(..written);
+        written
     }
 
     /// The device whose transport key is `transport`.
@@ -413,26 +464,22 @@ impl Approval {
 
     /// The approved management change, to apply as it is; an agent request
     /// is handed back, to go through [`crate::policy::evaluate_approved`].
-    pub fn into_management(self) -> std::result::Result<Approved, Self> {
+    pub fn into_management(self) -> std::result::Result<(Approved, Change), Self> {
         match self.approved.parked.object.as_ref() {
-            ParkedObject::Management(_) => Ok(*self.approved),
+            ParkedObject::Management(change) => {
+                let change = change.clone();
+                Ok((*self.approved, change))
+            }
             _ => Err(self),
         }
     }
+}
 
-    /// The parked request this approves.
-    pub fn parked(&self) -> &Parked {
-        &self.approved.parked
-    }
+impl std::ops::Deref for Approval {
+    type Target = Approved;
 
-    /// The device whose approver key signed the approval.
-    pub fn device(&self) -> &Device {
-        &self.approved.device
-    }
-
-    /// The decision's signature.
-    pub fn signature(&self) -> &Hex64 {
-        &self.approved.sig
+    fn deref(&self) -> &Approved {
+        &self.approved
     }
 }
 
@@ -451,6 +498,7 @@ impl Approved {
         &self.sig
     }
 
+    #[cfg(test)]
     pub fn into_parked(self) -> Parked {
         self.parked
     }
@@ -639,7 +687,8 @@ mod tests {
         let second = Approval::verify(&approve2, &f.channel, &f.device, parked).unwrap();
         let (d, _) = evaluate_approved(second, &grant(&f), &mut budgets, 0);
         assert_eq!(d, Decision::Deny(DenyReason::ManagementChange));
-        let approved = approval.into_management().unwrap();
+        let (approved, applied) = approval.into_management().unwrap();
+        assert_eq!(applied, change);
         assert!(matches!(
             approved.parked().object(),
             ParkedObject::Management(c) if *c == change

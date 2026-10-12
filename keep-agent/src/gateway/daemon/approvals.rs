@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-//! What the gateway keeps for approvals over Nostr: the approver devices and
-//! the freeze epoch in the vault, the wraps it opens outside its state lock,
-//! the queue of wraps waiting for the relay helper, and the link to it.
+//! What the gateway keeps for approvals over Nostr: the wraps it opens
+//! outside its state lock, the queue of wraps waiting for the relay helper,
+//! and the link to it.
 //!
-//! The approver devices, their freeze counters, the freeze epoch and recent
-//! denials live in the vault under [`STORE_KEY`], beside the agent ledgers
-//! (see [`crate::approval::Store`]). The channel key never does: it is a
+//! The approver devices and the rest of the approval state live in the
+//! vault beside the agent ledgers (see [`crate::approval::Store`]), and the
+//! freeze epoch in the vault's own config. The channel key never does: it is a
 //! credential of its own, sealed to the host, and the vault records only its
 //! public key, so a gateway started with another key, or none, is refused
 //! while an approver is registered.
@@ -20,10 +20,7 @@ use keep_approval::Hex32;
 use nostr_sdk::prelude::{Event, Keys};
 use tokio::sync::Notify;
 
-pub use crate::approval::{
-    OwedEntry, RegisteredDevice, Store, StoredDevice, DENIALS_TO_FREEZE, DENIAL_WINDOW_SECS,
-    STORE_KEY,
-};
+pub use crate::approval::{Store, StoredDevice};
 
 /// The most requests parked at once, across every credential.
 pub const MAX_PARKED: usize = 16;
@@ -32,6 +29,13 @@ pub const MAX_PARKED: usize = 16;
 /// re-parking cannot lock the owner out of issuing, unfreezing and changing
 /// who approves.
 pub const MANAGEMENT_RESERVED: usize = 2;
+
+/// Freezes one device may send in a minute; more are dropped unanswered.
+/// A phone resends a freeze no anchor has shown every 15 seconds and its
+/// owner may freeze a few credentials at once, so this is well above use,
+/// while it bounds the anchors and the work a stolen transport key, which
+/// needs no biometric, can cause.
+pub const FREEZES_PER_MINUTE: u32 = 30;
 
 /// How long a pairing session lasts.
 pub const PAIRING_SECS: u64 = 600;
@@ -185,13 +189,9 @@ impl Outbox {
     }
 
     /// How many wraps are queued.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         lock(&self.queue).len()
-    }
-
-    /// Whether none are.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -263,6 +263,7 @@ pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::Chan
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::DENIAL_WINDOW_SECS;
     use crate::policy::{BitcoinGrant, Grant, RequestLimits, ReservedKeys};
     use crate::scope::Operation;
     use keep_approval::change::{Change, OPERATIONS};

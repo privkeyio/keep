@@ -888,13 +888,25 @@ fn a_freeze_and_an_approval_work_with_the_agents_audit_budget_used_up() {
     ap.deliver_from(&phone, kind::FREEZE, &freeze);
     assert!(ap.gw.state.keep().agent_freeze().unwrap());
     assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 1);
-    // A management change is still approved and recorded. The budget's own
-    // freeze of the credential moved the epoch too.
+    // The budget's own freeze of the credential moved the epoch too.
     assert_eq!(ap.epoch(), 2);
-    let unfreeze = phone.unfreeze(Scope::All, 2);
-    ap.deliver_from(&phone, kind::FREEZE, &unfreeze);
+    // A management change is still decided on the phone, applied and
+    // recorded.
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(0, conn, json!({ "op": "unfreeze_all" }));
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(true));
     assert!(!ap.gw.state.keep().agent_freeze().unwrap());
-    assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 2);
+    assert!(ap
+        .gw
+        .reasons(AuditEventType::AgentApprovalDecided)
+        .iter()
+        .any(|r| r.contains("approved and applied") && r.contains(&request.request_hash.to_hex())));
 }
 
 #[test]
@@ -1824,6 +1836,9 @@ fn an_added_device_is_checked_again_when_approved() {
     assert_eq!(answers[0]["ok"], json!(true), "{}", answers[0]);
     assert_eq!(answers[1]["ok"], json!(false), "{}", answers[1]);
     assert_eq!(ap.store().devices.len(), 2);
+    // The addition approved but not carried out is refused to the phone.
+    let mut second = second;
+    assert!(refused(&mut ap, &mut second));
 }
 
 fn cid_of(id: &str) -> [u8; 16] {
@@ -2107,16 +2122,30 @@ fn expired_and_withdrawn_requests_count_against_the_agents_audit_budget() {
     ap.gw.boot.advance(120);
     ap.gw.state.approval_tick();
     assert!(!unanswered(&mut pending));
-    assert!(ap.gw.entries(AuditEventType::AgentRefused).iter().any(|e| e
-        .reason
-        .as_deref()
-        .unwrap_or_default()
-        .contains("approval expired")));
+    let decided = |ap: &Ap| -> Vec<keep_core::audit::AuditEntry> {
+        ap.gw.entries(AuditEventType::AgentApprovalDecided)
+    };
+    let expired = decided(&ap);
+    assert_eq!(expired.len(), 1);
+    let text = expired[0].reason.clone().unwrap_or_default();
+    assert!(
+        text.starts_with(&format!("agent {id} approval expired")) && text.contains("expired"),
+        "{text}"
+    );
     assert!(!ap.frozen(&id));
+    // The withdrawal finds the budget used up: the credential is frozen,
+    // and the end is still written, as the owner's.
     let pending = ap.park(&token, 2, "sign_nostr_event", kind0());
     ap.gw.state.cancel_parked(pending.request_id.unwrap());
     assert!(ap.frozen(&id), "the withdrawal was not charged");
     assert_eq!(ap.epoch(), 1);
+    let ended = decided(&ap);
+    assert_eq!(ended.len(), 2);
+    let text = ended[1].reason.clone().unwrap_or_default();
+    assert!(
+        text.starts_with(&format!("agent {id} approval withdrawn: request ")),
+        "{text}"
+    );
 }
 
 /// A freeze of everything, from the device being removed or any other,
@@ -2472,4 +2501,207 @@ fn a_failed_revoke_or_delete_still_cancels_what_the_credential_waits_for() {
         let (text, error) = tool_text(&reply(pending));
         assert!(error && text.starts_with("canceled"), "{op}: {text}");
     }
+}
+
+/// The last anchor `phone` received since the last call.
+fn last_anchor(ap: &mut Ap, phone: &mut Phone) -> Option<Anchor> {
+    ap.received(phone)
+        .into_iter()
+        .rfind(|(k, _)| *k == kind::ANCHOR)
+        .map(|(_, t)| wire::parse(&t).unwrap())
+}
+
+/// A credential row that cannot be read stops neither pairing nor the
+/// anchors: it is shown frozen, since it serves no agent.
+#[test]
+fn an_unreadable_credential_is_shown_frozen_and_anchors_go_on() {
+    let mut ap = Ap::new();
+    let (id, _) = ap.issue(&nostr_grant(ap.gw.key));
+    let bad = [0xee; 16];
+    ap.gw
+        .state
+        .keep()
+        .misplace_agent_credential_for_testing(&cid_of(&id), &bad)
+        .unwrap();
+    let mut phone = Phone::new();
+    ap.pair_first(&mut phone);
+    ap.gw.boot.advance(super::approvals::ANCHOR_EVERY_SECS);
+    ap.gw.state.approval_tick();
+    let anchor = last_anchor(&mut ap, &mut phone).expect("an anchor");
+    assert_eq!(anchor.frozen.credentials, [Hex16(bad)]);
+}
+
+/// With approvals off, a freeze from the admin socket keeps the approval
+/// state the vault holds, and owed entries are still written.
+#[test]
+fn with_approvals_off_a_freeze_keeps_the_approval_state_and_owed_entries_are_written() {
+    use crate::approval::OwedEntry;
+    use keep_approval::messages::LogPoint;
+    let mut gw = Gw::new();
+    let store = Store {
+        owed: vec![OwedEntry {
+            event: AuditEventType::AgentApproverRemoved,
+            reason: "owed from before".into(),
+            more: 0,
+        }],
+        last_anchor: Some(LogPoint {
+            seq: 5,
+            head: Hex32([3; 32]),
+        }),
+        denials: [(Hex16([4; 16]), vec![1])].into(),
+        ..Store::default()
+    };
+    store.save(gw.state.keep_mut()).unwrap();
+    gw.admin_ok(json!({ "op": "freeze_all" }));
+    assert_eq!(Store::load(gw.state.keep()).unwrap(), store);
+    gw.state.approval_tick();
+    let after = Store::load(gw.state.keep()).unwrap();
+    assert!(after.owed.is_empty());
+    assert_eq!(after.last_anchor, store.last_anchor);
+    assert_eq!(after.denials, store.denials);
+    assert_eq!(
+        gw.reasons(AuditEventType::AgentApproverRemoved),
+        ["owed from before"]
+    );
+}
+
+/// A device is registered once it is saved, though its entry has to wait
+/// for the log: the entry is kept owed with it and written later.
+#[test]
+fn a_device_is_registered_though_its_entry_waits_for_the_log() {
+    let mut ap = Ap::new();
+    let mut phone = Phone::new();
+    ap.gw.break_log(true);
+    ap.pair_first(&mut phone);
+    let store = ap.store();
+    assert_eq!(store.devices.len(), 1);
+    assert_eq!(store.owed.len(), 1);
+    ap.gw.break_log(false);
+    ap.gw.state.approval_tick();
+    assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverAdded).len(), 1);
+    assert!(ap.store().owed.is_empty());
+}
+
+/// A removal and a reset are made though their entries have to wait for
+/// the log.
+#[test]
+fn a_removal_and_a_reset_are_made_though_their_entries_wait_for_the_log() {
+    let (mut ap, mut phone, _, _) = paired();
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "approver_remove", "transport": hex::encode(phone.t()) }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.break_log(true);
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(true));
+    assert!(ap.store().devices.is_empty());
+    let (answer, _) = ap.admin_from(0, conn, json!({ "op": "approver_reset" }));
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    ap.gw.break_log(false);
+    ap.gw.state.approval_tick();
+    let removed = ap.gw.reasons(AuditEventType::AgentApproverRemoved);
+    assert_eq!(removed.len(), 2, "{removed:?}");
+    assert!(removed[0].starts_with("label "));
+    assert!(removed[1].starts_with("reset: no approver"));
+    assert!(ap.store().owed.is_empty());
+}
+
+/// A freeze already in effect writes nothing (no entry, no epoch, no
+/// counter) and is answered with the state; past the rate, a device's
+/// freezes are dropped until the minute is over.
+#[test]
+fn a_freeze_already_in_effect_writes_nothing_and_a_flood_is_cut_off() {
+    use super::approvals::FREEZES_PER_MINUTE;
+    let (mut ap, mut phone, _, _) = paired();
+    let freeze = phone.freeze(Scope::All, 0);
+    ap.deliver_from(&phone, kind::FREEZE, &freeze);
+    assert_eq!(ap.epoch(), 1);
+    let _ = ap.received(&mut phone);
+    for _ in 1..FREEZES_PER_MINUTE {
+        let again = phone.freeze(Scope::All, 1);
+        ap.deliver_from(&phone, kind::FREEZE, &again);
+    }
+    assert_eq!(ap.gw.reasons(AuditEventType::AgentApproverFreeze).len(), 1);
+    assert_eq!(ap.epoch(), 1);
+    assert_eq!(ap.store().devices[0].counter, 1);
+    let anchors = ap
+        .received(&mut phone)
+        .iter()
+        .filter(|(k, _)| *k == kind::ANCHOR)
+        .count();
+    assert_eq!(anchors as u32, FREEZES_PER_MINUTE - 1);
+    let over = phone.freeze(Scope::All, 1);
+    ap.deliver_from(&phone, kind::FREEZE, &over);
+    assert!(last_anchor(&mut ap, &mut phone).is_none());
+    ap.gw.boot.advance(60);
+    let later = phone.freeze(Scope::All, 1);
+    ap.deliver_from(&phone, kind::FREEZE, &later);
+    assert!(last_anchor(&mut ap, &mut phone).is_some());
+}
+
+/// A phone whose addition is denied is told it was refused.
+#[test]
+fn a_phone_whose_addition_is_denied_is_told_it_was_refused() {
+    let (mut ap, mut first, _, _) = paired();
+    let mut second = Phone::new();
+    let conn = ap.conn();
+    let (answer, pending) =
+        ap.admin_from(0, conn, json!({ "op": "approver_pair", "label": "Tablet" }));
+    let uri = PairingUri::parse(answer["result"]["uri"].as_str().unwrap()).unwrap();
+    assert!(ap.deliver(&second.pair(&uri.secret, ap.now())));
+    let _ = reply(pending.unwrap());
+    let (_, pending) = ap.admin_from(0, conn, json!({ "op": "approver_confirm" }));
+    let request = ap.requests(&mut first).pop().unwrap();
+    ap.deliver_from(
+        &first,
+        kind::DECISION,
+        &first.decide(&request, Verdict::Deny),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(false));
+    assert!(refused(&mut ap, &mut second));
+    assert_eq!(ap.store().devices.len(), 1);
+}
+
+/// Whether `phone` was sent a pairing `refused` since the last call.
+fn refused(ap: &mut Ap, phone: &mut Phone) -> bool {
+    ap.received(phone).iter().any(|(k, t)| {
+        *k == kind::PAIRING && matches!(wire::parse::<Pairing>(t), Ok(Pairing::Refused { .. }))
+    })
+}
+
+/// An approved issue is checked again when it is carried out: a key
+/// deleted from the vault while it waited is not issued.
+#[test]
+fn an_approved_issue_of_a_key_deleted_meanwhile_issues_nothing() {
+    let (mut ap, mut phone, _, _) = paired();
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "late", "uid": OTHER, "grant": nostr_grant(ap.gw.key) }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    let key = ap.gw.key;
+    ap.gw.state.keep_mut().delete_key(&key).unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending.unwrap());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("not in the vault"),
+        "{answer}"
+    );
 }

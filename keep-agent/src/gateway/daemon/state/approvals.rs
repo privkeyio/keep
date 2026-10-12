@@ -34,12 +34,11 @@ use zeroize::Zeroizing;
 use super::{
     decode_ledger, line, load_credential, tool_result, wallet_key, Refusal, State, LEDGER_NETWORKS,
 };
-use crate::approval::{Approval, OwedEntry, ParkRequest, Parked, ParkedObject, STORE_KEY};
+use crate::approval::{Approval, ParkRequest, Parked, ParkedObject, STORE_KEY};
 use crate::error::{AgentError, Result};
-use crate::gateway::audit::RefusalKind;
 use crate::gateway::daemon::approvals::{
     lock, Carries, Inbox, Outbox, RelayLink, Source, Store, StoredDevice, ANCHOR_EVERY_SECS,
-    MANAGEMENT_RESERVED, MAX_PARKED, PAIRING_SECS,
+    FREEZES_PER_MINUTE, MANAGEMENT_RESERVED, MAX_PARKED, PAIRING_SECS,
 };
 use crate::gateway::GrantedCredential;
 use crate::policy::{evaluate_approved, ApprovalReason, Budgets, Decision, Grant, Ledger};
@@ -158,6 +157,9 @@ pub(crate) struct Approvals {
     inbox: Arc<Mutex<Inbox>>,
     /// When the next anchor is due, on the budget clock.
     next_anchor: u64,
+    /// Each device's freezes in the current minute: when it began, on the
+    /// budget clock, and how many.
+    freezes: HashMap<[u8; 32], (u64, u32)>,
     /// Tests only: an approval's second check fails, which nothing else
     /// can make happen.
     #[cfg(test)]
@@ -254,6 +256,7 @@ impl State {
             outbox,
             inbox,
             next_anchor: self.clock.now(),
+            freezes: HashMap::new(),
             #[cfg(test)]
             reverify_fails: false,
         });
@@ -308,9 +311,10 @@ impl State {
 
     /// The approval deadline, when approvals are active.
     pub(crate) fn approval_deadline(&self) -> Option<u64> {
-        self.approvals_active()
-            .then(|| self.approvals.as_ref().map(|a| a.deadline_secs))
-            .flatten()
+        self.approvals
+            .as_ref()
+            .filter(|a| !a.store.devices.is_empty())
+            .map(|a| a.deadline_secs)
     }
 
     fn refresh_expected(&mut self) {
@@ -331,12 +335,14 @@ impl State {
         Ok(())
     }
 
-    /// The store as it is now, to change and save.
-    pub(super) fn store(&self) -> Store {
-        self.approvals
-            .as_ref()
-            .map(|a| a.store.clone())
-            .unwrap_or_default()
+    /// The store as it is now, to change and save: the one approvals keep,
+    /// or the vault's while approvals are off, so a change made then keeps
+    /// what is already there.
+    pub(super) fn store(&self) -> Result<Store> {
+        match self.approvals.as_ref() {
+            Some(a) => Ok(a.store.clone()),
+            None => Store::load(&self.keep),
+        }
     }
 
     /// Wrap `content` of `kind` for the device with transport key `to` and
@@ -371,6 +377,18 @@ impl State {
     /// so the next one's `prev` names it; when that cannot be recorded,
     /// nothing carrying it is sent.
     fn take_anchor(&mut self) -> Result<AnchorState> {
+        let mut store = self.store()?;
+        let before = store.last_anchor;
+        let anchor = self.anchor_into(&mut store)?;
+        if store.last_anchor != before {
+            self.save_store(store)?;
+        }
+        Ok(anchor)
+    }
+
+    /// The anchor now, with `prev` the last one `store` names, and `store`
+    /// changed to name this one: saved before anything carrying it is sent.
+    fn anchor_into(&self, store: &mut Store) -> Result<AnchorState> {
         let (seq, head) = self.keep.audit_anchor()?;
         let now = self.clock.now();
         let mut wallets = Vec::new();
@@ -393,26 +411,27 @@ impl State {
             }
         }
         wallets.sort_by(|a, b| a.wallet.cmp(&b.wallet));
-        let mut store = self.store();
         let anchor = AnchorState {
             seq,
             head: Hex32(head),
             prev: store.last_anchor,
             wallets,
         };
-        if store.last_anchor.as_ref() != Some(&anchor.point()) {
-            store.last_anchor = Some(anchor.point());
-            self.save_store(store)?;
-        }
+        store.last_anchor = Some(anchor.point());
         Ok(anchor)
     }
 
     /// What is frozen, the freeze epoch, and the unfreezes lately applied.
+    /// A credential whose row cannot be read serves no agent, so it is
+    /// listed as frozen rather than holding every anchor back.
     fn frozen_state(&self) -> Result<Frozen> {
         let mut credentials = Vec::new();
         for id in self.keep.agent_credential_ids()? {
-            if let Some(c) = load_credential(&self.keep, &id)? {
-                if c.frozen {
+            match load_credential(&self.keep, &id) {
+                Ok(Some(c)) if c.frozen => credentials.push(Hex16(id)),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(id = %hex(id), error = %e, "an agent credential cannot be read; anchors show it frozen");
                     credentials.push(Hex16(id));
                 }
             }
@@ -430,8 +449,12 @@ impl State {
         })
     }
 
-    /// Send an anchor to `to`, or to every device.
+    /// Send an anchor to `to`, or to every device while approvals are
+    /// active.
     fn send_anchor(&mut self, to: Option<[u8; 32]>) {
+        if to.is_none() && !self.approvals_active() {
+            return;
+        }
         let anchor = match self
             .frozen_state()
             .and_then(|f| Ok((self.take_anchor()?, f)))
@@ -459,8 +482,14 @@ impl State {
     fn owner_entry(&mut self, event: AuditEventType, reason: String) {
         if let Err(e) = self.keep.record_owner_event(event, &reason) {
             tracing::error!(error = %e, %event, "an approval entry could not be written yet; retrying");
-            let mut store = self.store();
-            store.owed.push(OwedEntry { event, reason });
+            let mut store = match self.store() {
+                Ok(store) => store,
+                Err(e) => {
+                    tracing::error!(error = %e, %event, "an approval entry is lost: the approval state cannot be read");
+                    return;
+                }
+            };
+            store.owe(event, reason);
             let owed = store.owed.clone();
             if let Err(e) = self.save_store(store) {
                 tracing::error!(error = %e, "an owed approval entry could not be kept in the vault");
@@ -474,25 +503,12 @@ impl State {
     /// Write the owner entries owed, oldest first, stopping at the first that
     /// still fails.
     fn retry_owed(&mut self) {
-        let mut store = self.store();
-        if store.owed.is_empty() {
+        let Ok(mut store) = self.store() else {
+            return;
+        };
+        if store.write_owed(&mut self.keep) == 0 {
             return;
         }
-        let mut written = 0;
-        for entry in &store.owed {
-            if self
-                .keep
-                .record_owner_event(entry.event, &entry.reason)
-                .is_err()
-            {
-                break;
-            }
-            written += 1;
-        }
-        if written == 0 {
-            return;
-        }
-        store.owed.drain(..written);
         let owed = store.owed.clone();
         if let Err(e) = self.save_store(store) {
             // Written but still owed in the vault: written again after a
@@ -505,13 +521,14 @@ impl State {
     }
 
     /// Run the approval timers: count freezes an audit budget made (the
-    /// vault moved the epoch with each), expire parked requests and a
-    /// pairing session past their time, retry owed entries, and send the
-    /// anchor every 15 minutes.
+    /// vault moved the epoch with each), retry owed entries (approvals on or
+    /// not), expire parked requests and a pairing session past their time,
+    /// and send the anchor every 15 minutes.
     pub fn approval_tick(&mut self) {
         for id in self.audit.take_frozen() {
             self.after_freeze(Scope::Credential(Hex16(id)), "an audit budget");
         }
+        self.retry_owed();
         let now = self.clock.now();
         let Some(a) = self.approvals.as_mut() else {
             return;
@@ -533,7 +550,6 @@ impl State {
         for id in expired {
             self.end(id, End::Expired);
         }
-        self.retry_owed();
         let Some(a) = self.approvals.as_mut() else {
             return;
         };
@@ -757,7 +773,10 @@ impl State {
     /// End parked request `id` other than by an approval: record it, tell
     /// every device, and answer whoever waits. An expiry or a withdrawal of
     /// an agent's request is charged to that agent's audit budget, so its
-    /// requests cannot use up the room the owner's entries need.
+    /// requests cannot use up the room the owner's entries need; one the
+    /// budget no longer takes is written as the owner's, so the log still
+    /// shows how every request ended. A phone whose addition ends is told
+    /// it was refused.
     fn end(&mut self, id: [u8; 32], end: End) {
         let Some(waiting) = self.approvals.as_mut().and_then(|a| a.parked.remove(&id)) else {
             return;
@@ -788,16 +807,18 @@ impl State {
         );
         match (&waiting.waiter, &end) {
             (Waiter::Agent { credential, .. }, End::Expired | End::Withdrawn) => {
-                let kind = match end {
-                    End::Expired => RefusalKind::ApprovalExpired,
-                    _ => RefusalKind::ApprovalWithdrawn,
+                let label = match end {
+                    End::Expired => "approval expired",
+                    _ => "approval withdrawn",
                 };
                 let now = self.clock.now();
                 if let Err(e) =
                     self.audit
-                        .record_refusal(&mut self.keep, credential, kind, &entry, now)
+                        .record_approval_ended(&mut self.keep, credential, label, &entry, now)
                 {
-                    tracing::warn!(error = %e, "the end of an agent's approval request could not be recorded");
+                    tracing::warn!(error = %e, "the end of an agent's approval request is written as the owner's");
+                    let entry = format!("agent {} {label}: {entry}", hex(credential));
+                    self.owner_entry(AuditEventType::AgentApprovalDecided, entry);
                 }
             }
             _ => self.owner_entry(AuditEventType::AgentApprovalDecided, entry),
@@ -816,19 +837,18 @@ impl State {
                 reply,
                 ..
             } => {
-                let _ = reply.send(self.reply_agent(id, &message));
+                let _ = reply.send(tool_result(id, &Value::String(message), true));
                 if matches!(end, End::Denied { .. }) {
                     self.note_denial(credential);
                 }
             }
-            Waiter::Admin { reply, .. } => {
+            Waiter::Admin { reply, effect, .. } => {
                 let _ = reply.send(admin_err(&message));
+                if let Some(transport) = adding(&effect, waiting.parked.object()) {
+                    self.refuse_pair(&transport, &message);
+                }
             }
         }
-    }
-
-    fn reply_agent(&self, id: Value, message: &str) -> Zeroizing<String> {
-        tool_result(id, &Value::String(message.into()), true)
     }
 
     fn send_outcome(&mut self, id: [u8; 32], outcome: OutcomeKind, by: Option<[u8; 33]>) {
@@ -846,13 +866,19 @@ impl State {
     /// freeze when it makes one.
     fn note_denial(&mut self, cid: [u8; 16]) {
         let now = self.clock.now();
-        let mut store = self.store();
+        let mut store = match self.store() {
+            Ok(store) => store,
+            Err(e) => {
+                tracing::error!(error = %e, "a denial could not be counted");
+                return;
+            }
+        };
         let freeze = store.note_denial(cid, now);
         if freeze {
             if let Err(e) = self.freeze(
                 Scope::Credential(Hex16(cid)),
                 "three denials in a day",
-                store,
+                Some(store),
             ) {
                 tracing::error!(error = %e, "a credential denied three times could not be frozen");
             }
@@ -1134,11 +1160,18 @@ impl State {
         approval: Approval,
         now: u64,
     ) -> super::Served {
-        let ParkedObject::Psbt { key, analysis, .. } = approval.parked().object() else {
+        let ParkedObject::Psbt {
+            psbt,
+            analysis,
+            key,
+            ..
+        } = approval.parked().object()
+        else {
             return Err(Refusal::Internal("not a PSBT".into()));
         };
-        let key = *key;
-        let network = analysis.network;
+        let (key, network, mut psbt) = (*key, analysis.network, (**psbt).clone());
+        let (fee_sats, leaving_wallet_sats) = (analysis.fee_sats, analysis.leaving_wallet_sats());
+        let request_id = approval.parked().request_id();
         let cid = granted.credential.id;
         let wallet = wallet_key(&key, network);
         let wallet_window_sats = self.settings.wallet_budget_sats;
@@ -1167,7 +1200,7 @@ impl State {
                 ])
             })
             .map_err(|e| Refusal::Internal(format!("the budget ledgers cannot be updated: {e}")))?;
-        let Some((decision, approved)) = outcome else {
+        let Some((decision, _)) = outcome else {
             return Err(Refusal::Internal("no decision".into()));
         };
         let reservation = match decision {
@@ -1180,16 +1213,12 @@ impl State {
                 ))
             }
         };
-        let ParkedObject::Psbt { psbt, .. } = approved.parked().object() else {
-            return Err(Refusal::Internal("not a PSBT".into()));
-        };
-        let mut psbt = (**psbt).clone();
         let signed = self.sign_psbt_exactly(&key, network, &mut psbt);
         let signed = signed.and_then(|count| {
             let txid = psbt.unsigned_tx.compute_txid();
             let context = format!(
                 "sign_bitcoin_psbt txid {txid} inputs {count} approved request {}",
-                hex(approved.parked().request_id())
+                hex(request_id)
             );
             self.audit
                 .record_signature(&mut self.keep, &cid, &key, txid.as_ref(), &context, now)
@@ -1197,18 +1226,13 @@ impl State {
             Ok(count)
         });
         match signed {
-            Ok(count) => {
-                let ParkedObject::Psbt { analysis, .. } = approved.parked().object() else {
-                    return Err(Refusal::Internal("not a PSBT".into()));
-                };
-                Ok(json!({
-                    "signed_psbt": keep_bitcoin::psbt::serialize_psbt_base64(&psbt),
-                    "inputs_signed": count,
-                    "fee_sats": analysis.fee_sats,
-                    "leaving_wallet_sats": analysis.leaving_wallet_sats(),
-                    "network": network.to_string()
-                }))
-            }
+            Ok(count) => Ok(json!({
+                "signed_psbt": keep_bitcoin::psbt::serialize_psbt_base64(&psbt),
+                "inputs_signed": count,
+                "fee_sats": fee_sats,
+                "leaving_wallet_sats": leaving_wallet_sats,
+                "network": network.to_string()
+            })),
             Err(refusal) => {
                 if let Some(reservation) = reservation {
                     self.release(&cid, &wallet, reservation);
@@ -1243,46 +1267,59 @@ impl State {
 
     // Freezes.
 
-    /// Freeze `scope` now, from `source`, saving `store` with it: the vault
-    /// applies the freeze and moves the freeze epoch in one write, so an
-    /// unfreeze held back from before can never undo it. Parked requests it
-    /// covers are canceled, even when the freeze cannot be written, and
-    /// every device is shown the new state.
-    pub(crate) fn freeze(&mut self, scope: Scope, source: &str, store: Store) -> Result<()> {
-        let bytes = store.encode()?;
+    /// Freeze `scope` now, from `source`, saving `store` with it when there
+    /// is one (a freeze never waits on the approval state being readable):
+    /// the vault applies the freeze and moves the freeze epoch in one write,
+    /// so an unfreeze held back from before can never undo it. Parked
+    /// requests it covers are canceled, even when the freeze cannot be
+    /// written, and every device is shown the new state.
+    pub(crate) fn freeze(
+        &mut self,
+        scope: Scope,
+        source: &str,
+        store: Option<Store>,
+    ) -> Result<()> {
+        let bytes = store.as_ref().and_then(|s| s.encode().ok());
+        let ledgers: Vec<(&[u8], &[u8])> = bytes.iter().map(|b| (STORE_KEY, &b[..])).collect();
         let id = match scope {
             Scope::All => None,
             Scope::Credential(id) => Some(id.0),
         };
         if let Err(e) = self
             .keep
-            .set_agent_frozen(id.as_ref(), true, None, &[(STORE_KEY, &bytes)])
+            .set_agent_frozen(id.as_ref(), true, None, &ledgers)
         {
             tracing::error!(error = %e, source, "a freeze could not be applied");
             self.cancel_covered(scope);
             return Err(e.into());
         }
-        if let Some(a) = self.approvals.as_mut() {
+        if let (Some(a), Some(store)) = (self.approvals.as_mut(), store.filter(|_| bytes.is_some()))
+        {
             a.store = store;
         }
         self.after_freeze(scope, source);
         Ok(())
     }
 
-    /// Clear the freeze of `scope` from the admin socket, with no approver
-    /// registered to ask: the epoch still moves.
     /// Delete credential `id`. Deleting a frozen credential clears its
     /// freeze, so the epoch moves and the clear is noted among the unfreezes
     /// anchors list, in the same write: no phone takes the freeze vanishing
-    /// for a rollback.
+    /// for a rollback. A row that cannot be read is listed as frozen (see
+    /// [`Self::frozen_state`]), so deleting it is treated the same way.
     pub(crate) fn delete_credential(&mut self, id: &[u8; 16]) -> Result<()> {
-        let frozen = load_credential(&self.keep, id)?.is_some_and(|c| c.frozen);
+        let frozen = match load_credential(&self.keep, id) {
+            Ok(c) => c.is_some_and(|c| c.frozen),
+            Err(e) => {
+                tracing::warn!(id = %hex(id), error = %e, "deleting an agent credential that cannot be read");
+                true
+            }
+        };
         if !frozen {
             self.keep.delete_agent_credential(id)?;
             return Ok(());
         }
         let epoch = self.keep.agent_freeze_epoch()?;
-        let mut store = self.store();
+        let mut store = self.store()?;
         store.denials.remove(&Hex16(*id));
         store.note_unfrozen(
             Scope::Credential(Hex16(*id)),
@@ -1295,18 +1332,16 @@ impl State {
         if let Some(a) = self.approvals.as_mut() {
             a.store = store;
         }
-        if self.approvals_active() {
-            self.send_anchor(None);
-        }
+        self.send_anchor(None);
         Ok(())
     }
 
+    /// Clear the freeze of `scope` from the admin socket, with no approver
+    /// registered to ask: the epoch still moves.
     pub(crate) fn unfreeze_now(&mut self, scope: Scope) -> Result<()> {
         let epoch = self.keep.agent_freeze_epoch()?;
         self.unfreeze(scope, epoch, None)?;
-        if self.approvals_active() {
-            self.send_anchor(None);
-        }
+        self.send_anchor(None);
         Ok(())
     }
 
@@ -1315,9 +1350,7 @@ impl State {
     fn after_freeze(&mut self, scope: Scope, source: &str) {
         tracing::warn!(?scope, source, "agents frozen");
         self.cancel_covered(scope);
-        if self.approvals_active() {
-            self.send_anchor(None);
-        }
+        self.send_anchor(None);
     }
 
     /// Cancel the parked requests a freeze of `scope` covers. A freeze of
@@ -1351,7 +1384,7 @@ impl State {
         epoch: u64,
         counter: Option<([u8; 32], u64)>,
     ) -> Result<()> {
-        let mut store = self.store();
+        let mut store = self.store()?;
         if let Some((transport, counter)) = counter {
             if let Some(d) = store
                 .devices
@@ -1399,22 +1432,29 @@ impl State {
             tracing::warn!(error = %e, "a freeze did not verify, ignored");
             return;
         }
-        // A replayed or reordered message, one whose counter jumps too far,
-        // or one for a credential that does not exist, is refused with the
-        // current state.
-        let known = match freeze.scope {
-            Scope::All => true,
-            Scope::Credential(id) => matches!(load_credential(&self.keep, &id.0), Ok(Some(_))),
-        };
+        // A replayed or reordered message, or one whose counter jumps too
+        // far, is refused with the current state. One for a credential that
+        // does not exist is refused by the vault, which writes nothing.
         if let Err(e) = sig::check_counter(stored.counter, freeze.counter) {
             tracing::info!(counter = freeze.counter, error = %e, "a freeze or unfreeze refused");
             self.send_anchor(Some(*transport));
             return;
         }
-        if !known {
-            tracing::info!("a freeze or unfreeze for an unknown credential refused");
-            self.send_anchor(Some(*transport));
-            return;
+        if matches!(freeze.action, FreezeAction::Freeze) {
+            if !self.freeze_allowed(transport) {
+                tracing::warn!(
+                    transport = %hex(transport),
+                    "a device sent more than {FREEZES_PER_MINUTE} freezes in a minute; dropped"
+                );
+                return;
+            }
+            // Already in effect: nothing to write or record, only the
+            // state to show, so a key that needs no biometric cannot grow
+            // the log by repeating a freeze.
+            if self.frozen_now(freeze.scope) {
+                self.send_anchor(Some(*transport));
+                return;
+            }
         }
         let what = match freeze.action {
             FreezeAction::Freeze => "freeze",
@@ -1431,10 +1471,10 @@ impl State {
         );
         match freeze.action {
             FreezeAction::Freeze => {
-                let mut store = self.store();
+                let mut store = self.store().ok();
                 if let Some(d) = store
-                    .devices
                     .iter_mut()
+                    .flat_map(|s| s.devices.iter_mut())
                     .find(|d| d.transport.0 == *transport)
                 {
                     d.counter = freeze.counter;
@@ -1461,6 +1501,32 @@ impl State {
                         self.send_anchor(Some(*transport));
                     }
                 }
+            }
+        }
+    }
+
+    /// Count a freeze from the device with transport key `transport`, and
+    /// say whether it is within [`FREEZES_PER_MINUTE`].
+    fn freeze_allowed(&mut self, transport: &[u8; 32]) -> bool {
+        let now = self.clock.now();
+        let Some(a) = self.approvals.as_mut() else {
+            return false;
+        };
+        let (since, count) = a.freezes.entry(*transport).or_insert((now, 0));
+        if now >= since.saturating_add(60) {
+            (*since, *count) = (now, 0);
+        }
+        *count = count.saturating_add(1);
+        *count <= FREEZES_PER_MINUTE
+    }
+
+    /// Whether a freeze of `scope` is in effect already. Unreadable state
+    /// counts as not, so the freeze is applied.
+    fn frozen_now(&self, scope: Scope) -> bool {
+        match scope {
+            Scope::All => self.keep.agent_freeze().unwrap_or(false),
+            Scope::Credential(id) => {
+                matches!(load_credential(&self.keep, &id.0), Ok(Some(c)) if c.frozen)
             }
         }
     }
@@ -1513,6 +1579,8 @@ impl State {
             Ok(u) => u,
             Err(e) => return (admin_err(&e.to_string()), None),
         };
+        let answer = pairing_line(&uri);
+        drop(uri);
         let (reply, receiver) = oneshot::channel();
         if let Some(a) = self.approvals.as_mut() {
             a.pairing = Some(PairingSession {
@@ -1526,7 +1594,7 @@ impl State {
         }
         self.refresh_expected();
         (
-            admin_ok(json!({ "uri": uri.as_str(), "expires_in": PAIRING_SECS })),
+            answer,
             Some(Pending {
                 request_id: None,
                 reply: receiver,
@@ -1663,29 +1731,22 @@ impl State {
         let Some(a) = self.approvals.as_mut() else {
             return (admin_err("approvals are not set up"), None);
         };
-        match a.pairing.as_ref() {
-            Some(s) if s.conn == conn => {
-                if matches!(s.state, PairState::Waiting) {
-                    return (admin_err("the phone has not paired yet"), None);
-                }
-            }
-            _ => {
-                return (
-                    admin_err("no pairing session is waiting on this connection"),
-                    None,
-                )
-            }
-        }
-        let Some(session) = a.pairing.take() else {
-            return (
-                admin_err("no pairing session is waiting on this connection"),
-                None,
-            );
+        let taken = a
+            .pairing
+            .take_if(|s| s.conn == conn && matches!(s.state, PairState::Confirming { .. }));
+        let Some(PairingSession {
+            state: PairState::Confirming { device, alg },
+            label,
+            ..
+        }) = taken
+        else {
+            let why = match &a.pairing {
+                Some(s) if s.conn == conn => "the phone has not paired yet",
+                _ => "no pairing session is waiting on this connection",
+            };
+            return (admin_err(why), None);
         };
         self.refresh_expected();
-        let PairState::Confirming { device, alg } = session.state else {
-            return (admin_err("the phone has not paired yet"), None);
-        };
         if !confirmed {
             self.refuse_pair(&device.transport, "the operator rejected the fingerprint");
             return (admin_ok(json!({ "rejected": true })), None);
@@ -1699,7 +1760,7 @@ impl State {
             .as_ref()
             .is_some_and(|a| a.store.devices.is_empty());
         if first {
-            return match self.register(device, alg, &session.label) {
+            return match self.register(device, alg, &label) {
                 Ok(fingerprint) => (admin_ok(json!({ "registered": fingerprint })), None),
                 Err(e) => {
                     self.refuse_pair(
@@ -1713,18 +1774,22 @@ impl State {
         let change = Change::AddApprover {
             transport: Hex32(device.transport),
             approver: Hex33(device.approver),
-            label: session.label.clone(),
+            label,
             fingerprint: sig::fingerprint(&device.transport, &device.approver),
         };
         self.park_management(conn, change, Effect::AddApprover)
     }
 
     /// Register `device` with approver key type `alg`, labeled `label`,
-    /// record it, and tell it so.
+    /// record it, and tell it so. Everything the phone is told is built
+    /// before the device is saved, and the entry is saved owed with it and
+    /// written right after: once saved, the device is registered, whatever
+    /// follows.
     fn register(&mut self, device: Device, alg: Alg, label: &str) -> Result<String> {
         let Some(a) = self.approvals.as_ref() else {
             return Err(AgentError::Other("approvals are not set up".into()));
         };
+        let (relays, deadline_secs) = (a.relays.clone(), a.deadline_secs);
         let mut store = a.store.clone();
         store.channel = Some(Hex32(a.channel_pub));
         store.devices.push(StoredDevice {
@@ -1735,32 +1800,30 @@ impl State {
             counter: 0,
         });
         let fingerprint = sig::fingerprint(&device.transport, &device.approver);
-        self.keep.record_owner_event(
+        let frozen = self.frozen_state()?;
+        let anchor = self.anchor_into(&mut store)?;
+        store.owe(
             AuditEventType::AgentApproverAdded,
-            &format!(
+            format!(
                 "label \"{}\" transport {} approver {} alg p256 fingerprint {fingerprint}",
                 keep_core::agent::audit_text(label),
                 hex(device.transport),
                 hex(device.approver)
             ),
-        )?;
+        );
         self.save_store(store)?;
+        self.retry_owed();
         if let Some(a) = self.approvals.as_mut() {
             a.next_anchor = 0;
         }
         self.refresh_expected();
-        let frozen = self.frozen_state()?;
         let paired = Pairing::Paired {
             v: V1,
             transport: Hex32(device.transport),
             approver: Hex33(device.approver),
-            relays: self
-                .approvals
-                .as_ref()
-                .map(|a| a.relays.clone())
-                .unwrap_or_default(),
-            deadline_secs: self.approvals.as_ref().map_or(0, |a| a.deadline_secs),
-            anchor: self.take_anchor()?,
+            relays,
+            deadline_secs,
+            anchor,
             frozen,
         };
         self.send_to(
@@ -1773,9 +1836,10 @@ impl State {
         Ok(fingerprint)
     }
 
-    /// Remove `device`, record it, and stop expecting its messages.
+    /// Remove `device`, record it, and stop expecting its messages. The
+    /// entry is saved owed with the removal and written right after.
     fn unregister(&mut self, transport: &[u8; 32]) -> Result<()> {
-        let mut store = self.store();
+        let mut store = self.store()?;
         let Some(i) = store
             .devices
             .iter()
@@ -1787,16 +1851,17 @@ impl State {
         if store.devices.is_empty() {
             store.channel = None;
         }
-        self.keep.record_owner_event(
+        store.owe(
             AuditEventType::AgentApproverRemoved,
-            &format!(
+            format!(
                 "label \"{}\" transport {} approver {}",
                 keep_core::agent::audit_text(&removed.label),
                 removed.transport.to_hex(),
                 removed.approver.to_hex()
             ),
-        )?;
+        );
         self.save_store(store)?;
+        self.retry_owed();
         self.refresh_expected();
         if !self.approvals_active() {
             // No approver is left to answer.
@@ -1998,18 +2063,11 @@ impl State {
     /// recorded as not carried out and announced canceled.
     fn carry_out_management(&mut self, approval: Approval, effect: Effect) -> Zeroizing<String> {
         let by = ApprovedBy::of(&approval);
-        let approved = match approval.into_management() {
-            Ok(a) => a,
-            Err(_) => {
-                self.decided_entry(&by, Err("an agent request waited as a management change"));
-                return admin_err("an agent request waited as a management change");
-            }
+        let refuse = adding(&effect, approval.parked().object());
+        let Ok((_, change)) = approval.into_management() else {
+            self.decided_entry(&by, Err("an agent request waited as a management change"));
+            return admin_err("an agent request waited as a management change");
         };
-        let ParkedObject::Management(change) = approved.parked().object() else {
-            self.decided_entry(&by, Err("not a management change"));
-            return admin_err("not a management change");
-        };
-        let change = change.clone();
         let done: Result<Zeroizing<String>> = match (change, effect) {
             (
                 Change::IssueCredential {
@@ -2082,6 +2140,9 @@ impl State {
             Err(e) => {
                 let why = e.to_string();
                 self.decided_entry(&by, Err(&why));
+                if let Some(transport) = refuse {
+                    self.refuse_pair(&transport, &why);
+                }
                 admin_err(&why)
             }
         }
@@ -2144,30 +2205,62 @@ impl State {
 
 /// Remove every approver device from the vault's store and record each, or
 /// that there were none: what `keep gateway approver reset` does, with the
-/// gateway running or not. Returns how many were removed.
+/// gateway running or not. The entries are saved owed with the reset and
+/// written right after; one the log cannot take yet stays owed, and the
+/// gateway writes it. Returns how many were removed.
 pub fn reset_store(keep: &mut keep_core::Keep) -> Result<usize> {
     let mut store = Store::load(keep)?;
     let removed = std::mem::take(&mut store.devices);
     if removed.is_empty() {
-        keep.record_owner_event(
+        store.owe(
             AuditEventType::AgentApproverRemoved,
-            "reset: no approver device was registered",
-        )?;
+            "reset: no approver device was registered".into(),
+        );
     }
     for d in &removed {
-        keep.record_owner_event(
+        store.owe(
             AuditEventType::AgentApproverRemoved,
-            &format!(
+            format!(
                 "reset: label \"{}\" transport {} approver {}",
                 keep_core::agent::audit_text(&d.label),
                 d.transport.to_hex(),
                 d.approver.to_hex()
             ),
-        )?;
+        );
     }
     store.channel = None;
     store.save(keep)?;
+    if store.write_owed(keep) > 0 {
+        if let Err(e) = store.save(keep) {
+            tracing::warn!(error = %e, "the reset's entries were written but are still owed; they will be written again");
+        }
+    }
     Ok(removed.len())
+}
+
+/// The pairing answer, written straight into a buffer that is wiped and
+/// sized so it never reallocates, since the URI carries the pairing secret.
+fn pairing_line(uri: &str) -> Zeroizing<String> {
+    let mut out = Zeroizing::new(Vec::with_capacity(uri.len() * 6 + 64));
+    out.extend_from_slice(b"{\"ok\":true,\"result\":{\"expires_in\":");
+    out.extend_from_slice(PAIRING_SECS.to_string().as_bytes());
+    out.extend_from_slice(b",\"uri\":");
+    if serde_json::to_writer(&mut *out, uri).is_err() {
+        return admin_err("the pairing code could not be written");
+    }
+    out.extend_from_slice(b"}}");
+    // JSON is UTF-8, so this never fails.
+    Zeroizing::new(String::from_utf8(std::mem::take(&mut *out)).unwrap_or_default())
+}
+
+/// The transport key of the phone a waiting `add_approver` would add.
+fn adding(effect: &Effect, object: &ParkedObject) -> Option<[u8; 32]> {
+    match (effect, object) {
+        (Effect::AddApprover, ParkedObject::Management(Change::AddApprover { transport, .. })) => {
+            Some(transport.0)
+        }
+        _ => None,
+    }
 }
 
 /// A management change's type, as entries name it.
