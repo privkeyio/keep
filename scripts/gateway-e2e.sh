@@ -103,10 +103,7 @@ ADMIN_SOCK=$RUN/admin/admin.sock
 # The vault password as systemd hands it to the gateway: a file in a
 # directory named by CREDENTIALS_DIRECTORY, readable by the gateway alone.
 CREDS=$WORK/creds
-install -d -m 0700 -o "$GW" "$CREDS"
-printf '%s\n' "$PASS" >"$CREDS/vault-password"
-chown "$GW" "$CREDS/vault-password"
-chmod 0400 "$CREDS/vault-password"
+make_creds "$CREDS"
 chmod 0500 "$CREDS"
 
 start_gateway() {
@@ -295,7 +292,7 @@ if MSG=$(as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gatewa
     --uid "$(uid "$A1")" --key "$NPUB" --op get_public_key 2>&1); then
     fail "issued through a socket of the wrong user"
 fi
-echo "$MSG" | grep -q "may have been issued" && fail "false alarm: $MSG"
+grep -q "may have been issued" <<<"$MSG" && fail "false alarm: $MSG"
 pass "an issue that was never sent raises no false alarm"
 
 # Issuing to the gateway's or the admin's uid is refused.
@@ -414,9 +411,9 @@ bridge_refuses() {
     if msg=$(rpc 1 ping '{}' | "$@" 2>&1); then
         fail "the bridge ran with $why"
     fi
-    echo "$msg" | grep -q "$want" || fail "$why: $msg"
-    echo "$msg" | grep -qE 'keep_agt_[0-9a-f]{64}' && fail "$why: the token was printed"
-    echo "$msg" | grep -q "$PASS" && fail "$why: the password was printed"
+    grep -q "$want" <<<"$msg" || fail "$why: $msg"
+    grep -qE 'keep_agt_[0-9a-f]{64}' <<<"$msg" && fail "$why: the token was printed"
+    grep -q "$PASS" <<<"$msg" && fail "$why: the password was printed"
     return 0
 }
 install -m 0640 -o "$A1" "$WORK/a1/token" "$WORK/a1/loose"
@@ -482,8 +479,8 @@ if MSG=$(as "$GW" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-u
     --uid "$(uid "$A2")" --key "$NPUB" --op get_public_key 2>&1); then
     fail "the gateway's own uid issued a credential"
 fi
-echo "$MSG" | grep -q "may have been issued" && fail "false alarm for a refused issue: $MSG"
-echo "$MSG" | grep -q "run as root or the gateway's admin uid" || fail "refused issue: $MSG"
+grep -q "may have been issued" <<<"$MSG" && fail "false alarm for a refused issue: $MSG"
+grep -q "run as root or the gateway's admin uid" <<<"$MSG" || fail "refused issue: $MSG"
 if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "the gateway's own uid was admitted to the admin socket"
 fi
@@ -494,7 +491,7 @@ pass "socket access: outsiders and agents shut out, root and the admin let in"
 if OUT_MSG=$("$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$A1" 2>&1); then
     fail "the admin client trusted a socket of another user"
 fi
-echo "$OUT_MSG" | grep -q "not the gateway's uid" || fail "wrong gateway user: $OUT_MSG"
+grep -q "not the gateway's uid" <<<"$OUT_MSG" || fail "wrong gateway user: $OUT_MSG"
 pass "the admin client checks the socket belongs to the gateway user"
 
 # Freeze, unfreeze and revoke take effect on the next request.
@@ -538,7 +535,7 @@ sign_psbt() {
         | python3 -c 'import json,sys; r=json.loads(sys.stdin.read())["result"]; t=r["content"][0]["text"]; print(("ERR " + t) if r["isError"] else ("OK %d %d" % (json.loads(t)["inputs_signed"], json.loads(t)["leaving_wallet_sats"])))'
 }
 ADDR=$(call 1 get_bitcoin_address '{}' | as "$A2" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a2/btc")
-echo "$ADDR" | grep -q '\\"address\\":\\"tb1p' || fail "address: $ADDR"
+grep -q '\\"address\\":\\"tb1p' <<<"$ADDR" || fail "address: $ADDR"
 [[ $(sign_psbt "$PSBT_10K") == "OK 1 10000" ]] || fail "PSBT within the grant was not signed"
 GOT=$(sign_psbt "$PSBT_60K")
 [[ $GOT == ERR*"over the 20000 sat limit per PSBT"* ]] || fail "over the per-PSBT limit: $GOT"

@@ -87,8 +87,19 @@ remove_created_accounts() {
 
 uid() { id -u "$1"; }
 
-# Run as `user` with its own groups. setpriv execs the command, so a
-# backgrounded call's $! is the command itself.
+# A credentials directory as systemd hands one to the gateway, holding the
+# vault password ($PASS) and readable by the gateway's user ($GW) alone.
+make_creds() {
+    local dir=$1
+    install -d -m 0700 -o "$GW" "$dir"
+    printf '%s\n' "$PASS" >"$dir/vault-password"
+    chown "$GW" "$dir/vault-password"
+    chmod 0400 "$dir/vault-password"
+}
+
+# Run as `user` with its own groups. A backgrounded call's $! is a subshell
+# of this script, not the command: whatever it started runs as a created
+# user, and remove_created_accounts kills it.
 as() {
     local user=$1
     shift

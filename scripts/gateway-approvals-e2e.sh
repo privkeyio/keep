@@ -69,7 +69,7 @@ fail_context() {
 }
 
 cleanup() {
-    exec 7>&- 2>/dev/null || true
+    { exec 7>&-; } 2>/dev/null || true
     stop_pid "$PAIR_PID" "$CLI_PID" "$MCP_PID" "$AGENT_PID" "$PHONE_PID" "$HELPER_PID" "$GW_PID" "$OLD_GW_PID" "$RELAY_PID"
     remove_created_accounts
     rm -rf "$WORK"
@@ -152,13 +152,6 @@ new_channel_key() {
 
 # Credentials as systemd hands them to the gateway: the vault password, and
 # the channel key in a directory of its own for each case below.
-make_creds() {
-    local dir=$1
-    install -d -m 0700 -o "$GW" "$dir"
-    printf '%s\n' "$PASS" >"$dir/vault-password"
-    chown "$GW" "$dir/vault-password"
-    chmod 0400 "$dir/vault-password"
-}
 CREDS=$WORK/creds
 make_creds "$CREDS"
 new_channel_key "$CREDS"
@@ -219,12 +212,7 @@ refuses_start() {
 }
 
 # Approvals need a relay.
-if msg=$(as "$GW" timeout 20 env CREDENTIALS_DIRECTORY="$CREDS" "$KEEP" --path "$VAULT" gateway serve \
-    --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" --relay-socket "$RELAY_SOCK" \
-    --relay-user "$RELAY_USER" </dev/null 2>&1); then
-    fail "the gateway started with a channel key and no relay"
-fi
-grep -q "at least one relay" <<<"$msg" || fail "no relay: $msg"
+refuses_start "$CREDS" "at least one relay"
 pass "a channel key without a relay is refused"
 
 start_gateway

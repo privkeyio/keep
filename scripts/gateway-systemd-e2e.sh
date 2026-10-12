@@ -398,7 +398,7 @@ EOF
         || fail "approvals not configured"
     [[ -f /run/credentials/$UNIT/channel-key ]] || fail "no channel key credential"
     for _ in $(seq 100); do
-        journalctl -u "$RELAY_UNIT" --no-pager -o cat | grep -q "connected to the gateway's relay socket" && break
+        grep -q "connected to the gateway's relay socket" <<<"$(journalctl -u "$RELAY_UNIT" --no-pager -o cat)" && break
         sleep 0.1
     done
     LOG=$(journalctl -u "$RELAY_UNIT" --no-pager -o cat)
