@@ -546,3 +546,45 @@ async fn the_relay_task_hands_over_what_is_queued_as_the_gateway_stops() {
         .expect("the relay task returns at once")
         .unwrap();
 }
+
+/// The relay socket serves one helper at a time: a second connection waits,
+/// unserved, until the first one ends, and is served then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_relay_socket_serves_one_helper_at_a_time() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = me();
+    let dir = socket_dir(root.path(), "relay");
+    let (keep, _) = vault(root.path());
+    let boot = FakeBoot::default();
+    boot.set_wall(super::clock::wall_clock().unwrap());
+    let mut state = start(keep, Settings::default(), &boot, BOOT).unwrap();
+    state
+        .configure_approvals(Some(channel()), vec!["wss://relay.example.com".into()], 60)
+        .unwrap();
+    let link = state.take_relay_link().unwrap();
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(state));
+    let (stop, _) = tokio::sync::watch::channel(false);
+    let (_closing, closed) = tokio::sync::watch::channel(false);
+    let socket = dir.join("relay.sock");
+    let listener = server::bind(&socket, uid).unwrap();
+    let task = tokio::spawn(super::relay::relay_task(
+        listener, uid, link, shared, stop, closed,
+    ));
+    let connect = || async {
+        let (read, write) = UnixStream::connect(&socket).await.unwrap().into_split();
+        (BufReader::new(read).lines(), write)
+    };
+    let (mut first, first_write) = connect().await;
+    assert!(line(&mut first).await.get("relays").is_some());
+    let (mut second, _second_write) = connect().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), second.next_line())
+            .await
+            .is_err(),
+        "a second helper is not served while the first is"
+    );
+    drop(first_write);
+    drop(first);
+    assert!(line(&mut second).await.get("relays").is_some());
+    task.abort();
+}
