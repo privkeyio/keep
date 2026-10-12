@@ -13,7 +13,7 @@ bitcoin = { workspace = true }
 sha2 = { version = "0.11", features = ["zeroize"] }
 hmac = { version = "0.13", features = ["zeroize"] }
 hkdf = "0.13"
-p256 = { version = "0.13", features = ["ecdsa"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
