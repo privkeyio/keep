@@ -1554,9 +1554,21 @@ mod sockets {
             assert!(c.recv().await.is_none());
         }
 
-        // Two connections per uid: a third is closed at once.
-        let first = Conn::open(&gw.agent).await;
-        let second = Conn::open(&gw.agent).await;
+        // Two connections per uid: a third is closed at once. A connection
+        // closed above may still hold its slot for a moment after the close
+        // is seen, so the two are opened until each is served.
+        let served = || async {
+            for _ in 0..100 {
+                let mut conn = Conn::open(&gw.agent).await;
+                if conn.ask("nope", ping()).await.is_some() {
+                    return conn;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("no connection was served");
+        };
+        let first = served().await;
+        let second = served().await;
         let mut third = Conn::open(&gw.agent).await;
         assert!(third.recv().await.is_none());
         drop((first, second));
