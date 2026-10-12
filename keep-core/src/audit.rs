@@ -1571,6 +1571,7 @@ struct ChainVerifier {
     failures: u64,
     first_failure: Option<u64>,
     too_long: bool,
+    latest_time: i64,
 }
 
 /// What [`ChainVerifier`] found.
@@ -1588,6 +1589,9 @@ pub struct ChainCheck {
     /// The log holds more than [`MAX_AUDIT_ENTRIES`] entries, and was
     /// checked only that far.
     pub too_long: bool,
+    /// The latest time keep set on an entry it checked (a trip's time is
+    /// not one), in Unix seconds; zero when there is none.
+    pub latest_time: i64,
 }
 
 impl ChainVerifier {
@@ -1609,6 +1613,9 @@ impl ChainVerifier {
         }
         if entry.retention.is_some() {
             self.mark = entry.retention;
+        }
+        if entry.event_type != AuditEventType::RateLimitTripped {
+            self.latest_time = self.latest_time.max(entry.timestamp);
         }
         self.prev = Some((entry.hash, entry.seq.checked_add(1)));
     }
@@ -1644,6 +1651,7 @@ impl ChainVerifier {
             first_failure: self.first_failure,
             breaks: crypto::blake2b_256(&self.breaks),
             too_long: self.too_long,
+            latest_time: self.latest_time,
         }
     }
 }

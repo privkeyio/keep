@@ -373,7 +373,6 @@ impl Keep {
         let rotation = self.storage.rotation_in_progress();
         let migrated = audit.migrated_on_open().cloned();
         let mut first_open = false;
-        self.storage.set_seed_floor(audit.own_time());
         let mut record = match self.load_audit_record()? {
             Some(Ok(record)) => record,
             Some(Err(e)) => {
@@ -472,6 +471,9 @@ impl Keep {
         }
         record.retention_pending = None;
         let chain = audit.check_chain(&data_key)?;
+        // A clock stepped back since an entry was written: a seeded epoch
+        // still goes above the latest time the log recorded.
+        self.storage.set_seed_floor(chain.latest_time);
         record.too_long = chain.too_long;
         if chain.valid || record.chain_acknowledged == Some(chain.breaks) {
             record.chain_broken = None;
@@ -6369,7 +6371,9 @@ mod tests {
             .storage
             .remove_config_for_tests(b"agent_freeze_epoch")
             .unwrap());
-        keep.lock();
+        drop(keep);
+        // A new process: only the log tells it the latest time.
+        let mut keep = Keep::open(&path).unwrap();
         keep.unlock("testpass").unwrap();
         let epoch = keep.agent_freeze_epoch().unwrap();
         assert!(epoch >= (ahead as u64) << 24, "{epoch}");
@@ -6380,6 +6384,26 @@ mod tests {
         assert_eq!(a >> 24, b >> 24);
         assert_ne!(a, b, "random low bits");
         assert!(a & ((1 << 24) - 1) < 1 << 23);
+
+        // An entry written later in the session, as after a clock stepped
+        // back, raises the floor a freeze seeds from too.
+        let (one, _) = keep
+            .issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+            .unwrap();
+        let later = ahead + 100_000;
+        let data_key = keep.data_key().unwrap();
+        let audit = keep.audit.as_mut().unwrap();
+        let mut entry = AuditEntry::new(AuditEventType::KeyGenerate, audit.last_hash());
+        entry.timestamp = later;
+        audit.log(entry, &data_key).unwrap();
+        keep.note_audit_place();
+        keep.storage
+            .put_raw(crate::backend::CONFIG_TABLE, b"agent_freeze_epoch", b"x")
+            .unwrap();
+        let seeded = keep
+            .set_agent_frozen(Some(&one.id), true, None, &[])
+            .unwrap();
+        assert!(seeded >= (later as u64) << 24, "{seeded}");
     }
 
     /// A wallet descriptor counts by its creation time.
