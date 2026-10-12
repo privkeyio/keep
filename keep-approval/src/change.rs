@@ -259,13 +259,13 @@ pub const MAX_LABEL_CHARS: usize = 64;
 /// [`crate::approver::is_hidden`]).
 pub fn check_label(text: &str, what: &str) -> Result<()> {
     let chars = text.chars().count();
-    if chars == 0 || chars > MAX_LABEL_CHARS {
+    if chars > MAX_LABEL_CHARS {
         return Err(malformed(format!(
-            "a {what} is 1 to {MAX_LABEL_CHARS} characters"
+            "a {what} is at most {MAX_LABEL_CHARS} characters"
         )));
     }
     if text.trim().is_empty() {
-        return Err(malformed(format!("a {what} is not only spaces")));
+        return Err(malformed(format!("a {what} is not empty or only spaces")));
     }
     if text.chars().any(crate::approver::is_hidden) {
         return Err(malformed(format!(

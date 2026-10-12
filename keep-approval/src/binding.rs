@@ -1025,6 +1025,10 @@ pub(crate) mod tests {
                 format!("{checked:?}"),
             ] {
                 assert!(!shown.contains(&plaintext), "{shown}");
+                assert!(
+                    !shown.contains("cashu") && !shown.contains("note to self"),
+                    "{shown}"
+                );
                 assert!(shown.contains("plaintext_len") || shown.contains("Request"));
             }
         }

@@ -177,7 +177,14 @@ mod tests {
             uri.replace("keep-approver:v1?", "keep-approver:v2?"),
             uri.replace("gateway=", "gw="),
             uri.to_uppercase(),
-            head.replace("npub1", "NPUB1") + "&relay=" + relays,
+            {
+                let (prefix, npub) = head.split_once("gateway=").unwrap();
+                let (npub, secret) = npub.split_once('&').unwrap();
+                format!(
+                    "{prefix}gateway={}&{secret}&relay={relays}",
+                    npub.to_uppercase()
+                )
+            },
             head.to_string(),
             format!("{uri}&extra=1"),
             format!("{uri}&relay=wss://relay.example.com"),

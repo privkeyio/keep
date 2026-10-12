@@ -131,12 +131,10 @@ fn explains(unfrozen: Scope, scope: Scope) -> bool {
 
 impl AnchorTracker {
     /// Keep the anchor a `paired` message carries, which has no time of its
-    /// own, as the first one: every later anchor is compared with it. Does
-    /// nothing once an anchor is kept.
+    /// own, as the first one: every later anchor is compared with it. Taken
+    /// at time 0, it changes nothing once an anchor is kept.
     pub fn baseline(&mut self, anchor: &AnchorState, frozen: &Frozen, local_now: u64) {
-        if self.kept.is_none() {
-            self.observe(0, anchor, Some(frozen), local_now);
-        }
+        self.observe(0, anchor, Some(frozen), local_now);
     }
 
     /// Note the phone's own freeze of `scope`, carrying `epoch`, sent at the
@@ -700,6 +698,25 @@ mod tests {
         assert_eq!(
             t.due_alerts(2_010 + CLEARED_GRACE_SECS),
             [Alert::FreezeCleared { scope: Scope::All }]
+        );
+        // An unfreeze explains only its own scope.
+        let mut t = AnchorTracker::default();
+        t.observe(
+            100,
+            &anchor(1, 1, &[]),
+            Some(&frozen_with(5, false, &[7, 8])),
+            0,
+        );
+        t.observe(
+            101,
+            &anchor(2, 1, &[]),
+            Some(&frozen_with(6, false, &[])),
+            10,
+        );
+        t.unfreeze_seen(c(7), 20);
+        assert_eq!(
+            t.due_alerts(10 + CLEARED_GRACE_SECS),
+            [Alert::FreezeCleared { scope: c(8) }]
         );
         // An anchor from a request, with no freeze state, clears nothing.
         let mut t = AnchorTracker::default();
