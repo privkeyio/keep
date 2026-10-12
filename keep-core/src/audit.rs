@@ -461,6 +461,9 @@ pub struct AuditLog {
     last_hash: [u8; 32],
     /// The last entry's sequence number; zero for an empty log.
     seq: u64,
+    /// The latest time keep set on an entry it wrote this session or found
+    /// last in the log (a trip's time is not one), in Unix seconds.
+    own_time: i64,
     entries: usize,
     /// Where to cut a partial line a failed write left, before the next append.
     torn: Option<u64>,
@@ -547,6 +550,7 @@ impl AuditLog {
             path: path.join("audit.log"),
             last_hash: [0u8; 32],
             seq: 0,
+            own_time: 0,
             entries: 0,
             torn: None,
             on_disk: OnDisk::default(),
@@ -580,6 +584,7 @@ impl AuditLog {
                     drop_torn()?;
                     log.last_hash = last.hash;
                     log.seq = last.seq;
+                    log.note_time(&last);
                     log.entries = tail.count;
                     log.on_disk = tail.on_disk();
                 }
@@ -609,6 +614,17 @@ impl AuditLog {
     /// The number of entries in the log.
     pub fn entry_count(&self) -> usize {
         self.entries
+    }
+
+    /// The latest time keep set on an entry this log wrote or found last.
+    pub fn own_time(&self) -> i64 {
+        self.own_time
+    }
+
+    fn note_time(&mut self, entry: &AuditEntry) {
+        if entry.event_type != AuditEventType::RateLimitTripped {
+            self.own_time = self.own_time.max(entry.timestamp);
+        }
     }
 
     /// The time of the last entry whose time keep set itself (any but a
@@ -812,6 +828,7 @@ impl AuditLog {
 
         self.last_hash = entry.hash;
         self.seq = entry.seq;
+        self.note_time(&entry);
         self.entries += 1;
         let end = len + line.len() as u64;
         self.on_disk = OnDisk {
@@ -1327,6 +1344,9 @@ impl AuditLog {
         let (last_hash, seq) = entries.last().map_or(([0u8; 32], 0), |e| (e.hash, e.seq));
         self.last_hash = last_hash;
         self.seq = seq;
+        if let Some(last) = entries.last() {
+            self.note_time(last);
+        }
         self.entries = entries.len();
         self.torn = None;
         self.on_disk = OnDisk::read(&self.path).unwrap_or(OnDisk {

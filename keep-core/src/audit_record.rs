@@ -143,6 +143,20 @@ pub struct AuditRecord {
     /// The log held more than the entries an unlock checks, at the latest
     /// unlock; reported while it does, not acknowledged.
     pub too_long: bool,
+    /// The agent freeze epoch found missing at an unlock and started again,
+    /// until the owner acknowledges it.
+    pub epoch_reseeded: Option<EpochReseeded>,
+}
+
+/// The agent freeze epoch found missing at an unlock other than a vault's
+/// first, and started again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EpochReseeded {
+    /// The epoch started.
+    pub epoch: u64,
+    /// When, in Unix seconds.
+    pub found_at: i64,
 }
 
 /// Something about the audit log the owner must be told on every unlock
@@ -175,6 +189,8 @@ pub enum AuditWarning {
     ChainBroken(ChainBroken),
     /// The log is longer than an unlock checks.
     TooLong,
+    /// The agent freeze epoch was missing and was started again.
+    EpochReseeded(EpochReseeded),
 }
 
 const ACKNOWLEDGE: &str =
@@ -242,6 +258,13 @@ impl std::fmt::Display for AuditWarning {
             Self::MoreSetAside(count) => write!(
                 f,
                 "{count} more logs were set aside than the vault's record names; {ACKNOWLEDGE}"
+            ),
+            Self::EpochReseeded(r) => write!(
+                f,
+                "the agent freeze epoch was missing from the vault database and was started \
+                 again at {}: no unfreeze approved before can match it, but it was deleted; \
+                 {ACKNOWLEDGE}",
+                r.epoch
             ),
             Self::TooLong => write!(
                 f,
@@ -328,6 +351,7 @@ impl AuditRecord {
             || self.lost.is_some()
             || !self.signing_set_asides.is_empty()
             || self.chain_broken.is_some()
+            || self.epoch_reseeded.is_some()
     }
 
     /// Clear everything noted for the owner, once acknowledged.
@@ -338,6 +362,7 @@ impl AuditRecord {
         self.lost = None;
         self.signing_set_asides.clear();
         self.chain_broken = None;
+        self.epoch_reseeded = None;
     }
 }
 

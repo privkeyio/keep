@@ -249,8 +249,7 @@ impl Keep {
             signing_audit: None,
             audit_record: None,
         };
-        let epoch = keep.storage.missing_agent_freeze_epoch()?;
-        keep.save_audit_record_with(audit_record::AuditRecord::default(), epoch)?;
+        keep.save_audit_record_with(audit_record::AuditRecord::default(), Some(0))?;
         keep.audit_record = None;
         Ok(keep)
     }
@@ -294,7 +293,7 @@ impl Keep {
         let data_key = self.get_data_key()?;
         self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
         self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &data_key)?);
-        self.check_audit_record()?;
+        let reseeded = self.check_audit_record()?;
 
         // Flush any rate-limit trip events queued by prior failed unlocks
         // before recording this success, so the audit chain reflects the
@@ -315,9 +314,14 @@ impl Keep {
             });
         }
 
-        self.audit_event(AuditEventType::VaultUnlock, |e| {
-            e.with_reason(audit_record::RECORD_NOTE)
-        });
+        let reason = match reseeded {
+            Some(epoch) => format!(
+                "{}; the agent freeze epoch was missing and was started again at {epoch}",
+                audit_record::RECORD_NOTE
+            ),
+            None => audit_record::RECORD_NOTE.to_string(),
+        };
+        self.audit_event(AuditEventType::VaultUnlock, |e| e.with_reason(&reason));
         debug!("loading keys to keyring");
         self.load_keys_to_keyring()
     }
@@ -356,16 +360,20 @@ impl Keep {
     /// that cannot be decrypted or parsed, is itself noted and started
     /// again, so detection resumes. Only a failure to read the database or
     /// the log fails the unlock.
-    fn check_audit_record(&mut self) -> Result<()> {
+    /// Returns the epoch started when the agent freeze epoch was found
+    /// deleted.
+    fn check_audit_record(&mut self) -> Result<Option<u64>> {
         let data_key = self.get_data_key()?;
         let (Some(audit), Some(signing)) = (self.audit.as_ref(), self.signing_audit.as_ref())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let (seq, head) = (audit.seq(), audit.last_hash());
         let now = chrono::Utc::now().timestamp();
         let rotation = self.storage.rotation_in_progress();
         let migrated = audit.migrated_on_open().cloned();
+        let mut first_open = false;
+        self.storage.set_seed_floor(audit.own_time());
         let mut record = match self.load_audit_record()? {
             Some(Ok(record)) => record,
             Some(Err(e)) => {
@@ -402,6 +410,7 @@ impl Keep {
                 let lost = noted
                     || self.storage.agent_freeze_epoch_row()?
                     || self.storage.latest_created_at()? > logged_until;
+                first_open = !lost;
                 audit_record::AuditRecord {
                     lost: lost.then_some(audit_record::RecordLost {
                         missing: true,
@@ -479,6 +488,17 @@ impl Keep {
         // is a missing one written, in the same write as the record, so a
         // stop between them cannot leave either without the other.
         let epoch = self.storage.missing_agent_freeze_epoch()?;
+        // Outside a vault's first open the row was written when the vault
+        // was created and at every unlock since, so a missing one was
+        // deleted: told to the owner until acknowledged, and noted in the
+        // unlock's own entry.
+        let reseeded = epoch.filter(|_| !first_open);
+        if let Some(epoch) = reseeded {
+            record.epoch_reseeded = Some(audit_record::EpochReseeded {
+                epoch,
+                found_at: now,
+            });
+        }
         if let Err(e) = self.save_audit_record_with(record, epoch) {
             tracing::error!(error = %e, "the record of the audit log could not be written");
         }
@@ -490,7 +510,7 @@ impl Keep {
         for warning in self.audit_warnings() {
             tracing::error!("{warning}");
         }
-        Ok(())
+        Ok(reseeded)
     }
 
     /// The record of the audit log: `None` when there is none, and an inner
@@ -536,6 +556,9 @@ impl Keep {
     /// memory only moves forward, so a log behind the record here is noted,
     /// never moved to silently.
     fn note_audit_place(&mut self) {
+        if let Some(audit) = self.audit.as_ref() {
+            self.storage.set_seed_floor(audit.own_time());
+        }
         let (Some(audit), Some(record)) = (self.audit.as_ref(), self.audit_record.as_ref()) else {
             return;
         };
@@ -617,6 +640,9 @@ impl Keep {
         }
         if let Some(broken) = record.chain_broken {
             warnings.push(AuditWarning::ChainBroken(broken));
+        }
+        if let Some(reseeded) = record.epoch_reseeded {
+            warnings.push(AuditWarning::EpochReseeded(reseeded));
         }
         if record.too_long {
             warnings.push(AuditWarning::TooLong);
@@ -3175,13 +3201,19 @@ mod tests {
             .unwrap();
         assert!(keep.refreeze_agent(None, &[]).is_err());
         assert!(keep.refreeze_agent(Some(&credential.id), &[]).is_err());
-        assert_eq!(keep.agent_freeze_epoch().unwrap(), 0);
+        let e0 = keep.agent_freeze_epoch().unwrap();
         keep.set_agent_credential_frozen(&credential.id, true)
             .unwrap();
         keep.set_agent_freeze(true).unwrap();
         let entries = keep.audit_read_all().unwrap().len();
-        assert_eq!(keep.refreeze_agent(Some(&credential.id), &[]).unwrap(), 3);
-        assert_eq!(keep.refreeze_agent(None, &[(b"ledger", b"x")]).unwrap(), 4);
+        assert_eq!(
+            keep.refreeze_agent(Some(&credential.id), &[]).unwrap(),
+            e0 + 3
+        );
+        assert_eq!(
+            keep.refreeze_agent(None, &[(b"ledger", b"x")]).unwrap(),
+            e0 + 4
+        );
         assert_eq!(keep.audit_read_all().unwrap().len(), entries);
         assert_eq!(
             keep.load_agent_ledger(b"ledger")
@@ -5463,21 +5495,22 @@ mod tests {
         let (frozen, _) = keep
             .issue_agent_credential("frozen", 1000, Vec::new(), unix_now(), 3600)
             .unwrap();
+        let e0 = keep.agent_freeze_epoch().unwrap();
         keep.delete_agent_credential(&plain.id).unwrap();
-        assert_eq!(keep.agent_freeze_epoch().unwrap(), 0);
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), e0);
         keep.set_agent_credential_frozen(&frozen.id, true).unwrap();
-        assert_eq!(keep.agent_freeze_epoch().unwrap(), 1);
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), e0 + 1);
         assert!(keep
-            .delete_agent_credential_with(&frozen.id, Some(0), &[])
+            .delete_agent_credential_with(&frozen.id, Some(e0), &[])
             .is_err());
         assert!(keep.load_agent_credential(&frozen.id).unwrap().is_some());
         let ledger: (&[u8], &[u8]) = (b"noted", b"value");
         assert_eq!(
-            keep.delete_agent_credential_with(&frozen.id, Some(1), &[ledger])
+            keep.delete_agent_credential_with(&frozen.id, Some(e0 + 1), &[ledger])
                 .unwrap(),
-            Some(2)
+            Some(e0 + 2)
         );
-        assert_eq!(keep.agent_freeze_epoch().unwrap(), 2);
+        assert_eq!(keep.agent_freeze_epoch().unwrap(), e0 + 2);
         assert_eq!(
             keep.load_agent_ledger(b"noted")
                 .unwrap()
@@ -5704,7 +5737,7 @@ mod tests {
         let floor = unix_now() << 24;
         let dir = tempdir().unwrap();
         let mut keep = test_keep(&dir.path().join("keep"));
-        assert_eq!(keep.agent_freeze_epoch().unwrap(), 0);
+        assert!(keep.agent_freeze_epoch().is_ok());
         let (one, _) = keep
             .issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
             .unwrap();
@@ -6250,30 +6283,123 @@ mod tests {
         }
     }
 
-    /// A missing freeze epoch is started again at unlock, seeded once
-    /// agents exist (never 0, which an unfreeze held back from when the
-    /// epoch was 0 would match), without taking the record for a deleted
-    /// one.
+    /// A missing freeze epoch is started again at unlock, seeded whether
+    /// or not agent rows remain (never 0, which an unfreeze held back from
+    /// when the epoch was 0 would match, as wiping the agents and the epoch
+    /// together would otherwise allow), noted in the unlock's entry and
+    /// reported until acknowledged, without taking the record for a deleted
+    /// one. Only creating a vault starts the epoch at 0.
     #[test]
-    fn a_missing_epoch_is_seeded_at_unlock_once_agents_exist() {
+    fn a_missing_epoch_is_seeded_and_reported_at_unlock() {
         let floor = unix_now() << 24;
+        for wipe_agents in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("keep");
+            let mut keep =
+                Keep::create_with_params(&path, "testpass", crypto::Argon2Params::TESTING).unwrap();
+            drop(keep);
+            keep = Keep::open(&path).unwrap();
+            keep.unlock("testpass").unwrap();
+            assert_eq!(keep.agent_freeze_epoch().unwrap(), 0, "created at 0");
+            assert!(keep.audit_warnings().is_empty());
+            let (one, _) = keep
+                .issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
+                .unwrap();
+            if wipe_agents {
+                keep.delete_agent_credential(&one.id).unwrap();
+            }
+            assert!(keep
+                .storage
+                .remove_config_for_tests(b"agent_freeze_epoch")
+                .unwrap());
+            keep.lock();
+            keep.unlock("testpass").unwrap();
+            let epoch = keep.agent_freeze_epoch().unwrap();
+            assert!(epoch >= floor, "wiped agents: {wipe_agents}");
+            assert_eq!(
+                keep.audit_warnings(),
+                [audit_record::AuditWarning::EpochReseeded(
+                    audit_record::EpochReseeded {
+                        epoch,
+                        found_at: keep
+                            .audit_record
+                            .as_ref()
+                            .unwrap()
+                            .epoch_reseeded
+                            .unwrap()
+                            .found_at,
+                    }
+                )]
+            );
+            let unlock = keep.audit_read_all().unwrap().pop().unwrap();
+            assert_eq!(unlock.event_type, AuditEventType::VaultUnlock);
+            assert!(unlock
+                .reason
+                .unwrap()
+                .contains(&format!("started again at {epoch}")));
+            acknowledge(&mut keep);
+            keep.lock();
+            keep.unlock("testpass").unwrap();
+            assert!(keep.audit_warnings().is_empty());
+            assert_eq!(keep.agent_freeze_epoch().unwrap(), epoch);
+        }
+    }
+
+    /// A seeded epoch is never below the latest time the audit log
+    /// recorded (a wall clock stepped back), and two in the same second
+    /// differ in their random low bits.
+    #[test]
+    fn seeded_epochs_follow_the_log_and_differ() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keep");
-        let mut keep = test_keep(&path);
-        keep.issue_agent_credential("one", 1000, Vec::new(), unix_now(), 3600)
-            .unwrap();
+        let keep = test_keep(&path);
+        let data_key = keep.data_key().unwrap();
+        drop(keep);
+        let ahead = unix_now() as i64 + 100_000;
+        let mut log = AuditLog::open(&path, &data_key).unwrap();
+        let mut entry = AuditEntry::new(AuditEventType::KeyGenerate, log.last_hash());
+        entry.timestamp = ahead;
+        log.log(entry, &data_key).unwrap();
+        drop(log);
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
         assert!(keep
             .storage
             .remove_config_for_tests(b"agent_freeze_epoch")
             .unwrap());
         keep.lock();
         keep.unlock("testpass").unwrap();
-        assert!(keep.agent_freeze_epoch().unwrap() >= floor);
-        assert!(
-            keep.audit_warnings().is_empty(),
-            "{:?}",
-            keep.audit_warnings()
+        let epoch = keep.agent_freeze_epoch().unwrap();
+        assert!(epoch >= (ahead as u64) << 24, "{epoch}");
+        let (a, b) = (
+            keep.storage.missing_or_seeded_for_tests(),
+            keep.storage.missing_or_seeded_for_tests(),
         );
+        assert_eq!(a >> 24, b >> 24);
+        assert_ne!(a, b, "random low bits");
+        assert!(a & ((1 << 24) - 1) < 1 << 23);
+    }
+
+    /// A wallet descriptor counts by its creation time.
+    #[test]
+    fn a_wallet_descriptor_counts_by_its_creation_time() {
+        let dir = tempdir().unwrap();
+        let keep = test_keep(&dir.path().join("keep"));
+        keep.storage
+            .store_descriptor(&WalletDescriptor {
+                group_pubkey: [9u8; 32],
+                external_descriptor: "tr(xpub.../0/*)".into(),
+                internal_descriptor: "tr(xpub.../1/*)".into(),
+                network: "bitcoin".into(),
+                created_at: 2_000,
+                device_registrations: Vec::new(),
+                policy_hash: [0u8; 32],
+                version: 1,
+                previous_descriptor_hash: None,
+                policy: None,
+            })
+            .unwrap();
+        assert_eq!(keep.storage.latest_created_at().unwrap(), 2_000);
     }
 
     /// A secret updated after it was created counts by its update time.

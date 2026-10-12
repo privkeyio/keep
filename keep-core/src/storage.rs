@@ -39,20 +39,22 @@ const ROTATION_IN_PROGRESS: &[u8] = b"rotation_in_progress";
 /// seconds.
 const SEEDED_EPOCH_SHIFT: u32 = 24;
 
-/// A freeze epoch for a vault whose epoch cannot be read: the current Unix
-/// time in seconds shifted left 24 bits. The gateway applies an unfreeze only
-/// at the exact current epoch, so the new epoch must equal no epoch a
-/// held-back unfreeze could carry. Epochs count up by one from 0 per freeze
-/// and unfreeze, so reaching this one by counting would take 2^24 of them for
-/// every second since 1970; and every earlier seed was made at an earlier
-/// time, so it is lower by at least 2^24 per second between them, more than
-/// any count since. Only a wall clock set back past an earlier seed could
-/// meet one again, which takes root on the gateway's host.
-fn seeded_epoch() -> u64 {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(1, |d| d.as_secs().max(1));
-    secs.saturating_mul(1 << SEEDED_EPOCH_SHIFT)
+/// A freeze epoch for a vault whose epoch cannot be read or is missing:
+/// the later of the current Unix time and `floor_secs` (the latest time the
+/// audit log recorded), in seconds, shifted left 24 bits, with 23 random low
+/// bits. The gateway applies an unfreeze only at the exact current epoch, so
+/// the new epoch must equal no epoch a held-back unfreeze could carry.
+/// Epochs count up by one from 0 per freeze and unfreeze, so reaching this
+/// one by counting would take 2^24 of them for every second since 1970; an
+/// earlier seed was made at an earlier time as the log saw it, so it is lower
+/// by at least 2^24 per second between them, less the 2^23 the random bits
+/// span; and two seeds in the same second, or after the wall clock stepped
+/// back past the log's last entry, meet only when 23 random bits do.
+fn seeded_epoch(floor_secs: i64) -> Result<u64> {
+    let now = chrono::Utc::now().timestamp();
+    let secs = u64::try_from(now.max(floor_secs).max(1)).unwrap_or(1);
+    let low = u32::from_le_bytes(crypto::try_random_bytes::<4>()?) & ((1 << 23) - 1);
+    Ok(secs.saturating_mul(1 << SEEDED_EPOCH_SHIFT) | u64::from(low))
 }
 
 /// The freeze epoch moved by a freeze or a clear of one.
@@ -366,6 +368,9 @@ pub struct Storage {
     /// Optional replication sink; see [`StatePublisher`]. `RwLock` so keep-web can install it after
     /// construction (via [`Storage::set_state_publisher`]) while storage methods take `&self`.
     pub(crate) state_publisher: std::sync::RwLock<Option<std::sync::Arc<dyn StatePublisher>>>,
+    /// The latest time the audit log recorded, in Unix seconds, which a
+    /// seeded freeze epoch never goes below; set as the log moves.
+    pub(crate) seed_floor: std::sync::atomic::AtomicI64,
 }
 
 fn create_storage_dir(path: &Path) -> Result<()> {
@@ -751,6 +756,7 @@ impl Storage {
             backend: Some(backend),
             descriptor_lock: std::sync::Mutex::new(()),
             state_publisher: std::sync::RwLock::new(None),
+            seed_floor: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -814,6 +820,7 @@ impl Storage {
             backend: None,
             descriptor_lock: std::sync::Mutex::new(()),
             state_publisher: std::sync::RwLock::new(None),
+            seed_floor: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -2009,14 +2016,10 @@ impl Storage {
     /// epoch can be told apart from one for the current state.
     pub fn get_agent_freeze_epoch(&self) -> Result<u64> {
         match self.get_config_bound(AGENT_FREEZE_EPOCH)? {
-            // Written as 0 before any agent exists, so missing after that, it
-            // was deleted: read as 0, an unfreeze held back from when the
-            // epoch was 0 would match it again.
-            None if self.any_agent_rows()? => Err(StorageError::corrupted(
-                "the agent freeze epoch is missing though agents exist",
-            )
-            .into()),
-            None => Ok(0),
+            // Written when the vault is created and at every unlock, so a
+            // missing one was deleted: read as 0, an unfreeze held back from
+            // when the epoch was 0 would match it again.
+            None => Err(StorageError::corrupted("the agent freeze epoch is missing").into()),
             Some(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_le_bytes)
                 .map_err(|_| {
@@ -2103,7 +2106,10 @@ impl Storage {
             }
             Err(e) if may_seed => {
                 tracing::error!(error = %e, "the agent freeze epoch cannot be read; the freeze goes ahead with a new one");
-                (seeded_epoch(), true)
+                (
+                    seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed))?,
+                    true,
+                )
             }
             Err(e) => return Err(e),
         };
@@ -2118,22 +2124,26 @@ impl Storage {
         })
     }
 
-    /// Write the freeze epoch's first value, 0, when it is missing and no
-    /// agent was ever issued, frozen or given a ledger; after that, a missing
-    /// epoch means a deleted one, which [`Storage::get_agent_freeze_epoch`]
-    /// refuses to read as 0.
-    ///
-    /// On a vault's first open by a keep that keeps the epoch (`first_open`),
-    /// agents an older keep made get a seeded epoch, which no unfreeze held
-    /// back from that keep can match.
+    /// A seeded epoch to write when the epoch's row is missing at unlock:
+    /// one that no unfreeze held back from before can match, whatever agent
+    /// rows were there or were wiped. Only creating a vault starts at 0.
     pub(crate) fn missing_agent_freeze_epoch(&self) -> Result<Option<u64>> {
         if self.agent_freeze_epoch_row()? {
             return Ok(None);
         }
-        Ok(Some(match self.any_agent_rows()? {
-            false => 0,
-            true => seeded_epoch(),
-        }))
+        seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed)).map(Some)
+    }
+
+    /// A seeded epoch as unlock would write one.
+    #[cfg(test)]
+    pub(crate) fn missing_or_seeded_for_tests(&self) -> u64 {
+        seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed)).unwrap()
+    }
+
+    /// Note the latest time the audit log recorded, in Unix seconds.
+    pub(crate) fn set_seed_floor(&self, secs: i64) {
+        self.seed_floor
+            .fetch_max(secs, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Store the audit record `record` (serialized), and the agent freeze
@@ -2165,8 +2175,9 @@ impl Storage {
         Ok(self.config_row(AGENT_FREEZE_EPOCH)?.is_some())
     }
 
-    /// The latest `created_at` of any key, share, secret or agent credential
-    /// that can be read, or a secret's `updated_at`, in Unix seconds; a row
+    /// The latest `created_at` of any key, share, secret, wallet descriptor
+    /// or agent credential that can be read, or a secret's `updated_at`, in
+    /// Unix seconds; a row
     /// that cannot be decrypted or decoded is passed over. Only a failure to read the database is an
     /// error.
     pub(crate) fn latest_created_at(&self) -> Result<i64> {
@@ -2193,19 +2204,19 @@ impl Storage {
                 latest = latest.max(secret.created_at.max(secret.updated_at));
             }
         }
+        for (_, stored) in backend.list(DESCRIPTORS_TABLE)? {
+            if let Some(descriptor) =
+                open(&stored).and_then(|b| serde_json::from_slice::<WalletDescriptor>(&b).ok())
+            {
+                latest = latest.max(i64::try_from(descriptor.created_at).unwrap_or(i64::MAX));
+            }
+        }
         for (key, stored) in backend.list(AGENT_CREDENTIALS_TABLE)? {
             if let Ok(credential) = self.decode_agent_credential(&key, &stored) {
                 latest = latest.max(i64::try_from(credential.created_at).unwrap_or(i64::MAX));
             }
         }
         Ok(latest)
-    }
-
-    fn any_agent_rows(&self) -> Result<bool> {
-        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        Ok(!backend.list(AGENT_CREDENTIALS_TABLE)?.is_empty()
-            || !backend.list(AGENT_LEDGERS_TABLE)?.is_empty()
-            || backend.get(CONFIG_TABLE, AGENT_FREEZE)?.is_some())
     }
 
     /// Note that a data key rotation is under way (`true`), in a row the
