@@ -49,7 +49,7 @@ pub(super) struct Gw {
 pub(super) fn vault(dir: &std::path::Path) -> (Keep, [u8; 32]) {
     let path = dir.join("keep");
     if !path.exists() {
-        keep_core::storage::Storage::create(
+        keep_core::Keep::create_with_params(
             &path,
             "testpass",
             keep_core::crypto::Argon2Params::TESTING,

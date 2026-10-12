@@ -572,7 +572,7 @@ mod tests {
     /// `locked`, so recording fails).
     fn test_vault(dir: &std::path::Path, locked: bool) -> keep_core::Keep {
         let path = dir.join("keep");
-        keep_core::storage::Storage::create(
+        keep_core::Keep::create_with_params(
             &path,
             "testpass",
             keep_core::crypto::Argon2Params::TESTING,

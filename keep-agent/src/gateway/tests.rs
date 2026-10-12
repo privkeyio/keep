@@ -24,7 +24,7 @@ impl Vault {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("keep");
-        keep_core::storage::Storage::create(
+        keep_core::Keep::create_with_params(
             &path,
             "testpass",
             keep_core::crypto::Argon2Params::TESTING,
