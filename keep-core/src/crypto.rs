@@ -498,6 +498,33 @@ pub fn decrypt_with_aad(
     SecretVec::new(plaintext)
 }
 
+/// Decrypts many values under one key, taking the key out of its protected
+/// memory once rather than per value, for reading a whole log.
+pub struct BatchDecryptor {
+    cipher: XChaCha20Poly1305,
+}
+
+impl BatchDecryptor {
+    /// A decryptor for values [`encrypt`] sealed under `key`.
+    pub fn new(key: &SecretKey) -> Result<Self> {
+        let decrypted = key.decrypt()?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&*decrypted)
+            .map_err(|_| KeepError::DecryptionFailed)?;
+        Ok(Self { cipher })
+    }
+
+    /// What [`decrypt`] gives for `encrypted`.
+    pub fn decrypt(&self, encrypted: &EncryptedData) -> Result<Zeroizing<Vec<u8>>> {
+        self.cipher
+            .decrypt(
+                &XNonce::from(encrypted.nonce),
+                encrypted.ciphertext.as_ref(),
+            )
+            .map(Zeroizing::new)
+            .map_err(|_| KeepError::DecryptionFailed)
+    }
+}
+
 /// Compute Blake2b-256 hash of data.
 pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b512::new();

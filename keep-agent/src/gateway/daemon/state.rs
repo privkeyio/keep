@@ -1747,7 +1747,7 @@ fn only_args(args: &Value, allowed: &[&str]) -> std::result::Result<(), Refusal>
     match map.keys().find(|k| !allowed.contains(&k.as_str())) {
         Some(k) => Err(Refusal::params(format!(
             "unknown argument {:?}",
-            keep_core::agent::cap_text(k)
+            keep_core::agent::cap_text(k, keep_core::agent::MAX_AUDIT_TEXT)
         ))),
         None => Ok(()),
     }

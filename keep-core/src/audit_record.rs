@@ -64,6 +64,9 @@ impl std::fmt::Display for AuditRollback {
     }
 }
 
+/// How many set-aside logs the record names before it only counts them.
+pub(crate) const MAX_NOTED: usize = 16;
+
 /// A log set aside because it held lines this keep could not read, or a
 /// migration whose old chain failed its check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +76,24 @@ pub struct SetAside {
     pub kept: String,
     /// Not one line of it decrypted under the vault's data key.
     pub unreadable: bool,
+    /// Where the record had the log when it was set aside.
+    pub recorded_seq: u64,
+    /// The head the record had with it.
+    pub recorded_head: [u8; 32],
+    /// A data key rotation was under way and unfinished.
+    pub rotation: bool,
+}
+
+/// The log's chain found broken at unlock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChainBroken {
+    /// When it was first found so, in Unix seconds.
+    pub found_at: i64,
+    /// How many entries or lines broke the chain rules the last time.
+    pub failures: u64,
+    /// The sequence number (or line number) of the first break then.
+    pub first_failure: u64,
 }
 
 /// The record itself found missing or unreadable.
@@ -95,18 +116,28 @@ pub struct AuditRecord {
     pub seq: u64,
     /// The log's last entry hash at that sequence number.
     pub head: [u8; 32],
-    /// A migration that failed its check, or a log set aside, until the
-    /// owner acknowledges it.
-    pub failed_migration: Option<SetAside>,
+    /// Migrations that failed their check, and logs set aside, until the
+    /// owner acknowledges them: the first [`MAX_NOTED`].
+    pub set_asides: Vec<SetAside>,
+    /// How many more there were past those.
+    pub more_set_asides: u64,
     /// The log found not continuing the record, until the owner
     /// acknowledges it.
     pub rollback: Option<AuditRollback>,
     /// The record found missing or unreadable, until the owner acknowledges
     /// it.
     pub lost: Option<RecordLost>,
-    /// The name a signing audit log that could not be read was kept under,
-    /// until the owner acknowledges it.
-    pub signing_set_aside: Option<String>,
+    /// The names signing audit logs that could not be read were kept under,
+    /// until the owner acknowledges them: the first [`MAX_NOTED`].
+    pub signing_set_asides: Vec<String>,
+    /// The log's chain found broken, until the owner acknowledges it.
+    pub chain_broken: Option<ChainBroken>,
+    /// The fingerprint of the breaks the owner acknowledged, so only new
+    /// ones are reported.
+    pub chain_acknowledged: Option<[u8; 32]>,
+    /// The sequence number and hash a pruning about to replace the log
+    /// will leave it at, until the record follows it.
+    pub retention_pending: Option<(u64, [u8; 32])>,
 }
 
 /// Something about the audit log the owner must be told on every unlock
@@ -133,6 +164,10 @@ pub enum AuditWarning {
         /// That file is no longer beside the log.
         missing: bool,
     },
+    /// More logs were set aside than the record names.
+    MoreSetAside(u64),
+    /// The log's chain is broken in a way not acknowledged before.
+    ChainBroken(ChainBroken),
 }
 
 const ACKNOWLEDGE: &str =
@@ -148,14 +183,23 @@ impl std::fmt::Display for AuditWarning {
             }
         };
         match self {
-            Self::FailedMigration { set_aside, missing } if set_aside.unreadable => write!(
-                f,
-                "the audit log could not be read under the vault's data key (an interrupted \
-                 `keep rotate-data-key` or a failed re-encryption leaves it so, as does a file \
-                 put in its place), so it was set aside and a new log started: entries before \
-                 that cannot be read; {}; {ACKNOWLEDGE}",
-                kept_text(&set_aside.kept, *missing)
-            ),
+            Self::FailedMigration { set_aside, missing } if set_aside.unreadable => {
+                let why = if set_aside.rotation {
+                    "a `keep rotate-data-key` was under way and unfinished, which leaves the log \
+                     under the data key it replaced"
+                } else {
+                    "no data key change was under way, so it was replaced or damaged"
+                };
+                write!(
+                    f,
+                    "the audit log could not be read under the vault's data key ({why}), so it \
+                     was set aside and a new log started: the entries up to entry {} (head {}) \
+                     cannot be read; {}; {ACKNOWLEDGE}",
+                    set_aside.recorded_seq,
+                    hex::encode(set_aside.recorded_head),
+                    kept_text(&set_aside.kept, *missing)
+                )
+            }
             Self::FailedMigration { set_aside, missing } => write!(
                 f,
                 "the audit log was moved to sequence numbers or set aside, and the old log FAILED \
@@ -169,8 +213,9 @@ impl std::fmt::Display for AuditWarning {
             ),
             Self::RecordLost(lost) if lost.missing => write!(
                 f,
-                "the vault's record of the audit log was deleted, though the log shows one was \
-                 kept: a log replaced before this unlock would not have been noticed; {ACKNOWLEDGE}"
+                "the vault's record of the audit log is missing, though the log or the vault's \
+                 contents show it had one: a log replaced before this unlock would not have been \
+                 noticed; {ACKNOWLEDGE}"
             ),
             Self::RecordLost(_) => write!(
                 f,
@@ -183,6 +228,16 @@ impl std::fmt::Display for AuditWarning {
                  damage, or entries this keep cannot read) and was set aside, and a new one \
                  started; {}; {ACKNOWLEDGE}",
                 kept_text(kept, *missing)
+            ),
+            Self::MoreSetAside(count) => write!(
+                f,
+                "{count} more logs were set aside than the vault's record names; {ACKNOWLEDGE}"
+            ),
+            Self::ChainBroken(broken) => write!(
+                f,
+                "the audit log's hash chain is broken in {} places, the first at entry or line \
+                 {}: entries were removed, changed or put in from another log; {ACKNOWLEDGE}",
+                broken.failures, broken.first_failure
             ),
         }
     }
@@ -223,12 +278,50 @@ impl AuditRecord {
         found
     }
 
+    /// Note a log set aside, once per kept name, naming the first
+    /// [`MAX_NOTED`] and counting the rest.
+    pub(crate) fn note_set_aside(&mut self, set_aside: SetAside) {
+        if self.set_asides.iter().any(|s| s.kept == set_aside.kept) {
+            return;
+        }
+        if self.set_asides.len() < MAX_NOTED {
+            self.set_asides.push(set_aside);
+        } else {
+            self.more_set_asides = self.more_set_asides.saturating_add(1);
+        }
+    }
+
+    /// Note a signing log set aside, once per kept name, as
+    /// [`AuditRecord::note_set_aside`] does.
+    pub(crate) fn note_signing_set_aside(&mut self, kept: &str) {
+        if self.signing_set_asides.iter().any(|k| k == kept) {
+            return;
+        }
+        if self.signing_set_asides.len() < MAX_NOTED {
+            self.signing_set_asides.push(kept.to_string());
+        } else {
+            self.more_set_asides = self.more_set_asides.saturating_add(1);
+        }
+    }
+
     /// Whether anything is noted for the owner to acknowledge.
     pub(crate) fn pending(&self) -> bool {
-        self.failed_migration.is_some()
+        !self.set_asides.is_empty()
+            || self.more_set_asides > 0
             || self.rollback.is_some()
             || self.lost.is_some()
-            || self.signing_set_aside.is_some()
+            || !self.signing_set_asides.is_empty()
+            || self.chain_broken.is_some()
+    }
+
+    /// Clear everything noted for the owner, once acknowledged.
+    pub(crate) fn clear_pending(&mut self) {
+        self.set_asides.clear();
+        self.more_set_asides = 0;
+        self.rollback = None;
+        self.lost = None;
+        self.signing_set_asides.clear();
+        self.chain_broken = None;
     }
 }
 

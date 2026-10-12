@@ -209,7 +209,11 @@ impl AgentAudit {
         if self.spent.get(id).is_some_and(|s| s.frozen) {
             return Ok(());
         }
-        let key = (*id, kind, cap_text(detail).to_string());
+        let key = (
+            *id,
+            kind,
+            cap_text(detail, keep_core::agent::MAX_AUDIT_TEXT).to_string(),
+        );
         if let Some(window) = self.pending.get_mut(&key) {
             window.repeats = window.repeats.saturating_add(1);
             return Ok(());

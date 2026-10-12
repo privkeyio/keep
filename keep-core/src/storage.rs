@@ -29,6 +29,74 @@ use zeroize::Zeroizing;
 /// The config key the agent freeze epoch is stored under.
 const AGENT_FREEZE_EPOCH: &[u8] = b"agent_freeze_epoch";
 
+/// The config key noting a data key rotation under way.
+const ROTATION_IN_PROGRESS: &[u8] = b"rotation_in_progress";
+
+/// How far a seeded freeze epoch is shifted from the current Unix time in
+/// seconds.
+const SEEDED_EPOCH_SHIFT: u32 = 24;
+
+/// A freeze epoch for a vault whose epoch cannot be read: the current Unix
+/// time in seconds shifted left 24 bits. The gateway applies an unfreeze only
+/// at the exact current epoch, so the new epoch must equal no epoch a
+/// held-back unfreeze could carry. Epochs count up by one from 0 per freeze
+/// and unfreeze, so reaching this one by counting would take 2^24 of them for
+/// every second since 1970; and every earlier seed was made at an earlier
+/// time, so it is lower by at least 2^24 per second between them, more than
+/// any count since. Only a wall clock set back past an earlier seed could
+/// meet one again, which takes root on the gateway's host.
+fn seeded_epoch() -> u64 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs().max(1));
+    secs.saturating_mul(1 << SEEDED_EPOCH_SHIFT)
+}
+
+/// The freeze epoch moved by a freeze or a clear of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochMoved {
+    /// The new epoch.
+    pub epoch: u64,
+    /// The old epoch could not be read, so this one was seeded.
+    pub seeded: bool,
+}
+
+/// What [`Storage::epoch_write`] prepared.
+struct EpochWrite {
+    next: u64,
+    seeded: bool,
+    value: Vec<u8>,
+    ledgers: Vec<Vec<u8>>,
+}
+
+impl EpochWrite {
+    fn ops<'a>(&'a self, ledgers: &'a [(&'a [u8], &'a [u8])]) -> Vec<AtomicOp<'a>> {
+        std::iter::once(AtomicOp {
+            table: CONFIG_TABLE,
+            key: AGENT_FREEZE_EPOCH,
+            value: Some(&self.value),
+        })
+        .chain(
+            ledgers
+                .iter()
+                .zip(&self.ledgers)
+                .map(|((key, _), value)| AtomicOp {
+                    table: AGENT_LEDGERS_TABLE,
+                    key,
+                    value: Some(value),
+                }),
+        )
+        .collect()
+    }
+
+    fn result(&self) -> EpochMoved {
+        EpochMoved {
+            epoch: self.next,
+            seeded: self.seeded,
+        }
+    }
+}
+
 /// What a value [`Storage::set_config_bound`] stores starts with: the key and
 /// a zero byte.
 fn bound_prefix(key: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -1288,11 +1356,10 @@ impl Storage {
         id: &[u8; 16],
         expect_epoch: Option<u64>,
         ledgers: &[(&[u8], &[u8])],
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<EpochMoved>> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none()
-            && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none()
-        {
+        let row = backend.get(AGENT_CREDENTIALS_TABLE, id)?;
+        if row.is_none() && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none() {
             return Err(KeepError::NotFound(hex::encode(id)));
         }
         let mut ops = vec![
@@ -1307,43 +1374,24 @@ impl Storage {
                 value: None,
             },
         ];
-        let frozen = self.load_agent_credential(id)?.is_some_and(|c| c.frozen);
+        // A row that cannot be read may have been frozen, so deleting it
+        // clears a freeze as far as anyone can tell; it is never refused,
+        // since deleting it is how the owner gets rid of it.
+        let frozen = row.is_some_and(|row| match self.decode_agent_credential(id, &row) {
+            Ok(credential) => credential.frozen,
+            Err(e) => {
+                tracing::warn!(error = %e, "deleting an agent credential that cannot be read; taking it for frozen");
+                true
+            }
+        });
         if !frozen {
             backend.write_atomic(&ops)?;
             return Ok(None);
         }
-        let epoch = self.get_agent_freeze_epoch()?;
-        if expect_epoch.is_some_and(|expected| expected != epoch) {
-            return Err(KeepError::invalid_input(format!(
-                "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
-            )));
-        }
-        let next = epoch
-            .checked_add(1)
-            .ok_or_else(|| StorageError::corrupted("the agent freeze epoch is at its end"))?;
-        let epoch_value =
-            self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?;
-        let encrypted = ledgers
-            .iter()
-            .map(|(_, ledger)| self.encrypt_value(ledger))
-            .collect::<Result<Vec<_>>>()?;
-        ops.push(AtomicOp {
-            table: CONFIG_TABLE,
-            key: AGENT_FREEZE_EPOCH,
-            value: Some(&epoch_value),
-        });
-        ops.extend(
-            ledgers
-                .iter()
-                .zip(&encrypted)
-                .map(|((key, _), value)| AtomicOp {
-                    table: AGENT_LEDGERS_TABLE,
-                    key,
-                    value: Some(value),
-                }),
-        );
+        let moved = self.epoch_write(true, expect_epoch, ledgers)?;
+        ops.extend(moved.ops(ledgers));
         backend.write_atomic(&ops)?;
-        Ok(Some(next))
+        Ok(Some(moved.result()))
     }
 
     /// The serialized agent ledger stored under `key`, if any.
@@ -1833,6 +1881,7 @@ impl Storage {
     }
 
     /// The decrypted config value stored under `key`, if any.
+    #[cfg(test)]
     pub(crate) fn get_config_bytes(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
         match backend.get(CONFIG_TABLE, key)? {
@@ -1852,18 +1901,43 @@ impl Storage {
     /// if any. A value stored under another key, or without its key, is
     /// refused as corrupted.
     pub(crate) fn get_config_bound(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
-        let Some(stored) = self.get_config_bytes(key)? else {
-            return Ok(None);
-        };
+        self.config_row(key)?
+            .map(|stored| self.open_config_bound(key, &stored))
+            .transpose()
+    }
+
+    /// The config row `key` as stored, encrypted; an error is a failure to
+    /// read the database.
+    pub(crate) fn config_row(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .get(CONFIG_TABLE, key)
+    }
+
+    /// Decrypt `stored`, a row [`Storage::set_config_bound`] wrote under
+    /// `key`, refusing one written under another key.
+    pub(crate) fn open_config_bound(
+        &self,
+        key: &[u8],
+        stored: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let stored = self.decrypt_value(stored)?;
         let prefix = bound_prefix(key);
         match stored.strip_prefix(prefix.as_slice()) {
-            Some(value) => Ok(Some(Zeroizing::new(value.to_vec()))),
+            Some(value) => Ok(Zeroizing::new(value.to_vec())),
             None => Err(StorageError::corrupted(format!(
                 "config {} holds a value stored under another key",
                 String::from_utf8_lossy(key)
             ))
             .into()),
         }
+    }
+
+    /// The row `key` of `table` as stored, encrypted.
+    #[cfg(test)]
+    pub(crate) fn raw_row_for_tests(&self, table: &str, key: &[u8]) -> Option<Vec<u8>> {
+        self.backend.as_ref()?.get(table, key).ok()?
     }
 
     /// Remove the config row `key`, as someone editing `keep.db` would.
@@ -1924,6 +1998,13 @@ impl Storage {
     /// epoch can be told apart from one for the current state.
     pub fn get_agent_freeze_epoch(&self) -> Result<u64> {
         match self.get_config_bound(AGENT_FREEZE_EPOCH)? {
+            // Written as 0 before any agent exists, so missing after that, it
+            // was deleted: read as 0, an unfreeze held back from when the
+            // epoch was 0 would match it again.
+            None if self.any_agent_rows()? => Err(StorageError::corrupted(
+                "the agent freeze epoch is missing though agents exist",
+            )
+            .into()),
             None => Ok(0),
             Some(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
                 .map(u64::from_le_bytes)
@@ -1945,23 +2026,9 @@ impl Storage {
         frozen: bool,
         expect_epoch: Option<u64>,
         ledgers: &[(&[u8], &[u8])],
-    ) -> Result<u64> {
+    ) -> Result<EpochMoved> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        let epoch = self.get_agent_freeze_epoch()?;
-        if expect_epoch.is_some_and(|expected| expected != epoch) {
-            return Err(KeepError::invalid_input(format!(
-                "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
-            )));
-        }
-        let distinct: std::collections::HashSet<&[u8]> = ledgers.iter().map(|(k, _)| *k).collect();
-        if distinct.len() != ledgers.len() {
-            return Err(KeepError::invalid_input(
-                "an agent ledger update names each ledger once",
-            ));
-        }
-        let next = epoch
-            .checked_add(1)
-            .ok_or_else(|| StorageError::corrupted("the agent freeze epoch is at its end"))?;
+        let moved = self.epoch_write(frozen, expect_epoch, ledgers)?;
         let flag = match credential {
             Some(id) => {
                 let existing = self
@@ -1983,36 +2050,101 @@ impl Storage {
                 self.encrypt_value(&[u8::from(frozen)])?,
             ),
         };
-        let epoch_value =
-            self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?;
-        let encrypted = ledgers
-            .iter()
-            .map(|(_, ledger)| self.encrypt_value(ledger))
-            .collect::<Result<Vec<_>>>()?;
-        let mut ops = vec![
-            AtomicOp {
-                table: flag.0,
-                key: &flag.1,
-                value: Some(&flag.2),
-            },
-            AtomicOp {
-                table: CONFIG_TABLE,
-                key: AGENT_FREEZE_EPOCH,
-                value: Some(&epoch_value),
-            },
-        ];
-        ops.extend(
-            ledgers
-                .iter()
-                .zip(&encrypted)
-                .map(|((key, _), value)| AtomicOp {
-                    table: AGENT_LEDGERS_TABLE,
-                    key,
-                    value: Some(value),
-                }),
-        );
+        let mut ops = vec![AtomicOp {
+            table: flag.0,
+            key: &flag.1,
+            value: Some(&flag.2),
+        }];
+        ops.extend(moved.ops(ledgers));
         backend.write_atomic(&ops)?;
-        Ok(next)
+        Ok(moved.result())
+    }
+
+    /// The freeze epoch's next value and the agent ledgers `ledgers`,
+    /// encrypted, for a write that freezes or clears a freeze, refused when
+    /// `expect_epoch` is given and is not the current epoch, or when a
+    /// ledger is named twice. When the epoch cannot be read, a write that
+    /// may go ahead regardless (`may_seed`: a freeze, or deleting a frozen
+    /// credential) gets a freshly seeded epoch, and any other is refused.
+    fn epoch_write(
+        &self,
+        may_seed: bool,
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<EpochWrite> {
+        let distinct: std::collections::HashSet<&[u8]> = ledgers.iter().map(|(k, _)| *k).collect();
+        if distinct.len() != ledgers.len() {
+            return Err(KeepError::invalid_input(
+                "an agent ledger update names each ledger once",
+            ));
+        }
+        let (next, seeded) = match self.get_agent_freeze_epoch() {
+            Ok(epoch) => {
+                if expect_epoch.is_some_and(|expected| expected != epoch) {
+                    return Err(KeepError::invalid_input(format!(
+                        "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
+                    )));
+                }
+                let next = epoch.checked_add(1).ok_or_else(|| {
+                    StorageError::corrupted("the agent freeze epoch is at its end")
+                })?;
+                (next, false)
+            }
+            Err(e) if may_seed => {
+                tracing::error!(error = %e, "the agent freeze epoch cannot be read; the freeze goes ahead with a new one");
+                (seeded_epoch(), true)
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(EpochWrite {
+            next,
+            seeded,
+            value: self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?,
+            ledgers: ledgers
+                .iter()
+                .map(|(_, ledger)| self.encrypt_value(ledger))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    /// Write the freeze epoch's first value, 0, when it is missing and no
+    /// agent was ever issued, frozen or given a ledger; after that, a missing
+    /// epoch means a deleted one, which [`Storage::get_agent_freeze_epoch`]
+    /// refuses to read as 0.
+    pub(crate) fn ensure_agent_freeze_epoch(&self) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        if backend.get(CONFIG_TABLE, AGENT_FREEZE_EPOCH)?.is_some() || self.any_agent_rows()? {
+            return Ok(());
+        }
+        self.set_config_bound(AGENT_FREEZE_EPOCH, &0u64.to_le_bytes())
+    }
+
+    fn any_agent_rows(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        Ok(!backend.list(AGENT_CREDENTIALS_TABLE)?.is_empty()
+            || !backend.list(AGENT_LEDGERS_TABLE)?.is_empty()
+            || backend.get(CONFIG_TABLE, b"agent_freeze")?.is_some())
+    }
+
+    /// Note that a data key rotation is under way (`true`), in a row the
+    /// rotation itself carries to the new key, or that it finished (`false`).
+    /// A log found under a key the vault no longer has is put down to an
+    /// interrupted rotation only while the note is there.
+    pub(crate) fn set_rotation_in_progress(&self, in_progress: bool) -> Result<()> {
+        if in_progress {
+            return self.set_config_bound(ROTATION_IN_PROGRESS, &[1]);
+        }
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .delete(CONFIG_TABLE, ROTATION_IN_PROGRESS)
+            .map(|_| ())
+    }
+
+    /// Whether a data key rotation was noted under way and not finished. A
+    /// note that cannot be read counts as none.
+    pub(crate) fn rotation_in_progress(&self) -> bool {
+        matches!(self.get_config_bound(ROTATION_IN_PROGRESS), Ok(Some(_)))
     }
 
     /// Get the proxy configuration from the vault.
