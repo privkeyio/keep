@@ -673,3 +673,115 @@ async fn the_gateway_turns_away_junk_wraps_quickly() {
     drop(writer.await.unwrap());
     task.abort();
 }
+
+/// The admin connection that started a pairing stays open while the
+/// operator compares the fingerprint, however long past the idle limit, so
+/// the confirmation still lands; the session's expiry bounds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_admin_comparing_a_fingerprint_is_not_idle() {
+    let root = tempfile::tempdir().unwrap();
+    let uid = me();
+    let (agent_dir, admin_dir, relay_dir) = (
+        socket_dir(root.path(), "agent"),
+        socket_dir(root.path(), "admin"),
+        socket_dir(root.path(), "relay"),
+    );
+    let (keep, _) = vault(root.path());
+    let first = Phone::new();
+    let second = Phone::new();
+    let boot = FakeBoot::default();
+    boot.set_wall(super::clock::wall_clock().unwrap());
+    // The test's uid is the admin uid (the gateway's own uid is a stand-in).
+    let settings = Settings {
+        admin_uid: Some(uid),
+        ..Settings::default()
+    };
+    let mut state = start(keep, settings, &boot, BOOT).unwrap();
+    Store {
+        channel: Some(Hex32(channel().public_key().to_bytes())),
+        devices: vec![StoredDevice {
+            transport: Hex32(first.t()),
+            alg: keep_approval::sig::Alg::P256,
+            approver: keep_approval::Hex33(first.a()),
+            label: "Phone".into(),
+            counter: 0,
+        }],
+        ..Store::default()
+    }
+    .save(state.keep_mut())
+    .unwrap();
+    state
+        .configure_approvals(Some(channel()), vec!["wss://relay.example.com".into()], 60)
+        .unwrap();
+    let (agent, admin, relay_socket) = (
+        agent_dir.join("agent.sock"),
+        admin_dir.join("admin.sock"),
+        relay_dir.join("relay.sock"),
+    );
+    let agent_listener = server::bind(&agent, uid).unwrap();
+    let admin_listener = server::bind(&admin, uid).unwrap();
+    let relay_listener = server::bind(&relay_socket, uid).unwrap();
+    let idle = Duration::from_millis(300);
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let gateway = tokio::spawn(server::serve(
+        state,
+        agent_listener,
+        admin_listener,
+        Some((relay_listener, uid)),
+        Limits {
+            admin_idle: idle,
+            ..Limits::default()
+        },
+        async {
+            let _ = stopped.await;
+        },
+    ));
+    let (read, mut helper_write) = UnixStream::connect(&relay_socket)
+        .await
+        .unwrap()
+        .into_split();
+    let mut helper = BufReader::new(read).lines();
+    assert!(line(&mut helper).await.get("relays").is_some());
+    assert!(line(&mut helper).await.get("subscribe").is_some());
+
+    // An admin connection with nothing going on is still closed when idle.
+    let (read, _quiet) = UnixStream::connect(&admin).await.unwrap().into_split();
+    let mut quiet = BufReader::new(read).lines();
+    let closed = tokio::time::timeout(idle * 10, quiet.next_line())
+        .await
+        .expect("an idle admin connection is closed");
+    assert!(closed.unwrap().is_none());
+
+    let (read, mut write) = UnixStream::connect(&admin).await.unwrap().into_split();
+    let mut admin_read = BufReader::new(read).lines();
+    write
+        .write_all(b"{\"op\":\"approver_pair\",\"label\":\"Tablet\"}\n")
+        .await
+        .unwrap();
+    let answer = line(&mut admin_read).await;
+    let uri = answer["result"]["uri"].as_str().expect("a pairing code");
+    let uri = keep_approval::pairing::PairingUri::parse(uri).unwrap();
+    let pair = second.pair(&uri.secret, super::clock::wall_clock().unwrap());
+    helper_write
+        .write_all(format!("{}\n", json!({ "event": pair })).as_bytes())
+        .await
+        .unwrap();
+    let shown = line(&mut admin_read).await;
+    assert!(shown["result"]["fingerprint"].is_string(), "{shown}");
+    // The operator takes many idle periods to compare.
+    tokio::time::sleep(idle * 6).await;
+    write
+        .write_all(b"{\"op\":\"approver_confirm\"}\n")
+        .await
+        .unwrap();
+    let confirmed = tokio::time::timeout(Duration::from_secs(5), admin_read.next_line())
+        .await
+        .expect("an answer in time")
+        .unwrap()
+        .expect("the connection was kept");
+    let confirmed: Value = serde_json::from_str(&confirmed).unwrap();
+    assert!(confirmed["pending"].is_string(), "{confirmed}");
+
+    let _ = stop.send(());
+    gateway.await.unwrap().unwrap();
+}

@@ -2105,6 +2105,16 @@ impl State {
         }
     }
 
+    /// Whether admin connection `conn` holds the pairing session and the
+    /// phone's fingerprint is being compared, which keeps the connection
+    /// open past the idle limit.
+    pub fn confirming(&self, conn: u64) -> bool {
+        self.approvals
+            .as_ref()
+            .and_then(|a| a.pairing.as_ref())
+            .is_some_and(|s| s.conn == conn && matches!(s.state, PairState::Confirming { .. }))
+    }
+
     /// Cancel what admin connection `conn` was waiting for, once it is gone:
     /// an `issue_credential` is never approved with nobody to receive the
     /// token.

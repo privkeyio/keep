@@ -523,10 +523,7 @@ struct WaitingState {
 
 impl Waiting {
     fn state(&self) -> std::sync::MutexGuard<'_, WaitingState> {
-        self.0
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        super::approvals::lock(&self.0.state)
     }
 
     /// Write `pending`'s line through `lines` once it comes.
@@ -574,25 +571,37 @@ impl Waiting {
     }
 }
 
-/// The next request line on an authenticated connection, or `None` once it
-/// ends, fails, sends a line too long, or sits idle past `idle` with nothing
-/// waited on. While a request or a pairing waits on an approver the
-/// connection stays open (the approval deadline and the session's expiry
-/// bound it); once nothing does, the idle limit counts again from then.
+/// What came next on a connection.
+enum Next {
+    Line(Zeroizing<Vec<u8>>),
+    /// Idle past the limit with nothing waited on.
+    Idle,
+    /// Ended, failed, or sent a line too long.
+    Ended,
+}
+
+/// The next request line on an authenticated connection. While a request or
+/// a pairing waits on an approver the connection stays open (the approval
+/// deadline and the session's expiry bound it); once nothing does, the idle
+/// limit counts again from then.
 async fn next_request<R: AsyncRead + Unpin>(
     reader: &mut LineReader<R>,
     waiting: &Waiting,
     idle: Duration,
-) -> Option<Zeroizing<Vec<u8>>> {
+) -> Next {
+    let line = |read: std::io::Result<Option<Zeroizing<Vec<u8>>>>| match read {
+        Ok(Some(line)) => Next::Line(line),
+        _ => Next::Ended,
+    };
     loop {
         if waiting.is_empty() {
             return match tokio::time::timeout(idle, reader.next_line()).await {
-                Ok(Ok(line)) => line,
-                _ => None,
+                Ok(read) => line(read),
+                Err(_) => Next::Idle,
             };
         }
         tokio::select! {
-            line = reader.next_line() => return line.ok().flatten(),
+            read = reader.next_line() => return line(read),
             () = waiting.emptied() => {}
         }
     }
@@ -621,8 +630,8 @@ async fn agent_connection(
                 next_request(&mut reader, &waiting, limits.idle).await
             } else {
                 match tokio::time::timeout_at(deadline, reader.next_line()).await {
-                    Ok(Ok(line)) => line,
-                    _ => None,
+                    Ok(Ok(Some(line))) => Next::Line(line),
+                    _ => Next::Ended,
                 }
             }
         };
@@ -630,8 +639,8 @@ async fn agent_connection(
             biased;
             () = closed(&mut closing) => break,
             next = next => match next {
-                Some(line) => line,
-                None => break,
+                Next::Line(line) => line,
+                Next::Idle | Next::Ended => break,
             },
         };
         // Blank lines are requests too: refused and counted like any other,
@@ -691,8 +700,16 @@ async fn admin_connection(
             biased;
             () = closed(&mut closing) => break,
             next = next_request(&mut reader, &waiting, limits.admin_idle) => match next {
-                Some(line) => line,
-                None => break,
+                Next::Line(line) => line,
+                // The operator comparing a pairing's fingerprint is not idle:
+                // the session's expiry bounds that.
+                Next::Idle => {
+                    if with_state(&state, &stop, move |s| s.confirming(conn)).await == Some(true) {
+                        continue;
+                    }
+                    break;
+                }
+                Next::Ended => break,
             },
         };
         let Some((answer, pending)) = with_state(&state, &stop, move |s| {
@@ -710,7 +727,6 @@ async fn admin_connection(
         }
         tokio::task::yield_now().await;
     }
-    let _ = waiting.take();
     with_state(&state, &stop, move |s| s.admin_gone(conn)).await;
     drop(lines);
     let _ = writing.await;
@@ -1090,7 +1106,7 @@ mod tests {
                 .await
                 .expect("idle again once answered")
                 .unwrap();
-            assert!(ended.is_none());
+            assert!(matches!(ended, super::Next::Idle));
             assert!(waiting.is_empty());
         }
     }
