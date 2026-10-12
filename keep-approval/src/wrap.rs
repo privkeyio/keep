@@ -387,7 +387,18 @@ pub fn open<T: Clone>(
     now: u64,
 ) -> Result<Opened<T>> {
     let candidate = match_tag(event, candidates, now)?;
-    event.verify().map_err(|_| invalid("wrap signature"))?;
+    // A repeat is turned away after one hash, before the signature check: a
+    // relay replaying a wrap costs no more than that. The id is checked
+    // first, so a copy with a bad signature cannot take a real wrap's place.
+    if !event.verify_id() {
+        return Err(invalid("wrap id"));
+    }
+    if seen.contains(&event.id.to_bytes()) {
+        return Err(Error::NotOurs);
+    }
+    if !event.verify_signature() {
+        return Err(invalid("wrap signature"));
+    }
     if !seen.first_time(event.id.to_bytes(), event.created_at.as_secs(), now) {
         return Err(Error::NotOurs);
     }
@@ -455,6 +466,10 @@ pub struct SeenWraps {
 }
 
 impl SeenWraps {
+    fn contains(&self, wrap_id: &[u8; 32]) -> bool {
+        self.seen.contains_key(wrap_id)
+    }
+
     /// Record a wrap, returning whether it is seen for the first time and
     /// inside the window.
     pub fn first_time(&mut self, wrap_id: [u8; 32], created_at: u64, now: u64) -> bool {
@@ -1002,6 +1017,19 @@ mod tests {
         let mut seen = SeenWraps::default();
         assert!(open(&p.gateway, &forged, &candidates, &mut seen, NOW).is_err());
         assert!(open(&p.gateway, &event, &candidates, &mut seen, NOW).is_ok());
+        // Once the real one is in, a copy is turned away as a repeat before
+        // its signature is checked.
+        assert_eq!(
+            open(&p.gateway, &forged, &candidates, &mut seen, NOW).unwrap_err(),
+            Error::NotOurs
+        );
+        // A copy whose id does not match its content is refused as such.
+        let mut renamed = event.clone();
+        renamed.content.push(' ');
+        assert!(matches!(
+            open(&p.gateway, &renamed, &candidates, &mut seen, NOW),
+            Err(Error::Invalid(_) | Error::NotOurs)
+        ));
     }
 
     /// A pairing session, whose sender is not known yet, opens only a
