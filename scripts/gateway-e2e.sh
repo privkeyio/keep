@@ -35,49 +35,19 @@ ADMINS=${P}admins
 RUN=/run/${P}
 GW_PID=
 PASS=e2e-vault-password
-CREATED_USERS=()
-CREATED_GROUPS=()
 CREATED_RUN=
+. "$(dirname "$0")/lib/gateway-e2e.sh"
 
-# Never touch accounts or a run directory this script did not create.
-for u in $GW $ADMIN $A1 $A2 $OUT; do
-    if getent passwd "$u" >/dev/null; then
-        echo "refusing to run: user $u already exists" >&2
-        exit 2
-    fi
-done
-for g in $AGENTS $ADMINS; do
-    if getent group "$g" >/dev/null; then
-        echo "refusing to run: group $g already exists" >&2
-        exit 2
-    fi
-done
-if [[ -e $RUN ]]; then
-    echo "refusing to run: $RUN already exists" >&2
-    exit 2
-fi
+refuse_users $GW $ADMIN $A1 $A2 $OUT
+refuse_groups $AGENTS $ADMINS
+refuse_paths "$RUN"
 WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 
-fail() {
-    echo "FAIL: $*" >&2
+fail_context() {
     if [[ -f $WORK/gateway.log ]]; then
-        echo "--- gateway log ---" >&2
-        tail -50 "$WORK/gateway.log" >&2
+        echo "--- gateway log ---"
+        tail -50 "$WORK/gateway.log"
     fi
-    exit 1
-}
-pass() { echo "ok - $*"; }
-
-# Wait at most 10 seconds for `pid` to exit, then kill it.
-reap() {
-    local pid=$1 status=0
-    for _ in $(seq 100); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-    done
-    kill -KILL "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || status=$?
-    return "$status"
 }
 
 cleanup() {
@@ -85,10 +55,7 @@ cleanup() {
         kill "$GW_PID" 2>/dev/null || true
         reap "$GW_PID" || true
     fi
-    # Anything left running as these users would keep userdel from removing them.
-    for u in "${CREATED_USERS[@]}"; do pkill -KILL -u "$u" 2>/dev/null || true; done
-    for u in "${CREATED_USERS[@]}"; do userdel "$u" 2>/dev/null || echo "could not remove user $u" >&2; done
-    for g in "${CREATED_GROUPS[@]}"; do groupdel "$g" 2>/dev/null || echo "could not remove group $g" >&2; done
+    remove_created_accounts
     rm -rf "$WORK"
     if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
 }
@@ -98,28 +65,15 @@ for g in $AGENTS $ADMINS; do
     groupadd --system "$g"
     CREATED_GROUPS+=("$g")
 done
-add_user() {
-    useradd --system --no-create-home --shell /usr/sbin/nologin "$@"
-    CREATED_USERS+=("${@: -1}")
-}
 add_user "$GW"
 add_user -G "$ADMINS" "$ADMIN"
 add_user -G "$AGENTS" "$A1"
 add_user -G "$AGENTS" "$A2"
 add_user "$OUT"
-uid() { id -u "$1"; }
 
 chmod 0755 "$WORK"
 install -m 0755 "$BIN_SRC" "$WORK/keep"
 KEEP=$WORK/keep
-# Run as `user` with its own groups. setpriv execs the command, so a
-# backgrounded call's $! is the command itself.
-as() {
-    local user=$1
-    shift
-    setpriv --reuid="$user" --regid="$(id -g "$user")" --init-groups \
-        env -i PATH=/usr/bin:/bin HOME="$WORK" "$@"
-}
 
 # The vault, owned by the gateway's user and closed to everyone else.
 install -d -m 0700 -o "$GW" -g "$GW" "$WORK/vault-home"
@@ -149,10 +103,7 @@ ADMIN_SOCK=$RUN/admin/admin.sock
 # The vault password as systemd hands it to the gateway: a file in a
 # directory named by CREDENTIALS_DIRECTORY, readable by the gateway alone.
 CREDS=$WORK/creds
-install -d -m 0700 -o "$GW" "$CREDS"
-printf '%s\n' "$PASS" >"$CREDS/vault-password"
-chown "$GW" "$CREDS/vault-password"
-chmod 0400 "$CREDS/vault-password"
+make_creds "$CREDS"
 chmod 0500 "$CREDS"
 
 start_gateway() {
@@ -341,7 +292,7 @@ if MSG=$(as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gatewa
     --uid "$(uid "$A1")" --key "$NPUB" --op get_public_key 2>&1); then
     fail "issued through a socket of the wrong user"
 fi
-echo "$MSG" | grep -q "may have been issued" && fail "false alarm: $MSG"
+grep -q "may have been issued" <<<"$MSG" && fail "false alarm: $MSG"
 pass "an issue that was never sent raises no false alarm"
 
 # Issuing to the gateway's or the admin's uid is refused.
@@ -460,9 +411,9 @@ bridge_refuses() {
     if msg=$(rpc 1 ping '{}' | "$@" 2>&1); then
         fail "the bridge ran with $why"
     fi
-    echo "$msg" | grep -q "$want" || fail "$why: $msg"
-    echo "$msg" | grep -qE 'keep_agt_[0-9a-f]{64}' && fail "$why: the token was printed"
-    echo "$msg" | grep -q "$PASS" && fail "$why: the password was printed"
+    grep -q "$want" <<<"$msg" || fail "$why: $msg"
+    grep -qE 'keep_agt_[0-9a-f]{64}' <<<"$msg" && fail "$why: the token was printed"
+    grep -q "$PASS" <<<"$msg" && fail "$why: the password was printed"
     return 0
 }
 install -m 0640 -o "$A1" "$WORK/a1/token" "$WORK/a1/loose"
@@ -528,8 +479,8 @@ if MSG=$(as "$GW" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-u
     --uid "$(uid "$A2")" --key "$NPUB" --op get_public_key 2>&1); then
     fail "the gateway's own uid issued a credential"
 fi
-echo "$MSG" | grep -q "may have been issued" && fail "false alarm for a refused issue: $MSG"
-echo "$MSG" | grep -q "run as root or the gateway's admin uid" || fail "refused issue: $MSG"
+grep -q "may have been issued" <<<"$MSG" && fail "false alarm for a refused issue: $MSG"
+grep -q "run as root or the gateway's admin uid" <<<"$MSG" || fail "refused issue: $MSG"
 if as "$GW" "$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1; then
     fail "the gateway's own uid was admitted to the admin socket"
 fi
@@ -540,7 +491,7 @@ pass "socket access: outsiders and agents shut out, root and the admin let in"
 if OUT_MSG=$("$KEEP" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$A1" 2>&1); then
     fail "the admin client trusted a socket of another user"
 fi
-echo "$OUT_MSG" | grep -q "not the gateway's uid" || fail "wrong gateway user: $OUT_MSG"
+grep -q "not the gateway's uid" <<<"$OUT_MSG" || fail "wrong gateway user: $OUT_MSG"
 pass "the admin client checks the socket belongs to the gateway user"
 
 # Freeze, unfreeze and revoke take effect on the next request.
@@ -584,7 +535,7 @@ sign_psbt() {
         | python3 -c 'import json,sys; r=json.loads(sys.stdin.read())["result"]; t=r["content"][0]["text"]; print(("ERR " + t) if r["isError"] else ("OK %d %d" % (json.loads(t)["inputs_signed"], json.loads(t)["leaving_wallet_sats"])))'
 }
 ADDR=$(call 1 get_bitcoin_address '{}' | as "$A2" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a2/btc")
-echo "$ADDR" | grep -q '\\"address\\":\\"tb1p' || fail "address: $ADDR"
+grep -q '\\"address\\":\\"tb1p' <<<"$ADDR" || fail "address: $ADDR"
 [[ $(sign_psbt "$PSBT_10K") == "OK 1 10000" ]] || fail "PSBT within the grant was not signed"
 GOT=$(sign_psbt "$PSBT_60K")
 [[ $GOT == ERR*"over the 20000 sat limit per PSBT"* ]] || fail "over the per-PSBT limit: $GOT"

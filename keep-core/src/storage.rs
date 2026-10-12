@@ -26,6 +26,100 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+/// The config key the freeze of every agent is stored under.
+pub(crate) const AGENT_FREEZE: &[u8] = b"agent_freeze";
+
+/// The config key the agent freeze epoch is stored under.
+const AGENT_FREEZE_EPOCH: &[u8] = b"agent_freeze_epoch";
+
+/// The config key noting a data key rotation under way.
+const ROTATION_IN_PROGRESS: &[u8] = b"rotation_in_progress";
+
+/// How far a seeded freeze epoch is shifted from the current Unix time in
+/// seconds.
+const SEEDED_EPOCH_SHIFT: u32 = 24;
+
+/// A freeze epoch for a vault whose epoch cannot be read or is missing:
+/// the later of the current Unix time and `floor_secs` (the latest time the
+/// audit log recorded), in seconds, shifted left 24 bits, with 23 random low
+/// bits. The gateway applies an unfreeze only at the exact current epoch, so
+/// the new epoch must equal no epoch a held-back unfreeze could carry.
+/// Epochs count up by one from 0 per freeze and unfreeze, so reaching this
+/// one by counting would take 2^24 of them for every second since 1970; an
+/// earlier seed was made at an earlier time as the log saw it, so it is lower
+/// by at least 2^24 per second between them, less the 2^23 the random bits
+/// span; and two seeds in the same second, or after the wall clock stepped
+/// back past the log's last entry, meet only when 23 random bits do.
+fn seeded_epoch(floor_secs: i64) -> Result<u64> {
+    let now = chrono::Utc::now().timestamp();
+    // Capped so a seed always leaves room to count up from it.
+    let secs = u64::try_from(now.max(floor_secs).max(1))
+        .unwrap_or(1)
+        .min((u64::MAX >> SEEDED_EPOCH_SHIFT) - 1);
+    let low = u32::from_le_bytes(crypto::try_random_bytes::<4>()?) & ((1 << 23) - 1);
+    Ok((secs << SEEDED_EPOCH_SHIFT) | u64::from(low))
+}
+
+/// The freeze epoch moved by a freeze or a clear of one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpochMoved {
+    /// The new epoch.
+    pub epoch: u64,
+    /// The old epoch could not be read, so this one was seeded.
+    pub seeded: bool,
+}
+
+/// What [`Storage::epoch_write`] prepared.
+struct EpochWrite {
+    next: u64,
+    seeded: bool,
+    value: Vec<u8>,
+    ledgers: Vec<Vec<u8>>,
+}
+
+impl EpochWrite {
+    fn ops<'a>(&'a self, ledgers: &'a [(&'a [u8], &'a [u8])]) -> Vec<AtomicOp<'a>> {
+        std::iter::once(AtomicOp {
+            table: CONFIG_TABLE,
+            key: AGENT_FREEZE_EPOCH,
+            value: Some(&self.value),
+        })
+        .chain(
+            ledgers
+                .iter()
+                .zip(&self.ledgers)
+                .map(|((key, _), value)| AtomicOp {
+                    table: AGENT_LEDGERS_TABLE,
+                    key,
+                    value: Some(value),
+                }),
+        )
+        .collect()
+    }
+
+    fn result(&self) -> EpochMoved {
+        EpochMoved {
+            epoch: self.next,
+            seeded: self.seeded,
+        }
+    }
+}
+
+/// What a value [`Storage::set_config_bound`] stores starts with: the key and
+/// a zero byte.
+fn bound_prefix(key: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut prefix = Zeroizing::new(Vec::with_capacity(key.len() + 1));
+    prefix.extend_from_slice(key);
+    prefix.push(0);
+    prefix
+}
+
+fn bound_value(key: &[u8], value: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut bound = bound_prefix(key);
+    bound.extend_from_slice(value);
+    bound
+}
+
 /// Marker value stored for a pending delete-tombstone. Only the entry KEY
 /// (`"<table>:<hex record id>"`) carries information; the delete is re-published
 /// with a fresh `created_at`, so no timestamp needs to persist here.
@@ -277,6 +371,9 @@ pub struct Storage {
     /// Optional replication sink; see [`StatePublisher`]. `RwLock` so keep-web can install it after
     /// construction (via [`Storage::set_state_publisher`]) while storage methods take `&self`.
     pub(crate) state_publisher: std::sync::RwLock<Option<std::sync::Arc<dyn StatePublisher>>>,
+    /// The latest time the audit log recorded, in Unix seconds, which a
+    /// seeded freeze epoch never goes below; set as the log moves.
+    pub(crate) seed_floor: std::sync::atomic::AtomicI64,
 }
 
 fn create_storage_dir(path: &Path) -> Result<()> {
@@ -662,6 +759,7 @@ impl Storage {
             backend: Some(backend),
             descriptor_lock: std::sync::Mutex::new(()),
             state_publisher: std::sync::RwLock::new(None),
+            seed_floor: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -725,6 +823,7 @@ impl Storage {
             backend: None,
             descriptor_lock: std::sync::Mutex::new(()),
             state_publisher: std::sync::RwLock::new(None),
+            seed_floor: std::sync::atomic::AtomicI64::new(0),
         })
     }
 
@@ -1260,14 +1359,23 @@ impl Storage {
 
     /// Delete an agent credential and its ledger in one transaction. Errors if
     /// neither exists; a ledger left without its credential is removed too.
-    pub fn delete_agent_credential(&self, id: &[u8; 16]) -> Result<()> {
+    /// Delete agent credential `id` and its ledger. Deleting a frozen
+    /// credential clears its freeze, so it also moves the freeze epoch on by
+    /// one and stores the agent ledgers `ledgers`, in the same write, refused
+    /// when `expect_epoch` is given and is not the current epoch. Returns the
+    /// new epoch when it moved.
+    pub fn delete_agent_credential(
+        &self,
+        id: &[u8; 16],
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<Option<EpochMoved>> {
         let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
-        if backend.get(AGENT_CREDENTIALS_TABLE, id)?.is_none()
-            && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none()
-        {
+        let row = backend.get(AGENT_CREDENTIALS_TABLE, id)?;
+        if row.is_none() && backend.get(AGENT_LEDGERS_TABLE, id)?.is_none() {
             return Err(KeepError::NotFound(hex::encode(id)));
         }
-        backend.write_atomic(&[
+        let mut ops = vec![
             AtomicOp {
                 table: AGENT_CREDENTIALS_TABLE,
                 key: id,
@@ -1278,7 +1386,25 @@ impl Storage {
                 key: id,
                 value: None,
             },
-        ])
+        ];
+        // A row that cannot be read may have been frozen, so deleting it
+        // clears a freeze as far as anyone can tell; it is never refused,
+        // since deleting it is how the owner gets rid of it.
+        let frozen = row.is_some_and(|row| match self.decode_agent_credential(id, &row) {
+            Ok(credential) => credential.frozen,
+            Err(e) => {
+                tracing::warn!(error = %e, "deleting an agent credential that cannot be read; taking it for frozen");
+                true
+            }
+        });
+        if !frozen {
+            backend.write_atomic(&ops)?;
+            return Ok(None);
+        }
+        let moved = self.epoch_write(true, expect_epoch, ledgers)?;
+        ops.extend(moved.ops(ledgers));
+        backend.write_atomic(&ops)?;
+        Ok(Some(moved.result()))
     }
 
     /// The serialized agent ledger stored under `key`, if any.
@@ -1767,6 +1893,92 @@ impl Storage {
         backend.put(CONFIG_TABLE, key, &encrypted)
     }
 
+    /// The decrypted config value stored under `key`, if any.
+    #[cfg(test)]
+    pub(crate) fn get_config_bytes(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        match backend.get(CONFIG_TABLE, key)? {
+            Some(stored) => Ok(Some(self.decrypt_value(&stored)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Store `value` encrypted under the config `key`.
+    pub(crate) fn set_config_bytes(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let encrypted = self.encrypt_value(value)?;
+        backend.put(CONFIG_TABLE, key, &encrypted)
+    }
+
+    /// The config value stored under `key` with [`Storage::set_config_bound`],
+    /// if any. A value stored under another key, or without its key, is
+    /// refused as corrupted.
+    pub(crate) fn get_config_bound(&self, key: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>> {
+        self.config_row(key)?
+            .map(|stored| self.open_config_bound(key, &stored))
+            .transpose()
+    }
+
+    /// The config row `key` as stored, encrypted; an error is a failure to
+    /// read the database.
+    pub(crate) fn config_row(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .get(CONFIG_TABLE, key)
+    }
+
+    /// Decrypt `stored`, a row [`Storage::set_config_bound`] wrote under
+    /// `key`, refusing one written under another key.
+    pub(crate) fn open_config_bound(
+        &self,
+        key: &[u8],
+        stored: &[u8],
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let stored = self.decrypt_value(stored)?;
+        let prefix = bound_prefix(key);
+        match stored.strip_prefix(prefix.as_slice()) {
+            Some(value) => Ok(Zeroizing::new(value.to_vec())),
+            None => Err(StorageError::corrupted(format!(
+                "config {} holds a value stored under another key",
+                String::from_utf8_lossy(key)
+            ))
+            .into()),
+        }
+    }
+
+    /// The row `key` of `table` as stored, encrypted.
+    #[cfg(test)]
+    pub(crate) fn raw_row_for_tests(&self, table: &str, key: &[u8]) -> Option<Vec<u8>> {
+        self.backend.as_ref()?.get(table, key).ok()?
+    }
+
+    /// Plant a rate-limit trip dated `timestamp`, as someone who can write
+    /// the vault folder can.
+    #[cfg(test)]
+    pub(crate) fn forge_trip_for_tests(&self, timestamp: u64) {
+        let hmac_key = crate::rate_limit::derive_hmac_key(&self.header.salt);
+        crate::rate_limit::forge_trip_for_tests(&self.path, &hmac_key, timestamp);
+    }
+
+    /// Remove the config row `key`, as someone editing `keep.db` would.
+    #[cfg(test)]
+    pub(crate) fn remove_config_for_tests(&self, key: &[u8]) -> Result<bool> {
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .delete(CONFIG_TABLE, key)
+    }
+
+    /// Store `value` encrypted under the config `key`, with the key inside
+    /// the encrypted value, so it cannot be moved under another key. The
+    /// value is one opaque blob under the data key, which rotation carries
+    /// as it carries every config row; only keys no older keep reads are
+    /// stored this way.
+    pub(crate) fn set_config_bound(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.set_config_bytes(key, &bound_value(key, value))
+    }
+
     /// Get the kill switch state from the vault.
     pub fn get_kill_switch(&self) -> Result<bool> {
         self.get_config_flag(b"kill_switch")
@@ -1779,7 +1991,7 @@ impl Storage {
 
     /// Whether every agent credential is frozen.
     pub fn get_agent_freeze(&self) -> Result<bool> {
-        self.get_config_flag(b"agent_freeze")
+        self.get_config_flag(AGENT_FREEZE)
     }
 
     /// Write raw bytes into a table, for tests that corrupt a stored value.
@@ -1792,14 +2004,271 @@ impl Storage {
     }
 
     /// Every raw row of a table, for tests that copy a stored value.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn list_raw(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.backend.as_ref().ok_or(KeepError::Locked)?.list(table)
     }
 
-    /// Freeze or unfreeze every agent credential.
+    /// Freeze or unfreeze every agent credential, moving the freeze epoch.
     pub fn set_agent_freeze(&self, frozen: bool) -> Result<()> {
-        self.set_config_flag(b"agent_freeze", frozen)
+        self.set_agent_frozen(None, frozen, None, &[]).map(|_| ())
+    }
+
+    /// The agent freeze epoch: one more on every freeze and unfreeze, of one
+    /// credential or of every agent, so an unfreeze signed for an earlier
+    /// epoch can be told apart from one for the current state.
+    pub fn get_agent_freeze_epoch(&self) -> Result<u64> {
+        match self.get_config_bound(AGENT_FREEZE_EPOCH)? {
+            // Written when the vault is created and at every unlock, so a
+            // missing one was deleted: read as 0, an unfreeze held back from
+            // when the epoch was 0 would match it again.
+            None => Err(StorageError::corrupted("the agent freeze epoch is missing").into()),
+            Some(bytes) => <[u8; 8]>::try_from(bytes.as_slice())
+                .map(u64::from_le_bytes)
+                .map_err(|_| {
+                    StorageError::corrupted("the agent freeze epoch is not 8 bytes").into()
+                }),
+        }
+    }
+
+    /// Freeze or unfreeze (`frozen`) agent credential `credential`, or every
+    /// agent when it is `None`, move the freeze epoch on by one, and store
+    /// the agent ledgers `ledgers`, all in one durable write, so a freeze
+    /// never applies at an epoch that failed to move. Refused, with nothing
+    /// written, when `expect_epoch` is given and is not the current epoch.
+    /// Returns the new epoch.
+    pub(crate) fn set_agent_frozen(
+        &self,
+        credential: Option<&[u8; 16]>,
+        frozen: bool,
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<EpochMoved> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let moved = self.epoch_write(frozen, expect_epoch, ledgers)?;
+        let flag = match credential {
+            Some(id) => {
+                let existing = self
+                    .load_agent_credential(id)?
+                    .ok_or_else(|| KeepError::NotFound(hex::encode(id)))?;
+                let mut updated = existing.clone();
+                updated.frozen = frozen;
+                updated.check_replaces(&existing)?;
+                let serialized = Zeroizing::new(bincode_options().serialize(&updated)?);
+                (
+                    AGENT_CREDENTIALS_TABLE,
+                    id.to_vec(),
+                    self.encrypt_value(&serialized)?,
+                )
+            }
+            None => (
+                CONFIG_TABLE,
+                AGENT_FREEZE.to_vec(),
+                self.encrypt_value(&[u8::from(frozen)])?,
+            ),
+        };
+        let mut ops = vec![AtomicOp {
+            table: flag.0,
+            key: &flag.1,
+            value: Some(&flag.2),
+        }];
+        ops.extend(moved.ops(ledgers));
+        backend.write_atomic(&ops)?;
+        Ok(moved.result())
+    }
+
+    /// The freeze epoch's next value and the agent ledgers `ledgers`,
+    /// encrypted, for a write that freezes or clears a freeze, refused when
+    /// `expect_epoch` is given and is not the current epoch, or when a
+    /// ledger is named twice. When the epoch cannot be read, a write that
+    /// may go ahead regardless (`may_seed`: a freeze, or deleting a frozen
+    /// credential) gets a freshly seeded epoch, and any other is refused.
+    fn epoch_write(
+        &self,
+        may_seed: bool,
+        expect_epoch: Option<u64>,
+        ledgers: &[(&[u8], &[u8])],
+    ) -> Result<EpochWrite> {
+        let distinct: std::collections::HashSet<&[u8]> = ledgers.iter().map(|(k, _)| *k).collect();
+        if distinct.len() != ledgers.len() {
+            return Err(KeepError::invalid_input(
+                "an agent ledger update names each ledger once",
+            ));
+        }
+        let (next, seeded) = match self.get_agent_freeze_epoch() {
+            Ok(epoch) => {
+                if expect_epoch.is_some_and(|expected| expected != epoch) {
+                    return Err(KeepError::invalid_input(format!(
+                        "the agent freeze epoch moved to {epoch}: something froze or unfroze since"
+                    )));
+                }
+                match epoch.checked_add(1) {
+                    Some(next) => (next, false),
+                    // At the end no unfreeze can apply, since one would have
+                    // to move the epoch on; a freeze still goes ahead and
+                    // leaves it there, so a freeze never fails open.
+                    None if may_seed => (epoch, false),
+                    None => {
+                        return Err(
+                            StorageError::corrupted("the agent freeze epoch is at its end").into(),
+                        )
+                    }
+                }
+            }
+            Err(e) if may_seed => {
+                tracing::error!(error = %e, "the agent freeze epoch cannot be read; the freeze goes ahead with a new one");
+                (
+                    seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed))?,
+                    true,
+                )
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(EpochWrite {
+            next,
+            seeded,
+            value: self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &next.to_le_bytes()))?,
+            ledgers: ledgers
+                .iter()
+                .map(|(_, ledger)| self.encrypt_value(ledger))
+                .collect::<Result<Vec<_>>>()?,
+        })
+    }
+
+    /// A seeded epoch to write when the epoch's row is missing at unlock:
+    /// one that no unfreeze held back from before can match, whatever agent
+    /// rows were there or were wiped. Only creating a vault starts at 0.
+    pub(crate) fn missing_agent_freeze_epoch(&self) -> Result<Option<u64>> {
+        if self.agent_freeze_epoch_row()? {
+            return Ok(None);
+        }
+        seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed)).map(Some)
+    }
+
+    /// A seeded epoch as unlock would write one.
+    #[cfg(test)]
+    pub(crate) fn missing_or_seeded_for_tests(&self) -> u64 {
+        seeded_epoch(self.seed_floor.load(std::sync::atomic::Ordering::Relaxed)).unwrap()
+    }
+
+    /// Note the latest time the audit log recorded, in Unix seconds.
+    pub(crate) fn set_seed_floor(&self, secs: i64) {
+        self.seed_floor
+            .fetch_max(secs, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Store the audit record `record` (serialized), and the agent freeze
+    /// epoch `epoch` when given, in one write.
+    pub(crate) fn set_audit_record(&self, record: &[u8], epoch: Option<u64>) -> Result<()> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let record =
+            self.encrypt_value(&bound_value(crate::audit_record::AUDIT_RECORD_KEY, record))?;
+        let epoch = epoch
+            .map(|e| self.encrypt_value(&bound_value(AGENT_FREEZE_EPOCH, &e.to_le_bytes())))
+            .transpose()?;
+        let mut ops = vec![AtomicOp {
+            table: CONFIG_TABLE,
+            key: crate::audit_record::AUDIT_RECORD_KEY,
+            value: Some(&record),
+        }];
+        if let Some(epoch) = &epoch {
+            ops.push(AtomicOp {
+                table: CONFIG_TABLE,
+                key: AGENT_FREEZE_EPOCH,
+                value: Some(epoch),
+            });
+        }
+        backend.write_atomic(&ops)
+    }
+
+    /// Whether the agent freeze epoch's row is there at all, readable or not.
+    pub(crate) fn agent_freeze_epoch_row(&self) -> Result<bool> {
+        Ok(self.config_row(AGENT_FREEZE_EPOCH)?.is_some())
+    }
+
+    /// Whether the vault holds any key, share, secret, wallet descriptor,
+    /// agent credential or ledger, or the global agent freeze, readable or
+    /// not: something whose making the audit log would have recorded.
+    pub(crate) fn holds_logged_rows(&self) -> Result<bool> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        for table in [
+            KEYS_TABLE,
+            SHARES_TABLE,
+            SECRETS_TABLE,
+            DESCRIPTORS_TABLE,
+            AGENT_CREDENTIALS_TABLE,
+            AGENT_LEDGERS_TABLE,
+        ] {
+            if !backend.list(table)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(self.config_row(AGENT_FREEZE)?.is_some())
+    }
+
+    /// The latest `created_at` of any key, share, secret, wallet descriptor
+    /// or agent credential that can be read, or a secret's `updated_at`, in
+    /// Unix seconds; a row
+    /// that cannot be decrypted or decoded is passed over. Only a failure to read the database is an
+    /// error.
+    pub(crate) fn latest_created_at(&self) -> Result<i64> {
+        let backend = self.backend.as_ref().ok_or(KeepError::Locked)?;
+        let open =
+            |stored: &[u8]| -> Option<Zeroizing<Vec<u8>>> { self.decrypt_value(stored).ok() };
+        let mut latest = i64::MIN;
+        for (_, stored) in backend.list(KEYS_TABLE)? {
+            if let Some(record) =
+                open(&stored).and_then(|b| bincode_options().deserialize::<KeyRecord>(&b).ok())
+            {
+                latest = latest.max(record.created_at);
+            }
+        }
+        for (_, stored) in backend.list(SHARES_TABLE)? {
+            if let Some(share) = open(&stored).and_then(|b| deserialize_stored_share(&b).ok()) {
+                latest = latest.max(share.metadata.created_at);
+            }
+        }
+        for (_, stored) in backend.list(SECRETS_TABLE)? {
+            if let Some(secret) =
+                open(&stored).and_then(|b| bincode_options().deserialize::<SecretRecord>(&b).ok())
+            {
+                latest = latest.max(secret.created_at.max(secret.updated_at));
+            }
+        }
+        for (_, stored) in backend.list(DESCRIPTORS_TABLE)? {
+            if let Some(descriptor) =
+                open(&stored).and_then(|b| serde_json::from_slice::<WalletDescriptor>(&b).ok())
+            {
+                latest = latest.max(i64::try_from(descriptor.created_at).unwrap_or(i64::MAX));
+            }
+        }
+        for (key, stored) in backend.list(AGENT_CREDENTIALS_TABLE)? {
+            if let Ok(credential) = self.decode_agent_credential(&key, &stored) {
+                latest = latest.max(i64::try_from(credential.created_at).unwrap_or(i64::MAX));
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Note that a data key rotation is under way (`true`), in a row the
+    /// rotation itself carries to the new key, or that it finished (`false`).
+    /// A log found under a key the vault no longer has is put down to an
+    /// interrupted rotation only while the note is there.
+    pub(crate) fn set_rotation_in_progress(&self, in_progress: bool) -> Result<()> {
+        if in_progress {
+            return self.set_config_bound(ROTATION_IN_PROGRESS, &[1]);
+        }
+        self.backend
+            .as_ref()
+            .ok_or(KeepError::Locked)?
+            .delete(CONFIG_TABLE, ROTATION_IN_PROGRESS)
+            .map(|_| ())
+    }
+
+    /// Whether a data key rotation was noted under way and not finished. A
+    /// note that cannot be read counts as none.
+    pub(crate) fn rotation_in_progress(&self) -> bool {
+        matches!(self.get_config_bound(ROTATION_IN_PROGRESS), Ok(Some(_)))
     }
 
     /// Get the proxy configuration from the vault.

@@ -14,6 +14,7 @@ keep-core = { path = "../keep-core", features = ["ed25519"] }
 keep-bitcoin = { path = "../keep-bitcoin", features = ["esplora-chain-view"] }
 keep-enclave-host = { path = "../keep-enclave/host" }
 keep-agent = { path = "../keep-agent", features = ["mcp"] }
+keep-approval = { path = "../keep-approval" }
 keep-frost-net = { path = "../keep-frost-net" }
 keep-nip46 = { path = "../keep-nip46" }
 
@@ -33,6 +34,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 hex = "0.4"
+qrcode = { version = "0.13", default-features = false }
 
 urlencoding = "2.1"
 url = "2.5"

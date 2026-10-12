@@ -1318,8 +1318,9 @@ fn test_audit_verify_detects_tampering() {
 }
 
 /// Overwrite `vault`'s audit log with entries in the format the release
-/// before sequence numbers wrote, chained from zero; `break_link` breaks the
-/// chain at the second entry.
+/// before sequence numbers wrote, chained from zero, and remove the record of
+/// the log and the freeze epoch from `keep.db`, as that release kept
+/// neither; `break_link` breaks the chain at the second entry.
 fn write_format1_audit_log(vault: &Path, break_link: bool) {
     use base64::Engine;
     use keep_core::audit::{AuditEntry, AuditEventType};
@@ -1352,6 +1353,11 @@ fn write_format1_audit_log(vault: &Path, break_link: bool) {
         out.push('\n');
     }
     std::fs::write(vault.join("audit.log"), out).unwrap();
+    use keep_core::backend::StorageBackend;
+    let db = keep_core::backend::RedbBackend::open(&vault.join("keep.db")).unwrap();
+    for row in [&b"audit_record"[..], b"agent_freeze_epoch"] {
+        db.delete(keep_core::backend::CONFIG_TABLE, row).unwrap();
+    }
 }
 
 /// A vault whose audit log predates sequence numbers is migrated the next
@@ -1400,8 +1406,9 @@ fn test_audit_verify_fails_after_a_failed_migration() {
     assert!(output_contains(&out, "cannot be trusted"));
     assert!(output_contains(&out, "audit.log.v1"));
 
-    // Once retention has removed every entry from before the migration,
-    // verify passes and only notes the failed migration.
+    // Once retention has removed every entry from before the migration, the
+    // chain itself checks out and only notes the failed migration, but verify
+    // still fails while the warning waits for the owner's acknowledgement.
     assert_success(
         &KeepCmd::new(&bin)
             .path(&vault)
@@ -1412,13 +1419,113 @@ fn test_audit_verify_fails_after_a_failed_migration() {
         .path(&vault)
         .args(["audit", "verify"])
         .run();
-    assert_success(&out);
+    assert_failure(&out);
+    assert!(output_contains(&out, "hash chain is valid"));
     assert!(output_contains(&out, "None of them remain"));
 
+    // Deleting the kept old log does not silence the warning; it says the
+    // kept log is missing until the owner acknowledges it.
     std::fs::remove_file(vault.join("audit.log.v1")).unwrap();
     let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
     assert_success(&out);
+    assert!(output_contains(&out, "FAILED its chain check"));
+    assert!(output_contains(&out, "audit.log.v1 is missing"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Acknowledged"));
+    let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+    assert_success(&out);
     assert!(!output_contains(&out, "FAILED its chain check"));
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["audit", "verify"])
+            .run(),
+    );
+}
+
+/// The latest session cut off the audit log is reported on every unlock,
+/// `audit verify` exits 1 until the owner acknowledges it, and the
+/// acknowledgement is itself recorded.
+#[test]
+fn test_audit_verify_fails_on_a_rollback_until_acknowledged() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("audit-vault");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k1"])
+            .run(),
+    );
+    let before = std::fs::read(vault.join("audit.log")).unwrap();
+    assert_success(
+        &KeepCmd::new(&bin)
+            .path(&vault)
+            .args(["generate", "--name", "k2"])
+            .run(),
+    );
+    std::fs::write(vault.join("audit.log"), before).unwrap();
+
+    for _ in 0..2 {
+        let out = KeepCmd::new(&bin).path(&vault).args(["list"]).run();
+        assert_success(&out);
+        assert!(output_contains(&out, "replaced or cut back"));
+    }
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    assert!(output_contains(&out, "replaced or cut back"));
+
+    // Without KEEP_YES and without a terminal to confirm on, nothing is
+    // acknowledged; with it, what is acknowledged is shown first.
+    let mut unconfirmed = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"]);
+    unconfirmed.cmd.env_remove("KEEP_YES");
+    let out = unconfirmed.run();
+    assert_failure(&out);
+    assert!(output_contains(&out, "About to acknowledge"));
+    assert!(output_contains(&out, "replaced or cut back"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_failure(&out);
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "About to acknowledge"));
+    assert!(output_contains(&out, "Acknowledged"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "acknowledge"])
+        .run();
+    assert_success(&out);
+    assert!(output_contains(&out, "Nothing to acknowledge"));
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "verify"])
+        .run();
+    assert_success(&out);
+    let out = KeepCmd::new(&bin)
+        .path(&vault)
+        .args(["audit", "stats"])
+        .run();
+    assert_success(&out);
 }
 
 /// `audit stats` reports the count of each event type; two `generate`s show as
@@ -2735,4 +2842,205 @@ fn test_gateway_serve_takes_its_password_only_from_a_closed_credential() {
     let output = serve(&[("CREDENTIALS_DIRECTORY", &creds)], false);
     refused(&output, "/nonexistent");
     assert!(!output_contains(&output, "Decryption failed"), "{output:?}");
+}
+
+/// An offline reset of the approvers runs only as the vault's owner, so no
+/// file in the gateway's vault comes to belong to anyone else; root is no
+/// exception.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_offline_reset_runs_only_as_the_vaults_owner() {
+    use std::os::unix::fs::MetadataExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let me = std::fs::metadata("/proc/self").unwrap().uid();
+    // A vault directory someone else owns: root makes one; anyone else is
+    // pointed at one root owns.
+    let vault = if me == 0 {
+        let vault = dir.path().join("vault");
+        std::fs::create_dir(&vault).unwrap();
+        std::os::unix::fs::chown(&vault, Some(65534), Some(65534)).unwrap();
+        vault
+    } else {
+        std::path::PathBuf::from("/")
+    };
+    let output = Command::new(&keep)
+        .env_clear()
+        .arg("--path")
+        .arg(&vault)
+        .args(["gateway", "approver", "reset", "--offline"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "as the vault's owner"),
+        "{output:?}"
+    );
+}
+
+/// `keep gateway approver pair` without a terminal to confirm the
+/// fingerprint on is refused before the gateway is asked for a session.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_pairing_needs_a_terminal_before_it_asks_the_gateway() {
+    use std::os::unix::fs::MetadataExt;
+
+    let keep = require_binary!();
+    let me = std::fs::metadata("/proc/self").unwrap().uid();
+    let output = Command::new(&keep)
+        .env_clear()
+        .args(["--path", "/"])
+        .args([
+            "gateway",
+            "approver",
+            "pair",
+            "--label",
+            "Phone",
+            "--admin-socket",
+            "/nonexistent-admin/admin.sock",
+            "--gateway-user",
+            &me.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(output_contains(&output, "on a terminal"), "{output:?}");
+    assert!(!output_contains(&output, "admin socket"), "{output:?}");
+}
+
+/// `keep gateway channel-key new` writes the key only into a pipe, as 64
+/// hex digits on one line, and the public key to stderr; `keep gateway
+/// serve` with relays needs that key as a credential, and checks it as it
+/// checks the password.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_gateway_channel_key_goes_only_to_a_pipe_and_approvals_need_it() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    let keep = require_binary!();
+    let dir = TempDir::new().unwrap();
+    // To a file, or nowhere: refused, nothing written.
+    let file = dir.path().join("key");
+    let output = Command::new(&keep)
+        .env_clear()
+        .args(["gateway", "channel-key", "new"])
+        .stdout(std::fs::File::create(&file).unwrap())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(output_contains(&output, "only to a pipe"), "{output:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"");
+    // Into a pipe.
+    let mut child = Command::new(&keep)
+        .env_clear()
+        .args(["gateway", "channel-key", "new"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut key = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut key)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output);
+    let key = key.strip_suffix('\n').unwrap();
+    assert_eq!(key.len(), 64);
+    assert!(key.bytes().all(|b| b.is_ascii_hexdigit()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("npub1"), "{stderr}");
+    assert!(!stderr.contains(key), "the secret went to stderr");
+
+    let me = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata("/proc/self").unwrap().uid()
+    };
+    if me == 0 {
+        return;
+    }
+    let vault = dir.path().join("vault");
+    assert_success(
+        &KeepCmd::new(&keep)
+            .path(&vault)
+            .args(["init", "--size", "10"])
+            .run(),
+    );
+    let creds = dir.path().join("creds");
+    std::fs::create_dir(&creds).unwrap();
+    let password = creds.join("vault-password");
+    std::fs::write(&password, format!("{TEST_PASSWORD}\n")).unwrap();
+    std::fs::set_permissions(&password, std::fs::Permissions::from_mode(0o400)).unwrap();
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let serve = || {
+        Command::new(&keep)
+            .env_clear()
+            .env("CREDENTIALS_DIRECTORY", &creds)
+            .arg("--path")
+            .arg(&vault)
+            .args([
+                "gateway",
+                "serve",
+                "--agent-socket",
+                "/nonexistent/agent.sock",
+                "--admin-socket",
+                "/nonexistent-admin/admin.sock",
+                "--approval-relay",
+                "wss://relay.example.com",
+                "--relay-user",
+                &me.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let output = serve();
+    assert_failure(&output);
+    assert!(output_contains(&output, "channel-key"), "{output:?}");
+    let channel = creds.join("channel-key");
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&channel, format!("{key}\n")).unwrap();
+    std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let output = serve();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "closed to other users"),
+        "{output:?}"
+    );
+    assert!(!output_contains(&output, key), "the key was printed");
+    // The key is read only after the gateway's own refusals.
+    let output = Command::new(&keep)
+        .env_clear()
+        .env("CREDENTIALS_DIRECTORY", &creds)
+        .env("KEEP_PASSWORD", TEST_PASSWORD)
+        .arg("--path")
+        .arg(&vault)
+        .args([
+            "gateway",
+            "serve",
+            "--approval-relay",
+            "wss://relay.example.com",
+            "--relay-user",
+            &me.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_failure(&output);
+    assert!(
+        output_contains(&output, "never reads the vault password from KEEP_PASSWORD"),
+        "{output:?}"
+    );
+    // Closed, the gateway goes on to its sockets, which do not exist here.
+    std::fs::set_permissions(&channel, std::fs::Permissions::from_mode(0o400)).unwrap();
+    let output = serve();
+    assert_failure(&output);
+    assert!(output_contains(&output, "/nonexistent"), "{output:?}");
+    assert!(!output_contains(&output, key), "the key was printed");
 }

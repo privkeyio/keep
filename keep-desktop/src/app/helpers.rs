@@ -44,6 +44,7 @@ impl App {
         self.identities.clear();
         self.cached_share_count = 0;
         self.cached_nsec_count = 0;
+        self.audit_warnings.clear();
         self.identity_switcher_open = false;
         self.delete_identity_confirm = None;
         self.toast = None;

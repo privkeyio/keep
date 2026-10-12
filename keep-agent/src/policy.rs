@@ -16,6 +16,7 @@ use keep_bitcoin::{Network, PsbtAnalysis};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+pub use crate::approval::{Approval, Approved};
 use crate::error::{AgentError, Result};
 use crate::scope::{canonical_allowlist, check_outputs, Operation, OutputRejection};
 
@@ -55,6 +56,10 @@ const APPROVAL_RANGE: std::ops::Range<u16> = 10_000..30_000;
 fn kind_needs_approval(kind: u16) -> bool {
     APPROVAL_KINDS.contains(&kind) || APPROVAL_RANGE.contains(&kind)
 }
+
+/// Keys no grant may name: the gateway's channel key and every registered
+/// approver device's transport key.
+pub type ReservedKeys = BTreeSet<[u8; 32]>;
 
 /// What a credential may do. Every field is an explicit allowance: an empty set
 /// allows nothing.
@@ -117,14 +122,35 @@ pub struct BitcoinGrant {
 }
 
 impl Grant {
-    /// The grant a credential may be issued with: it names its keys, each
-    /// operation has what it needs to ever be allowed, and allowlisted addresses
-    /// are on the grant's network (stored canonically).
-    pub fn validated(mut self) -> Result<Self> {
+    /// The grant a credential may be issued with: it names its keys, none of
+    /// them `reserved` (in `keys` or `nip44_peers`), each operation has what it
+    /// needs to ever be allowed, it lists none of the approval protocol's
+    /// kinds, and allowlisted addresses are on the grant's network (stored
+    /// canonically).
+    pub fn validated(mut self, reserved: &ReservedKeys) -> Result<Self> {
         let refuse = |m: &str| Err(AgentError::ScopeViolation(m.into()));
         let has = |op| self.operations.contains(&op);
         if self.keys.is_empty() {
             return refuse("a grant needs the keys it may use");
+        }
+        if self
+            .keys
+            .iter()
+            .chain(&self.nip44_peers)
+            .any(|k| reserved.contains(k))
+        {
+            return refuse(
+                "a grant cannot name the gateway's channel key or an approver device's key",
+            );
+        }
+        if self
+            .event_kinds
+            .iter()
+            .any(|&k| keep_approval::kind::is_protocol_kind(k))
+        {
+            return refuse(
+                "kinds 24250 to 24255 belong to the approval protocol and are never granted",
+            );
         }
         if has(Operation::SignNostrEvent) && self.event_kinds.is_empty() {
             return refuse("sign_nostr_event needs an explicit list of event kinds");
@@ -216,6 +242,11 @@ pub enum Decision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyReason {
+    /// One of the approval protocol's kinds, never signed for an agent.
+    ProtocolKind(u16),
+    /// A management change, which no grant covers: it is applied once
+    /// approved, never evaluated as an agent's request.
+    ManagementChange,
     KeyNotGranted,
     OperationNotGranted(Operation),
     KindNotGranted(u16),
@@ -259,6 +290,11 @@ pub enum ApprovalReason {
 impl fmt::Display for DenyReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtocolKind(k) => write!(
+                f,
+                "event kind {k} belongs to the approval protocol and is never signed for an agent"
+            ),
+            Self::ManagementChange => write!(f, "a management change is not an agent request"),
             Self::KeyNotGranted => write!(f, "that key is not granted"),
             Self::OperationNotGranted(op) => write!(f, "{} is not granted", op.as_str()),
             Self::KindNotGranted(k) => write!(f, "event kind {k} is not granted"),
@@ -309,6 +345,11 @@ pub struct Ledger {
     /// The latest time the ledger has seen. Spends are stamped no earlier, so a
     /// clock stepped back neither frees nor shortens them.
     last_seen: u64,
+    /// One more on every reservation, never decreasing, not even when a spend
+    /// ages out or is released: an approver that sees it go down knows the
+    /// ledger was rolled back. Zero in a ledger written before it existed.
+    #[serde(default)]
+    seq: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +375,11 @@ impl Ledger {
     /// The latest time the ledger has seen.
     pub fn last_seen(&self) -> u64 {
         self.last_seen
+    }
+
+    /// How many reservations the ledger has ever made.
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     fn advance(&mut self, now: u64) -> u64 {
@@ -392,19 +438,26 @@ pub fn evaluate(
     decide(grant, key, request, budgets, now, false)
 }
 
-/// Decide a request a human has approved. Everything is checked again except
+/// Decide a request an approver approved. Everything is checked again except
 /// what only needed the approval (risky kinds, own-key NIP-44 and the spend
 /// threshold); hard limits and budgets still apply, and an approved spend is
-/// reserved like any other. The caller must hold an approval bound to this
-/// exact request (its hash) and consume it, so one approval clears one request.
+/// reserved like any other. It takes the [`Approval`] by value, which only a
+/// verified decision over the parked request's hash makes and which carries
+/// that request, so what is evaluated is exactly what was approved, once; it
+/// hands the request back to be signed exactly as parked. A management
+/// change is not an agent request and is denied here.
 pub fn evaluate_approved(
+    approval: Approval,
     grant: &Grant,
-    key: &[u8; 32],
-    request: &Request<'_>,
     budgets: &mut Budgets<'_>,
     now: u64,
-) -> Decision {
-    decide(grant, key, request, budgets, now, true)
+) -> (Decision, Approved) {
+    let approved = approval.into_approved();
+    let decision = match approved.parked().policy_request() {
+        Some((key, request)) => decide(grant, &key, &request, budgets, now, true),
+        None => Decision::Deny(DenyReason::ManagementChange),
+    };
+    (decision, approved)
 }
 
 fn decide(
@@ -415,6 +468,13 @@ fn decide(
     now: u64,
     approved: bool,
 ) -> Decision {
+    // Before any other rule, whatever the grant says or an approver decided:
+    // an agent never signs a message of the approval protocol.
+    if let Request::SignNostrEvent { kind } = *request {
+        if keep_approval::kind::is_protocol_kind(kind) {
+            return Decision::Deny(DenyReason::ProtocolKind(kind));
+        }
+    }
     if !grant.keys.contains(key) {
         return Decision::Deny(DenyReason::KeyNotGranted);
     }
@@ -547,6 +607,7 @@ fn spend_decision(
             at,
             sats: requested,
         });
+        ledger.seq = ledger.seq.saturating_add(1);
     }
     Decision::Spend(Reservation {
         id,
@@ -661,7 +722,7 @@ mod tests {
         }
 
         fn approved(&mut self, g: &Grant, request: Request<'_>, now: u64) -> Decision {
-            evaluate_approved(g, &KEY, &request, &mut self.budgets(), now)
+            decide(g, &KEY, &request, &mut self.budgets(), now, true)
         }
 
         fn spends(&mut self, g: &Grant, sats: u64, now: u64) -> bool {
@@ -681,7 +742,7 @@ mod tests {
         );
         assert_eq!(d, Decision::Deny(DenyReason::KeyNotGranted));
         let a = spend(1_000);
-        let d = evaluate_approved(&grant(), &PEER, &sign(&a), &mut s.budgets(), T0);
+        let d = decide(&grant(), &PEER, &sign(&a), &mut s.budgets(), T0, true);
         assert_eq!(d, Decision::Deny(DenyReason::KeyNotGranted));
         assert_eq!(s.credential.spent(T0), 0);
     }
@@ -854,7 +915,7 @@ mod tests {
         let mut s = State::new();
         let mut g = grant();
         btc(&mut g).address_allowlist = Some([ADDR.to_string()].into());
-        let g = g.validated().unwrap();
+        let g = g.validated(&ReservedKeys::new()).unwrap();
         assert!(s.spends(&g, 1_000, T0));
         let a = analysis(&[(1_000, Some(OTHER), false)], 100);
         assert_eq!(
@@ -1075,11 +1136,11 @@ mod tests {
 
     #[test]
     fn validation_requires_what_each_operation_needs() {
-        let refused = |g: Grant| match g.validated() {
+        let refused = |g: Grant| match g.validated(&ReservedKeys::new()) {
             Err(AgentError::ScopeViolation(m)) => m,
             other => panic!("expected a refusal, got {other:?}"),
         };
-        assert!(grant().validated().is_ok());
+        assert!(grant().validated(&ReservedKeys::new()).is_ok());
         let only = |op| {
             let mut g = grant();
             g.operations = [op].into();
@@ -1113,7 +1174,7 @@ mod tests {
         assert!(refused(g).contains("not an address on"));
         let mut g = grant();
         btc(&mut g).address_allowlist = Some([ADDR.to_uppercase()].into());
-        let g = g.validated().unwrap();
+        let g = g.validated(&ReservedKeys::new()).unwrap();
         assert!(g.bitcoin.unwrap().address_allowlist.unwrap().contains(ADDR));
         let max = MAX_REQUESTS_PER_DAY;
         for (per_minute, per_hour, per_day) in
@@ -1136,7 +1197,7 @@ mod tests {
             per_hour: 1,
             per_day: max,
         };
-        assert!(g.validated().is_ok());
+        assert!(g.validated(&ReservedKeys::new()).is_ok());
     }
 
     #[test]
@@ -1145,10 +1206,87 @@ mod tests {
         json.as_object_mut().unwrap().remove("limits");
         let g: Grant = serde_json::from_value(json).unwrap();
         assert_eq!(g.limits, RequestLimits::default());
-        assert_eq!(g.clone().validated().unwrap(), g);
+        assert_eq!(g.clone().validated(&ReservedKeys::new()).unwrap(), g);
         let mut json = serde_json::to_value(grant()).unwrap();
         json["limits"]["per_week"] = 1.into();
         assert!(serde_json::from_value::<Grant>(json).is_err());
+    }
+
+    /// The approval protocol's kinds are denied before any other rule: under
+    /// a grant listing them, for a key not granted, and approved.
+    #[test]
+    fn protocol_kinds_are_denied_whatever_the_grant() {
+        let mut g = grant();
+        g.event_kinds.extend(24_249..=24_256);
+        let mut s = State::new();
+        for kind in 24_250..=24_255 {
+            let request = Request::SignNostrEvent { kind };
+            let denied = Decision::Deny(DenyReason::ProtocolKind(kind));
+            assert_eq!(s.decide(&g, request, T0), denied);
+            assert_eq!(s.approved(&g, request, T0), denied);
+            assert_eq!(
+                decide(&g, &PEER, &request, &mut s.budgets(), T0, false),
+                denied
+            );
+        }
+        // The kinds on either side are ordinary approval-range kinds.
+        for kind in [24_249, 24_256] {
+            assert_eq!(
+                s.decide(&g, Request::SignNostrEvent { kind }, T0),
+                Decision::RequireApproval(ApprovalReason::Kind(kind))
+            );
+        }
+    }
+
+    /// A grant naming a reserved key, in its keys or its NIP-44 peers, or
+    /// listing a protocol kind, is refused.
+    #[test]
+    fn validation_refuses_reserved_keys_and_protocol_kinds() {
+        let refused = |g: Grant, reserved: &ReservedKeys| match g.validated(reserved) {
+            Err(AgentError::ScopeViolation(m)) => m,
+            other => panic!("expected a refusal, got {other:?}"),
+        };
+        let reserved: ReservedKeys = [[9; 32]].into();
+        assert!(grant().validated(&reserved).is_ok());
+        let mut g = grant();
+        g.keys.insert([9; 32]);
+        assert!(refused(g, &reserved).contains("channel key"));
+        let mut g = grant();
+        g.nip44_peers.insert([9; 32]);
+        assert!(refused(g, &reserved).contains("channel key"));
+        for kind in [24_250, 24_255] {
+            let mut g = grant();
+            g.event_kinds.insert(kind);
+            assert!(refused(g, &ReservedKeys::new()).contains("approval protocol"));
+        }
+        let mut g = grant();
+        g.event_kinds.extend([24_249, 24_256]);
+        assert!(g.validated(&reserved).is_ok());
+    }
+
+    /// Every reservation moves both ledgers' counts on; releasing or aging
+    /// out a spend never moves them back.
+    #[test]
+    fn ledger_counts_only_go_up() {
+        let g = grant();
+        let mut s = State::new();
+        assert_eq!((s.credential.seq(), s.wallet.seq()), (0, 0));
+        assert!(s.spends(&g, 1_000, T0));
+        let Decision::Spend(r) = s.decide(&g, sign(&spend(2_000)), T0) else {
+            panic!("not reserved");
+        };
+        assert_eq!((s.credential.seq(), s.wallet.seq()), (2, 2));
+        r.release(&mut s.credential, &mut s.wallet);
+        assert_eq!((s.credential.seq(), s.wallet.seq()), (2, 2));
+        // Nothing reserved, nothing counted.
+        assert_eq!(s.decide(&g, Request::GetPublicKey, T0), Decision::Allow);
+        assert!(s.spends(&g, 1_000, T0 + 2 * W));
+        assert_eq!(s.credential.seq(), 3);
+        assert_eq!(s.credential.spent(T0 + 2 * W), 1_000);
+        // A ledger from before the count reads as zero.
+        let mut old = serde_json::to_value(&s.credential).unwrap();
+        old.as_object_mut().unwrap().remove("seq");
+        assert_eq!(serde_json::from_value::<Ledger>(old).unwrap().seq(), 0);
     }
 
     #[test]

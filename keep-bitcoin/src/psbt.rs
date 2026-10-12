@@ -186,6 +186,20 @@ impl PsbtSigner {
         single_key: bool,
         accept: impl Fn(&DerivationPath) -> bool,
     ) -> Result<Option<Keypair>> {
+        Ok(self
+            .key_path_signer_with_path(spk, origins, single_key, accept)?
+            .map(|(keypair, _)| keypair))
+    }
+
+    /// [`Self::key_path_signer`], with the path of the origin that proved it
+    /// (`None` for the secret used directly as a key).
+    fn key_path_signer_with_path<'a>(
+        &self,
+        spk: &ScriptBuf,
+        origins: &'a TapKeyOrigins,
+        single_key: bool,
+        accept: impl Fn(&DerivationPath) -> bool,
+    ) -> Result<Option<(Keypair, Option<&'a DerivationPath>)>> {
         if !spk.is_p2tr() {
             return Ok(None);
         }
@@ -214,7 +228,7 @@ impl PsbtSigner {
             tweaked.non_secure_erase();
             return Ok(None);
         }
-        Ok(Some(tweaked))
+        Ok(Some((tweaked, path)))
     }
 
     /// The signer for input `index`: its witness UTXO must be a BIP-86 output of one
@@ -405,6 +419,30 @@ impl PsbtSigner {
             signature: sig,
             sighash_type,
         })
+    }
+
+    /// The change chain index (the last step of `m/86'/coin'/0'/1/<index>`)
+    /// of output `index`, when [`Self::analyze`] recognizes it as change: the
+    /// index of the very key that proved it, so an approver can be shown the
+    /// path the change was re-derived on.
+    pub fn change_index(&self, psbt: &Psbt, index: usize) -> Option<u32> {
+        let txout = psbt.unsigned_tx.output.get(index)?;
+        let output = psbt.outputs.get(index)?;
+        match self.key_path_signer_with_path(
+            &txout.script_pubkey,
+            &output.tap_key_origins,
+            false,
+            |p| self.is_change_path(p),
+        ) {
+            Ok(Some((mut keypair, path))) => {
+                keypair.non_secure_erase();
+                match path?.as_ref().last()? {
+                    ChildNumber::Normal { index } => Some(*index),
+                    ChildNumber::Hardened { .. } => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     fn is_change_output(&self, psbt: &Psbt, index: usize) -> bool {
@@ -959,10 +997,14 @@ mod tests {
             !s.analyze(&psbt).unwrap().outputs[0].is_change,
             "no origin: counted as a spend"
         );
+        assert_eq!(s.change_index(&psbt, 0), None);
         psbt.outputs[0]
             .tap_key_origins
             .insert(c.public_key, (vec![], (fingerprint(), c.path.clone())));
         assert!(s.analyze(&psbt).unwrap().outputs[0].is_change);
+        // The index is the one of the key that proved the output change.
+        assert_eq!(s.change_index(&psbt, 0), Some(3));
+        assert_eq!(s.change_index(&psbt, 1), None);
 
         let mut other = [2u8; 32];
         let mut forged = psbt_paying(

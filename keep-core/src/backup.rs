@@ -579,7 +579,7 @@ pub fn verify_backup(data: &[u8], passphrase: &str) -> Result<BackupInfo> {
 }
 
 fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) -> Result<()> {
-    let keep = Keep::create(path, vault_password)?;
+    let mut keep = Keep::create(path, vault_password)?;
     let data_key = keep.data_key()?;
 
     for bk in &backup.keys {
@@ -684,6 +684,10 @@ fn restore_to_path(backup: &DecryptedBackup, path: &Path, vault_password: &str) 
         let data_key = keep.data_key()?;
         let mut audit = AuditLog::open(path, &data_key)?;
         audit.restore_entries(&backup.audit_entries, &data_key)?;
+        // The restored entries carry the source vault's notes that a record
+        // was kept; this vault's record starts here, so the first unlock does
+        // not take the new vault for one whose record was deleted.
+        keep.record_audit_place(audit.seq(), audit.last_hash())?;
     }
 
     drop(keep);
@@ -915,6 +919,13 @@ mod tests {
 
         let mut restored = Keep::open(&dst_path).unwrap();
         restored.unlock("new-password-456").unwrap();
+        // The source's notes that a record was kept do not make the new
+        // vault's first unlock report a deleted record.
+        assert!(
+            restored.audit_warnings().is_empty(),
+            "{:?}",
+            restored.audit_warnings()
+        );
         let restored_entries = restored.read_audit_entries().unwrap();
 
         // Restored vault must contain at least every source entry, in source

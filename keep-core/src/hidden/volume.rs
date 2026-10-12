@@ -376,7 +376,7 @@ impl HiddenStorage {
 
         let trips = rate_limit::drain_pending_trips(&self.path, hmac_key);
         for trip in trips {
-            let trip_ts = i64::try_from(trip.timestamp).unwrap_or(i64::MAX);
+            let trip_ts = trip.audit_time();
             let reason = format!(
                 "rate limit threshold reached after {} failed attempts",
                 trip.failed_attempts

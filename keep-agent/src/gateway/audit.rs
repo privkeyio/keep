@@ -84,6 +84,8 @@ pub struct AgentAudit {
     pending: HashMap<WindowKey, Window>,
     spent: HashMap<[u8; 16], Spent>,
     gateway: Spent,
+    /// Credentials a budget froze since [`Self::take_frozen`] last ran.
+    newly_frozen: Vec<[u8; 16]>,
 }
 
 type WindowKey = ([u8; 16], RefusalKind, String);
@@ -139,7 +141,53 @@ impl AgentAudit {
             pending: HashMap::new(),
             spent: HashMap::new(),
             gateway: Spent::default(),
+            newly_frozen: Vec::new(),
         }
+    }
+
+    /// The credentials a budget froze since the last call, so the gateway can
+    /// count each freeze like any other (the freeze epoch, the requests it
+    /// cancels, the anchor that shows it).
+    pub fn take_frozen(&mut self) -> Vec<[u8; 16]> {
+        std::mem::take(&mut self.newly_frozen)
+    }
+
+    /// Record a request by credential `id` sent to the approvers, before it
+    /// is sent, charged to its budget like a request served. Fails when the
+    /// entry cannot be written, so nothing unrecorded is sent.
+    pub fn record_approval_requested(
+        &mut self,
+        keep: &mut Keep,
+        id: &[u8; 16],
+        label: &str,
+        detail: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)?;
+        keep.record_agent_approval_requested(id, label, Some(detail))?;
+        self.charge(id, false);
+        Ok(())
+    }
+
+    /// Record how a request by credential `id` sent to the approvers ended
+    /// without an approval (`label`: it expired, or the agent withdrew it),
+    /// charged to its budget like the request. Fails when the budget is used
+    /// up (which freezes it) or the entry cannot be written; the caller then
+    /// writes it as the owner's, so the log still shows the end.
+    pub fn record_approval_ended(
+        &mut self,
+        keep: &mut Keep,
+        id: &[u8; 16],
+        label: &str,
+        detail: &str,
+        now: u64,
+    ) -> Result<()> {
+        self.flush_expired(keep, now)?;
+        self.check(keep, id, false, now)?;
+        keep.record_agent_approval_decided(id, label, Some(detail))?;
+        self.charge(id, false);
+        Ok(())
     }
 
     /// Record a refused request by credential `id` at `now`. The first refusal
@@ -161,7 +209,11 @@ impl AgentAudit {
         if self.spent.get(id).is_some_and(|s| s.frozen) {
             return Ok(());
         }
-        let key = (*id, kind, cap_text(detail).to_string());
+        let key = (
+            *id,
+            kind,
+            cap_text(detail, keep_core::agent::MAX_AUDIT_TEXT).to_string(),
+        );
         if let Some(window) = self.pending.get_mut(&key) {
             window.repeats = window.repeats.saturating_add(1);
             return Ok(());
@@ -311,7 +363,10 @@ impl AgentAudit {
             }
             if !spent.frozen {
                 match keep.set_agent_credential_frozen(id, true) {
-                    Ok(()) => spent.frozen = true,
+                    Ok(()) => {
+                        spent.frozen = true;
+                        self.newly_frozen.push(*id);
+                    }
                     Err(e) => tracing::warn!(
                         id = %hex::encode(id),
                         error = %e,

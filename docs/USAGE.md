@@ -506,18 +506,21 @@ log inside the vault.
 ```bash
 keep audit list --limit 50      # Recent entries
 keep audit verify               # Verify hash-chain integrity
+keep audit acknowledge          # Acknowledge the audit warnings the vault reports
 keep audit stats                # Summary statistics
 keep audit export --output audit.json
 keep audit retention --max-days 90 --apply   # Prune old entries
 ```
 
-Each entry carries a sequence number inside its hash, one more than the entry before, counted from the first entry the log ever had. Pruning removes only the oldest entries, keeps every remaining entry's hash and sequence number, and records where the kept chain now starts in an entry of its own (counted toward `--max-entries`), so `keep audit verify` fails if anything else cut entries from the front or spliced the chain. A log whose chain is broken is never pruned. Changing the data key re-encrypts the log without changing a hash. Entries cut from the end, or the whole log replaced by an earlier copy, cannot be detected from the vault alone: that needs an outside record of the latest sequence number and hash.
+Each entry carries a sequence number inside its hash, one more than the entry before, counted from the first entry the log ever had. Pruning removes only the oldest entries, keeps every remaining entry's hash and sequence number, and records where the kept chain now starts in an entry of its own (counted toward `--max-entries`), so `keep audit verify` fails if anything else cut entries from the front or spliced the chain. A log whose chain is broken is never pruned. Changing the data key re-encrypts the log without changing a hash.
 
-A vault whose log was written before sequence numbers is migrated the first time it is opened: the old chain is checked, every entry that can be read is written again with sequence numbers, a migration entry records the old log's last hash, its entry count and whether its chain checked out, and the old file is kept beside it as `audit.log.v1` (or `audit.log.v1.2` and so on when that name is taken). If the old chain failed its check, the vault still opens, but every open warns (the CLI and the gateway log an error, the desktop app shows it) while the kept file is there, and `keep audit verify` fails, saying the entries from before the migration cannot be trusted, for as long as the log still holds any of them; once pruning has removed them it passes and only notes the failure, which neither pruning nor a later migration erases. Keep the kept file to investigate; `audit.log.v1.failed` names it. A data key change re-encrypts kept files too.
+The vault database also records the log's latest sequence number and hash, after every entry is written. An unlock that finds the log behind that record (entries cut from the end, or the whole log replaced by an earlier copy, such as the old log a migration kept), or past it without the recorded entry (another log swapped in, such as another node's under a shared data key), still opens the vault, but warns on every unlock (the CLI and the gateway log an error, the desktop app shows a banner that stays), and `keep audit verify` fails, until `keep audit acknowledge`, run once you have investigated, shows every pending warning, asks for confirmation (`KEEP_YES` answers it), and writes them into the log itself; it acknowledges only what it showed. Every unlock that finds the log so before then is counted, with the lowest entry it was found at. Every unlock also checks the chain from its start, so entries removed, changed or spliced in before the last one are reported the same way; acknowledging covers the breaks as that unlock found them, and any other break is reported after. A log longer than 100,000 entries is checked that far and reported as too long until pruning shortens it. The record is written when the vault is created, and stored with its own name inside its encrypted value, so it cannot be moved under another name. A record deleted from the vault database is reported the same way when the log notes one was kept (every unlock entry and every pruning entry does), when the agent freeze epoch's row is there (written when the vault is created and on every unlock), or when a key, FROST share, secret, wallet descriptor or agent credential was created (or a secret updated) after the log's last entry whose time keep set itself (rate-limit trips are passed over: their time comes from a file anyone with the vault folder can write, and is entered no later than the unlock that writes it); otherwise the unlock is taken for the vault's first by a keep that keeps the record (one an older release or an unreleased build made) and quietly writes the first record and freeze epoch. A record that cannot be decrypted or parsed is reported too. Either way it is started again so later changes are still noticed; a failure to read the vault database stops the unlock instead. Pruning notes in the record where the log will end before it replaces the log. A log changed on disk while the vault is open, even padded back to its length, is neither appended to nor pruned nor re-encrypted as the vault's own until the next unlock, which compares it with the record. A log put back together with an earlier copy of the vault database (or with the record and the freeze epoch rows deleted and nothing created since the log's last entry, where a share refreshed or a key used since does not count, and a row that cannot be read is passed over) is not caught this way: that needs a record kept outside the vault, such as the anchors an approver phone keeps (see the agent gateway's [approvals](#approvals)).
 
-Lines that cannot be decrypted never stop the vault from opening. An older log keeps every entry that can be read; a log already in the new format keeps the entries before its first damaged line, unchanged; a log of which nothing can be read under the vault's key (one left under a data key that no longer exists) is set aside entirely. Each time the old file is kept and the failure recorded as above, and entries lost this way make the sequence number go back. A damaged line before the last is found only when the whole log is read: `keep audit verify` and pruning then fail, and a data key change sets the log aside. Restoring a backup whose audit entries fail their chain check records the failure the same way, so `keep audit verify` fails on the restored vault too. The signing audit log (`signing_audit.log`) keeps its format; one whose last line cannot be decrypted under the vault's key is kept as `signing_audit.log.unreadable` and a new one started, and a data key change re-encrypts that file too. An entry that decrypts but that this keep cannot parse (written by a newer keep, or copied in from the other log) is never cut away: when opening would migrate around it, the vault refuses to open, and otherwise listing, verifying, pruning and data key changes fail until it is dealt with.
+A vault whose log was written before sequence numbers is migrated the first time it is opened: the old chain is checked, every entry that can be read is written again with sequence numbers, a migration entry records the old log's last hash, its entry count and whether its chain checked out, and the old file is kept beside it as `audit.log.v1` (or `audit.log.v1.2` and so on when that name is taken). If the old chain failed its check, the vault still opens, but every unlock warns (the CLI and the gateway log an error, the desktop app shows a banner) until `keep audit acknowledge`, and `keep audit verify` fails until then; it also says the entries from before the migration cannot be trusted for as long as the log still holds any of them, and once pruning has removed them, only notes the failure, which neither pruning nor a later migration erases. Keep the kept file to investigate; `audit.log.v1.failed` names it. The failure is recorded in the vault database, so deleting `audit.log.v1.failed` or the kept file does not stop the warning (a kept file that is gone is reported missing); acknowledging does, and removes `audit.log.v1.failed`. A data key change re-encrypts kept files too.
 
-Do not go back to an older keep after the migration. An older keep cannot read the migration and retention entries: it cannot verify, list or prune the log, it refuses to open the vault while the newest entry is one of them, and its `rotate-data-key` stops partway, leaving the audit log, the signing audit log when it has entries, and any kept files under a data key that no longer exists; the next newer keep sets the live logs aside as above, but the kept files stay unreadable. Entries an older keep appends are taken into the chain by the next newer keep that opens the vault.
+Lines that cannot be read never stop the vault from opening: a line that does not decrypt, one that decrypts but that this keep cannot parse (an entry type a newer keep added, or a line copied in from the other log), and one in a newer format alike. An older log keeps every entry that can be read; a log already in the new format keeps the entries before the first line it cannot read, unchanged, and the whole file is kept byte for byte; a log of which nothing can be read under the vault's key is set aside entirely, and reported in one warning that says whether a `keep rotate-data-key` was under way and unfinished (which leaves the log under the key it replaced) or not (so the file was replaced or damaged), and where the record had the log. Every log set aside before the owner acknowledges is reported, not only the latest. A final line without its newline, an append a crash cut short, is dropped only after a line that reads; otherwise it stays in the kept copy. Each time the old file is kept and the failure recorded as above, and entries lost this way make the sequence number go back. A damaged line before the last is found only when the whole log is read: `keep audit verify` and pruning then fail, and a data key change sets the log aside. A set-aside a crash kept from the record is found from `audit.log.v1.failed` on the next unlock and reported; the log is still compared with the record, since anyone who can write the vault folder can write that file. Restoring a backup whose audit entries fail their chain check records the failure the same way, so `keep audit verify` fails on the restored vault too. The signing audit log (`signing_audit.log`) keeps its format; one whose last line cannot be read under the vault's key is kept byte for byte as `signing_audit.log.unreadable`, a new one started, and the owner warned until `keep audit acknowledge`; a data key change re-encrypts that file too. A data key change sets aside a log that does not end where the vault left it rather than re-encrypting another log as its own.
+
+Do not go back to an older keep after the migration. An older keep cannot read the entry types added since (migration, retention, rollback acknowledgement, and the agent gateway's approval entries): it cannot verify, list or prune the log, a keep from before this release refuses to open the vault while the newest entry is one of them (later keeps set such a log aside instead, with a warning), and its `rotate-data-key` stops partway, leaving the audit log, the signing audit log when it has entries, and any kept files under a data key that no longer exists; the next newer keep sets the live logs aside as above, but the kept files stay unreadable. Entries an older keep appends are taken into the chain by the next newer keep that opens the vault.
 
 ---
 
@@ -654,7 +657,7 @@ Set `KEEP_PASSWORD` in the server's environment so it can unlock the vault non-i
 
 ### Agent Gateway (preview)
 
-`keep gateway serve` (Linux only) is a daemon that holds the unlocked vault so agents never do. It runs as its own user and refuses to run as root. Each agent gets a credential: a token bound to the uid the agent runs as, with a grant listing the keys, operations, event kinds and Bitcoin limits it may use, request rate limits and an expiry. Requests are refused unless the grant allows them. Requests that would need a human approval are refused, since approvals are not available yet. Every answer that returns data, and every signature, is recorded in the vault's audit log before it is returned. Refused tokens all get the same answer, whatever made them invalid.
+`keep gateway serve` (Linux only) is a daemon that holds the unlocked vault so agents never do. It runs as its own user and refuses to run as root. Each agent gets a credential: a token bound to the uid the agent runs as, with a grant listing the keys, operations, event kinds and Bitcoin limits it may use, request rate limits and an expiry. Requests are refused unless the grant allows them. Requests that need a person's approval wait for one from the owner's phone when [approvals](#approvals) are set up, and are refused otherwise. Every answer that returns data, and every signature, is recorded in the vault's audit log before it is returned. Refused tokens all get the same answer, whatever made them invalid.
 
 The owner manages credentials over a second socket, open only to root and one admin uid. While the gateway runs it holds the vault's lock, so management goes through this socket.
 
@@ -758,6 +761,117 @@ keep gateway audit --limit 50
 
 Credentials expire after 30 days by default (`--ttl-days`). A credential may not be bound to root, the gateway's uid, the vault owner's uid, the admin uid or the overflow uid. Agents that share a uid share every grant bound to it (see [Strong mode](#strong-mode)).
 
+#### Approvals
+
+Some requests need a person to approve them:
+
+- signing a Nostr event of a kind that rewrites the owner's state or carries payments, logins or remote signing: kinds 0, 3, 5, 62, 7374 to 7376, 9321 and 37375, and every kind from 10000 to 29999;
+- a PSBT that would take the credential past its `--approval-above-sats` within 24 hours.
+
+Without approvals these are refused. With them, the gateway asks the owner's phone and waits for its decision. The phone runs an approver app paired with the gateway; the two exchange end-to-end encrypted Nostr messages (NIP-59 gift wraps) over relays, so relays see only that the gateway and the phone are talking. The gateway seals its messages with a channel key kept apart from the vault. The phone holds two keys of its own: a transport key that opens messages and sends freezes, and an approver key that signs decisions.
+
+The phone shows the request in full: the event, or the PSBT with its fee, what leaves the wallet, and the outputs the gateway found to be its own change, each with its derivation path, and what the credential has already spent of its budget. The phone works out the fee from the transaction itself, but it cannot re-derive change addresses, so for which outputs are change, and so for what leaves the wallet, it takes the gateway's word, which no agent can influence. A decision is a signature by the approver key over a hash of exactly that request, and the gateway checks it against the request it is holding before it signs anything, so an approval cannot be moved to another request or to a changed one. Each request takes one decision, the first to arrive.
+
+What waits for an approval:
+
+- An agent's request as above. The agent's call is answered once the phone decides, or refused when no decision comes within the deadline (`--approval-deadline`, 30 to 120 seconds, 120 by default). A credential may have one request waiting at a time, and the gateway 16 in all.
+- While any phone is paired, any management change that gives agents more power: `keep gateway issue`, `unfreeze` (of one credential or `--all`), pairing another phone, and `keep gateway approver remove`. The command prints `Waiting for an approver device to approve...` and ends with the phone's decision; interrupting it withdraws the request. Freezing, revoking and deleting never wait.
+
+The phone can freeze one credential, or every one, at any time without asking anyone; only a decision signed by an approver key lifts that freeze. A credential whose requests are denied three times within 24 hours is frozen the same way. Every freeze and unfreeze, and deleting a frozen credential, moves the vault's freeze epoch, so an unfreeze approved for an earlier state cannot lift a later freeze. A freeze goes ahead even when the epoch cannot be read (damaged or deleted), starting a new epoch above any earlier one and saying so in the audit log; an unfreeze is refused until the epoch reads again, so freeze once to start a new one. A missing epoch is started again at the next unlock, seeded the same way whether or not agents remain (only a new vault starts at 0), noted in that unlock's audit entry and reported until `keep audit acknowledge`, since the vault writes it at creation and every unlock and only a deletion removes it. A seeded epoch is never below the latest time the audit log recorded, and carries random low bits so two seeds in the same second differ. Every 15 minutes, and after each freeze or unfreeze, the gateway sends the phone an anchor: where the audit log is, how many spends each wallet's ledger has recorded, and what is frozen. The phone warns when an anchor goes backwards, as it does when the gateway's vault is put back to an earlier copy, and when a freeze it sent is not shown.
+
+No grant may name the channel key or any phone's keys, or list the protocol's own kinds (24250 to 24255), which no agent may sign, approved or not. Every request, decision, freeze, pairing and removal is written to the audit log.
+
+##### Setting up approvals
+
+The gateway itself has no network. A relay helper, `keep gateway relay`, runs as its own user, `keep-gateway-relay`, with network access and nothing else: no vault, no key, no credential. It connects to the gateway's relay socket, `/run/keep-gateway-relay/relay.sock`, whose directory only that user may enter and on which the gateway accepts only that user, and carries the sealed messages between the gateway and the relays. It can open none of them, so a compromised helper can do no more than a hostile relay: hold messages back.
+
+1. Create the helper's user:
+
+   ```bash
+   sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin keep-gateway-relay
+   ```
+
+   It must be a user of its own. The gateway refuses to start when the relay user is root, the gateway's own user, the vault's owner or the admin uid, or when a credential is bound to it, and refuses to issue a credential bound to it: an agent running as the relay user could take the single relay connection and cut the gateway off from the phone.
+
+2. Generate the channel key and seal it to this machine, as the vault password is. It is written only to a pipe, never to a terminal or a file, and its public key is printed on stderr:
+
+   ```bash
+   sudo -v
+   keep gateway channel-key new | sudo systemd-creds encrypt \
+     --name=channel-key --with-key=host+tpm2 --tpm2-pcrs=7 - /etc/keep/gateway/channel-key.cred
+   ```
+
+   The key never enters the vault, and the gateway refuses one that is a vault key.
+
+3. Install the helper's unit and the gateway's approvals drop-in, which loads the channel key and creates the relay socket's directory (`keep-gateway:keep-gateway-relay`, mode 0750):
+
+   ```bash
+   sudo install -m 0644 contrib/systemd/keep-gateway-relay.service /etc/systemd/system/
+   sudo install -d -m 0755 /etc/systemd/system/keep-gateway.service.d
+   sudo install -m 0644 contrib/systemd/keep-gateway-approvals.conf /etc/systemd/system/keep-gateway.service.d/approvals.conf
+   ```
+
+4. Name the relays in the gateway's own drop-in (`sudo systemctl edit keep-gateway`), at least one and preferably two or three, then restart it and start the helper:
+
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=/usr/local/bin/keep --path /var/lib/keep-gateway/vault gateway serve --admin-uid 1000 --wallet-budget-sats 100000 \
+     --approval-relay wss://relay.example.com --approval-relay wss://relay.example.org
+   ```
+
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl restart keep-gateway
+   sudo systemctl enable --now keep-gateway-relay
+   ```
+
+5. Pair the phone. Root pairs the first one:
+
+   ```bash
+   sudo keep gateway approver pair --label "Phone"
+   ```
+
+   It shows a pairing code, as a QR code and as text, valid for ten minutes and for one phone. Scan it with the approver app; the command then shows the fingerprint the phone shows. Answer `y` only if the two match. From then on the requests above wait for the phone. `keep gateway status` shows whether approvals are on and how many phones are paired; `keep gateway approver list` lists them.
+
+Once a phone is paired, the gateway refuses to start without the same channel key, since the phone trusts no other. A lost channel key is handled like a lost phone, below.
+
+Managing phones, as root or the admin uid:
+
+```bash
+keep gateway approver list                 # label, fingerprint and keys of each phone
+keep gateway approver pair --label "Tablet"   # a further phone: a paired one must approve it
+keep gateway approver remove <transport>   # a paired phone must approve
+sudo keep gateway approver reset           # root only: remove every phone at once
+```
+
+`reset` is for a lost phone with no other left to approve its removal. It removes every phone without asking one, writes that to the audit log, forgets the channel key and turns approvals off until a phone is paired again; anything waiting is refused. Since it needs no phone, it needs root. When the gateway cannot start (the channel key was lost, the TPM was cleared, the vault moved to another machine), stop it and reset on the vault directly; this asks for the vault password:
+
+```bash
+sudo systemctl stop keep-gateway
+sudo -u keep-gateway keep --path /var/lib/keep-gateway/vault gateway approver reset --offline
+```
+
+Then generate a new channel key (step 2), start the gateway and pair again.
+
+`journalctl -u keep-gateway-relay` shows the helper reaching the gateway and the relays. While it is down, messages to the phone wait for it, and requests time out at their deadline.
+
+##### What the agent sees
+
+`get_session_info` tells the agent whether approvals are on and the deadline: `"approvals": {"enabled": true, "deadline_secs": 120}`. A request that waits is answered like any other, only later, so the MCP client must let a tool call run longer than the deadline: about 130 seconds with the default deadline (`keep agent connect` itself waits 150 seconds). Client timeouts are not well documented; what follows comes from user reports, not vendor documentation, so check your client. Claude Code is reported to wait that long for a stdio server unless `MCP_TOOL_TIMEOUT` (in milliseconds) is set lower. Some clients are reported to give up on a tool call after 60 seconds with no setting to wait longer; for those, shorten the deadline with `--approval-deadline 50`. A client that gives up and sends `notifications/cancelled` withdraws the request, and the bridge passes that on; one that gives up without it leaves the request waiting, and an approval then still signs it, with the answer going nowhere. A request that is not approved is answered with a tool error (`isError`) whose text says why:
+
+| Text | Meaning |
+|------|---------|
+| `denied by the approver` | The phone denied it. |
+| `no approval within N seconds` | No decision came within the deadline. |
+| `canceled: frozen`, `canceled: revoked` | The credential was frozen, revoked, deleted or expired while it waited. |
+| `canceled: the request was withdrawn` | The client sent `notifications/cancelled` for it, or closed the connection. |
+| `canceled: the gateway is stopping`, `canceled: no approver device is registered`, `canceled: the approver devices were reset` | The gateway stopped, or no phone is left to decide. |
+| `an approval for this credential is already pending` | One request per credential waits at a time. |
+| `too many requests are waiting for an approval; try again later` | The gateway already holds 16. |
+| `the request is too large to approve` | The request is larger than the phone accepts. |
+| `needs approval, which this gateway cannot obtain yet: ...` | Approvals are not set up, or no phone is paired. |
+
 #### Connecting an MCP client
 
 `keep agent connect` lets a stock MCP client (Claude, Cursor, any client that runs a stdio server) use the gateway. It speaks MCP on stdio and passes each request to the gateway's agent socket with the agent's token. It needs no vault and no password.
@@ -796,12 +910,12 @@ The bridge sends one request at a time over one connection. It keeps running whe
 
 | Error code | Meaning |
 |------------|---------|
-| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. |
+| `-32001` | The gateway refused the request: the token is unknown, revoked, frozen or expired, or was presented from another uid; the agent's uid sent too many requests; or the gateway is stopping. Every refusal reads the same. A notification (a message with no `id`, such as `notifications/cancelled`) is never answered, refused or not. |
 | `-32002` | The credential is over its per-minute, per-hour or per-day request limit, or the gateway is tracking too many credentials. |
 | `-32010` | The request was not sent, or the gateway turned it away unread: the gateway is stopped or restarting, the socket failed the checks above, or the agent's uid already holds as many connections as the gateway allows (8 open connections by default; uids no credential is bound to share one pool of 8), or the gateway holds its most connections in all (128 by default). |
 | `-32011` | The request was sent and no answer came: the connection closed, no part of the answer came for 150 seconds, or the answer was not for this request. The request may have been carried out (a signature may be recorded), so the bridge did not send it again. |
 
-Notifications from the client are not sent to the gateway, which acts on none of them.
+Notifications from the client are not sent to the gateway, with one exception: `notifications/cancelled` for the request the bridge is waiting on, which withdraws that request if it is waiting for an [approval](#approvals).
 
 Other clients can talk to the agent socket directly: one JSON object per line, `{"token": "keep_agt_...", "message": <JSON-RPC request>}`, speaking MCP (`initialize`, `tools/list`, `tools/call`, `ping`).
 

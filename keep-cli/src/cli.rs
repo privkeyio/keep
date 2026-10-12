@@ -206,6 +206,14 @@ pub(crate) const DEFAULT_ADMIN_SOCKET: &str = "/run/keep-gateway-admin/admin.soc
 #[cfg(target_os = "linux")]
 pub(crate) const DEFAULT_GATEWAY_USER: &str = "keep-gateway";
 
+/// Where the gateway listens for its relay helper.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_RELAY_SOCKET: &str = "/run/keep-gateway-relay/relay.sock";
+
+/// The relay helper's user.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_RELAY_USER: &str = "keep-gateway-relay";
+
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 pub(crate) enum GatewayCommands {
@@ -225,6 +233,41 @@ pub(crate) enum GatewayCommands {
         /// 24 hours, fees included. 0 (the default) refuses every spend.
         #[arg(long, default_value_t = 0)]
         wallet_budget_sats: u64,
+        /// A relay approvals travel through (repeatable). Approvals need the
+        /// channel-key credential and the relay helper.
+        #[arg(long = "approval-relay")]
+        approval_relays: Vec<String>,
+        /// How long an approver has to decide, 30 to 120 seconds
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(30..=120))]
+        approval_deadline: u64,
+        /// Where the relay helper connects
+        #[arg(long, default_value = DEFAULT_RELAY_SOCKET)]
+        relay_socket: PathBuf,
+        /// The relay helper's user, by name or uid; no one else may use the
+        /// relay socket
+        #[arg(long, default_value = DEFAULT_RELAY_USER)]
+        relay_user: String,
+    },
+    /// Run the relay helper: carry the gateway's approval messages to and
+    /// from the relays. Runs as its own user with network access, never root,
+    /// and holds no key.
+    Relay {
+        #[arg(long, default_value = DEFAULT_RELAY_SOCKET)]
+        relay_socket: PathBuf,
+        /// The user the gateway runs as, by name or uid. The relay socket, and
+        /// the directory it is in, must be that user's.
+        #[arg(long, default_value = DEFAULT_GATEWAY_USER)]
+        gateway_user: String,
+    },
+    /// The channel key the gateway seals approval messages with
+    ChannelKey {
+        #[command(subcommand)]
+        command: ChannelKeyCommands,
+    },
+    /// The approver devices that approve agent requests and management
+    Approver {
+        #[command(subcommand)]
+        command: ApproverCommands,
     },
     /// Show the running gateway's state
     Status {
@@ -272,6 +315,51 @@ pub(crate) enum GatewayCommands {
     Audit {
         #[arg(long, default_value_t = 100)]
         limit: usize,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub(crate) enum ChannelKeyCommands {
+    /// Generate a channel key and write it, as 64 hex digits, to a pipe
+    /// only, for `systemd-creds encrypt --name=channel-key`. The public key
+    /// goes to stderr.
+    New,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Subcommand)]
+pub(crate) enum ApproverCommands {
+    /// Pair a phone: show a pairing code, then the phone's fingerprint to
+    /// compare. Root pairs the first device; a later one also needs an
+    /// existing device's approval.
+    Pair {
+        /// The device's label
+        #[arg(long)]
+        label: String,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// List the approver devices
+    List {
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Remove an approver device, by its transport key; an approver device
+    /// must approve
+    Remove {
+        transport: String,
+        #[command(flatten)]
+        target: AdminTarget,
+    },
+    /// Remove every approver device (root only), for a lost phone or a new
+    /// channel key. With --offline, while the gateway is stopped, on the vault
+    /// directly.
+    Reset {
+        #[arg(long)]
+        offline: bool,
         #[command(flatten)]
         target: AdminTarget,
     },
@@ -448,6 +536,9 @@ pub(crate) enum AuditCommands {
         output: Option<String>,
     },
     Verify,
+    /// Acknowledge the audit warnings the vault reports on unlock, once
+    /// investigated; the acknowledgement is itself audited.
+    Acknowledge,
     Retention {
         #[arg(long, help = "Maximum entries to keep")]
         max_entries: Option<usize>,
@@ -1400,6 +1491,20 @@ mod tests {
             unit.lines().any(|l| l == "User=keep-gateway"),
             "the unit's user"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gateway_serve_takes_an_approval_deadline_of_30_to_120_seconds() {
+        let serve = |deadline: &str| {
+            Cli::try_parse_from(["keep", "gateway", "serve", "--approval-deadline", deadline])
+        };
+        for deadline in ["29", "121", "0"] {
+            assert!(serve(deadline).is_err(), "{deadline}");
+        }
+        for deadline in ["30", "120"] {
+            assert!(serve(deadline).is_ok(), "{deadline}");
+        }
     }
 
     #[test]

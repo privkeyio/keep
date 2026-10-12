@@ -129,6 +129,25 @@ pub enum AuditEventType {
     /// Retention removed old entries. Carries where the kept chain now
     /// starts, in [`AuditEntry::retention`].
     AuditRetention = 36,
+    /// An agent request was sent to the approvers: its credential, op,
+    /// reason and request hash.
+    AgentApprovalRequested = 37,
+    /// A request sent to the approvers ended: approved, denied, expired or
+    /// canceled, with the deciding device's keys and the decision's
+    /// signature when a device decided.
+    AgentApprovalDecided = 38,
+    /// A freeze or unfreeze from an approver device, with the device's
+    /// transport key, the key that signed, the counter, the epoch and the
+    /// signature.
+    AgentApproverFreeze = 39,
+    /// An approver device was registered: its label and both of its keys.
+    AgentApproverAdded = 40,
+    /// An approver device was removed: its label and both of its keys.
+    AgentApproverRemoved = 41,
+    /// The owner acknowledged the audit warnings the vault reported (a log
+    /// set aside, a log found not continuing the record, the record lost),
+    /// naming each.
+    AuditAcknowledged = 42,
 }
 
 impl std::fmt::Display for AuditEventType {
@@ -171,6 +190,12 @@ impl std::fmt::Display for AuditEventType {
             Self::AgentServed => write!(f, "agent_served"),
             Self::AuditLogMigrated => write!(f, "audit_log_migrated"),
             Self::AuditRetention => write!(f, "audit_retention"),
+            Self::AgentApprovalRequested => write!(f, "agent_approval_requested"),
+            Self::AgentApprovalDecided => write!(f, "agent_approval_decided"),
+            Self::AgentApproverFreeze => write!(f, "agent_approver_freeze"),
+            Self::AgentApproverAdded => write!(f, "agent_approver_added"),
+            Self::AgentApproverRemoved => write!(f, "agent_approver_removed"),
+            Self::AuditAcknowledged => write!(f, "audit_acknowledged"),
         }
     }
 }
@@ -436,14 +461,40 @@ pub struct AuditLog {
     last_hash: [u8; 32],
     /// The last entry's sequence number; zero for an empty log.
     seq: u64,
+    /// The latest time keep set on an entry it wrote this session or found
+    /// last in the log (a trip's time is not one), in Unix seconds.
+    own_time: i64,
     entries: usize,
     /// Where to cut a partial line a failed write left, before the next append.
     torn: Option<u64>,
+    /// The file as this log last left it. Anything else before a write
+    /// means the file was changed, replaced or removed while the log was
+    /// open.
+    on_disk: OnDisk,
     read_cap: usize,
     retention: RetentionPolicy,
     /// A migration found the old log failed its chain check, and the old
     /// log is still kept beside this one.
     failed_migration_kept: bool,
+    /// The migration this open ran, if any.
+    migrated: Option<OpenedMigration>,
+}
+
+/// A migration [`AuditLog::open`] ran: a format 1 log moved to sequence
+/// numbers, or a log holding lines this keep cannot read set aside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenedMigration {
+    /// Every line was read and the old chain checked out.
+    pub chain_valid: bool,
+    /// The name the old log was kept under beside the log.
+    pub kept: String,
+    /// Not one line of the old log decrypted under the data key.
+    pub unreadable: bool,
+    /// The old log was one written before sequence numbers.
+    pub from_format1: bool,
+    /// The time of the old log's last readable entry, in Unix seconds;
+    /// zero when it had none.
+    pub old_last_timestamp: i64,
 }
 
 /// What [`AuditLog::verify`] found.
@@ -499,33 +550,54 @@ impl AuditLog {
             path: path.join("audit.log"),
             last_hash: [0u8; 32],
             seq: 0,
+            own_time: 0,
             entries: 0,
             torn: None,
+            on_disk: OnDisk::default(),
             read_cap: MAX_AUDIT_ENTRIES,
             retention: RetentionPolicy::default(),
             failed_migration_kept: false,
+            migrated: None,
         };
         log.recover_interrupted_rewrite(data_key)?;
         if log.path.exists() {
-            match Self::read_tail(&log.path, data_key) {
-                Ok(None) => {}
-                Ok(Some((last, _))) if last.format > AUDIT_FORMAT => {
-                    return Err(StorageError::invalid_format(format!(
-                        "the audit log was written by a newer keep (entry format {})",
-                        last.format
-                    ))
-                    .into());
+            let tail = scan_tail(&log.path)?;
+            let last = tail
+                .last
+                .as_ref()
+                .map(|line| Self::decrypt_bytes(line_text(line), data_key));
+            // A final line without its newline is an append a crash cut
+            // short. It is dropped only after a line that reads, so a log
+            // that is set aside is kept byte for byte, torn end and all.
+            let drop_torn = || match tail.complete {
+                Some(complete) => truncate(&log.path, complete),
+                None => Ok(()),
+            };
+            match last {
+                None => {
+                    drop_torn()?;
+                    log.on_disk = tail.on_disk();
                 }
-                Ok(Some((last, count))) if last.format != 1 => {
+                // A newer keep's entry is a line this keep cannot read: the
+                // log is set aside as a damaged one is, never refused.
+                Some(Ok(last)) if last.format != 1 && last.format <= AUDIT_FORMAT => {
+                    drop_torn()?;
                     log.last_hash = last.hash;
                     log.seq = last.seq;
-                    log.entries = count;
+                    log.note_time(&last);
+                    log.entries = tail.count;
+                    log.on_disk = tail.on_disk();
                 }
-                Ok(Some(_)) => log.migrate(data_key)?,
-                // The last entry cannot be read. The log is migrated with the
-                // fault recorded and the old file kept beside it, whatever its
-                // format, so a damaged log never locks the vault.
-                Err(_) => log.migrate(data_key)?,
+                Some(Ok(last)) if last.format == 1 => {
+                    drop_torn()?;
+                    log.migrate(data_key)?;
+                }
+                // The last entry cannot be read, or does not parse. The log
+                // is migrated with the fault recorded and the old file kept
+                // beside it byte for byte, whatever its format, so a damaged
+                // log, or one holding an entry a newer keep wrote or a line
+                // copied in from another file, never locks the vault.
+                Some(_) => log.migrate(data_key)?,
             }
         }
         let kept = log.failed_migration_kept_path();
@@ -544,6 +616,44 @@ impl AuditLog {
         self.entries
     }
 
+    /// The latest time keep set on an entry this log wrote or found last.
+    pub fn own_time(&self) -> i64 {
+        self.own_time
+    }
+
+    fn note_time(&mut self, entry: &AuditEntry) {
+        if entry.event_type != AuditEventType::RateLimitTripped {
+            self.own_time = self.own_time.max(entry.timestamp);
+        }
+    }
+
+    /// The time of the last entry whose time keep set itself (any but a
+    /// rate-limit trip, whose time comes from a forgeable file), in Unix
+    /// seconds; zero when there is none. Reads the whole log, so it is for
+    /// the rare unlock that finds the record missing.
+    pub fn last_own_timestamp(&self, data_key: &SecretKey) -> Result<i64> {
+        if self.seq == 0 {
+            return Ok(0);
+        }
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e.into()),
+        };
+        let batch = crypto::BatchDecryptor::new(data_key)?;
+        let mut reader = BufReader::new(file);
+        let (mut line, mut latest) = (Vec::new(), 0);
+        while reader.read_until(b'\n', &mut line)? > 0 {
+            if let Ok(entry) = Self::decrypt_batch(line_text(&line), &batch) {
+                if entry.event_type != AuditEventType::RateLimitTripped {
+                    latest = entry.timestamp;
+                }
+            }
+            line.clear();
+        }
+        Ok(latest)
+    }
+
     /// The last entry's sequence number, which counts every entry the log
     /// ever had; zero for an empty log.
     pub fn seq(&self) -> u64 {
@@ -555,6 +665,109 @@ impl AuditLog {
     /// entries from before the migration cannot be trusted.
     pub fn failed_migration_kept(&self) -> bool {
         self.failed_migration_kept
+    }
+
+    /// The name of the kept old log the marker beside the log names, while
+    /// both exist: what an earlier migration that failed its check left.
+    pub fn failed_migration_marked(&self) -> Option<String> {
+        self.failed_migration_kept_path()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    /// The migration this open ran, if any.
+    pub fn migrated_on_open(&self) -> Option<&OpenedMigration> {
+        self.migrated.as_ref()
+    }
+
+    /// Remove the marker a migration that failed its check left beside the
+    /// log, once the owner acknowledged the failure.
+    pub fn clear_failed_migration_marker(&mut self) -> Result<()> {
+        match std::fs::remove_file(self.marker_path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        sync_parent(&self.marker_path());
+        self.failed_migration_kept = false;
+        Ok(())
+    }
+
+    /// The hash of the entry with sequence number `seq`, if the log still
+    /// holds it: `None` when it is past the log's end, before the first
+    /// entry retention kept, or the line there cannot be read or carries
+    /// another sequence number. Reads only the first line and that one.
+    pub fn entry_hash_at(&self, seq: u64, data_key: &SecretKey) -> Option<[u8; 32]> {
+        if seq == 0 || seq > self.seq {
+            return None;
+        }
+        let mut reader = BufReader::new(File::open(&self.path).ok()?);
+        let mut line = Vec::new();
+        let mut next = |reader: &mut BufReader<File>| -> Option<Vec<u8>> {
+            loop {
+                line.clear();
+                if reader.read_until(b'\n', &mut line).ok()? == 0 {
+                    return None;
+                }
+                let text = line_text(&line);
+                if !text.is_empty() {
+                    return Some(text.to_vec());
+                }
+            }
+        };
+        let first = Self::decrypt_bytes(&next(&mut reader)?, data_key).ok()?;
+        let mut skip = seq.checked_sub(first.seq)?;
+        let mut entry = first;
+        while skip > 0 {
+            let text = next(&mut reader)?;
+            skip -= 1;
+            if skip == 0 {
+                entry = Self::decrypt_bytes(&text, data_key).ok()?;
+            }
+        }
+        (entry.seq == seq).then_some(entry.hash)
+    }
+
+    /// Whether any readable entry of `event_type` carries `note` in its
+    /// reason. Lines that cannot be read are passed over.
+    pub fn any_entry_noting(
+        &self,
+        event_types: &[AuditEventType],
+        note: &str,
+        data_key: &SecretKey,
+    ) -> bool {
+        let Ok(file) = File::open(&self.path) else {
+            return false;
+        };
+        let Ok(batch) = crypto::BatchDecryptor::new(data_key) else {
+            return false;
+        };
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        while reader.read_until(b'\n', &mut line).is_ok_and(|n| n > 0) {
+            let noted = Self::decrypt_batch(line_text(&line), &batch).is_ok_and(|e| {
+                event_types.contains(&e.event_type)
+                    && e.reason.as_deref().is_some_and(|r| r.contains(note))
+            });
+            if noted {
+                return true;
+            }
+            line.clear();
+        }
+        false
+    }
+
+    /// Whether a file named `name` (one a migration kept) is still beside
+    /// the log.
+    pub fn kept_log_present(&self, name: &str) -> bool {
+        self.migrated_paths()
+            .iter()
+            .any(|p| p.file_name().is_some_and(|n| n == name))
+    }
+
+    /// Lower how many entries reads and checks go to, for tests of long
+    /// logs.
+    #[cfg(test)]
+    pub(crate) fn set_read_cap_for_tests(&mut self, cap: usize) {
+        self.read_cap = cap;
     }
 
     /// Set the retention policy.
@@ -599,6 +812,9 @@ impl AuditLog {
             truncate(&self.path, len)?;
             self.torn = None;
         }
+        // Appending to a file someone else cut, replaced or removed would
+        // carry this log's place onto it, hiding what was there.
+        self.check_on_disk()?;
         let mut file = opts.open(&self.path)?;
         let len = file.metadata()?.len();
         // A partial line left by a failed write would make the log unreadable.
@@ -612,8 +828,99 @@ impl AuditLog {
 
         self.last_hash = entry.hash;
         self.seq = entry.seq;
+        self.note_time(&entry);
         self.entries += 1;
+        let end = len + line.len() as u64;
+        self.on_disk = OnDisk {
+            len: end,
+            last: Some((end, line.into_bytes())),
+        };
         Ok(())
+    }
+
+    /// Refuse unless `entries`, read from the file, end where this log last
+    /// left it. Behind [`AuditLog::check_on_disk`] this holds already; it is
+    /// checked again on what was actually read before it is rewritten.
+    fn check_tail(&self, entries: &[AuditEntry]) -> Result<()> {
+        let tail = entries.last().map_or((0, [0u8; 32]), |e| (e.seq, e.hash));
+        if tail == (self.seq, self.last_hash) {
+            return Ok(());
+        }
+        Err(StorageError::corrupted(format!(
+            "the audit log on disk ends at entry {}, not at entry {} where this vault left it",
+            tail.0, self.seq
+        ))
+        .into())
+    }
+
+    /// Refuse unless the file is as this log last left it: the same length,
+    /// and this log's last line still where it wrote it. Padding a cut file
+    /// back to its length with blank lines does not pass.
+    fn check_on_disk(&self) -> Result<()> {
+        let now = file_len(&self.path)?;
+        let at_end = match &self.on_disk.last {
+            None => true,
+            Some((end, line)) => {
+                let mut found = vec![0u8; line.len()];
+                File::open(&self.path)
+                    .and_then(|mut f| {
+                        std::io::Seek::seek(
+                            &mut f,
+                            std::io::SeekFrom::Start(end.saturating_sub(line.len() as u64)),
+                        )?;
+                        std::io::Read::read_exact(&mut f, &mut found)
+                    })
+                    .is_ok_and(|()| found == *line)
+            }
+        };
+        if now == self.on_disk.len && at_end {
+            return Ok(());
+        }
+        Err(StorageError::corrupted(format!(
+            "the audit log changed on disk while the vault was open ({now} bytes where this vault \
+             left {}); nothing more is written to it until the vault is unlocked again",
+            self.on_disk.len
+        ))
+        .into())
+    }
+
+    /// Check the whole chain without holding the log, as
+    /// [`AuditLog::verify`] does, counting a line that cannot be read as a
+    /// break rather than failing. A log longer than [`MAX_AUDIT_ENTRIES`]
+    /// entries is checked from its start that far, since the chain's first
+    /// entry is where its rules start, and reported too long rather than
+    /// broken.
+    pub fn check_chain(&self, data_key: &SecretKey) -> Result<ChainCheck> {
+        let mut chain = ChainVerifier::default();
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(chain.finish()),
+            Err(e) => return Err(e.into()),
+        };
+        let batch = crypto::BatchDecryptor::new(data_key)?;
+        let mut reader = BufReader::new(file);
+        let (mut line, mut number, mut entries) = (Vec::new(), 0u64, 0usize);
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            number += 1;
+            let text = line_text(&line);
+            if text.is_empty() {
+                continue;
+            }
+            entries += 1;
+            if entries > self.read_cap {
+                chain.too_long = true;
+                break;
+            }
+            match Self::decrypt_batch(text, &batch) {
+                Ok(entry) => chain.push(&entry),
+                Err(_) => chain.unreadable(number),
+            }
+        }
+        Ok(chain.finish())
     }
 
     /// Read all entries.
@@ -647,10 +954,26 @@ impl AuditLog {
     /// retention entry counts toward `max_entries`. A log whose chain fails
     /// its check is never pruned, so pruning cannot hide a cut or splice.
     pub fn apply_retention(&mut self, data_key: &SecretKey) -> Result<usize> {
-        if !self.path.exists() {
+        self.apply_retention_noting(data_key, None, |_, _| Ok(()))
+    }
+
+    /// [`AuditLog::apply_retention`], with `note` added to the retention
+    /// entry's reason, and `before_rewrite` given the sequence number and
+    /// hash the log will end at, before the log is replaced; the log is not
+    /// pruned if it fails. Only the log this process left is pruned: one
+    /// changed on disk is refused.
+    pub fn apply_retention_noting(
+        &mut self,
+        data_key: &SecretKey,
+        note: Option<&str>,
+        before_rewrite: impl FnOnce(u64, [u8; 32]) -> Result<()>,
+    ) -> Result<usize> {
+        if !self.path.exists() && self.seq == 0 {
             return Ok(0);
         }
+        self.check_on_disk()?;
         let mut entries = Self::read_entries(&self.path, data_key, usize::MAX)?;
+        self.check_tail(&entries)?;
         let Some(last) = entries.last() else {
             return Ok(0);
         };
@@ -683,8 +1006,12 @@ impl AuditLog {
             Some(first) => (first.seq, first.prev_hash),
             None => (last_seq.saturating_add(1), last_hash),
         };
-        let mut mark = AuditEntry::new(AuditEventType::AuditRetention, last_hash)
-            .with_reason(&format!("retention removed {cut} entries"));
+        let reason = match note {
+            Some(note) => format!("retention removed {cut} entries; {note}"),
+            None => format!("retention removed {cut} entries"),
+        };
+        let mut mark =
+            AuditEntry::new(AuditEventType::AuditRetention, last_hash).with_reason(&reason);
         mark.seq = last_seq
             .checked_add(1)
             .ok_or_else(|| StorageError::invalid_format("audit log sequence overflow"))?;
@@ -695,6 +1022,7 @@ impl AuditLog {
             migration,
         });
         mark.hash = mark.compute_hash();
+        before_rewrite(mark.seq, mark.hash)?;
         kept.push(mark);
 
         self.rewrite(&kept, data_key)?;
@@ -706,37 +1034,6 @@ impl AuditLog {
         let entries = self.read_all(data_key)?;
         serde_json::to_string_pretty(&entries)
             .map_err(|e| StorageError::serialization(format!("export audit log: {e}")).into())
-    }
-
-    /// The last entry and the entry count, decrypting only the last entry, so
-    /// opening never depends on the log's length. A final line without its
-    /// newline is an append cut short by a crash, and is dropped.
-    fn read_tail(path: &Path, data_key: &SecretKey) -> Result<Option<(AuditEntry, usize)>> {
-        let mut reader = BufReader::new(File::open(path)?);
-        let (mut line, mut last) = (Vec::new(), Vec::new());
-        let (mut count, mut complete) = (0, 0u64);
-        loop {
-            line.clear();
-            let n = reader.read_until(b'\n', &mut line)?;
-            if n == 0 {
-                break;
-            }
-            if line.last() != Some(&b'\n') {
-                truncate(path, complete)?;
-                break;
-            }
-            complete += n as u64;
-            if !line_text(&line).is_empty() {
-                count += 1;
-                std::mem::swap(&mut last, &mut line);
-            }
-        }
-        if count == 0 {
-            return Ok(None);
-        }
-        let entry = Self::decrypt_bytes(line_text(&last), data_key)
-            .map_err(|e| StorageError::corrupted(format!("audit log at entry {count}: {e}")))?;
-        Ok(Some((entry, count)))
     }
 
     /// Finish a rewrite a crash interrupted in an older release, which
@@ -754,12 +1051,15 @@ impl AuditLog {
         if !is_regular_file(&backup) {
             return Ok(());
         }
-        let from =
-            if is_regular_file(&temp) && matches!(Self::read_tail(&temp, data_key), Ok(Some(_))) {
-                temp
-            } else {
-                backup
-            };
+        let from = if is_regular_file(&temp)
+            && scan_tail(&temp).is_ok_and(|tail| {
+                tail.last
+                    .is_some_and(|line| Self::decrypt_bytes(line_text(&line), data_key).is_ok())
+            }) {
+            temp
+        } else {
+            backup
+        };
         std::fs::rename(&from, &self.path)?;
         sync_parent(&self.path);
         Ok(())
@@ -769,6 +1069,7 @@ impl AuditLog {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
+        let batch = crypto::BatchDecryptor::new(data_key)?;
 
         for (line_num, line) in reader.lines().enumerate() {
             if entries.len() >= cap {
@@ -781,7 +1082,7 @@ impl AuditLog {
             if line.is_empty() {
                 continue;
             }
-            let entry = Self::decrypt_line(&line, data_key).map_err(|e| {
+            let entry = Self::decrypt_batch(line.as_bytes(), &batch).map_err(|e| {
                 StorageError::corrupted(format!("audit log at line {}: {}", line_num + 1, e))
             })?;
             entries.push(entry);
@@ -790,44 +1091,52 @@ impl AuditLog {
         Ok(entries)
     }
 
-    /// Every entry that can be read, skipping lines that cannot be decrypted,
-    /// and how many were read before the first such line, if there is one.
-    /// A failure to read the file, or a line that decrypts but does not
-    /// parse, is an error.
+    /// Every entry that can be read, how many were read before the first
+    /// line that cannot be, if there is one, and how many lines decrypted.
+    /// A line that does not decrypt, that decrypts but does not parse (an
+    /// entry type a newer keep added, or a line copied in from the signing
+    /// log), or that is in a format newer than this keep's, cannot be read.
+    /// Only a failure to read the file is an error.
     fn read_readable(
         path: &Path,
         data_key: &SecretKey,
-    ) -> Result<(Vec<AuditEntry>, Option<usize>)> {
+    ) -> Result<(Vec<AuditEntry>, Option<usize>, usize)> {
         let mut reader = BufReader::new(File::open(path)?);
-        let (mut entries, mut before_gap) = (Vec::new(), None);
+        let (mut entries, mut before_gap, mut decrypted) = (Vec::new(), None, 0);
         let mut line = Vec::new();
         loop {
             line.clear();
             if reader.read_until(b'\n', &mut line)? == 0 {
-                return Ok((entries, before_gap));
+                return Ok((entries, before_gap, decrypted));
             }
             let text = line_text(&line);
             if text.is_empty() {
                 continue;
             }
-            // A line that does not decrypt is damage. One that decrypts but
-            // does not parse was written under this key by a keep that knows
-            // more entry types, or copied in from the signing log, so the log
-            // is refused rather than cut there.
             let plaintext = std::str::from_utf8(text)
                 .ok()
                 .and_then(|text| Self::decrypt_raw(text, data_key).ok());
-            match plaintext {
-                Some(plaintext) => entries.push(serde_json::from_slice(&plaintext).map_err(|e| {
-                    StorageError::invalid_format(format!(
-                        "the audit log holds an entry this keep cannot read, written by a newer keep or copied in from another file: {e}"
-                    ))
-                })?),
+            decrypted += usize::from(plaintext.is_some());
+            match plaintext
+                .and_then(|p| serde_json::from_slice::<AuditEntry>(&p).ok())
+                .filter(|e| e.format <= AUDIT_FORMAT)
+            {
+                Some(entry) => entries.push(entry),
                 None => {
                     before_gap.get_or_insert(entries.len());
                 }
             }
         }
+    }
+
+    /// [`AuditLog::decrypt_bytes`] with the key taken out once for many lines.
+    fn decrypt_batch(line: &[u8], batch: &crypto::BatchDecryptor) -> Result<AuditEntry> {
+        let bytes = STANDARD
+            .decode(line)
+            .map_err(|e| StorageError::invalid_format(format!("audit line: {e}")))?;
+        let plaintext = batch.decrypt(&crypto::EncryptedData::from_bytes(&bytes)?)?;
+        serde_json::from_slice(&plaintext)
+            .map_err(|e| StorageError::invalid_format(format!("audit entry: {e}")).into())
     }
 
     fn decrypt_bytes(line: &[u8], data_key: &SecretKey) -> Result<AuditEntry> {
@@ -877,8 +1186,14 @@ impl AuditLog {
     /// again on the next open, or the new one. The old file is kept under
     /// the first name no earlier migration used, and never replaces a file.
     fn migrate(&mut self, data_key: &SecretKey) -> Result<()> {
-        let (mut old, gap) = Self::read_readable(&self.path, data_key)?;
+        let (mut old, gap, decrypted) = Self::read_readable(&self.path, data_key)?;
         let complete = gap.is_none();
+        let from_format1 = old.iter().any(|e| e.format == 1);
+        let old_last_timestamp = old
+            .iter()
+            .rev()
+            .find(|e| e.event_type != AuditEventType::RateLimitTripped)
+            .map_or(0, |e| e.timestamp);
         // A log that already holds entries in a later format and has a line
         // that cannot be read keeps only what came before the damage, so no
         // entry whose sequence number was already seen is renumbered; the
@@ -949,13 +1264,16 @@ impl AuditLog {
             self.path.parent().unwrap_or(Path::new(".")),
             MIGRATED_LOG,
         );
+        let mut kept_name = String::new();
         let marked = kept.and_then(|kept| {
+            kept_name = kept
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if chain_valid {
                 return Ok(());
             }
-            let name = kept.file_name().map(|n| n.to_string_lossy().into_owned());
-            write_marker(&self.marker_path(), name.unwrap_or_default().as_bytes())
-                .map_err(Into::into)
+            write_marker(&self.marker_path(), kept_name.as_bytes()).map_err(Into::into)
         });
         if let Err(e) = marked {
             let _ = std::fs::remove_file(&temp_path);
@@ -967,6 +1285,13 @@ impl AuditLog {
         }
         sync_parent(&self.path);
         self.set_tail(&entries);
+        self.migrated = Some(OpenedMigration {
+            chain_valid,
+            kept: kept_name,
+            unreadable: decrypted == 0 && !complete,
+            from_format1,
+            old_last_timestamp,
+        });
         Ok(())
     }
 
@@ -1019,8 +1344,15 @@ impl AuditLog {
         let (last_hash, seq) = entries.last().map_or(([0u8; 32], 0), |e| (e.hash, e.seq));
         self.last_hash = last_hash;
         self.seq = seq;
+        if let Some(last) = entries.last() {
+            self.note_time(last);
+        }
         self.entries = entries.len();
         self.torn = None;
+        self.on_disk = OnDisk::read(&self.path).unwrap_or(OnDisk {
+            len: u64::MAX,
+            last: None,
+        });
     }
 
     /// Write `entries` exactly as they are, hashes and sequence numbers
@@ -1054,12 +1386,16 @@ impl AuditLog {
     /// hash and sequence number. The old logs migrations kept are
     /// re-encrypted separately, by [`AuditLog::reencrypt_kept_logs`].
     pub fn reencrypt(&mut self, old_key: &SecretKey, new_key: &SecretKey) -> Result<()> {
-        if !self.path.exists() {
+        if !self.path.exists() && self.seq == 0 {
             return Ok(());
         }
+        self.check_on_disk()?;
         // Past the read cap too, so rotating a long log cannot strand it under
         // the old key after the new one is committed.
         let entries = Self::read_entries(&self.path, old_key, usize::MAX)?;
+        // Another log put in its place is not re-encrypted as this one, but
+        // left to be set aside.
+        self.check_tail(&entries)?;
         if entries.is_empty() {
             return Ok(());
         }
@@ -1203,78 +1539,201 @@ fn latest_migration(entries: &[AuditEntry]) -> Option<AuditMigration> {
 
 /// The verification rules of [`AuditLog::verify`], over entries already read.
 fn verify_entries(entries: &[AuditEntry]) -> AuditVerification {
-    let migration = latest_migration(entries);
-    let Some(first) = entries.first() else {
-        return AuditVerification {
-            valid: true,
-            migration,
-            first_seq: 0,
-        };
-    };
-    let mut valid = true;
-    let mut mark = None;
-    let mut prev_hash = first.prev_hash;
-    let mut seq = Some(first.seq);
+    let mut chain = ChainVerifier::default();
     for entry in entries {
-        valid &= entry.format == AUDIT_FORMAT;
-        valid &= Some(entry.seq) == seq;
-        valid &= entry.verify(&prev_hash);
-        valid &= entry.migration.is_none() || entry.event_type == AuditEventType::AuditLogMigrated;
-        valid &= entry.retention.is_none() || entry.event_type == AuditEventType::AuditRetention;
-        if entry.retention.is_some() {
-            mark = entry.retention;
-        }
-        prev_hash = entry.hash;
-        seq = entry.seq.checked_add(1);
+        chain.push(entry);
     }
-    valid &= if first.seq == 1 {
-        first.prev_hash == [0u8; 32]
-    } else {
-        mark.is_some_and(|m| m.first_seq == first.seq && m.first_link == first.prev_hash)
-    };
     AuditVerification {
-        valid,
-        migration,
-        first_seq: first.seq,
+        valid: chain.finish().valid,
+        migration: latest_migration(entries),
+        first_seq: entries.first().map_or(0, |e| e.seq),
     }
 }
 
-/// Cut a final line without its newline, an append a crash cut short.
-fn drop_torn_tail(path: &Path) -> std::io::Result<()> {
+/// The chain rules of [`AuditLog::verify`], applied one entry at a time, so
+/// a log can be checked without holding it: every entry in the current
+/// format, carrying the next sequence number, linking to the entry before
+/// and hashing to its stored hash, the records only their own entries carry,
+/// and a first entry that is the log's first or where the latest retention
+/// entry says the kept chain starts. Each entry or line that breaks a rule is
+/// counted and fingerprinted, so the same breaks can be told from new ones.
+#[derive(Default)]
+struct ChainVerifier {
+    /// The first entry's sequence number and link.
+    first: Option<(u64, [u8; 32])>,
+    /// The last entry's hash and the sequence number the next must carry.
+    prev: Option<([u8; 32], Option<u64>)>,
+    /// The latest retention record.
+    mark: Option<RetentionMark>,
+    /// What broke the rules, in order: each breaking entry's sequence number
+    /// and hash, or the line number of a line that could not be read.
+    breaks: Vec<u8>,
+    failures: u64,
+    first_failure: Option<u64>,
+    too_long: bool,
+    latest_time: i64,
+}
+
+/// What [`ChainVerifier`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainCheck {
+    /// Nothing broke the rules.
+    pub valid: bool,
+    /// How many entries or lines broke them.
+    pub failures: u64,
+    /// The sequence number (or, for a line that could not be read, the line
+    /// number) of the first break.
+    pub first_failure: Option<u64>,
+    /// A fingerprint of every break, which only the same breaks reproduce.
+    pub breaks: [u8; 32],
+    /// The log holds more than [`MAX_AUDIT_ENTRIES`] entries, and was
+    /// checked only that far.
+    pub too_long: bool,
+    /// The latest time keep set on an entry it checked (a trip's time is
+    /// not one), in Unix seconds; zero when there is none.
+    pub latest_time: i64,
+}
+
+impl ChainVerifier {
+    fn push(&mut self, entry: &AuditEntry) {
+        let (prev_hash, seq) = match self.prev {
+            Some(prev) => prev,
+            None => {
+                self.first = Some((entry.seq, entry.prev_hash));
+                (entry.prev_hash, Some(entry.seq))
+            }
+        };
+        let valid = entry.format == AUDIT_FORMAT
+            && Some(entry.seq) == seq
+            && entry.verify(&prev_hash)
+            && (entry.migration.is_none() || entry.event_type == AuditEventType::AuditLogMigrated)
+            && (entry.retention.is_none() || entry.event_type == AuditEventType::AuditRetention);
+        if !valid {
+            self.broke(b'e', entry.seq, &entry.hash);
+        }
+        if entry.retention.is_some() {
+            self.mark = entry.retention;
+        }
+        if entry.event_type != AuditEventType::RateLimitTripped {
+            self.latest_time = self.latest_time.max(entry.timestamp);
+        }
+        self.prev = Some((entry.hash, entry.seq.checked_add(1)));
+    }
+
+    /// A line `number` (counted from 1) that could not be read as an entry.
+    fn unreadable(&mut self, number: u64) {
+        self.broke(b'l', number, &[0; 32]);
+    }
+
+    fn broke(&mut self, kind: u8, at: u64, hash: &[u8; 32]) {
+        self.failures += 1;
+        self.first_failure.get_or_insert(at);
+        self.breaks.push(kind);
+        self.breaks.extend_from_slice(&at.to_le_bytes());
+        self.breaks.extend_from_slice(hash);
+    }
+
+    fn finish(mut self) -> ChainCheck {
+        if let Some((first_seq, first_link)) = self.first {
+            let starts = if first_seq == 1 {
+                first_link == [0u8; 32]
+            } else {
+                self.mark
+                    .is_some_and(|m| m.first_seq == first_seq && m.first_link == first_link)
+            };
+            if !starts {
+                self.broke(b's', first_seq, &first_link);
+            }
+        }
+        ChainCheck {
+            valid: self.failures == 0,
+            failures: self.failures,
+            first_failure: self.first_failure,
+            breaks: crypto::blake2b_256(&self.breaks),
+            too_long: self.too_long,
+            latest_time: self.latest_time,
+        }
+    }
+}
+
+/// A log file as a log last left it: its length, and its last line with
+/// the offset that line ends at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OnDisk {
+    len: u64,
+    last: Option<(u64, Vec<u8>)>,
+}
+
+impl OnDisk {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        Ok(scan_tail(path)?.on_disk())
+    }
+}
+
+/// What [`scan_tail`] found.
+struct Tail {
+    /// The last complete line that is not blank, with its newline.
+    last: Option<Vec<u8>>,
+    /// Where that line ends.
+    last_end: u64,
+    /// How many complete lines are not blank.
+    count: usize,
+    /// The length of the complete lines, when a final line has no newline.
+    complete: Option<u64>,
+    /// The length of the complete lines.
+    end: u64,
+}
+
+impl Tail {
+    /// The file as it is once a torn final line, if any, is dropped.
+    fn on_disk(&self) -> OnDisk {
+        OnDisk {
+            len: self.end,
+            last: self.last.clone().map(|line| (self.last_end, line)),
+        }
+    }
+}
+
+/// Scan `path` for its last complete line that is not blank, without
+/// changing it.
+fn scan_tail(path: &Path) -> std::io::Result<Tail> {
     let mut reader = BufReader::new(File::open(path)?);
-    let (mut line, mut complete) = (Vec::new(), 0u64);
-    loop {
+    let (mut line, mut last) = (Vec::new(), Vec::new());
+    let (mut count, mut at, mut last_end) = (0, 0u64, 0u64);
+    let complete = loop {
         line.clear();
         let n = reader.read_until(b'\n', &mut line)?;
         if n == 0 {
-            return Ok(());
+            break None;
         }
         if line.last() != Some(&b'\n') {
-            return truncate(path, complete);
+            break Some(at);
         }
-        complete += n as u64;
-    }
+        at += n as u64;
+        if !line_text(&line).is_empty() {
+            count += 1;
+            last_end = at;
+            std::mem::swap(&mut last, &mut line);
+        }
+    };
+    Ok(Tail {
+        last: (!last.is_empty()).then_some(last),
+        last_end,
+        count,
+        complete,
+        end: at,
+    })
 }
 
-/// Whether any non-empty line of `path` fails to decrypt under `data_key`.
-fn has_undecryptable_line(path: &Path, data_key: &SecretKey) -> std::io::Result<bool> {
-    let mut reader = BufReader::new(File::open(path)?);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            return Ok(false);
-        }
-        let text = line_text(&line);
-        if text.is_empty() {
-            continue;
-        }
-        let decrypts = std::str::from_utf8(text)
-            .ok()
-            .is_some_and(|text| AuditLog::decrypt_raw(text, data_key).is_ok());
-        if !decrypts {
-            return Ok(true);
-        }
+/// The length of the file at `path`; zero when there is none.
+fn file_len(path: &Path) -> std::io::Result<u64> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(e) => Err(e),
     }
 }
 
@@ -1625,33 +2084,52 @@ pub struct SigningAuditLog {
     path: PathBuf,
     last_hash: [u8; 32],
     retention: RetentionPolicy,
+    /// The name this open kept an unreadable log under, if it did.
+    set_aside: Option<String>,
 }
 
 impl SigningAuditLog {
     /// Open or create a signing audit log at the given path, decrypting only
     /// its last line. A final line cut short by a crash is dropped. A log
-    /// whose last line cannot be decrypted under `data_key` (one left under a
-    /// data key that no longer exists, say) is kept beside it as
+    /// whose last line cannot be read under `data_key` (one left under a
+    /// data key that no longer exists, an entry a newer keep wrote, or a line
+    /// copied in from the audit log) is kept beside it byte for byte as
     /// `signing_audit.log.unreadable` and a new one started, with an error
     /// logged, rather than locking the vault.
     pub fn open(path: &Path, data_key: &SecretKey) -> Result<Self> {
         let audit_path = path.join("signing_audit.log");
+        let mut set_aside = None;
         let last_hash = if audit_path.exists() {
-            drop_torn_tail(&audit_path)?;
-            match Self::read_last_hash(&audit_path, data_key) {
+            let tail = scan_tail(&audit_path)?;
+            let last = tail.last.as_ref().map_or(Ok([0u8; 32]), |line| {
+                std::str::from_utf8(line_text(line))
+                    .map_err(|e| {
+                        StorageError::invalid_format(format!("signing audit line: {e}")).into()
+                    })
+                    .and_then(|text| Self::decrypt_line(text, data_key))
+                    .map(|entry| entry.hash)
+            });
+            // A torn final line is dropped only after a line that reads, so
+            // a log that is set aside is kept byte for byte.
+            if last.is_ok() {
+                if let Some(complete) = tail.complete {
+                    truncate(&audit_path, complete)?;
+                }
+            }
+            match last {
                 Ok(hash) => hash,
-                Err(e) if has_undecryptable_line(&audit_path, data_key)? => {
+                Err(e) => {
                     let kept = keep_copy(&audit_path, path, UNREADABLE_SIGNING_LOG)?;
                     std::fs::remove_file(&audit_path)?;
                     sync_parent(&audit_path);
                     tracing::error!(
                         error = %e,
                         kept = %kept.display(),
-                        "the signing audit log has lines that cannot be decrypted under the vault's key; it was kept under the name here and a new one started"
+                        "the signing audit log's last line cannot be read under the vault's key; it was kept under the name here and a new one started"
                     );
+                    set_aside = kept.file_name().map(|n| n.to_string_lossy().into_owned());
                     [0u8; 32]
                 }
-                Err(e) => return Err(e),
             }
         } else {
             [0u8; 32]
@@ -1661,7 +2139,24 @@ impl SigningAuditLog {
             path: audit_path,
             last_hash,
             retention: RetentionPolicy::default(),
+            set_aside,
         })
+    }
+
+    /// The name this open kept an unreadable log under, if it did.
+    pub fn set_aside_on_open(&self) -> Option<&str> {
+        self.set_aside.as_deref()
+    }
+
+    /// Whether a file named `name` (one [`SigningAuditLog::open`] kept) is
+    /// still beside the log.
+    pub fn kept_log_present(&self, name: &str) -> bool {
+        kept_paths(
+            self.path.parent().unwrap_or(Path::new(".")),
+            UNREADABLE_SIGNING_LOG,
+        )
+        .iter()
+        .any(|p| p.file_name().is_some_and(|n| n == name))
     }
 
     /// Set the retention policy.
@@ -1851,28 +2346,6 @@ impl SigningAuditLog {
         }
     }
 
-    /// The last entry's hash, decrypting only the last line, so opening
-    /// never depends on the log's length.
-    fn read_last_hash(path: &Path, data_key: &SecretKey) -> Result<[u8; 32]> {
-        let mut reader = BufReader::new(File::open(path)?);
-        let (mut line, mut last) = (Vec::new(), Vec::new());
-        loop {
-            line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 {
-                break;
-            }
-            if !line_text(&line).is_empty() {
-                std::mem::swap(&mut last, &mut line);
-            }
-        }
-        if last.is_empty() {
-            return Ok([0u8; 32]);
-        }
-        let text = std::str::from_utf8(line_text(&last))
-            .map_err(|e| StorageError::invalid_format(format!("signing audit line: {e}")))?;
-        Ok(Self::decrypt_line(text, data_key)?.hash)
-    }
-
     fn read_entries(path: &Path, data_key: &SecretKey) -> Result<Vec<SigningAuditEntry>> {
         const MAX_ENTRIES: usize = 100_000;
 
@@ -1990,6 +2463,30 @@ pub(crate) mod test_support {
         pub(crate) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Makes this thread's copies into a kept log's name fail.
         pub(crate) static FAIL_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Append `count` entries to the log in `dir`, chained from its last
+    /// entry, without a sync per line, for tests of long logs.
+    pub(crate) fn write_long_log(dir: &Path, key: &SecretKey, count: usize) {
+        let log = AuditLog::open(dir, key).unwrap();
+        let (mut seq, mut prev) = (log.seq(), log.last_hash());
+        let mut out = std::io::BufWriter::new(
+            OpenOptions::new()
+                .append(true)
+                .open(dir.join("audit.log"))
+                .unwrap(),
+        );
+        for _ in 0..count {
+            let mut entry = AuditEntry::new(AuditEventType::Sign, prev);
+            entry.format = AUDIT_FORMAT;
+            seq += 1;
+            entry.seq = seq;
+            entry.hash = entry.compute_hash();
+            prev = entry.hash;
+            out.write_all(AuditLog::encrypt_line(&entry, key).unwrap().as_bytes())
+                .unwrap();
+        }
+        out.flush().unwrap();
     }
 
     /// Write `entries` to `dir/audit.log` exactly as the release before
@@ -3751,10 +4248,37 @@ mod sequence_tests {
         assert!(!log.verify_chain(&key).unwrap());
     }
 
-    /// A log whose newest entry is in a format newer than this keep writes
-    /// refuses to open rather than having older entries appended after it.
+    /// Pruning tells its caller where the log will end before replacing it,
+    /// and leaves the log as it was when the caller fails.
     #[test]
-    fn a_log_from_a_newer_keep_refuses_to_open() {
+    fn retention_reports_the_new_end_before_rewriting() {
+        let dir = tempdir().unwrap();
+        let key = key();
+        let mut log = logged(dir.path(), &key, 4);
+        log.set_retention(RetentionPolicy {
+            max_entries: Some(2),
+            max_age_days: None,
+        });
+        let path = dir.path().join("audit.log");
+        let before = std::fs::read(&path).unwrap();
+        assert!(log
+            .apply_retention_noting(&key, None, |_, _| Err(KeepError::Other("no".into())))
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut told = None;
+        log.apply_retention_noting(&key, None, |seq, hash| {
+            told = Some((seq, hash));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(told, Some((log.seq(), log.last_hash())));
+    }
+
+    /// A log whose newest entry is in a format newer than this keep writes
+    /// is set aside byte for byte rather than refusing to open or having
+    /// older entries appended after it.
+    #[test]
+    fn a_log_from_a_newer_keep_is_set_aside() {
         let dir = tempdir().unwrap();
         let key = key();
         let log = logged(dir.path(), &key, 2);
@@ -3767,8 +4291,15 @@ mod sequence_tests {
         let mut text = std::fs::read_to_string(&path).unwrap();
         text.push_str(&AuditLog::encrypt_line(&next, &key).unwrap());
         std::fs::write(&path, &text).unwrap();
-        assert!(AuditLog::open(dir.path(), &key).is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        let log = AuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(MIGRATED_LOG)).unwrap(),
+            text
+        );
+        assert!(!log.migrated_on_open().unwrap().chain_valid);
+        let entries = log.read_all(&key).unwrap();
+        assert!(entries.iter().all(|e| e.format == AUDIT_FORMAT));
+        assert!(verify_entries(&entries).valid);
     }
 
     /// The marker, the kept logs and an interrupted rewrite's files are used
@@ -3958,43 +4489,82 @@ mod sequence_tests {
         format!("{}\n", STANDARD.encode(encrypted.to_bytes()))
     }
 
-    /// A line that decrypts but does not parse came from a newer keep, so a
-    /// log that would otherwise be migrated around it (an old log holding
-    /// one anywhere, a current-format log ending in one) refuses to open
-    /// rather than being cut.
+    /// A line that decrypts but does not parse (an entry type a newer keep
+    /// added, a line copied in from the signing log) or that is in a newer
+    /// format never stops the log opening: the log is set aside byte for
+    /// byte, the readable entries before the line carry on with the failure
+    /// recorded, and nothing after it is renumbered.
     #[test]
-    fn an_entry_from_a_newer_keep_refuses_rather_than_cuts() {
+    fn an_entry_this_keep_cannot_read_sets_the_log_aside_rather_than_refusing() {
         let key = key();
         let entry = serde_json::to_value(sign(9)).unwrap();
         let mut newer = entry.clone();
         newer["event_type"] = "SomethingNewer".into();
-        let newer = foreign_line(&newer.to_string(), &key);
-        for format1 in [true, false] {
-            let dir = tempdir().unwrap();
-            if format1 {
-                write_format1_log(dir.path(), &key, vec![sign(1), sign(2)]);
-            } else {
-                logged(dir.path(), &key, 2);
+        let mut format3 = serde_json::to_value({
+            let mut e = sign(9);
+            e.format = 3;
+            e
+        })
+        .unwrap();
+        format3["seq"] = 3.into();
+        let signing = foreign_line(
+            &serde_json::to_string(
+                &SigningAuditEntry::new(
+                    SigningRequestType::SignEvent,
+                    SigningDecision::Approved,
+                    false,
+                    "caller".into(),
+                    [0; 32],
+                )
+                .finalize(),
+            )
+            .unwrap(),
+            &key,
+        );
+        for line in [
+            foreign_line(&newer.to_string(), &key),
+            foreign_line(&format3.to_string(), &key),
+            signing,
+        ] {
+            for format1 in [true, false] {
+                let dir = tempdir().unwrap();
+                if format1 {
+                    write_format1_log(dir.path(), &key, vec![sign(1), sign(2)]);
+                } else {
+                    logged(dir.path(), &key, 2);
+                }
+                let path = dir.path().join("audit.log");
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                if format1 {
+                    text.insert_str(0, &line);
+                } else {
+                    text.push_str(&line);
+                }
+                std::fs::write(&path, &text).unwrap();
+                let log = AuditLog::open(dir.path(), &key).unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(dir.path().join(MIGRATED_LOG)).unwrap(),
+                    text,
+                    "kept byte for byte"
+                );
+                let migrated = log.migrated_on_open().unwrap();
+                assert!(!migrated.chain_valid);
+                assert!(!migrated.unreadable);
+                assert!(log.failed_migration_kept());
+                let entries = log.read_all(&key).unwrap();
+                assert!(verify_entries(&entries).valid);
+                // Both readable entries carry on; the migration follows.
+                assert_eq!(entries.len(), 3);
+                assert_eq!(log.seq(), 3);
             }
-            let path = dir.path().join("audit.log");
-            let mut text = std::fs::read_to_string(&path).unwrap();
-            if format1 {
-                text.insert_str(0, &newer);
-            } else {
-                text.push_str(&newer);
-            }
-            std::fs::write(&path, &text).unwrap();
-            assert!(AuditLog::open(dir.path(), &key).is_err());
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-            assert!(!dir.path().join(MIGRATED_LOG).exists());
         }
     }
 
-    /// A signing log whose last line a crash cut short drops that line, and
-    /// one holding an entry this keep cannot parse refuses to open; neither
-    /// is set aside.
+    /// A signing log whose last line a crash cut short drops that line and
+    /// is not set aside; one ending in an entry this keep cannot parse is
+    /// set aside byte for byte rather than refusing to open.
     #[test]
-    fn the_signing_log_is_set_aside_only_for_lines_that_do_not_decrypt() {
+    fn the_signing_log_is_set_aside_for_a_last_line_it_cannot_read() {
         let dir = tempdir().unwrap();
         let key = key();
         let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
@@ -4028,9 +4598,16 @@ mod sequence_tests {
         assert!(!dir.path().join(UNREADABLE_SIGNING_LOG).exists());
 
         let newer = foreign_line(r#"{"unknown":"entry"}"#, &key);
-        std::fs::write(&path, format!("{whole}{newer}")).unwrap();
-        assert!(SigningAuditLog::open(dir.path(), &key).is_err());
-        assert!(path.exists());
-        assert!(!dir.path().join(UNREADABLE_SIGNING_LOG).exists());
+        let text = format!("{whole}{newer}");
+        std::fs::write(&path, &text).unwrap();
+        let log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        assert_eq!(log.last_hash(), [0; 32]);
+        assert_eq!(log.set_aside_on_open(), Some(UNREADABLE_SIGNING_LOG));
+        assert!(log.kept_log_present(UNREADABLE_SIGNING_LOG));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(UNREADABLE_SIGNING_LOG)).unwrap(),
+            text
+        );
     }
 }

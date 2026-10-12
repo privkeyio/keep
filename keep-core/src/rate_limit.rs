@@ -219,6 +219,16 @@ const TRIP_RECORD_SIZE: usize = 20;
 const MAX_TRIP_RECORDS: usize = 256;
 
 impl PendingTrip {
+    /// The time to give this trip's audit entry: its recorded time, but
+    /// never later than now. The trip file is forgeable (see above), and an
+    /// entry dated in the future would pass for the latest thing the log
+    /// recorded.
+    pub(crate) fn audit_time(&self) -> i64 {
+        i64::try_from(self.timestamp)
+            .unwrap_or(i64::MAX)
+            .min(chrono::Utc::now().timestamp())
+    }
+
     fn to_bytes(&self, hmac_key: &[u8; 32]) -> [u8; TRIP_RECORD_SIZE] {
         let mut data = [0u8; TRIP_RECORD_SIZE];
         data[0..4].copy_from_slice(&self.failed_attempts.to_le_bytes());
@@ -279,6 +289,13 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
         tracing::debug!("failed to write rate-limit trip event");
     }
     let _ = file.sync_all();
+}
+
+/// Write a trip record with any `timestamp`, as someone who can write the
+/// vault folder can.
+#[cfg(test)]
+pub(crate) fn forge_trip_for_tests(path: &Path, hmac_key: &[u8; 32], timestamp: u64) {
+    record_trip(path, hmac_key, 5, timestamp);
 }
 
 /// Read and clear all pending trip events for `path`. Records with invalid

@@ -145,12 +145,12 @@ pub const MAX_AUDIT_TEXT: usize = 256;
 /// backslashes escaped (which can lengthen it, to at most a few times the
 /// cap), so it cannot run on, break a line or pose as other text.
 pub fn audit_text(text: &str) -> String {
-    cap_text(text).escape_debug().to_string()
+    cap_text(text, MAX_AUDIT_TEXT).escape_debug().to_string()
 }
 
-/// `text` cut to [`MAX_AUDIT_TEXT`] bytes at a character boundary.
-pub fn cap_text(text: &str) -> &str {
-    let mut end = text.len().min(MAX_AUDIT_TEXT);
+/// `text` cut to `max` bytes at a character boundary.
+pub fn cap_text(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -166,6 +166,27 @@ pub fn bindable_uid(uid: u32) -> bool {
 impl AgentCredential {
     /// A new credential and the token for it, shown to the owner once.
     pub fn issue(
+        name: &str,
+        uid: u32,
+        grant: Vec<u8>,
+        now: u64,
+        ttl_secs: u64,
+    ) -> Result<(Self, Zeroizing<String>)> {
+        Self::issue_with_id(
+            entropy::try_random_bytes()?,
+            name,
+            uid,
+            grant,
+            now,
+            ttl_secs,
+        )
+    }
+
+    /// [`Self::issue`] with the id chosen beforehand, as when an approver
+    /// approves a credential before it exists: the id, the issue time and the
+    /// lifetime it approved are exactly the credential's.
+    pub fn issue_with_id(
+        id: [u8; 16],
         name: &str,
         uid: u32,
         grant: Vec<u8>,
@@ -204,7 +225,7 @@ impl AgentCredential {
             write!(token, "{byte:02x}").map_err(|e| KeepError::Other(e.to_string()))?;
         }
         let credential = Self {
-            id: entropy::try_random_bytes()?,
+            id,
             name: name.to_string(),
             token_hash: token_hash(&token),
             uid,

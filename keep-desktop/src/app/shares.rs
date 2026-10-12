@@ -439,15 +439,19 @@ impl App {
                 self.reconcile_kill_switch();
                 self.set_share_screen(shares);
                 self.load_config_from_vault();
-                if lock_keep(&self.keep)
+                self.audit_warnings = lock_keep(&self.keep)
                     .as_ref()
-                    .is_some_and(keep_core::Keep::audit_failed_migration_kept)
-                {
-                    self.set_toast(
-                        "The audit log was moved to a new format, but the old log FAILED its integrity check: entries from before the move cannot be trusted. Keep the old log in the vault folder (audit.log.v1, or the name audit.log.v1.failed gives) and run `keep audit verify`.".into(),
-                        ToastKind::Error,
-                    );
-                }
+                    .map(keep_core::Keep::audit_warnings)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|w| {
+                        let mut text = w.to_string();
+                        if let Some(first) = text.get_mut(..1) {
+                            first.make_ascii_uppercase();
+                        }
+                        format!("{text}.")
+                    })
+                    .collect();
                 if let Some(request) = super::take_pending_nostrconnect() {
                     return self.process_pending_nostrconnect(request);
                 }
