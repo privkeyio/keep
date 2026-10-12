@@ -1493,6 +1493,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_serve_takes_an_approval_deadline_of_30_to_120_seconds() {
         let serve = |deadline: &str| {
