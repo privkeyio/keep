@@ -31,6 +31,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
             approval_deadline,
             relay_socket,
             relay_user,
+            inject_socket,
         } => {
             if hidden {
                 return Err(KeepError::NotImplemented(
@@ -46,6 +47,8 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                 admin_uid,
                 relay_uid,
                 wallet_budget_sats,
+                inject: inject_socket
+                    .map(|socket| daemon::state::InjectSettings { socket, owner: 0 }),
                 ..Settings::default()
             };
             serve(
@@ -67,9 +70,9 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                 },
             )
         }
-        GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. } => {
-            dispatch_without_vault(command)
-        }
+        GatewayCommands::Relay { .. }
+        | GatewayCommands::ChannelKey { .. }
+        | GatewayCommands::InjectWorker {} => dispatch_without_vault(command),
         GatewayCommands::Approver { command } => approver(out, path, command),
         GatewayCommands::Status { target } => print(&admin(&target, json!({ "op": "status" }))?),
         GatewayCommands::List { target } => print(&admin(&target, json!({ "op": "list" }))?),
@@ -91,7 +94,12 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                 per_day,
                 ttl_days,
                 token_out,
+                secrets_file,
             } = *args;
+            let secrets = match &secrets_file {
+                Some(file) => read_secrets_file(file)?,
+                None => Vec::new(),
+            };
             let grant = build_grant(GrantArgs {
                 keys,
                 operations,
@@ -106,6 +114,7 @@ pub fn dispatch(out: &Output, path: &Path, command: GatewayCommands, hidden: boo
                     per_hour,
                     per_day,
                 },
+                secrets,
             })?;
             let ttl_secs = ttl_days
                 .checked_mul(24 * 60 * 60)
@@ -220,6 +229,7 @@ pub fn dispatch_without_vault(command: GatewayCommands) -> Result<()> {
         GatewayCommands::ChannelKey {
             command: ChannelKeyCommands::New,
         } => new_channel_key(),
+        GatewayCommands::InjectWorker {} => inject_worker(),
         _ => Err(KeepError::Other("this command needs the vault".into())),
     }
 }
@@ -292,6 +302,23 @@ fn relay(socket: &Path, gateway_user: &str) -> Result<()> {
             tracing::info!("stopping the relay helper");
         }))
         .map_err(|e| KeepError::Runtime(e.to_string()))
+}
+
+fn inject_worker() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
+    let done = runtime.block_on(keep_agent::inject::worker::run());
+    // Standard input is read on a blocking thread the runtime would wait on;
+    // the answer is written, so exit without waiting.
+    std::process::exit(match done {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!(error = %e, "inject worker");
+            1
+        }
+    })
 }
 
 fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> {
@@ -823,10 +850,29 @@ struct GrantArgs {
     approval_above_sats: Option<u64>,
     allow_addresses: Vec<String>,
     limits: RequestLimits,
+    secrets: Vec<Value>,
 }
 
-/// The grant the flags describe, validated as the gateway will validate it.
-fn build_grant(args: GrantArgs) -> Result<Grant> {
+/// The secret entries in `file`, a JSON array. They hold no secret values,
+/// only ids or names and where each may be sent.
+fn read_secrets_file(file: &std::path::Path) -> Result<Vec<Value>> {
+    let invalid = |m: String| KeepError::InvalidInput(m);
+    let text = std::fs::read_to_string(file)
+        .map_err(|e| invalid(format!("--secrets-file {}: {e}", file.display())))?;
+    match serde_json::from_str(&text) {
+        Ok(Value::Array(entries)) => Ok(entries),
+        _ => Err(invalid(format!(
+            "--secrets-file {} must hold a JSON array of secret entries",
+            file.display()
+        ))),
+    }
+}
+
+/// The grant the flags and secrets describe, as sent to the gateway. Without
+/// secrets it is validated here as the gateway will validate it; secrets go
+/// as the owner wrote them, since only the gateway can resolve their names
+/// and check them in the vault.
+fn build_grant(args: GrantArgs) -> Result<Value> {
     let invalid = |m: String| KeepError::InvalidInput(m);
     let keys = args
         .keys
@@ -865,6 +911,7 @@ fn build_grant(args: GrantArgs) -> Result<Grant> {
         }
     };
     let grant = Grant {
+        secrets: Vec::new(),
         keys,
         operations,
         event_kinds: args.kinds.into_iter().collect(),
@@ -872,9 +919,18 @@ fn build_grant(args: GrantArgs) -> Result<Grant> {
         bitcoin,
         limits: args.limits,
     };
-    grant
-        .validated(&keep_agent::policy::ReservedKeys::new())
-        .map_err(|e| invalid(e.to_string()))
+    let grant = if args.secrets.is_empty() {
+        grant
+            .validated(&keep_agent::policy::ReservedKeys::new())
+            .map_err(|e| invalid(e.to_string()))?
+    } else {
+        grant
+    };
+    let mut value = serde_json::to_value(&grant).map_err(|e| invalid(e.to_string()))?;
+    if !args.secrets.is_empty() {
+        value["secrets"] = Value::Array(args.secrets);
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
@@ -940,12 +996,17 @@ mod tests {
             approval_above_sats: None,
             allow_addresses: vec![],
             limits: RequestLimits::default(),
+            secrets: vec![],
         }
+    }
+
+    fn checked(args: GrantArgs) -> Result<Grant> {
+        build_grant(args).map(|v| serde_json::from_value(v).unwrap())
     }
 
     #[test]
     fn flags_build_a_validated_grant() {
-        let grant = build_grant(args()).unwrap();
+        let grant = checked(args()).unwrap();
         assert_eq!(grant.keys.len(), 1);
         assert!(grant.operations.contains(&Operation::SignNostrEvent));
         assert_eq!(grant.event_kinds, [1].into());
@@ -956,7 +1017,7 @@ mod tests {
         btc.per_psbt_sats = Some(1_000);
         btc.window_sats = Some(5_000);
         btc.allow_addresses = vec!["TB1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KXPJZSX".into()];
-        let grant = build_grant(btc).unwrap();
+        let grant = checked(btc).unwrap();
         let b = grant.bitcoin.unwrap();
         assert!(b
             .address_allowlist
@@ -991,5 +1052,42 @@ mod tests {
         })
         .contains("per_psbt_sats"));
         assert!(refused(|a| a.limits.per_minute = 0).contains("request limits"));
+        assert!(refused(|a| a.keys.clear()).contains("keys"));
+    }
+
+    fn rule(prefix: &str) -> Value {
+        json!({
+            "host": "api.example.com", "port": 443, "methods": ["GET"],
+            "path_prefix": prefix, "header": "authorization", "format": "Bearer {}"
+        })
+    }
+
+    #[test]
+    fn secrets_are_sent_as_written_for_the_gateway_to_resolve() {
+        let with = |secrets: Vec<Value>| GrantArgs {
+            keys: vec![],
+            operations: vec!["http_request".into()],
+            kinds: vec![],
+            secrets,
+            ..args()
+        };
+        let named = json!({ "secret": { "name": "deploy token" }, "http": [rule("/v1")] });
+        let by_id = json!({ "secret": "ab".repeat(32), "http": [rule("/v2")] });
+        let sent = build_grant(with(vec![named.clone(), by_id.clone()])).unwrap();
+        assert_eq!(sent["secrets"], json!([named, by_id]));
+        assert_eq!(sent["keys"], json!([]));
+        let refused = build_grant(with(vec![])).unwrap_err().to_string();
+        assert!(refused.contains("http_request"), "{refused}");
+    }
+
+    #[test]
+    fn a_secrets_file_holds_a_json_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secrets.json");
+        std::fs::write(&file, r#"[{"secret":{"name":"t"},"http":[]}]"#).unwrap();
+        assert_eq!(read_secrets_file(&file).unwrap().len(), 1);
+        std::fs::write(&file, r#"{"secret":"x"}"#).unwrap();
+        assert!(read_secrets_file(&file).is_err());
+        assert!(read_secrets_file(&dir.path().join("missing")).is_err());
     }
 }

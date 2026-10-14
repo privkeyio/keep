@@ -214,6 +214,10 @@ pub(crate) const DEFAULT_RELAY_SOCKET: &str = "/run/keep-gateway-relay/relay.soc
 #[cfg(target_os = "linux")]
 pub(crate) const DEFAULT_RELAY_USER: &str = "keep-gateway-relay";
 
+/// Where systemd listens for the gateway's connections to inject workers.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_INJECT_SOCKET: &str = "/run/keep-gateway-inject/worker.sock";
+
 #[cfg(target_os = "linux")]
 #[derive(Subcommand)]
 pub(crate) enum GatewayCommands {
@@ -247,7 +251,17 @@ pub(crate) enum GatewayCommands {
         /// relay socket
         #[arg(long, default_value = DEFAULT_RELAY_USER)]
         relay_user: String,
+        /// Serve http_request, reaching inject workers through this socket,
+        /// which systemd listens on (its directory and the socket must be
+        /// root's). Without it, http_request is unavailable
+        #[arg(long, num_args = 0..=1, default_missing_value = DEFAULT_INJECT_SOCKET)]
+        inject_socket: Option<PathBuf>,
     },
+    /// Run one inject worker: send the one request the gateway writes on
+    /// standard input and write the response to standard output. Started by
+    /// systemd for each connection, as its own user; never root, never with
+    /// the vault
+    InjectWorker {},
     /// Run the relay helper: carry the gateway's approval messages to and
     /// from the relays. Runs as its own user with network access, never root,
     /// and holds no key.
@@ -377,13 +391,19 @@ pub(crate) struct IssueArgs {
     /// The uid the agent runs as; the token is refused from any other
     #[arg(long)]
     pub(crate) uid: u32,
-    /// A vault key the agent may use, as hex or npub (repeatable)
-    #[arg(long = "key", required = true)]
+    /// A vault key the agent may use, as hex or npub (repeatable). Needed by
+    /// every operation but http_request
+    #[arg(long = "key")]
     pub(crate) keys: Vec<String>,
     /// An operation the agent may request (repeatable): get_public_key,
-    /// sign_nostr_event, get_bitcoin_address, sign_psbt
+    /// sign_nostr_event, get_bitcoin_address, sign_psbt, http_request
     #[arg(long = "op", required = true)]
     pub(crate) operations: Vec<String>,
+    /// A JSON file listing the vault secrets the agent may use and where each
+    /// may be sent (see the agent gateway's secrets in docs/USAGE.md). A
+    /// secret is given by its id or as {"name": "..."}
+    #[arg(long)]
+    pub(crate) secrets_file: Option<PathBuf>,
     /// A Nostr event kind the agent may sign (repeatable)
     #[arg(long = "kind")]
     pub(crate) kinds: Vec<u16>,
