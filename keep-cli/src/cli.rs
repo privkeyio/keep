@@ -490,6 +490,27 @@ pub(crate) enum AgentCommands {
         #[arg(long, default_value = DEFAULT_GATEWAY_USER)]
         gateway_user: String,
     },
+    /// Serve an SSH agent whose keys stay in the gateway: SSH clients and
+    /// git use the SSH keys the agent's credential is granted through it,
+    /// with SSH_AUTH_SOCK set to the socket. Runs as the agent's user, needs
+    /// no vault and no password, and refuses to run with KEEP_PASSWORD set.
+    #[cfg(target_os = "linux")]
+    SshAgent {
+        /// The file holding the agent's token, owned by the user running
+        /// the agent and readable by it alone (chmod 600).
+        #[arg(long)]
+        token_file: PathBuf,
+        /// Where to serve the SSH agent: a path in a directory the agent's
+        /// user owns and no one else can enter (mkdir -m 700).
+        #[arg(long)]
+        listen: PathBuf,
+        /// The gateway's agent socket.
+        #[arg(long, default_value = DEFAULT_AGENT_SOCKET)]
+        socket: PathBuf,
+        /// The user the gateway runs as, by name or uid.
+        #[arg(long, default_value = DEFAULT_GATEWAY_USER)]
+        gateway_user: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -617,6 +638,19 @@ pub(crate) enum SecretCommands {
     },
     /// List stored secrets (name, kind, id) — never the values.
     List,
+    /// Generate an Ed25519 SSH key inside keep and print its public key, as
+    /// authorized_keys takes it. The private key never leaves the vault: an
+    /// agent uses it through the gateway, with `keep agent ssh-agent`.
+    SshKeygen {
+        /// Human-readable title for the key (e.g. "deploy key").
+        #[arg(short, long)]
+        name: String,
+    },
+    /// Print an SSH key's public key, as authorized_keys takes it.
+    SshPubkey {
+        /// The key's name, or its hex id (from `list`) to disambiguate duplicates.
+        name: String,
+    },
     /// Remove a secret by name or hex id.
     Rm {
         /// Secret name, or its hex id (from `list`) to disambiguate duplicates.

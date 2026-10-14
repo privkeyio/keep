@@ -180,6 +180,45 @@ pub fn cmd_agent_connect(token_file: &Path, socket: &Path, gateway_user: &str) -
         .map_err(runtime)
 }
 
+#[cfg(target_os = "linux")]
+pub fn cmd_agent_ssh_agent(
+    token_file: &Path,
+    listen: &Path,
+    socket: &Path,
+    gateway_user: &str,
+) -> Result<()> {
+    use keep_agent::gateway::bridge::{self, Bridge, Timing, Token};
+    use keep_agent::gateway::{daemon, ssh_agent};
+
+    if let Some(var) = bridge::vault_secret_var(|v| std::env::var_os(v).is_some()) {
+        return Err(KeepError::InvalidInput(format!(
+            "refusing to run with {var} set: the agent can read this environment. The SSH \
+             agent needs only its token file"
+        )));
+    }
+    let euid = daemon::euid();
+    if euid == 0 {
+        return Err(KeepError::InvalidInput(
+            "run the SSH agent as the agent's user; root can hold no gateway credential".into(),
+        ));
+    }
+    let runtime = |e: keep_agent::error::AgentError| KeepError::Runtime(e.to_string());
+    daemon::harden().map_err(runtime)?;
+    let token = Token::read(token_file, euid).map_err(runtime)?;
+    let gateway_uid = super::gateway::gateway_uid(gateway_user)?;
+    let bridge = Bridge::connect(socket, gateway_uid, token, Timing::default())
+        .map_err(|e| KeepError::Runtime(format!("connect to the gateway: {e}")))?;
+    let listener = ssh_agent::listen(listen, euid).map_err(runtime)?;
+    eprintln!(
+        "keep agent ssh-agent: serving at {}; set SSH_AUTH_SOCK={} for the agent's SSH clients",
+        listen.display(),
+        listen.display()
+    );
+    std::sync::Arc::new(ssh_agent::SshAgent::new(bridge))
+        .serve(listener, euid)
+        .map_err(runtime)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

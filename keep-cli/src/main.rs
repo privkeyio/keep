@@ -151,6 +151,19 @@ fn run(out: &Output) -> Result<()> {
     {
         return commands::agent::cmd_agent_connect(token_file, socket, gateway_user);
     }
+    #[cfg(target_os = "linux")]
+    if let Commands::Agent {
+        command:
+            AgentCommands::SshAgent {
+                token_file,
+                listen,
+                socket,
+                gateway_user,
+            },
+    } = &cli.command
+    {
+        return commands::agent::cmd_agent_ssh_agent(token_file, listen, socket, gateway_user);
+    }
     // The relay helper runs as a user with no vault, and a channel key is
     // made before any vault is involved.
     #[cfg(target_os = "linux")]
@@ -217,6 +230,12 @@ fn run(out: &Output) -> Result<()> {
                 cfg.default_relay(),
             ),
             SecretCommands::List => commands::secret::cmd_secret_list(out, &path, hidden),
+            SecretCommands::SshKeygen { name } => {
+                commands::secret::cmd_secret_ssh_keygen(out, &path, &name, hidden)
+            }
+            SecretCommands::SshPubkey { name } => {
+                commands::secret::cmd_secret_ssh_pubkey(out, &path, &name, hidden)
+            }
             SecretCommands::Rm { name } => {
                 commands::secret::cmd_secret_rm(out, &path, &name, hidden)
             }
@@ -309,6 +328,10 @@ fn dispatch_agent(
         // Run before the vault path is resolved, in `run`.
         #[cfg(target_os = "linux")]
         AgentCommands::Connect { .. } => unreachable!("keep agent connect is dispatched earlier"),
+        #[cfg(target_os = "linux")]
+        AgentCommands::SshAgent { .. } => {
+            unreachable!("keep agent ssh-agent is dispatched earlier")
+        }
     }
 }
 
