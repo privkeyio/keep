@@ -259,7 +259,27 @@ impl PsbtSigner {
         })
     }
 
+    /// Refuse a PSBT whose origins naming this wallet, over all its inputs
+    /// and outputs, are more than [`MAX_PSBT_WALLET_ORIGINS`].
+    fn check_wallet_origins(&self, psbt: &Psbt) -> Result<()> {
+        let named = psbt
+            .inputs
+            .iter()
+            .map(|i| &i.tap_key_origins)
+            .chain(psbt.outputs.iter().map(|o| &o.tap_key_origins))
+            .flat_map(|origins| origins.values())
+            .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
+            .count();
+        if named > MAX_PSBT_WALLET_ORIGINS {
+            return Err(BitcoinError::InvalidPsbt(format!(
+                "the PSBT names this wallet's keys {named} times; at most {MAX_PSBT_WALLET_ORIGINS} are read"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn analyze(&self, psbt: &Psbt) -> Result<PsbtAnalysis> {
+        self.check_wallet_origins(psbt)?;
         let mut total_input_sats = 0u64;
         let mut input_sats = Vec::with_capacity(psbt.inputs.len());
         let mut signable_inputs = Vec::new();
@@ -319,6 +339,7 @@ impl PsbtSigner {
     }
 
     pub fn sign(&self, psbt: &mut Psbt) -> Result<usize> {
+        self.check_wallet_origins(psbt)?;
         let prevouts: Vec<TxOut> = psbt
             .inputs
             .iter()
@@ -506,6 +527,12 @@ pub const MAX_PSBT_BYTES: usize = 512 * 1024;
 /// The most key origins naming this wallet that one input or output may
 /// carry, each checked against its output key before any secret is used.
 pub const MAX_WALLET_ORIGINS: usize = 8;
+
+/// The most key origins naming this wallet a whole PSBT may carry: one for
+/// each input of a maximum-size standard transaction, and its change. Each
+/// costs a tweak check, so this bounds the work a hostile PSBT can force
+/// however it spreads them.
+pub const MAX_PSBT_WALLET_ORIGINS: usize = 2048;
 
 pub fn parse_psbt(data: &[u8]) -> Result<Psbt> {
     if data.len() > MAX_PSBT_BYTES {
@@ -1044,6 +1071,41 @@ mod tests {
             );
         }
         assert!(s.analyze(&others).unwrap().outputs[0].is_change);
+    }
+
+    #[test]
+    fn origins_naming_the_wallet_are_bounded_across_the_whole_psbt() {
+        let s = signer();
+        let c = derived(true, 3);
+        let secp = Secp256k1::new();
+        // Outputs each under their own limit, together over the PSBT's.
+        let spread = |outputs: usize| {
+            let mut psbt = psbt_paying(c.address.script_pubkey(), 10_000, 20_000, None);
+            let mut template = psbt.unsigned_tx.output[0].clone();
+            template.value = bitcoin::Amount::from_sat(10);
+            psbt.unsigned_tx.output = vec![template; outputs];
+            psbt.outputs = vec![Default::default(); outputs];
+            let mut n = 0u32;
+            for output in &mut psbt.outputs {
+                for _ in 0..4 {
+                    n += 1;
+                    let mut sk = [1u8; 32];
+                    sk[28..].copy_from_slice(&n.to_be_bytes());
+                    let key = bitcoin::secp256k1::SecretKey::from_slice(&sk)
+                        .unwrap()
+                        .x_only_public_key(&secp)
+                        .0;
+                    output
+                        .tap_key_origins
+                        .insert(key, (vec![], (fingerprint(), c.path.clone())));
+                }
+            }
+            psbt
+        };
+        assert!(s.analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4)).is_ok());
+        let mut over = spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1);
+        assert!(s.analyze(&over).is_err());
+        assert!(s.sign(&mut over).is_err());
     }
 
     #[test]
