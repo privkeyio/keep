@@ -247,14 +247,41 @@ jobs:
           key: msrv
       - run: cargo check --all-targets --features testing
 
-  reproducible:
+  # Whether a pull request touches what the release images are built from:
+  # the reproducible and Debian builds below run on those, and on every push.
+  release-inputs:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Build twice and compare
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
         run: |
-          docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
+          files=$(git diff --name-only "$BASE"...HEAD)
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^Dockerfile|^\.dockerignore$|^LICENSE$|^contrib/|^keep-web/ui/|^rust-toolchain|^\.github/workflows/ci\.yml$' <<<"$files"; then
+            echo changed=true >>"$GITHUB_OUTPUT"
+          else
+            echo changed=false >>"$GITHUB_OUTPUT"
+          fi
+
+  reproducible:
+    runs-on: ubuntu-latest
+    needs: release-inputs
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.release-inputs.outputs.changed == 'true') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Build
+        run: docker build -f Dockerfile.reproducible -o type=local,dest=./dist1 .
+      # Twice only on pushes: once is enough to show a pull request builds.
+      - name: Build again and compare
+        if: github.event_name == 'push'
+        run: |
           docker build --no-cache -f Dockerfile.reproducible -o type=local,dest=./dist2 .
           for bin in keep keep-desktop keep-web; do
             HASH1=$(sha256sum "dist1/$bin" | cut -d' ' -f1)
@@ -270,7 +297,8 @@ jobs:
 
   debian:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    needs: release-inputs
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.release-inputs.outputs.changed == 'true') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Build Debian packages
