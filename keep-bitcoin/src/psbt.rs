@@ -203,6 +203,18 @@ impl PsbtSigner {
         if !spk.is_p2tr() {
             return Ok(None);
         }
+        // Each origin naming this wallet costs a public tweak check below, so
+        // a PSBT padded with forged ones would hold up every request served
+        // after it. A key-path output has one key.
+        let named = origins
+            .values()
+            .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
+            .count();
+        if named > MAX_WALLET_ORIGINS {
+            return Err(BitcoinError::InvalidPsbt(format!(
+                "an input or output names this wallet's keys {named} times; at most {MAX_WALLET_ORIGINS} are read"
+            )));
+        }
         let Ok(output_key) = XOnlyPublicKey::from_slice(&spk.as_bytes()[2..34]) else {
             return Ok(None);
         };
@@ -247,7 +259,38 @@ impl PsbtSigner {
         })
     }
 
+    /// Refuse a PSBT whose origins naming this wallet on a path that would be
+    /// checked (a wallet path on an input, a change path on an output), over
+    /// all its inputs and outputs, are more than [`MAX_PSBT_WALLET_ORIGINS`].
+    fn check_wallet_origins(&self, psbt: &Psbt) -> Result<()> {
+        let named = |origins: &TapKeyOrigins, accept: &dyn Fn(&DerivationPath) -> bool| {
+            origins
+                .values()
+                .filter(|(leaves, (fp, path))| {
+                    leaves.is_empty() && *fp == self.fingerprint && accept(path)
+                })
+                .count()
+        };
+        let named = psbt
+            .inputs
+            .iter()
+            .map(|i| named(&i.tap_key_origins, &|p| self.is_wallet_path(p)))
+            .chain(
+                psbt.outputs
+                    .iter()
+                    .map(|o| named(&o.tap_key_origins, &|p| self.is_change_path(p))),
+            )
+            .sum::<usize>();
+        if named > MAX_PSBT_WALLET_ORIGINS {
+            return Err(BitcoinError::InvalidPsbt(format!(
+                "the PSBT names this wallet's keys {named} times; at most {MAX_PSBT_WALLET_ORIGINS} are read"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn analyze(&self, psbt: &Psbt) -> Result<PsbtAnalysis> {
+        self.check_wallet_origins(psbt)?;
         let mut total_input_sats = 0u64;
         let mut input_sats = Vec::with_capacity(psbt.inputs.len());
         let mut signable_inputs = Vec::new();
@@ -307,6 +350,7 @@ impl PsbtSigner {
     }
 
     pub fn sign(&self, psbt: &mut Psbt) -> Result<usize> {
+        self.check_wallet_origins(psbt)?;
         let prevouts: Vec<TxOut> = psbt
             .inputs
             .iter()
@@ -490,6 +534,16 @@ pub(crate) fn requested_sighash_type(psbt: &Psbt, index: usize) -> Result<TapSig
 /// it; the bound keeps an attacker's PSBT from costing unbounded time to analyze and
 /// sign.
 pub const MAX_PSBT_BYTES: usize = 512 * 1024;
+
+/// The most key origins naming this wallet that one input or output may
+/// carry, each checked against its output key before any secret is used.
+pub const MAX_WALLET_ORIGINS: usize = 8;
+
+/// The most key origins naming this wallet, on a path that is checked, a
+/// whole PSBT may carry: one for each input of a maximum-size standard
+/// transaction, and its change. Each costs a tweak check, so this bounds the
+/// work a hostile PSBT can force however it spreads them.
+pub const MAX_PSBT_WALLET_ORIGINS: usize = 2048;
 
 pub fn parse_psbt(data: &[u8]) -> Result<Psbt> {
     if data.len() > MAX_PSBT_BYTES {
@@ -989,6 +1043,91 @@ mod tests {
     }
 
     #[test]
+    fn origins_naming_the_wallet_are_read_up_to_the_limit() {
+        let s = signer();
+        let c = derived(true, 3);
+        let secp = Secp256k1::new();
+        let with_forged = |forged: u8| {
+            let mut psbt = psbt_paying(c.address.script_pubkey(), 10_000, 20_000, None);
+            psbt.outputs[0]
+                .tap_key_origins
+                .insert(c.public_key, (vec![], (fingerprint(), c.path.clone())));
+            for i in 0..forged {
+                let key = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32])
+                    .unwrap()
+                    .x_only_public_key(&secp)
+                    .0;
+                psbt.outputs[0]
+                    .tap_key_origins
+                    .insert(key, (vec![], (fingerprint(), c.path.clone())));
+            }
+            psbt
+        };
+        let at_limit = with_forged(MAX_WALLET_ORIGINS as u8 - 1);
+        assert!(s.analyze(&at_limit).unwrap().outputs[0].is_change);
+        // Past the limit the output is not read as change, so it counts as
+        // a spend, and no tweak was checked.
+        let over = with_forged(MAX_WALLET_ORIGINS as u8);
+        assert!(!s.analyze(&over).unwrap().outputs[0].is_change);
+        // Origins naming other wallets cost nothing and are not counted.
+        let mut others = with_forged(0);
+        for i in 0..32u8 {
+            let key = bitcoin::secp256k1::SecretKey::from_slice(&[i + 1; 32])
+                .unwrap()
+                .x_only_public_key(&secp)
+                .0;
+            others.outputs[0].tap_key_origins.insert(
+                key,
+                (vec![], (Fingerprint::from([9, 9, 9, 9]), c.path.clone())),
+            );
+        }
+        assert!(s.analyze(&others).unwrap().outputs[0].is_change);
+    }
+
+    #[test]
+    fn origins_naming_the_wallet_are_bounded_across_the_whole_psbt() {
+        let s = signer();
+        let c = derived(true, 3);
+        let secp = Secp256k1::new();
+        // Outputs each under their own limit, together over the PSBT's.
+        let spread = |outputs: usize, path: &DerivationPath| {
+            let mut psbt = psbt_paying(c.address.script_pubkey(), 10_000, 20_000, None);
+            let mut template = psbt.unsigned_tx.output[0].clone();
+            template.value = bitcoin::Amount::from_sat(10);
+            psbt.unsigned_tx.output = vec![template; outputs];
+            psbt.outputs = vec![Default::default(); outputs];
+            let mut n = 0u32;
+            for output in &mut psbt.outputs {
+                for _ in 0..4 {
+                    n += 1;
+                    let mut sk = [1u8; 32];
+                    sk[28..].copy_from_slice(&n.to_be_bytes());
+                    let key = bitcoin::secp256k1::SecretKey::from_slice(&sk)
+                        .unwrap()
+                        .x_only_public_key(&secp)
+                        .0;
+                    output
+                        .tap_key_origins
+                        .insert(key, (vec![], (fingerprint(), path.clone())));
+                }
+            }
+            psbt
+        };
+        assert!(s
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4, &c.path))
+            .is_ok());
+        let mut over = spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, &c.path);
+        assert!(s.analyze(&over).is_err());
+        assert!(s.sign(&mut over).is_err());
+        // Origins on outputs that name a receive path are never checked, so
+        // they cost nothing and are not counted.
+        let receive = derived(false, 0).path;
+        assert!(s
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, &receive))
+            .is_ok());
+    }
+
+    #[test]
     fn change_to_a_derived_address_is_recognized_only_with_a_matching_origin() {
         let s = signer();
         let c = derived(true, 3);
@@ -1245,19 +1384,16 @@ mod tests {
         let a = derived(false, 0);
         let mut psbt = spending(&[a.address.script_pubkey()]);
         let secp = Secp256k1::new();
-        for n in 1..=2000u32 {
+        let forge = |psbt: &mut Psbt, n: u32| {
             let mut sk = [0u8; 32];
             sk[28..].copy_from_slice(&n.to_be_bytes());
             let (xonly, _) = Keypair::from_seckey_slice(&secp, &sk)
                 .unwrap()
                 .x_only_public_key();
-            with_origin(
-                &mut psbt,
-                0,
-                xonly,
-                fingerprint(),
-                &format!("86'/1'/0'/0/{n}"),
-            );
+            with_origin(psbt, 0, xonly, fingerprint(), &format!("86'/1'/0'/0/{n}"));
+        };
+        for n in 1..MAX_WALLET_ORIGINS as u32 {
+            forge(&mut psbt, n);
         }
         with_origin(
             &mut psbt,
@@ -1273,6 +1409,22 @@ mod tests {
         assert_eq!(signed, 1);
         assert!(spends_on_chain(&psbt, 0));
         assert_eq!(used, 1, "secret derivations for one input");
+
+        // One more naming this wallet is refused before any derivation.
+        let mut padded = spending(&[a.address.script_pubkey()]);
+        for n in 1..=MAX_WALLET_ORIGINS as u32 {
+            forge(&mut padded, n);
+        }
+        with_origin(
+            &mut padded,
+            0,
+            a.public_key,
+            fingerprint(),
+            &a.path.to_string(),
+        );
+        let before = SECRET_DERIVATIONS.with(|n| n.get());
+        assert!(s.sign(&mut padded).is_err());
+        assert_eq!(SECRET_DERIVATIONS.with(|n| n.get()), before);
     }
 
     #[test]
