@@ -1020,11 +1020,13 @@ An agent can log in over SSH, and sign git commits, with a key that never leaves
 
    ```bash
    keep gateway issue --name pusher --uid "$(id -u agent-writer)" --op ssh_sign --secrets-file ssh.json --token-out pusher.token
+   sudo install -D -m 0600 -o agent-writer pusher.token ~agent-writer/.config/keep/pusher.token
+   rm pusher.token
    ```
 
    `users` and `host_keys` go together (both or neither), `sshsig_namespaces` may stand alone, and each lists at most 8, sorted, each once. A user is letters, digits, `.`, `_` or `-`; a namespace may also hold `@`. With a phone paired, the phone shows each host key by type and `SHA256:` fingerprint.
 
-3. Run the SSH agent as the agent's user, in a directory only that user can enter, and point the agent's SSH clients at it:
+3. Run the SSH agent as the agent's user (here `agent-writer`), with the token file it owns, in a directory only that user can enter, and point the agent's SSH clients at it:
 
    ```bash
    install -d -m 700 ~/.keep-ssh
