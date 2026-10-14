@@ -1548,19 +1548,23 @@ impl State {
                     info.kind.as_str()
                 )));
             }
-            if let Some(rule) = entry.http.first() {
-                let value = self
-                    .keep
-                    .use_secret(&entry.secret, &crate::inject::rule::HTTP_KINDS)
-                    .map_err(|_| {
-                        AgentError::ScopeViolation(format!("secret {id} cannot be read"))
-                    })?;
+        }
+        // Only once the rules are valid: a header value is built from each
+        // rule's format.
+        let grant = grant.validated(&self.reserved)?;
+        for entry in grant.secrets.iter().filter(|e| !e.http.is_empty()) {
+            let id = hex::encode(entry.secret);
+            let value = self
+                .keep
+                .use_secret(&entry.secret, &crate::inject::rule::HTTP_KINDS)
+                .map_err(|_| AgentError::ScopeViolation(format!("secret {id} cannot be read")))?;
+            for rule in &entry.http {
                 rule.header_value(&value).map_err(|e| {
                     AgentError::ScopeViolation(format!("secret {id} cannot be sent: {e}"))
                 })?;
             }
         }
-        grant.validated(&self.reserved)
+        Ok(grant)
     }
 
     /// Issue a credential. The answer is the one line that carries its token,

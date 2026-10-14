@@ -156,7 +156,6 @@ fn basic_pair(secret: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
         .then_some(decoded)
 }
 
-/// `%XX` in either case to its byte; `+` is left alone, as in a path.
 /// Without NUL, CR and LF: UTF-16 or UTF-32 text of ASCII, and base64 or
 /// hex broken into lines, read as the bytes they carry.
 fn strip_decode(input: &[u8]) -> Zeroizing<Vec<u8>> {
@@ -165,6 +164,7 @@ fn strip_decode(input: &[u8]) -> Zeroizing<Vec<u8>> {
     out
 }
 
+/// `%XX` in either case to its byte; `+` is left alone, as in a path.
 fn percent_decode(input: &[u8]) -> Zeroizing<Vec<u8>> {
     percent_decode_with(input, false)
 }

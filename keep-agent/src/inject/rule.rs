@@ -303,10 +303,9 @@ impl HttpRule {
                 "a secret sent in a header must be {MIN_INJECTED} to {MAX_INJECTED} bytes"
             ));
         }
-        let (before, after) = self
-            .format
-            .split_once("{}")
-            .expect("validated: one {} in the format");
+        let Some((before, after)) = self.format.split_once("{}") else {
+            return refuse("rule format must hold {}");
+        };
         let mut value = zeroize::Zeroizing::new(Vec::with_capacity(
             before.len() + secret.len() + after.len(),
         ));
@@ -449,10 +448,10 @@ fn form_overrides_method(form: &[u8]) -> bool {
 /// so every body is read both ways whatever its type: any form field or
 /// top-level JSON key that is a method override refuses it, as does a body
 /// that looks like a JSON object but does not parse (a server's parser may
-/// take what this one refuses, a leading byte order mark included), any
-/// multipart body, whose part names are not checked, and any body a server
-/// could read as other than UTF-8: one holding NUL, or declared in another
-/// charset.
+/// take what this one refuses), any multipart body, whose part names are
+/// not checked, and any body a server could read differently: one starting
+/// with a byte order mark (which some strip first), holding NUL, or declared
+/// in a charset other than UTF-8.
 fn body_overrides_method(content_type: Option<&str>, body: &str) -> bool {
     let multipart = content_type.is_some_and(|t| {
         t.trim_start()
@@ -462,6 +461,7 @@ fn body_overrides_method(content_type: Option<&str>, body: &str) -> bool {
     if multipart
         || content_type.is_some_and(foreign_charset)
         || body.contains('\0')
+        || body.trim_start().starts_with('\u{feff}')
         || form_overrides_method(body.as_bytes())
     {
         return true;
@@ -469,18 +469,19 @@ fn body_overrides_method(content_type: Option<&str>, body: &str) -> bool {
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(serde_json::Value::Object(map)) => map.keys().any(|k| overrides_method(k)),
         Ok(_) => false,
-        Err(_) => body
-            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
-            .starts_with('{'),
+        Err(_) => body.trim_start().starts_with('{'),
     }
 }
 
 /// Whether a `Content-Type` names a charset other than UTF-8 or its ASCII
-/// subset, in which a server would decode the body differently.
+/// subset, in which a server would decode the body differently. Extended
+/// forms (`charset*`, `charset*0`) count as naming one.
 fn foreign_charset(content_type: &str) -> bool {
     content_type.split(';').skip(1).any(|param| {
         param.split_once('=').is_some_and(|(name, value)| {
-            name.trim().eq_ignore_ascii_case("charset")
+            name.trim()
+                .get(..7)
+                .is_some_and(|n| n.eq_ignore_ascii_case("charset"))
                 && !["utf-8", "utf8", "us-ascii"]
                     .iter()
                     .any(|ok| value.trim().trim_matches('"').eq_ignore_ascii_case(ok))
@@ -949,6 +950,9 @@ mod tests {
                 "a=1",
             ),
             (Some("text/plain;Charset = latin1"), "hello"),
+            (Some("text/plain; charset*=utf-16''"), "hello"),
+            (Some("text/plain; charset*0=utf-16"), "hello"),
+            (None, "\u{feff}_method=DELETE"),
         ] {
             assert!(
                 !ok(content_type, body),

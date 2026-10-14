@@ -277,7 +277,9 @@ pub async fn run() -> Result<()> {
     rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
         .map_err(|e| AgentError::Other(format!("PR_SET_DUMPABLE: {e}")))?;
     let mut input = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = Zeroizing::new(Vec::new());
+    // Sized for the longest line, so it never grows and leaves a copy of
+    // the secret behind.
+    let mut line = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_LINE + 1));
     (&mut input)
         .take(MAX_REQUEST_LINE as u64 + 1)
         .read_until(b'\n', &mut line)

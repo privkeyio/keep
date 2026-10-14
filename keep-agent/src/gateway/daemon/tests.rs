@@ -2245,6 +2245,51 @@ fn a_secret_no_header_could_carry_is_refused_at_issue() {
 }
 
 #[test]
+fn a_bad_rule_format_is_refused_at_issue_and_every_rule_is_checked() {
+    use keep_core::secret::{SecretKind, SecretRecord};
+    let mut g = Gw::new();
+    let id = store_secret(&mut g, "deploy token", SecretKind::ApiToken);
+    let mut entry = secret_entry(json!(hex::encode(id)), "/v1");
+    entry["http"][0]["format"] = json!("Bearer $TOKEN");
+    let answer = g.admin(
+        json!({ "op": "issue", "name": "x", "uid": AGENT, "grant": secrets_grant(vec![entry]) }),
+    );
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("format"),
+        "{answer}"
+    );
+
+    // Fine under the first rule's format, not as the whole value under the
+    // second's.
+    let record = SecretRecord::new(
+        "padded".into(),
+        SecretKind::ApiToken,
+        b" tk_test_0123456789".to_vec(),
+    )
+    .unwrap();
+    g.state.keep_mut().store_secret(&record).unwrap();
+    let mut entry = secret_entry(json!(hex::encode(record.id)), "/v1");
+    let mut second = entry["http"][0].clone();
+    second["path_prefix"] = json!("/v2");
+    second["format"] = json!("{}");
+    entry["http"].as_array_mut().unwrap().push(second);
+    let answer = g.admin(
+        json!({ "op": "issue", "name": "x", "uid": AGENT, "grant": secrets_grant(vec![entry]) }),
+    );
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("cannot be sent"),
+        "{answer}"
+    );
+    assert!(g.state.keep().agent_credentials().unwrap().is_empty());
+}
+
+#[test]
 fn list_secrets_names_what_the_grant_allows_and_never_a_value() {
     use keep_core::secret::SecretKind;
     let mut g = Gw::new();
