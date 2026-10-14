@@ -259,17 +259,28 @@ impl PsbtSigner {
         })
     }
 
-    /// Refuse a PSBT whose origins naming this wallet, over all its inputs
-    /// and outputs, are more than [`MAX_PSBT_WALLET_ORIGINS`].
+    /// Refuse a PSBT whose origins naming this wallet on a path that would be
+    /// checked (a wallet path on an input, a change path on an output), over
+    /// all its inputs and outputs, are more than [`MAX_PSBT_WALLET_ORIGINS`].
     fn check_wallet_origins(&self, psbt: &Psbt) -> Result<()> {
+        let named = |origins: &TapKeyOrigins, accept: &dyn Fn(&DerivationPath) -> bool| {
+            origins
+                .values()
+                .filter(|(leaves, (fp, path))| {
+                    leaves.is_empty() && *fp == self.fingerprint && accept(path)
+                })
+                .count()
+        };
         let named = psbt
             .inputs
             .iter()
-            .map(|i| &i.tap_key_origins)
-            .chain(psbt.outputs.iter().map(|o| &o.tap_key_origins))
-            .flat_map(|origins| origins.values())
-            .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
-            .count();
+            .map(|i| named(&i.tap_key_origins, &|p| self.is_wallet_path(p)))
+            .chain(
+                psbt.outputs
+                    .iter()
+                    .map(|o| named(&o.tap_key_origins, &|p| self.is_change_path(p))),
+            )
+            .sum::<usize>();
         if named > MAX_PSBT_WALLET_ORIGINS {
             return Err(BitcoinError::InvalidPsbt(format!(
                 "the PSBT names this wallet's keys {named} times; at most {MAX_PSBT_WALLET_ORIGINS} are read"
@@ -528,10 +539,10 @@ pub const MAX_PSBT_BYTES: usize = 512 * 1024;
 /// carry, each checked against its output key before any secret is used.
 pub const MAX_WALLET_ORIGINS: usize = 8;
 
-/// The most key origins naming this wallet a whole PSBT may carry: one for
-/// each input of a maximum-size standard transaction, and its change. Each
-/// costs a tweak check, so this bounds the work a hostile PSBT can force
-/// however it spreads them.
+/// The most key origins naming this wallet, on a path that is checked, a
+/// whole PSBT may carry: one for each input of a maximum-size standard
+/// transaction, and its change. Each costs a tweak check, so this bounds the
+/// work a hostile PSBT can force however it spreads them.
 pub const MAX_PSBT_WALLET_ORIGINS: usize = 2048;
 
 pub fn parse_psbt(data: &[u8]) -> Result<Psbt> {
@@ -1079,7 +1090,7 @@ mod tests {
         let c = derived(true, 3);
         let secp = Secp256k1::new();
         // Outputs each under their own limit, together over the PSBT's.
-        let spread = |outputs: usize| {
+        let spread = |outputs: usize, path: &DerivationPath| {
             let mut psbt = psbt_paying(c.address.script_pubkey(), 10_000, 20_000, None);
             let mut template = psbt.unsigned_tx.output[0].clone();
             template.value = bitcoin::Amount::from_sat(10);
@@ -1097,15 +1108,23 @@ mod tests {
                         .0;
                     output
                         .tap_key_origins
-                        .insert(key, (vec![], (fingerprint(), c.path.clone())));
+                        .insert(key, (vec![], (fingerprint(), path.clone())));
                 }
             }
             psbt
         };
-        assert!(s.analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4)).is_ok());
-        let mut over = spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1);
+        assert!(s
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4, &c.path))
+            .is_ok());
+        let mut over = spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, &c.path);
         assert!(s.analyze(&over).is_err());
         assert!(s.sign(&mut over).is_err());
+        // Origins on outputs that name a receive path are never checked, so
+        // they cost nothing and are not counted.
+        let receive = derived(false, 0).path;
+        assert!(s
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, &receive))
+            .is_ok());
     }
 
     #[test]
