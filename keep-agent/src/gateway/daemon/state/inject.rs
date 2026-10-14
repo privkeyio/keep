@@ -126,7 +126,7 @@ fn failed(cause: Cause) -> Refusal {
 /// A policy refusal. Every one reads the same to the agent, so it learns
 /// nothing about the secret (its length, its bytes) or the rules beyond what
 /// `list_secrets` shows; the reason goes to the audit log.
-fn refused(reason: impl std::fmt::Display) -> Refusal {
+pub(super) fn refused(reason: impl std::fmt::Display) -> Refusal {
     Refusal::Policy {
         kind: RefusalKind::Denied,
         message: "denied: request not allowed".into(),
@@ -144,7 +144,7 @@ fn reason(e: crate::error::AgentError) -> Refusal {
 
 /// The first 128 bits of `data`'s SHA-256, in hex: enough to tell requests
 /// apart in the audit log, short enough that its entry still holds the path.
-fn hex_sha256(data: &[u8]) -> String {
+pub(super) fn hex_sha256(data: &[u8]) -> String {
     hex::encode(&keep_approval::sha256(data)[..16])
 }
 

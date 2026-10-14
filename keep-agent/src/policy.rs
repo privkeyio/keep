@@ -138,15 +138,20 @@ impl Grant {
         let key_operations = self
             .operations
             .iter()
-            .any(|op| *op != Operation::HttpRequest);
+            .any(|op| !matches!(op, Operation::HttpRequest | Operation::SshSign));
         if self.keys.is_empty() && (key_operations || self.operations.is_empty()) {
             return refuse("a grant needs the keys it may use");
         }
         crate::inject::rule::validate_secrets(&self.secrets)?;
-        if has(Operation::HttpRequest) == self.secrets.is_empty() {
+        let http = self.secrets.iter().any(|s| s.ssh.is_none());
+        let ssh = self.secrets.iter().any(|s| s.ssh.is_some());
+        if has(Operation::HttpRequest) != http {
             return refuse(
-                "http_request needs the secrets it may use, and secrets need http_request",
+                "http_request needs the secrets it may send, and secrets sent over HTTP need http_request",
             );
+        }
+        if has(Operation::SshSign) != ssh {
+            return refuse("ssh_sign needs the SSH keys it may use, and SSH keys need ssh_sign");
         }
         if self
             .keys

@@ -16,6 +16,7 @@ pub const SIGN_PSBT: &str = "sign_bitcoin_psbt";
 pub const SESSION_INFO: &str = "get_session_info";
 pub const LIST_SECRETS: &str = "list_secrets";
 pub const HTTP_REQUEST: &str = "http_request";
+pub const SSH_SIGN: &str = "ssh_sign";
 
 fn key_property() -> Value {
     json!({
@@ -45,6 +46,7 @@ pub fn operation(name: &str) -> Option<Operation> {
         GET_ADDRESS => Some(Operation::GetBitcoinAddress),
         SIGN_PSBT => Some(Operation::SignPsbt),
         HTTP_REQUEST => Some(Operation::HttpRequest),
+        SSH_SIGN => Some(Operation::SshSign),
         _ => None,
     }
 }
@@ -115,8 +117,23 @@ pub fn list(grant: &Grant) -> Vec<Value> {
             &["secret", "method", "url"],
         ),
         tool(
+            SSH_SIGN,
+            "Sign with a granted SSH key, as `keep agent ssh-agent` asks for SSH clients: an SSH login to a host and user the key's rule names, inside a session that host's key bound, or an SSHSIG signature (git commits) in a namespace the rule names. The key is never returned.",
+            json!({
+                "secret": { "type": "string", "description": "The key's secret id, from list_secrets." },
+                "data": { "type": "string", "description": "Base64 of the data to sign." },
+                "flags": { "type": "integer", "description": "The SSH agent request's flags: 0." },
+                "bindings": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Base64 of each session-bind@openssh.com body the SSH client sent, in order."
+                }
+            }),
+            &["secret", "data"],
+        ),
+        tool(
             LIST_SECRETS,
-            "List the vault secrets this credential may use, by id, name and kind, with where each may be sent. Never returns a secret's value.",
+            "List the vault secrets this credential may use, by id, name and kind, with where each may be sent or what each SSH key may sign, and an SSH key's public key. Never returns a secret's value.",
             json!({}),
             &[],
         ),

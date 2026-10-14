@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use keep_bitcoin::Network;
 use keep_core::agent::{bindable_uid, AgentCredential, AgentRefusal};
 use keep_core::keys::KeyType;
+use keep_core::secret::SecretKind;
 use keep_core::Keep;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -19,6 +20,7 @@ use zeroize::Zeroizing;
 
 mod approvals;
 mod inject;
+mod ssh;
 
 pub use approvals::{reset_store, Pending};
 pub use inject::InjectSettings;
@@ -922,6 +924,7 @@ impl State {
             Some(tools::SESSION_INFO) => self.session_info(granted, args, now),
             Some(tools::LIST_SECRETS) => self.list_secrets(granted, args, now),
             Some(tools::HTTP_REQUEST) => return self.http_request(granted, id, args, now),
+            Some(tools::SSH_SIGN) => self.ssh_sign(granted, args, now),
             _ => Err(Refusal::Invalid {
                 code: -32602,
                 message: "unknown tool".into(),
@@ -1322,17 +1325,33 @@ impl State {
             .iter()
             .map(|entry| {
                 let id = hex::encode(entry.secret);
-                match self.keep.secret_info(&entry.secret) {
-                    Ok(info) => json!({
-                        "id": id,
-                        "name": info.name,
-                        "kind": info.kind.as_str(),
-                        "usable": !info.sealed
-                            && crate::inject::rule::HTTP_KINDS.contains(&info.kind),
-                        "http": entry.http,
-                    }),
-                    Err(_) => json!({ "id": id, "usable": false, "http": entry.http }),
+                let mut listed = match self.keep.secret_info(&entry.secret) {
+                    Ok(info) => {
+                        let usable = !info.sealed
+                            && match &entry.ssh {
+                                Some(_) => info.kind == SecretKind::SshKey,
+                                None => crate::inject::rule::HTTP_KINDS.contains(&info.kind),
+                            };
+                        json!({
+                            "id": id,
+                            "name": info.name,
+                            "kind": info.kind.as_str(),
+                            "usable": usable,
+                        })
+                    }
+                    Err(_) => json!({ "id": id, "usable": false }),
+                };
+                match &entry.ssh {
+                    Some(rule) => {
+                        listed["ssh"] = json!(rule);
+                        match self.ssh_public_key(&entry.secret) {
+                            Some(key) => listed["public_key"] = json!(key),
+                            None => listed["usable"] = json!(false),
+                        }
+                    }
+                    None => listed["http"] = json!(entry.http),
                 }
+                listed
             })
             .collect();
         self.served(granted, tools::LIST_SECRETS, "", now)?;
@@ -1548,6 +1567,12 @@ impl State {
                     info.kind.as_str()
                 )));
             }
+            if entry.ssh.is_some() != (info.kind == SecretKind::SshKey) {
+                return Err(AgentError::ScopeViolation(format!(
+                    "secret {id} is a {}: an SSH rule is for an ssh_key, and an ssh_key needs one",
+                    info.kind.as_str()
+                )));
+            }
         }
         // Only once the rules are valid: a header value is built from each
         // rule's format.
@@ -1563,6 +1588,14 @@ impl State {
                     AgentError::ScopeViolation(format!("secret {id} cannot be sent: {e}"))
                 })?;
             }
+        }
+        for entry in grant.secrets.iter().filter(|e| e.ssh.is_some()) {
+            self.ssh_key(&entry.secret).ok_or_else(|| {
+                AgentError::ScopeViolation(format!(
+                    "secret {} is not an SSH key keep generated",
+                    hex::encode(entry.secret)
+                ))
+            })?;
         }
         Ok(grant)
     }
