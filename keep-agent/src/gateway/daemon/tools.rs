@@ -14,6 +14,8 @@ pub const SIGN_EVENT: &str = "sign_nostr_event";
 pub const GET_ADDRESS: &str = "get_bitcoin_address";
 pub const SIGN_PSBT: &str = "sign_bitcoin_psbt";
 pub const SESSION_INFO: &str = "get_session_info";
+pub const LIST_SECRETS: &str = "list_secrets";
+pub const HTTP_REQUEST: &str = "http_request";
 
 fn key_property() -> Value {
     json!({
@@ -42,6 +44,7 @@ pub fn operation(name: &str) -> Option<Operation> {
         SIGN_EVENT => Some(Operation::SignNostrEvent),
         GET_ADDRESS => Some(Operation::GetBitcoinAddress),
         SIGN_PSBT => Some(Operation::SignPsbt),
+        HTTP_REQUEST => Some(Operation::HttpRequest),
         _ => None,
     }
 }
@@ -95,13 +98,35 @@ pub fn list(grant: &Grant) -> Vec<Value> {
             json!({}),
             &[],
         ),
+        tool(
+            HTTP_REQUEST,
+            "Send an HTTPS request with a granted secret added as the header its rule names, to a host, port, method and path prefix the rule allows. The secret is never returned: a response that carries it is refused. Redirects are returned, not followed.",
+            json!({
+                "secret": { "type": "string", "description": "The secret's id, from list_secrets." },
+                "method": { "type": "string", "enum": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"] },
+                "url": { "type": "string", "description": "An https URL, written exactly as it parses (lowercase host, no default port, no dot segments)." },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Accept, Content-Type, User-Agent, the If- headers, and any the rule adds."
+                },
+                "body": { "type": "string" }
+            }),
+            &["secret", "method", "url"],
+        ),
+        tool(
+            LIST_SECRETS,
+            "List the vault secrets this credential may use, by id, name and kind, with where each may be sent. Never returns a secret's value.",
+            json!({}),
+            &[],
+        ),
     ];
     all.into_iter()
-        .filter(|t| {
-            t["name"]
-                .as_str()
+        .filter(|t| match t["name"].as_str() {
+            Some(LIST_SECRETS) => !grant.secrets.is_empty(),
+            name => name
                 .and_then(operation)
-                .is_none_or(|op| grant.operations.contains(&op))
+                .is_none_or(|op| grant.operations.contains(&op)),
         })
         .collect()
 }

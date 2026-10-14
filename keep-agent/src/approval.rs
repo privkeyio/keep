@@ -598,6 +598,7 @@ mod tests {
 
     fn grant(f: &Fixture) -> Grant {
         Grant {
+            secrets: Vec::new(),
             keys: [f.key].into(),
             operations: [Operation::SignNostrEvent].into(),
             event_kinds: [0].into(),

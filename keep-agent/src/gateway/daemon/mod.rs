@@ -14,6 +14,7 @@
 pub mod approvals;
 pub mod clock;
 pub mod helper;
+mod inject;
 pub mod limits;
 pub mod relay;
 pub mod server;
@@ -29,6 +30,9 @@ mod approval_tests;
 
 #[cfg(test)]
 mod relay_tests;
+
+#[cfg(test)]
+mod inject_tests;
 
 #[cfg(test)]
 mod dir_tests {

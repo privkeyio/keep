@@ -82,6 +82,7 @@ impl Vault {
 
 fn grant() -> Grant {
     Grant {
+        secrets: Vec::new(),
         keys: [KEY].into(),
         operations: [Operation::SignNostrEvent, Operation::SignPsbt].into(),
         event_kinds: [1].into(),

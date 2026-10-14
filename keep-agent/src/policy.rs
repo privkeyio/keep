@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::approval::{Approval, Approved};
 use crate::error::{AgentError, Result};
+pub use crate::inject::rule::SecretGrant;
 use crate::scope::{canonical_allowlist, check_outputs, Operation, OutputRejection};
 
 /// The length of a spend budget's rolling window.
@@ -78,6 +79,10 @@ pub struct Grant {
     /// How many requests the credential may make, allowed or not.
     #[serde(default)]
     pub limits: RequestLimits,
+    /// The vault secrets the credential may use, and how. Left out when empty,
+    /// so a grant without secrets reads the same to an older gateway.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretGrant>,
 }
 
 /// The most requests a grant may allow a day. Each allowed request writes an
@@ -130,8 +135,18 @@ impl Grant {
     pub fn validated(mut self, reserved: &ReservedKeys) -> Result<Self> {
         let refuse = |m: &str| Err(AgentError::ScopeViolation(m.into()));
         let has = |op| self.operations.contains(&op);
-        if self.keys.is_empty() {
+        let key_operations = self
+            .operations
+            .iter()
+            .any(|op| *op != Operation::HttpRequest);
+        if self.keys.is_empty() && (key_operations || self.operations.is_empty()) {
             return refuse("a grant needs the keys it may use");
+        }
+        crate::inject::rule::validate_secrets(&self.secrets)?;
+        if has(Operation::HttpRequest) == self.secrets.is_empty() {
+            return refuse(
+                "http_request needs the secrets it may use, and secrets need http_request",
+            );
         }
         if self
             .keys
@@ -273,6 +288,7 @@ pub enum DenyReason {
         limit: u64,
     },
     LedgerFull,
+    SecretNotGranted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +335,7 @@ impl fmt::Display for DenyReason {
                 "{requested} sats on top of {spent} already spent exceeds the wallet's {limit} sat budget"
             ),
             Self::LedgerFull => write!(f, "too many spends in the budget window"),
+            Self::SecretNotGranted => write!(f, "that secret is not granted"),
         }
     }
 }
@@ -423,6 +440,22 @@ impl Reservation {
         credential.release(self.id);
         wallet.release(self.id);
     }
+}
+
+/// The grant's entry for `secret`, when both `op` and that secret are granted.
+pub fn secret_entry<'g>(
+    grant: &'g Grant,
+    op: Operation,
+    secret: &[u8; 32],
+) -> std::result::Result<&'g SecretGrant, DenyReason> {
+    if !grant.operations.contains(&op) {
+        return Err(DenyReason::OperationNotGranted(op));
+    }
+    grant
+        .secrets
+        .iter()
+        .find(|s| &s.secret == secret)
+        .ok_or(DenyReason::SecretNotGranted)
 }
 
 /// Decide `request` made with the key `key` under `grant`. A spend it allows is
@@ -629,6 +662,7 @@ mod tests {
 
     fn grant() -> Grant {
         Grant {
+            secrets: Vec::new(),
             keys: [KEY].into(),
             operations: [
                 Operation::GetPublicKey,

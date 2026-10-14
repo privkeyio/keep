@@ -235,6 +235,7 @@ impl Gw {
 
 pub(super) fn nostr_grant(key: [u8; 32]) -> Grant {
     Grant {
+        secrets: Vec::new(),
         keys: [key].into(),
         operations: [Operation::GetPublicKey, Operation::SignNostrEvent].into(),
         event_kinds: [1, 0].into(),
@@ -246,6 +247,7 @@ pub(super) fn nostr_grant(key: [u8; 32]) -> Grant {
 
 pub(super) fn bitcoin_grant(key: [u8; 32]) -> Grant {
     Grant {
+        secrets: Vec::new(),
         keys: [key].into(),
         operations: [Operation::GetBitcoinAddress, Operation::SignPsbt].into(),
         event_kinds: Default::default(),
@@ -2074,4 +2076,200 @@ fn journal_lines_wait_for_the_tick() {
         g.state.journal_lines() < 1_024,
         "at most so many uids a minute"
     );
+}
+
+pub(super) fn store_secret(
+    g: &mut Gw,
+    name: &str,
+    kind: keep_core::secret::SecretKind,
+) -> [u8; 32] {
+    let record =
+        keep_core::secret::SecretRecord::new(name.into(), kind, b"tk_test_0123456789".to_vec())
+            .unwrap();
+    g.state.keep_mut().store_secret(&record).unwrap();
+    record.id
+}
+
+pub(super) fn secret_entry(secret: Value, prefix: &str) -> Value {
+    json!({
+        "secret": secret,
+        "http": [{
+            "host": "api.example.com",
+            "port": 443,
+            "methods": ["GET"],
+            "path_prefix": prefix,
+            "header": "authorization",
+            "format": "Bearer {}"
+        }]
+    })
+}
+
+pub(super) fn secrets_grant(entries: Vec<Value>) -> Value {
+    json!({
+        "keys": [],
+        "operations": ["http_request"],
+        "event_kinds": [],
+        "nip44_peers": [],
+        "bitcoin": null,
+        "secrets": entries,
+    })
+}
+
+#[test]
+fn secrets_are_granted_by_name_or_id_and_checked_in_the_vault() {
+    use keep_core::secret::SecretKind;
+    let mut g = Gw::new();
+    let token_id = store_secret(&mut g, "deploy token", SecretKind::ApiToken);
+    let pass_id = store_secret(&mut g, "registry", SecretKind::Password);
+    let note_id = store_secret(&mut g, "note", SecretKind::Note);
+    store_secret(&mut g, "twin", SecretKind::ApiToken);
+    store_secret(&mut g, "twin", SecretKind::ApiToken);
+
+    let issue = |g: &mut Gw, grant: Value| {
+        g.admin(json!({ "op": "issue", "name": "x", "uid": AGENT, "grant": grant }))
+    };
+    // Names resolve to ids, and entries are put in id order whatever order
+    // the owner wrote them in.
+    let answer = issue(
+        &mut g,
+        secrets_grant(vec![
+            secret_entry(json!({ "name": "registry" }), "/v2"),
+            secret_entry(json!(hex::encode(token_id)), "/v1"),
+        ]),
+    );
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    let mut want = [hex::encode(token_id), hex::encode(pass_id)];
+    want.sort();
+    let granted: Vec<&str> = answer["result"]["grant"]["secrets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["secret"].as_str().unwrap())
+        .collect();
+    assert_eq!(granted, want);
+
+    let unknown = issue(
+        &mut g,
+        secrets_grant(vec![secret_entry(json!({ "name": "nope" }), "/v1")]),
+    );
+    let twin = issue(
+        &mut g,
+        secrets_grant(vec![secret_entry(json!({ "name": "twin" }), "/v1")]),
+    );
+    assert_eq!(unknown["ok"], json!(false));
+    assert_eq!(
+        unknown["error"], twin["error"],
+        "none and many answer the same"
+    );
+    for (grant, why) in [
+        (
+            secrets_grant(vec![secret_entry(json!(hex::encode([0x55; 32])), "/v1")]),
+            "not in the vault",
+        ),
+        (
+            secrets_grant(vec![secret_entry(json!(hex::encode(note_id)), "/v1")]),
+            "is a note",
+        ),
+        (
+            secrets_grant(vec![secret_entry(
+                json!({ "name": "registry", "x": 1 }),
+                "/v1",
+            )]),
+            "by its id",
+        ),
+        (
+            secrets_grant(vec![secret_entry(json!(hex::encode(token_id)), "/")]),
+            "path prefix",
+        ),
+    ] {
+        let answer = issue(&mut g, grant);
+        assert!(
+            answer["error"].as_str().unwrap_or("").contains(why),
+            "{why}: {answer}"
+        );
+    }
+    let mut no_op = secrets_grant(vec![secret_entry(json!(hex::encode(token_id)), "/v1")]);
+    no_op["operations"] = json!([]);
+    assert_eq!(issue(&mut g, no_op)["ok"], json!(false));
+    let mut sealed = keep_core::secret::SecretRecord::new(
+        "sealed".into(),
+        SecretKind::ApiToken,
+        b"tk_test_0123456789".to_vec(),
+    )
+    .unwrap();
+    sealed = g
+        .state
+        .keep_mut()
+        .store_sealed_secret(
+            sealed,
+            &keep_core::crypto::SecretKey::from_slice(&[9u8; 32]).unwrap(),
+            0,
+        )
+        .unwrap();
+    let answer = issue(
+        &mut g,
+        secrets_grant(vec![secret_entry(json!(hex::encode(sealed.id)), "/v1")]),
+    );
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("threshold-sealed"),
+        "{answer}"
+    );
+    assert_eq!(g.state.keep().agent_credentials().unwrap().len(), 1);
+}
+
+#[test]
+fn list_secrets_names_what_the_grant_allows_and_never_a_value() {
+    use keep_core::secret::SecretKind;
+    let mut g = Gw::new();
+    let id = store_secret(&mut g, "deploy token", SecretKind::ApiToken);
+    let grant = secrets_grant(vec![secret_entry(json!(hex::encode(id)), "/v1")]);
+    let answer = g.admin(json!({ "op": "issue", "name": "x", "uid": AGENT, "grant": grant }));
+    let cid = answer["result"]["id"].as_str().unwrap().to_string();
+    let token = answer["token"].as_str().unwrap().to_string();
+
+    let list = g.rpc(&token, "tools/list", json!({}));
+    let mut names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["get_session_info", "http_request", "list_secrets"]);
+
+    let (listed, err) = g.tool(&token, "list_secrets", json!({}));
+    assert!(!err, "{listed}");
+    assert_eq!(listed["secrets"][0]["id"], json!(hex::encode(id)));
+    assert_eq!(listed["secrets"][0]["name"], json!("deploy token"));
+    assert_eq!(listed["secrets"][0]["kind"], json!("api_token"));
+    assert_eq!(listed["secrets"][0]["usable"], json!(true));
+    assert_eq!(
+        listed["secrets"][0]["http"][0]["host"],
+        json!("api.example.com")
+    );
+    assert!(!listed.to_string().contains("tk_test_"));
+    assert!(g
+        .reasons(AuditEventType::AgentServed)
+        .contains(&format!("agent {cid} list_secrets")));
+    let bad = g.rpc(
+        &token,
+        "tools/call",
+        json!({ "name": "list_secrets", "arguments": { "x": 1 } }),
+    );
+    assert_eq!(bad["error"]["code"], json!(-32602), "{bad}");
+
+    // A secret deleted after the grant was issued is listed as unusable.
+    g.state.keep_mut().delete_secret(&id).unwrap();
+    let (listed, _) = g.tool(&token, "list_secrets", json!({}));
+    assert_eq!(listed["secrets"][0]["usable"], json!(false));
+    assert!(listed["secrets"][0].get("name").is_none());
+
+    // A credential without secrets is not offered the tool, and is denied it.
+    let (_, other) = g.issue(&nostr_grant(g.key), AGENT);
+    let (why, err) = g.tool(&other, "list_secrets", json!({}));
+    assert!(err);
+    assert_eq!(why, json!("denied: that secret is not granted"));
 }

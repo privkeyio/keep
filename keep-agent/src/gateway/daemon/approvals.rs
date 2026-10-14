@@ -208,9 +208,15 @@ pub struct RelayLink {
 /// The grant an `issue_credential` change carries: the gateway's grant with
 /// every number a decimal string and every list in ascending order, so it
 /// has one form. Every field is named, so a field added to the grant fails
-/// to compile here until the change carries it.
-pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::ChangeGrant {
-    use keep_approval::change::{ChangeBitcoin, ChangeGrant, ChangeLimits, Decimal};
+/// to compile here until the change carries it. Each secret carries its name
+/// and kind from `info`, so the approver can tell which secret it is.
+pub fn change_grant(
+    grant: &crate::policy::Grant,
+    info: impl Fn(&[u8; 32]) -> keep_core::error::Result<keep_core::secret::SecretInfo>,
+) -> crate::error::Result<keep_approval::change::ChangeGrant> {
+    use keep_approval::change::{
+        ChangeBitcoin, ChangeGrant, ChangeLimits, ChangeRule, ChangeSecret, Decimal,
+    };
     let crate::policy::Grant {
         keys,
         operations,
@@ -218,18 +224,63 @@ pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::Chan
         nip44_peers,
         bitcoin,
         limits,
+        secrets,
     } = grant;
     let crate::policy::RequestLimits {
         per_minute,
         per_hour,
         per_day,
     } = limits;
+    let secrets = secrets
+        .iter()
+        .map(|entry| {
+            let crate::inject::rule::SecretGrant { secret, http } = entry;
+            let unusable = |why: &str| {
+                crate::error::AgentError::ScopeViolation(format!(
+                    "secret {} {why}",
+                    hex::encode(secret)
+                ))
+            };
+            let info = info(secret).map_err(|_| unusable("is not in the vault"))?;
+            keep_approval::change::check_label(&info.name, "secret name")
+                .map_err(|_| unusable("has a name an approver cannot be shown; rename it"))?;
+            let http = http
+                .iter()
+                .map(|rule| {
+                    let crate::inject::rule::HttpRule {
+                        host,
+                        port,
+                        methods,
+                        path_prefix,
+                        header,
+                        format,
+                        agent_headers,
+                    } = rule;
+                    ChangeRule {
+                        host: host.clone(),
+                        port: Decimal(u64::from(*port)),
+                        path_prefix: path_prefix.clone(),
+                        methods: methods.iter().map(|m| m.as_str().to_string()).collect(),
+                        header: header.clone(),
+                        format: format.clone(),
+                        agent_headers: agent_headers.clone(),
+                    }
+                })
+                .collect();
+            Ok(ChangeSecret {
+                secret: Hex32(*secret),
+                name: info.name,
+                kind: info.kind.as_str().to_string(),
+                http,
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
     let mut operations: Vec<String> = operations
         .iter()
         .map(|op: &crate::scope::Operation| op.as_str().to_string())
         .collect();
     operations.sort();
-    ChangeGrant {
+    Ok(ChangeGrant {
         keys: keys.iter().copied().map(Hex32).collect(),
         operations,
         event_kinds: event_kinds.iter().map(|&k| Decimal(u64::from(k))).collect(),
@@ -257,7 +308,8 @@ pub fn change_grant(grant: &crate::policy::Grant) -> keep_approval::change::Chan
             per_hour: Decimal(u64::from(*per_hour)),
             per_day: Decimal(u64::from(*per_day)),
         },
-    }
+        secrets,
+    })
 }
 
 #[cfg(test)]
@@ -280,9 +332,97 @@ mod tests {
             Operation::Nip44Decrypt,
             Operation::GetBitcoinAddress,
             Operation::SignPsbt,
+            Operation::HttpRequest,
         ] {
             assert!(OPERATIONS.contains(&op.as_str()), "{}", op.as_str());
         }
+    }
+
+    fn no_secret(_: &[u8; 32]) -> keep_core::error::Result<keep_core::secret::SecretInfo> {
+        Err(keep_core::error::KeepError::NotFound("no secret".into()))
+    }
+
+    /// A grant with secrets becomes a change an approver parses: rules and
+    /// methods in the order it checks, each secret named and of its kind. A
+    /// secret the vault lacks, or one named in a way an approver cannot show,
+    /// makes no change.
+    #[test]
+    fn a_grant_with_secrets_becomes_a_change_an_approver_accepts() {
+        use crate::inject::rule::{HttpRule, Method, SecretGrant};
+        use keep_core::secret::{SecretInfo, SecretKind};
+        let rule = |host: &str, prefix: &str, methods: Vec<Method>| HttpRule {
+            host: host.into(),
+            port: 443,
+            methods,
+            path_prefix: prefix.into(),
+            header: "authorization".into(),
+            format: "Bearer {}".into(),
+            agent_headers: vec!["idempotency-key".into()],
+        };
+        let grant = Grant {
+            keys: Default::default(),
+            operations: [Operation::HttpRequest].into(),
+            event_kinds: Default::default(),
+            nip44_peers: Default::default(),
+            bitcoin: None,
+            limits: RequestLimits::default(),
+            secrets: vec![
+                SecretGrant {
+                    secret: [1; 32],
+                    http: vec![
+                        rule(
+                            "api.example.com",
+                            "/v1/a",
+                            vec![Method::Patch, Method::Post],
+                        ),
+                        rule("api.example.com", "/v1/b", vec![Method::Get]),
+                    ],
+                },
+                SecretGrant {
+                    secret: [2; 32],
+                    http: vec![rule("xn--bcher-kva.example", "/x", vec![Method::Delete])],
+                },
+            ],
+        }
+        .validated(&ReservedKeys::new())
+        .unwrap();
+        let info = |id: &[u8; 32]| {
+            Ok(SecretInfo {
+                name: format!("token {} \u{1f511}", id[0]),
+                kind: SecretKind::ApiToken,
+                sealed: false,
+            })
+        };
+        let shown = change_grant(&grant, info).unwrap();
+        assert_eq!(shown.secrets.len(), 2);
+        assert_eq!(shown.secrets[0].http[0].methods, ["PATCH", "POST"]);
+        assert_eq!(shown.secrets[0].kind, "api_token");
+        let change = Change::IssueCredential {
+            id: Hex16([1; 16]),
+            name: "agent".into(),
+            uid: keep_approval::change::Decimal(1001),
+            created_at: keep_approval::change::Decimal(1),
+            expires_at: keep_approval::change::Decimal(2),
+            grant: shown,
+        };
+        let parsed = Change::parse(
+            &keep_approval::change::parse_without_duplicates(
+                &serde_json::to_string(&change.to_value()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed, change);
+
+        assert!(change_grant(&grant, no_secret).is_err());
+        let hidden = |_: &[u8; 32]| {
+            Ok(SecretInfo {
+                name: "api\u{202e}kcah".into(),
+                kind: SecretKind::ApiToken,
+                sealed: false,
+            })
+        };
+        assert!(change_grant(&grant, hidden).is_err());
     }
 
     /// A validated grant becomes a change grant an approver parses, for
@@ -302,6 +442,7 @@ mod tests {
                 _ => "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
             };
             let grant = Grant {
+                secrets: Vec::new(),
                 keys: [[2; 32], [1; 32]].into(),
                 operations: [
                     Operation::SignPsbt,
@@ -329,7 +470,7 @@ mod tests {
                 uid: keep_approval::change::Decimal(1001),
                 created_at: keep_approval::change::Decimal(1),
                 expires_at: keep_approval::change::Decimal(2),
-                grant: change_grant(&grant),
+                grant: change_grant(&grant, no_secret).unwrap(),
             };
             let parsed = Change::parse(
                 &keep_approval::change::parse_without_duplicates(

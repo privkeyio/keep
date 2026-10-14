@@ -80,7 +80,7 @@ enum Effect {
     /// Issue the credential with this grant, whose change grant the change
     /// carries.
     Issue {
-        grant: Grant,
+        grant: Box<Grant>,
     },
     Unfreeze,
     /// Register the paired device, then tell it so.
@@ -742,6 +742,7 @@ impl State {
 
     /// Withdraw parked request `id` whose waiter went away.
     pub fn cancel_parked(&mut self, id: [u8; 32]) {
+        self.cancel_inject(&id);
         self.end_where(|| End::Withdrawn, |w| w.parked.request_id() == id);
     }
 
@@ -774,12 +775,14 @@ impl State {
 
     /// Cancel the parked requests of credential `cid`, revoked or deleted.
     pub(crate) fn cancel_revoked(&mut self, cid: &[u8; 16]) {
+        self.cancel_injects(|c| c == cid);
         self.cancel_where("canceled: revoked", |w| w.parked.credential() == Some(*cid));
     }
 
     /// Cancel every parked request and the pairing session, as the gateway
     /// stops.
     pub(crate) fn cancel_all(&mut self, why: &'static str) {
+        self.cancel_injects(|_| true);
         self.cancel_where(why, |_| true);
         if let Some(a) = self.approvals.as_mut() {
             if let Some(mut session) = a.pairing.take() {
@@ -1393,6 +1396,10 @@ impl State {
     /// cannot hold off its own removal by freezing.
     fn cancel_covered(&mut self, scope: Scope) {
         match scope {
+            Scope::All => self.cancel_injects(|_| true),
+            Scope::Credential(id) => self.cancel_injects(|c| *c == id.0),
+        }
+        match scope {
             Scope::All => self.cancel_where("canceled: frozen", |w| {
                 !matches!(
                     w.waiter,
@@ -1453,6 +1460,7 @@ impl State {
         if let Some(id) = id {
             self.audit.reset(&id);
         }
+        self.forget_leaks(id.as_ref());
         self.retry_owed();
         Ok(())
     }
@@ -2081,15 +2089,27 @@ impl State {
         ) {
             return (admin_err(&e.to_string()), None);
         }
+        let shown = match crate::gateway::daemon::approvals::change_grant(&grant, |id| {
+            self.keep.secret_info(id)
+        }) {
+            Ok(shown) => shown,
+            Err(e) => return (admin_err(&e.to_string()), None),
+        };
         let change = Change::IssueCredential {
             id: Hex16(id),
             name: name.to_string(),
             uid: Decimal(u64::from(uid)),
             created_at: Decimal(now),
             expires_at: Decimal(now.saturating_add(ttl)),
-            grant: crate::gateway::daemon::approvals::change_grant(&grant),
+            grant: shown,
         };
-        self.park_management(conn, change, Effect::Issue { grant })
+        self.park_management(
+            conn,
+            change,
+            Effect::Issue {
+                grant: Box::new(grant),
+            },
+        )
     }
 
     /// Ask the approvers to unfreeze `scope` at the current epoch.
@@ -2147,8 +2167,12 @@ impl State {
                 },
                 Effect::Issue { grant },
             ) => {
-                // Issue exactly the grant the approver was shown.
-                if crate::gateway::daemon::approvals::change_grant(&grant) != shown {
+                // Issue exactly the grant the approver was shown, its secrets
+                // still the ones (and named as) the approver saw.
+                let now_shown = crate::gateway::daemon::approvals::change_grant(&grant, |id| {
+                    self.keep.secret_info(id)
+                });
+                if now_shown.ok().as_ref() != Some(&shown) {
                     Err(AgentError::Other(
                         "the grant to issue is not the one approved".into(),
                     ))
@@ -2158,7 +2182,7 @@ impl State {
                             id.0,
                             &name,
                             uid,
-                            grant,
+                            *grant,
                             created_at.0,
                             expires_at.0.saturating_sub(created_at.0),
                         ),

@@ -2828,3 +2828,98 @@ fn a_frozen_credential_is_deleted_though_the_epoch_cannot_be_read() {
     let anchor = last_anchor(&mut ap, &mut phone).expect("an anchor");
     assert_eq!(anchor.frozen.epoch, seeded);
 }
+
+/// A grant's secrets go to the approver named, with their rules, and the
+/// credential is issued only while each is still the secret it was shown.
+#[test]
+fn issuing_with_secrets_shows_them_and_checks_them_again_when_approved() {
+    use super::tests::{secret_entry, secrets_grant, store_secret};
+    use keep_core::secret::SecretKind;
+    let (mut ap, mut phone, _, _) = paired();
+    let id = store_secret(&mut ap.gw, "deploy token", SecretKind::ApiToken);
+    let grant = secrets_grant(vec![secret_entry(json!({ "name": "deploy token" }), "/v1")]);
+
+    let conn = ap.conn();
+    let (answer, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "deployer", "uid": OTHER, "grant": grant.clone() }),
+    );
+    assert!(answer["pending"].is_string(), "{answer}");
+    let request = ap.requests(&mut phone).pop().unwrap();
+    let keep_approval::change::Change::IssueCredential { grant: shown, .. } =
+        keep_approval::change::Change::parse(&request.payload["change"]).unwrap()
+    else {
+        panic!("not an issue change");
+    };
+    assert_eq!(shown.operations, ["http_request"]);
+    assert_eq!(shown.secrets.len(), 1);
+    assert_eq!(shown.secrets[0].secret, Hex32(id));
+    assert_eq!(shown.secrets[0].name, "deploy token");
+    assert_eq!(shown.secrets[0].kind, "api_token");
+    assert_eq!(shown.secrets[0].http[0].path_prefix, "/v1");
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending.unwrap());
+    assert_eq!(answer["ok"], json!(true), "{answer}");
+    assert_eq!(
+        answer["result"]["grant"]["secrets"][0]["secret"],
+        json!(hex::encode(id))
+    );
+
+    // Renamed while waiting: not the secret the approver saw, so not issued.
+    let conn = ap.conn();
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "renamed", "uid": OTHER, "grant": grant }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    let mut record = ap.gw.state.keep().load_secret(&id).unwrap();
+    record.name = "something else".into();
+    ap.gw.state.keep_mut().store_secret(&record).unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    let answer = reply(pending.unwrap());
+    assert_eq!(answer["ok"], json!(false), "{answer}");
+    assert!(
+        answer["error"]
+            .as_str()
+            .unwrap()
+            .contains("not the one approved"),
+        "{answer}"
+    );
+
+    // Deleted while waiting: the same.
+    let conn = ap.conn();
+    let grant = secrets_grant(vec![secret_entry(json!(hex::encode(id)), "/v1")]);
+    let (_, pending) = ap.admin_from(
+        0,
+        conn,
+        json!({ "op": "issue", "name": "deleted", "uid": OTHER, "grant": grant }),
+    );
+    let request = ap.requests(&mut phone).pop().unwrap();
+    ap.gw.state.keep_mut().delete_secret(&id).unwrap();
+    ap.deliver_from(
+        &phone,
+        kind::DECISION,
+        &phone.decide(&request, Verdict::Approve),
+    );
+    assert_eq!(reply(pending.unwrap())["ok"], json!(false));
+    let names: Vec<Value> = ap
+        .gw
+        .admin_ok(json!({ "op": "list" }))
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].clone())
+        .collect();
+    assert!(names.contains(&json!("deployer")));
+    assert!(!names.contains(&json!("renamed")) && !names.contains(&json!("deleted")));
+}
