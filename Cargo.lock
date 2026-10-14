@@ -4553,7 +4553,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "unicode-normalization",
  "url",
  "urlencoding",
  "uuid",

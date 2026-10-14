@@ -1548,6 +1548,17 @@ impl State {
                     info.kind.as_str()
                 )));
             }
+            if let Some(rule) = entry.http.first() {
+                let value = self
+                    .keep
+                    .use_secret(&entry.secret, &crate::inject::rule::HTTP_KINDS)
+                    .map_err(|_| {
+                        AgentError::ScopeViolation(format!("secret {id} cannot be read"))
+                    })?;
+                rule.header_value(&value).map_err(|e| {
+                    AgentError::ScopeViolation(format!("secret {id} cannot be sent: {e}"))
+                })?;
+            }
         }
         grant.validated(&self.reserved)
     }

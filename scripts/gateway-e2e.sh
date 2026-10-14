@@ -807,13 +807,13 @@ as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$
     || fail "issue with secrets: $(cat "$WORK/http-issue.err")"
 install -m 0600 -o "$A1" "$WORK/admin-out/http-token" "$WORK/a1/http-token"
 SECRET_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["grant"]["secrets"][0]["secret"])' "$WORK/http-issue.json")
+HTTP_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK/http-issue.json")
 pass "issued a credential granted the secret by name ($SECRET_ID)"
 
 req() { call "$1" http_request "{\"secret\":\"$SECRET_ID\",\"method\":\"${3:-GET}\",\"url\":\"$2\"${4:-}}"; }
 ANS=$( {
     call 1 list_secrets '{}'
     req 2 https://echo.keep.test/v1/ok
-    req 3 https://echo.keep.test/v1/echo
     req 4 https://echo.keep.test/v1/gzip
     req 5 https://echo.keep.test/v1/redirect
     req 6 https://echo.keep.test/v2/ok
@@ -821,7 +821,6 @@ ANS=$( {
     req 8 https://echo.keep.test:443/v1/ok
     req 9 https://echo.keep.test/v1/ok POST
     req 10 https://echo.keep.test/v1/ok GET ',"headers":{"X-Other":"y"}'
-    req 11 https://echo.keep.test/v1/cut
 } | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token")
 printf '%s\n' "$ANS" >"$WORK/http-answers"
 python3 - "$WORK/http-answers" "$SECRET_ID" <<'PY' || fail "http_request answers: $ANS"
@@ -833,7 +832,6 @@ assert listed[0]["id"] == sys.argv[2] and listed[0]["name"] == "deploy token" an
 ok = json.loads(text(2))
 assert not by_id[2]["isError"] and ok["status"] == 200 and ok["body"] == '{"ok":true}', ok
 assert ok["headers"] == {"content-type": "application/json"}, ok
-assert by_id[3]["isError"] and text(3) == "secret in response", text(3)
 assert by_id[4]["isError"] and text(4) == "encoded response", text(4)
 redirect = json.loads(text(5))
 assert redirect["status"] == 302 and redirect["headers"]["location"] == "https://echo.keep.test/v1/ok", redirect
@@ -841,15 +839,28 @@ refused = "denied: request not allowed"
 for i in (6, 8, 9, 10):
     assert by_id[i]["isError"] and text(i) == refused, (i, text(i))
 assert by_id[7]["isError"] and text(7) == "address refused", text(7)
-assert by_id[11]["isError"] and text(11) == "secret in response", text(11)
 PY
-pass "http_request: answered within the rule; echoes (one split across the cut), gzip, other paths, methods and headers, internal addresses and unnormalized URLs refused; redirects returned"
+pass "http_request: answered within the rule; gzip, other paths, methods and headers, internal addresses and unnormalized URLs refused; redirects returned"
+
+# An echo of the secret is refused and freezes the credential.
+echoed() {
+    local out
+    out=$(req "$1" "$2" | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token")
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert r["isError"] and r["content"][0]["text"] == "secret in response", r' "$out" \
+        || fail "echo $2: $out"
+    gw_admin list | python3 -c 'import json,sys; c=[c for c in json.load(sys.stdin) if c["id"]==sys.argv[1]]; assert c and c[0]["frozen"], c' "$HTTP_ID" \
+        || fail "not frozen after an echo of $2"
+    gw_admin unfreeze "$HTTP_ID" >/dev/null || fail "unfreeze after an echo"
+}
+echoed 3 https://echo.keep.test/v1/echo
+echoed 11 https://echo.keep.test/v1/cut
+pass "an echo of the secret, one split across the cut, is refused and freezes the credential"
 
 python3 - "$WORK/server-requests" "$SECRET_VALUE" <<'PY' || fail "server saw: $(cat "$WORK/server-requests")"
 import json, sys
 reqs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 paths = [r["path"] for r in reqs]
-assert paths == ["/v1/ok", "/v1/echo", "/v1/gzip", "/v1/redirect", "/v1/cut"], paths
+assert paths == ["/v1/ok", "/v1/gzip", "/v1/redirect", "/v1/echo", "/v1/cut"], paths
 for r in reqs:
     h = {k.lower(): v for k, v in r["headers"].items()}
     assert h["authorization"] == "Bearer " + sys.argv[2], h

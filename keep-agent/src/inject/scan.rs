@@ -8,9 +8,10 @@
 //! Encoders escape some characters and leave others alone, and which ones
 //! differs between them, so the response is decoded rather than the secret
 //! encoded: the secret, ASCII case-folded, is looked for in the response as
-//! is and in percent-, JSON- and HTML-decoded views of it, alone and chained.
-//! Base64 and hex are whole-string encodings, so those forms of the secret
-//! are looked for in the same views.
+//! is and in percent-, JSON- and HTML-decoded views of it, and one with NUL,
+//! CR and LF removed (UTF-16 or UTF-32 text, base64 wrapped into lines),
+//! alone and chained. Base64 and hex are whole-string encodings, so those
+//! forms of the secret are looked for in the same views.
 
 use memchr::memmem;
 use zeroize::Zeroizing;
@@ -37,7 +38,13 @@ pub fn longest_form(len: usize) -> usize {
 
 type Decoder = fn(&[u8]) -> Zeroizing<Vec<u8>>;
 
-const DECODERS: [Decoder; 4] = [percent_decode, form_decode, json_decode, html_decode];
+const DECODERS: [Decoder; 5] = [
+    percent_decode,
+    form_decode,
+    json_decode,
+    html_decode,
+    strip_decode,
+];
 
 /// The decoded views searched: the response as it is, each decoder alone,
 /// and every ordered pair of decoders (a pair is applied left to right).
@@ -72,7 +79,9 @@ impl Scanner {
         let mut folded = Vec::new();
         for p in parts {
             folded.push(Zeroizing::new(p.to_ascii_lowercase()));
-            folded.push(Zeroizing::new(hex::encode(p).into_bytes()));
+            let mut hex = Zeroizing::new(vec![0; p.len() * 2]);
+            hex::encode_to_slice(p, &mut hex).expect("sized for the hex");
+            folded.push(hex);
         }
         // A Basic credential is base64 of `user:password`, and servers echo
         // it decoded: look for the pair and the password as well.
@@ -148,6 +157,14 @@ fn basic_pair(secret: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
 }
 
 /// `%XX` in either case to its byte; `+` is left alone, as in a path.
+/// Without NUL, CR and LF: UTF-16 or UTF-32 text of ASCII, and base64 or
+/// hex broken into lines, read as the bytes they carry.
+fn strip_decode(input: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len()));
+    out.extend(input.iter().filter(|&&b| !matches!(b, 0 | b'\r' | b'\n')));
+    out
+}
+
 fn percent_decode(input: &[u8]) -> Zeroizing<Vec<u8>> {
     percent_decode_with(input, false)
 }
@@ -375,7 +392,7 @@ mod tests {
             // encodeURIComponent leaves !'()* alone; Python quote leaves / alone.
             b"tk_live_Ab/%2B%3D%26%3C%3E%22'%5C%20x9".to_vec(),
             b"tk_live_Ab&#x2f;+=&amp;&lt;&gt;&quot;&#39;\\ x9".to_vec(),
-            b"sk&#95;live&#95;Ab&#47;&#43;&#61;&#38;&#60;&#62;&#34;&#39;&#92;&#32;x9".to_vec(),
+            b"tk&#95;live&#95;Ab&#47;&#43;&#61;&#38;&#60;&#62;&#34;&#39;&#92;&#32;x9".to_vec(),
             b"tk_live_Ab&#X00002F;+=&AMP;&LT;&GT;&QUOT;&apos;&bsol;&nbsp;x9".to_vec(),
             // Go's PathEscape: `+` left alone, `/` encoded.
             b"tk_live_Ab%2F+=&%3C%3E%22%27%5C%20x9".to_vec(),
@@ -399,6 +416,21 @@ mod tests {
             })
             .collect();
         forms.push(all_u.into_bytes());
+        // UTF-16 and UTF-32, either byte order, as a server answering in the
+        // request's charset writes them.
+        let wide = |width: usize, big: bool| -> Vec<u8> {
+            SECRET
+                .iter()
+                .flat_map(|&b| {
+                    let mut unit = vec![0; width];
+                    unit[if big { width - 1 } else { 0 }] = b;
+                    unit
+                })
+                .collect()
+        };
+        for (width, big) in [(2, false), (2, true), (4, false), (4, true)] {
+            forms.push(wide(width, big));
+        }
         let engines = [
             base64::engine::general_purpose::STANDARD,
             base64::engine::general_purpose::STANDARD_NO_PAD,
@@ -411,6 +443,10 @@ mod tests {
                 input.extend_from_slice(SECRET);
                 input.extend_from_slice(b"tail");
                 let b64 = engine.encode(&input).into_bytes();
+                // MIME and PEM wrap base64 into lines; wrapped short here so
+                // no part of the secret survives unbroken.
+                let wrapped: Vec<u8> = b64.chunks(6).collect::<Vec<_>>().join(&b"\r\n"[..]);
+                forms.push(wrapped);
                 forms.push(json(&b64).replace_slash());
                 forms.push(b64);
                 let mut bare = prefix.to_vec();

@@ -31,7 +31,6 @@ urlencoding = { workspace = true }
 url = { workspace = true }
 memchr = "2"
 base64 = "0.23"
-unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -8,7 +8,7 @@
 //! sees it. A freeze, revoke or disconnect answers the agent at once and
 //! drops the worker's connection, which stops the worker.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use base64::Engine;
@@ -20,7 +20,7 @@ use super::{tool_result, Pending, Refusal, Reply, State};
 use crate::gateway::audit::RefusalKind;
 use crate::gateway::GrantedCredential;
 use crate::inject::rule::{self, HttpAsk, HTTP_KINDS};
-use crate::inject::wire::{Cause, WorkerRequest};
+use crate::inject::wire::{Cause, WorkerRequest, MAX_REQUEST_LINE};
 use crate::policy::secret_entry;
 use crate::scope::Operation;
 
@@ -30,10 +30,6 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 pub(crate) const MAX_IN_FLIGHT: usize = 4;
 pub(crate) const MAX_PER_CREDENTIAL: usize = 1;
 pub(crate) const MAX_PER_UID: usize = 2;
-
-/// Responses carrying the secret that freeze a credential, within a day.
-pub(crate) const LEAKS_TO_FREEZE: usize = 3;
-const LEAK_WINDOW_SECS: u64 = 24 * 60 * 60;
 
 /// Where the gateway reaches inject workers: a socket systemd listens on and
 /// starts one worker per connection behind. Its directory and the peer must
@@ -78,8 +74,6 @@ pub(crate) struct Injects {
     /// The other end, and where workers are reached, for the server's task.
     receiver: Option<(mpsc::Receiver<InjectJob>, InjectSettings)>,
     inflight: HashMap<[u8; 32], InFlight>,
-    /// When each credential's responses carried its secret, within the day.
-    leaks: HashMap<[u8; 16], VecDeque<u64>>,
 }
 
 impl Injects {
@@ -96,6 +90,29 @@ impl Injects {
             ..Self::default()
         }
     }
+}
+
+/// `request` as one line, written into a buffer sized for the longest a
+/// worker takes, so it never grows and leaves a copy of the secret behind.
+fn request_line(request: &WorkerRequest) -> Option<Zeroizing<Vec<u8>>> {
+    struct Bounded<'a>(&'a mut Vec<u8>);
+    impl std::io::Write for Bounded<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            // Room is kept for the newline.
+            if self.0.len() + buf.len() >= MAX_REQUEST_LINE {
+                return Err(std::io::ErrorKind::FileTooLarge.into());
+            }
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut line = Zeroizing::new(Vec::with_capacity(MAX_REQUEST_LINE));
+    serde_json::to_writer(Bounded(&mut line), request).ok()?;
+    line.push(b'\n');
+    Some(line)
 }
 
 fn failed(cause: Cause) -> Refusal {
@@ -242,15 +259,10 @@ impl State {
             body_b64: B64.encode(body.as_bytes()),
             secret_b64: B64.encode(&*value),
         };
-        let mut line = Zeroizing::new(
-            serde_json::to_vec(&request).map_err(|e| Refusal::Internal(e.to_string()))?,
-        );
-        drop(request);
-        line.push(b'\n');
         // A worker refuses a longer line, after the secret has left.
-        if line.len() > crate::inject::wire::MAX_REQUEST_LINE {
-            return Err(refused("the request is too large to send"));
-        }
+        let line =
+            request_line(&request).ok_or_else(|| refused("the request is too large to send"))?;
+        drop(request);
         // What the agent wrote comes last: the audit log caps what an entry
         // holds, and a long path must not cut off the secret or the hashes.
         let detail = format!(
@@ -306,8 +318,9 @@ impl State {
     }
 
     /// Answer request `id` with what its worker brought back, unless it was
-    /// withdrawn meanwhile. A response that carried the secret is recorded
-    /// against the credential, and enough of them within a day freeze it.
+    /// withdrawn meanwhile. A response that carried the secret freezes the
+    /// credential: an endpoint that reflects what the agent sends would
+    /// otherwise answer guesses at the secret, one bit each.
     pub(crate) fn finish_inject(&mut self, id: [u8; 32], outcome: InjectOutcome) {
         let Some(flight) = self.injects.inflight.remove(&id) else {
             return;
@@ -332,18 +345,10 @@ impl State {
             "http_request: the response carried the secret",
             now,
         );
-        let times = self.injects.leaks.entry(*credential).or_default();
-        while times.front().is_some_and(|&t| t + LEAK_WINDOW_SECS <= now) {
-            times.pop_front();
-        }
-        times.push_back(now);
-        if times.len() >= LEAKS_TO_FREEZE {
-            times.clear();
-            let scope = keep_approval::change::Scope::Credential(keep_approval::Hex16(*credential));
-            let store = self.store().ok();
-            if let Err(e) = self.freeze(scope, "responses carrying its secret", store) {
-                tracing::error!(error = %e, "a credential whose responses carried its secret could not be frozen");
-            }
+        let scope = keep_approval::change::Scope::Credential(keep_approval::Hex16(*credential));
+        let store = self.store().ok();
+        if let Err(e) = self.freeze(scope, "a response carried its secret", store) {
+            tracing::error!(error = %e, "a credential whose response carried its secret could not be frozen");
         }
     }
 
@@ -369,16 +374,6 @@ impl State {
     /// Withdraw request `id`, whose agent's connection went away.
     pub(super) fn cancel_inject(&mut self, id: &[u8; 32]) {
         self.injects.inflight.remove(id);
-    }
-
-    /// An unfreeze clears the count of responses that carried the secret.
-    pub(super) fn forget_leaks(&mut self, credential: Option<&[u8; 16]>) {
-        match credential {
-            Some(c) => {
-                self.injects.leaks.remove(c);
-            }
-            None => self.injects.leaks.clear(),
-        }
     }
 
     #[cfg(test)]
@@ -440,4 +435,29 @@ pub(crate) fn checked_response(
         "body_base64": base64,
         "truncated": truncated,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(body_b64: String) -> WorkerRequest {
+        WorkerRequest {
+            method: "GET".into(),
+            url: "https://api.example.com/v1".into(),
+            headers: vec![["authorization".into(), "Bearer abcdefghijkl".into()]],
+            body_b64,
+            secret_b64: "YWJjZGVmZ2hpamts".into(),
+        }
+    }
+
+    #[test]
+    fn a_request_line_fills_its_buffer_without_growing_it() {
+        let bare = request_line(&request(String::new())).unwrap().len();
+        let line = request_line(&request("A".repeat(MAX_REQUEST_LINE - bare))).unwrap();
+        assert_eq!(line.len(), MAX_REQUEST_LINE);
+        assert_eq!(line.last(), Some(&b'\n'));
+        assert_eq!(line.capacity(), MAX_REQUEST_LINE);
+        assert!(request_line(&request("A".repeat(MAX_REQUEST_LINE - bare + 1))).is_none());
+    }
 }

@@ -386,14 +386,15 @@ impl CheckedRequest<'_> {
 }
 
 /// Bytes a path may carry percent-encoded: those the URL parser itself
-/// encodes in a path, and bytes of multibyte UTF-8. Never an unreserved
-/// character, a delimiter, `%` or a control byte, any of which a server may
-/// decode into a different path than the one the rule checked.
+/// encodes in a path. Never an unreserved character, a delimiter, `%`, a
+/// control byte or a byte of non-ASCII text, any of which a server may decode
+/// or normalize into a different path than the one the rule checked
+/// (Unicode lookalikes of `/` and `.` among them).
 fn escapable(b: u8) -> bool {
     matches!(
         b,
         b' ' | b'"' | b'<' | b'>' | b'^' | b'`' | b'{' | b'|' | b'}'
-    ) || b >= 0x80
+    )
 }
 
 /// Whether a query parameter name is a method override once a framework has
@@ -416,43 +417,24 @@ fn overrides_method(name: &str) -> bool {
 
 fn check_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
             b';' => return false,
             b'%' => {
-                let Some(b) = bytes
+                let escaped = bytes
                     .get(i + 1..i + 3)
                     .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                    .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
-                else {
-                    return false;
-                };
-                if !escapable(b) {
+                    .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok());
+                if !escaped.is_some_and(escapable) {
                     return false;
                 }
-                decoded.push(b);
                 i += 3;
             }
-            b => {
-                decoded.push(b);
-                i += 1;
-            }
+            _ => i += 1,
         }
     }
-    let Ok(decoded) = std::str::from_utf8(&decoded) else {
-        return false;
-    };
-    !decoded.chars().any(normalizes_to_delimiter) && !path.split('/').any(|s| s == "." || s == "..")
-}
-
-/// Whether a non-ASCII character becomes a path delimiter under Unicode
-/// compatibility normalization, which some servers apply to paths: fullwidth
-/// `．．／`, for one, is `../` once normalized.
-fn normalizes_to_delimiter(c: char) -> bool {
-    use unicode_normalization::UnicodeNormalization;
-    !c.is_ascii() && std::iter::once(c).nfkc().any(|n| "./\\;%?#".contains(n))
+    !path.split('/').any(|s| s == "." || s == "..")
 }
 
 /// Whether any parameter of a query or form body is a method override.
@@ -467,22 +449,43 @@ fn form_overrides_method(form: &[u8]) -> bool {
 /// so every body is read both ways whatever its type: any form field or
 /// top-level JSON key that is a method override refuses it, as does a body
 /// that looks like a JSON object but does not parse (a server's parser may
-/// take what this one refuses) and any multipart body, whose part names are
-/// not checked.
+/// take what this one refuses, a leading byte order mark included), any
+/// multipart body, whose part names are not checked, and any body a server
+/// could read as other than UTF-8: one holding NUL, or declared in another
+/// charset.
 fn body_overrides_method(content_type: Option<&str>, body: &str) -> bool {
     let multipart = content_type.is_some_and(|t| {
         t.trim_start()
             .get(..10)
             .is_some_and(|p| p.eq_ignore_ascii_case("multipart/"))
     });
-    if multipart || form_overrides_method(body.as_bytes()) {
+    if multipart
+        || content_type.is_some_and(foreign_charset)
+        || body.contains('\0')
+        || form_overrides_method(body.as_bytes())
+    {
         return true;
     }
     match serde_json::from_str::<serde_json::Value>(body) {
         Ok(serde_json::Value::Object(map)) => map.keys().any(|k| overrides_method(k)),
         Ok(_) => false,
-        Err(_) => body.trim_start().starts_with('{'),
+        Err(_) => body
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}')
+            .starts_with('{'),
     }
+}
+
+/// Whether a `Content-Type` names a charset other than UTF-8 or its ASCII
+/// subset, in which a server would decode the body differently.
+fn foreign_charset(content_type: &str) -> bool {
+    content_type.split(';').skip(1).any(|param| {
+        param.split_once('=').is_some_and(|(name, value)| {
+            name.trim().eq_ignore_ascii_case("charset")
+                && !["utf-8", "utf8", "us-ascii"]
+                    .iter()
+                    .any(|ok| value.trim().trim_matches('"').eq_ignore_ascii_case(ok))
+        })
+    })
 }
 
 /// Check an agent's request against a secret's rules: the first rule whose
@@ -755,7 +758,6 @@ mod tests {
     fn matching_requests_are_allowed() {
         assert!(allowed("https://api.example.com/v1/items"));
         assert!(allowed("https://api.example.com/v1/items/42?x=1&y=%20z"));
-        assert!(allowed("https://api.example.com/v1/items/caf%C3%A9"));
         assert!(allowed("https://api.example.com/v1/items/a%20b"));
         assert!(allowed(
             "https://api.example.com/v1/items?payment_method=pm_1"
@@ -786,6 +788,8 @@ mod tests {
             "https://api.example.com/v1/items/%+1",
             "https://api.example.com/v1/items/%EF%BC%8E%EF%BC%8E%EF%BC%8Fadmin",
             "https://api.example.com/v1/items/%E2%80%A5/admin",
+            "https://api.example.com/v1/items/..%E2%88%95..%E2%88%95admin",
+            "https://api.example.com/v1/items/caf%C3%A9",
             "https://api.example.com/v1/items?a=1;_method=DELETE",
             "https://api.example.com/v1/items?+_method=DELETE",
             "https://api.example.com/v1/items?_method%00=DELETE",
@@ -904,6 +908,8 @@ mod tests {
         ));
         assert!(ok(Some("application/json"), "[1,2]"));
         assert!(ok(Some("text/plain"), "hello"));
+        assert!(ok(Some("application/json; charset=UTF-8"), "{}"));
+        assert!(ok(Some("text/plain; charset=\"us-ascii\""), "hello"));
         let deep = format!(
             r#"{{"_method":"DELETE","x":{}{}}}"#,
             "[".repeat(200),
@@ -934,6 +940,15 @@ mod tests {
             (Some("application/json"), r#"{"_method":"DELETE"}"#),
             (Some("text/plain"), r#"{"_method":"DELETE"}"#),
             (Some("multipart/form-data; boundary=x"), "--x--"),
+            (Some("application/json"), "\u{feff}{\"_method\":\"DELETE\"}"),
+            (None, " \u{feff}{\"_method\":\"DELETE\"}"),
+            (None, "_\0m\0e\0t\0h\0o\0d\0=\0D\0E\0L\0E\0T\0E\0"),
+            (None, "hello\0"),
+            (
+                Some("application/x-www-form-urlencoded; charset=utf-16le"),
+                "a=1",
+            ),
+            (Some("text/plain;Charset = latin1"), "hello"),
         ] {
             assert!(
                 !ok(content_type, body),

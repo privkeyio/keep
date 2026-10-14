@@ -1460,7 +1460,6 @@ impl State {
         if let Some(id) = id {
             self.audit.reset(&id);
         }
-        self.forget_leaks(id.as_ref());
         self.retry_owed();
         Ok(())
     }

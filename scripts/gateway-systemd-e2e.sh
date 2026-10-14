@@ -445,6 +445,7 @@ JSON
     || fail "issue with secrets: $(cat "$WORK/http-issue.err")"
 install -m 0600 -o "$AGENT" "$WORK/root/http-token" "$WORK/agent/http-token"
 SECRET_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["grant"]["secrets"][0]["secret"])' "$WORK/http-issue.json")
+HTTP_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK/http-issue.json")
 # One http_request through the bridge; prints the tool result.
 cat >"$WORK/call_http.py" <<'PY'
 import json, select, subprocess, sys
@@ -538,7 +539,9 @@ PY
     result_is "$OUT_HTTP" ok '"status":200' || fail "http_request under the sandbox: $OUT_HTTP $(cat "$WORK/server.log" "$WORK/dns.log") $(ss -ltn) $(journalctl -u 'keep-gateway-inject@*' --no-pager -o cat | tail -5)"
     OUT_HTTP=$(http https://echo.keep.test/v1/echo) || fail "http_request: $OUT_HTTP"
     result_is "$OUT_HTTP" error "secret in response" || fail "echo under the sandbox: $OUT_HTTP"
-    pass "under the shipped sandbox a worker resolves, connects, verifies and answers, and refuses an echo of the secret"
+    "$BIN" gateway list | python3 -c 'import json,sys; c=[c for c in json.load(sys.stdin) if c["id"]==sys.argv[1]]; assert c and c[0]["frozen"], c' "$HTTP_ID" \
+        || fail "not frozen after an echo"
+    pass "under the shipped sandbox a worker resolves, connects, verifies and answers, and refuses an echo of the secret, freezing the credential"
 fi
 JOURNAL=$(journalctl -u "$UNIT" -u 'keep-gateway-inject@*' --no-pager -o cat)
 grep -qF "$SECRET_VALUE" <<<"$JOURNAL" && fail "the secret is in the journal"

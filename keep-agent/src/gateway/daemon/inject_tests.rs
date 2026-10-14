@@ -322,69 +322,26 @@ fn a_disconnect_withdraws_the_request_silently() {
 }
 
 #[test]
-fn responses_carrying_the_secret_are_recorded_and_three_freeze_the_credential() {
-    let (mut g, secret, cid, token) = gateway("/nonexistent/worker.sock".into());
+fn a_response_carrying_the_secret_is_recorded_and_freezes_the_credential() {
+    let (mut g, secret, _, token) = gateway("/nonexistent/worker.sock".into());
     let (mut jobs, _) = g.state.take_inject_jobs().unwrap();
-    for n in 1..=3 {
-        let pending = later(call(&mut g, AGENT, &token, ask(&secret)));
-        let job = jobs.try_recv().unwrap();
-        g.state
-            .finish_inject(job.id, InjectOutcome::Failed(Cause::SecretInResponse));
-        assert_eq!(reply(pending), (json!("secret in response"), true));
-        let frozen = g.admin_ok(json!({ "op": "list" }))[0]["frozen"].clone();
-        assert_eq!(frozen, json!(n == 3), "after {n}");
-    }
+    let pending = later(call(&mut g, AGENT, &token, ask(&secret)));
+    let job = jobs.try_recv().unwrap();
+    assert!(!frozen(&mut g));
+    g.state
+        .finish_inject(job.id, InjectOutcome::Failed(Cause::SecretInResponse));
+    assert_eq!(reply(pending), (json!("secret in response"), true));
+    assert!(frozen(&mut g), "the first one freezes");
     let leaks = g
         .reasons(AuditEventType::AgentRefused)
         .into_iter()
         .filter(|r| r.contains("carried the secret"))
         .count();
-    // Identical refusals within a minute collapse into one entry, counted.
     assert_eq!(leaks, 1);
-    let _ = cid;
-}
-
-fn leak(
-    g: &mut Gw,
-    jobs: &mut tokio::sync::mpsc::Receiver<super::state::InjectJob>,
-    token: &str,
-    secret: &[u8; 32],
-) {
-    let pending = later(call(g, AGENT, token, ask(secret)));
-    let job = jobs.try_recv().unwrap();
-    g.state
-        .finish_inject(job.id, InjectOutcome::Failed(Cause::SecretInResponse));
-    let _ = reply(pending);
 }
 
 fn frozen(g: &mut Gw) -> bool {
     g.admin_ok(json!({ "op": "list" }))[0]["frozen"] == json!(true)
-}
-
-#[test]
-fn an_unfreeze_starts_the_leak_count_again() {
-    let (mut g, secret, cid, token) = gateway("/nonexistent/worker.sock".into());
-    let (mut jobs, _) = g.state.take_inject_jobs().unwrap();
-    leak(&mut g, &mut jobs, &token, &secret);
-    leak(&mut g, &mut jobs, &token, &secret);
-    g.admin_ok(json!({ "op": "freeze", "id": cid }));
-    g.admin_ok(json!({ "op": "unfreeze", "id": cid }));
-    leak(&mut g, &mut jobs, &token, &secret);
-    assert!(!frozen(&mut g), "two before the unfreeze no longer count");
-}
-
-#[test]
-fn leaks_older_than_a_day_no_longer_count() {
-    let (mut g, secret, _, token) = gateway("/nonexistent/worker.sock".into());
-    let (mut jobs, _) = g.state.take_inject_jobs().unwrap();
-    leak(&mut g, &mut jobs, &token, &secret);
-    leak(&mut g, &mut jobs, &token, &secret);
-    g.boot.advance(24 * 60 * 60 + 1);
-    leak(&mut g, &mut jobs, &token, &secret);
-    assert!(!frozen(&mut g));
-    leak(&mut g, &mut jobs, &token, &secret);
-    leak(&mut g, &mut jobs, &token, &secret);
-    assert!(frozen(&mut g), "three within the day");
 }
 
 /// Another credential granted the same secret, bound to `uid`; its token.
@@ -645,7 +602,24 @@ fn a_worker_answer_is_checked_again_before_the_agent_sees_it() {
     let mut results = Vec::new();
     for _ in 0..8 {
         let pending = later(shared_call(&r.shared, &r.token, ask(&r.secret)));
-        results.push(reply(pending));
+        let answer = reply(pending);
+        if answer.0 == json!("secret in response") {
+            let cid = r.cid.clone();
+            let unfrozen = r.rt.block_on(with_state(&r.shared, &r.stop, move |s| {
+                s.admin_request(
+                    json!({ "op": "unfreeze", "id": cid })
+                        .to_string()
+                        .as_bytes(),
+                )
+            }));
+            let unfrozen = unfrozen.expect("the state is up");
+            assert!(
+                unfrozen.contains("\"ok\":true"),
+                "frozen by the echo: {}",
+                *unfrozen
+            );
+        }
+        results.push(answer);
     }
     assert!(!results[0].1);
     assert_eq!(

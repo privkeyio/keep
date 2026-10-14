@@ -2221,6 +2221,30 @@ fn secrets_are_granted_by_name_or_id_and_checked_in_the_vault() {
 }
 
 #[test]
+fn a_secret_no_header_could_carry_is_refused_at_issue() {
+    use keep_core::secret::{SecretKind, SecretRecord};
+    let mut g = Gw::new();
+    for (value, why) in [
+        (b"short".to_vec(), "12 to 2048 bytes"),
+        (
+            b"tk_test_0123456789\n".to_vec(),
+            "a header value cannot carry",
+        ),
+    ] {
+        let record = SecretRecord::new("bad".into(), SecretKind::ApiToken, value).unwrap();
+        g.state.keep_mut().store_secret(&record).unwrap();
+        let grant = secrets_grant(vec![secret_entry(json!(hex::encode(record.id)), "/v1")]);
+        let answer = g.admin(json!({ "op": "issue", "name": "x", "uid": AGENT, "grant": grant }));
+        let error = answer["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("cannot be sent") && error.contains(why),
+            "{answer}"
+        );
+    }
+    assert!(g.state.keep().agent_credentials().unwrap().is_empty());
+}
+
+#[test]
 fn list_secrets_names_what_the_grant_allows_and_never_a_value() {
     use keep_core::secret::SecretKind;
     let mut g = Gw::new();
