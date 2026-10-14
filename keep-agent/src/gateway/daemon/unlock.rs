@@ -93,7 +93,9 @@ pub(crate) fn untrusted_acl(fd: impl AsFd, reader: &Reader) -> Option<String> {
         return Some("has an access ACL that cannot be parsed".into());
     }
     let entries: Vec<(u16, u16, u32)> = acl[4..]
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|e| {
             (
                 u16::from_le_bytes([e[0], e[1]]),

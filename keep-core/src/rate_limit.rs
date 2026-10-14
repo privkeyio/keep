@@ -322,7 +322,7 @@ pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<Pendi
     }
 
     let mut out = Vec::with_capacity(buf.len() / TRIP_RECORD_SIZE);
-    for chunk in buf.chunks_exact(TRIP_RECORD_SIZE) {
+    for chunk in buf.as_chunks::<TRIP_RECORD_SIZE>().0 {
         if let Some(trip) = PendingTrip::from_bytes(chunk, hmac_key) {
             out.push(trip);
         }

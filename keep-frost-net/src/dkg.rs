@@ -279,7 +279,7 @@ pub async fn fetch_group_roster(client: &Client, group_id_hex: &str) -> Result<D
         .map_err(|e| KeepError::NetworkErr(NetworkError::request(format!("fetch roster: {e}"))))?;
 
     let mut candidates: Vec<&Event> = events.iter().collect();
-    candidates.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    candidates.sort_by_key(|a| std::cmp::Reverse(a.created_at));
 
     let mut last_err: Option<KeepError> = None;
     for ev in candidates {
