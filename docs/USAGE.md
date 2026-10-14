@@ -872,6 +872,118 @@ Then generate a new channel key (step 2), start the gateway and pair again.
 | `the request is too large to approve` | The request is larger than the phone accepts. |
 | `needs approval, which this gateway cannot obtain yet: ...` | Approvals are not set up, or no phone is paired. |
 
+#### Secrets
+
+An agent can call an HTTPS API with a token from the vault without ever holding the token. The grant names the secret and exactly where it may go: a host, a port, the methods and a path prefix, and the header the token is sent in. The agent asks the gateway to send the request; the gateway adds the token, sends it only where a rule allows, and returns the response, refusing it if it carries the token back. The token never reaches the agent, its model provider, or anything the agent can read.
+
+Requests go out through inject workers, never from the gateway itself, which has no network. systemd starts a fresh worker for each request, under a uid of its own, with no vault: it resolves the host, refuses an address that is not globally reachable (any private, loopback, link-local or otherwise special address in the answer refuses the whole lookup), connects only to the addresses it checked, verifies the server against the root certificates built into keep (not the system's), sends the request and exits. A hostile response or DNS answer that compromised a worker would get only that one request's token, and could not reach later ones.
+
+##### Setting up secrets
+
+1. Add the secret with the gateway stopped (the gateway holds the vault's lock while it runs). The value is read from standard input:
+
+   ```bash
+   sudo systemctl stop keep-gateway
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault secret add --name "deploy token" --kind api-token
+   ```
+
+   A secret sent in a header must be an `api-token`, `password` or `generic` secret (not a `note`), not threshold-sealed, 12 to 2,048 bytes, and visible ASCII.
+
+2. Install the worker units and the drop-in, and add `--inject-socket` to the gateway's `ExecStart=` in the drop-in that sets its other options:
+
+   ```bash
+   sudo install -m 0644 contrib/systemd/keep-gateway-inject.socket contrib/systemd/keep-gateway-inject@.service /etc/systemd/system/
+   sudo install -m 0644 contrib/systemd/keep-gateway-inject.conf /etc/systemd/system/keep-gateway.service.d/inject.conf
+   sudo systemctl edit keep-gateway   # ExecStart=/usr/local/bin/keep ... gateway serve ... --inject-socket
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now keep-gateway-inject.socket
+   sudo systemctl start keep-gateway
+   ```
+
+   The socket, `/run/keep-gateway-inject/worker.sock`, is root's and open to the `keep-gateway` group; the gateway checks that its directory and the process serving it are root's before it sends a token. Nothing but the gateway's user may be in the `keep-gateway` group. Each worker runs with `DynamicUser=` under a name unique to its connection, so no two share a uid; while injection is on, no credential may be bound to a uid in systemd's dynamic range (61184 to 65519).
+
+3. Issue a credential with the `http_request` operation and a file listing its secrets. A secret is given by its id or by name; the gateway resolves names, and refuses a name no secret has or several share (with one answer for both):
+
+   ```json
+   [
+     {
+       "secret": { "name": "deploy token" },
+       "http": [
+         {
+           "host": "api.example.com",
+           "port": 443,
+           "methods": ["GET", "POST"],
+           "path_prefix": "/v1/deployments",
+           "header": "authorization",
+           "format": "Bearer {}",
+           "agent_headers": ["idempotency-key"]
+         }
+       ]
+     }
+   ]
+   ```
+
+   ```bash
+   keep gateway issue --name deployer --uid "$(id -u agent-writer)" --op http_request --secrets-file secrets.json --token-out deployer.token
+   ```
+
+   With a phone paired, the phone shows each secret by name, kind and id, and every rule in full, before the credential is issued; a secret renamed, deleted or sealed while the request waits makes the issue fail.
+
+A rule:
+
+- `host`: a DNS name with a dot, lowercase, in ASCII form (an internationalized name in its `xn--` form), never an IP address.
+- `port`: 1 to 65535.
+- `methods`: any of `DELETE GET HEAD OPTIONS PATCH POST PUT`, in that order, each once.
+- `path_prefix`: starts with `/`, is more than `/`, at most 256 characters, with no `%`, `;`, empty segment, `.` or `..`. A path matches when it equals the prefix, starts with it when the prefix ends in `/`, or continues it after a `/`: `/v1` matches `/v1` and `/v1/x` but not `/v1x`.
+- `header`: the lowercase header the secret is sent in, without `_`, and not one that changes routing, framing or encoding.
+- `format`: the header's value, at most 128 printable ASCII characters, with exactly one `{}` that the secret replaces.
+- `agent_headers`: up to 8 more lowercase headers the agent may set, in order. Every rule already lets it set `Accept`, `Content-Type`, `User-Agent` and the `If-` headers.
+
+A secret holds at most 4 rules, sorted by host, port and prefix, no two of which could match one request; a grant names at most 8 secrets.
+
+Choose the narrowest prefix that does what the agent needs. A rule constrains only the method and path a request names: on an API that routes by query, body or GraphQL operation, it allows whatever that path allows. And if the token can create other credentials (an API key or OAuth token endpoint under the prefix), the agent can make one keep never sees, which outlives freezing and revoking the agent's credential. Leave such endpoints outside every prefix. The host a rule names receives the token by design: keep cannot stop a hostile host from passing it on.
+
+##### Using secrets
+
+An agent with secrets is offered `list_secrets`, which lists each granted secret's id, name, kind and rules, and whether it can be used now (never its value), and, with `http_request`, the tool of that name:
+
+```json
+{"secret": "<id>", "method": "POST", "url": "https://api.example.com/v1/deployments", "headers": {"Content-Type": "application/json"}, "body": "{\"ref\":\"main\"}"}
+```
+
+The gateway refuses the request unless the first rule matching its host, port, method and path allows it, and:
+
+- the URL is `https`, written exactly as it parses (lowercase host, no default port, no dot segments, nothing the parser would change), with no user information or fragment, no `;`, and no percent-encoding in the path but of space, `"`, `<`, `>`, `^`, `` ` ``, `{`, `|`, `}` and multibyte UTF-8 that no server could normalize into a delimiter;
+- no query parameter, form field or top-level JSON key is a method override (`_method`, however escaped or spelled); every body is read as a form and as JSON whatever its `Content-Type`, since servers disagree on which they parse, and a body that starts with `{` but is not valid JSON, or is multipart, is refused;
+- every header is one the rule allows, at most 16 of them and 8 KiB together, each once, with a visible ASCII value; the body is at most 256 KiB.
+
+The use is written to the audit log before the token leaves the gateway (`agent_served`, naming the secret and giving 128-bit SHA-256 prefixes of the URL and body, then the method, host, port and path; never the token); if it cannot be written, nothing is sent. The worker sends the request with `Accept-Encoding: identity`, follows no redirect and uses no proxy, and has 30 seconds. The answer is:
+
+```json
+{"status": 200, "headers": {"content-type": "application/json"}, "body": "...", "body_base64": false, "truncated": false}
+```
+
+Only `Content-Type`, `Content-Encoding`, `Location` and `Retry-After` come back (never `Set-Cookie`). A body that is not UTF-8 comes back in base64, and one over 256 KiB is cut and marked `truncated`. A redirect comes back as it is, its `Location` included, for the agent to request again if a rule allows. A compressed response, or one under any transfer coding but chunked, is refused. A response that carries the token in any common encoding (as is, percent-, JSON- or HTML-escaped, base64 or hex, and the decoded pair of a Basic credential), or its first or last half (at least 16 bytes), anywhere in what was read, including past the cut, is refused, recorded against the credential, and three within 24 hours freeze it. An endpoint that reflects what the agent sends lets it test guesses at a short value, a correct guess coming back as `secret in response`, so do not grant a guessable password. A credential has one request in flight at a time, a uid two, and the gateway four. A freeze or revoke answers a request in flight at once and stops its worker, though a request already sent may have reached the host.
+
+A request that got no response is answered with one of these, never the underlying error:
+
+| Answer | Meaning |
+|--------|---------|
+| `denied: request not allowed` | The grant or a rule does not allow the request. Every such refusal reads the same; the reason is in the audit log (`keep gateway audit`). |
+| `unavailable` | The gateway was started without `--inject-socket`, or no worker could be reached. |
+| `busy` | Too many requests are in flight. |
+| `dns` | The host did not resolve. |
+| `address refused` | The host resolved to an address that is not globally reachable. |
+| `connect` | The connection failed. |
+| `tls` | The server's certificate was not valid for the host under keep's built-in roots. |
+| `timeout` | No complete response within the time allowed. |
+| `encoded response` | The response was compressed. |
+| `secret in response` | The response carried the secret. |
+| `http` | The response could not be read. |
+| `canceled` | A freeze, revoke or the gateway stopping withdrew the request. |
+
+Older keeps cannot use a credential with secrets: an older gateway reports that it cannot read it and refuses its token until it is deleted.
+
 #### Connecting an MCP client
 
 `keep agent connect` lets a stock MCP client (Claude, Cursor, any client that runs a stdio server) use the gateway. It speaks MCP on stdio and passes each request to the gateway's agent socket with the agent's token. It needs no vault and no password.
