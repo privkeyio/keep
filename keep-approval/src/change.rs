@@ -448,7 +448,9 @@ pub fn ssh_host_key_ok(key: &str) -> bool {
 }
 
 impl ChangeSsh {
-    fn check(&self) -> Result<()> {
+    /// Check the rule as an approver does: each list sorted, at most
+    /// [`MAX_SSH_ITEMS`], users with host keys, and every part well formed.
+    pub fn check(&self) -> Result<()> {
         for (list, what) in [
             (&self.users, "users"),
             (&self.host_keys, "host_keys"),

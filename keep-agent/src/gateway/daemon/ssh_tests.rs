@@ -17,29 +17,24 @@ const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STA
 const SESSION: &[u8] = &[0x5a; 32];
 const REFUSED: &str = "denied: request not allowed";
 
+/// An SSH server's host key: an Ed25519 key signs as a host's does.
 struct Host {
-    key: ed25519_dalek::SigningKey,
+    key: crate::ssh::SshKey,
     blob: Vec<u8>,
 }
 
 fn host(seed: u8) -> Host {
-    let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-    let mut blob = Vec::new();
-    put_string(&mut blob, ED25519.as_bytes());
-    put_string(&mut blob, key.verifying_key().as_bytes());
+    let key = crate::ssh::SshKey::from_seed(&[seed; 32]).unwrap();
+    let blob = key.public_blob();
     Host { key, blob }
 }
 
 impl Host {
     fn binding(&self, forwarding: u8) -> Vec<u8> {
-        use ed25519_dalek::Signer;
-        let mut sig = Vec::new();
-        put_string(&mut sig, ED25519.as_bytes());
-        put_string(&mut sig, &self.key.sign(SESSION).to_bytes());
         let mut b = Vec::new();
         put_string(&mut b, &self.blob);
         put_string(&mut b, SESSION);
-        put_string(&mut b, &sig);
+        put_string(&mut b, &self.key.sign(SESSION));
         b.push(forwarding);
         b
     }
@@ -135,17 +130,7 @@ fn sign(
 
 fn verifies(key: &[u8], data: &[u8], answer: &Value) -> bool {
     let sig = B64.decode(answer["signature"].as_str().unwrap()).unwrap();
-    let mut r = crate::ssh::wire::Reader::new(&sig);
-    assert_eq!(r.string(), Some(ED25519.as_bytes()));
-    let bytes: [u8; 64] = r.string().unwrap().try_into().unwrap();
-    assert!(r.is_empty());
-    let mut k = crate::ssh::wire::Reader::new(key);
-    k.string().unwrap();
-    let point: [u8; 32] = k.string().unwrap().try_into().unwrap();
-    ed25519_dalek::VerifyingKey::from_bytes(&point)
-        .unwrap()
-        .verify_strict(data, &ed25519_dalek::Signature::from_bytes(&bytes))
-        .is_ok()
+    crate::ssh::host_signed(key, &sig, data)
 }
 
 #[test]

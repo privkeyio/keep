@@ -15,6 +15,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -23,14 +24,17 @@ use serde_json::{json, Value};
 use super::bridge::Bridge;
 use crate::error::{AgentError, Result};
 use crate::ssh::wire::{put_string, Reader};
+use crate::ssh::MAX_BINDINGS;
 
 /// The longest message read or written: OpenSSH's own agent's limit.
 pub const MAX_MESSAGE: usize = 256 * 1024;
 /// The most connections served at once.
 pub const MAX_CONNECTIONS: usize = 16;
-/// The most session bindings kept for one connection: the gateway signs a
-/// login only with exactly one.
-const MAX_BINDINGS: usize = 4;
+/// How long a client connection may sit idle before it is closed.
+pub const IDLE: Duration = Duration::from_secs(10 * 60);
+/// How long the keys listed are used to answer an identities request: each
+/// listing the gateway serves costs the credential an audit entry.
+const IDENTITIES_FOR: Duration = Duration::from_secs(60);
 
 const SSH_AGENT_FAILURE: u8 = 5;
 const SSH_AGENT_SUCCESS: u8 = 6;
@@ -49,19 +53,30 @@ struct Identity {
     comment: String,
 }
 
-/// What a client sent on one connection.
+/// What a client sent on one connection: its session bindings, at most
+/// [`MAX_BINDINGS`] kept. The gateway signs a login only with exactly one,
+/// and SSHSIG only with none, so dropping more refuses nothing it would sign.
 #[derive(Default)]
 pub struct Connection {
     bindings: Vec<Vec<u8>>,
-    /// More bindings came than are kept, so no login is signed on it.
-    overflowed: bool,
+}
+
+/// A client connection's place among the [`MAX_CONNECTIONS`], given back
+/// when it is dropped.
+pub struct Slot(Arc<SshAgent>);
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.connections.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// The agent: one gateway connection shared by every client connection,
 /// one request at a time.
 pub struct SshAgent {
     bridge: Mutex<Bridge>,
-    identities: Mutex<Vec<Identity>>,
+    /// The keys last listed, and when.
+    identities: Mutex<(Vec<Identity>, Option<Instant>)>,
     next_id: AtomicI64,
     connections: AtomicUsize,
 }
@@ -70,7 +85,7 @@ impl SshAgent {
     pub fn new(bridge: Bridge) -> Self {
         Self {
             bridge: Mutex::new(bridge),
-            identities: Mutex::new(Vec::new()),
+            identities: Mutex::new((Vec::new(), None)),
             next_id: AtomicI64::new(1),
             connections: AtomicUsize::new(0),
         }
@@ -116,8 +131,19 @@ impl SshAgent {
                 })
             })
             .collect();
-        *self.identities.lock().unwrap_or_else(|e| e.into_inner()) = identities.clone();
+        *self.identities.lock().unwrap_or_else(|e| e.into_inner()) =
+            (identities.clone(), Some(Instant::now()));
         Some(identities)
+    }
+
+    /// The keys listed within [`IDENTITIES_FOR`], or a fresh listing.
+    fn current_identities(&self) -> Option<Vec<Identity>> {
+        let cached = self.identities.lock().unwrap_or_else(|e| e.into_inner());
+        if cached.1.is_some_and(|at| at.elapsed() < IDENTITIES_FOR) {
+            return Some(cached.0.clone());
+        }
+        drop(cached);
+        self.refresh_identities()
     }
 
     fn secret_for(&self, blob: &[u8]) -> Option<String> {
@@ -126,7 +152,7 @@ impl SshAgent {
                 .find(|i| i.blob == blob)
                 .map(|i| i.secret.clone())
         };
-        let known = find(&self.identities.lock().unwrap_or_else(|e| e.into_inner()));
+        let known = find(&self.identities.lock().unwrap_or_else(|e| e.into_inner()).0);
         known.or_else(|| find(&self.refresh_identities()?))
     }
 
@@ -138,7 +164,7 @@ impl SshAgent {
         };
         match kind {
             SSH_AGENTC_REQUEST_IDENTITIES if body.is_empty() => {
-                let Some(identities) = self.refresh_identities() else {
+                let Some(identities) = self.current_identities() else {
                     return failure;
                 };
                 let mut out = vec![SSH_AGENT_IDENTITIES_ANSWER];
@@ -155,7 +181,7 @@ impl SshAgent {
                 else {
                     return failure;
                 };
-                if !r.is_empty() || conn.overflowed {
+                if !r.is_empty() {
                     return failure;
                 }
                 let Some(secret) = self.secret_for(blob) else {
@@ -192,13 +218,30 @@ impl SshAgent {
                 let binding = &body[4 + SESSION_BIND.len()..];
                 if conn.bindings.len() < MAX_BINDINGS {
                     conn.bindings.push(binding.to_vec());
-                } else {
-                    conn.overflowed = true;
                 }
                 vec![SSH_AGENT_SUCCESS]
             }
             _ => failure,
         }
+    }
+
+    /// A place for a connection from `peer_uid`: only the agent's own user
+    /// (`owner`) is served, at most [`MAX_CONNECTIONS`] at once.
+    pub fn admit(self: &Arc<Self>, peer_uid: u32, owner: u32) -> Option<Slot> {
+        if peer_uid != owner {
+            tracing::warn!(peer_uid, "refused a connection from another user");
+            return None;
+        }
+        if self.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+            self.connections.fetch_sub(1, Ordering::SeqCst);
+            tracing::warn!(
+                limit = MAX_CONNECTIONS,
+                "refused a connection: too many open; idle ones close after {} minutes",
+                IDLE.as_secs() / 60
+            );
+            return None;
+        }
+        Some(Slot(self.clone()))
     }
 
     /// Serve the agent protocol on `listener` until it fails.
@@ -208,15 +251,17 @@ impl SshAgent {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(error = %e, "accepting a client failed");
+                    std::thread::sleep(Duration::from_millis(100));
                     continue;
                 }
             };
-            match rustix::net::sockopt::socket_peercred(&stream) {
-                Ok(peer) if peer.uid.as_raw() == owner => {}
-                _ => continue,
-            }
-            if self.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-                self.connections.fetch_sub(1, Ordering::SeqCst);
+            let Ok(peer) = rustix::net::sockopt::socket_peercred(&stream) else {
+                continue;
+            };
+            let Some(slot) = self.admit(peer.uid.as_raw(), owner) else {
+                continue;
+            };
+            if stream.set_read_timeout(Some(IDLE)).is_err() {
                 continue;
             }
             let agent = self.clone();
@@ -224,7 +269,7 @@ impl SshAgent {
                 if let Err(e) = agent.serve_connection(stream) {
                     tracing::debug!(error = %e, "a client connection ended");
                 }
-                agent.connections.fetch_sub(1, Ordering::SeqCst);
+                drop(slot);
             });
         }
         Err(AgentError::Other("the listening socket closed".into()))

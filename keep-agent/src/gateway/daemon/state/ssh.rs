@@ -15,21 +15,16 @@ use super::{only_args, parse_secret_id, tools, Refusal, Served, State};
 use crate::gateway::GrantedCredential;
 use crate::policy::secret_entry;
 use crate::scope::Operation;
-use crate::ssh::{check_request, fingerprint, public_key_text, Signing, SshKey};
+use crate::ssh::{check_request, fingerprint, public_key_text, Signing, SshKey, MAX_BINDINGS};
 
 /// The most data a request may ask to have signed: a login request or SSHSIG
 /// data is far smaller.
 pub(crate) const MAX_DATA: usize = 16 * 1024;
-/// The most session bindings a request carries, and the longest one.
-pub(crate) const MAX_BINDINGS: usize = 4;
+/// The longest session binding a request carries.
 pub(crate) const MAX_BINDING: usize = 4 * 1024;
 
 fn base64_arg(value: Option<&Value>, max: usize) -> Option<Vec<u8>> {
-    let text = value?.as_str()?;
-    if text.len() > max.div_ceil(3) * 4 {
-        return None;
-    }
-    B64.decode(text).ok().filter(|b| b.len() <= max)
+    B64.decode(value?.as_str()?).ok().filter(|b| b.len() <= max)
 }
 
 impl State {
@@ -59,12 +54,12 @@ impl State {
             .ok_or_else(|| Refusal::params("secret must be a secret id, 64 lowercase hex"))?;
         let data = base64_arg(args.get("data"), MAX_DATA)
             .ok_or_else(|| Refusal::params("data must be base64, at most 16 KiB decoded"))?;
-        let flags = match args.get("flags") {
-            None | Some(Value::Null) => 0,
-            Some(v) => v
-                .as_u64()
-                .filter(|&f| f <= u64::from(u32::MAX))
-                .ok_or_else(|| Refusal::params("flags must be a 32-bit unsigned integer"))?,
+        // Flags only select RSA signature algorithms.
+        let flags_set = match args.get("flags") {
+            None | Some(Value::Null) => false,
+            Some(v) if v.as_u64() == Some(0) => false,
+            Some(v) if v.as_u64().is_some_and(|f| f <= u64::from(u32::MAX)) => true,
+            Some(_) => return Err(Refusal::params("flags must be a 32-bit unsigned integer")),
         };
         let bindings: Vec<Vec<u8>> = match args.get("bindings") {
             None | Some(Value::Null) => Vec::new(),
@@ -83,7 +78,7 @@ impl State {
         let Some(rule) = &entry.ssh else {
             return Err(refused("not an SSH key"));
         };
-        if flags != 0 {
+        if flags_set {
             return Err(refused("signature flags, which only RSA keys take"));
         }
         let key = self
@@ -92,9 +87,10 @@ impl State {
         let signing = check_request(rule, &key.public_blob(), &data, &bindings).map_err(refused)?;
         let detail = match &signing {
             Signing::Login { user, host } => format!(
-                "secret {} login {user} host {}",
+                "secret {} login {user} host {} data sha256 {}",
                 hex::encode(&secret[..16]),
-                fingerprint(host)
+                fingerprint(host),
+                hex_sha256(&data)
             ),
             Signing::Sshsig { namespace } => format!(
                 "secret {} sshsig {namespace} data sha256 {}",

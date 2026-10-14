@@ -153,7 +153,7 @@ fn anything_refused_or_malformed_is_a_failure() {
 }
 
 #[test]
-fn a_connection_bound_too_often_signs_nothing() {
+fn bindings_past_the_limit_are_dropped() {
     let fake = gateway();
     let agent = agent(&fake);
     let mut conn = Connection::default();
@@ -163,11 +163,40 @@ fn a_connection_bound_too_often_signs_nothing() {
             [SSH_AGENT_SUCCESS]
         );
     }
-    assert_eq!(
-        agent.handle(&mut conn, &sign_request(&key_blob(), b"data", 0)),
-        [SSH_AGENT_FAILURE]
-    );
-    assert!(signs_requested(&fake).is_empty());
+    assert_eq!(conn.bindings.len(), MAX_BINDINGS);
+}
+
+#[test]
+fn identities_are_listed_once_a_minute_at_most() {
+    let fake = gateway();
+    let agent = agent(&fake);
+    let lists = || {
+        fake.log()
+            .iter()
+            .filter(|(_, e)| e["message"]["params"]["name"] == "list_secrets")
+            .count()
+    };
+    let mut conn = Connection::default();
+    let first = agent.handle(&mut conn, &[SSH_AGENTC_REQUEST_IDENTITIES]);
+    let again = agent.handle(&mut conn, &[SSH_AGENTC_REQUEST_IDENTITIES]);
+    assert_eq!(first, again);
+    assert_eq!(lists(), 1);
+    // A key not listed is looked for again before the request fails.
+    agent.handle(&mut conn, &sign_request(b"not a key", b"data", 0));
+    assert_eq!(lists(), 2);
+}
+
+#[test]
+fn only_the_owner_is_admitted_and_only_so_many_at_once() {
+    let fake = gateway();
+    let agent = Arc::new(agent(&fake));
+    assert!(agent.admit(me() + 1, me()).is_none(), "another user");
+    let slots: Vec<Slot> = (0..MAX_CONNECTIONS)
+        .map(|_| agent.admit(me(), me()).unwrap())
+        .collect();
+    assert!(agent.admit(me(), me()).is_none(), "over the limit");
+    drop(slots);
+    assert!(agent.admit(me(), me()).is_some(), "places come back");
 }
 
 #[test]

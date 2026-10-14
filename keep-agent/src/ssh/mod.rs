@@ -28,12 +28,15 @@ pub const ED25519: &str = "ssh-ed25519";
 pub const ECDSA_P256: &str = "ecdsa-sha2-nistp256";
 
 const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
-const PUBLICKEY: &[u8] = b"publickey";
 const PUBLICKEY_HOSTBOUND: &[u8] = b"publickey-hostbound-v00@openssh.com";
 const SSHSIG_MAGIC: &[u8] = b"SSHSIG";
 
-/// The longest session id read: OpenSSH's own agent's limit.
-const MAX_SESSION_ID: usize = 128;
+/// The lengths a session id has: the output of the key exchange's hash,
+/// SHA-1, SHA-256, SHA-384 or SHA-512.
+const SESSION_ID_LENGTHS: [usize; 4] = [20, 32, 48, 64];
+
+/// The most session bindings a request carries: a login needs exactly one.
+pub const MAX_BINDINGS: usize = 4;
 
 pub use keep_approval::change::MAX_SSH_ITEMS;
 
@@ -132,60 +135,34 @@ fn key_type(blob: &[u8]) -> Option<&'static str> {
 
 /// Whether `sig`, in the SSH encoding, is host key `host`'s signature over
 /// `data`.
-fn host_signed(host: &[u8], sig: &[u8], data: &[u8]) -> bool {
-    let mut key = Reader::new(host);
-    let mut sig = Reader::new(sig);
-    match key_type(host) {
-        Some(ED25519) => {
-            let (Some(_), Some(point)) = (key.string(), key.string()) else {
-                return false;
-            };
-            let Ok(point) = <[u8; 32]>::try_from(point) else {
-                return false;
-            };
-            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&point) else {
-                return false;
-            };
-            let (Some(kind), Some(bytes)) = (sig.string(), sig.string()) else {
-                return false;
-            };
-            let Ok(bytes) = <[u8; 64]>::try_from(bytes) else {
-                return false;
-            };
-            kind == ED25519.as_bytes()
-                && sig.is_empty()
-                && vk
-                    .verify_strict(data, &ed25519_dalek::Signature::from_bytes(&bytes))
-                    .is_ok()
+pub(crate) fn host_signed(host: &[u8], sig: &[u8], data: &[u8]) -> bool {
+    let check = || -> Option<()> {
+        let mut key = Reader::new(host);
+        let mut sig = Reader::new(sig);
+        let kind = key_type(host)?;
+        key.string()?;
+        if sig.string()? != kind.as_bytes() {
+            return None;
         }
-        Some(ECDSA_P256) => {
+        let ok = if kind == ED25519 {
+            let vk =
+                ed25519_dalek::VerifyingKey::from_bytes(key.string()?.try_into().ok()?).ok()?;
+            let bytes: [u8; 64] = sig.string()?.try_into().ok()?;
+            vk.verify_strict(data, &ed25519_dalek::Signature::from_bytes(&bytes))
+                .is_ok()
+        } else {
             use p256::ecdsa::signature::Verifier;
-            let (Some(_), Some(_), Some(point)) = (key.string(), key.string(), key.string()) else {
-                return false;
-            };
-            let Ok(vk) = p256::ecdsa::VerifyingKey::from_sec1_bytes(point) else {
-                return false;
-            };
-            let (Some(kind), Some(inner)) = (sig.string(), sig.string()) else {
-                return false;
-            };
-            let mut inner = Reader::new(inner);
-            let (Some(r), Some(s)) = (
-                inner.string().and_then(mpint32),
-                inner.string().and_then(mpint32),
-            ) else {
-                return false;
-            };
-            let Ok(signature) = p256::ecdsa::Signature::from_scalars(r, s) else {
-                return false;
-            };
-            kind == ECDSA_P256.as_bytes()
-                && sig.is_empty()
-                && inner.is_empty()
-                && vk.verify(data, &signature).is_ok()
-        }
-        _ => false,
-    }
+            key.string()?;
+            let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key.string()?).ok()?;
+            let mut inner = Reader::new(sig.string()?);
+            let r = mpint32(inner.string()?)?;
+            let s = mpint32(inner.string()?)?;
+            let signature = p256::ecdsa::Signature::from_scalars(r, s).ok()?;
+            inner.is_empty() && vk.verify(data, &signature).is_ok()
+        };
+        (ok && sig.is_empty()).then_some(())
+    };
+    check().is_some()
 }
 
 /// A positive `mpint` of at most 32 bytes, minimally encoded, as 32
@@ -225,42 +202,21 @@ fn refuse<T>(message: impl Into<String>) -> Result<T> {
 }
 
 impl SshRule {
+    /// Valid as an approver checks it (see
+    /// [`keep_approval::change::ChangeSsh::check`]), with each host key a
+    /// well-formed key and the keys sorted, each once.
     pub fn validate(&self) -> Result<()> {
-        use keep_approval::change::{ssh_user_ok, sshsig_namespace_ok};
-        for (list, what) in [
-            (&self.users, "users"),
-            (&self.host_keys, "host_keys"),
-            (&self.sshsig_namespaces, "sshsig_namespaces"),
-        ] {
-            if list.len() > MAX_SSH_ITEMS {
-                return refuse(format!("an SSH rule lists at most {MAX_SSH_ITEMS} {what}"));
-            }
-            if !list.windows(2).all(|w| w[0] < w[1]) {
-                return refuse(format!("an SSH rule's {what} must be sorted, each once"));
-            }
-        }
-        if self.users.is_empty() != self.host_keys.is_empty() {
-            return refuse("an SSH rule names users and host keys together");
-        }
-        if self.users.is_empty() && self.sshsig_namespaces.is_empty() {
-            return refuse("an SSH rule must allow at least one use");
-        }
-        if !self.users.iter().all(|u| ssh_user_ok(u)) {
-            return refuse("an SSH user is 1 to 64 letters, digits, '.', '_' or '-'");
-        }
-        if !self
-            .sshsig_namespaces
-            .iter()
-            .all(|n| sshsig_namespace_ok(n))
-        {
-            return refuse("an SSHSIG namespace is 1 to 64 letters, digits, '@', '.', '_' or '-'");
-        }
         if let Some(bad) = self.host_keys.iter().find(|k| parse_host_key(k).is_none()) {
             return refuse(format!(
                 "host key {bad:?} is not an ssh-ed25519 or ecdsa-sha2-nistp256 key as known_hosts writes it (type, space, base64)"
             ));
         }
-        Ok(())
+        if !self.host_keys.windows(2).all(|w| w[0] < w[1]) {
+            return refuse("an SSH rule's host_keys must be sorted, each once");
+        }
+        self.change()
+            .check()
+            .map_err(|e| AgentError::ScopeViolation(e.to_string()))
     }
 
     /// The rule as an approver is shown it, host keys by fingerprint.
@@ -293,6 +249,11 @@ pub enum Signing<'a> {
 /// client sent on its agent connection, in order (host key, session id,
 /// signature, forwarding flag). An error is the reason, for the audit log
 /// alone.
+///
+/// A login must use `publickey-hostbound-v00@openssh.com`, which names the
+/// bound host key in the signed data, and the server checks it is its own.
+/// A plain `publickey` login names no server, so anyone holding a granted
+/// host's private key could bind another server's session to it.
 pub fn check_request<'a>(
     rule: &SshRule,
     key: &[u8],
@@ -313,7 +274,7 @@ pub fn check_request<'a>(
     else {
         return Err("a malformed session binding");
     };
-    if !b.is_empty() || session.is_empty() || session.len() > MAX_SESSION_ID {
+    if !b.is_empty() || !SESSION_ID_LENGTHS.contains(&session.len()) {
         return Err("a malformed session binding");
     }
     if forwarding != 0 {
@@ -330,53 +291,46 @@ pub fn check_request<'a>(
         return Err("a session binding the host key did not sign");
     }
     let mut r = Reader::new(data);
-    let parsed = (|| {
-        let id = r.string()?;
-        let msg = r.u8()?;
-        let user = r.text()?;
-        let service = r.string()?;
-        let method = r.string()?;
-        let has_signature = r.u8()?;
-        let alg = r.string()?;
-        let blob = r.string()?;
-        let bound_host = if method == PUBLICKEY_HOSTBOUND {
-            Some(r.string()?)
-        } else {
-            None
-        };
-        Some((
-            id,
-            msg,
-            user,
-            service,
-            method,
-            has_signature,
-            alg,
-            blob,
-            bound_host,
-        ))
-    })();
-    let Some((id, msg, user, service, method, has_signature, alg, blob, bound_host)) = parsed
+    let (
+        Some(id),
+        Some(msg),
+        Some(user),
+        Some(service),
+        Some(method),
+        Some(has_signature),
+        Some(alg),
+        Some(blob),
+    ) = (
+        r.string(),
+        r.u8(),
+        r.text(),
+        r.string(),
+        r.string(),
+        r.u8(),
+        r.string(),
+        r.string(),
+    )
     else {
         return Err("data that is neither a login nor an SSHSIG signature");
     };
-    if !r.is_empty()
-        || msg != SSH_MSG_USERAUTH_REQUEST
+    if msg != SSH_MSG_USERAUTH_REQUEST
         || service != b"ssh-connection"
-        || !(method == PUBLICKEY || method == PUBLICKEY_HOSTBOUND)
         || has_signature != 1
         || alg != ED25519.as_bytes()
     {
         return Err("data that is not a public key login request");
+    }
+    if method != PUBLICKEY_HOSTBOUND {
+        return Err("a login by a method that does not name the host key");
+    }
+    if r.string() != Some(host) || !r.is_empty() {
+        return Err("a login naming another host key than the one bound");
     }
     if id != session {
         return Err("a login for another session than the one bound");
     }
     if blob != key {
         return Err("a login naming another key");
-    }
-    if bound_host.is_some_and(|h| h != host) {
-        return Err("a login naming another host key than the one bound");
     }
     if !rule.users.iter().any(|u| u == user) {
         return Err("a user the rule does not name");

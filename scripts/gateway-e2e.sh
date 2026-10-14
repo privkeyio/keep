@@ -63,6 +63,7 @@ DNS_PID=
 CREATED_NS=
 PASS=e2e-vault-password
 CREATED_RUN=
+CREATED_SSHD_RUN=
 . "$(dirname "$0")/lib/gateway-e2e.sh"
 
 refuse_users $GW $ADMIN $A1 $A2 $OUT $INJ $SSH_USER $SSH_OTHER
@@ -94,6 +95,7 @@ cleanup() {
     remove_created_accounts
     rm -rf "$WORK"
     if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
+    if [[ -n $CREATED_SSHD_RUN ]]; then rmdir /run/sshd 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
@@ -681,11 +683,13 @@ stop_gateway
 pass "a stale socket from a killed gateway is replaced"
 
 # SSH keys. The gateway is stopped, so the owner generates the key.
-SSH_PUB=$(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-keygen --name "deploy key" 2>&1 \
-    | grep '^ssh-ed25519 ') || fail "secret ssh-keygen"
-[[ $(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-pubkey "deploy key" 2>&1 | grep '^ssh-ed25519 ') == "$SSH_PUB" ]] \
+# The public key alone goes to standard output, ready for authorized_keys.
+SSH_PUB=$(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-keygen --name "deploy key" 2>/dev/null) \
+    || fail "secret ssh-keygen"
+[[ $SSH_PUB =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*$ ]] || fail "ssh-keygen printed $SSH_PUB"
+[[ $(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-pubkey "deploy key" 2>/dev/null) == "$SSH_PUB" ]] \
     || fail "secret ssh-pubkey differs from what ssh-keygen printed"
-pass "the vault generated an SSH key and prints its public key again"
+pass "the vault generated an SSH key and prints its public key again, on standard output"
 
 # Two SSH servers on loopback, each with its own host key; the grant names
 # only the first, and only the first of two users both servers let in. The
@@ -697,7 +701,11 @@ for u in "$SSH_USER" "$SSH_OTHER"; do
     # No password, without the lock sshd refuses outside PAM.
     usermod -p '*' "$u"
 done
-install -d -m 0755 /run/sshd
+# sshd's privilege separation directory, made only if the host lacks it.
+if [[ ! -d /run/sshd ]]; then
+    install -d -m 0755 /run/sshd
+    CREATED_SSHD_RUN=1
+fi
 # sshd reads authorized_keys as the login user; the host keys stay 0600.
 install -d -m 0755 "$WORK/sshd"
 printf '%s\n' "$SSH_PUB" >"$WORK/sshd/authorized_keys"

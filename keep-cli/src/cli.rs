@@ -392,11 +392,12 @@ pub(crate) struct IssueArgs {
     #[arg(long)]
     pub(crate) uid: u32,
     /// A vault key the agent may use, as hex or npub (repeatable). Needed by
-    /// every operation but http_request
+    /// every operation but http_request and ssh_sign
     #[arg(long = "key")]
     pub(crate) keys: Vec<String>,
     /// An operation the agent may request (repeatable): get_public_key,
-    /// sign_nostr_event, get_bitcoin_address, sign_psbt, http_request
+    /// sign_nostr_event, get_bitcoin_address, sign_psbt, http_request,
+    /// ssh_sign
     #[arg(long = "op", required = true)]
     pub(crate) operations: Vec<String>,
     /// A JSON file listing the vault secrets the agent may use and where each

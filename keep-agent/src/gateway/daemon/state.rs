@@ -1326,27 +1326,23 @@ impl State {
             .map(|entry| {
                 let id = hex::encode(entry.secret);
                 let mut listed = match self.keep.secret_info(&entry.secret) {
-                    Ok(info) => {
-                        let usable = !info.sealed
-                            && match &entry.ssh {
-                                Some(_) => info.kind == SecretKind::SshKey,
-                                None => crate::inject::rule::HTTP_KINDS.contains(&info.kind),
-                            };
-                        json!({
-                            "id": id,
-                            "name": info.name,
-                            "kind": info.kind.as_str(),
-                            "usable": usable,
-                        })
-                    }
+                    Ok(info) => json!({
+                        "id": id,
+                        "name": info.name,
+                        "kind": info.kind.as_str(),
+                        "usable": !info.sealed
+                            && crate::inject::rule::HTTP_KINDS.contains(&info.kind),
+                    }),
                     Err(_) => json!({ "id": id, "usable": false }),
                 };
                 match &entry.ssh {
+                    // The key loads only when it is a plain SSH key.
                     Some(rule) => {
+                        let key = self.ssh_public_key(&entry.secret);
+                        listed["usable"] = json!(key.is_some());
                         listed["ssh"] = json!(rule);
-                        match self.ssh_public_key(&entry.secret) {
-                            Some(key) => listed["public_key"] = json!(key),
-                            None => listed["usable"] = json!(false),
+                        if let Some(key) = key {
+                            listed["public_key"] = json!(key);
                         }
                     }
                     None => listed["http"] = json!(entry.http),

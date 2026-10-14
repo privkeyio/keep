@@ -263,7 +263,7 @@ fn good_login<'a>(key: &'a [u8], host: &'a [u8], hostbound: bool) -> Login<'a> {
         method: if hostbound {
             PUBLICKEY_HOSTBOUND
         } else {
-            PUBLICKEY
+            b"publickey"
         },
         has_signature: 1,
         alg: ED25519,
@@ -277,16 +277,18 @@ fn a_login_in_a_session_a_granted_host_signed_is_signed() {
     let (host_key, host) = ed25519_host();
     let key = agent_key().public_blob();
     let bound = vec![binding(&host, SESSION, &ed25519_sig(&host_key, SESSION), 0)];
-    for hostbound in [false, true] {
-        let data = login_data(&good_login(&key, &host, hostbound));
-        assert_eq!(
-            check_request(&rule(&host), &key, &data, &bound),
-            Ok(Signing::Login {
-                user: "git",
-                host: host.clone()
-            })
-        );
-    }
+    let data = login_data(&good_login(&key, &host, true));
+    assert_eq!(
+        check_request(&rule(&host), &key, &data, &bound),
+        Ok(Signing::Login {
+            user: "git",
+            host: host.clone()
+        })
+    );
+    // A plain publickey login names no server: a granted host's key, in the
+    // wrong hands, could bind any server's session to itself.
+    let plain = login_data(&good_login(&key, &host, false));
+    assert!(check_request(&rule(&host), &key, &plain, &bound).is_err());
     // A nistp256 host key, as many servers have, and its signature over
     // anything else refused.
     let (p_key, p_host) = p256_host();
@@ -344,13 +346,13 @@ fn every_login_check_refuses() {
     )];
     let data_other = login_data(&good_login(&key, &other_host, true));
     assert!(!check(&data_other, &other_bound), "host not granted");
-    let long = vec![0u8; MAX_SESSION_ID + 1];
+    let long = vec![0u8; 33];
     assert!(
         !check(
             &data,
             &[binding(&host, &long, &ed25519_sig(&host_key, &long), 0)]
         ),
-        "session id too long"
+        "session id of no hash length"
     );
 
     let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
@@ -501,4 +503,97 @@ fn a_high_s_host_signature_still_verifies() {
     put_string(&mut blob, ECDSA_P256.as_bytes());
     put_string(&mut blob, &inner);
     assert!(host_signed(&host, &blob, SESSION));
+}
+
+#[test]
+fn only_a_host_bound_login_of_a_hash_length_session_is_signed() {
+    let (host_key, host) = ed25519_host();
+    let key = agent_key().public_blob();
+    let r = rule(&host);
+    // Plain publickey, even with the host key appended as the host-bound
+    // method carries it.
+    let bound = vec![binding(&host, SESSION, &ed25519_sig(&host_key, SESSION), 0)];
+    let plain = login_data(&Login {
+        method: b"publickey",
+        ..good_login(&key, &host, true)
+    });
+    assert!(check_request(&r, &key, &plain, &bound).is_err());
+    for len in [20, 32, 48, 64] {
+        let session = vec![7u8; len];
+        let bound = vec![binding(
+            &host,
+            &session,
+            &ed25519_sig(&host_key, &session),
+            0,
+        )];
+        let data = login_data(&Login {
+            session: &session,
+            ..good_login(&key, &host, true)
+        });
+        assert!(check_request(&r, &key, &data, &bound).is_ok(), "{len}");
+    }
+    for len in [1, 19, 33, 65, 128] {
+        let session = vec![7u8; len];
+        let bound = vec![binding(
+            &host,
+            &session,
+            &ed25519_sig(&host_key, &session),
+            0,
+        )];
+        let data = login_data(&Login {
+            session: &session,
+            ..good_login(&key, &host, true)
+        });
+        assert!(check_request(&r, &key, &data, &bound).is_err(), "{len}");
+    }
+}
+
+#[test]
+fn a_host_signature_must_be_exactly_its_own_kind() {
+    use ed25519_dalek::Signer;
+    let (host_key, host) = ed25519_host();
+    let raw = host_key.sign(SESSION).to_bytes();
+    let mut relabeled = Vec::new();
+    put_string(&mut relabeled, ECDSA_P256.as_bytes());
+    put_string(&mut relabeled, &raw);
+    assert!(
+        !host_signed(&host, &relabeled, SESSION),
+        "another kind's label"
+    );
+    let mut trailing = ed25519_sig(&host_key, SESSION);
+    trailing.push(0);
+    assert!(!host_signed(&host, &trailing, SESSION), "trailing byte");
+
+    let (p_key, p_host) = p256_host();
+    let good = p256_sig(&p_key, SESSION);
+    assert!(host_signed(&p_host, &good, SESSION));
+    let mut trailing = good.clone();
+    trailing.push(0);
+    assert!(!host_signed(&p_host, &trailing, SESSION), "trailing byte");
+    // A byte after s, inside the signature's own string.
+    let mut r = Reader::new(&good);
+    r.string().unwrap();
+    let mut inner = r.string().unwrap().to_vec();
+    inner.push(0);
+    let mut padded = Vec::new();
+    put_string(&mut padded, ECDSA_P256.as_bytes());
+    put_string(&mut padded, &inner);
+    assert!(
+        !host_signed(&p_host, &padded, SESSION),
+        "trailing byte inside"
+    );
+}
+
+#[test]
+fn host_keys_must_be_sorted() {
+    let (_, a) = ed25519_host();
+    let (_, b) = p256_host();
+    let mut keys = vec![public_key_text(&a).unwrap(), public_key_text(&b).unwrap()];
+    keys.sort();
+    let mut r = rule(&a);
+    r.host_keys = keys.clone();
+    assert!(r.validate().is_ok());
+    keys.reverse();
+    r.host_keys = keys;
+    assert!(r.validate().is_err());
 }

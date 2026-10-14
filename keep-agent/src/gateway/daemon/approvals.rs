@@ -434,14 +434,11 @@ mod tests {
     #[test]
     fn an_ssh_grant_becomes_a_change_an_approver_accepts() {
         use crate::inject::rule::SecretGrant;
-        use crate::ssh::wire::put_string;
         use keep_core::secret::{SecretInfo, SecretKind};
         let host = |seed: u8| {
-            let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]);
-            let mut blob = Vec::new();
-            put_string(&mut blob, b"ssh-ed25519");
-            put_string(&mut blob, key.verifying_key().as_bytes());
-            blob
+            crate::ssh::SshKey::from_seed(&[seed; 32])
+                .unwrap()
+                .public_blob()
         };
         let (a, b) = (host(1), host(2));
         let mut host_keys = vec![

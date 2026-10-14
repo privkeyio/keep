@@ -188,7 +188,7 @@ pub fn cmd_secret_ssh_keygen(out: &Output, path: &Path, name: &str, hidden: bool
         "Stored SSH key '{name}'; id {}. Its public key:",
         hex::encode(record.id)
     ));
-    out.info(&ssh_public_key(&key));
+    println!("{}", ssh_public_key(&key));
     Ok(())
 }
 
@@ -204,7 +204,7 @@ pub fn cmd_secret_ssh_pubkey(out: &Output, path: &Path, handle: &str, hidden: bo
     }
     let key = keep_agent::ssh::SshKey::from_seed(&record.value)
         .ok_or_else(|| KeepError::invalid_input("this SSH key does not hold an Ed25519 seed"))?;
-    out.info(&ssh_public_key(&key));
+    println!("{}", ssh_public_key(&key));
     Ok(())
 }
 

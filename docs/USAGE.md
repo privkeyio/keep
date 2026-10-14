@@ -988,8 +988,8 @@ Older keeps cannot use a credential with secrets: an older gateway reports that 
 
 An agent can log in over SSH, and sign git commits, with a key that never leaves the vault. keep generates the key; the agent's SSH client talks to `keep agent ssh-agent`, a local SSH agent that holds no key and passes each signature request to the gateway, which signs only what the key's rule allows:
 
-- **Logins** to a host whose key the rule names, as a user it names. OpenSSH 8.9 and later bind the agent connection to each SSH session with the host's signature over the session; the gateway checks that signature on every request, and signs only a public key login request for that session, that user and this key. A client that sends no binding (OpenSSH before 8.9), a connection bound more than once, or one bound for agent forwarding is refused.
-- **SSHSIG signatures** (`ssh-keygen -Y sign`, which git uses for SSH-signed commits) in a namespace the rule names, only on a connection no SSH session is bound to, so a host the agent's agent was forwarded to cannot get any.
+- **Logins** to a host whose key the rule names, as a user it names. OpenSSH 8.9 and later bind the agent connection to each SSH session with the host's signature over the session; the gateway checks that signature on every request, and signs only a host-bound login request (`publickey-hostbound-v00@openssh.com`) for that session, that user, this key and that host key. The server checks the host key in the request is its own, so a signature made for one host is useless to any other, even to someone holding a granted host's private key. A client that sends no binding (OpenSSH before 8.9), a connection bound more than once or bound for agent forwarding, and a server that does not offer host-bound logins are refused. OpenSSH 8.9 and later servers and GitHub offer them; GitLab and Bitbucket did not when this was written, so an agent cannot log in to them with a vault key yet.
+- **SSHSIG signatures** (`ssh-keygen -Y sign`, which git uses for SSH-signed commits) in a namespace the rule names, only on a connection no SSH session is bound to. OpenSSH 8.9 and later bind every agent connection they forward, so a host the agent forwards its SSH agent to with them gets none; a client that forwards without binding (an older OpenSSH, and some SSH libraries) passes unbound connections on, and the host at the other end can then get signatures within the rule. Do not let the agent forward its SSH agent (`ssh -A`) except with OpenSSH 8.9 or later.
 
 ##### Setting up an SSH key
 
@@ -1032,12 +1032,12 @@ An agent can log in over SSH, and sign git commits, with a key that never leaves
    export SSH_AUTH_SOCK=~/.keep-ssh/agent.sock
    ssh-add -L                       # the granted key
    git push                         # logs in with it
-   git -c gpg.format=ssh -c user.signingkey="key::$(ssh-add -L)" commit -S -m "..."
+   git -c gpg.format=ssh -c user.signingkey="key::$(ssh-add -L | head -1)" commit -S -m "..."
    ```
 
    The socket is created with mode 0600 and serves only its own user. Like `keep agent connect`, it refuses to run as root or with `KEEP_PASSWORD` set.
 
-Every signature is written to the audit log before it is returned (`agent_served` labeled `ssh_sign`, naming the key, then the user and the host key's fingerprint, or the namespace and a hash of the data); every refusal is recorded with its reason, and the agent is told only `denied: request not allowed`. A freeze or revoke stops new signatures at once, but cannot end an SSH session already logged in. A host that authenticates with a host certificate rather than a plain key is refused.
+Every signature is written to the audit log before it is returned (`agent_served` labeled `ssh_sign`, naming the key, then the user and the host key's fingerprint, or the namespace, and a hash of the data); every refusal is recorded with its reason, and the agent is told only `denied: request not allowed`. Each signature, and each listing of the keys (the SSH agent lists them at most once a minute), counts against the credential's request limits and its daily audit budget like any other request. A freeze or revoke stops new signatures at once, but cannot end an SSH session already logged in. A host that authenticates with a host certificate rather than a plain key is refused.
 
 Older keeps cannot read an SSH key: an older `keep secret list` fails while the vault holds one, an older keep cannot restore a backup holding one, and an older gateway refuses a credential granting one (serving every other). Remove the key with this release (`keep secret rm`) before going back to an older keep.
 
