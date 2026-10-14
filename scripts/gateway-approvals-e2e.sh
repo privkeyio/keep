@@ -15,6 +15,9 @@
 #   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-approvals-e2e.sh \
 #     target/release/keep target/release/examples/approval_peer [old-keep]
 #
+# With KEEP_E2E_PHONE naming keep-mobile's mobile_approver example, that is
+# the phone instead: the app's own approver code, against the real gateway.
+#
 # With an older keep binary as the third argument, it also runs old and new
 # binaries against each other: the old bridge and admin commands against
 # the new gateway, and the new bridge against an old gateway.
@@ -91,6 +94,11 @@ install -m 0755 "$BIN_SRC" "$WORK/keep"
 install -m 0755 "$PEER_SRC" "$WORK/approval_peer"
 KEEP=$WORK/keep
 PEER=$WORK/approval_peer
+PHONE=$PEER
+if [[ -n ${KEEP_E2E_PHONE:-} ]]; then
+    install -m 0755 "$KEEP_E2E_PHONE" "$WORK/phone"
+    PHONE=$WORK/phone
+fi
 OLD=
 if [[ -n $OLD_SRC ]]; then
     install -m 0755 "$OLD_SRC" "$WORK/old-keep"
@@ -338,7 +346,7 @@ PAIR_PID=$!
 for _ in $(seq 300); do [[ -f $WORK/uri ]] && break; sleep 0.1; done
 [[ -f $WORK/uri ]] || fail "no pairing code: $(cat "$WORK/pair.out")"
 mkfifo -m 0600 "$WORK/phone.in"
-"$PEER" phone "$(cat "$WORK/uri")" <"$WORK/phone.in" >"$WORK/phone.log" 2>&1 &
+"$PHONE" phone "$(cat "$WORK/uri")" <"$WORK/phone.in" >"$WORK/phone.log" 2>&1 &
 PHONE_PID=$!
 exec 7>"$WORK/phone.in"
 phone() { printf '%s\n' "$1" >&7; }
@@ -375,7 +383,9 @@ printf '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"sign_bit
 AGENT_PID=$!
 wait_for "$WORK/phone.log" "^request " $((n + 1)) 30
 grep '^request ' "$WORK/phone.log" | tail -1 >"$WORK/psbt.request"
-grep -q '"sign_psbt" {"type":"above_threshold","requested":10000,"spent":0,"threshold":5000}' "$WORK/psbt.request" \
+# The stand-in phone prints the reason as sent; keep-mobile's approver as
+# the app shows it.
+grep -qE '"sign_psbt" (\{"type":"above_threshold","requested":10000,"spent":0,"threshold":5000\}|spends 10000 sats with 0 sats already spent, above the 5000 sats)' "$WORK/psbt.request" \
     || fail "the phone was not shown the spend: $(cat "$WORK/psbt.request")"
 phone approve
 wait "$AGENT_PID" || true
