@@ -31,6 +31,8 @@ urlencoding = { workspace = true }
 url = { workspace = true }
 memchr = "2"
 base64 = "0.23"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
