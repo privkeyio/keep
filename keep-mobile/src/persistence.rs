@@ -262,7 +262,7 @@ fn descriptor_key(group_pubkey_hex: &str) -> String {
     format!("{DESCRIPTOR_KEY_PREFIX}{group_pubkey_hex}")
 }
 
-fn storage_metadata(name: &str) -> ShareMetadataInfo {
+pub(crate) fn storage_metadata(name: &str) -> ShareMetadataInfo {
     ShareMetadataInfo {
         name: name.into(),
         identifier: 0,

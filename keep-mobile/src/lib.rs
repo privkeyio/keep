@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+mod approver;
 mod audit;
 mod dkg;
 mod error;
@@ -24,6 +25,10 @@ mod storage_integrity;
 mod types;
 mod velocity;
 
+pub use approver::{
+    ApprovalField, ApprovalRequest, ApproverCallbacks, ApproverEvent, ApproverHandler,
+    ApproverStatus, PairingStart,
+};
 pub use audit::{
     AuditEntry, AuditEventType, AuditLog, AuditStorage, SigningAuditEntry, SigningAuditLog,
     SigningAuditStorage, SigningDecision, SigningRequestType,
@@ -608,7 +613,7 @@ pub struct KeepMobile {
     /// so the node never drops and keeps signing on the relays. Held here so
     /// invalidate_live_node can abort them.
     node_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    storage: Arc<dyn SecureStorage>,
+    pub(crate) storage: Arc<dyn SecureStorage>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
     /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
