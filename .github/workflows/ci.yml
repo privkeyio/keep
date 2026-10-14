@@ -264,7 +264,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           files=$(git diff --name-only "$BASE"...HEAD)
-          if grep -qE '(^|/)Cargo\.(toml|lock)$|^Dockerfile|^contrib/debian/|^keep-web/ui/|^rust-toolchain|^\.github/workflows/ci\.yml$' <<<"$files"; then
+          if grep -qE '(^|/)Cargo\.(toml|lock)$|^Dockerfile|^\.dockerignore$|^LICENSE$|^contrib/|^keep-web/ui/|^rust-toolchain|^\.github/workflows/ci\.yml$' <<<"$files"; then
             echo changed=true >>"$GITHUB_OUTPUT"
           else
             echo changed=false >>"$GITHUB_OUTPUT"
