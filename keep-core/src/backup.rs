@@ -279,6 +279,7 @@ fn secret_kind_to_string(k: SecretKind) -> String {
         SecretKind::ApiToken => "ApiToken".into(),
         SecretKind::Note => "Note".into(),
         SecretKind::Generic => "Generic".into(),
+        SecretKind::SshKey => "SshKey".into(),
     }
 }
 
@@ -288,6 +289,7 @@ fn string_to_secret_kind(s: &str) -> Result<SecretKind> {
         "ApiToken" => Ok(SecretKind::ApiToken),
         "Note" => Ok(SecretKind::Note),
         "Generic" => Ok(SecretKind::Generic),
+        "SshKey" => Ok(SecretKind::SshKey),
         other => Err(KeepError::InvalidInput(format!(
             "unknown secret kind: {other}"
         ))),

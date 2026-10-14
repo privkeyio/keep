@@ -31,6 +31,8 @@ pub enum SecretKind {
     Note,
     /// Any other secret material that does not fit the categories above.
     Generic,
+    /// An Ed25519 SSH key: its 32-byte seed, generated inside keep.
+    SshKey,
 }
 
 /// A stored arbitrary secret sitting alongside curve-key records in the vault.
@@ -104,6 +106,7 @@ impl SecretKind {
             SecretKind::ApiToken => "api_token",
             SecretKind::Note => "note",
             SecretKind::Generic => "generic",
+            SecretKind::SshKey => "ssh_key",
         }
     }
 }
