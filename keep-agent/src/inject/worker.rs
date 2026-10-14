@@ -178,6 +178,25 @@ async fn send(request: &WorkerRequest, env: &Env) -> std::result::Result<WorkerR
         .await
         .map_err(classify)?;
     let status = response.status().as_u16();
+    let returned: Vec<[String; 2]> = RETURNED_HEADERS
+        .iter()
+        .filter_map(|name| {
+            let value = response.headers().get(*name)?;
+            let bytes = value.as_bytes();
+            (bytes.len() <= MAX_HEADER_VALUE && super::rule::is_header_value(bytes)).then(|| {
+                [
+                    name.to_string(),
+                    String::from_utf8_lossy(bytes).into_owned(),
+                ]
+            })
+        })
+        .collect();
+    // An echo counts whatever else is wrong with the response, so it is
+    // looked for first, and in what was read before any failure.
+    let scanner = Scanner::new(&secret);
+    if returned.iter().any(|[_, v]| scanner.found_in(v.as_bytes())) {
+        return Err(Cause::SecretInResponse);
+    }
     // Every value counts, not only the first: a body under any encoding but
     // identity, or a transfer coding but chunked, is bytes the scan cannot
     // read.
@@ -193,23 +212,22 @@ async fn send(request: &WorkerRequest, env: &Env) -> std::result::Result<WorkerR
     {
         return Err(Cause::EncodedResponse);
     }
-    let returned: Vec<[String; 2]> = RETURNED_HEADERS
-        .iter()
-        .filter_map(|name| {
-            let value = response.headers().get(*name)?;
-            let bytes = value.as_bytes();
-            (bytes.len() <= MAX_HEADER_VALUE && super::rule::is_header_value(bytes)).then(|| {
-                [
-                    name.to_string(),
-                    String::from_utf8_lossy(bytes).into_owned(),
-                ]
-            })
-        })
-        .collect();
     let limit = MAX_RESPONSE_BODY + longest_form(secret.len());
-    let mut read = Zeroizing::new(Vec::new());
+    let mut read = Zeroizing::new(Vec::with_capacity(limit));
+    let failed = |error, read: &[u8]| {
+        if scanner.found_in(read) {
+            Cause::SecretInResponse
+        } else {
+            classify(error)
+        }
+    };
     let mut more = false;
-    while let Some(chunk) = response.chunk().await.map_err(classify)? {
+    loop {
+        let chunk = match response.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(e) => return Err(failed(e, &read)),
+        };
         let room = limit - read.len();
         if chunk.len() > room {
             read.extend_from_slice(&chunk[..room]);
@@ -218,16 +236,14 @@ async fn send(request: &WorkerRequest, env: &Env) -> std::result::Result<WorkerR
         }
         read.extend_from_slice(&chunk);
         if read.len() == limit {
-            more = response
-                .chunk()
-                .await
-                .map_err(classify)?
-                .is_some_and(|c| !c.is_empty());
+            more = match response.chunk().await {
+                Ok(next) => next.is_some_and(|c| !c.is_empty()),
+                Err(e) => return Err(failed(e, &read)),
+            };
             break;
         }
     }
-    let scanner = Scanner::new(&secret);
-    if returned.iter().any(|[_, v]| scanner.found_in(v.as_bytes())) || scanner.found_in(&read) {
+    if scanner.found_in(&read) {
         return Err(Cause::SecretInResponse);
     }
     Ok(WorkerResponse {

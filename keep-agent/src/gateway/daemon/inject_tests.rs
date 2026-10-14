@@ -485,9 +485,11 @@ fn fake_worker(answers: Vec<Option<String>>) -> FakeWorker {
             let mut stream = stream;
             match answer {
                 Some(a) => {
+                    // Recorded before answering, so it is there once the
+                    // agent has its answer.
+                    log.lock().unwrap().push((line, false));
                     stream.write_all(a.as_bytes()).unwrap();
                     stream.write_all(b"\n").unwrap();
-                    log.lock().unwrap().push((line, false));
                 }
                 None => {
                     // Hold the connection until the gateway closes it.

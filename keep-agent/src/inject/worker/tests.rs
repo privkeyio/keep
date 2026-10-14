@@ -29,6 +29,10 @@ enum Reply {
     TransferGzip,
     /// A redirect.
     Redirect,
+    /// The secret, then the connection closed short of the declared length.
+    SecretThenCut,
+    /// A gzip-encoded body, and the secret in `Location`.
+    GzipSecretLocation,
 }
 
 struct Server {
@@ -107,15 +111,25 @@ async fn serve(reply: Reply) -> Server {
                     vec![0x1f, 0x8b, 0, 0],
                 ),
                 Reply::Redirect => ("Location: https://elsewhere.example/x\r\n", Vec::new()),
+                Reply::SecretThenCut => ("", SECRET.to_vec()),
+                Reply::GzipSecretLocation => (
+                    "Content-Encoding: gzip\r\nLocation: https://x.example/?t=tk_test_0123456789abcdef\r\n",
+                    vec![0x1f, 0x8b, 0, 0],
+                ),
             };
             let status = if matches!(reply, Reply::Redirect) {
                 "302 Found"
             } else {
                 "200 OK"
             };
+            let declared = body.len()
+                + if matches!(reply, Reply::SecretThenCut) {
+                    100
+                } else {
+                    0
+                };
             let response = format!(
-                "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+                "HTTP/1.1 {status}\r\n{extra}Content-Length: {declared}\r\nConnection: close\r\n\r\n"
             );
             let _ = tls.write_all(response.as_bytes()).await;
             let _ = tls.write_all(&body).await;
@@ -208,6 +222,15 @@ async fn a_compressed_response_is_refused() {
         let server = serve(reply).await;
         let answer = perform(&request(server.port), &env(server.port, test_root(), any)).await;
         assert_eq!(failed(answer), Cause::EncodedResponse);
+    }
+}
+
+#[tokio::test]
+async fn an_echo_is_found_when_the_body_breaks_off_or_the_body_is_refused() {
+    for reply in [Reply::SecretThenCut, Reply::GzipSecretLocation] {
+        let server = serve(reply).await;
+        let answer = perform(&request(server.port), &env(server.port, test_root(), any)).await;
+        assert_eq!(failed(answer), Cause::SecretInResponse);
     }
 }
 
