@@ -540,8 +540,8 @@ async fn spawn_consumer(
                                     );
                                 }
                                 consecutive_future_rejections += 1;
-                                if consecutive_future_rejections % PERSISTENT_DIVERGENCE_THRESHOLD
-                                    == 0
+                                if consecutive_future_rejections
+                                    .is_multiple_of(PERSISTENT_DIVERGENCE_THRESHOLD)
                                 {
                                     tracing::error!(
                                         consecutive = consecutive_future_rejections,

@@ -301,7 +301,7 @@ impl ShareExport {
             return Err(invalid());
         }
         let mut shares = std::collections::BTreeMap::new();
-        for (i, bytes) in (1..=self.total).zip(list.chunks_exact(VERIFYING_SHARE_LEN)) {
+        for (i, bytes) in (1..=self.total).zip(list.as_chunks::<VERIFYING_SHARE_LEN>().0) {
             let id = Identifier::try_from(i).map_err(|_| invalid())?;
             let share = VerifyingShare::deserialize(bytes).map_err(|_| invalid())?;
             shares.insert(id, share);

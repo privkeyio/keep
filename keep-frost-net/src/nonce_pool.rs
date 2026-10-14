@@ -273,20 +273,14 @@ impl NoncePool {
                 .iter()
                 .find(|(i, id)| *i == idx && !chosen.contains(&(*i, *id)))
                 .copied();
-            match next {
-                Some(key) => chosen.push(key),
-                None => return None,
-            }
+            chosen.push(next?);
         }
 
         let mut reserved = Vec::with_capacity(chosen.len());
         for key in chosen {
-            if let Some(commitment) = inner.peer.remove(&key) {
-                inner.peer_order.retain(|k| k != &key);
-                reserved.push((key.0, key.1, commitment));
-            } else {
-                return None;
-            }
+            let commitment = inner.peer.remove(&key)?;
+            inner.peer_order.retain(|k| k != &key);
+            reserved.push((key.0, key.1, commitment));
         }
         Some(reserved)
     }

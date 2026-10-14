@@ -1382,15 +1382,14 @@ fn decode_psbt_for_snapshot(psbt_bytes: &[u8]) -> Option<([u8; 32], u32, Option<
         .try_fold(0u64, |acc, (psbt_in, tx_in)| {
             let value_sat = if let Some(wu) = psbt_in.witness_utxo.as_ref() {
                 wu.value.to_sat()
-            } else if let Some(nwu) = psbt_in.non_witness_utxo.as_ref() {
+            } else {
+                let nwu = psbt_in.non_witness_utxo.as_ref()?;
                 if nwu.compute_txid() != tx_in.previous_output.txid {
                     return None;
                 }
                 let vout = tx_in.previous_output.vout as usize;
                 let out = nwu.output.get(vout)?;
                 out.value.to_sat()
-            } else {
-                return None;
             };
             acc.checked_add(value_sat)
         });
@@ -1454,7 +1453,7 @@ fn aggregate_partial_psbts(
     let mut aggregated = bitcoin::psbt::Psbt::deserialize(proposal_psbt)
         .map_err(|e| FrostNetError::Session(format!("proposal PSBT decode failed: {e}")))?;
     let mut sorted: Vec<(&SignerId, &Vec<u8>)> = partial_psbts.iter().collect();
-    sorted.sort_by(|(a, _), (b, _)| signer_id_sort_key(a).cmp(&signer_id_sort_key(b)));
+    sorted.sort_by_key(|(a, _)| signer_id_sort_key(a));
     for (signer, bytes) in sorted {
         let partial = bitcoin::psbt::Psbt::deserialize(bytes).map_err(|e| {
             FrostNetError::Session(format!("partial PSBT decode failed for {signer:?}: {e}"))

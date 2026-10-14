@@ -41,6 +41,9 @@ fn is_rdrand_available() -> bool {
     *AVAILABLE.get_or_init(|| {
         // SAFETY: __cpuid with leaf 1 is safe on all x86_64 processors.
         // This instruction queries CPU feature flags and does not modify state.
+        // Newer Rust makes __cpuid a safe function; the MSRV still needs the
+        // block.
+        #[allow(unused_unsafe)]
         let result = unsafe { core::arch::x86_64::__cpuid(1) };
         (result.ecx & (1 << 30)) != 0
     })
@@ -79,7 +82,7 @@ fn rdrand64_with_retry() -> Option<u64> {
 
 #[cfg(target_arch = "x86_64")]
 fn fill_rdrand(pool: &mut [u8; 16]) -> bool {
-    for chunk in pool.chunks_exact_mut(8) {
+    for chunk in pool.as_chunks_mut::<8>().0 {
         let Some(val) = rdrand64_with_retry() else {
             return false;
         };
