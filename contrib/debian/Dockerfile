@@ -37,6 +37,7 @@ COPY keep-cli ./keep-cli
 COPY keep-nip46 ./keep-nip46
 COPY keep-bitcoin ./keep-bitcoin
 COPY keep-agent ./keep-agent
+COPY keep-approval ./keep-approval
 COPY keep-frost-net ./keep-frost-net
 COPY keep-enclave ./keep-enclave
 COPY keep-mobile ./keep-mobile

@@ -43,6 +43,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt -- --check
       - run: cargo clippy -- -D warnings
+      # The reproducible and Debian builds run only on pushes and tags, so a
+      # workspace member missing from their Dockerfiles is caught here instead.
+      - run: scripts/check-dockerfile-members.sh
       # keep-agent-py and keep-agent-ts are excluded from the workspace (cdylib
       # bindings with their own lockfiles), so --workspace never sees them. Check
       # them explicitly to catch dependency drift that only surfaces on compile.
