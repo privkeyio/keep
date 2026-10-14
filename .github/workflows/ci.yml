@@ -124,16 +124,31 @@ jobs:
       # The agent gateway end to end in strong mode, with real users for the
       # gateway, its admin, two agents and an outsider. Creating them needs
       # root, so it runs under sudo, on Linux, where the gateway runs.
+      # The inject worker the gateway e2e sends http_request through to its
+      # own test server: the same keep with one throwaway test root added,
+      # built with a --cfg no feature can turn on, into its own target
+      # directory. The release keep must not carry the root's marker.
       - if: matrix.os == 'ubuntu-latest'
-        timeout-minutes: 10
-        run: sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep
+        timeout-minutes: 30
+        run: |
+          scripts/lib/inject-e2e-pki.sh "$RUNNER_TEMP/inject-pki"
+          KEEP_E2E_CA_DER="$RUNNER_TEMP/inject-pki/ca.der" RUSTFLAGS='--cfg keep_e2e_roots' \
+            cargo build --release -p keep-cli --target-dir target/e2e-roots
+          grep -q keep-e2e-roots-build target/e2e-roots/release/keep
+          if grep -q keep-e2e-roots-build target/release/keep; then
+            echo "the release keep carries the e2e test root" >&2
+            exit 1
+          fi
+      - if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep target/e2e-roots/release/keep "$RUNNER_TEMP/inject-pki"
       # The shipped systemd unit, booted for real on the runner: it passes
       # systemd-analyze verify, unlocks the gateway from an encrypted
       # credential, serves an MCP client through the bridge, restarts
       # unattended and refuses to start when misconfigured.
       - if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 10
-        run: sudo KEEP_GATEWAY_SYSTEMD_E2E=1 scripts/gateway-systemd-e2e.sh target/release/keep target/release/examples/approval_peer
+        run: sudo KEEP_GATEWAY_SYSTEMD_E2E=1 scripts/gateway-systemd-e2e.sh target/release/keep target/release/examples/approval_peer target/e2e-roots/release/keep "$RUNNER_TEMP/inject-pki"
       # Approvals end to end over a local relay: the relay helper, pairing
       # the stand-in phone, approved and refused requests, freezes and
       # management changes, as real users.

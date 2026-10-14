@@ -20,6 +20,13 @@ jobs:
           mv dist/keep keep-linux-x86_64
           mv dist/keep-desktop keep-desktop-linux-x86_64
           mv dist/keep-web keep-web-linux-x86_64
+      # Only the gateway e2e's own build trusts its test root.
+      - name: Check no test root is built in
+        run: |
+          if grep -q keep-e2e-roots-build keep-linux-x86_64; then
+            echo "the release keep carries the e2e test root" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: linux

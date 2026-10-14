@@ -7,6 +7,9 @@
 # user, unlocks from an encrypted credential, reports ready only once it
 # serves, serves an MCP client through `keep agent connect`, restarts
 # unattended, and refuses to start, and stops retrying, when misconfigured.
+# It also runs http_request under the shipped inject socket and worker
+# units: the socket's permissions, a worker per connection under a dynamic
+# uid of its own, and a request carried from an agent to a worker.
 # Given keep-agent's approval_peer example as well, it also runs approvals
 # under the shipped units: the approvals drop-in, the relay helper's unit, a
 # phone paired over a local relay, and the refusal to start without the
@@ -38,8 +41,10 @@ if [[ ! -d /run/systemd/system ]]; then
     echo "refusing to run: this machine was not booted with systemd" >&2
     exit 2
 fi
-BIN_SRC=${1:?usage: gateway-systemd-e2e.sh path/to/keep [path/to/approval_peer]}
+BIN_SRC=${1:?usage: gateway-systemd-e2e.sh path/to/keep [path/to/approval_peer [path/to/e2e-roots-keep pki-dir]]}
 PEER_SRC=${2:-}
+E2E_SRC=${3:-}
+PKI=${4:-}
 CONTRIB=$(cd "$(dirname "$0")/.." && pwd)/contrib/systemd
 UNIT_SRC=$CONTRIB/keep-gateway.service
 [[ -f $UNIT_SRC ]] || { echo "no unit at $UNIT_SRC" >&2; exit 2; }
@@ -60,6 +65,14 @@ OUT=kgsdout
 RELAY_USER=keep-gateway-relay
 RELAY_UNIT=keep-gateway-relay.service
 RELAY_UNIT_FILE=/etc/systemd/system/$RELAY_UNIT
+INJECT_SOCKET_UNIT=keep-gateway-inject.socket
+INJECT_UNITS=(/etc/systemd/system/$INJECT_SOCKET_UNIT /etc/systemd/system/keep-gateway-inject@.service)
+INJECT_DROPIN=/etc/systemd/system/keep-gateway-inject@.service.d
+E2E_BIN=/usr/local/bin/keep-e2e
+TEST_LINK=kgsd0
+HOLD_PID=
+SERVER_PID=
+DNS_PID=
 RELAY_PID=
 PAIR_PID=
 PHONE_PID=
@@ -71,8 +84,9 @@ UNIT_INSTALLED=
 refuse_users $GW $AGENT $ADMIN $OUT $RELAY_USER
 refuse_groups $GW keep-agents keep-admins $AGENT $ADMIN $OUT $RELAY_USER
 refuse_paths "$UNIT_FILE" "$DROPIN" "$RELAY_UNIT_FILE" "$BIN" /etc/keep "$STATE" /run/keep-gateway \
-    /run/keep-gateway-admin /run/keep-gateway-relay
-for u in "$UNIT" "$RELAY_UNIT"; do
+    /run/keep-gateway-admin /run/keep-gateway-relay /run/keep-gateway-inject "${INJECT_UNITS[@]}" \
+    "$INJECT_DROPIN" "$E2E_BIN" "/sys/class/net/$TEST_LINK"
+for u in "$UNIT" "$RELAY_UNIT" "$INJECT_SOCKET_UNIT"; do
     if systemctl cat "$u" >/dev/null 2>&1; then
         echo "refusing to run: a $u unit is already installed" >&2
         exit 2
@@ -89,6 +103,12 @@ fail_context() {
 }
 
 cleanup() {
+    stop_pid "$HOLD_PID" "$SERVER_PID" "$DNS_PID"
+    ip link delete "$TEST_LINK" 2>/dev/null || true
+    rm -rf "$INJECT_DROPIN" "$E2E_BIN"
+    systemctl stop "$INJECT_SOCKET_UNIT" 'keep-gateway-inject@*' >/dev/null 2>&1 || true
+    systemctl reset-failed 'keep-gateway-inject@*' >/dev/null 2>&1 || true
+    rm -f "${INJECT_UNITS[@]}"
     systemctl stop "$RELAY_UNIT" >/dev/null 2>&1 || true
     systemctl reset-failed "$RELAY_UNIT" >/dev/null 2>&1 || true
     rm -f "$RELAY_UNIT_FILE"
@@ -102,7 +122,7 @@ cleanup() {
     systemctl daemon-reload || true
     remove_created_accounts
     for p in "${CREATED[@]}"; do rm -rf "$p"; done
-    rm -rf /run/keep-gateway /run/keep-gateway-admin /run/keep-gateway-relay
+    rm -rf /run/keep-gateway /run/keep-gateway-admin /run/keep-gateway-relay /run/keep-gateway-inject
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -352,6 +372,183 @@ systemctl is-active --quiet "$UNIT" || fail "did not start again with the right 
 MSG=$("$BIN" gateway status 2>&1) || fail "not answering after the fix: $MSG"
 pass "sealed again with the right password, it starts after reset-failed"
 
+# http_request under the shipped units. The secret is added with the gateway
+# stopped, as documented.
+systemctl stop "$UNIT"
+SECRET_VALUE=sk_sd_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+printf '%s' "$SECRET_VALUE" | as $GW env KEEP_PASSWORD=$PASS "$BIN" --path "$VAULT" \
+    secret add --name "deploy token" --kind api-token >/dev/null 2>&1 || fail "secret add"
+install -m 0644 "$CONTRIB/keep-gateway-inject.socket" "${INJECT_UNITS[0]}"
+install -m 0644 "$CONTRIB/keep-gateway-inject@.service" "${INJECT_UNITS[1]}"
+install -m 0644 "$CONTRIB/keep-gateway-inject.conf" "$DROPIN/inject.conf"
+sed -i 's|^ExecStart=\(.\+ gateway serve .*\)$|ExecStart=\1 --inject-socket|' "$DROPIN/admin.conf"
+grep -q -- '--inject-socket$' "$DROPIN/admin.conf" || fail "drop-in: $(cat "$DROPIN/admin.conf")"
+systemctl daemon-reload
+for f in "${INJECT_UNITS[@]}"; do
+    VERIFY=$(systemd-analyze verify "$f" 2>&1) || fail "systemd-analyze verify $f: $VERIFY"
+    if grep -qF "$(basename "$f")" <<<"$VERIFY"; then fail "systemd-analyze verify warns: $VERIFY"; fi
+done
+PROPS=$(systemctl show --all keep-gateway-inject@probe.service)
+for want in DynamicUser=yes NoNewPrivileges=yes ProtectSystem=strict ProtectHome=yes PrivateTmp=yes \
+    PrivateDevices=yes ProtectProc=invisible ProcSubset=pid CapabilityBoundingSet= MemoryDenyWriteExecute=yes \
+    RestrictNamespaces=yes LimitCORE=0 UMask=0077 RuntimeMaxUSec=40s StandardInput=socket Type=exec \
+    SocketBindDeny=any; do
+    grep -qxF "$want" <<<"$PROPS" || fail "the worker unit does not set $want: $(grep "^${want%%=*}=" <<<"$PROPS")"
+done
+systemctl start "$INJECT_SOCKET_UNIT" || fail "the inject socket did not start"
+systemctl start "$UNIT" || fail "the gateway did not start with --inject-socket"
+dir_is /run/keep-gateway-inject "root:root 755"
+[[ $(stat -c '%U:%G %a' /run/keep-gateway-inject/worker.sock) == "root:$GW 660" ]] \
+    || fail "worker socket: $(stat -c '%U:%G %a' /run/keep-gateway-inject/worker.sock)"
+pass "the inject socket is root's, open to the gateway's group alone, and the gateway starts with it"
+
+# Two connections at once: two workers, each under a dynamic uid of its own.
+python3 -c '
+import socket, time
+held = [socket.socket(socket.AF_UNIX) for _ in range(2)]
+for s in held:
+    s.connect("/run/keep-gateway-inject/worker.sock")
+time.sleep(20)
+' &
+HOLD_PID=$!
+for _ in $(seq 100); do
+    [[ $(systemctl list-units 'keep-gateway-inject@*' --state=running --no-legend | wc -l) -ge 2 ]] && break
+    sleep 0.1
+done
+UIDS=()
+for u in $(systemctl list-units 'keep-gateway-inject@*' --state=running --no-legend --plain | awk '{print $1}'); do
+    PIDW=$(systemctl show -p MainPID --value "$u")
+    UIDS+=("$(awk '/^Uid:/ {print $3}' "/proc/$PIDW/status")")
+done
+[[ ${#UIDS[@]} -eq 2 ]] || fail "expected two workers, saw ${#UIDS[@]}"
+[[ ${UIDS[0]} != "${UIDS[1]}" ]] || fail "two workers share uid ${UIDS[0]}"
+for w in "${UIDS[@]}"; do
+    [[ $w -ge 61184 && $w -le 65519 ]] || fail "worker uid $w is not a dynamic one"
+done
+stop_pid "$HOLD_PID"
+HOLD_PID=
+pass "each worker runs under a dynamic uid of its own (${UIDS[*]})"
+
+# A credential is never bound to a dynamic uid while injection is on.
+if MSG=$("$BIN" gateway issue --name dyn --uid 61200 --op get_public_key --key "$NPUB" 2>&1); then
+    fail "issued a credential bound to a dynamic uid"
+fi
+grep -q "dynamic services" <<<"$MSG" || fail "dynamic uid refused for another reason: $MSG"
+
+# An agent's request reaches a worker through the socket unit and back.
+cat >"$WORK/secrets.json" <<'JSON'
+[{"secret": {"name": "deploy token"}, "http": [{"host": "echo.keep.test", "port": 443,
+  "methods": ["GET"], "path_prefix": "/v1", "header": "authorization", "format": "Bearer {}"}]}]
+JSON
+"$BIN" gateway issue --name http --uid "$(uid "$AGENT")" --op http_request --secrets-file "$WORK/secrets.json" \
+    --token-out "$WORK/root/http-token" >"$WORK/http-issue.json" 2>"$WORK/http-issue.err" \
+    || fail "issue with secrets: $(cat "$WORK/http-issue.err")"
+install -m 0600 -o "$AGENT" "$WORK/root/http-token" "$WORK/agent/http-token"
+SECRET_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["grant"]["secrets"][0]["secret"])' "$WORK/http-issue.json")
+# One http_request through the bridge; prints the tool result.
+cat >"$WORK/call_http.py" <<'PY'
+import json, select, subprocess, sys
+secret, url, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
+server = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+def ask(message):
+    server.stdin.write((json.dumps(message) + "\n").encode())
+    server.stdin.flush()
+    ready, _, _ = select.select([server.stdout], [], [], 60)
+    return json.loads(server.stdout.readline()) if ready else None
+ask({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+r = ask({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "http_request",
+    "arguments": {"secret": secret, "method": "GET", "url": url}}})
+server.stdin.close()
+server.wait(timeout=10)
+print(json.dumps(r["result"]))
+PY
+chmod 0644 "$WORK/call_http.py"
+http() {
+    as "$AGENT" python3 "$WORK/call_http.py" "$SECRET_ID" "$1" "$BIN" agent connect --token-file "$WORK/agent/http-token" \
+        2>>"$WORK/bridge.log"
+}
+# The text of a tool result, and whether it is an error.
+result_is() {
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert r["isError"] == (sys.argv[2] == "error") and sys.argv[3] in r["content"][0]["text"], r' "$@"
+}
+if [[ -z $E2E_SRC ]]; then
+    # The test machine resolves no name under .test, so the worker answers dns.
+    OUT_HTTP=$(http https://echo.keep.test/v1/ok) || fail "http_request: $OUT_HTTP"
+    result_is "$OUT_HTTP" error dns || fail "http_request through the units: $OUT_HTTP"
+    pass "an agent's http_request reaches a worker started by the socket unit (resolving under its sandbox)"
+else
+    # The whole path under the shipped sandbox: a test server on a globally
+    # reachable address on a dummy link, its name answered by a DNS server
+    # there that systemd-resolved routes keep.test to, and the workers run
+    # from the e2e build, which trusts the test root.
+    ip link add "$TEST_LINK" type dummy
+    ip addr add 11.22.33.44/32 dev "$TEST_LINK"
+    ip link set "$TEST_LINK" up
+    resolvectl dns "$TEST_LINK" 11.22.33.44
+    resolvectl domain "$TEST_LINK" '~keep.test'
+    cat >"$WORK/dns.py" <<'PY'
+import socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("11.22.33.44", 53))
+while True:
+    q, addr = s.recvfrom(512)
+    qid = struct.unpack(">H", q[:2])[0]
+    labels, i = [], 12
+    while q[i]:
+        labels.append(q[i + 1:i + 1 + q[i]])
+        i += q[i] + 1
+    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
+    known = b".".join(labels).lower() == b"echo.keep.test"
+    answer = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + socket.inet_aton("11.22.33.44") if known and qtype == 1 else b""
+    s.sendto(struct.pack(">HHHHHH", qid, 0x8180 | (0 if known else 3), 1, 1 if answer else 0, 0, 0) + q[12:i + 5] + answer, addr)
+PY
+    cat >"$WORK/server.py" <<'PY'
+import http.server, ssl, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b'{"ok":true}' if self.path == "/v1/ok" else str(self.headers).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(sys.argv[1] + "/leaf.pem", sys.argv[1] + "/leaf.key")
+srv = http.server.HTTPServer(("11.22.33.44", 443), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+    python3 -I "$WORK/dns.py" >>"$WORK/dns.log" 2>&1 &
+    DNS_PID=$!
+    python3 -I "$WORK/server.py" "$PKI" >>"$WORK/server.log" 2>&1 &
+    SERVER_PID=$!
+    install -m 0755 "$E2E_SRC" "$E2E_BIN"
+    install -d -m 0755 "$INJECT_DROPIN"
+    printf '[Service]\nExecStart=\nExecStart=%s gateway inject-worker\n' "$E2E_BIN" >"$INJECT_DROPIN/e2e.conf"
+    systemctl daemon-reload
+    for _ in $(seq 50); do
+        ss -ltnH 'sport = :443' | grep -q 11.22.33.44 && ss -lunH 'sport = :53' | grep -q 11.22.33.44 && break
+        sleep 0.1
+    done
+    kill -0 "$SERVER_PID" "$DNS_PID" || fail "test servers: $(cat "$WORK/server.log" "$WORK/dns.log")"
+    [[ $(resolvectl query --legend=no echo.keep.test 2>&1) == *11.22.33.44* ]] \
+        || fail "resolved does not route keep.test: $(resolvectl query echo.keep.test 2>&1)"
+    OUT_HTTP=$(http https://echo.keep.test/v1/ok) || fail "http_request: $OUT_HTTP"
+    result_is "$OUT_HTTP" ok '"status":200' || fail "http_request under the sandbox: $OUT_HTTP $(cat "$WORK/server.log" "$WORK/dns.log") $(ss -ltn) $(journalctl -u 'keep-gateway-inject@*' --no-pager -o cat | tail -5)"
+    OUT_HTTP=$(http https://echo.keep.test/v1/echo) || fail "http_request: $OUT_HTTP"
+    result_is "$OUT_HTTP" error "secret in response" || fail "echo under the sandbox: $OUT_HTTP"
+    pass "under the shipped sandbox a worker resolves, connects, verifies and answers, and refuses an echo of the secret"
+fi
+JOURNAL=$(journalctl -u "$UNIT" -u 'keep-gateway-inject@*' --no-pager -o cat)
+grep -qF "$SECRET_VALUE" <<<"$JOURNAL" && fail "the secret is in the journal"
+pass "the journal never holds the secret"
+systemctl stop "$INJECT_SOCKET_UNIT"
+rm -f "$DROPIN/inject.conf"
+sed -i 's| --inject-socket$||' "$DROPIN/admin.conf"
+systemctl daemon-reload
+systemctl restart "$UNIT" || fail "restart without injection"
+
 if [[ -n $PEER_SRC ]]; then
     # Approvals under the shipped units, set up as documented.
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin $RELAY_USER
@@ -449,6 +646,7 @@ EOF
     pass "with a phone paired, it refuses to start without its channel key, and starts again with it"
     systemctl stop "$RELAY_UNIT"
 fi
+
 
 systemctl stop "$UNIT"
 [[ $(systemctl show -p ExecMainStatus --value "$UNIT") == 0 ]] || fail "stopped with status $(systemctl show -p ExecMainStatus --value "$UNIT")"

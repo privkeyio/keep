@@ -1,0 +1,28 @@
+# Keep agent gateway inject workers: systemd listens here and starts one
+# keep-gateway-inject@.service per connection, so each of the gateway's
+# http_request calls runs in a fresh process of its own (see docs/USAGE.md,
+# "Secrets"). Needs systemd 250 or later.
+#
+# The directory is systemd's, root-owned 0755; the socket is root's, open
+# to the gateway's group alone. The gateway checks both before it sends a
+# request with a secret in it. Nothing but the gateway's user may be in the
+# keep-gateway group.
+
+[Unit]
+Description=Keep agent gateway inject workers
+Documentation=https://github.com/privkeyio/keep/blob/main/docs/USAGE.md#secrets
+PartOf=keep-gateway.service
+
+[Socket]
+ListenStream=/run/keep-gateway-inject/worker.sock
+Accept=yes
+SocketUser=root
+SocketGroup=keep-gateway
+SocketMode=0660
+DirectoryMode=0755
+# The gateway allows four requests in flight; this is a second bound.
+MaxConnections=8
+MaxConnectionsPerSource=8
+
+[Install]
+WantedBy=sockets.target
