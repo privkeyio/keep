@@ -8,7 +8,7 @@ const TOKEN: &str = "keep_agt_00112233445566778899aabbccddeeff001122334455667788
 const KEY_ID: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 
 fn key_blob() -> Vec<u8> {
-    crate::ssh::SshKey::from_seed(&[3u8; 32])
+    crate::ssh::SshKey::from_bytes(&[3u8; 32])
         .unwrap()
         .public_blob()
 }

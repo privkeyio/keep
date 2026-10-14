@@ -54,7 +54,7 @@ impl SshKey {
     }
 
     /// The key a stored seed holds.
-    pub fn from_seed(seed: &[u8]) -> Option<Self> {
+    pub fn from_bytes(seed: &[u8]) -> Option<Self> {
         let seed: &[u8; 32] = seed.try_into().ok()?;
         Some(Self(ed25519_dalek::SigningKey::from_bytes(seed)))
     }

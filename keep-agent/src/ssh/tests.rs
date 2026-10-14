@@ -99,7 +99,7 @@ fn rule(host: &[u8]) -> SshRule {
 }
 
 fn agent_key() -> SshKey {
-    SshKey::from_seed(&[3u8; 32]).unwrap()
+    SshKey::from_bytes(&[3u8; 32]).unwrap()
 }
 
 #[test]
@@ -116,10 +116,10 @@ fn a_key_signs_as_ssh_ed25519_and_reads_back() {
     let sig = key.sign(b"data");
     assert!(host_signed(&blob, &sig, b"data"));
     assert!(!host_signed(&blob, &sig, b"other"));
-    assert!(SshKey::from_seed(&[0u8; 31]).is_none());
+    assert!(SshKey::from_bytes(&[0u8; 31]).is_none());
     let (generated, seed) = SshKey::generate().unwrap();
     assert_eq!(
-        SshKey::from_seed(&*seed).unwrap().public_blob(),
+        SshKey::from_bytes(&*seed).unwrap().public_blob(),
         generated.public_blob()
     );
 }
@@ -304,7 +304,7 @@ fn every_login_check_refuses() {
     let (host_key, host) = ed25519_host();
     let (other_key, other_host) = p256_host();
     let key = agent_key().public_blob();
-    let other_agent = SshKey::from_seed(&[4u8; 32]).unwrap().public_blob();
+    let other_agent = SshKey::from_bytes(&[4u8; 32]).unwrap().public_blob();
     let sig = ed25519_sig(&host_key, SESSION);
     let bound = || vec![binding(&host, SESSION, &sig, 0)];
     let good = || good_login(&key, &host, true);

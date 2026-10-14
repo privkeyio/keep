@@ -436,7 +436,7 @@ mod tests {
         use crate::inject::rule::SecretGrant;
         use keep_core::secret::{SecretInfo, SecretKind};
         let host = |seed: u8| {
-            crate::ssh::SshKey::from_seed(&[seed; 32])
+            crate::ssh::SshKey::from_bytes(&[seed; 32])
                 .unwrap()
                 .public_blob()
         };

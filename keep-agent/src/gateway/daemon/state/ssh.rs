@@ -31,7 +31,7 @@ impl State {
     /// The SSH key secret `id` holds, if it is a plain one keep generated.
     pub(super) fn ssh_key(&self, id: &[u8; 32]) -> Option<SshKey> {
         let seed = self.keep.use_secret(id, &[SecretKind::SshKey]).ok()?;
-        SshKey::from_seed(&seed)
+        SshKey::from_bytes(&seed)
     }
 
     /// `list_secrets`' view of an SSH key: its public key, when it can be

@@ -24,7 +24,7 @@ struct Host {
 }
 
 fn host(seed: u8) -> Host {
-    let key = crate::ssh::SshKey::from_seed(&[seed; 32]).unwrap();
+    let key = crate::ssh::SshKey::from_bytes(&[seed; 32]).unwrap();
     let blob = key.public_blob();
     Host { key, blob }
 }

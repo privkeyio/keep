@@ -202,7 +202,7 @@ pub fn cmd_secret_ssh_pubkey(out: &Output, path: &Path, handle: &str, hidden: bo
             record.name
         )));
     }
-    let key = keep_agent::ssh::SshKey::from_seed(&record.value)
+    let key = keep_agent::ssh::SshKey::from_bytes(&record.value)
         .ok_or_else(|| KeepError::invalid_input("this SSH key does not hold an Ed25519 seed"))?;
     println!("{}", ssh_public_key(&key));
     Ok(())
