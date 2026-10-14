@@ -101,7 +101,43 @@ pub struct ChangeGrant {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bitcoin: Option<ChangeBitcoin>,
     pub limits: ChangeLimits,
+    /// The vault secrets the grant uses. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<ChangeSecret>,
 }
+
+/// One vault secret a grant uses. `name` and `kind` are shown so the owner
+/// knows which secret it is; they are the gateway's word, and only the rest
+/// is the grant itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeSecret {
+    pub secret: Hex32,
+    pub name: String,
+    pub kind: String,
+    pub http: Vec<ChangeRule>,
+}
+
+/// Where a secret may be sent over HTTPS. Field order is the order rules
+/// are sorted in: host, then port, then path prefix.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeRule {
+    pub host: String,
+    pub port: Decimal,
+    pub path_prefix: String,
+    pub methods: Vec<String>,
+    pub header: String,
+    pub format: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_headers: Vec<String>,
+}
+
+/// The kinds a granted secret may have.
+pub const SECRET_KINDS: [&str; 4] = ["api_token", "generic", "note", "password"];
+
+/// The HTTP methods a rule may allow, in the ascending order a rule lists them.
+pub const METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
 
 /// A grant's Bitcoin part.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,9 +162,10 @@ pub struct ChangeLimits {
 }
 
 /// The operations a grant may name.
-pub const OPERATIONS: [&str; 6] = [
+pub const OPERATIONS: [&str; 7] = [
     "get_bitcoin_address",
     "get_public_key",
+    "http_request",
     "nip44_decrypt",
     "nip44_encrypt",
     "sign_nostr_event",
@@ -298,6 +335,120 @@ impl ChangeGrant {
                 return Err(malformed("limit out of range"));
             }
         }
+        if self.secrets.len() > MAX_SECRETS {
+            return Err(malformed("too many secrets"));
+        }
+        if !self.secrets.windows(2).all(|w| w[0].secret < w[1].secret) {
+            return Err(malformed("secrets must be strictly ascending by id"));
+        }
+        self.secrets.iter().try_for_each(ChangeSecret::check)
+    }
+}
+
+/// The most secrets a grant names, and HTTP rules a secret holds: the
+/// gateway's limits, so a change no gateway would make is refused.
+pub const MAX_SECRETS: usize = 8;
+pub const MAX_RULES: usize = 4;
+
+impl ChangeSecret {
+    fn check(&self) -> Result<()> {
+        check_label(&self.name, "secret name")?;
+        if !SECRET_KINDS.contains(&self.kind.as_str()) {
+            return Err(malformed(format!("unknown secret kind {:?}", self.kind)));
+        }
+        if self.http.is_empty() || self.http.len() > MAX_RULES {
+            return Err(malformed(format!(
+                "a secret holds 1 to {MAX_RULES} HTTP rules"
+            )));
+        }
+        ascending(&self.http, "http")?;
+        self.http.iter().try_for_each(ChangeRule::check)
+    }
+}
+
+// The shapes of a rule's parts. The gateway checks rules with these same
+// functions (and more), so it never builds a change an approver refuses.
+
+/// A rule host: a lowercase ASCII DNS name with a dot, at most 253
+/// characters, each label 1 to 63 letters, digits or `-`.
+pub fn rule_host_ok(host: &str) -> bool {
+    host.len() <= 253
+        && host.contains('.')
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+/// A rule path prefix: starts with `/`, is more than `/`, at most 256
+/// characters, only unescaped path characters (no `%` or `;`), and no empty,
+/// `.` or `..` segment.
+pub fn path_prefix_ok(prefix: &str) -> bool {
+    prefix.starts_with('/')
+        && prefix != "/"
+        && prefix.len() <= 256
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/-._~!$&'()*+,=:@".contains(&b))
+        && !prefix.contains("//")
+        && !prefix.split('/').any(|s| s == "." || s == "..")
+}
+
+/// A header name as a rule carries it: 1 to 64 lowercase letters, digits
+/// or `-`.
+pub fn header_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// A rule format: at most 128 printable ASCII characters, exactly one `{}`,
+/// no space at either end.
+pub fn format_ok(format: &str) -> bool {
+    format.len() <= 128
+        && format.matches("{}").count() == 1
+        && format.bytes().all(|b| (b' '..=b'~').contains(&b))
+        && !format.starts_with(' ')
+        && !format.ends_with(' ')
+}
+
+/// The most further headers a rule lets an agent set.
+pub const MAX_AGENT_HEADERS: usize = 8;
+
+impl ChangeRule {
+    fn check(&self) -> Result<()> {
+        if !rule_host_ok(&self.host) {
+            return Err(malformed("a rule host is a lowercase ASCII DNS name"));
+        }
+        if self.port.0 == 0 || self.port.0 > u64::from(u16::MAX) {
+            return Err(malformed("rule port out of range"));
+        }
+        if !path_prefix_ok(&self.path_prefix) {
+            return Err(malformed(
+                "a rule path prefix holds plain path characters only",
+            ));
+        }
+        if self.methods.is_empty() || self.methods.iter().any(|m| !METHODS.contains(&m.as_str())) {
+            return Err(malformed("a rule lists known methods"));
+        }
+        ascending(&self.methods, "methods")?;
+        if !header_name_ok(&self.header) {
+            return Err(malformed("a rule header is a lowercase header name"));
+        }
+        if !format_ok(&self.format) {
+            return Err(malformed("a rule format is printable ASCII with one {}"));
+        }
+        if self.agent_headers.len() > MAX_AGENT_HEADERS
+            || !self.agent_headers.iter().all(|h| header_name_ok(h))
+        {
+            return Err(malformed("agent headers are lowercase header names"));
+        }
+        ascending(&self.agent_headers, "agent_headers")?;
         Ok(())
     }
 }
@@ -553,6 +704,99 @@ mod tests {
     /// Anything outside the schema is refused: a number, a boolean, a null,
     /// an unknown field, a list out of order, an unknown operation or
     /// network, a padded decimal, a value out of range.
+    fn secret_rule(host: &str, port: &str, prefix: &str) -> Value {
+        json!({
+            "host": host, "port": port, "path_prefix": prefix,
+            "methods": ["GET", "POST"], "header": "authorization",
+            "format": "Bearer {}", "agent_headers": ["idempotency-key"]
+        })
+    }
+
+    fn with_secrets() -> Value {
+        let mut v = issue();
+        v["grant"]["operations"] = json!(["http_request"]);
+        v["grant"]["secrets"] = json!([{
+            "secret": "31".repeat(32),
+            "name": "deploy token",
+            "kind": "api_token",
+            "http": [
+                secret_rule("api.example.com", "443", "/v1/a"),
+                secret_rule("api.example.com", "443", "/v1/b"),
+                secret_rule("api.example.com", "8443", "/v1/a"),
+            ]
+        }]);
+        v
+    }
+
+    #[test]
+    fn secrets_in_a_grant_parse_strictly() {
+        Change::parse(&with_secrets()).unwrap();
+
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        let cases: Vec<Mutation> = vec![
+            Box::new(|v| v["grant"]["secrets"][0]["kind"] = json!("ssh_key")),
+            Box::new(|v| v["grant"]["secrets"][0]["reveal"] = json!("true")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["host"] = json!("a_b.example")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["format"] = json!(" {}")),
+            Box::new(|v| v["grant"]["secrets"][0]["name"] = json!("bad\u{202e}name")),
+            Box::new(|v| v["grant"]["secrets"][0]["name"] = json!("")),
+            Box::new(|v| v["grant"]["secrets"][0]["extra"] = json!("x")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"] = json!([])),
+            Box::new(|v| {
+                let r = v["grant"]["secrets"][0]["http"].as_array_mut().unwrap();
+                r.swap(0, 1);
+            }),
+            Box::new(|v| {
+                let r = v["grant"]["secrets"][0]["http"].as_array_mut().unwrap();
+                r.swap(1, 2);
+            }),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["host"] = json!("API.example.com")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["host"] = json!("localhost")),
+            Box::new(|v| {
+                v["grant"]["secrets"][0]["http"][0]["host"] = json!("b\u{fc}cher.example")
+            }),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["host"] = json!("a..example")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["port"] = json!("0")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["port"] = json!("65536")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["port"] = json!(443)),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["path_prefix"] = json!("/")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["path_prefix"] = json!("/v1/../x")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["path_prefix"] = json!("/v1;x")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["path_prefix"] = json!("/v1\u{202e}")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["methods"] = json!(["POST", "GET"])),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["methods"] = json!(["get"])),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["methods"] = json!([])),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["header"] = json!("Authorization")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["header"] = json!("x_api_key")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["format"] = json!("Bearer")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["format"] = json!("{}\n")),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["agent_headers"] = json!(["b", "a"])),
+            Box::new(|v| v["grant"]["secrets"][0]["http"][0]["agent_headers"] = json!(["X-Y"])),
+            Box::new(|v| {
+                let first = v["grant"]["secrets"][0].clone();
+                let mut second = first.clone();
+                second["secret"] = json!("30".repeat(32));
+                v["grant"]["secrets"] = json!([first, second]);
+            }),
+            Box::new(|v| {
+                let first = v["grant"]["secrets"][0].clone();
+                v["grant"]["secrets"] = json!(vec![first; MAX_SECRETS + 1]);
+            }),
+            Box::new(|v| {
+                let r = v["grant"]["secrets"][0]["http"][0].clone();
+                v["grant"]["secrets"][0]["http"] = json!(vec![r; MAX_RULES + 1]);
+            }),
+        ];
+        for (i, change) in cases.iter().enumerate() {
+            let mut v = with_secrets();
+            change(&mut v);
+            assert!(
+                Change::parse(&v).is_err(),
+                "case {i} should be refused: {v}"
+            );
+        }
+    }
+
     #[test]
     fn strict_parse_refuses_everything_else() {
         let mut bad: Vec<Value> = Vec::new();

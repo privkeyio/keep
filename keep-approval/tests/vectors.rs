@@ -18,7 +18,9 @@ use keep_approval::binding::{
     check_request, Binding, Network, Nip44DecryptPayload, Nip44EncryptPayload, NostrPayload,
     Payload, RequestDraft, UnsignedEventFields,
 };
-use keep_approval::change::{Change, ChangeBitcoin, ChangeGrant, ChangeLimits, Decimal, Scope};
+use keep_approval::change::{
+    Change, ChangeBitcoin, ChangeGrant, ChangeLimits, ChangeRule, ChangeSecret, Decimal, Scope,
+};
 use keep_approval::messages::{
     AnchorState, Budget, CredentialRef, FreezeAction, LogPoint, Reason, Request, SignerKey,
     Verdict, WalletAnchor, WalletName,
@@ -145,6 +147,60 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
             per_hour: Decimal(100),
             per_day: Decimal(1000),
         },
+        secrets: vec![],
+    };
+    let secrets_grant = ChangeGrant {
+        keys: vec![],
+        operations: vec!["http_request".into()],
+        event_kinds: vec![],
+        nip44_peers: vec![],
+        bitcoin: None,
+        limits: ChangeLimits {
+            per_minute: Decimal(10),
+            per_hour: Decimal(100),
+            per_day: Decimal(1000),
+        },
+        secrets: vec![
+            ChangeSecret {
+                secret: Hex32([0x31; 32]),
+                name: "GitHub token \u{1f511}".into(),
+                kind: "api_token".into(),
+                http: vec![
+                    ChangeRule {
+                        host: "api.github.com".into(),
+                        port: Decimal(443),
+                        path_prefix: "/repos/privkeyio/".into(),
+                        methods: vec!["GET".into(), "POST".into()],
+                        header: "authorization".into(),
+                        format: "Bearer {}".into(),
+                        agent_headers: vec!["x-github-api-version".into()],
+                    },
+                    ChangeRule {
+                        host: "xn--bcher-kva.example".into(),
+                        port: Decimal(8443),
+                        path_prefix: "/v1".into(),
+                        methods: vec!["GET".into()],
+                        header: "x-api-key".into(),
+                        format: "{}".into(),
+                        agent_headers: vec![],
+                    },
+                ],
+            },
+            ChangeSecret {
+                secret: Hex32([0x32; 32]),
+                name: "Stripe".into(),
+                kind: "password".into(),
+                http: vec![ChangeRule {
+                    host: "api.stripe.com".into(),
+                    port: Decimal(443),
+                    path_prefix: "/v1/charges".into(),
+                    methods: vec!["GET".into()],
+                    header: "authorization".into(),
+                    format: "Basic {}".into(),
+                    agent_headers: vec![],
+                }],
+            },
+        ],
     };
     vec![
         (
@@ -275,6 +331,27 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
                 None,
                 None,
                 Some(credential.clone()),
+            ),
+        ),
+        (
+            "management issue_credential with secrets",
+            draft(
+                Payload::Management(Change::IssueCredential {
+                    id: Hex16([0x23; 16]),
+                    name: "deployer".into(),
+                    uid: Decimal(1002),
+                    created_at: Decimal(1_791_580_000),
+                    expires_at: Decimal(1_794_172_000),
+                    grant: secrets_grant,
+                }),
+                Reason::Management,
+                None,
+                None,
+                Some(CredentialRef {
+                    id: Hex16([0x23; 16]),
+                    name: "deployer".into(),
+                    uid: 1002,
+                }),
             ),
         ),
         (
