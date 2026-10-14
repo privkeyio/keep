@@ -52,11 +52,19 @@ fn init_logging() {
     // at ERROR during normal FROST coordination (we frequently close and
     // re-open ephemeral subscriptions). The error is recoverable; the noise
     // is misleading. Operators can re-enable via RUST_LOG=nostr_relay_pool=error.
-    let filter = EnvFilter::from_default_env().add_directive(
-        "nostr_relay_pool=warn"
-            .parse()
-            .expect("static directive is valid"),
-    );
+    // The inject worker's HTTP and TLS stack would log request headers, a
+    // secret among them, at debug and trace, and a RUST_LOG directive for any
+    // of its modules would override a cap on its crates: the worker logs at
+    // warn, whatever RUST_LOG says.
+    let filter = if std::env::args_os().any(|a| a == "inject-worker") {
+        EnvFilter::new("warn")
+    } else {
+        EnvFilter::from_default_env().add_directive(
+            "nostr_relay_pool=warn"
+                .parse()
+                .expect("static directive is valid"),
+        )
+    };
 
     // Logs MUST go to stderr: commands like `frost network oprf-unlock` emit the raw
     // 32-byte LUKS key as the ONLY thing on stdout (a boot gate reads it with
@@ -147,7 +155,10 @@ fn run(out: &Output) -> Result<()> {
     // made before any vault is involved.
     #[cfg(target_os = "linux")]
     if let Commands::Gateway {
-        command: command @ (GatewayCommands::Relay { .. } | GatewayCommands::ChannelKey { .. }),
+        command:
+            command @ (GatewayCommands::Relay { .. }
+            | GatewayCommands::ChannelKey { .. }
+            | GatewayCommands::InjectWorker {}),
     } = cli.command
     {
         return commands::gateway::dispatch_without_vault(command);

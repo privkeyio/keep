@@ -18,8 +18,13 @@ use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
 mod approvals;
+mod inject;
 
 pub use approvals::{reset_store, Pending};
+pub use inject::InjectSettings;
+#[cfg(test)]
+pub(crate) use inject::MAX_IN_FLIGHT;
+pub(crate) use inject::{checked_response, InjectJob, InjectOutcome};
 
 use super::clock::{self, Clock, Heartbeat, Seed, TimeSource, HEARTBEAT_KEY};
 use super::limits::Counters;
@@ -123,6 +128,8 @@ pub struct Settings {
     pub uid_limits: RequestLimits,
     /// Audit entries a day: one credential's, and every credential's together.
     pub audit_budgets: (u32, u32),
+    /// Where inject workers are reached, when `http_request` is served.
+    pub inject: Option<InjectSettings>,
 }
 
 impl Default for Settings {
@@ -137,6 +144,7 @@ impl Default for Settings {
                 per_day: 20_000,
             },
             audit_budgets: (AUDIT_BUDGET_PER_DAY, GATEWAY_AUDIT_BUDGET_PER_DAY),
+            inject: None,
         }
     }
 }
@@ -340,6 +348,8 @@ pub struct State {
     /// Keys no grant may name: the channel key and every registered approver
     /// device's keys.
     reserved: ReservedKeys,
+    /// `http_request`s in flight, and the way to the inject workers.
+    injects: inject::Injects,
     /// Tests only: how many withdrawals got as far as reading a credential
     /// row, and as far as checking the token against every credential.
     #[cfg(test)]
@@ -480,6 +490,7 @@ impl State {
             )));
         }
         let (credential_budget, gateway_budget) = settings.audit_budgets;
+        let injects = inject::Injects::new(settings.inject.clone());
         let mut state = Self {
             keep,
             audit: AgentAudit::with_budgets(credential_budget, gateway_budget),
@@ -499,6 +510,7 @@ impl State {
             deferred: Vec::new(),
             dropped: 0,
             reserved: ReservedKeys::new(),
+            injects,
             #[cfg(test)]
             withdrawal_checks: (0, 0),
         };
@@ -908,6 +920,8 @@ impl State {
             Some(tools::GET_ADDRESS) => self.get_address(granted, args, now),
             Some(tools::SIGN_PSBT) => self.sign_psbt(granted, args, now),
             Some(tools::SESSION_INFO) => self.session_info(granted, args, now),
+            Some(tools::LIST_SECRETS) => self.list_secrets(granted, args, now),
+            Some(tools::HTTP_REQUEST) => return self.http_request(granted, id, args, now),
             _ => Err(Refusal::Invalid {
                 code: -32602,
                 message: "unknown tool".into(),
@@ -1294,6 +1308,37 @@ impl State {
         }))
     }
 
+    /// The secrets the grant names, with what each may be used for: never a
+    /// value. A secret deleted, sealed or of a kind its use does not allow
+    /// since the grant was issued is listed as unusable.
+    fn list_secrets(&mut self, granted: &GrantedCredential, args: &Value, now: u64) -> Served {
+        only_args(args, &[])?;
+        if granted.grant.secrets.is_empty() {
+            return Err(Refusal::deny(DenyReason::SecretNotGranted));
+        }
+        let secrets: Vec<Value> = granted
+            .grant
+            .secrets
+            .iter()
+            .map(|entry| {
+                let id = hex::encode(entry.secret);
+                match self.keep.secret_info(&entry.secret) {
+                    Ok(info) => json!({
+                        "id": id,
+                        "name": info.name,
+                        "kind": info.kind.as_str(),
+                        "usable": !info.sealed
+                            && crate::inject::rule::HTTP_KINDS.contains(&info.kind),
+                        "http": entry.http,
+                    }),
+                    Err(_) => json!({ "id": id, "usable": false, "http": entry.http }),
+                }
+            })
+            .collect();
+        self.served(granted, tools::LIST_SECRETS, "", now)?;
+        Ok(json!({ "secrets": secrets }))
+    }
+
     fn served(
         &mut self,
         granted: &GrantedCredential,
@@ -1416,10 +1461,46 @@ impl State {
 
     /// The grant a credential for `uid` may be issued with, parsed from
     /// `grant`: see [`Self::checked_grant`].
-    fn issuable_grant(&self, uid: u32, grant: Value) -> Result<Grant> {
+    fn issuable_grant(&self, uid: u32, mut grant: Value) -> Result<Grant> {
+        self.resolve_secret_names(&mut grant)?;
         let grant: Grant = serde_json::from_value(grant)
             .map_err(|e| AgentError::ScopeViolation(format!("invalid grant: {e}")))?;
         self.checked_grant(uid, grant)
+    }
+
+    /// Replace each secret the owner named as `{"name": ...}` with its id,
+    /// then sort the entries by id, as a grant lists them. A name no secret
+    /// has and one several share get one answer, so the admin socket cannot
+    /// tell those two apart.
+    fn resolve_secret_names(&self, grant: &mut Value) -> Result<()> {
+        let Some(secrets) = grant.get_mut("secrets").and_then(Value::as_array_mut) else {
+            return Ok(());
+        };
+        for entry in secrets.iter_mut() {
+            let Some(slot) = entry.get_mut("secret") else {
+                continue;
+            };
+            let Some(named) = slot.as_object() else {
+                continue;
+            };
+            let name = match (named.len(), named.get("name").and_then(Value::as_str)) {
+                (1, Some(name)) => name.to_string(),
+                _ => {
+                    return Err(AgentError::ScopeViolation(
+                        "a secret is given by its id or as {\"name\": ...}".into(),
+                    ))
+                }
+            };
+            let id = self.keep.find_secret(&name).map_err(|_| {
+                AgentError::ScopeViolation("unknown or ambiguous secret name".into())
+            })?;
+            *slot = Value::String(hex::encode(id));
+        }
+        secrets.sort_by(|a, b| {
+            let id = |v: &Value| v.get("secret").and_then(Value::as_str).map(str::to_owned);
+            id(a).cmp(&id(b))
+        });
+        Ok(())
     }
 
     /// `grant`, if a credential for `uid` may be issued with it now: the uid
@@ -1430,7 +1511,8 @@ impl State {
         if forbidden_uid(&self.host, &self.settings, uid) || !bindable_uid(uid) {
             return Err(AgentError::ScopeViolation(format!(
                 "uid {uid} is root, the gateway's, the vault owner's, the admin's, the relay \
-                 helper's or the overflow uid; a credential bound to it would stop nothing"
+                 helper's, the overflow uid or (with injection on) one systemd gives \
+                 dynamic services; a credential bound to it would stop nothing"
             )));
         }
         for key in &grant.keys {
@@ -1450,7 +1532,39 @@ impl State {
                 }
             }
         }
-        grant.validated(&self.reserved)
+        for entry in &grant.secrets {
+            let id = hex::encode(entry.secret);
+            let info = self.keep.secret_info(&entry.secret).map_err(|_| {
+                AgentError::ScopeViolation(format!("secret {id} is not in the vault"))
+            })?;
+            if info.sealed {
+                return Err(AgentError::ScopeViolation(format!(
+                    "secret {id} is threshold-sealed, and cannot be used by an agent"
+                )));
+            }
+            if !entry.http.is_empty() && !crate::inject::rule::HTTP_KINDS.contains(&info.kind) {
+                return Err(AgentError::ScopeViolation(format!(
+                    "secret {id} is a {}, which is not sent over HTTP",
+                    info.kind.as_str()
+                )));
+            }
+        }
+        // Only once the rules are valid: a header value is built from each
+        // rule's format.
+        let grant = grant.validated(&self.reserved)?;
+        for entry in grant.secrets.iter().filter(|e| !e.http.is_empty()) {
+            let id = hex::encode(entry.secret);
+            let value = self
+                .keep
+                .use_secret(&entry.secret, &crate::inject::rule::HTTP_KINDS)
+                .map_err(|_| AgentError::ScopeViolation(format!("secret {id} cannot be read")))?;
+            for rule in &entry.http {
+                rule.header_value(&value).map_err(|e| {
+                    AgentError::ScopeViolation(format!("secret {id} cannot be sent: {e}"))
+                })?;
+            }
+        }
+        Ok(grant)
     }
 
     /// Issue a credential. The answer is the one line that carries its token,
@@ -1699,7 +1813,12 @@ fn forbidden_uid(host: &Host, settings: &Settings, uid: u32) -> bool {
         || uid == host.overflow_uid
         || settings.admin_uid == Some(uid)
         || settings.relay_uid == Some(uid)
+        || (settings.inject.is_some() && DYNAMIC_UIDS.contains(&uid))
 }
+
+/// The uids systemd gives services that run under `DynamicUser=`, as inject
+/// workers do: no credential is bound to one.
+pub const DYNAMIC_UIDS: std::ops::RangeInclusive<u32> = 61_184..=65_519;
 
 /// The longest line taken for a cancellation before the uid's request limit:
 /// a longer one is refused as any line is, with a null id, so the bridge
@@ -1790,6 +1909,11 @@ fn only_args(args: &Value, allowed: &[&str]) -> std::result::Result<(), Refusal>
     }
 }
 
+/// A secret id as an agent names it: 64 lowercase hex characters.
+fn parse_secret_id(s: &str) -> Option<[u8; 32]> {
+    keep_approval::Hex32::parse(s).ok().map(|h| h.0)
+}
+
 /// The key a request names, or the grant's only key.
 fn key_arg(grant: &Grant, args: &Value) -> std::result::Result<[u8; 32], Refusal> {
     match args.get("key") {
@@ -1864,6 +1988,7 @@ fn grant_json(grant: &Grant) -> Value {
         "nip44_peers": grant.nip44_peers.iter().map(hex::encode).collect::<Vec<_>>(),
         "bitcoin": grant.bitcoin,
         "limits": grant.limits,
+        "secrets": grant.secrets,
     })
 }
 

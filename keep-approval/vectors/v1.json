@@ -39,6 +39,82 @@
       "type_code": 1
     },
     {
+      "canonical": "{\"created_at\":\"1791580000\",\"expires_at\":\"1794172000\",\"grant\":{\"event_kinds\":[],\"keys\":[],\"limits\":{\"per_day\":\"1000\",\"per_hour\":\"100\",\"per_minute\":\"10\"},\"nip44_peers\":[],\"operations\":[\"http_request\"],\"secrets\":[{\"http\":[{\"agent_headers\":[\"x-github-api-version\"],\"format\":\"Bearer {}\",\"header\":\"authorization\",\"host\":\"api.github.com\",\"methods\":[\"GET\",\"POST\"],\"path_prefix\":\"/repos/privkeyio/\",\"port\":\"443\"},{\"format\":\"{}\",\"header\":\"x-api-key\",\"host\":\"xn--bcher-kva.example\",\"methods\":[\"GET\"],\"path_prefix\":\"/v1\",\"port\":\"8443\"}],\"kind\":\"api_token\",\"name\":\"GitHub token 🔑\",\"secret\":\"3131313131313131313131313131313131313131313131313131313131313131\"},{\"http\":[{\"format\":\"Basic {}\",\"header\":\"authorization\",\"host\":\"api.stripe.com\",\"methods\":[\"GET\"],\"path_prefix\":\"/v1/charges\",\"port\":\"443\"}],\"kind\":\"password\",\"name\":\"Stripe\",\"secret\":\"3232323232323232323232323232323232323232323232323232323232323232\"}]},\"id\":\"23232323232323232323232323232323\",\"name\":\"deployer\",\"type\":\"issue_credential\",\"uid\":\"1002\"}",
+      "change": {
+        "created_at": "1791580000",
+        "expires_at": "1794172000",
+        "grant": {
+          "event_kinds": [],
+          "keys": [],
+          "limits": {
+            "per_day": "1000",
+            "per_hour": "100",
+            "per_minute": "10"
+          },
+          "nip44_peers": [],
+          "operations": [
+            "http_request"
+          ],
+          "secrets": [
+            {
+              "http": [
+                {
+                  "agent_headers": [
+                    "x-github-api-version"
+                  ],
+                  "format": "Bearer {}",
+                  "header": "authorization",
+                  "host": "api.github.com",
+                  "methods": [
+                    "GET",
+                    "POST"
+                  ],
+                  "path_prefix": "/repos/privkeyio/",
+                  "port": "443"
+                },
+                {
+                  "format": "{}",
+                  "header": "x-api-key",
+                  "host": "xn--bcher-kva.example",
+                  "methods": [
+                    "GET"
+                  ],
+                  "path_prefix": "/v1",
+                  "port": "8443"
+                }
+              ],
+              "kind": "api_token",
+              "name": "GitHub token 🔑",
+              "secret": "3131313131313131313131313131313131313131313131313131313131313131"
+            },
+            {
+              "http": [
+                {
+                  "format": "Basic {}",
+                  "header": "authorization",
+                  "host": "api.stripe.com",
+                  "methods": [
+                    "GET"
+                  ],
+                  "path_prefix": "/v1/charges",
+                  "port": "443"
+                }
+              ],
+              "kind": "password",
+              "name": "Stripe",
+              "secret": "3232323232323232323232323232323232323232323232323232323232323232"
+            }
+          ]
+        },
+        "id": "23232323232323232323232323232323",
+        "name": "deployer",
+        "type": "issue_credential",
+        "uid": "1002"
+      },
+      "sha256": "233d3fcb485884b01be64a33508a760af696071c1e99a09d03a5c2afd0fc59b0",
+      "type_code": 1
+    },
+    {
       "canonical": "{\"epoch\":\"41\",\"scope\":\"all\",\"type\":\"unfreeze\"}",
       "change": {
         "epoch": "41",
@@ -605,6 +681,119 @@
         "v": 1
       },
       "request_hash": "54f5aea7794bf6c9f812b37bbc1f74a12e4ff6fb4563029d735149f5ae550645"
+    },
+    {
+      "name": "management issue_credential with secrets",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f232323232323232323232323232323234444444444444444444444444444444444444444444444444444444444444444100000000000000000000000000000000000000000000000000000000000000000002100000001233d3fcb485884b01be64a33508a760af696071c1e99a09d03a5c2afd0fc59b0",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "23232323232323232323232323232323",
+          "name": "deployer",
+          "uid": 1002
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "created_at": "1791580000",
+            "expires_at": "1794172000",
+            "grant": {
+              "event_kinds": [],
+              "keys": [],
+              "limits": {
+                "per_day": "1000",
+                "per_hour": "100",
+                "per_minute": "10"
+              },
+              "nip44_peers": [],
+              "operations": [
+                "http_request"
+              ],
+              "secrets": [
+                {
+                  "http": [
+                    {
+                      "agent_headers": [
+                        "x-github-api-version"
+                      ],
+                      "format": "Bearer {}",
+                      "header": "authorization",
+                      "host": "api.github.com",
+                      "methods": [
+                        "GET",
+                        "POST"
+                      ],
+                      "path_prefix": "/repos/privkeyio/",
+                      "port": "443"
+                    },
+                    {
+                      "format": "{}",
+                      "header": "x-api-key",
+                      "host": "xn--bcher-kva.example",
+                      "methods": [
+                        "GET"
+                      ],
+                      "path_prefix": "/v1",
+                      "port": "8443"
+                    }
+                  ],
+                  "kind": "api_token",
+                  "name": "GitHub token 🔑",
+                  "secret": "3131313131313131313131313131313131313131313131313131313131313131"
+                },
+                {
+                  "http": [
+                    {
+                      "format": "Basic {}",
+                      "header": "authorization",
+                      "host": "api.stripe.com",
+                      "methods": [
+                        "GET"
+                      ],
+                      "path_prefix": "/v1/charges",
+                      "port": "443"
+                    }
+                  ],
+                  "kind": "password",
+                  "name": "Stripe",
+                  "secret": "3232323232323232323232323232323232323232323232323232323232323232"
+                }
+              ]
+            },
+            "id": "23232323232323232323232323232323",
+            "name": "deployer",
+            "type": "issue_credential",
+            "uid": "1002"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "0f3adde1b283390ef0133f4103266df59c3b6d6acc26f258735df7d7fdac5366",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "0f3adde1b283390ef0133f4103266df59c3b6d6acc26f258735df7d7fdac5366"
     },
     {
       "name": "management unfreeze all",

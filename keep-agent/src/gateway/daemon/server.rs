@@ -787,6 +787,7 @@ pub async fn serve(
     let is_admin = move |uid: u32| uid == 0 || admin_uid == Some(uid);
     let bound = state.bound_uids();
     let link = state.take_relay_link();
+    let inject_jobs = state.take_inject_jobs();
     let state: Shared = Arc::new(Mutex::new(state));
     let (stop, mut stopped) = watch::channel(false);
     let agent_slots = Slots::default();
@@ -806,6 +807,14 @@ pub async fn serve(
         ))),
         _ => None,
     };
+    let injects = inject_jobs.map(|(jobs, settings)| {
+        tokio::spawn(super::inject::inject_task(
+            jobs,
+            settings,
+            state.clone(),
+            stop.clone(),
+        ))
+    });
     tokio::pin!(shutdown);
     let failed = loop {
         tokio::select! {
@@ -879,6 +888,10 @@ pub async fn serve(
             s.cancel_all("canceled: the gateway is stopping")
         })
         .await;
+    }
+    if let Some(injects) = injects {
+        injects.abort();
+        let _ = injects.await;
     }
     let _ = closing.send(true);
     if let Some(mut relay) = relay {

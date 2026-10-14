@@ -1,0 +1,67 @@
+# One Keep inject worker, for one connection from the gateway: it reads the
+# request (a secret in it) from the connection, sends it over HTTPS, and
+# writes the response back. It holds no vault. Started by
+# keep-gateway-inject.socket; never enabled or started by hand.
+
+[Unit]
+Description=Keep agent gateway inject worker
+Documentation=https://github.com/privkeyio/keep/blob/main/docs/USAGE.md#secrets
+CollectMode=inactive-or-failed
+
+[Service]
+# Running only once the worker itself runs, under its own user.
+Type=exec
+ExecStart=/usr/local/bin/keep gateway inject-worker
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+# A uid of its own, shared with no other instance and no other service:
+# systemd allocates a dynamic user per name, and the instance name is
+# unique to the connection (DynamicUser= alone would give every instance
+# the template's one user).
+DynamicUser=yes
+User=kgi-%i
+# Past the worker's own 35 s limit.
+RuntimeMaxSec=40
+
+UMask=0077
+LimitCORE=0
+LimitNOFILE=64
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+# The resolver and the host the rule names; the gateway's connection is
+# standard input.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# It connects out and never listens; nor does it need the system bus.
+SocketBindDeny=any
+InaccessiblePaths=-/run/dbus
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RemoveIPC=yes
+DevicePolicy=closed
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @debug process_vm_readv process_vm_writev pidfd_getfd
+SystemCallErrorNumber=EPERM
+# No IPAddressDeny= on private ranges: it would block the resolver
+# (127.0.0.53 under systemd-resolved, or one on the LAN). The worker refuses
+# any address that is not globally reachable, and verifies the server's
+# certificate, itself.

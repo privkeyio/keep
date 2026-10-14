@@ -16,6 +16,9 @@ pub enum Operation {
     GetBitcoinAddress,
     Nip44Encrypt,
     Nip44Decrypt,
+    /// Send an HTTPS request with a granted secret added to it, without the
+    /// agent ever holding the secret.
+    HttpRequest,
 }
 
 impl Operation {
@@ -27,6 +30,7 @@ impl Operation {
             Operation::GetBitcoinAddress => "get_bitcoin_address",
             Operation::Nip44Encrypt => "nip44_encrypt",
             Operation::Nip44Decrypt => "nip44_decrypt",
+            Operation::HttpRequest => "http_request",
         }
     }
 }

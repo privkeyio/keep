@@ -11,6 +11,16 @@
 # only when KEEP_GATEWAY_E2E=1:
 #
 #   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep
+#
+# With two more arguments it also checks http_request end to end: a build of
+# keep made with RUSTFLAGS='--cfg keep_e2e_roots' and KEEP_E2E_CA_DER naming
+# the CA in the directory scripts/lib/inject-e2e-pki.sh made, which runs the
+# inject workers, and that directory, whose certificate the test server
+# presents. The server, its DNS and the workers run in a network namespace
+# with no route out.
+#
+#   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep \
+#       target/e2e-roots/release/keep /path/to/pki
 
 set -euo pipefail
 
@@ -22,7 +32,9 @@ if [[ $(id -u) -ne 0 ]]; then
     echo "run as root" >&2
     exit 2
 fi
-BIN_SRC=${1:?usage: gateway-e2e.sh path/to/keep}
+BIN_SRC=${1:?usage: gateway-e2e.sh path/to/keep [path/to/e2e-roots-keep pki-dir]}
+E2E_BIN_SRC=${2:-}
+PKI=${3:-}
 
 P=kgwe2e
 GW=${P}gw
@@ -32,15 +44,25 @@ A2=${P}a2
 OUT=${P}out
 AGENTS=${P}agents
 ADMINS=${P}admins
+INJ=${P}inj
+NS=${P}
 RUN=/run/${P}
 GW_PID=
+ACTIVATOR_PID=
+SERVER_PID=
+DNS_PID=
+CREATED_NS=
 PASS=e2e-vault-password
 CREATED_RUN=
 . "$(dirname "$0")/lib/gateway-e2e.sh"
 
-refuse_users $GW $ADMIN $A1 $A2 $OUT
+refuse_users $GW $ADMIN $A1 $A2 $OUT $INJ
 refuse_groups $AGENTS $ADMINS
-refuse_paths "$RUN"
+refuse_paths "$RUN" "/etc/netns/$NS"
+if [[ -n $E2E_BIN_SRC ]] && ip netns list | grep -qw "$NS"; then
+    echo "refusing to run: network namespace $NS exists" >&2
+    exit 2
+fi
 WORK=$(mktemp -d /tmp/${P}.XXXXXX)
 
 fail_context() {
@@ -54,6 +76,11 @@ cleanup() {
     if [[ -n $GW_PID ]] && kill -0 "$GW_PID" 2>/dev/null; then
         kill "$GW_PID" 2>/dev/null || true
         reap "$GW_PID" || true
+    fi
+    stop_pid "$ACTIVATOR_PID" "$SERVER_PID" "$DNS_PID"
+    if [[ -n $CREATED_NS ]]; then
+        ip netns delete "$NS" 2>/dev/null || true
+        rm -rf "/etc/netns/$NS"
     fi
     remove_created_accounts
     rm -rf "$WORK"
@@ -643,5 +670,232 @@ start_gateway
 gw_admin status >/dev/null || fail "status after a crash"
 stop_gateway
 pass "a stale socket from a killed gateway is replaced"
+
+if [[ -z $E2E_BIN_SRC ]]; then
+    echo "all gateway e2e checks passed (http_request not checked: no e2e build given)"
+    exit 0
+fi
+
+# http_request. The gateway is stopped, so the owner adds the secret.
+SECRET_VALUE=sk_e2e_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+printf '%s' "$SECRET_VALUE" | as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" \
+    secret add --name "deploy token" --kind api-token >/dev/null 2>&1 || fail "secret add"
+install -m 0755 "$E2E_BIN_SRC" "$WORK/keep-e2e"
+grep -q keep-e2e-roots-build "$WORK/keep-e2e" || fail "the e2e build lacks its marker"
+grep -q keep-e2e-roots-build "$KEEP" && fail "the release build carries the e2e marker"
+pass "only the e2e build carries the e2e root"
+
+# A namespace with one globally reachable address and no route out: the test
+# server and its DNS answer there, and the workers run in it.
+ip netns add "$NS"
+CREATED_NS=1
+ip -n "$NS" link set lo up
+ip -n "$NS" link add d0 type dummy
+ip -n "$NS" addr add 11.22.33.44/32 dev d0
+ip -n "$NS" link set d0 up
+install -d -m 0755 "/etc/netns/$NS"
+echo "nameserver 11.22.33.44" >"/etc/netns/$NS/resolv.conf"
+echo "hosts: files dns" >"/etc/netns/$NS/nsswitch.conf"
+printf '127.0.0.1 localhost\n' >"/etc/netns/$NS/hosts"
+cat >"$WORK/dns.py" <<'PY'
+import socket, struct
+names = {b"echo.keep.test": "11.22.33.44", b"evil.keep.test": "10.0.0.1"}
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("11.22.33.44", 53))
+while True:
+    q, addr = s.recvfrom(512)
+    qid, _, qd = struct.unpack(">HHH", q[:6])[0], 0, 1
+    labels, i = [], 12
+    while q[i]:
+        labels.append(q[i + 1:i + 1 + q[i]])
+        i += q[i] + 1
+    qtype = struct.unpack(">H", q[i + 1:i + 3])[0]
+    question = q[12:i + 5]
+    name = b".".join(labels).lower()
+    ip = names.get(name)
+    answers = b""
+    if ip and qtype == 1:
+        answers = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + socket.inet_aton(ip)
+    rcode = 0 if ip else 3
+    header = struct.pack(">HHHHHH", qid, 0x8180 | rcode, 1, 1 if answers else 0, 0, 0)
+    s.sendto(header + question + answers, addr)
+PY
+cat >"$WORK/server.py" <<'PY'
+import http.server, json, ssl, sys
+pki, log = sys.argv[1], sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(log, "a") as f:
+            f.write(json.dumps({"path": self.path, "headers": dict(self.headers)}) + "\n")
+        if self.path == "/v1/ok":
+            body, extra = b'{"ok":true}', [("Set-Cookie", "session=abc"), ("Content-Type", "application/json")]
+        elif self.path == "/v1/echo":
+            body, extra = str(self.headers).encode(), [("Content-Type", "text/plain")]
+        elif self.path == "/v1/gzip":
+            body, extra = b"\x1f\x8b\x08\x00", [("Content-Encoding", "gzip")]
+        elif self.path == "/v1/cut":
+            # The secret straddling the 256 KiB the agent is given.
+            body = b"x" * (256 * 1024 - 5) + self.headers["Authorization"].encode() + b"y" * 100
+            extra = [("Content-Type", "text/plain")]
+        elif self.path == "/v1/slow":
+            import time
+            time.sleep(4)
+            body, extra = b"slow", []
+        elif self.path == "/v1/redirect":
+            self.send_response(302)
+            self.send_header("Location", "https://echo.keep.test/v1/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        else:
+            body, extra = b"not found", []
+        self.send_response(200)
+        for k, v in extra:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(pki + "/leaf.pem", pki + "/leaf.key")
+srv = http.server.HTTPServer(("11.22.33.44", 443), H)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+PY
+ip netns exec "$NS" python3 -I "$WORK/dns.py" >>"$WORK/dns.log" 2>&1 &
+DNS_PID=$!
+ip netns exec "$NS" python3 -I "$WORK/server.py" "$PKI" "$WORK/server-requests" >>"$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+sleep 1
+kill -0 "$DNS_PID" "$SERVER_PID" || fail "test server: $(cat "$WORK/server.log" "$WORK/dns.log")"
+
+# The workers, one per connection, as systemd's socket unit starts them: as
+# their own user, in the namespace, the connection as their standard input
+# and output. The socket is root's, in a root directory, open to the
+# gateway's group.
+add_user --user-group "$INJ"
+install -d -m 0755 "$RUN/inject"
+WORKER_SOCK=$RUN/inject/worker.sock
+start_workers() {
+    local bin=$1
+    rm -f "$WORKER_SOCK"
+    systemd-socket-activate --accept --inetd -l "$WORKER_SOCK" -- \
+        ip netns exec "$NS" setpriv --reuid="$INJ" --regid="$INJ" --clear-groups \
+        env -i PATH=/usr/bin:/bin "$bin" gateway inject-worker >>"$WORK/worker.log" 2>&1 &
+    ACTIVATOR_PID=$!
+    for _ in $(seq 50); do [[ -S $WORKER_SOCK ]] && break; sleep 0.1; done
+    [[ -S $WORKER_SOCK ]] || fail "worker socket"
+    chgrp "$GW" "$WORKER_SOCK"
+    chmod 0660 "$WORKER_SOCK"
+}
+start_workers "$WORK/keep-e2e"
+start_gateway --inject-socket "$WORKER_SOCK"
+
+cat >"$WORK/admin-out/secrets.json" <<'JSON'
+[{"secret": {"name": "deploy token"}, "http": [
+  {"host": "echo.keep.test", "port": 443, "methods": ["GET"], "path_prefix": "/v1",
+   "header": "authorization", "format": "Bearer {}"},
+  {"host": "evil.keep.test", "port": 443, "methods": ["GET"], "path_prefix": "/v1",
+   "header": "authorization", "format": "Bearer {}"}
+]}]
+JSON
+chmod 0644 "$WORK/admin-out/secrets.json"
+as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name http \
+    --uid "$(uid "$A1")" --op http_request --secrets-file "$WORK/admin-out/secrets.json" \
+    --per-minute 60 --token-out "$WORK/admin-out/http-token" >"$WORK/http-issue.json" 2>"$WORK/http-issue.err" \
+    || fail "issue with secrets: $(cat "$WORK/http-issue.err")"
+install -m 0600 -o "$A1" "$WORK/admin-out/http-token" "$WORK/a1/http-token"
+SECRET_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["grant"]["secrets"][0]["secret"])' "$WORK/http-issue.json")
+HTTP_ID=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$WORK/http-issue.json")
+pass "issued a credential granted the secret by name ($SECRET_ID)"
+
+req() { call "$1" http_request "{\"secret\":\"$SECRET_ID\",\"method\":\"${3:-GET}\",\"url\":\"$2\"${4:-}}"; }
+ANS=$( {
+    call 1 list_secrets '{}'
+    req 2 https://echo.keep.test/v1/ok
+    req 4 https://echo.keep.test/v1/gzip
+    req 5 https://echo.keep.test/v1/redirect
+    req 6 https://echo.keep.test/v2/ok
+    req 7 https://evil.keep.test/v1/ok
+    req 8 https://echo.keep.test:443/v1/ok
+    req 9 https://echo.keep.test/v1/ok POST
+    req 10 https://echo.keep.test/v1/ok GET ',"headers":{"X-Other":"y"}'
+} | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token")
+printf '%s\n' "$ANS" >"$WORK/http-answers"
+python3 - "$WORK/http-answers" "$SECRET_ID" <<'PY' || fail "http_request answers: $ANS"
+import json, sys
+by_id = {a["id"]: a["result"] for a in map(json.loads, filter(str.strip, open(sys.argv[1])))}
+text = lambda i: by_id[i]["content"][0]["text"]
+listed = json.loads(text(1))["secrets"]
+assert listed[0]["id"] == sys.argv[2] and listed[0]["name"] == "deploy token" and listed[0]["usable"], listed
+ok = json.loads(text(2))
+assert not by_id[2]["isError"] and ok["status"] == 200 and ok["body"] == '{"ok":true}', ok
+assert ok["headers"] == {"content-type": "application/json"}, ok
+assert by_id[4]["isError"] and text(4) == "encoded response", text(4)
+redirect = json.loads(text(5))
+assert redirect["status"] == 302 and redirect["headers"]["location"] == "https://echo.keep.test/v1/ok", redirect
+refused = "denied: request not allowed"
+for i in (6, 8, 9, 10):
+    assert by_id[i]["isError"] and text(i) == refused, (i, text(i))
+assert by_id[7]["isError"] and text(7) == "address refused", text(7)
+PY
+pass "http_request: answered within the rule; gzip, other paths, methods and headers, internal addresses and unnormalized URLs refused; redirects returned"
+
+# An echo of the secret is refused and freezes the credential.
+echoed() {
+    local out
+    out=$(req "$1" "$2" | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token")
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert r["isError"] and r["content"][0]["text"] == "secret in response", r' "$out" \
+        || fail "echo $2: $out"
+    gw_admin list | python3 -c 'import json,sys; c=[c for c in json.load(sys.stdin) if c["id"]==sys.argv[1]]; assert c and c[0]["frozen"], c' "$HTTP_ID" \
+        || fail "not frozen after an echo of $2"
+    gw_admin unfreeze "$HTTP_ID" >/dev/null || fail "unfreeze after an echo"
+}
+echoed 3 https://echo.keep.test/v1/echo
+echoed 11 https://echo.keep.test/v1/cut
+pass "an echo of the secret, one split across the cut, is refused and freezes the credential"
+
+python3 - "$WORK/server-requests" "$SECRET_VALUE" <<'PY' || fail "server saw: $(cat "$WORK/server-requests")"
+import json, sys
+reqs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+paths = [r["path"] for r in reqs]
+assert paths == ["/v1/ok", "/v1/gzip", "/v1/redirect", "/v1/echo", "/v1/cut"], paths
+for r in reqs:
+    h = {k.lower(): v for k, v in r["headers"].items()}
+    assert h["authorization"] == "Bearer " + sys.argv[2], h
+    assert h["accept-encoding"] == "identity" and h["host"] == "echo.keep.test", h
+PY
+pass "the server got the secret in the rule's header, and nothing outside the rule reached it"
+
+for f in "$WORK/http-answers" "$WORK/gateway.log" "$WORK/worker.log"; do
+    grep -qF "$SECRET_VALUE" "$f" && fail "the secret is in $(basename "$f")"
+done
+# While a request is in flight (the server holds it for 4 seconds), no
+# process's arguments or environment hold the secret.
+req 12 https://echo.keep.test/v1/slow | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token" >"$WORK/slow" &
+SLOW_PID=$!
+sleep 2
+pgrep -f "inject-worker" >/dev/null || fail "no worker running during the held request"
+for c in /proc/[0-9]*/cmdline /proc/[0-9]*/environ; do
+    grep -qaF "$SECRET_VALUE" "$c" 2>/dev/null && fail "the secret is in $c"
+done
+wait "$SLOW_PID" || fail "held request: $(cat "$WORK/slow")"
+grep -qF 'body\":\"slow' "$WORK/slow" || fail "held request answer: $(cat "$WORK/slow")"
+AUDIT=$(gw_admin audit --limit 40)
+grep -q "http_request" <<<"$AUDIT" || fail "no http_request in the audit log"
+grep -qF "$SECRET_VALUE" <<<"$AUDIT" && fail "the secret is in the audit log"
+pass "the secret is in no answer, log, audit entry, process argument or environment"
+
+# The release build trusts only the bundled roots: the same server fails TLS.
+stop_pid "$ACTIVATOR_PID"
+start_workers "$KEEP"
+ANS=$(req 9 https://echo.keep.test/v1/ok | as "$A1" python3 "$WORK/client.py" "$AGENT_SOCK" "$WORK/a1/http-token")
+python3 -c 'import json,sys; r=json.loads(sys.argv[1])["result"]; assert r["isError"] and r["content"][0]["text"] == "tls", r' "$ANS" \
+    || fail "release worker against the test root: $ANS"
+pass "the release worker refuses a server only the e2e root vouches for"
+stop_gateway
+stop_pid "$ACTIVATOR_PID"
+ACTIVATOR_PID=
 
 echo "all gateway e2e checks passed"

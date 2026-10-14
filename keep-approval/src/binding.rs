@@ -565,6 +565,7 @@ pub(crate) mod tests {
                 per_hour: Decimal(100),
                 per_day: Decimal(1000),
             },
+            secrets: vec![],
         }
     }
 

@@ -85,6 +85,29 @@ impl SecretRecord {
     }
 }
 
+/// What a secret is, without its value: see [`crate::Keep::secret_info`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretInfo {
+    /// The secret's title.
+    pub name: String,
+    /// Its category.
+    pub kind: SecretKind,
+    /// Whether its value is threshold-sealed behind an OPRF quorum.
+    pub sealed: bool,
+}
+
+impl SecretKind {
+    /// The kind's name in a management change shown to an approver.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SecretKind::Password => "password",
+            SecretKind::ApiToken => "api_token",
+            SecretKind::Note => "note",
+            SecretKind::Generic => "generic",
+        }
+    }
+}
+
 /// The threshold seal that gates a secret's VALUE behind a t-of-n OPRF quorum.
 ///
 /// The value is encrypted under a fresh random per-secret data-encryption key

@@ -581,14 +581,18 @@ PY
     "$OLD" gateway status --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1 || fail "old status"
     "$OLD" gateway list --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" >/dev/null 2>&1 || fail "old list"
     before=$(count_credentials)
-    c=$(grep -c '^outcome .*"canceled"' "$WORK/phone.log" || true)
+    # An old keep from before approvals leaves at once and its request is
+    # canceled; one that waits for the phone gives up at the deadline, when
+    # the request expires. Either way nothing is issued.
+    ended='^outcome .*"\(canceled\|expired\)"'
+    c=$(grep -c -- "$ended" "$WORK/phone.log" || true)
     if "$OLD" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name old --uid "$(uid "$A1")" \
         --key "$NPUB" --op get_public_key --token-out "$WORK/root-out/old.token" >"$WORK/old-issue.out" 2>&1; then
         fail "the old issue succeeded without an approval: $(cat "$WORK/old-issue.out")"
     fi
-    wait_for "$WORK/phone.log" '^outcome .*"canceled"' $((c + 1)) 30
+    wait_for "$WORK/phone.log" "$ended" $((c + 1)) 30
     [[ $(count_credentials) == "$before" ]] || fail "the old issue created a credential"
-    pass "old admin commands read the new gateway, and an old issue is withdrawn, not carried out"
+    pass "old admin commands read the new gateway, and an old issue ends unapproved, not carried out"
 fi
 
 # Reset with the gateway stopped: the phone and the channel key are

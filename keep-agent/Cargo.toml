@@ -8,7 +8,7 @@ description = "Agent SDK for Keep - secure signing for AI agents"
 
 [features]
 default = []
-mcp = ["dep:rustix"]
+mcp = ["dep:rustix", "dep:reqwest", "dep:rustls", "dep:webpki-roots"]
 enclave = ["dep:aws-nitro-enclaves-nsm-api"]
 
 [dependencies]
@@ -28,14 +28,26 @@ tracing = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 urlencoding = { workspace = true }
+url = { workspace = true }
+memchr = "2"
+base64 = "0.23"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aws-nitro-enclaves-nsm-api = { version = "0.5", optional = true }
 rustix = { version = "1.1", features = ["fs", "net", "process", "time"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1.0", optional = true }
 
 [dev-dependencies]
 nostr-relay-builder = "0.44"
 keep-core = { path = "../keep-core", features = ["testing"] }
 tempfile = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+
+[lints.rust]
+# Set only by the gateway e2e's own build of the inject worker, through
+# RUSTFLAGS, so no feature can turn it on in a release build.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(keep_e2e_roots)"] }
