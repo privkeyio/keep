@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::HashMap as Map;
+use std::sync::atomic::AtomicBool;
 
+use keep_approval::approver::{CLEARED_GRACE_SECS, FREEZE_SHOWN_SECS, SILENCE_SECS};
 use keep_approval::binding::{
     Nip44DecryptPayload, NostrPayload, Payload, RequestDraft, UnsignedEventFields,
 };
+use keep_approval::change::Decimal;
 use keep_approval::messages::{AnchorState, CredentialRef, Frozen, Reason};
 use p256::ecdsa::signature::Signer;
 
@@ -13,7 +16,7 @@ use super::*;
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 
 #[derive(Default)]
-struct Memory(Mutex<Map<String, Vec<u8>>>);
+struct Memory(Mutex<Map<String, Vec<u8>>>, AtomicBool);
 
 impl SecureStorage for Memory {
     fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
@@ -37,6 +40,9 @@ impl SecureStorage for Memory {
         data: Vec<u8>,
         _: ShareMetadataInfo,
     ) -> Result<(), KeepMobileError> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(KeepMobileError::StorageError { msg: "full".into() });
+        }
         self.0.lock().unwrap().insert(key, data);
         Ok(())
     }
@@ -66,13 +72,15 @@ impl SecureStorage for Memory {
 struct Phone {
     handler: Arc<ApproverHandler>,
     mobile: Arc<KeepMobile>,
+    memory: Arc<Memory>,
     channel: Keys,
     approver: p256::ecdsa::SigningKey,
 }
 
 /// A handler paired with a gateway whose channel key is `channel`.
 fn paired() -> Phone {
-    let storage: Arc<dyn SecureStorage> = Arc::new(Memory::default());
+    let memory = Arc::new(Memory::default());
+    let storage: Arc<dyn SecureStorage> = memory.clone();
     let mobile = Arc::new(KeepMobile::new(storage).unwrap());
     let channel = Keys::generate();
     let approver = p256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
@@ -92,12 +100,20 @@ fn paired() -> Phone {
         counter: 0,
         tracker: AnchorTracker::default(),
         gate: RequestGate::default(),
+        waiting: Vec::new(),
+        alerts: Vec::new(),
+        alert_seq: 0,
+        alerts_dropped: 0,
+        silent_reported: false,
+        unfreeze: None,
     };
-    let handler = ApproverHandler::new(mobile.clone());
-    handler.lock().stored = Some(stored);
+    let handler = ApproverHandler::new(mobile.clone()).unwrap();
+    handler.persist(&stored).unwrap();
+    handler.lock().set(Some(stored));
     Phone {
         handler,
         mobile,
+        memory,
         channel,
         approver,
     }
@@ -113,6 +129,29 @@ fn anchor(seq: u64) -> AnchorState {
 }
 
 impl Phone {
+    /// The app stopped and started again: a new handler on the same storage.
+    fn reopen(self) -> Phone {
+        let Phone {
+            handler,
+            mobile,
+            memory,
+            channel,
+            approver,
+        } = self;
+        drop(handler);
+        Phone {
+            handler: ApproverHandler::new(mobile.clone()).unwrap(),
+            mobile,
+            memory,
+            channel,
+            approver,
+        }
+    }
+
+    fn stored<T>(&self, f: impl FnOnce(&mut Stored) -> T) -> T {
+        f(self.handler.lock().stored.as_mut().unwrap())
+    }
+
     fn channel(&self) -> [u8; 32] {
         sig::xonly(&self.channel)
     }
@@ -186,10 +225,9 @@ fn a_checked_request_is_shown_once_with_the_agents_words_apart() {
     assert!(content.by_agent);
     assert_eq!(content.value, "helloworld", "the bidi override removed");
     assert_eq!(content.removed, 1);
-    assert!(shown
-        .fields
-        .iter()
-        .any(|f| f.label == "tag 0" && f.by_agent));
+    let tag = shown.fields.iter().find(|f| f.label == "tag 0").unwrap();
+    assert!(tag.by_agent);
+    assert_eq!(tag.value, format!("[\"p\",\"{}\"]", "aa".repeat(32)));
     assert!(
         !shown
             .fields
@@ -257,19 +295,49 @@ fn a_decision_is_signed_only_for_a_waiting_request_by_the_approver_key() {
     let wrong: p256::ecdsa::Signature = other.sign(&digest);
     assert!(checked_signature(wrong.to_der().as_bytes(), &approver, &digest32).is_err());
     // Not running: nothing is sent, and the request still waits.
+    let id = request.request_id.to_hex();
     assert!(phone
         .handler
-        .send_decision(phone.sign(&digest, false))
+        .send_decision(id.clone(), true, phone.sign(&digest, false))
         .is_err());
-    assert!(phone
+    assert_eq!(phone.handler.waiting_requests().len(), 1);
+    // Signed for the other verdict: refused here.
+    let deny = phone.handler.decision_digest(id.clone(), false).unwrap();
+    let err = phone
         .handler
-        .lock()
-        .waiting
-        .contains_key(&request.request_id));
+        .send_decision(id, true, phone.sign(&deny, false))
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("sign the digest for this request again"));
+}
+
+#[test]
+fn a_decision_names_a_request_that_is_waiting() {
+    let phone = paired();
+    let request = phone.request(11, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let digest = phone
+        .handler
+        .decision_digest(request.request_id.to_hex(), true)
+        .unwrap();
+    let signature = phone.sign(&digest, false);
+    for id in ["00".repeat(32), "nope".into(), "AB".repeat(32)] {
+        assert!(phone.handler.decision_digest(id.clone(), true).is_err());
+        assert!(phone
+            .handler
+            .send_decision(id, true, signature.clone())
+            .is_err());
+    }
+    phone.stored(|s| s.waiting[0].request = None);
     assert!(
-        phone.handler.send_decision(vec![]).is_err(),
-        "nothing asked"
+        phone
+            .handler
+            .decision_digest(request.request_id.to_hex(), true)
+            .is_err(),
+        "decided once"
     );
+    assert!(phone.handler.waiting_requests().is_empty());
 }
 
 #[test]
@@ -277,13 +345,7 @@ fn a_request_past_its_time_cannot_be_decided() {
     let phone = paired();
     let request = phone.request(5, "x", 10);
     phone.take(kind::REQUEST, &wire::to_text(&request));
-    phone
-        .handler
-        .lock()
-        .waiting
-        .get_mut(&request.request_id)
-        .unwrap()
-        .until = now() - 1;
+    phone.stored(|s| s.waiting[0].until = now() - 1);
     assert!(phone
         .handler
         .decision_digest(request.request_id.to_hex(), true)
@@ -306,7 +368,7 @@ fn an_outcome_ends_a_request_once() {
         &events[..],
         [ApproverEvent::Outcome { outcome, .. }] if outcome == "denied"
     ));
-    assert!(phone.handler.lock().waiting.is_empty());
+    assert!(phone.stored(|s| s.waiting.is_empty()));
     assert!(
         phone.take(kind::OUTCOME, &outcome).is_empty(),
         "a replay counts once"
@@ -346,7 +408,7 @@ fn anchors_are_tracked_and_a_rollback_alerts() {
     let events = phone.take(kind::ANCHOR, &anchor_at(t + 60, 90, 3, true));
     assert!(
         events.iter().any(
-            |e| matches!(e, ApproverEvent::Alert { message } if message.contains("went back"))
+            |e| matches!(e, ApproverEvent::Alert { message, .. } if message.contains("went back"))
         ),
         "{events:?}"
     );
@@ -381,19 +443,33 @@ fn the_pairing_is_kept_across_runs() {
     let phone = paired();
     let request = phone.request(8, "x", 10);
     phone.take(kind::REQUEST, &wire::to_text(&request));
-    let again = ApproverHandler::new(phone.mobile.clone());
-    let status = again.status();
+    assert!(
+        ApproverHandler::new(phone.mobile.clone()).is_err(),
+        "one handler at a time"
+    );
+    phone.stored(|s| {
+        s.waiting[0].until = now() + 30;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    let status = phone.handler.status();
     assert!(status.paired);
     assert_eq!(status.label.as_deref(), Some("phone"));
+    // The request still waits, with the time it has left.
+    let waiting = phone.handler.waiting_requests();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].request_id, request.request_id.to_hex());
+    assert!((29..=30).contains(&waiting[0].seconds_left));
+    phone
+        .handler
+        .decision_digest(request.request_id.to_hex(), true)
+        .unwrap();
     // The request gate came back too: the same request is not shown again.
-    let mut inner = again.lock();
-    let events = again
-        .handle(&mut inner, kind::REQUEST, &wire::to_text(&request), now())
-        .events;
-    assert!(shown_request(&events).is_none());
-    drop(inner);
-    again.forget().unwrap();
-    assert!(!ApproverHandler::new(phone.mobile.clone()).status().paired);
+    assert!(shown_request(&phone.take(kind::REQUEST, &wire::to_text(&request))).is_none());
+    phone.handler.forget().unwrap();
+    let phone = phone.reopen();
+    assert!(!phone.handler.status().paired);
+    assert!(phone.handler.waiting_requests().is_empty());
 }
 
 #[test]
@@ -435,7 +511,7 @@ fn a_decrypt_request_warns_the_plaintext_reaches_the_agent() {
 #[test]
 fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     let storage: Arc<dyn SecureStorage> = Arc::new(Memory::default());
-    let handler = ApproverHandler::new(Arc::new(KeepMobile::new(storage).unwrap()));
+    let handler = ApproverHandler::new(Arc::new(KeepMobile::new(storage).unwrap())).unwrap();
     let channel = Keys::generate();
     let uri = PairingUri {
         gateway: sig::xonly(&channel),
@@ -480,13 +556,543 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     // A signature by another key is refused before anything is sent.
     let other = p256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
     let wrong: p256::ecdsa::Signature = other.sign(&start.digest);
-    struct Nobody;
-    impl ApproverCallbacks for Nobody {
-        fn on_event(&self, _: ApproverEvent) {}
-    }
     assert!(handler
         .clone()
         .finish_pairing(wrong.to_der().as_bytes().to_vec(), Arc::new(Nobody))
-        .is_err());
+        .unwrap_err()
+        .to_string()
+        .contains("does not verify"));
     assert!(!handler.status().pairing, "nothing kept");
+    // The pairing begun stays, so the right signature can follow; one no
+    // relay takes leaves nothing stored and the pairing still begun.
+    let right: p256::ecdsa::Signature = approver.sign(&start.digest);
+    let right = right.to_der().as_bytes().to_vec();
+    assert!(handler
+        .clone()
+        .finish_pairing(right.clone(), Arc::new(Nobody))
+        .is_err());
+    assert!(!handler.status().pairing);
+    assert!(!handler.status().running);
+    assert!(handler.lock().begun.is_some());
+    // Paired meanwhile: never overwritten.
+    let phone = paired();
+    let begun = handler.lock().begun.take();
+    phone.handler.lock().begun = begun;
+    assert!(phone
+        .handler
+        .clone()
+        .finish_pairing(right, Arc::new(Nobody))
+        .unwrap_err()
+        .to_string()
+        .contains("already paired"));
+    assert!(phone.handler.status().paired);
+}
+
+fn anchor_text(at: u64, seq: u64, epoch: u64, all: bool) -> String {
+    wire::to_text(&Anchor {
+        v: V1,
+        at,
+        anchor: anchor(seq),
+        frozen: Frozen {
+            epoch,
+            all,
+            credentials: vec![],
+            unfrozen: vec![],
+        },
+    })
+}
+
+fn alerts(events: &[ApproverEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ApproverEvent::Alert { message, .. } => Some(message.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn an_anchor_not_newer_than_the_one_kept_is_not_shown() {
+    let phone = paired();
+    let t = now();
+    assert_eq!(
+        phone
+            .take(kind::ANCHOR, &anchor_text(t, 100, 3, false))
+            .len(),
+        1
+    );
+    assert!(
+        phone
+            .take(kind::ANCHOR, &anchor_text(t, 100, 3, false))
+            .is_empty(),
+        "a replay"
+    );
+    assert!(
+        phone
+            .take(kind::ANCHOR, &anchor_text(t - 60, 50, 1, true))
+            .is_empty(),
+        "an old anchor arriving late"
+    );
+    let status = phone.handler.status();
+    assert_eq!(status.epoch, Some(3));
+    assert!(!status.all_frozen);
+    assert!(status.alerts.is_empty());
+}
+
+#[test]
+fn alerts_stay_until_acknowledged_and_survive_a_restart() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    let events = phone.take(kind::ANCHOR, &anchor_text(t + 60, 90, 3, false));
+    assert_eq!(alerts(&events).len(), 2, "{events:?}");
+    let phone = phone.reopen();
+    let kept = phone.handler.status().alerts;
+    assert_eq!(
+        kept.iter().map(|a| a.message.as_str()).collect::<Vec<_>>(),
+        alerts(&events)
+    );
+    // One raised after the owner looked stays.
+    let mut fx = Effects::default();
+    phone.stored(|s| s.alert("later".into(), &mut fx));
+    phone.handler.acknowledge_alerts(kept[1].seq).unwrap();
+    let left = phone.handler.status().alerts;
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].message, "later");
+    phone.handler.acknowledge_alerts(left[0].seq).unwrap();
+    assert!(phone.handler.status().alerts.is_empty());
+    let phone = phone.reopen();
+    assert!(phone.handler.status().alerts.is_empty());
+}
+
+#[test]
+fn alerts_kept_are_bounded() {
+    let phone = paired();
+    let mut fx = Effects::default();
+    phone.stored(|s| {
+        for i in 0..MAX_ALERTS + 5 {
+            s.alert(format!("alert {i}"), &mut fx);
+        }
+    });
+    let status = phone.handler.status();
+    assert_eq!(status.alerts.len(), MAX_ALERTS);
+    assert_eq!(status.alerts[0].message, "alert 5", "the oldest go");
+    assert_eq!(status.alerts_dropped, 5, "counted");
+    // The same alert, still unacknowledged, is not raised again.
+    let mut fx = Effects::default();
+    phone.stored(|s| s.alert(format!("alert {}", MAX_ALERTS + 4), &mut fx));
+    assert!(fx.events.is_empty());
+    assert_eq!(phone.handler.status().alerts_dropped, 5);
+    phone.handler.acknowledge_alerts(0).unwrap();
+    assert_eq!(phone.handler.status().alerts_dropped, 0);
+}
+
+#[test]
+fn a_freeze_is_resent_until_shown_and_alerts_once_when_it_is_not() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    // Not running: not sent now, but kept to resend.
+    assert!(phone.handler.freeze(None).is_err());
+    assert_eq!(phone.stored(|s| s.counter), 1);
+    let fx = phone.handler.tick_at(t + 15);
+    assert_eq!(fx.send.len(), 1);
+    let (k, content) = &fx.send[0];
+    assert_eq!(*k, kind::FREEZE);
+    let freeze: Freeze = wire::parse(content).unwrap();
+    assert_eq!(freeze.action, FreezeAction::Freeze);
+    assert_eq!(freeze.scope, Scope::All);
+    assert_eq!((freeze.counter, freeze.epoch), (2, 3));
+    assert!(alerts(&fx.events).is_empty());
+    let fx = phone.handler.tick_at(t + FREEZE_SHOWN_SECS);
+    let shown = alerts(&fx.events);
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].contains("has not shown at the gateway"));
+    assert!(alerts(&phone.handler.tick_at(t + FREEZE_SHOWN_SECS + 15).events).is_empty());
+    // An anchor showing it ends the resends.
+    phone.take(kind::ANCHOR, &anchor_text(t + 1, 101, 4, true));
+    assert!(phone.handler.tick_at(t + 200).send.is_empty());
+}
+
+#[test]
+fn silence_alerts_once_until_an_anchor_arrives() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    assert!(alerts(&phone.handler.tick_at(t + 60).events).is_empty());
+    let fx = phone.handler.tick_at(t + SILENCE_SECS);
+    assert_eq!(alerts(&fx.events), vec![SILENT_ALERT]);
+    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 15).events).is_empty());
+    assert!(phone
+        .handler
+        .status()
+        .alerts
+        .iter()
+        .any(|a| a.message == SILENT_ALERT));
+    // Restarted while still silent: not raised again.
+    let phone = phone.reopen();
+    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 30).events).is_empty());
+    let seq = phone.handler.status().alerts[0].seq;
+    phone.handler.acknowledge_alerts(seq).unwrap();
+    let phone = phone.reopen();
+    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 45).events).is_empty());
+    // An anchor ends the silence; the next one alerts again.
+    phone.take(kind::ANCHOR, &anchor_text(t + 1, 101, 3, false));
+    let later = now() + SILENCE_SECS;
+    assert_eq!(
+        alerts(&phone.handler.tick_at(later).events),
+        vec![SILENT_ALERT]
+    );
+}
+
+#[test]
+fn a_tick_drops_requests_past_their_time_and_saves_only_changes() {
+    let phone = paired();
+    let request = phone.request(12, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    phone
+        .mobile
+        .storage
+        .delete_share_by_key(STATE_KEY.into())
+        .unwrap();
+    phone.handler.tick_at(now() + 1);
+    assert!(
+        phone
+            .mobile
+            .storage
+            .load_share_by_key(STATE_KEY.into())
+            .is_err(),
+        "nothing changed, nothing saved"
+    );
+    phone.handler.tick_at(now() + 121);
+    assert!(phone.stored(|s| s.waiting.is_empty()));
+    assert!(phone
+        .mobile
+        .storage
+        .load_share_by_key(STATE_KEY.into())
+        .is_ok());
+}
+
+#[test]
+fn too_many_waiting_requests_are_refused() {
+    let phone = paired();
+    for i in 0..MAX_WAITING {
+        let r = phone.request(0, "x", 10);
+        let mut r = r;
+        r.request_id = Hex32([i as u8; 32]);
+        phone.stored(|s| {
+            s.waiting.push(Waiting {
+                id: r.request_id,
+                until: now() + 100,
+                unfreeze: None,
+                request: Some(r),
+            })
+        });
+    }
+    let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(200, "x", 10)));
+    assert!(shown_request(&events).is_none());
+    assert!(events.iter().any(
+        |e| matches!(e, ApproverEvent::RequestRefused { reason } if reason.contains("too many"))
+    ));
+    // A relay replaying it is dropped by the gate, not refused again.
+    assert!(phone
+        .take(kind::REQUEST, &wire::to_text(&phone.request(200, "x", 10)))
+        .is_empty());
+    phone.stored(|s| s.waiting[0].request = None);
+    let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(201, "x", 10)));
+    assert!(
+        shown_request(&events).is_some(),
+        "a decided one does not count"
+    );
+}
+
+#[test]
+fn an_unfreeze_is_signed_for_what_was_asked() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, true));
+    let credential = "22".repeat(16);
+    assert!(phone.handler.unfreeze_digest(Some("zz".into())).is_err());
+    let digest = phone
+        .handler
+        .unfreeze_digest(Some(credential.clone()))
+        .unwrap();
+    let approver = phone.stored(|s| s.approver);
+    assert_eq!(
+        digest,
+        sig::freeze_digest(
+            &phone.channel(),
+            &SignerKey::Approver(approver),
+            1,
+            3,
+            FreezeAction::Unfreeze,
+            Scope::Credential(Hex16([0x22; 16])),
+        )
+    );
+    let signature = phone.sign(&digest, true);
+    assert!(
+        phone
+            .handler
+            .send_unfreeze(None, signature.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("no unfreeze of that scope"),
+        "another scope"
+    );
+    let wrong = phone.sign(&[0u8; 32], false);
+    assert!(phone
+        .handler
+        .send_unfreeze(Some(credential.clone()), wrong)
+        .unwrap_err()
+        .to_string()
+        .contains("does not verify"));
+    // Verified, but not running: still asked, so it can be sent again.
+    let err = phone
+        .handler
+        .send_unfreeze(Some(credential.clone()), signature)
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
+    assert!(phone.stored(|s| s.unfreeze.is_some()));
+    // The asked unfreeze survives a restart; a freeze after it counts on.
+    let phone = phone.reopen();
+    assert!(phone.stored(|s| s.unfreeze.is_some()));
+    // A freeze signed meanwhile voids it: its counter is now old.
+    assert!(phone.handler.freeze(Some(credential.clone())).is_err());
+    assert_eq!(phone.stored(|s| s.counter), 2);
+    let signature = phone.sign(&digest, false);
+    assert!(phone
+        .handler
+        .send_unfreeze(Some(credential), signature)
+        .unwrap_err()
+        .to_string()
+        .contains("ask for the unfreeze digest again"));
+    assert!(phone.stored(|s| s.unfreeze.is_none()));
+}
+
+#[test]
+fn freezes_are_not_resent_while_an_unfreeze_is_signed() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    assert!(phone.handler.freeze(None).is_err());
+    phone.handler.unfreeze_digest(None).unwrap();
+    let asked = phone.stored(|s| s.unfreeze.unwrap().at);
+    assert!(phone.handler.tick_at(asked + 15).send.is_empty());
+    assert_eq!(phone.stored(|s| s.counter), 2);
+    assert_eq!(
+        phone.handler.tick_at(asked + UNFREEZE_HOLD_SECS).send.len(),
+        1
+    );
+}
+
+#[test]
+fn a_freeze_is_resent_only_once_its_counter_is_saved() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    assert!(phone.handler.freeze(None).is_err());
+    phone.memory.1.store(true, Ordering::SeqCst);
+    assert!(phone.handler.tick_at(t + 15).send.is_empty());
+    assert!(phone.handler.freeze(None).is_err(), "nor sent unsaved");
+    phone.memory.1.store(false, Ordering::SeqCst);
+    let fx = phone.handler.tick_at(t + 30);
+    assert_eq!(fx.send.len(), 1);
+    let freeze: Freeze = wire::parse(&fx.send[0].1).unwrap();
+    let phone = phone.reopen();
+    assert_eq!(phone.stored(|s| s.counter), freeze.counter);
+}
+
+/// An approved unfreeze request this phone decided explains the freeze it
+/// lifts, so no alert follows.
+#[test]
+fn a_decided_unfreeze_explains_the_freeze_it_clears() {
+    for decided_outcome in [true, false] {
+        let phone = paired();
+        let t = now();
+        phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, true));
+        let channel = phone.channel();
+        let (request, _) = RequestDraft {
+            request_id: [13; 32],
+            created_at: now(),
+            deadline_secs: 120,
+            credential: None,
+            key: None,
+            network: None,
+            reason: Reason::Management,
+            payload: Payload::Management(Change::Unfreeze {
+                scope: Scope::All,
+                epoch: Decimal(3),
+            }),
+            budget: None,
+            anchor: anchor(100),
+        }
+        .finish(&channel)
+        .unwrap();
+        let events = phone.take(kind::REQUEST, &wire::to_text(&request));
+        assert!(shown_request(&events).is_some(), "{events:?}");
+        phone.stored(|s| s.waiting[0].request = None);
+        if decided_outcome {
+            phone.take(
+                kind::OUTCOME,
+                &wire::to_text(&Outcome {
+                    v: V1,
+                    request_id: request.request_id,
+                    outcome: OutcomeKind::Approved,
+                    by: None,
+                }),
+            );
+        }
+        phone.take(kind::ANCHOR, &anchor_text(t + 1, 101, 4, false));
+        let fx = phone.handler.tick_at(now() + CLEARED_GRACE_SECS + 1);
+        let cleared = alerts(&fx.events)
+            .iter()
+            .any(|a| a.contains("no unfreeze explains it"));
+        assert_eq!(cleared, !decided_outcome, "{:?}", fx.events);
+    }
+}
+
+#[test]
+fn an_outcome_for_a_request_never_shown_is_ignored() {
+    let phone = paired();
+    let before = phone.stored(|s| serde_json::to_vec(&s.tracker).unwrap());
+    let outcome = wire::to_text(&Outcome {
+        v: V1,
+        request_id: Hex32([0x77; 32]),
+        outcome: OutcomeKind::Approved,
+        by: None,
+    });
+    assert!(phone.take(kind::OUTCOME, &outcome).is_empty());
+    assert_eq!(
+        phone.stored(|s| serde_json::to_vec(&s.tracker).unwrap()),
+        before
+    );
+}
+
+struct Nobody;
+
+impl ApproverCallbacks for Nobody {
+    fn on_event(&self, _: ApproverEvent) {}
+}
+
+fn serve(phone: &Phone, relay: String) {
+    phone.stored(|s| s.relays = vec![relay]);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+}
+
+#[test]
+fn a_decision_is_decided_once_a_relay_takes_it_and_its_payload_goes() {
+    let phone = paired();
+    let relay = phone
+        .mobile
+        .runtime
+        .block_on(nostr_relay_builder::MockRelay::run())
+        .unwrap();
+    let url = phone.mobile.runtime.block_on(relay.url()).to_string();
+    serve(&phone, url);
+    let request = phone.request(14, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let id = request.request_id.to_hex();
+    let digest = phone.handler.decision_digest(id.clone(), true).unwrap();
+    phone
+        .handler
+        .send_decision(id.clone(), true, phone.sign(&digest, false))
+        .unwrap();
+    assert!(phone.handler.waiting_requests().is_empty());
+    assert!(phone.handler.decision_digest(id, true).is_err());
+    let phone = phone.reopen();
+    assert!(
+        phone.stored(|s| s.waiting.len() == 1 && s.waiting[0].request.is_none()),
+        "kept for its outcome, without the request"
+    );
+    let stored = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
+    let text = String::from_utf8(stored).unwrap();
+    assert!(!text.contains("\"payload\""), "{text}");
+}
+
+#[test]
+fn a_decision_no_relay_takes_is_not_decided() {
+    let phone = paired();
+    serve(&phone, "ws://127.0.0.1:1".into());
+    let request = phone.request(15, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let id = request.request_id.to_hex();
+    let digest = phone.handler.decision_digest(id.clone(), true).unwrap();
+    let err = phone
+        .handler
+        .send_decision(id, true, phone.sign(&digest, false))
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
+    assert_eq!(phone.handler.waiting_requests().len(), 1);
+    phone.handler.stop();
+    assert!(!phone.handler.status().running);
+}
+
+#[test]
+fn close_gives_the_slot_back_and_ends_the_handler() {
+    let phone = paired();
+    assert!(ApproverHandler::new(phone.mobile.clone()).is_err());
+    phone.handler.close();
+    assert!(!phone.handler.status().paired);
+    assert!(phone.handler.clone().start(Arc::new(Nobody)).is_err());
+    assert!(phone.handler.forget().is_err());
+    assert!(phone
+        .handler
+        .begin_pairing("keep-approver:v1?x".into(), vec![2; 33], "phone".into())
+        .unwrap_err()
+        .to_string()
+        .contains("closed"));
+    let next = ApproverHandler::new(phone.mobile.clone()).unwrap();
+    assert!(next.status().paired, "the pairing stays stored");
+    // The closed one dropping does not free the new one's slot.
+    let Phone {
+        handler, mobile, ..
+    } = phone;
+    drop(handler);
+    assert!(ApproverHandler::new(mobile.clone()).is_err());
+    drop(next);
+    assert!(ApproverHandler::new(mobile).is_ok());
+}
+
+#[test]
+fn a_pairing_a_relay_takes_waits_for_the_gateway() {
+    let storage: Arc<dyn SecureStorage> = Arc::new(Memory::default());
+    let mobile = Arc::new(KeepMobile::new(storage).unwrap());
+    let relay = mobile
+        .runtime
+        .block_on(nostr_relay_builder::MockRelay::run())
+        .unwrap();
+    let url = mobile.runtime.block_on(relay.url()).to_string();
+    let handler = ApproverHandler::new(mobile).unwrap();
+    let uri = PairingUri {
+        gateway: sig::xonly(&Keys::generate()),
+        secret: Zeroizing::new([3u8; 32]),
+        relays: vec![url],
+    }
+    .to_uri()
+    .unwrap();
+    let approver = p256::ecdsa::SigningKey::from_slice(&[5u8; 32]).unwrap();
+    let key = approver
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .to_vec();
+    let start = handler
+        .begin_pairing(uri.to_string(), key, "phone".into())
+        .unwrap();
+    let signature: p256::ecdsa::Signature = approver.sign(&start.digest);
+    handler
+        .clone()
+        .finish_pairing(signature.to_der().as_bytes().to_vec(), Arc::new(Nobody))
+        .unwrap();
+    let status = handler.status();
+    assert!(status.pairing && status.running && !status.paired);
+    assert!(handler.lock().begun.is_none(), "sent once");
+    assert!(handler
+        .clone()
+        .finish_pairing(vec![], Arc::new(Nobody))
+        .unwrap_err()
+        .to_string()
+        .contains("no pairing was begun"));
+    handler.close();
 }

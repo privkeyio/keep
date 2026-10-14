@@ -662,6 +662,9 @@ pub struct KeepMobile {
     /// a concurrent FFI init racing a delete/rotate cannot interleave into a
     /// node whose tasks were just aborted, or tasks pointing at a nulled node.
     node_lifecycle_lock: Arc<std::sync::Mutex<()>>,
+    /// Whether an `ApproverHandler` holds this instance's approver state:
+    /// two would overwrite each other's counters, request gate and anchors.
+    pub(crate) approver_live: Arc<std::sync::atomic::AtomicBool>,
     /// Serializes active-share selection against deletion so the check-then-set
     /// in `set_active_share` (load a share, then mark it active) cannot
     /// interleave with a concurrent `delete_share_by_key`, which would leave the
@@ -863,6 +866,7 @@ impl KeepMobile {
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
+            approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_share_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }

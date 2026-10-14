@@ -14,16 +14,25 @@
 //! the message. The transport key, which only seals messages and signs
 //! freezes, is kept in the app's secure storage, so a freeze needs no
 //! biometric.
+//!
+//! Requests waiting for the owner and alerts not yet acknowledged are kept
+//! with the pairing, so neither is lost when the app is stopped or killed:
+//! after a restart the app reads them back with
+//! [`ApproverHandler::waiting_requests`] and [`ApproverHandler::status`].
+//! One handler holds a `KeepMobile`'s approver state at a time; the app
+//! calls [`ApproverHandler::close`] when done with it.
 
 mod view;
 
 pub use view::{ApprovalField, ApprovalRequest};
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use keep_approval::approver::{clock_skew, Alert, AnchorTracker, RequestGate, FREEZE_RESEND_SECS};
+use keep_approval::approver::{
+    clock_skew, shown, Alert, AnchorTracker, RequestGate, FREEZE_RESEND_SECS, GATEWAY_TEXT_CHARS,
+};
 use keep_approval::binding::check_request;
 use keep_approval::change::{Change, Scope};
 use keep_approval::messages::{
@@ -32,9 +41,11 @@ use keep_approval::messages::{
 };
 use keep_approval::pairing::{check_paired, PairingUri};
 use keep_approval::sig::{self, Alg};
-use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey};
+use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey, TWEAK_SECS, WINDOW_PAST_SECS};
 use keep_approval::{kind, Hex16, Hex32, Hex33, Hex64};
-use nostr_sdk::prelude::{Client, Event, Filter, Keys, Kind, PublicKey, RelayPoolNotification};
+use nostr_sdk::prelude::{
+    Client, Event, Filter, Keys, Kind, PublicKey, RelayPoolNotification, Timestamp,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -42,6 +53,18 @@ use crate::error::KeepMobileError;
 use crate::KeepMobile;
 
 const STATE_KEY: &str = "__keep_approver";
+
+/// The most unacknowledged alerts kept; past this the oldest go, counted.
+const MAX_ALERTS: usize = 32;
+
+/// The most requests waiting for the owner at once, past which a new one
+/// is refused; and the most decided ones kept for their outcomes, past which
+/// the oldest go.
+const MAX_WAITING: usize = 64;
+
+/// How long after an unfreeze digest is handed out freezes are not resent,
+/// so a resend's new counter does not void the unfreeze being signed.
+const UNFREEZE_HOLD_SECS: u64 = 60;
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -54,8 +77,64 @@ fn invalid(msg: impl Into<String>) -> KeepMobileError {
     KeepMobileError::InvalidInput { msg: msg.into() }
 }
 
+/// Text from the gateway or the network, as the owner may be shown it.
+fn gateway_text(text: &str) -> String {
+    shown(text, GATEWAY_TEXT_CHARS).text
+}
+
+/// A request shown to the owner and not yet ended.
+#[derive(Clone, Serialize, Deserialize)]
+struct Waiting {
+    id: Hex32,
+    /// The phone's clock when it can no longer be approved.
+    until: u64,
+    /// The scope an unfreeze request lifts, which its approved outcome
+    /// explains.
+    unfreeze: Option<Scope>,
+    /// The request while the owner has not decided it; dropped (and wiped)
+    /// once this phone's decision is sent, keeping only what the outcome
+    /// needs.
+    request: Option<Request>,
+}
+
+impl Waiting {
+    fn open(&self, local_now: u64) -> Option<&Request> {
+        self.request.as_ref().filter(|_| self.until > local_now)
+    }
+}
+
+/// Whether `w` is still kept at `local_now`: until its time ends, and once
+/// decided, for as long as its outcome can still arrive.
+fn still_kept(w: &Waiting, local_now: u64) -> bool {
+    let grace = if w.request.is_none() {
+        WINDOW_PAST_SECS
+    } else {
+        0
+    };
+    w.until.saturating_add(grace) > local_now
+}
+
+/// An unfreeze whose digest was handed out and not yet sent.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct AskedUnfreeze {
+    scope: Scope,
+    counter: u64,
+    epoch: u64,
+    /// The phone's clock when the digest was handed out.
+    at: u64,
+}
+
+/// An alert the owner has not acknowledged.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproverAlert {
+    /// Counts up across alerts; [`ApproverHandler::acknowledge_alerts`]
+    /// takes the last one the owner saw.
+    pub seq: u64,
+    pub message: String,
+}
+
 /// What the phone keeps between runs.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Stored {
     /// The transport key's secret, hex.
     transport: Zeroizing<String>,
@@ -69,6 +148,21 @@ struct Stored {
     counter: u64,
     tracker: AnchorTracker,
     gate: RequestGate,
+    #[serde(default)]
+    waiting: Vec<Waiting>,
+    #[serde(default)]
+    alerts: Vec<ApproverAlert>,
+    #[serde(default)]
+    alert_seq: u64,
+    /// Alerts pushed out by [`MAX_ALERTS`] since the owner last
+    /// acknowledged.
+    #[serde(default)]
+    alerts_dropped: u64,
+    /// The silence alert was raised and no anchor has come since.
+    #[serde(default)]
+    silent_reported: bool,
+    #[serde(default)]
+    unfreeze: Option<AskedUnfreeze>,
 }
 
 impl Stored {
@@ -82,6 +176,27 @@ impl Stored {
             &self.approver.0,
         ))
     }
+
+    /// Raise `message`, unless the same alert is still unacknowledged.
+    fn alert(&mut self, message: String, fx: &mut Effects) {
+        if self.alerts.iter().any(|a| a.message == message) {
+            return;
+        }
+        if self.alerts.len() == MAX_ALERTS {
+            self.alerts.remove(0);
+            self.alerts_dropped += 1;
+        }
+        self.alert_seq += 1;
+        let alert = ApproverAlert {
+            seq: self.alert_seq,
+            message,
+        };
+        self.alerts.push(alert.clone());
+        fx.events.push(ApproverEvent::Alert {
+            seq: alert.seq,
+            message: alert.message,
+        });
+    }
 }
 
 /// A pairing begun, waiting for the approver key's signature.
@@ -91,34 +206,41 @@ struct Begun {
     digest: [u8; 32],
 }
 
-/// An approver signature asked for and not yet given.
-enum Asked {
-    Decision {
-        request_id: Hex32,
-        request_hash: Hex32,
-        verdict: Verdict,
-    },
-    Unfreeze {
-        scope: Scope,
-        counter: u64,
-        epoch: u64,
-    },
+/// The transport key and the one candidate a gateway's message is opened
+/// against, derived once per pairing rather than for every wrap.
+struct Session {
+    keys: Keys,
+    candidates: [Candidate<()>; 1],
 }
 
-struct Waiting {
-    request: Request,
-    /// The phone's clock when the request can no longer be approved.
-    until: u64,
+impl Session {
+    fn new(stored: &Stored) -> Option<Self> {
+        let keys = stored.keys().ok()?;
+        let tag_key = TagKey::device(&keys, &stored.channel.0).ok()?;
+        Some(Self {
+            keys,
+            candidates: [Candidate::Peer {
+                id: (),
+                tag_key,
+                sender: stored.channel.0,
+            }],
+        })
+    }
 }
 
 #[derive(Default)]
 struct Inner {
     stored: Option<Stored>,
+    session: Option<Session>,
     begun: Option<Begun>,
-    asked: Option<([u8; 32], Asked)>,
-    waiting: HashMap<Hex32, Waiting>,
     seen: SeenWraps,
-    silent_reported: bool,
+}
+
+impl Inner {
+    fn set(&mut self, stored: Option<Stored>) {
+        self.session = stored.as_ref().and_then(Session::new);
+        self.stored = stored;
+    }
 }
 
 /// What a pairing needs the approver key to sign.
@@ -140,12 +262,17 @@ pub struct ApproverStatus {
     pub label: Option<String>,
     pub fingerprint: Option<String>,
     pub relays: Vec<String>,
-    /// The gateway's freeze epoch, from the latest anchor.
+    /// The gateway's freeze epoch, from the latest anchor kept.
     pub epoch: Option<u64>,
     pub all_frozen: bool,
     pub frozen_credentials: Vec<String>,
     /// No anchor for an hour: the gateway is down, cut off, or withheld.
     pub silent: bool,
+    /// Alerts the owner has not acknowledged, oldest first.
+    pub alerts: Vec<ApproverAlert>,
+    /// Older unacknowledged alerts pushed out to keep the list bounded,
+    /// which the app states.
+    pub alerts_dropped: u64,
 }
 
 /// Something to show the owner.
@@ -169,14 +296,17 @@ pub enum ApproverEvent {
         /// `approved`, `denied`, `expired` or `canceled`.
         outcome: String,
     },
+    /// A newer anchor was kept: the gateway's freeze state now.
     Anchor {
         epoch: u64,
         all_frozen: bool,
         frozen_credentials: Vec<String>,
         audit_seq: u64,
     },
-    /// Something the owner must see, prominently.
+    /// Something the owner must see, prominently. It also stays in
+    /// [`ApproverStatus::alerts`] until acknowledged.
     Alert {
+        seq: u64,
         message: String,
     },
 }
@@ -206,9 +336,12 @@ fn alert_text(alert: &Alert) -> String {
         }
         Alert::PrevMissing => "The gateway's record of the anchors it sent is gone.".into(),
         Alert::WalletCountWentBack { wallet, from, to } => format!(
-            "A wallet ledger ({wallet}) went back from {from} to {to} spends."
+            "A wallet ledger ({}) went back from {from} to {to} spends.",
+            gateway_text(wallet)
         ),
-        Alert::WalletMissing { wallet } => format!("A wallet ledger ({wallet}) is gone."),
+        Alert::WalletMissing { wallet } => {
+            format!("A wallet ledger ({}) is gone.", gateway_text(wallet))
+        }
         Alert::EpochWentBack { from, to } => {
             format!("The gateway's freeze epoch went back from {from} to {to}.")
         }
@@ -223,6 +356,9 @@ fn alert_text(alert: &Alert) -> String {
     }
 }
 
+const SILENT_ALERT: &str =
+    "No word from the gateway for an hour: it is down, cut off, or its messages are withheld.";
+
 fn scope_arg(credential: Option<String>) -> Result<Scope, KeepMobileError> {
     match credential {
         None => Ok(Scope::All),
@@ -236,26 +372,68 @@ fn request_id_arg(id: &str) -> Result<Hex32, KeepMobileError> {
     Hex32::parse(id).map_err(|_| invalid("a request id is 64 lowercase hex characters"))
 }
 
+fn verdict(approve: bool) -> Verdict {
+    if approve {
+        Verdict::Approve
+    } else {
+        Verdict::Deny
+    }
+}
+
 /// A signature from the Keystore, checked against the approver key over
-/// `digest`, so a key the Keystore replaced (a new biometric enrolled) is
-/// found here rather than refused at the gateway.
+/// `digest` before anything is sent.
 fn checked_signature(
     der: &[u8],
     approver: &Hex33,
     digest: &[u8; 32],
 ) -> Result<Hex64, KeepMobileError> {
     let sig = sig::p256_from_der(der).map_err(|e| invalid(e.to_string()))?;
-    sig::verify_p256(&approver.0, digest, &sig)
-        .map_err(|_| invalid("the signature is not the approver key's: re-pair this phone"))?;
+    sig::verify_p256(&approver.0, digest, &sig).map_err(|_| {
+        invalid(
+            "the signature does not verify under this phone's approver key for what was asked: \
+             sign the digest for this request again, and if a fingerprint or face was enrolled \
+             since pairing, the key was replaced and the phone must be paired again",
+        )
+    })?;
     Ok(sig)
 }
 
-/// What the network side does after a state change, outside the lock.
+/// The change an unfreeze request carries.
+fn unfreeze_scope(request: &Request) -> Option<Scope> {
+    match Change::parse(request.payload.get("change")?) {
+        Ok(Change::Unfreeze { scope, .. }) => Some(scope),
+        _ => None,
+    }
+}
+
+/// A freeze of `scope` signed by the transport key with the next counter.
+fn signed_freeze(
+    stored: &mut Stored,
+    scope: Scope,
+    epoch: u64,
+    local_now: u64,
+) -> Result<String, KeepMobileError> {
+    let keys = stored.keys()?;
+    stored.counter += 1;
+    let freeze = sig::freeze(&keys, &stored.channel.0, stored.counter, epoch, scope);
+    stored.tracker.freeze_sent(scope, epoch, local_now);
+    Ok(wire::to_text(&freeze))
+}
+
+fn no_relay() -> KeepMobileError {
+    KeepMobileError::NetworkError {
+        msg: "no relay accepted the message".into(),
+    }
+}
+
+/// What happens after a state change, outside the lock.
 #[derive(Default)]
 struct Effects {
     events: Vec<ApproverEvent>,
     send: Vec<(u16, String)>,
     reconnect: Option<Vec<String>>,
+    /// Stop serving: the pairing is gone.
+    halt: bool,
 }
 
 struct Running {
@@ -263,12 +441,75 @@ struct Running {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+impl Running {
+    fn end(self, runtime: &tokio::runtime::Runtime) {
+        for task in self.tasks {
+            task.abort();
+        }
+        let client = self.client;
+        runtime.spawn(async move { client.shutdown().await });
+    }
+}
+
+/// A strong reference a task takes for a while. The handler owns the
+/// `KeepMobile` whose runtime runs the task, and a runtime dropped inside
+/// itself panics; so when this is the last reference, however the task
+/// ends, the handler is let go on a thread of its own.
+struct Held(Option<Arc<ApproverHandler>>);
+
+impl Held {
+    fn upgrade(weak: &Weak<ApproverHandler>) -> Option<Self> {
+        weak.upgrade().map(|a| Held(Some(a)))
+    }
+
+    fn of(handler: &Arc<ApproverHandler>) -> Self {
+        Held(Some(handler.clone()))
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = Arc<ApproverHandler>;
+
+    fn deref(&self) -> &Self::Target {
+        // Only `drop` takes it out.
+        self.0.as_ref().unwrap_or_else(|| unreachable!())
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(last) = self.0.take().and_then(Arc::into_inner) {
+            std::thread::spawn(move || drop(last));
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct ApproverHandler {
     mobile: Arc<KeepMobile>,
-    inner: Arc<Mutex<Inner>>,
+    inner: Mutex<Inner>,
     running: Mutex<Option<Running>>,
+    /// Serializes start, stop, close, forget and reconnects.
+    lifecycle: Mutex<()>,
+    /// Counts stops, so a reconnect scheduled before one does not undo it.
+    generation: AtomicU64,
+    /// Closed, or dropped: the `KeepMobile`'s approver slot is given back.
+    closed: AtomicBool,
     callbacks: Mutex<Option<Arc<dyn ApproverCallbacks>>>,
+}
+
+impl Drop for ApproverHandler {
+    fn drop(&mut self) {
+        if let Some(running) = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            running.end(&self.mobile.runtime);
+        }
+        self.release();
+    }
 }
 
 impl ApproverHandler {
@@ -276,16 +517,34 @@ impl ApproverHandler {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Give back the `KeepMobile`'s approver slot, once.
+    fn release(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.mobile.approver_live.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn open_check(&self) -> Result<(), KeepMobileError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(invalid("this approver was closed"));
+        }
+        Ok(())
+    }
+
     fn persist(&self, stored: &Stored) -> Result<(), KeepMobileError> {
-        let data = Zeroizing::new(
-            serde_json::to_vec(stored)
-                .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?,
-        );
+        let data = serde_json::to_vec(stored)
+            .map_err(|e| KeepMobileError::Serialization { msg: e.to_string() })?;
         self.mobile.storage.store_share_by_key(
             STATE_KEY.into(),
-            data.to_vec(),
+            data,
             crate::persistence::storage_metadata("approver"),
         )
+    }
+
+    fn persist_or_log(&self, stored: &Stored) {
+        if let Err(e) = self.persist(stored) {
+            tracing::error!(error = %e, "the approver state could not be kept");
+        }
     }
 
     fn emit(&self, events: Vec<ApproverEvent>) {
@@ -323,27 +582,49 @@ impl ApproverHandler {
             })
     }
 
-    /// Send `event` from a call the app made, on its own thread.
+    /// Send `event` from a call the app made, on its own thread: done only
+    /// when a relay took it.
     fn send_now(&self, event: Event) -> Result<(), KeepMobileError> {
         let client = self.client()?;
         self.mobile.runtime.block_on(async move {
-            client
+            let output = client
                 .send_event(&event)
                 .await
-                .map(|_| ())
-                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })
+                .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
+            if output.success.is_empty() {
+                return Err(no_relay());
+            }
+            Ok(())
         })
     }
 
+    /// Stop serving. Callers hold `lifecycle`.
+    fn halt(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        if let Some(running) = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            running.end(&self.mobile.runtime);
+        }
+    }
+
     /// Connect to `relays` and serve what arrives for the transport key.
+    /// Callers hold `lifecycle` and have halted what ran before.
     fn run(
         self: &Arc<Self>,
         relays: Vec<String>,
         transport: PublicKey,
     ) -> Result<(), KeepMobileError> {
-        self.halt();
         let client = Client::default();
-        let this = self.clone();
+        let weak = Arc::downgrade(self);
+        // What these tasks deliver is dropped once a stop or start follows.
+        let generation = self.generation.load(Ordering::SeqCst);
+        // Wraps carry a creation time up to `TWEAK_SECS` early, and are kept
+        // for the past window: anything older can no longer be opened.
+        let since = Timestamp::from_secs(now().saturating_sub(TWEAK_SECS + WINDOW_PAST_SECS));
         let tasks = self.mobile.runtime.block_on(async {
             for relay in &relays {
                 client
@@ -353,119 +634,115 @@ impl ApproverHandler {
             }
             client.connect().await;
             client
-                .subscribe(Filter::new().kind(Kind::GiftWrap).pubkey(transport), None)
+                .subscribe(
+                    Filter::new()
+                        .kind(Kind::GiftWrap)
+                        .pubkey(transport)
+                        .since(since),
+                    None,
+                )
                 .await
                 .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
             let mut events = client.notifications();
-            let receiver = this.clone();
+            let listen_weak = weak.clone();
             let listen = tokio::spawn(async move {
                 loop {
                     match events.recv().await {
                         Ok(RelayPoolNotification::Event { event, .. }) => {
+                            let Some(this) = Held::upgrade(&listen_weak) else {
+                                break;
+                            };
                             // Storage and the app's callbacks block; keep
                             // them off the runtime's workers.
-                            let r = receiver.clone();
+                            let r = Held::of(&this);
                             if let Ok(fx) =
                                 tokio::task::spawn_blocking(move || r.received(&event)).await
                             {
-                                receiver.deliver(fx).await;
+                                this.deliver(fx, generation).await;
                             }
                         }
                         Ok(_) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!(dropped = n, "the approver fell behind its relays");
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             });
-            let ticker = this.clone();
             let tick = tokio::spawn(async move {
                 let mut every = tokio::time::interval(Duration::from_secs(FREEZE_RESEND_SECS));
                 loop {
                     every.tick().await;
-                    let t = ticker.clone();
-                    if let Ok(fx) = tokio::task::spawn_blocking(move || t.tick()).await {
-                        ticker.deliver(fx).await;
+                    let Some(this) = Held::upgrade(&weak) else {
+                        break;
+                    };
+                    let t = Held::of(&this);
+                    if let Ok(fx) = tokio::task::spawn_blocking(move || t.tick_at(now())).await {
+                        this.deliver(fx, generation).await;
                     }
                 }
             });
             Ok::<_, KeepMobileError>(vec![listen, tick])
         })?;
-        *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running { client, tasks });
-        Ok(())
-    }
-
-    fn halt(&self) {
-        let running = self
+        let old = self
             .running
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(running) = running {
-            for task in running.tasks {
-                task.abort();
-            }
-            let client = running.client;
-            self.mobile
-                .runtime
-                .spawn(async move { client.shutdown().await });
+            .replace(Running { client, tasks });
+        if let Some(old) = old {
+            old.end(&self.mobile.runtime);
         }
+        Ok(())
     }
 
     fn received(&self, event: &Event) -> Effects {
         let mut inner = self.lock();
-        let Inner { stored, seen, .. } = &mut *inner;
-        let Some(stored) = stored.as_ref() else {
+        let Inner { session, seen, .. } = &mut *inner;
+        let Some(session) = session.as_ref() else {
             return Effects::default();
         };
-        let Ok(keys) = stored.keys() else {
-            return Effects::default();
-        };
-        let Ok(tag_key) = TagKey::device(&keys, &stored.channel.0) else {
-            return Effects::default();
-        };
-        let candidates = [Candidate::Peer {
-            id: (),
-            tag_key,
-            sender: stored.channel.0,
-        }];
-        let Ok(opened) = wrap::open(&keys, event, &candidates, seen, now()) else {
+        let Ok(opened) = wrap::open(&session.keys, event, &session.candidates, seen, now()) else {
             return Effects::default();
         };
         let (kind, content) = (opened.kind, opened.content.to_string());
         self.handle(&mut inner, kind, &content, now())
     }
 
-    /// Send what `fx` holds and tell the app, from the runtime: messages are
-    /// sent with the running client, the app is called on a blocking thread,
-    /// and a reconnect runs on a thread of its own, since it replaces the
-    /// tasks this runs in.
-    async fn deliver(self: &Arc<Self>, fx: Effects) {
+    /// Send what `fx` holds and tell the app, from the tasks `run` started
+    /// at `generation`. A reconnect or a halt runs on a thread of its own,
+    /// since it replaces the tasks this runs in.
+    async fn deliver(self: &Arc<Self>, fx: Effects, generation: u64) {
         if let Ok(client) = self.client() {
             for (kind, content) in fx.send {
                 match self.sealed(kind, &content) {
-                    Ok(event) => {
-                        if let Err(e) = client.send_event(&event).await {
-                            tracing::warn!(error = %e, "an approver message was not sent");
+                    Ok(event) => match client.send_event(&event).await {
+                        Ok(output) if output.success.is_empty() => {
+                            tracing::warn!("no relay accepted an approver message");
                         }
-                    }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "an approver message was not sent"),
+                    },
                     Err(e) => tracing::warn!(error = %e, "an approver message was not sealed"),
                 }
             }
         }
         if !fx.events.is_empty() {
-            let this = self.clone();
+            let this = Held::of(self);
             let events = fx.events;
             let _ = tokio::task::spawn_blocking(move || this.emit(events)).await;
         }
-        if let Some(relays) = fx.reconnect {
+        if fx.halt || fx.reconnect.is_some() {
             let this = self.clone();
+            let reconnect = fx.reconnect;
             std::thread::spawn(move || {
-                let transport = this
-                    .lock()
-                    .stored
-                    .as_ref()
-                    .and_then(|s| s.keys().ok())
-                    .map(|k| k.public_key());
+                let _lifecycle = this.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+                // A stop or start since then wins.
+                if this.generation.load(Ordering::SeqCst) != generation {
+                    return;
+                }
+                this.halt();
+                let Some(relays) = reconnect else { return };
+                let transport = this.lock().session.as_ref().map(|s| s.keys.public_key());
                 if let Some(transport) = transport {
                     if let Err(e) = this.run(relays, transport) {
                         tracing::warn!(error = %e, "the approver could not reconnect");
@@ -486,11 +763,7 @@ impl ApproverHandler {
             kind::PAIRING if !stored.paired => match wire::parse::<Pairing>(content) {
                 Ok(Pairing::Refused { reason, .. }) => {
                     fx.events.push(ApproverEvent::PairingRefused {
-                        reason: keep_approval::approver::shown(
-                            &reason,
-                            keep_approval::approver::GATEWAY_TEXT_CHARS,
-                        )
-                        .text,
+                        reason: gateway_text(&reason),
                     });
                     forget = true;
                 }
@@ -508,20 +781,18 @@ impl ApproverHandler {
                             stored
                                 .tracker
                                 .baseline(&paired.anchor, &paired.frozen, local_now);
-                            if let Err(e) = self.persist(stored) {
-                                tracing::error!(error = %e, "the pairing could not be kept");
-                            }
+                            self.persist_or_log(stored);
                             fx.events.push(ApproverEvent::Paired {
                                 fingerprint: stored.fingerprint().unwrap_or_default(),
                             });
                         }
                         Err(e) => fx.events.push(ApproverEvent::PairingRefused {
-                            reason: e.to_string(),
+                            reason: gateway_text(&e.to_string()),
                         }),
                     }
                 }
                 Err(e) => fx.events.push(ApproverEvent::PairingRefused {
-                    reason: e.to_string(),
+                    reason: gateway_text(&e.to_string()),
                 }),
             },
             kind::REQUEST if stored.paired => {
@@ -529,7 +800,7 @@ impl ApproverHandler {
                     Ok(r) => r,
                     Err(e) => {
                         fx.events.push(ApproverEvent::RequestRefused {
-                            reason: e.to_string(),
+                            reason: gateway_text(&e.to_string()),
                         });
                         return fx;
                     }
@@ -538,7 +809,7 @@ impl ApproverHandler {
                     Ok(c) => c,
                     Err(e) => {
                         fx.events.push(ApproverEvent::RequestRefused {
-                            reason: e.to_string(),
+                            reason: gateway_text(&e.to_string()),
                         });
                         return fx;
                     }
@@ -547,53 +818,64 @@ impl ApproverHandler {
                     tracing::debug!(error = %e, "a request not shown");
                     return fx;
                 }
+                stored.waiting.retain(|w| still_kept(w, local_now));
+                if stored
+                    .waiting
+                    .iter()
+                    .filter(|w| w.request.is_some())
+                    .count()
+                    >= MAX_WAITING
+                {
+                    self.persist_or_log(stored);
+                    fx.events.push(ApproverEvent::RequestRefused {
+                        reason: "too many requests are waiting: decide some first".into(),
+                    });
+                    return fx;
+                }
                 for alert in
                     stored
                         .tracker
                         .observe(request.created_at, &request.anchor, None, local_now)
                 {
-                    fx.events.push(ApproverEvent::Alert {
-                        message: alert_text(&alert),
-                    });
+                    stored.alert(alert_text(&alert), &mut fx);
                 }
-                let shown = view::view(
+                let view = view::view(
                     &request,
                     &checked,
                     clock_skew(request.created_at, local_now),
+                    request.deadline_secs,
                 );
-                inner.waiting.insert(
-                    request.request_id,
-                    Waiting {
-                        until: local_now.saturating_add(request.deadline_secs),
-                        request,
-                    },
-                );
-                if let Err(e) = self.persist(stored) {
-                    tracing::error!(error = %e, "the approver state could not be kept");
-                }
-                fx.events.push(ApproverEvent::Request { request: shown });
+                stored.waiting.push(Waiting {
+                    id: request.request_id,
+                    until: local_now.saturating_add(request.deadline_secs),
+                    unfreeze: unfreeze_scope(&request),
+                    request: Some(request),
+                });
+                self.persist_or_log(stored);
+                fx.events.push(ApproverEvent::Request { request: view });
             }
             kind::OUTCOME if stored.paired => {
                 let Ok(outcome) = wire::parse::<Outcome>(content) else {
                     return fx;
                 };
-                if !stored.tracker.outcome_seen(outcome.request_id, local_now) {
+                // Only for a request this phone showed and still keeps, so a
+                // replay, which finds it gone, counts once.
+                let Some(i) = stored
+                    .waiting
+                    .iter()
+                    .position(|w| w.id == outcome.request_id)
+                else {
                     return fx;
-                }
-                if let Some(waiting) = inner.waiting.remove(&outcome.request_id) {
-                    if outcome.outcome == OutcomeKind::Approved {
-                        if let Some(Change::Unfreeze { scope, .. }) =
-                            unfreeze_change(&waiting.request)
-                        {
-                            stored
-                                .tracker
-                                .unfreeze_seen(outcome.request_id, scope, local_now);
-                        }
+                };
+                let waiting = stored.waiting.remove(i);
+                if outcome.outcome == OutcomeKind::Approved {
+                    if let Some(scope) = waiting.unfreeze {
+                        stored
+                            .tracker
+                            .unfreeze_seen(outcome.request_id, scope, local_now);
                     }
                 }
-                if let Err(e) = self.persist(stored) {
-                    tracing::error!(error = %e, "the approver state could not be kept");
-                }
+                self.persist_or_log(stored);
                 fx.events.push(ApproverEvent::Outcome {
                     request_id: outcome.request_id.to_hex(),
                     outcome: match outcome.outcome {
@@ -609,128 +891,145 @@ impl ApproverHandler {
                 let Ok(anchor) = wire::parse::<Anchor>(content) else {
                     return fx;
                 };
-                for alert in stored.tracker.observe(
+                let before = stored.tracker.kept().map(|(at, a)| (at, a.seq));
+                let alerts = stored.tracker.observe(
                     anchor.at,
                     &anchor.anchor,
                     Some(&anchor.frozen),
                     local_now,
-                ) {
-                    fx.events.push(ApproverEvent::Alert {
-                        message: alert_text(&alert),
-                    });
+                );
+                // An anchor no later than the one kept, a relay's replay or
+                // a wrap arriving late, changes nothing and is not shown.
+                if stored.tracker.kept().map(|(at, a)| (at, a.seq)) == before {
+                    return fx;
                 }
-                inner.silent_reported = false;
-                if let Err(e) = self.persist(stored) {
-                    tracing::error!(error = %e, "the approver state could not be kept");
+                for alert in alerts {
+                    stored.alert(alert_text(&alert), &mut fx);
                 }
-                fx.events.push(ApproverEvent::Anchor {
-                    epoch: anchor.frozen.epoch,
-                    all_frozen: anchor.frozen.all,
-                    frozen_credentials: anchor
-                        .frozen
-                        .credentials
-                        .iter()
-                        .map(|c| c.to_hex())
-                        .collect(),
-                    audit_seq: anchor.anchor.seq,
-                });
+                stored.silent_reported = false;
+                self.persist_or_log(stored);
+                fx.events.push(anchor_event(&stored.tracker));
             }
             _ => {}
         }
         if forget {
-            inner.stored = None;
+            inner.set(None);
             let _ = self.mobile.storage.delete_share_by_key(STATE_KEY.into());
+            fx.halt = true;
         }
         fx
     }
 
-    /// Every [`FREEZE_RESEND_SECS`]: due alerts, the silence alert, freezes
-    /// no anchor has shown yet sent again, and requests past their time
-    /// dropped.
-    fn tick(&self) -> Effects {
-        let local_now = now();
-        {
-            let mut inner = self.lock();
-            let mut fx = Effects::default();
-            inner.waiting.retain(|_, w| w.until > local_now);
-            let silent_reported = inner.silent_reported;
-            let Some(stored) = inner.stored.as_mut() else {
-                return fx;
-            };
-            if !stored.paired {
-                return fx;
+    /// Every [`FREEZE_RESEND_SECS`], at the phone's `local_now`: due
+    /// alerts, the silence alert (once per silence), freezes no anchor has
+    /// shown yet sent again, and requests past their time dropped. Saves
+    /// only what changed, and sends a freeze only once its counter is saved,
+    /// so no counter is used twice across a restart.
+    fn tick_at(&self, local_now: u64) -> Effects {
+        let mut inner = self.lock();
+        let mut fx = Effects::default();
+        let Some(stored) = inner.stored.as_mut() else {
+            return fx;
+        };
+        if !stored.paired {
+            return fx;
+        }
+        let waiting_before = stored.waiting.len();
+        stored.waiting.retain(|w| still_kept(w, local_now));
+        let mut changed = stored.waiting.len() != waiting_before;
+        for alert in stored.tracker.due_alerts(local_now) {
+            stored.alert(alert_text(&alert), &mut fx);
+            changed = true;
+        }
+        let silent = stored.tracker.silent(local_now);
+        if silent != stored.silent_reported {
+            if silent {
+                stored.alert(SILENT_ALERT.into(), &mut fx);
             }
-            for alert in stored.tracker.due_alerts(local_now) {
-                fx.events.push(ApproverEvent::Alert {
-                    message: alert_text(&alert),
-                });
-            }
-            let silent = stored.tracker.silent(local_now);
-            if silent && !silent_reported {
-                fx.events.push(ApproverEvent::Alert {
-                    message: "No word from the gateway for an hour: it is down, cut off, or its messages are withheld.".into(),
-                });
-            }
+            stored.silent_reported = silent;
+            changed = true;
+        }
+        let unfreezing = stored
+            .unfreeze
+            .is_some_and(|a| local_now.saturating_sub(a.at) < UNFREEZE_HOLD_SECS);
+        if !unfreezing {
             let epoch = stored.tracker.epoch().unwrap_or(0);
             for scope in stored.tracker.freezes_to_resend() {
-                if let Ok(content) = signed_freeze(stored, scope, epoch) {
+                if let Ok(content) = signed_freeze(stored, scope, epoch, local_now) {
                     fx.send.push((kind::FREEZE, content));
+                    changed = true;
                 }
             }
+        }
+        if changed {
             if let Err(e) = self.persist(stored) {
                 tracing::error!(error = %e, "the approver state could not be kept");
+                fx.send.clear();
             }
-            inner.silent_reported = silent;
-            fx
         }
+        fx
     }
 }
 
-/// The change an unfreeze request carries.
-fn unfreeze_change(request: &Request) -> Option<Change> {
-    let change = request.payload.get("change")?;
-    match Change::parse(change) {
-        Ok(c @ Change::Unfreeze { .. }) => Some(c),
-        _ => None,
+fn anchor_event(tracker: &AnchorTracker) -> ApproverEvent {
+    let frozen = tracker.frozen();
+    ApproverEvent::Anchor {
+        epoch: frozen.map_or(0, |f| f.epoch),
+        all_frozen: frozen.is_some_and(|f| f.all),
+        frozen_credentials: frozen
+            .map(|f| f.credentials.iter().map(|c| c.to_hex()).collect())
+            .unwrap_or_default(),
+        audit_seq: tracker.kept().map_or(0, |(_, a)| a.seq),
     }
-}
-
-/// A freeze of `scope` signed by the transport key with the next counter.
-fn signed_freeze(stored: &mut Stored, scope: Scope, epoch: u64) -> Result<String, KeepMobileError> {
-    let keys = stored.keys()?;
-    stored.counter += 1;
-    let freeze = sig::freeze(&keys, &stored.channel.0, stored.counter, epoch, scope);
-    stored.tracker.freeze_sent(scope, epoch, now());
-    Ok(wire::to_text(&freeze))
 }
 
 #[uniffi::export]
 impl ApproverHandler {
+    /// The approver for `mobile`, with any pairing kept from an earlier
+    /// run. One at a time per `KeepMobile`: close the last one first.
     #[uniffi::constructor]
-    pub fn new(mobile: Arc<KeepMobile>) -> Arc<Self> {
-        let stored = mobile
-            .storage
-            .load_share_by_key(STATE_KEY.into())
-            .ok()
-            .and_then(|data| serde_json::from_slice::<Stored>(&Zeroizing::new(data)).ok());
-        Arc::new(Self {
+    pub fn new(mobile: Arc<KeepMobile>) -> Result<Arc<Self>, KeepMobileError> {
+        if mobile.approver_live.swap(true, Ordering::SeqCst) {
+            return Err(KeepMobileError::InitializationFailed {
+                msg: "an approver is already open for this KeepMobile".into(),
+            });
+        }
+        let stored = match mobile.storage.load_share_by_key(STATE_KEY.into()) {
+            Ok(data) => match serde_json::from_slice::<Stored>(&Zeroizing::new(data)) {
+                Ok(stored) => Some(stored),
+                Err(e) => {
+                    mobile.approver_live.store(false, Ordering::SeqCst);
+                    return Err(KeepMobileError::StorageError {
+                        msg: format!("the approver state cannot be read: {e}"),
+                    });
+                }
+            },
+            Err(KeepMobileError::StorageNotFound) => None,
+            Err(e) => {
+                mobile.approver_live.store(false, Ordering::SeqCst);
+                return Err(e);
+            }
+        };
+        let mut inner = Inner::default();
+        inner.set(stored);
+        Ok(Arc::new(Self {
             mobile,
-            inner: Arc::new(Mutex::new(Inner {
-                stored,
-                ..Inner::default()
-            })),
+            inner: Mutex::new(inner),
             running: Mutex::new(None),
+            lifecycle: Mutex::new(()),
+            generation: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
             callbacks: Mutex::new(None),
-        })
+        }))
     }
 
     pub fn status(&self) -> ApproverStatus {
-        let inner = self.lock();
         let running = self
             .running
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
+        let inner = self.lock();
         let Some(stored) = inner.stored.as_ref() else {
             return ApproverStatus {
                 paired: false,
@@ -743,6 +1042,8 @@ impl ApproverHandler {
                 all_frozen: false,
                 frozen_credentials: Vec::new(),
                 silent: false,
+                alerts: Vec::new(),
+                alerts_dropped: 0,
             };
         };
         let frozen = stored.tracker.frozen();
@@ -759,7 +1060,43 @@ impl ApproverHandler {
                 .map(|f| f.credentials.iter().map(|c| c.to_hex()).collect())
                 .unwrap_or_default(),
             silent: stored.tracker.silent(now()),
+            alerts: stored.alerts.clone(),
+            alerts_dropped: stored.alerts_dropped,
         }
+    }
+
+    /// The owner has seen the alerts up to and including `through_seq`
+    /// (the last [`ApproverAlert::seq`] shown); any raised since stay.
+    pub fn acknowledge_alerts(&self, through_seq: u64) -> Result<(), KeepMobileError> {
+        let mut inner = self.lock();
+        let stored = inner.stored.as_mut().ok_or_else(|| invalid("not paired"))?;
+        stored.alerts.retain(|a| a.seq > through_seq);
+        stored.alerts_dropped = 0;
+        self.persist(stored)
+    }
+
+    /// The requests still waiting for the owner, with the time each has
+    /// left, as when they arrived: after a restart, the app shows these.
+    pub fn waiting_requests(&self) -> Vec<ApprovalRequest> {
+        let inner = self.lock();
+        let Some(stored) = inner.stored.as_ref() else {
+            return Vec::new();
+        };
+        let local_now = now();
+        stored
+            .waiting
+            .iter()
+            .filter_map(|w| {
+                let request = w.open(local_now)?;
+                let checked = check_request(request, &stored.channel.0).ok()?;
+                Some(view::view(
+                    request,
+                    &checked,
+                    clock_skew(request.created_at, local_now),
+                    w.until - local_now,
+                ))
+            })
+            .collect()
     }
 
     /// Begin pairing with the gateway whose pairing code is `uri`, with the
@@ -773,6 +1110,7 @@ impl ApproverHandler {
         approver_key: Vec<u8>,
         label: String,
     ) -> Result<PairingStart, KeepMobileError> {
+        self.open_check()?;
         let mut inner = self.lock();
         if inner.stored.as_ref().is_some_and(|s| s.paired) {
             return Err(invalid("already paired: remove this pairing first"));
@@ -798,6 +1136,12 @@ impl ApproverHandler {
             counter: 0,
             tracker: AnchorTracker::default(),
             gate: RequestGate::default(),
+            waiting: Vec::new(),
+            alerts: Vec::new(),
+            alert_seq: 0,
+            alerts_dropped: 0,
+            silent_reported: false,
+            unfreeze: None,
         };
         let start = PairingStart {
             fingerprint: sig::fingerprint(&transport, &approver.0),
@@ -812,17 +1156,23 @@ impl ApproverHandler {
     }
 
     /// Send the pairing, signed by the approver key (`signature`, DER, as
-    /// the Keystore returns it), and wait for the gateway's answer.
+    /// the Keystore returns it), and wait for the gateway's answer. If it
+    /// cannot be sent, the pairing begun stays, to finish again.
     pub fn finish_pairing(
         self: Arc<Self>,
         signature: Vec<u8>,
         callbacks: Arc<dyn ApproverCallbacks>,
     ) -> Result<(), KeepMobileError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.open_check()?;
         let (pair, relays, keys, channel, secret) = {
             let mut inner = self.lock();
+            if inner.stored.as_ref().is_some_and(|s| s.paired) {
+                return Err(invalid("already paired: remove this pairing first"));
+            }
             let begun = inner
                 .begun
-                .take()
+                .as_ref()
                 .ok_or_else(|| invalid("no pairing was begun"))?;
             let sig = checked_signature(&signature, &begun.stored.approver, &begun.digest)?;
             let keys = begun.stored.keys()?;
@@ -837,50 +1187,79 @@ impl ApproverHandler {
                 proof: sig::pair_proof(&begun.secret, &channel, &transport, &a),
                 approver_sig: sig,
             };
-            self.persist(&begun.stored)?;
-            let relays = begun.stored.relays.clone();
-            inner.stored = Some(begun.stored);
-            (pair, relays, keys, channel, begun.secret)
+            let stored = begun.stored.clone();
+            let secret = begun.secret.clone();
+            self.persist(&stored)?;
+            let relays = stored.relays.clone();
+            inner.set(Some(stored));
+            (pair, relays, keys, channel, secret)
         };
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(callbacks);
-        self.run(relays, keys.public_key())?;
-        let tag = TagKey::pairing_phone(&secret);
-        let event = wrap::wrap(
-            &keys,
-            &channel,
-            &tag,
-            kind::PAIRING,
-            &wire::to_text(&pair),
-            now(),
-        )
-        .map_err(|e| invalid(e.to_string()))?;
-        self.send_now(event)
+        self.halt();
+        let sent = self.run(relays, keys.public_key()).and_then(|()| {
+            let tag = TagKey::pairing_phone(&secret);
+            let event = wrap::wrap(
+                &keys,
+                &channel,
+                &tag,
+                kind::PAIRING,
+                &wire::to_text(&pair),
+                now(),
+            )
+            .map_err(|e| invalid(e.to_string()))?;
+            self.send_now(event)
+        });
+        if let Err(e) = sent {
+            self.halt();
+            self.lock().set(None);
+            let _ = self.mobile.storage.delete_share_by_key(STATE_KEY.into());
+            return Err(e);
+        }
+        self.lock().begun = None;
+        Ok(())
     }
 
-    /// Start serving a pairing kept from an earlier run.
+    /// Start serving a pairing kept from an earlier run. Requests that
+    /// waited across the restart are read with [`Self::waiting_requests`].
     pub fn start(
         self: Arc<Self>,
         callbacks: Arc<dyn ApproverCallbacks>,
     ) -> Result<(), KeepMobileError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.open_check()?;
         let (relays, transport) = {
             let inner = self.lock();
             let stored = inner.stored.as_ref().ok_or_else(|| invalid("not paired"))?;
             (stored.relays.clone(), stored.keys()?.public_key())
         };
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(callbacks);
+        self.halt();
         self.run(relays, transport)
     }
 
     pub fn stop(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.halt();
+    }
+
+    /// Stop serving, let go of the callbacks, and give the `KeepMobile`'s
+    /// approver slot back, so a new handler can open. The pairing stays
+    /// stored; this handler can do nothing more.
+    pub fn close(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.halt();
+        *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.lock() = Inner::default();
+        self.release();
     }
 
     /// Forget the pairing on this phone. The gateway keeps the device until
     /// it is removed there.
     pub fn forget(&self) -> Result<(), KeepMobileError> {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        self.open_check()?;
         self.halt();
-        let mut inner = self.lock();
-        *inner = Inner::default();
+        *self.lock() = Inner::default();
         match self.mobile.storage.delete_share_by_key(STATE_KEY.into()) {
             Ok(()) | Err(KeepMobileError::StorageNotFound) => Ok(()),
             Err(e) => Err(e),
@@ -895,75 +1274,79 @@ impl ApproverHandler {
         approve: bool,
     ) -> Result<Vec<u8>, KeepMobileError> {
         let id = request_id_arg(&request_id)?;
-        let mut inner = self.lock();
-        let local_now = now();
-        let waiting = inner
-            .waiting
-            .get(&id)
-            .filter(|w| w.until > local_now)
-            .ok_or_else(|| invalid("that request is no longer waiting"))?;
-        let request_hash = waiting.request.request_hash;
+        let inner = self.lock();
         let stored = inner.stored.as_ref().ok_or_else(|| invalid("not paired"))?;
-        let verdict = if approve {
-            Verdict::Approve
-        } else {
-            Verdict::Deny
-        };
-        let digest = sig::decision_digest(
+        let local_now = now();
+        let request = stored
+            .waiting
+            .iter()
+            .filter(|w| w.id == id)
+            .find_map(|w| w.open(local_now))
+            .ok_or_else(|| invalid("that request is no longer waiting"))?;
+        Ok(sig::decision_digest(
             &stored.channel.0,
             &stored.approver.0,
-            &request_hash.0,
-            verdict,
-        );
-        inner.asked = Some((
-            digest,
-            Asked::Decision {
-                request_id: id,
-                request_hash,
-                verdict,
-            },
-        ));
-        Ok(digest.to_vec())
+            &request.request_hash.0,
+            verdict(approve),
+        )
+        .to_vec())
     }
 
-    /// Send the decision the Keystore signed (`signature`, DER) after
-    /// [`Self::decision_digest`].
-    pub fn send_decision(&self, signature: Vec<u8>) -> Result<(), KeepMobileError> {
+    /// Send the decision on request `request_id` that the Keystore signed
+    /// (`signature`, DER) over [`Self::decision_digest`]'s digest.
+    pub fn send_decision(
+        &self,
+        request_id: String,
+        approve: bool,
+        signature: Vec<u8>,
+    ) -> Result<(), KeepMobileError> {
+        let id = request_id_arg(&request_id)?;
+        let verdict = verdict(approve);
         let decision = {
-            let mut inner = self.lock();
-            let (digest, asked) = inner
-                .asked
-                .take()
-                .ok_or_else(|| invalid("no decision was asked for"))?;
-            let Asked::Decision {
-                request_id,
-                request_hash,
-                verdict,
-            } = asked
-            else {
-                return Err(invalid("the signature asked for is not a decision"));
-            };
-            if inner
-                .waiting
-                .get(&request_id)
-                .is_none_or(|w| w.until <= now())
-            {
-                return Err(invalid("that request is no longer waiting"));
-            }
+            let inner = self.lock();
             let stored = inner.stored.as_ref().ok_or_else(|| invalid("not paired"))?;
-            let sig = checked_signature(&signature, &stored.approver, &digest)?;
+            let request = stored
+                .waiting
+                .iter()
+                .filter(|w| w.id == id)
+                .find_map(|w| w.open(now()))
+                .ok_or_else(|| invalid("that request is no longer waiting"))?;
+            let request_hash = request.request_hash;
+            let digest = sig::decision_digest(
+                &stored.channel.0,
+                &stored.approver.0,
+                &request_hash.0,
+                verdict,
+            );
             Decision {
                 v: V1,
-                request_id,
+                request_id: id,
                 request_hash,
                 decision: verdict,
-                sig,
+                sig: checked_signature(&signature, &stored.approver, &digest)?,
             }
         };
-        // Taken off the waiting list only once sent, so a failed send can be
-        // tried again.
         self.send_now(self.sealed(kind::DECISION, &wire::to_text(&decision))?)?;
-        self.lock().waiting.remove(&decision.request_id);
+        // Decided only once a relay took it, so a failed send can be tried
+        // again. Its payload goes; what its outcome needs stays.
+        let mut inner = self.lock();
+        if let Some(stored) = inner.stored.as_mut() {
+            if let Some(w) = stored.waiting.iter_mut().find(|w| w.id == id) {
+                w.request = None;
+            }
+            if stored
+                .waiting
+                .iter()
+                .filter(|w| w.request.is_none())
+                .count()
+                > MAX_WAITING
+            {
+                if let Some(i) = stored.waiting.iter().position(|w| w.request.is_none()) {
+                    stored.waiting.remove(i);
+                }
+            }
+            self.persist_or_log(stored);
+        }
         Ok(())
     }
 
@@ -980,7 +1363,7 @@ impl ApproverHandler {
                 .filter(|s| s.paired)
                 .ok_or_else(|| invalid("not paired"))?;
             let epoch = stored.tracker.epoch().unwrap_or(0);
-            let content = signed_freeze(stored, scope, epoch)?;
+            let content = signed_freeze(stored, scope, epoch, now())?;
             self.persist(stored)?;
             content
         };
@@ -999,59 +1382,73 @@ impl ApproverHandler {
             .ok_or_else(|| invalid("not paired"))?;
         let epoch = stored.tracker.epoch().unwrap_or(0);
         stored.counter += 1;
-        let counter = stored.counter;
-        let signer = SignerKey::Approver(stored.approver);
-        let digest = sig::freeze_digest(
-            &stored.channel.0,
-            &signer,
-            counter,
-            epoch,
-            FreezeAction::Unfreeze,
+        let asked = AskedUnfreeze {
             scope,
-        );
+            counter: stored.counter,
+            epoch,
+            at: now(),
+        };
+        stored.unfreeze = Some(asked);
         self.persist(stored)?;
-        inner.asked = Some((
-            digest,
-            Asked::Unfreeze {
-                scope,
-                counter,
-                epoch,
-            },
-        ));
-        Ok(digest.to_vec())
+        Ok(unfreeze_digest(stored, asked).to_vec())
     }
 
-    /// Send the unfreeze the Keystore signed (`signature`, DER) after
-    /// [`Self::unfreeze_digest`].
-    pub fn send_unfreeze(&self, signature: Vec<u8>) -> Result<(), KeepMobileError> {
+    /// Send the unfreeze of the same credential (or every agent) that the
+    /// Keystore signed (`signature`, DER) over [`Self::unfreeze_digest`]'s
+    /// digest.
+    pub fn send_unfreeze(
+        &self,
+        credential: Option<String>,
+        signature: Vec<u8>,
+    ) -> Result<(), KeepMobileError> {
+        let scope = scope_arg(credential)?;
         let freeze = {
             let mut inner = self.lock();
-            let (digest, asked) = inner
-                .asked
-                .take()
-                .ok_or_else(|| invalid("no unfreeze was asked for"))?;
-            let Asked::Unfreeze {
-                scope,
-                counter,
-                epoch,
-            } = asked
-            else {
-                return Err(invalid("the signature asked for is not an unfreeze"));
-            };
-            let stored = inner.stored.as_ref().ok_or_else(|| invalid("not paired"))?;
-            let sig = checked_signature(&signature, &stored.approver, &digest)?;
+            let stored = inner.stored.as_mut().ok_or_else(|| invalid("not paired"))?;
+            let asked = stored
+                .unfreeze
+                .filter(|a| a.scope == scope)
+                .ok_or_else(|| invalid("no unfreeze of that scope was asked for"))?;
+            // A freeze signed since carries a higher counter, so the gateway
+            // would refuse this one as old.
+            if stored.counter != asked.counter {
+                stored.unfreeze = None;
+                self.persist_or_log(stored);
+                return Err(invalid(
+                    "a freeze was sent while this unfreeze was being signed: ask for the \
+                     unfreeze digest again",
+                ));
+            }
+            let digest = unfreeze_digest(stored, asked);
             Freeze {
                 v: V1,
                 action: FreezeAction::Unfreeze,
                 scope,
-                counter,
-                epoch,
+                counter: asked.counter,
+                epoch: asked.epoch,
                 signer: SignerKey::Approver(stored.approver),
-                sig,
+                sig: checked_signature(&signature, &stored.approver, &digest)?,
             }
         };
-        self.send_now(self.sealed(kind::FREEZE, &wire::to_text(&freeze))?)
+        self.send_now(self.sealed(kind::FREEZE, &wire::to_text(&freeze))?)?;
+        let mut inner = self.lock();
+        if let Some(stored) = inner.stored.as_mut() {
+            stored.unfreeze = None;
+            self.persist_or_log(stored);
+        }
+        Ok(())
     }
+}
+
+fn unfreeze_digest(stored: &Stored, asked: AskedUnfreeze) -> [u8; 32] {
+    sig::freeze_digest(
+        &stored.channel.0,
+        &SignerKey::Approver(stored.approver),
+        asked.counter,
+        asked.epoch,
+        FreezeAction::Unfreeze,
+        asked.scope,
+    )
 }
 
 #[cfg(test)]

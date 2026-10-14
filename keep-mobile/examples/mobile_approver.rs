@@ -146,7 +146,7 @@ impl ApproverCallbacks for Printer {
                 audit_seq,
                 ..
             } => say(&format!("anchor {epoch} {all_frozen} {audit_seq}")),
-            ApproverEvent::Alert { message } => say(&format!("alert {message}")),
+            ApproverEvent::Alert { message, .. } => say(&format!("alert {message}")),
         }
     }
 }
@@ -168,7 +168,7 @@ fn main() {
         .with_max_level(tracing::Level::WARN)
         .init();
     let mobile = Arc::new(KeepMobile::new(Arc::new(Memory::default())).expect("keep-mobile"));
-    let approver = ApproverHandler::new(mobile);
+    let approver = ApproverHandler::new(mobile).expect("an approver");
     let seed = keep_core::entropy::try_random_bytes::<32>().expect("entropy");
     let keystore = Keystore {
         key: p256::ecdsa::SigningKey::from_slice(&seed).expect("a P-256 key"),
@@ -198,14 +198,15 @@ fn main() {
                     say("no-request");
                     continue;
                 };
+                let approve = verdict == "approve";
                 approver
-                    .decision_digest(id, verdict == "approve")
-                    .and_then(|digest| approver.send_decision(keystore.sign(&digest)))
+                    .decision_digest(id.clone(), approve)
+                    .and_then(|digest| approver.send_decision(id, approve, keystore.sign(&digest)))
             }
             (Some("freeze"), Some(word)) => approver.freeze(scope(word)),
             (Some("unfreeze"), Some(word)) => approver
                 .unfreeze_digest(scope(word))
-                .and_then(|digest| approver.send_unfreeze(keystore.sign(&digest))),
+                .and_then(|digest| approver.send_unfreeze(scope(word), keystore.sign(&digest))),
             (Some("quit"), None) => break,
             _ => {
                 say("bad-command");

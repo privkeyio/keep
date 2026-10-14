@@ -341,6 +341,11 @@ impl AnchorTracker {
             .is_some_and(|at| local_now.saturating_sub(at) >= SILENCE_SECS)
     }
 
+    /// The anchor kept, with the gateway time it was taken at.
+    pub fn kept(&self) -> Option<(u64, &AnchorState)> {
+        self.kept.as_ref().map(|k| (k.at, &k.anchor))
+    }
+
     /// The latest gateway time from any anchor or request accepted.
     pub fn latest_gateway_time(&self) -> u64 {
         self.latest_gateway_time

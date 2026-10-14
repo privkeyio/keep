@@ -36,8 +36,8 @@ pub struct ApprovalRequest {
     pub reason: String,
     /// The credential asking, by name, when an agent asks.
     pub credential: Option<String>,
-    /// Seconds to decide, counted from when the request arrived.
-    pub deadline_secs: u64,
+    /// Seconds left to decide, by this phone's clock.
+    pub seconds_left: u64,
     pub fields: Vec<ApprovalField>,
     /// Things the owner must read first.
     pub warnings: Vec<String>,
@@ -127,7 +127,12 @@ fn flatten(prefix: &str, value: &Value, out: &mut Vec<ApprovalField>) {
 }
 
 /// The request as the app shows it.
-pub fn view(request: &Request, checked: &CheckedRequest, clock_skew: bool) -> ApprovalRequest {
+pub fn view(
+    request: &Request,
+    checked: &CheckedRequest,
+    clock_skew: bool,
+    seconds_left: u64,
+) -> ApprovalRequest {
     let mut fields = Vec::new();
     let mut warnings = Vec::new();
     if let Some(key) = &request.key {
@@ -153,7 +158,8 @@ pub fn view(request: &Request, checked: &CheckedRequest, clock_skew: bool) -> Ap
             fields.push(gateway("created at", &e.created_at.to_string()));
             fields.push(agent("content", &e.content));
             for (i, tag) in e.tags.iter().enumerate() {
-                fields.push(agent(&format!("tag {i}"), &tag.join(", ")));
+                let tag = serde_json::to_string(tag).unwrap_or_default();
+                fields.push(agent(&format!("tag {i}"), &tag));
             }
         }
         Payload::Psbt(_) => {
@@ -219,7 +225,7 @@ pub fn view(request: &Request, checked: &CheckedRequest, clock_skew: bool) -> Ap
             .credential
             .as_ref()
             .map(|c| shown(&c.name, GATEWAY_TEXT_CHARS).text),
-        deadline_secs: request.deadline_secs,
+        seconds_left,
         fields,
         warnings,
     }
