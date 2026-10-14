@@ -936,6 +936,57 @@ impl Keep {
         Ok(zeroize::Zeroizing::new(record.value.clone()))
     }
 
+    /// A secret's name and kind, and whether its value is threshold-sealed,
+    /// for granting it to an agent. The value is not returned.
+    pub fn secret_info(&self, id: &[u8; 32]) -> Result<crate::secret::SecretInfo> {
+        let sealed = self.storage.load_secret_seal(id)?.is_some();
+        let record = self.storage.load_secret(id)?;
+        Ok(crate::secret::SecretInfo {
+            name: record.name.clone(),
+            kind: record.kind,
+            sealed,
+        })
+    }
+
+    /// The id of the one secret named `name`. No secret by that name and more
+    /// than one are the same error, so the answer does not tell them apart.
+    pub fn find_secret(&self, name: &str) -> Result<[u8; 32]> {
+        let mut found = self
+            .storage
+            .list_secrets()?
+            .into_iter()
+            .filter(|r| r.name == name)
+            .map(|r| r.id);
+        match (found.next(), found.next()) {
+            (Some(id), None) => Ok(id),
+            _ => Err(KeepError::NotFound(
+                "unknown or ambiguous secret name".into(),
+            )),
+        }
+    }
+
+    /// The value of a plain secret whose kind is one of `kinds`, for the agent
+    /// gateway to use on an agent's behalf. Writes no audit entry: the caller
+    /// records the use, failing closed, before the value leaves the process.
+    pub fn use_secret(
+        &self,
+        id: &[u8; 32],
+        kinds: &[crate::secret::SecretKind],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+        if self.storage.load_secret_seal(id)?.is_some() {
+            return Err(KeepError::invalid_input(
+                "a threshold-sealed secret cannot be used by an agent",
+            ));
+        }
+        let record = self.storage.load_secret(id)?;
+        if !kinds.contains(&record.kind) {
+            return Err(KeepError::invalid_input(
+                "the secret's kind does not allow this use",
+            ));
+        }
+        Ok(zeroize::Zeroizing::new(record.value.clone()))
+    }
+
     /// Records a signature an agent obtained with `pubkey`'s key over `message`,
     /// with `context` naming what was signed. Fails when the entry cannot be
     /// written, so a caller can withhold a signature that would go unrecorded.
@@ -3611,6 +3662,61 @@ mod tests {
         let err = keep.reveal_secret(&stored.id).unwrap_err();
         assert!(err.to_string().contains("threshold-sealed"), "{err}");
         assert!(!audited(&keep, AuditEventType::SecretReveal, &stored.id));
+    }
+
+    /// The agent gateway learns a secret's name and kind without its value,
+    /// finds a secret by a name only it has, and uses only a plain secret of
+    /// a kind the use allows, writing no reveal.
+    #[test]
+    fn secrets_are_described_found_and_used_for_agents() {
+        use crate::secret::{SecretKind, SecretRecord};
+        let dir = tempdir().unwrap();
+        let mut keep = test_keep(&dir.path().join("keep"));
+        let token = SecretRecord::new("api".into(), SecretKind::ApiToken, b"tok".to_vec()).unwrap();
+        let note = SecretRecord::new("note".into(), SecretKind::Note, b"n".to_vec()).unwrap();
+        let twin_a = SecretRecord::new("twin".into(), SecretKind::Generic, b"a".to_vec()).unwrap();
+        let twin_b = SecretRecord::new("twin".into(), SecretKind::Generic, b"b".to_vec()).unwrap();
+        for r in [&token, &note, &twin_a, &twin_b] {
+            keep.store_secret(r).unwrap();
+        }
+        let sealed = keep
+            .store_sealed_secret(
+                SecretRecord::new("sealed".into(), SecretKind::ApiToken, b"v".to_vec()).unwrap(),
+                &crate::crypto::SecretKey::from_slice(&[9u8; 32]).unwrap(),
+                0,
+            )
+            .unwrap();
+
+        let info = keep.secret_info(&token.id).unwrap();
+        assert_eq!(
+            info,
+            crate::secret::SecretInfo {
+                name: "api".into(),
+                kind: SecretKind::ApiToken,
+                sealed: false
+            }
+        );
+        assert!(keep.secret_info(&sealed.id).unwrap().sealed);
+        assert!(keep.secret_info(&[0x77; 32]).is_err());
+
+        assert_eq!(keep.find_secret("api").unwrap(), token.id);
+        let missing = keep.find_secret("nope").unwrap_err().to_string();
+        let ambiguous = keep.find_secret("twin").unwrap_err().to_string();
+        assert_eq!(missing, ambiguous, "none and many answer the same");
+
+        let http = [
+            SecretKind::ApiToken,
+            SecretKind::Password,
+            SecretKind::Generic,
+        ];
+        assert_eq!(
+            keep.use_secret(&token.id, &http).unwrap().as_slice(),
+            b"tok"
+        );
+        assert!(keep.use_secret(&note.id, &http).is_err());
+        let err = keep.use_secret(&sealed.id, &http).unwrap_err().to_string();
+        assert!(err.contains("threshold-sealed"), "{err}");
+        assert!(!audited(&keep, AuditEventType::SecretReveal, &token.id));
     }
 
     /// A value too large to load back is refused when stored, not lost.
