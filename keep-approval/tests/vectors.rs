@@ -19,7 +19,8 @@ use keep_approval::binding::{
     Payload, RequestDraft, UnsignedEventFields,
 };
 use keep_approval::change::{
-    Change, ChangeBitcoin, ChangeGrant, ChangeLimits, ChangeRule, ChangeSecret, Decimal, Scope,
+    Change, ChangeBitcoin, ChangeGrant, ChangeLimits, ChangeRule, ChangeSecret, ChangeSsh, Decimal,
+    Scope,
 };
 use keep_approval::messages::{
     AnchorState, Budget, CredentialRef, FreezeAction, LogPoint, Reason, Request, SignerKey,
@@ -185,6 +186,7 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
                         agent_headers: vec![],
                     },
                 ],
+                ssh: None,
             },
             ChangeSecret {
                 secret: Hex32([0x32; 32]),
@@ -199,8 +201,35 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
                     format: "Basic {}".into(),
                     agent_headers: vec![],
                 }],
+                ssh: None,
             },
         ],
+    };
+    let ssh_grant = ChangeGrant {
+        keys: vec![],
+        operations: vec!["ssh_sign".into()],
+        event_kinds: vec![],
+        nip44_peers: vec![],
+        bitcoin: None,
+        limits: ChangeLimits {
+            per_minute: Decimal(10),
+            per_hour: Decimal(100),
+            per_day: Decimal(1000),
+        },
+        secrets: vec![ChangeSecret {
+            secret: Hex32([0x33; 32]),
+            name: "deploy key".into(),
+            kind: "ssh_key".into(),
+            http: vec![],
+            ssh: Some(ChangeSsh {
+                users: vec!["deploy".into(), "git".into()],
+                host_keys: vec![
+                    "ecdsa-sha2-nistp256 SHA256:hpR9FK9WdJ/XhGhFjMPJh24iLQSzfd3mQ0e3F3a5to8".into(),
+                    "ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0".into(),
+                ],
+                sshsig_namespaces: vec!["git".into()],
+            }),
+        }],
     };
     vec![
         (
@@ -351,6 +380,27 @@ fn drafts(key: [u8; 32]) -> Vec<(&'static str, RequestDraft)> {
                     id: Hex16([0x23; 16]),
                     name: "deployer".into(),
                     uid: 1002,
+                }),
+            ),
+        ),
+        (
+            "management issue_credential with an SSH key",
+            draft(
+                Payload::Management(Change::IssueCredential {
+                    id: Hex16([0x24; 16]),
+                    name: "git pusher".into(),
+                    uid: Decimal(1003),
+                    created_at: Decimal(1_791_580_000),
+                    expires_at: Decimal(1_794_172_000),
+                    grant: ssh_grant,
+                }),
+                Reason::Management,
+                None,
+                None,
+                Some(CredentialRef {
+                    id: Hex16([0x24; 16]),
+                    name: "git pusher".into(),
+                    uid: 1003,
                 }),
             ),
         ),

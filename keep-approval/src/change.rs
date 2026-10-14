@@ -115,7 +115,23 @@ pub struct ChangeSecret {
     pub secret: Hex32,
     pub name: String,
     pub kind: String,
+    /// Where the secret may be sent over HTTPS. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http: Vec<ChangeRule>,
+    /// What an SSH key may sign. Left out when the secret is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<ChangeSsh>,
+}
+
+/// What an SSH key may sign: logins as `users` to hosts holding one of
+/// `host_keys` (each `<type> SHA256:<fingerprint>`), and SSHSIG signatures
+/// in `sshsig_namespaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChangeSsh {
+    pub users: Vec<String>,
+    pub host_keys: Vec<String>,
+    pub sshsig_namespaces: Vec<String>,
 }
 
 /// Where a secret may be sent over HTTPS. Field order is the order rules
@@ -134,7 +150,7 @@ pub struct ChangeRule {
 }
 
 /// The kinds a granted secret may have.
-pub const SECRET_KINDS: [&str; 4] = ["api_token", "generic", "note", "password"];
+pub const SECRET_KINDS: [&str; 5] = ["api_token", "generic", "note", "password", "ssh_key"];
 
 /// The HTTP methods a rule may allow, in the ascending order a rule lists them.
 pub const METHODS: [&str; 7] = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"];
@@ -162,7 +178,7 @@ pub struct ChangeLimits {
 }
 
 /// The operations a grant may name.
-pub const OPERATIONS: [&str; 7] = [
+pub const OPERATIONS: [&str; 8] = [
     "get_bitcoin_address",
     "get_public_key",
     "http_request",
@@ -170,6 +186,7 @@ pub const OPERATIONS: [&str; 7] = [
     "nip44_encrypt",
     "sign_nostr_event",
     "sign_psbt",
+    "ssh_sign",
 ];
 
 /// The Bitcoin networks a grant may name.
@@ -356,13 +373,118 @@ impl ChangeSecret {
         if !SECRET_KINDS.contains(&self.kind.as_str()) {
             return Err(malformed(format!("unknown secret kind {:?}", self.kind)));
         }
-        if self.http.is_empty() || self.http.len() > MAX_RULES {
-            return Err(malformed(format!(
-                "a secret holds 1 to {MAX_RULES} HTTP rules"
-            )));
+        match &self.ssh {
+            Some(ssh) => {
+                if self.kind != "ssh_key" || !self.http.is_empty() {
+                    return Err(malformed(
+                        "an SSH rule is for an ssh_key secret, which has no HTTP rules",
+                    ));
+                }
+                ssh.check()
+            }
+            None => {
+                if self.kind == "ssh_key" {
+                    return Err(malformed("an ssh_key secret needs an SSH rule"));
+                }
+                if self.http.is_empty() || self.http.len() > MAX_RULES {
+                    return Err(malformed(format!(
+                        "a secret holds 1 to {MAX_RULES} HTTP rules"
+                    )));
+                }
+                ascending(&self.http, "http")?;
+                self.http.iter().try_for_each(ChangeRule::check)
+            }
         }
-        ascending(&self.http, "http")?;
-        self.http.iter().try_for_each(ChangeRule::check)
+    }
+}
+
+/// The most users, host keys or namespaces an SSH rule lists.
+pub const MAX_SSH_ITEMS: usize = 8;
+
+/// The host key types an SSH rule may name.
+pub const SSH_HOST_KEY_TYPES: [&str; 2] = ["ecdsa-sha2-nistp256", "ssh-ed25519"];
+
+/// A login user an SSH rule names: 1 to 64 ASCII letters, digits, `.`, `_`
+/// or `-`, not starting with `-`.
+pub fn ssh_user_ok(user: &str) -> bool {
+    ssh_word_ok(user, b"._-")
+}
+
+/// An SSHSIG namespace an SSH rule names: 1 to 64 ASCII letters, digits,
+/// `@`, `.`, `_` or `-`, not starting with `-`.
+pub fn sshsig_namespace_ok(namespace: &str) -> bool {
+    ssh_word_ok(namespace, b"@._-")
+}
+
+fn ssh_word_ok(word: &str, extra: &[u8]) -> bool {
+    !word.is_empty()
+        && word.len() <= 64
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+}
+
+/// A host key as a change carries it: its type, a space, and its SHA-256
+/// fingerprint as OpenSSH prints it (`SHA256:` and 43 base64 characters).
+pub fn ssh_host_key_ok(key: &str) -> bool {
+    let Some((kind, fingerprint)) = key.split_once(' ') else {
+        return false;
+    };
+    let Some(digest) = fingerprint.strip_prefix("SHA256:") else {
+        return false;
+    };
+    SSH_HOST_KEY_TYPES.contains(&kind)
+        && digest.len() == 43
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        // The last of 43 characters carries the digest's last 4 bits, and 2
+        // zero bits.
+        && digest
+            .bytes()
+            .last()
+            .is_some_and(|b| b"AEIMQUYcgkosw048".contains(&b))
+}
+
+impl ChangeSsh {
+    fn check(&self) -> Result<()> {
+        for (list, what) in [
+            (&self.users, "users"),
+            (&self.host_keys, "host_keys"),
+            (&self.sshsig_namespaces, "sshsig_namespaces"),
+        ] {
+            if list.len() > MAX_SSH_ITEMS {
+                return Err(malformed(format!(
+                    "an SSH rule lists at most {MAX_SSH_ITEMS} {what}"
+                )));
+            }
+            ascending(list, what)?;
+        }
+        if self.users.is_empty() != self.host_keys.is_empty() {
+            return Err(malformed("an SSH rule names users and host keys together"));
+        }
+        if self.users.is_empty() && self.sshsig_namespaces.is_empty() {
+            return Err(malformed("an SSH rule must allow at least one use"));
+        }
+        if !self.users.iter().all(|u| ssh_user_ok(u)) {
+            return Err(malformed("an SSH user is letters, digits, '.', '_' or '-'"));
+        }
+        if !self.host_keys.iter().all(|k| ssh_host_key_ok(k)) {
+            return Err(malformed(
+                "an SSH host key is its type and SHA256 fingerprint",
+            ));
+        }
+        if !self
+            .sshsig_namespaces
+            .iter()
+            .all(|n| sshsig_namespace_ok(n))
+        {
+            return Err(malformed(
+                "an SSHSIG namespace is letters, digits, '@', '.', '_' or '-'",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -789,6 +911,93 @@ mod tests {
         ];
         for (i, change) in cases.iter().enumerate() {
             let mut v = with_secrets();
+            change(&mut v);
+            assert!(
+                Change::parse(&v).is_err(),
+                "case {i} should be refused: {v}"
+            );
+        }
+    }
+
+    fn with_ssh() -> Value {
+        let mut v = with_secrets();
+        v["grant"]["operations"] = json!(["ssh_sign"]);
+        v["grant"]["secrets"] = json!([{
+            "secret": "33".repeat(32),
+            "name": "deploy key",
+            "kind": "ssh_key",
+            "ssh": {
+                "users": ["deploy", "git"],
+                "host_keys": [
+                    "ecdsa-sha2-nistp256 SHA256:hpR9FK9WdJ/XhGhFjMPJh24iLQSzfd3mQ0e3F3a5to8",
+                    "ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0"
+                ],
+                "sshsig_namespaces": ["git"]
+            }
+        }]);
+        v
+    }
+
+    #[test]
+    fn ssh_rules_in_a_grant_parse_strictly() {
+        Change::parse(&with_ssh()).unwrap();
+        let mut only_sshsig = with_ssh();
+        only_sshsig["grant"]["secrets"][0]["ssh"]["users"] = json!([]);
+        only_sshsig["grant"]["secrets"][0]["ssh"]["host_keys"] = json!([]);
+        Change::parse(&only_sshsig).unwrap();
+
+        type Mutation = Box<dyn Fn(&mut Value)>;
+        fn ssh(v: &mut Value) -> &mut Value {
+            &mut v["grant"]["secrets"][0]["ssh"]
+        }
+        let cases: Vec<Mutation> = vec![
+            Box::new(|v| v["grant"]["secrets"][0]["kind"] = json!("api_token")),
+            Box::new(|v| {
+                v["grant"]["secrets"][0]["http"] =
+                    with_secrets()["grant"]["secrets"][0]["http"].clone()
+            }),
+            Box::new(|v| ssh(v)["users"] = json!(["git", "deploy"])),
+            Box::new(|v| ssh(v)["users"] = json!(["git", "git"])),
+            Box::new(|v| ssh(v)["users"] = json!(["-oProxyCommand"])),
+            Box::new(|v| ssh(v)["users"] = json!(["a b"])),
+            Box::new(|v| ssh(v)["users"] = json!([])),
+            Box::new(|v| ssh(v)["host_keys"] = json!([])),
+            Box::new(|v| {
+                ssh(v)["users"] = json!([]);
+                ssh(v)["host_keys"] = json!([]);
+                ssh(v)["sshsig_namespaces"] = json!([]);
+            }),
+            Box::new(|v| {
+                ssh(v)["host_keys"] =
+                    json!(["ssh-rsa SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0"])
+            }),
+            Box::new(|v| {
+                ssh(v)["host_keys"] =
+                    json!(["ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza1"])
+            }),
+            Box::new(|v| {
+                ssh(v)["host_keys"] =
+                    json!(["ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza"])
+            }),
+            Box::new(|v| {
+                ssh(v)["host_keys"] = json!(["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpKbGPinFIK"])
+            }),
+            Box::new(|v| ssh(v)["sshsig_namespaces"] = json!([""])),
+            Box::new(|v| ssh(v)["sshsig_namespaces"] = json!(["file", "git", "git"])),
+            Box::new(|v| ssh(v)["extra"] = json!([])),
+            Box::new(|v| {
+                ssh(v)["users"] = json!((0..=MAX_SSH_ITEMS)
+                    .map(|i| format!("u{i:02}"))
+                    .collect::<Vec<_>>())
+            }),
+            Box::new(|v| {
+                if let Some(o) = ssh(v).as_object_mut() {
+                    o.remove("sshsig_namespaces");
+                }
+            }),
+        ];
+        for (i, change) in cases.iter().enumerate() {
+            let mut v = with_ssh();
             change(&mut v);
             assert!(
                 Change::parse(&v).is_err(),

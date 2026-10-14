@@ -115,6 +115,52 @@
       "type_code": 1
     },
     {
+      "canonical": "{\"created_at\":\"1791580000\",\"expires_at\":\"1794172000\",\"grant\":{\"event_kinds\":[],\"keys\":[],\"limits\":{\"per_day\":\"1000\",\"per_hour\":\"100\",\"per_minute\":\"10\"},\"nip44_peers\":[],\"operations\":[\"ssh_sign\"],\"secrets\":[{\"kind\":\"ssh_key\",\"name\":\"deploy key\",\"secret\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"ssh\":{\"host_keys\":[\"ecdsa-sha2-nistp256 SHA256:hpR9FK9WdJ/XhGhFjMPJh24iLQSzfd3mQ0e3F3a5to8\",\"ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0\"],\"sshsig_namespaces\":[\"git\"],\"users\":[\"deploy\",\"git\"]}}]},\"id\":\"24242424242424242424242424242424\",\"name\":\"git pusher\",\"type\":\"issue_credential\",\"uid\":\"1003\"}",
+      "change": {
+        "created_at": "1791580000",
+        "expires_at": "1794172000",
+        "grant": {
+          "event_kinds": [],
+          "keys": [],
+          "limits": {
+            "per_day": "1000",
+            "per_hour": "100",
+            "per_minute": "10"
+          },
+          "nip44_peers": [],
+          "operations": [
+            "ssh_sign"
+          ],
+          "secrets": [
+            {
+              "kind": "ssh_key",
+              "name": "deploy key",
+              "secret": "3333333333333333333333333333333333333333333333333333333333333333",
+              "ssh": {
+                "host_keys": [
+                  "ecdsa-sha2-nistp256 SHA256:hpR9FK9WdJ/XhGhFjMPJh24iLQSzfd3mQ0e3F3a5to8",
+                  "ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0"
+                ],
+                "sshsig_namespaces": [
+                  "git"
+                ],
+                "users": [
+                  "deploy",
+                  "git"
+                ]
+              }
+            }
+          ]
+        },
+        "id": "24242424242424242424242424242424",
+        "name": "git pusher",
+        "type": "issue_credential",
+        "uid": "1003"
+      },
+      "sha256": "04063f898f59fe2bf74831dbfc3810d26ac747c5bf0d688c45c1205c964f0291",
+      "type_code": 1
+    },
+    {
       "canonical": "{\"epoch\":\"41\",\"scope\":\"all\",\"type\":\"unfreeze\"}",
       "change": {
         "epoch": "41",
@@ -794,6 +840,89 @@
         "v": 1
       },
       "request_hash": "0f3adde1b283390ef0133f4103266df59c3b6d6acc26f258735df7d7fdac5366"
+    },
+    {
+      "name": "management issue_credential with an SSH key",
+      "preimage": "011b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f24242424242424242424242424242424444444444444444444444444444444444444444444444444444444444444444410000000000000000000000000000000000000000000000000000000000000000000210000000104063f898f59fe2bf74831dbfc3810d26ac747c5bf0d688c45c1205c964f0291",
+      "request": {
+        "anchor": {
+          "head": "3333333333333333333333333333333333333333333333333333333333333333",
+          "prev": {
+            "head": "3232323232323232323232323232323232323232323232323232323232323232",
+            "seq": 4170
+          },
+          "seq": 4210,
+          "wallets": [
+            {
+              "seq": 88,
+              "spent": 40000,
+              "wallet": "main:462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+              "window": 100000
+            }
+          ]
+        },
+        "budget": null,
+        "created_at": 1791580000,
+        "credential": {
+          "id": "24242424242424242424242424242424",
+          "name": "git pusher",
+          "uid": 1003
+        },
+        "deadline_secs": 120,
+        "key": null,
+        "network": null,
+        "op": "management",
+        "payload": {
+          "change": {
+            "created_at": "1791580000",
+            "expires_at": "1794172000",
+            "grant": {
+              "event_kinds": [],
+              "keys": [],
+              "limits": {
+                "per_day": "1000",
+                "per_hour": "100",
+                "per_minute": "10"
+              },
+              "nip44_peers": [],
+              "operations": [
+                "ssh_sign"
+              ],
+              "secrets": [
+                {
+                  "kind": "ssh_key",
+                  "name": "deploy key",
+                  "secret": "3333333333333333333333333333333333333333333333333333333333333333",
+                  "ssh": {
+                    "host_keys": [
+                      "ecdsa-sha2-nistp256 SHA256:hpR9FK9WdJ/XhGhFjMPJh24iLQSzfd3mQ0e3F3a5to8",
+                      "ssh-ed25519 SHA256:wVHjkspS1XP0W53oSvTloX9wH8Unch9YZOLuVqgFza0"
+                    ],
+                    "sshsig_namespaces": [
+                      "git"
+                    ],
+                    "users": [
+                      "deploy",
+                      "git"
+                    ]
+                  }
+                }
+              ]
+            },
+            "id": "24242424242424242424242424242424",
+            "name": "git pusher",
+            "type": "issue_credential",
+            "uid": "1003"
+          }
+        },
+        "reason": {
+          "type": "management"
+        },
+        "request_hash": "cc34cb497acf3207d67de24b69b67cf01418e4846e9a3786c8ae9a09b14e9110",
+        "request_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "v": 1
+      },
+      "request_hash": "cc34cb497acf3207d67de24b69b67cf01418e4846e9a3786c8ae9a09b14e9110"
     },
     {
       "name": "management unfreeze all",
