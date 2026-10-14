@@ -15,7 +15,7 @@ dirs=$(cargo metadata --no-deps --format-version 1 --manifest-path "$root/Cargo.
 status=0
 for dockerfile in Dockerfile.reproducible contrib/debian/Dockerfile; do
     for dir in $dirs; do
-        if ! grep -qx "COPY $dir ./$dir" "$root/$dockerfile"; then
+        if ! grep -Fxq "COPY $dir ./$dir" "$root/$dockerfile"; then
             echo "$dockerfile does not copy workspace member directory $dir" >&2
             status=1
         fi
