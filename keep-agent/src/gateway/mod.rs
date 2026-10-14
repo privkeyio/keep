@@ -12,6 +12,8 @@ pub mod bridge;
 mod credential;
 #[cfg(all(feature = "mcp", target_os = "linux"))]
 pub mod daemon;
+#[cfg(all(feature = "mcp", target_os = "linux"))]
+pub mod ssh_agent;
 
 pub use audit::{
     AgentAudit, RefusalKind, AUDIT_BUDGET_PER_DAY, GATEWAY_AUDIT_BUDGET_PER_DAY,

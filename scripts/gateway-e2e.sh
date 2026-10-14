@@ -12,6 +12,10 @@
 #
 #   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep
 #
+# It checks SSH signing with the system's OpenSSH (sshd, ssh, ssh-add and
+# ssh-keygen; openssh-server must be installed): logins through
+# `keep agent ssh-agent` to servers on loopback, and SSHSIG signatures.
+#
 # With two more arguments it also checks http_request end to end: a build of
 # keep made with RUSTFLAGS='--cfg keep_e2e_roots' and KEEP_E2E_CA_DER naming
 # the CA in the directory scripts/lib/inject-e2e-pki.sh made, which runs the
@@ -45,18 +49,24 @@ OUT=${P}out
 AGENTS=${P}agents
 ADMINS=${P}admins
 INJ=${P}inj
+SSH_USER=${P}login
+SSH_OTHER=${P}login2
 NS=${P}
 RUN=/run/${P}
 GW_PID=
+SSH_AGENT_PID=
+GOOD_SSHD_PID=
+OTHER_SSHD_PID=
 ACTIVATOR_PID=
 SERVER_PID=
 DNS_PID=
 CREATED_NS=
 PASS=e2e-vault-password
 CREATED_RUN=
+CREATED_SSHD_RUN=
 . "$(dirname "$0")/lib/gateway-e2e.sh"
 
-refuse_users $GW $ADMIN $A1 $A2 $OUT $INJ
+refuse_users $GW $ADMIN $A1 $A2 $OUT $INJ $SSH_USER $SSH_OTHER
 refuse_groups $AGENTS $ADMINS
 refuse_paths "$RUN" "/etc/netns/$NS"
 if [[ -n $E2E_BIN_SRC ]] && ip netns list | grep -qw "$NS"; then
@@ -77,7 +87,7 @@ cleanup() {
         kill "$GW_PID" 2>/dev/null || true
         reap "$GW_PID" || true
     fi
-    stop_pid "$ACTIVATOR_PID" "$SERVER_PID" "$DNS_PID"
+    stop_pid "$ACTIVATOR_PID" "$SERVER_PID" "$DNS_PID" "$SSH_AGENT_PID" "$GOOD_SSHD_PID" "$OTHER_SSHD_PID"
     if [[ -n $CREATED_NS ]]; then
         ip netns delete "$NS" 2>/dev/null || true
         rm -rf "/etc/netns/$NS"
@@ -85,6 +95,7 @@ cleanup() {
     remove_created_accounts
     rm -rf "$WORK"
     if [[ -n $CREATED_RUN ]]; then rm -rf "$RUN"; fi
+    if [[ -n $CREATED_SSHD_RUN ]]; then rmdir /run/sshd 2>/dev/null || true; fi
 }
 trap cleanup EXIT
 
@@ -670,6 +681,135 @@ start_gateway
 gw_admin status >/dev/null || fail "status after a crash"
 stop_gateway
 pass "a stale socket from a killed gateway is replaced"
+
+# SSH keys. The gateway is stopped, so the owner generates the key.
+# The public key alone goes to standard output, ready for authorized_keys.
+SSH_PUB=$(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-keygen --name "deploy key" 2>/dev/null) \
+    || fail "secret ssh-keygen"
+[[ $SSH_PUB =~ ^ssh-ed25519\ [A-Za-z0-9+/]+=*$ ]] || fail "ssh-keygen printed $SSH_PUB"
+[[ $(as "$GW" env KEEP_PASSWORD=$PASS "$KEEP" --path "$VAULT" secret ssh-pubkey "deploy key" 2>/dev/null) == "$SSH_PUB" ]] \
+    || fail "secret ssh-pubkey differs from what ssh-keygen printed"
+pass "the vault generated an SSH key and prints its public key again, on standard output"
+
+# Two SSH servers on loopback, each with its own host key; the grant names
+# only the first, and only the first of two users both servers let in. The
+# users have a shell, so a session runs.
+[[ -x /usr/sbin/sshd ]] || fail "the SSH checks need openssh-server"
+for u in "$SSH_USER" "$SSH_OTHER"; do
+    useradd --system --no-create-home --shell /bin/sh "$u"
+    CREATED_USERS+=("$u")
+    # No password, without the lock sshd refuses outside PAM.
+    usermod -p '*' "$u"
+done
+# sshd's privilege separation directory, made only if the host lacks it.
+if [[ ! -d /run/sshd ]]; then
+    install -d -m 0755 /run/sshd
+    CREATED_SSHD_RUN=1
+fi
+# sshd reads authorized_keys as the login user; the host keys stay 0600.
+install -d -m 0755 "$WORK/sshd"
+printf '%s\n' "$SSH_PUB" >"$WORK/sshd/authorized_keys"
+chmod 0644 "$WORK/sshd/authorized_keys"
+start_sshd() {
+    local name=$1 port=$2
+    ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/sshd/$name-host" || fail "ssh-keygen host key"
+    cat >"$WORK/sshd/$name.conf" <<CONF
+Port $port
+ListenAddress 127.0.0.1
+HostKey $WORK/sshd/$name-host
+PidFile $WORK/sshd/$name.pid
+AuthorizedKeysFile $WORK/sshd/authorized_keys
+StrictModes no
+UsePAM no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AllowUsers $SSH_USER $SSH_OTHER
+AllowAgentForwarding no
+LogLevel VERBOSE
+CONF
+    /usr/sbin/sshd -D -e -f "$WORK/sshd/$name.conf" >>"$WORK/sshd/$name.log" 2>&1 &
+    eval "${name^^}_SSHD_PID=\$!"
+    for _ in $(seq 50); do
+        ss -ltnH "sport = :$port" | grep -q 127.0.0.1 && return 0
+        sleep 0.1
+    done
+    fail "sshd $name: $(cat "$WORK/sshd/$name.log")"
+}
+GOOD_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+OTHER_PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
+start_sshd good "$GOOD_PORT"
+start_sshd other "$OTHER_PORT"
+GOOD_HOST=$(cut -d' ' -f1,2 "$WORK/sshd/good-host.pub")
+OTHER_HOST=$(cut -d' ' -f1,2 "$WORK/sshd/other-host.pub")
+
+start_gateway
+cat >"$WORK/admin-out/ssh.json" <<JSON
+[{"secret": {"name": "deploy key"},
+  "ssh": {"users": ["$SSH_USER"], "host_keys": ["$GOOD_HOST"], "sshsig_namespaces": ["git"]}}]
+JSON
+chmod 0644 "$WORK/admin-out/ssh.json"
+as "$ADMIN" "$KEEP" gateway issue --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" --name ssh \
+    --uid "$(uid "$A1")" --op ssh_sign --secrets-file "$WORK/admin-out/ssh.json" \
+    --per-minute 60 --token-out "$WORK/admin-out/ssh-token" >"$WORK/ssh-issue.json" 2>"$WORK/ssh-issue.err" \
+    || fail "issue with an SSH key: $(cat "$WORK/ssh-issue.err")"
+install -m 0600 -o "$A1" "$WORK/admin-out/ssh-token" "$WORK/a1/ssh-token"
+pass "issued a credential granted the SSH key by name"
+
+# The agent's SSH agent, as agent 1, in a directory only it can enter.
+install -d -m 0700 -o "$A1" "$WORK/a1/ssh"
+SSH_SOCK=$WORK/a1/ssh/agent.sock
+as "$A1" "$KEEP" agent ssh-agent --token-file "$WORK/a1/ssh-token" --listen "$SSH_SOCK" \
+    --socket "$AGENT_SOCK" --gateway-user "$GW" >>"$WORK/ssh-agent.log" 2>&1 &
+SSH_AGENT_PID=$!
+for _ in $(seq 50); do [[ -S $SSH_SOCK ]] && break; sleep 0.1; done
+[[ -S $SSH_SOCK ]] || fail "ssh-agent socket: $(cat "$WORK/ssh-agent.log")"
+[[ $(stat -c %a "$SSH_SOCK") == 600 ]] || fail "ssh-agent socket mode $(stat -c %a "$SSH_SOCK")"
+as "$A1" env SSH_AUTH_SOCK="$SSH_SOCK" ssh-add -L >"$WORK/ssh-add" 2>&1 || fail "ssh-add -L: $(cat "$WORK/ssh-add")"
+[[ $(cut -d' ' -f1,2 "$WORK/ssh-add") == "$SSH_PUB" ]] || fail "ssh-add -L listed $(cat "$WORK/ssh-add")"
+# Root can enter the directory, but the agent serves only its own user.
+env SSH_AUTH_SOCK="$SSH_SOCK" ssh-add -L >/dev/null 2>&1 && fail "the SSH agent served root"
+pass "the agent's SSH agent lists the granted key, to its own user alone"
+
+printf '[127.0.0.1]:%s %s\n[127.0.0.1]:%s %s\n' "$GOOD_PORT" "$GOOD_HOST" "$OTHER_PORT" "$OTHER_HOST" >"$WORK/a1/known_hosts"
+chown "$A1" "$WORK/a1/known_hosts"
+ssh_as_agent() {
+    local port=$1 user=$2
+    shift 2
+    as "$A1" env SSH_AUTH_SOCK="$SSH_SOCK" ssh -F /dev/null -o BatchMode=yes \
+        -o UserKnownHostsFile="$WORK/a1/known_hosts" -o StrictHostKeyChecking=yes \
+        -o ConnectTimeout=10 -p "$port" "$@" "$user@127.0.0.1" echo logged-in
+}
+OUT_SSH=$(ssh_as_agent "$GOOD_PORT" "$SSH_USER" 2>&1) || fail "ssh login: $OUT_SSH $(tail -5 "$WORK/sshd/good.log")"
+[[ $OUT_SSH == *logged-in* ]] || fail "ssh login output: $OUT_SSH"
+pass "an SSH client logs in through the agent's SSH agent with the vault's key"
+
+ssh_as_agent "$GOOD_PORT" "$SSH_OTHER" >/dev/null 2>&1 && fail "logged in as a user the rule does not name"
+ssh_as_agent "$OTHER_PORT" "$SSH_USER" >/dev/null 2>&1 && fail "logged in to a host the rule does not name"
+REFUSALS=$(gw_admin audit --limit 40)
+grep -q "a user the rule does not name" <<<"$REFUSALS" || fail "no refusal for the other user: $REFUSALS"
+grep -q "a host key the rule does not name" <<<"$REFUSALS" || fail "no refusal for the other host: $REFUSALS"
+grep -q "ssh_sign.*login $SSH_USER host SHA256:" <<<"$REFUSALS" || fail "no record of the login: $REFUSALS"
+pass "logins as another user or to another host are refused, and every one is recorded"
+
+# SSHSIG, as git signs commits: in the granted namespace only.
+printf 'commit\n' >"$WORK/a1/message"
+printf '%s\n' "$SSH_PUB" >"$WORK/a1/key.pub"
+chown "$A1" "$WORK/a1/message" "$WORK/a1/key.pub"
+as "$A1" env SSH_AUTH_SOCK="$SSH_SOCK" ssh-keygen -Y sign -f "$WORK/a1/key.pub" -n git "$WORK/a1/message" \
+    >"$WORK/sshsig.out" 2>&1 || fail "ssh-keygen -Y sign: $(cat "$WORK/sshsig.out")"
+printf 'agent@e2e namespaces="git" %s\n' "$SSH_PUB" >"$WORK/allowed_signers"
+ssh-keygen -Y verify -f "$WORK/allowed_signers" -I agent@e2e -n git -s "$WORK/a1/message.sig" \
+    <"$WORK/a1/message" >"$WORK/verify.out" 2>&1 || fail "ssh-keygen -Y verify: $(cat "$WORK/verify.out")"
+grep -q "Good" "$WORK/verify.out" || fail "verify output: $(cat "$WORK/verify.out")"
+rm -f "$WORK/a1/message.sig"
+as "$A1" env SSH_AUTH_SOCK="$SSH_SOCK" ssh-keygen -Y sign -f "$WORK/a1/key.pub" -n file "$WORK/a1/message" \
+    >/dev/null 2>&1 && fail "signed in a namespace the rule does not name"
+pass "SSHSIG signatures in the granted namespace verify with ssh-keygen; other namespaces are refused"
+
+stop_pid "$SSH_AGENT_PID" "$GOOD_SSHD_PID" "$OTHER_SSHD_PID"
+SSH_AGENT_PID= GOOD_SSHD_PID= OTHER_SSHD_PID=
+stop_gateway
 
 if [[ -z $E2E_BIN_SRC ]]; then
     echo "all gateway e2e checks passed (http_request not checked: no e2e build given)"

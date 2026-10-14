@@ -600,6 +600,18 @@ impl Bridge {
         }
     }
 
+    /// Send `message`, a JSON-RPC request with id `id` that no client stream
+    /// carries, and return the gateway's answer, or an error that says
+    /// whether the request may have been carried out. Nothing can cancel it.
+    pub fn call(&mut self, id: Value, message: &[u8]) -> Value {
+        let (_never_sends, receive) = mpsc::channel();
+        let mut inputs = Inputs {
+            receive,
+            waiting: VecDeque::new(),
+        };
+        self.forward(id, message, &mut inputs)
+    }
+
     /// Send one request and return the gateway's answer, or an error for the
     /// client that says whether the request may have been carried out.
     fn forward(&mut self, id: Value, message: &[u8], inputs: &mut Inputs) -> Value {

@@ -139,9 +139,15 @@ jobs:
             echo "the release keep carries the e2e test root" >&2
             exit 1
           fi
+      # The SSH checks log in to sshd on loopback.
       - if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 15
-        run: sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep target/e2e-roots/release/keep "$RUNNER_TEMP/inject-pki"
+        run: |
+          if [ ! -x /usr/sbin/sshd ]; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q openssh-server
+          fi
+          sudo KEEP_GATEWAY_E2E=1 scripts/gateway-e2e.sh target/release/keep target/e2e-roots/release/keep "$RUNNER_TEMP/inject-pki"
       # The shipped systemd unit, booted for real on the runner: it passes
       # systemd-analyze verify, unlocks the gateway from an encrypted
       # credential, serves an MCP client through the bridge, restarts

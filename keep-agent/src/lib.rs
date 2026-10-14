@@ -16,6 +16,7 @@ pub mod policy;
 pub mod rate_limit;
 pub mod scope;
 pub mod session;
+pub mod ssh;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

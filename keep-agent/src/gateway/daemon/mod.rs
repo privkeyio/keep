@@ -35,6 +35,9 @@ mod relay_tests;
 mod inject_tests;
 
 #[cfg(test)]
+mod ssh_tests;
+
+#[cfg(test)]
 mod dir_tests {
     #[test]
     fn the_sockets_must_be_in_different_directories_however_named() {

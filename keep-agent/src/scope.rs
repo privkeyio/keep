@@ -19,6 +19,9 @@ pub enum Operation {
     /// Send an HTTPS request with a granted secret added to it, without the
     /// agent ever holding the secret.
     HttpRequest,
+    /// Sign as an SSH key the grant names, within its rule, without the
+    /// agent ever holding the key.
+    SshSign,
 }
 
 impl Operation {
@@ -31,6 +34,7 @@ impl Operation {
             Operation::Nip44Encrypt => "nip44_encrypt",
             Operation::Nip44Decrypt => "nip44_decrypt",
             Operation::HttpRequest => "http_request",
+            Operation::SshSign => "ssh_sign",
         }
     }
 }

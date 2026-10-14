@@ -945,7 +945,7 @@ Choose the narrowest prefix that does what the agent needs. A rule constrains on
 
 ##### Using secrets
 
-An agent with secrets is offered `list_secrets`, which lists each granted secret's id, name, kind and rules, and whether it can be used now (never its value), and, with `http_request`, the tool of that name:
+An agent with secrets is offered `list_secrets`, which lists each granted secret's id, name, kind and rules, an SSH key's public key, and whether it can be used now (never its value), and, with `http_request`, the tool of that name:
 
 ```json
 {"secret": "<id>", "method": "POST", "url": "https://api.example.com/v1/deployments", "headers": {"Content-Type": "application/json"}, "body": "{\"ref\":\"main\"}"}
@@ -983,6 +983,65 @@ A request that got no response is answered with one of these, never the underlyi
 | `canceled` | A freeze, revoke or the gateway stopping withdrew the request. |
 
 Older keeps cannot use a credential with secrets: an older gateway reports that it cannot read it and refuses its token until it is deleted.
+
+#### SSH keys
+
+An agent can log in over SSH, and sign git commits, with a key that never leaves the vault. keep generates the key; the agent's SSH client talks to `keep agent ssh-agent`, a local SSH agent that holds no key and passes each signature request to the gateway, which signs only what the key's rule allows:
+
+- **Logins** to a host whose key the rule names, as a user it names. OpenSSH 8.9 and later bind the agent connection to each SSH session with the host's signature over the session; the gateway checks that signature on every request, and signs only a host-bound login request (`publickey-hostbound-v00@openssh.com`) for that session, that user, this key and that host key. The server checks the host key in the request is its own, so a signature made for one host is useless to any other, even to someone holding a granted host's private key. A client that sends no binding (OpenSSH before 8.9), a connection bound more than once or bound for agent forwarding, and a server that does not offer host-bound logins are refused. OpenSSH 8.9 and later servers and GitHub offer them; GitLab and Bitbucket did not when this was written, so an agent cannot log in to them with a vault key yet.
+- **SSHSIG signatures** (`ssh-keygen -Y sign`, which git uses for SSH-signed commits) in a namespace the rule names, only on a connection no SSH session is bound to. OpenSSH 8.9 and later bind every agent connection they forward, so a host the agent forwards its SSH agent to with them gets none; a client that forwards without binding (an older OpenSSH, and some SSH libraries) passes unbound connections on, and the host at the other end can then get signatures within the rule. Do not let the agent forward its SSH agent (`ssh -A`) except with OpenSSH 8.9 or later.
+
+##### Setting up an SSH key
+
+1. Generate the key with the gateway stopped. It prints the public key, as `authorized_keys` takes it, and `keep secret ssh-pubkey "<name>"` prints it again:
+
+   ```bash
+   sudo systemctl stop keep-gateway
+   sudo -u keep-gateway -H /usr/local/bin/keep --path /var/lib/keep-gateway/vault secret ssh-keygen --name "deploy key"
+   sudo systemctl start keep-gateway
+   ```
+
+   Add the public key where the agent should log in (a server's `authorized_keys`, a forge's deploy keys) or where its signatures are checked (git's `allowed_signers`). Importing an existing key is not supported.
+
+2. Issue a credential with the `ssh_sign` operation and a secrets file naming the key and its rule. Host keys are written as `known_hosts` writes them (type and base64, no comment: `cut -d' ' -f1,2` of a host's `.pub` file or of `ssh-keyscan`'s output, checked against a fingerprint from a trusted source); `ssh-ed25519` and `ecdsa-sha2-nistp256` host keys are accepted:
+
+   ```json
+   [
+     {
+       "secret": { "name": "deploy key" },
+       "ssh": {
+         "users": ["git"],
+         "host_keys": ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"],
+         "sshsig_namespaces": ["git"]
+       }
+     }
+   ]
+   ```
+
+   ```bash
+   keep gateway issue --name pusher --uid "$(id -u agent-writer)" --op ssh_sign --secrets-file ssh.json --token-out pusher.token
+   sudo install -D -m 0600 -o agent-writer pusher.token ~agent-writer/.config/keep/pusher.token
+   rm pusher.token
+   ```
+
+   `users` and `host_keys` go together (both or neither), `sshsig_namespaces` may stand alone, and each lists at most 8, sorted, each once. A user is letters, digits, `.`, `_` or `-`; a namespace may also hold `@`. With a phone paired, the phone shows each host key by type and `SHA256:` fingerprint.
+
+3. Run the SSH agent as the agent's user (here `agent-writer`), with the token file it owns, in a directory only that user can enter, and point the agent's SSH clients at it:
+
+   ```bash
+   install -d -m 700 ~/.keep-ssh
+   keep agent ssh-agent --token-file ~/.config/keep/pusher.token --listen ~/.keep-ssh/agent.sock &
+   export SSH_AUTH_SOCK=~/.keep-ssh/agent.sock
+   ssh-add -L                       # the granted key
+   git push                         # logs in with it
+   git -c gpg.format=ssh -c user.signingkey="key::$(ssh-add -L | head -1)" commit -S -m "..."
+   ```
+
+   The socket is created with mode 0600 and serves only its own user. Like `keep agent connect`, it refuses to run as root or with `KEEP_PASSWORD` set.
+
+Every signature is written to the audit log before it is returned (`agent_served` labeled `ssh_sign`, naming the key, then the user and the host key's fingerprint, or the namespace, and a hash of the data); every refusal is recorded with its reason, and the agent is told only `denied: request not allowed`. Each signature, and each listing of the keys (the SSH agent lists them at most once a minute), counts against the credential's request limits and its daily audit budget like any other request. A freeze or revoke stops new signatures at once, but cannot end an SSH session already logged in. A host that authenticates with a host certificate rather than a plain key is refused.
+
+Older keeps cannot read an SSH key: an older `keep secret list` fails while the vault holds one, an older keep cannot restore a backup holding one, and an older gateway refuses a credential granting one (serving every other). Remove the key with this release (`keep secret rm`) before going back to an older keep.
 
 #### Connecting an MCP client
 

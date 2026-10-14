@@ -172,6 +172,46 @@ pub fn cmd_secret_add(
     Ok(())
 }
 
+pub fn cmd_secret_ssh_keygen(out: &Output, path: &Path, name: &str, hidden: bool) -> Result<()> {
+    refuse_hidden(path, hidden)?;
+    validate_name(name)?;
+    let mut keep = open_unlock(out, path)?;
+    let (key, seed) =
+        keep_agent::ssh::SshKey::generate().map_err(|e| KeepError::Runtime(e.to_string()))?;
+    let record = SecretRecord::new(
+        name.to_string(),
+        keep_core::secret::SecretKind::SshKey,
+        seed.to_vec(),
+    )?;
+    keep.store_secret(&record)?;
+    out.success(&format!(
+        "Stored SSH key '{name}'; id {}. Its public key:",
+        hex::encode(record.id)
+    ));
+    println!("{}", ssh_public_key(&key));
+    Ok(())
+}
+
+pub fn cmd_secret_ssh_pubkey(out: &Output, path: &Path, handle: &str, hidden: bool) -> Result<()> {
+    refuse_hidden(path, hidden)?;
+    let keep = open_unlock(out, path)?;
+    let record = resolve_secret(&keep, handle)?;
+    if record.kind != keep_core::secret::SecretKind::SshKey {
+        return Err(KeepError::invalid_input(format!(
+            "'{}' is not an SSH key",
+            record.name
+        )));
+    }
+    let key = keep_agent::ssh::SshKey::from_bytes(&record.value)
+        .ok_or_else(|| KeepError::invalid_input("this SSH key does not hold an Ed25519 seed"))?;
+    println!("{}", ssh_public_key(&key));
+    Ok(())
+}
+
+fn ssh_public_key(key: &keep_agent::ssh::SshKey) -> String {
+    keep_agent::ssh::public_key_text(&key.public_blob()).expect("an Ed25519 key always encodes")
+}
+
 pub fn cmd_secret_get(
     out: &Output,
     path: &Path,

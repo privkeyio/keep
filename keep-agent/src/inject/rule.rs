@@ -146,7 +146,12 @@ pub struct HttpRule {
 pub struct SecretGrant {
     #[serde(with = "hex_id")]
     pub secret: [u8; 32],
+    /// Where an HTTP secret may be sent. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub http: Vec<HttpRule>,
+    /// What an SSH key may sign. Left out when the secret is not one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<crate::ssh::SshRule>,
 }
 
 mod hex_id {
@@ -321,6 +326,12 @@ impl HttpRule {
 
 impl SecretGrant {
     fn validate(&self) -> Result<()> {
+        if let Some(ssh) = &self.ssh {
+            if !self.http.is_empty() {
+                return refuse("a secret entry is either an SSH key or sent over HTTP, not both");
+            }
+            return ssh.validate();
+        }
         if self.http.is_empty() {
             return refuse("a secret entry must allow at least one use");
         }
@@ -587,6 +598,7 @@ mod tests {
         SecretGrant {
             secret: [7; 32],
             http: vec![rule()],
+            ssh: None,
         }
     }
 
@@ -703,6 +715,17 @@ mod tests {
         assert!(validate_secrets(&[a.clone(), a.clone()]).is_err());
         a.http.clear();
         assert!(validate_secrets(&[a.clone()]).is_err());
+        // An SSH key, and never one sent over HTTP too.
+        let ssh = crate::ssh::SshRule {
+            users: vec![],
+            host_keys: vec![],
+            sshsig_namespaces: vec!["git".into()],
+        };
+        a.ssh = Some(ssh);
+        validate_secrets(&[a.clone()]).unwrap();
+        a.http = vec![rule()];
+        assert!(validate_secrets(&[a.clone()]).is_err());
+        a.http.clear();
         let with_reveal = r#"{"secret":"0707070707070707070707070707070707070707070707070707070707070707","http":[],"reveal":true}"#;
         assert!(serde_json::from_str::<SecretGrant>(with_reveal).is_err());
         b.http = (0..=MAX_RULES)

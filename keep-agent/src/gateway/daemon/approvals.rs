@@ -234,7 +234,7 @@ pub fn change_grant(
     let secrets = secrets
         .iter()
         .map(|entry| {
-            let crate::inject::rule::SecretGrant { secret, http } = entry;
+            let crate::inject::rule::SecretGrant { secret, http, ssh } = entry;
             let unusable = |why: &str| {
                 crate::error::AgentError::ScopeViolation(format!(
                     "secret {} {why}",
@@ -272,6 +272,7 @@ pub fn change_grant(
                 name: info.name,
                 kind: info.kind.as_str().to_string(),
                 http,
+                ssh: ssh.as_ref().map(crate::ssh::SshRule::change),
             })
         })
         .collect::<crate::error::Result<Vec<_>>>()?;
@@ -333,6 +334,7 @@ mod tests {
             Operation::GetBitcoinAddress,
             Operation::SignPsbt,
             Operation::HttpRequest,
+            Operation::SshSign,
         ] {
             assert!(OPERATIONS.contains(&op.as_str()), "{}", op.as_str());
         }
@@ -377,10 +379,12 @@ mod tests {
                         ),
                         rule("api.example.com", "/v1/b", vec![Method::Get]),
                     ],
+                    ssh: None,
                 },
                 SecretGrant {
                     secret: [2; 32],
                     http: vec![rule("xn--bcher-kva.example", "/x", vec![Method::Delete])],
+                    ssh: None,
                 },
             ],
         }
@@ -423,6 +427,76 @@ mod tests {
             })
         };
         assert!(change_grant(&grant, hidden).is_err());
+    }
+
+    /// An SSH key's rule becomes a change an approver parses, its host keys
+    /// shown by type and fingerprint.
+    #[test]
+    fn an_ssh_grant_becomes_a_change_an_approver_accepts() {
+        use crate::inject::rule::SecretGrant;
+        use keep_core::secret::{SecretInfo, SecretKind};
+        let host = |seed: u8| {
+            crate::ssh::SshKey::from_bytes(&[seed; 32])
+                .unwrap()
+                .public_blob()
+        };
+        let (a, b) = (host(1), host(2));
+        let mut host_keys = vec![
+            crate::ssh::public_key_text(&a).unwrap(),
+            crate::ssh::public_key_text(&b).unwrap(),
+        ];
+        host_keys.sort();
+        let grant = Grant {
+            keys: Default::default(),
+            operations: [Operation::SshSign].into(),
+            event_kinds: Default::default(),
+            nip44_peers: Default::default(),
+            bitcoin: None,
+            limits: RequestLimits::default(),
+            secrets: vec![SecretGrant {
+                secret: [3; 32],
+                http: vec![],
+                ssh: Some(crate::ssh::SshRule {
+                    users: vec!["git".into()],
+                    host_keys,
+                    sshsig_namespaces: vec!["git".into()],
+                }),
+            }],
+        }
+        .validated(&ReservedKeys::new())
+        .unwrap();
+        let info = |_: &[u8; 32]| {
+            Ok(SecretInfo {
+                name: "deploy key".into(),
+                kind: SecretKind::SshKey,
+                sealed: false,
+            })
+        };
+        let shown = change_grant(&grant, info).unwrap();
+        let ssh = shown.secrets[0].ssh.as_ref().unwrap();
+        let mut want = vec![
+            crate::ssh::host_key_label(&a).unwrap(),
+            crate::ssh::host_key_label(&b).unwrap(),
+        ];
+        want.sort();
+        assert_eq!(ssh.host_keys, want);
+        assert_eq!(shown.secrets[0].kind, "ssh_key");
+        let change = Change::IssueCredential {
+            id: Hex16([1; 16]),
+            name: "agent".into(),
+            uid: keep_approval::change::Decimal(1001),
+            created_at: keep_approval::change::Decimal(1),
+            expires_at: keep_approval::change::Decimal(2),
+            grant: shown,
+        };
+        let parsed = Change::parse(
+            &keep_approval::change::parse_without_duplicates(
+                &serde_json::to_string(&change.to_value()).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed, change);
     }
 
     /// A validated grant becomes a change grant an approver parses, for
