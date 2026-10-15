@@ -638,6 +638,12 @@ impl BunkerHandler {
                 connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
                 auto_approve_kinds: bunker_auto_approve_kinds(),
                 connect_auto_approve_kinds: bunker_connect_auto_approve_kinds(),
+                // Enforce the SPKI pin inside the handshake of the socket that
+                // carries remote-signing traffic, not only on the
+                // `verify_and_pin_relays` probe above. Read-only: the live
+                // handshake never records a pin, so a bunker reconnect cannot
+                // write trust into the pin store.
+                tls_pinning: Some(self.mobile.live_pinning()?),
                 ..ServerConfig::default()
             };
 

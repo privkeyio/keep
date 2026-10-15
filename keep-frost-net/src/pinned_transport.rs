@@ -107,7 +107,7 @@ impl TlsPinning {
 ///
 /// `Client::new(signer)` is itself `Client::builder().signer(signer).build()`,
 /// so the unpinned result here is identical to what the callers built before.
-pub(crate) fn build_client(
+pub fn build_client(
     keys: &Keys,
     proxy: Option<SocketAddr>,
     pinning: Option<TlsPinning>,
