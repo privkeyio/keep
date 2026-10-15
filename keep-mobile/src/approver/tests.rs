@@ -765,7 +765,11 @@ fn a_tick_drops_requests_past_their_time_and_saves_only_changes() {
             .is_err(),
         "nothing changed, nothing saved"
     );
+    // Past its time: no longer decidable, but kept a while for the
+    // gateway's `expired` outcome.
     phone.handler.tick_at(now() + 121);
+    assert!(phone.stored(|s| s.waiting.len() == 1 && s.waiting[0].open(now() + 121).is_none()));
+    phone.handler.tick_at(now() + 120 + OUTCOME_GRACE_SECS + 1);
     assert!(phone.stored(|s| s.waiting.is_empty()));
     assert!(phone
         .mobile
@@ -799,6 +803,13 @@ fn too_many_waiting_requests_are_refused() {
     assert!(phone
         .take(kind::REQUEST, &wire::to_text(&phone.request(200, "x", 10)))
         .is_empty());
+    // Nor does one past its time, kept only for its outcome.
+    phone.stored(|s| s.waiting[1].until = now() - 1);
+    let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(202, "x", 10)));
+    assert!(
+        shown_request(&events).is_some(),
+        "an expired one does not count"
+    );
     phone.stored(|s| s.waiting[0].request = None);
     let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(201, "x", 10)));
     assert!(
@@ -1095,4 +1106,81 @@ fn a_pairing_a_relay_takes_waits_for_the_gateway() {
         .to_string()
         .contains("no pairing was begun"));
     handler.close();
+}
+
+#[test]
+fn an_expired_outcome_after_the_deadline_still_reaches_the_app() {
+    let phone = paired();
+    let request = phone.request(16, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    phone.stored(|s| s.waiting[0].until = now() - 30);
+    phone.handler.tick_at(now());
+    assert!(phone
+        .handler
+        .decision_digest(request.request_id.to_hex(), true)
+        .is_err());
+    let events = phone.take(
+        kind::OUTCOME,
+        &wire::to_text(&Outcome {
+            v: V1,
+            request_id: request.request_id,
+            outcome: OutcomeKind::Expired,
+            by: None,
+        }),
+    );
+    assert!(matches!(
+        &events[..],
+        [ApproverEvent::Outcome { outcome, .. }] if outcome == "expired"
+    ));
+}
+
+#[test]
+fn a_pairing_the_gateway_answered_stands_though_no_relay_confirmed_it() {
+    let phone = paired();
+    let (channel, transport) = phone.stored(|s| (s.channel.0, s.keys().unwrap().public_key()));
+    let digest = [9u8; 32];
+    phone
+        .handler
+        .settle_pairing(Err(no_relay()), channel, transport, digest)
+        .unwrap();
+    assert!(phone.handler.status().paired);
+    // Unanswered: undone, and nothing stored.
+    phone.stored(|s| s.paired = false);
+    assert!(phone
+        .handler
+        .settle_pairing(Err(no_relay()), channel, transport, digest)
+        .is_err());
+    assert!(phone.handler.lock().stored.is_none());
+    assert!(phone.memory.0.lock().unwrap().get(STATE_KEY).is_none());
+}
+
+#[test]
+fn settling_a_pairing_leaves_another_alone() {
+    let phone = paired();
+    let other = Keys::generate().public_key();
+    let (channel, transport) = phone.stored(|s| (s.channel.0, s.keys().unwrap().public_key()));
+    phone.stored(|s| s.paired = false);
+    // A failed send for another pairing does not undo this one.
+    assert!(phone
+        .handler
+        .settle_pairing(Err(no_relay()), channel, other, [9; 32])
+        .is_err());
+    assert!(phone.handler.lock().stored.is_some());
+    // A pairing begun again meanwhile keeps its own begun.
+    let begun = phone.handler.lock().stored.clone().map(|stored| Begun {
+        stored,
+        secret: Zeroizing::new([1; 32]),
+        digest: [7; 32],
+    });
+    phone.handler.lock().begun = begun;
+    phone
+        .handler
+        .settle_pairing(Ok(()), channel, transport, [9; 32])
+        .unwrap();
+    assert!(phone.handler.lock().begun.is_some());
+    phone
+        .handler
+        .settle_pairing(Ok(()), channel, transport, [7; 32])
+        .unwrap();
+    assert!(phone.handler.lock().begun.is_none());
 }

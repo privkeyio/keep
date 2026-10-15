@@ -62,6 +62,10 @@ const MAX_ALERTS: usize = 32;
 /// the oldest go.
 const MAX_WAITING: usize = 64;
 
+/// How long a request past its time is kept, no longer decidable, so the
+/// gateway's `expired` outcome still reaches the app.
+const OUTCOME_GRACE_SECS: u64 = 120;
+
 /// How long after an unfreeze digest is handed out freezes are not resent,
 /// so a resend's new counter does not void the unfreeze being signed.
 const UNFREEZE_HOLD_SECS: u64 = 60;
@@ -103,13 +107,13 @@ impl Waiting {
     }
 }
 
-/// Whether `w` is still kept at `local_now`: until its time ends, and once
-/// decided, for as long as its outcome can still arrive.
+/// Whether `w` is still kept at `local_now`: a little past its time, and
+/// once decided, for as long as its outcome can still arrive.
 fn still_kept(w: &Waiting, local_now: u64) -> bool {
     let grace = if w.request.is_none() {
         WINDOW_PAST_SECS
     } else {
-        0
+        OUTCOME_GRACE_SECS
     };
     w.until.saturating_add(grace) > local_now
 }
@@ -752,6 +756,39 @@ impl ApproverHandler {
         }
     }
 
+    /// After the pairing to `channel` from `transport` was sent, or not:
+    /// undo it if no relay took it, unless the gateway answered `paired`
+    /// anyway, which stands.
+    fn settle_pairing(
+        &self,
+        sent: Result<(), KeepMobileError>,
+        channel: [u8; 32],
+        transport: PublicKey,
+        digest: [u8; 32],
+    ) -> Result<(), KeepMobileError> {
+        let mut inner = self.lock();
+        let ours = |s: &Stored| {
+            s.channel.0 == channel && s.keys().ok().map(|k| k.public_key()) == Some(transport)
+        };
+        let answered = inner.stored.as_ref().is_some_and(|s| ours(s) && s.paired);
+        if let Err(e) = sent {
+            if !answered {
+                if inner.stored.as_ref().is_some_and(ours) {
+                    inner.set(None);
+                    let _ = self.mobile.storage.delete_share_by_key(STATE_KEY.into());
+                }
+                drop(inner);
+                self.halt();
+                return Err(e);
+            }
+        }
+        // A pairing begun again meanwhile is left alone.
+        if inner.begun.as_ref().is_some_and(|b| b.digest == digest) {
+            inner.begun = None;
+        }
+        Ok(())
+    }
+
     /// Take one message from the gateway, at the phone's `local_now`.
     fn handle(&self, inner: &mut Inner, kind: u16, content: &str, local_now: u64) -> Effects {
         let mut fx = Effects::default();
@@ -822,7 +859,7 @@ impl ApproverHandler {
                 if stored
                     .waiting
                     .iter()
-                    .filter(|w| w.request.is_some())
+                    .filter(|w| w.open(local_now).is_some())
                     .count()
                     >= MAX_WAITING
                 {
@@ -1165,7 +1202,7 @@ impl ApproverHandler {
     ) -> Result<(), KeepMobileError> {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.open_check()?;
-        let (pair, relays, keys, channel, secret) = {
+        let (pair, relays, keys, channel, secret, digest) = {
             let mut inner = self.lock();
             if inner.stored.as_ref().is_some_and(|s| s.paired) {
                 return Err(invalid("already paired: remove this pairing first"));
@@ -1189,10 +1226,11 @@ impl ApproverHandler {
             };
             let stored = begun.stored.clone();
             let secret = begun.secret.clone();
+            let digest = begun.digest;
             self.persist(&stored)?;
             let relays = stored.relays.clone();
             inner.set(Some(stored));
-            (pair, relays, keys, channel, secret)
+            (pair, relays, keys, channel, secret, digest)
         };
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(callbacks);
         self.halt();
@@ -1209,14 +1247,7 @@ impl ApproverHandler {
             .map_err(|e| invalid(e.to_string()))?;
             self.send_now(event)
         });
-        if let Err(e) = sent {
-            self.halt();
-            self.lock().set(None);
-            let _ = self.mobile.storage.delete_share_by_key(STATE_KEY.into());
-            return Err(e);
-        }
-        self.lock().begun = None;
-        Ok(())
+        self.settle_pairing(sent, channel, keys.public_key(), digest)
     }
 
     /// Start serving a pairing kept from an earlier run. Requests that

@@ -368,6 +368,11 @@ pub fn clock_skew(at: u64, local_now: u64) -> bool {
     at.abs_diff(local_now) > SKEW_WARNING_SECS
 }
 
+/// The most request ids a [`RequestGate`] keeps. Past it a new request is
+/// refused, so a gateway flooding requests cannot grow an approver's stored
+/// state without bound; a person decides far fewer in the time ids are kept.
+pub const MAX_SEEN_REQUESTS: usize = 4_096;
+
 /// The requests an approver has seen, so it shows each once and never one
 /// the gateway has already expired.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,6 +397,9 @@ impl RequestGate {
             .retain(|_, at| local_now.saturating_sub(*at) <= REPLAY_KEEP_SECS);
         if self.seen.contains_key(&request.request_id) {
             return Err(invalid("request already seen"));
+        }
+        if self.seen.len() >= MAX_SEEN_REQUESTS {
+            return Err(invalid("too many requests seen recently"));
         }
         let expires = request.created_at.saturating_add(request.deadline_secs);
         if expires < tracker.latest_gateway_time() {
@@ -1279,6 +1287,25 @@ mod tests {
             .is_err());
         assert!(gate
             .admit(&request(1, 2_000, 120), &t, REPLAY_KEEP_SECS + 1)
+            .is_ok());
+    }
+
+    #[test]
+    fn the_gate_keeps_a_bounded_number_of_ids() {
+        let mut gate = RequestGate::default();
+        let t = AnchorTracker::default();
+        let numbered = |n: usize| {
+            let mut r = request(0, 900, 120);
+            r.request_id.0[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            r
+        };
+        for n in 0..MAX_SEEN_REQUESTS {
+            assert!(gate.admit(&numbered(n), &t, 0).is_ok());
+        }
+        assert!(gate.admit(&numbered(MAX_SEEN_REQUESTS), &t, 0).is_err());
+        assert!(gate.admit(&numbered(0), &t, 0).is_err(), "still a repeat");
+        assert!(gate
+            .admit(&numbered(MAX_SEEN_REQUESTS), &t, REPLAY_KEEP_SECS + 1)
             .is_ok());
     }
 }
