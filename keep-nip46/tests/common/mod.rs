@@ -40,13 +40,18 @@ pub fn extract_bunker_secret(bunker_url: &str) -> Option<String> {
 }
 
 /// Send the NIP-46 `connect` request to a running bunker from a plain client.
+///
+/// `Err` when no relay took the event. `Client::send_event` resolves to `Ok`
+/// even when every relay refused it, so a client whose socket is not up yet
+/// sends into nothing and reports success; a caller polling for the effect
+/// would then wait out its whole deadline with nothing on the wire.
 pub async fn send_connect_request(
     client: &Client,
     client_keys: &Keys,
     server_pubkey: PublicKey,
     signer_pubkey: PublicKey,
     bunker_secret: &str,
-) {
+) -> Result<(), String> {
     let connect_json = serde_json::json!({
         "id": "req-1",
         "method": "connect",
@@ -64,5 +69,24 @@ pub async fn send_connect_request(
         .tag(Tag::public_key(server_pubkey))
         .sign_with_keys(client_keys)
         .unwrap();
-    client.send_event(&event).await.unwrap();
+    let output = client
+        .send_event(&event)
+        .await
+        .map_err(|e| format!("send connect: {e}"))?;
+    if output.success.is_empty() {
+        let why: Vec<String> = output
+            .failed
+            .iter()
+            .map(|(url, reason)| format!("{url}: {reason}"))
+            .collect();
+        return Err(format!(
+            "no relay accepted the connect request ({})",
+            if why.is_empty() {
+                "no connected relays".to_string()
+            } else {
+                why.join("; ")
+            }
+        ));
+    }
+    Ok(())
 }
