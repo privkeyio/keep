@@ -162,12 +162,17 @@ pub struct Server {
     bunker_secret: Option<Zeroizing<String>>,
 }
 
-async fn add_relays(client: &Client, relay_urls: &[String]) -> Result<()> {
+async fn add_relays(
+    client: &Client,
+    relay_urls: &[String],
+    proxy: Option<SocketAddr>,
+) -> Result<()> {
     let opts = nostr_sdk::RelayOptions::default()
         .reconnect(true)
         .ping(true)
         .retry_interval(std::time::Duration::from_secs(10))
         .adjust_retry_interval(true);
+    let opts = keep_frost_net::with_proxy(opts, proxy);
 
     for relay_url in relay_urls {
         client
@@ -352,7 +357,7 @@ impl Server {
 
         let client = keep_frost_net::build_client(&keys, proxy, config.tls_pinning.clone())
             .map_err(|e| NetworkError::connection(format!("relay client: {e}")))?;
-        add_relays(&client, relay_urls).await?;
+        add_relays(&client, relay_urls, proxy).await?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
         apply_pre_grants(&permissions, &config.pre_grants).await;
@@ -470,7 +475,7 @@ impl Server {
 
         let client = keep_frost_net::build_client(&keys, proxy, config.tls_pinning.clone())
             .map_err(|e| NetworkError::connection(format!("relay client: {e}")))?;
-        add_relays(&client, relay_urls).await?;
+        add_relays(&client, relay_urls, proxy).await?;
 
         let keyring = Arc::new(Mutex::new(Keyring::new()));
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
@@ -915,6 +920,28 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // `pool().add_relay` takes the relay options verbatim, so the proxy has to
+    // ride on them; a client-level connection option never reaches these
+    // sockets and the bunker would connect directly while the user believes
+    // their traffic is proxied.
+    #[tokio::test]
+    async fn a_configured_proxy_reaches_the_bunker_relay_sockets() {
+        use nostr_sdk::prelude::ConnectionMode;
+
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let relays = vec!["wss://relay.example.com".to_string()];
+
+        let client = keep_frost_net::build_client(&Keys::generate(), Some(proxy), None).unwrap();
+        add_relays(&client, &relays, Some(proxy)).await.unwrap();
+        let relay = client.relay(&relays[0]).await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Proxy(proxy));
+
+        let direct = keep_frost_net::build_client(&Keys::generate(), None, None).unwrap();
+        add_relays(&direct, &relays, None).await.unwrap();
+        let relay = direct.relay(&relays[0]).await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Direct);
+    }
 
     // An explicitly-configured `expected_secret` must surface as the bunker
     // secret, which `bunker_url()` embeds; otherwise clients get a secret-less

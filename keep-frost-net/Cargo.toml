@@ -46,6 +46,9 @@ x509-cert = "0.3"
 redb = "4"
 thiserror = "2.0"
 tokio-rustls = "0.26"
+# Already in the tree under async-wsocket, which builds the proxied relay
+# sockets with it; the pin probe dials through the same proxy.
+tokio-socks = "0.5"
 # Direct websocket client, used only by the SPKI-pinned relay transport so the
 # pin is enforced on the handshake that carries data. Version and TLS backend
 # must match what the relay stack uses (rustls 0.23) so the message type and

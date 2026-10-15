@@ -52,7 +52,7 @@ use nostr_sdk::prelude::transport::websocket::{
 };
 use nostr_sdk::prelude::{
     BoxedFuture, Client, ClientOptions, Connection, ConnectionMode, ConnectionTarget, Keys,
-    RelayStatus, Url,
+    RelayOptions, RelayStatus, Url,
 };
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
@@ -125,6 +125,24 @@ pub fn build_client(
     }
 
     Ok(builder.build())
+}
+
+/// Stamp `proxy` onto per-relay options so a pool-added relay honors it.
+///
+/// `ClientOptions::connection`, which [`build_client`] sets, is read only by
+/// `Client::add_relay`; `RelayPool::add_relay` takes the `RelayOptions` it is
+/// given verbatim and the relay connects with that per-relay mode. Callers that
+/// need their own relay options therefore go through the pool and have to carry
+/// the mode themselves, or the proxy is silently dropped and the socket is
+/// direct.
+///
+/// `keep-agent` keeps its own copy of this in `relay_opts`; it does not depend
+/// on this crate, so the two have to be kept in step by hand.
+pub fn with_proxy(opts: RelayOptions, proxy: Option<SocketAddr>) -> RelayOptions {
+    match proxy {
+        Some(addr) => opts.connection_mode(ConnectionMode::Proxy(addr)),
+        None => opts,
+    }
 }
 
 /// Wait for at least one relay to reach `Connected`, or fail.
@@ -571,6 +589,37 @@ mod tests {
         )
         .await;
         assert!(!err.contains("refusing non-TLS relay scheme"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn with_proxy_reaches_a_pool_added_relay() {
+        let proxy: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+        let client = build_client(&Keys::generate(), Some(proxy), None).unwrap();
+        client
+            .pool()
+            .add_relay(
+                "wss://relay.example.com",
+                with_proxy(RelayOptions::default(), Some(proxy)),
+            )
+            .await
+            .unwrap();
+        let relay = client.relay("wss://relay.example.com").await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Proxy(proxy));
+    }
+
+    #[tokio::test]
+    async fn without_a_proxy_a_pool_added_relay_stays_direct() {
+        let client = build_client(&Keys::generate(), None, None).unwrap();
+        client
+            .pool()
+            .add_relay(
+                "wss://relay.example.com",
+                with_proxy(RelayOptions::default(), None),
+            )
+            .await
+            .unwrap();
+        let relay = client.relay("wss://relay.example.com").await.unwrap();
+        assert_eq!(*relay.connection_mode(), ConnectionMode::Direct);
     }
 
     #[tokio::test]

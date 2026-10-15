@@ -26,22 +26,18 @@ use keep_nip46::{Server, ServerConfig};
 
 use common::{extract_bunker_secret, send_connect_request, setup_keyring};
 
-/// One mock relay for the whole binary. `MockRelay` picks a random port by
-/// binding a probe listener, dropping it, then binding again, so every extra
-/// instance is another chance for two relays to race onto the same port. These
-/// tests do not need their own relay, so they share one.
-static RELAY: tokio::sync::OnceCell<(MockRelay, String)> = tokio::sync::OnceCell::const_new();
-
-async fn shared_relay() -> &'static str {
-    let (_mock, url) = RELAY
-        .get_or_init(|| async {
-            install_default_crypto_provider();
-            let mock = MockRelay::run().await.expect("start mock relay");
-            let url = mock.url().await.to_string();
-            (mock, url)
-        })
-        .await;
-    url
+/// A relay of this test's own, like every other relay test in the workspace.
+/// Sharing one across the binary does not work: `MockRelay::run` spawns its
+/// accept loop on the runtime that happens to win the race to build it, and
+/// each `#[tokio::test]` owns its own runtime, so the relay stops serving the
+/// moment that first test ends and every later test times out against a socket
+/// nobody is listening on. The returned guard has to stay bound for the whole
+/// test.
+async fn mock_relay() -> (MockRelay, String) {
+    install_default_crypto_provider();
+    let mock = MockRelay::run().await.expect("start mock relay");
+    let url = mock.url().await.to_string();
+    (mock, url)
 }
 
 fn pinning(require_pinned: bool) -> TlsPinning {
@@ -84,7 +80,15 @@ async fn try_start(
 /// whether the bunker registered the client. That is only possible if the
 /// bunker's own relay socket carried the event, so it is the positive proof
 /// that installing the transport did not cost the bunker its relay.
-async fn connect_handshake_reaches_bunker(relay_url: &str, config: ServerConfig) -> bool {
+///
+/// `Err` carries why it did not land. The bunker's own `start` waits for a
+/// relay to reach `Connected` and gives up, so a bunker that exited early and
+/// a handshake that never arrived are two different failures with the same
+/// symptom; swallowing `run`'s error would hide exactly the one worth reading.
+async fn connect_handshake_reaches_bunker(
+    relay_url: &str,
+    config: ServerConfig,
+) -> Result<(), String> {
     install_default_crypto_provider();
     let (keyring, signer_pubkey) = setup_keyring();
     let relay_url = relay_url.to_string();
@@ -103,19 +107,32 @@ async fn connect_handshake_reaches_bunker(relay_url: &str, config: ServerConfig)
         extract_bunker_secret(&server.bunker_url()).expect("headless bunker URL must have secret");
     let server_pubkey = server.pubkey();
     let server_handler = server.handler();
+    let (exited_tx, mut exited) = tokio::sync::oneshot::channel();
     let server_handle = tokio::spawn(async move {
-        let _ = server.run().await;
+        if let Err(e) = server.run().await {
+            let _ = exited_tx.send(e.to_string());
+        }
     });
 
     let client_keys = Keys::generate();
     let client = Client::new(client_keys.clone());
     client.add_relay(relay_url).await.unwrap();
     client.connect().await;
+    // The client's own socket has to be up before anything is sent, or every
+    // send below is accepted by nobody and silently reports success.
+    keep_frost_net::wait_for_any_relay(&client, Duration::from_secs(30))
+        .await
+        .map_err(|e| format!("the test client never reached the relay: {e}"))?;
 
     // Bounded poll rather than a fixed sleep, so the positive case is fast and
-    // its deadline is explicit.
-    let reached = tokio::time::timeout(Duration::from_secs(15), async {
+    // its deadline is explicit. The deadline has to clear the bunker's own
+    // wait-for-a-relay bound with room to spare, or a loaded runner fails this
+    // on the bunker still coming up rather than on anything this file tests.
+    let reached = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
+            if let Ok(why) = exited.try_recv() {
+                return Err(format!("the bunker exited instead of serving: {why}"));
+            }
             send_connect_request(
                 &client,
                 &client_keys,
@@ -123,17 +140,17 @@ async fn connect_handshake_reaches_bunker(relay_url: &str, config: ServerConfig)
                 signer_pubkey,
                 &bunker_secret,
             )
-            .await;
+            .await?;
             for _ in 0..10 {
                 if !server_handler.list_clients().await.is_empty() {
-                    return;
+                    return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     })
     .await
-    .is_ok();
+    .unwrap_or_else(|_| Err("no client registered before the deadline".to_string()));
 
     server_handle.abort();
     client.disconnect().await;
@@ -145,12 +162,12 @@ async fn connect_handshake_reaches_bunker(relay_url: &str, config: ServerConfig)
 /// connect handshake still lands.
 #[tokio::test]
 async fn a_pinned_bunker_still_serves_its_relay() {
-    let url = shared_relay().await;
+    let (_relay, url) = mock_relay().await;
+    let url = url.as_str();
 
-    assert!(
-        connect_handshake_reaches_bunker(url, config(Some(pinning(false)))).await,
-        "pinned bunker transport dropped the connect handshake"
-    );
+    if let Err(why) = connect_handshake_reaches_bunker(url, config(Some(pinning(false)))).await {
+        panic!("pinned bunker transport dropped the connect handshake: {why}");
+    }
 }
 
 /// Strict pinning has nothing to pin on a cleartext socket, so the bunker must
@@ -162,7 +179,8 @@ async fn a_pinned_bunker_still_serves_its_relay() {
 /// that was simply never reachable from this test.
 #[tokio::test]
 async fn strict_pinning_refuses_a_bunker_relay_it_cannot_pin() {
-    let url = shared_relay().await;
+    let (_relay, url) = mock_relay().await;
+    let url = url.as_str();
 
     try_start(url, config(Some(pinning(false))))
         .await
@@ -179,12 +197,12 @@ async fn strict_pinning_refuses_a_bunker_relay_it_cannot_pin() {
 /// waiting for a relay. This is the control for the two tests above.
 #[tokio::test]
 async fn an_unpinned_bunker_is_unchanged() {
-    let url = shared_relay().await;
+    let (_relay, url) = mock_relay().await;
+    let url = url.as_str();
 
-    assert!(
-        connect_handshake_reaches_bunker(url, config(None)).await,
-        "default bunker transport dropped the handshake"
-    );
+    if let Err(why) = connect_handshake_reaches_bunker(url, config(None)).await {
+        panic!("default bunker transport dropped the handshake: {why}");
+    }
 }
 
 /// An unpinned bunker must still start when no relay is reachable at all, since
@@ -224,7 +242,7 @@ async fn a_bunker_enforces_a_probe_learned_pin_on_its_live_socket() {
     install_default_crypto_provider();
 
     let empty = CertificatePinSet::new();
-    let (_observed, learned) = verify_relay_certificate(LIVE_RELAY, &empty, false)
+    let (_observed, learned) = verify_relay_certificate(LIVE_RELAY, &empty, false, None)
         .await
         .expect("probe should trust the relay on first use");
     let (host, hash) = learned.expect("probe should surface a pin to record");
@@ -234,10 +252,11 @@ async fn a_bunker_enforces_a_probe_learned_pin_on_its_live_socket() {
     provisioned.add_pin(host, hash);
     let strict = TlsPinning::new(Arc::new(std::sync::Mutex::new(provisioned)), true);
 
-    assert!(
-        connect_handshake_reaches_bunker(LIVE_RELAY, config(Some(strict))).await,
-        "strict pinning rejected the pin the probe had just learned from {LIVE_RELAY}"
-    );
+    if let Err(why) = connect_handshake_reaches_bunker(LIVE_RELAY, config(Some(strict))).await {
+        panic!(
+            "strict pinning rejected the pin the probe had just learned from {LIVE_RELAY}: {why}"
+        );
+    }
 }
 
 /// A wrong pin must stop the bunker's relay socket from coming up, which is

@@ -130,7 +130,7 @@ pub use oprf_session::{
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use pinned_transport::{
-    build_client, wait_for_any_relay, PinnedWebSocketTransport, TlsPinning,
+    build_client, wait_for_any_relay, with_proxy, PinnedWebSocketTransport, TlsPinning,
 };
 pub use pinning::PinningServerCertVerifier;
 pub use protocol::{

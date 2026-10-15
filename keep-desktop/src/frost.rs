@@ -53,6 +53,7 @@ pub(crate) async fn verify_relay_certificates(
     certificate_pins: &Mutex<keep_frost_net::CertificatePinSet>,
     keep_path: &std::path::Path,
     require_pinned: bool,
+    proxy: Option<std::net::SocketAddr>,
 ) -> Result<(), crate::message::ConnectionError> {
     use crate::message::ConnectionError;
     // Fail closed: refuse to connect when the on-disk pin store exists but is
@@ -78,7 +79,7 @@ pub(crate) async fn verify_relay_certificates(
         // `require_pinned` comes from the strict-pinning setting: false is
         // trust-on-first-use; true rejects any relay with no recorded pin.
         let (_hash, new_pin) =
-            keep_frost_net::verify_relay_certificate(url, &pins_snapshot, require_pinned)
+            keep_frost_net::verify_relay_certificate(url, &pins_snapshot, require_pinned, proxy)
                 .await
                 .map_err(|e| match e {
                     keep_frost_net::FrostNetError::CertificatePinMismatch {
@@ -327,6 +328,7 @@ pub(crate) async fn setup_frost_node(
         &net.certificate_pins,
         &net.keep_path,
         net.require_pinned,
+        net.proxy,
     )
     .await?;
 

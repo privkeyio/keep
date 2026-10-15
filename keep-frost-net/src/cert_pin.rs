@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+use tokio_socks::tcp::Socks5Stream;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
@@ -20,6 +21,15 @@ use keep_core::relay::is_internal_ip;
 use crate::error::{FrostNetError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for a probe that goes through a proxy, where building a Tor circuit
+/// and then handshaking over it routinely costs more than a direct dial. Ten
+/// seconds is a normal cold-circuit time, so reusing [`CONNECT_TIMEOUT`] here
+/// would make turning the proxy on look like the relay is down, and the
+/// cheapest way out of that for a user is to turn the proxy back off, which is
+/// the exposure this is supposed to prevent. Bounded well under the 90s desktop
+/// allows a proxied session so a dead proxy still fails rather than hangs.
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub type SpkiHash = [u8; 32];
 
@@ -188,10 +198,16 @@ pub fn normalize_pin_hostname(input: &str) -> Option<String> {
 /// an un-pinned host is trusted-on-first-use (the observed hash is surfaced to
 /// pin). A high-assurance deployment provisions relay pins out-of-band and
 /// passes `true`, mirroring the opt-in strict attestation (`--expected-pcr`).
+///
+/// `proxy` MUST carry the same SOCKS address the live relay sockets use. The
+/// probe is a second TCP connection to the relay, so a probe that dials direct
+/// while the data socket is proxied still reveals the host address to the relay
+/// and to anyone watching the link, and it does so on every connect attempt.
 pub async fn verify_relay_certificate(
     relay_url: &str,
     pins: &CertificatePinSet,
     require_pinned: bool,
+    proxy: Option<SocketAddr>,
 ) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
     let url = url::Url::parse(relay_url)
         .map_err(|e| FrostNetError::Transport(format!("Invalid relay URL: {e}")))?;
@@ -227,40 +243,67 @@ pub async fn verify_relay_certificate(
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
-    let resolve_addr = addr.clone();
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            resolve_addr
-                .to_socket_addrs()
-                .ok()
-                .map(|iter| iter.collect::<Vec<SocketAddr>>())
-                .filter(|v| !v.is_empty())
-        }),
-    )
-    .await
-    .map_err(|_| FrostNetError::Timeout(format!("DNS resolve {addr}")))?
-    .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
-    .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
+    // Both the dial and the handshake below cross the proxy, so both take the
+    // proxied budget.
+    let connect_timeout = if proxy.is_some() {
+        PROXY_CONNECT_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
+    };
 
-    let safe_addrs: Vec<SocketAddr> = addrs
-        .into_iter()
-        .filter(|a| !is_internal_ip(&a.ip()))
-        .collect();
-    if safe_addrs.is_empty() {
-        return Err(FrostNetError::Transport(format!(
-            "Relay {hostname} resolves to internal addresses only"
-        )));
-    }
-
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&safe_addrs[..]))
+    let tcp_stream = match proxy {
+        // Hand the relay name to the proxy rather than resolving it here: a
+        // local lookup would leak the relay being contacted even though the
+        // connection itself is proxied, which is the whole point of routing
+        // through Tor. That also means `is_internal_ip` cannot run, since no
+        // address is resolved on this side; the target is whatever the proxy
+        // reaches, exactly as for the live relay sockets, which build their
+        // proxied streams the same way.
+        Some(socks) => tokio::time::timeout(
+            connect_timeout,
+            Socks5Stream::connect(socks, (hostname.as_str(), port)),
+        )
         .await
-        .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
-        .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?;
+        .map_err(|_| FrostNetError::Timeout(format!("SOCKS connect to {addr} via {socks}")))?
+        .map_err(|e| FrostNetError::Transport(format!("SOCKS connect to {addr} via {socks}: {e}")))?
+        .into_inner(),
+        None => {
+            let resolve_addr = addr.clone();
+            let addrs: Vec<SocketAddr> = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio::task::spawn_blocking(move || {
+                    use std::net::ToSocketAddrs;
+                    resolve_addr
+                        .to_socket_addrs()
+                        .ok()
+                        .map(|iter| iter.collect::<Vec<SocketAddr>>())
+                        .filter(|v| !v.is_empty())
+                }),
+            )
+            .await
+            .map_err(|_| FrostNetError::Timeout(format!("DNS resolve {addr}")))?
+            .map_err(|e| FrostNetError::Transport(format!("DNS resolve {addr}: {e}")))?
+            .ok_or_else(|| FrostNetError::Transport(format!("No addresses for {addr}")))?;
+
+            let safe_addrs: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|a| !is_internal_ip(&a.ip()))
+                .collect();
+            if safe_addrs.is_empty() {
+                return Err(FrostNetError::Transport(format!(
+                    "Relay {hostname} resolves to internal addresses only"
+                )));
+            }
+
+            tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&safe_addrs[..]))
+                .await
+                .map_err(|_| FrostNetError::Timeout(format!("TCP connect to {addr}")))?
+                .map_err(|e| FrostNetError::Transport(format!("TCP connect to {addr}: {e}")))?
+        }
+    };
 
     let tls_stream =
-        tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
+        tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp_stream))
             .await
             .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {hostname}")))?
             .map_err(|e| FrostNetError::Transport(format!("TLS handshake with {hostname}: {e}")))?;

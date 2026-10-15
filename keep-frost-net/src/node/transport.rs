@@ -59,6 +59,7 @@ impl NostrTransport {
         pinning: Option<TlsPinning>,
     ) -> Result<Self> {
         let client = crate::pinned_transport::build_client(&keys, proxy, pinning)?;
+        let relay_opts = crate::pinned_transport::with_proxy(relay_opts, proxy);
 
         for relay in relays {
             client
@@ -150,6 +151,44 @@ impl CosignTransport for NostrTransport {
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
+
+    /// A relay the transport can reach directly must stay unreachable once a
+    /// proxy is configured, otherwise the proxy is being dropped and the socket
+    /// is direct. Nothing listens on the proxy port, so the SOCKS handshake
+    /// cannot complete and no relay reaches `Connected`.
+    #[tokio::test]
+    async fn a_configured_proxy_reaches_the_node_relay_sockets() {
+        use nostr_relay_builder::MockRelay;
+
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let relays = vec![url.to_string()];
+
+        let direct = NostrTransport::connect(
+            Keys::generate(),
+            &relays,
+            None,
+            RelayOptions::default(),
+            None,
+        )
+        .await
+        .expect("the mock relay must be reachable without a proxy, or the negative below proves nothing");
+        direct.client.shutdown().await;
+
+        let proxy: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            NostrTransport::connect(
+                Keys::generate(),
+                &relays,
+                Some(proxy),
+                RelayOptions::default(),
+                None,
+            )
+            .await
+            .is_err(),
+            "connected through a dead proxy, so the relay socket ignored it"
+        );
+    }
 
     fn output(success: &[&str], failed: &[(&str, &str)]) -> Output<EventId> {
         Output {
