@@ -321,8 +321,8 @@ impl SignPolicyStore {
     }
 
     /// Resolve the effective selection for a package: per-app override (`Manual`
-    /// when stored but unreadable), else the
-    /// global policy, else `Manual`. Mirrors keep-android's precedence.
+    /// when stored but unreadable), else the global policy, else `Manual`.
+    /// Mirrors keep-android's precedence.
     pub fn effective_policy(&self, package: String) -> SignPolicySelection {
         self.app_override(package)
             .unwrap_or_else(|| self.global_policy())
@@ -1677,6 +1677,16 @@ mod tests {
         assert!(!bad.set_global_policy(SignPolicySelection::Auto));
         assert!(!bad.set_app_override("com.example".into(), Some(SignPolicySelection::Auto)));
         assert!(!bad.set_app_override("com.example".into(), None));
+        // Nor can it be read: everything resolves to Manual.
+        assert_eq!(
+            bad.app_override("com.example".into()),
+            Some(SignPolicySelection::Manual)
+        );
+        assert_eq!(
+            bad.effective_policy("com.example".into()),
+            SignPolicySelection::Manual
+        );
+        assert_eq!(bad.global_policy(), SignPolicySelection::Manual);
     }
 
     #[test]
@@ -1752,17 +1762,38 @@ mod tests {
                 "{stored:?}"
             );
         }
-        // An unreadable global is Manual too.
-        storage
-            .map
-            .lock()
-            .unwrap()
-            .insert(GLOBAL_SIGN_POLICY_KEY.into(), UNREADABLE.into());
-        assert_eq!(store.global_policy(), SignPolicySelection::Manual);
-        assert_eq!(
-            store.effective_policy("com.other".into()),
-            SignPolicySelection::Manual
-        );
+        // A u8 out of range is Manual as well.
+        for stored in ["3", "255"] {
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .insert(app_override_key("com.app"), stored.into());
+            assert_eq!(
+                store.effective_policy("com.app".into()),
+                SignPolicySelection::Manual,
+                "{stored:?}"
+            );
+        }
+        // An unreadable or unparseable global is Manual too, and a readable
+        // override still wins over it.
+        store.set_app_override("com.app".into(), Some(SignPolicySelection::Auto));
+        for stored in [UNREADABLE, "auto"] {
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .insert(GLOBAL_SIGN_POLICY_KEY.into(), stored.into());
+            assert_eq!(store.global_policy(), SignPolicySelection::Manual);
+            assert_eq!(
+                store.effective_policy("com.other".into()),
+                SignPolicySelection::Manual
+            );
+            assert_eq!(
+                store.effective_policy("com.app".into()),
+                SignPolicySelection::Auto
+            );
+        }
     }
 
     #[test]
