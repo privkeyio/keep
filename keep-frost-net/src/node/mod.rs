@@ -48,6 +48,7 @@ use crate::nonce_pool::{NonceId, NoncePool};
 use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::oprf_session::{OprfEvalRateLimiter, OprfUnlockSessionManager};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
+use crate::pinned_transport::TlsPinning;
 use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
@@ -1312,6 +1313,31 @@ impl KfpNode {
         Self::with_nonce_store(share, relays, None, Some(proxy), None).await
     }
 
+    /// Relay connections with the SPKI pin enforced on the live socket.
+    /// Prefer this over [`Self::new`] wherever a pin store is available.
+    pub async fn new_pinned(
+        share: SharePackage,
+        relays: Vec<String>,
+        proxy: Option<SocketAddr>,
+        pinning: TlsPinning,
+    ) -> Result<Self> {
+        Self::with_nonce_store_pinned(share, relays, None, proxy, None, Some(pinning)).await
+    }
+
+    /// Relay connections with standard CA validation only. Any SPKI pin
+    /// enforced by a caller's pre-flight probe does not cover these sockets;
+    /// use [`Self::new_pinned`] or [`Self::with_nonce_store_pinned`] for that.
+    pub async fn with_nonce_store(
+        share: SharePackage,
+        relays: Vec<String>,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+        proxy: Option<SocketAddr>,
+        session_timeout: Option<Duration>,
+    ) -> Result<Self> {
+        Self::with_nonce_store_pinned(share, relays, nonce_store, proxy, session_timeout, None)
+            .await
+    }
+
     pub async fn with_nonce_store_path(
         share: SharePackage,
         relays: Vec<String>,
@@ -1328,12 +1354,16 @@ impl KfpNode {
         .await
     }
 
-    pub async fn with_nonce_store(
+    /// As [`Self::with_nonce_store`], but with the relay sockets enforcing the
+    /// SPKI pin inside their own TLS handshake. This is the variant that closes
+    /// the probe-vs-connect gap; see [`crate::PinnedWebSocketTransport`].
+    pub async fn with_nonce_store_pinned(
         share: SharePackage,
         relays: Vec<String>,
         nonce_store: Option<Arc<dyn NonceStore>>,
         proxy: Option<SocketAddr>,
         session_timeout: Option<Duration>,
+        pinning: Option<TlsPinning>,
     ) -> Result<Self> {
         for relay in &relays {
             let validate = if ALLOW_INTERNAL_HOSTS {
@@ -1349,7 +1379,8 @@ impl KfpNode {
         require_learnable_verifying_shares(&share)?;
         let keys = derive_keys_from_share(&share)?;
         let transport = Arc::new(
-            NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts()).await?,
+            NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts(), pinning)
+                .await?,
         ) as Arc<dyn CosignTransport>;
 
         Self::assemble(share, keys, transport, nonce_store, session_timeout)

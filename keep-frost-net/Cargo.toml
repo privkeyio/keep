@@ -46,6 +46,16 @@ x509-cert = "0.3"
 redb = "4"
 thiserror = "2.0"
 tokio-rustls = "0.26"
+# Direct websocket client, used only by the SPKI-pinned relay transport so the
+# pin is enforced on the handshake that carries data. Version and TLS backend
+# must match what the relay stack uses (rustls 0.23) so the message type and
+# connector unify.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# The relay stack's own socket type, so the pinned stream is handed back in the
+# exact shape nostr-sdk expects and its message conversion is reused rather
+# than re-implemented. Must stay the version nostr-sdk resolves, or the two
+# copies of `Message` stop unifying (a compile error, not a silent fault).
+async-wsocket = "0.13"
 tracing = "0.1"
 fs2 = "0.4"
 sha2 = "0.11"

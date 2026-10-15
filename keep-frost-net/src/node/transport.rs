@@ -9,6 +9,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::broadcast;
 
 use crate::error::{FrostNetError, Result};
+use crate::pinned_transport::TlsPinning;
 
 /// Transport seam between [`KfpNode`](super::KfpNode) and the relay layer. Moves
 /// opaque, already-signed nostr [`Event`]s and [`Filter`]s only; all crypto
@@ -46,20 +47,18 @@ impl NostrTransport {
     /// Build the client, add the relays, connect, and wait (bounded) for at
     /// least one relay to reach `Connected`. Relay URLs are validated by the
     /// caller before this runs.
+    ///
+    /// With `pinning` set, the relay sockets enforce the SPKI pin inside their
+    /// own TLS handshake (see [`crate::PinnedWebSocketTransport`]); without it
+    /// they do standard CA validation only.
     pub(crate) async fn connect(
         keys: Keys,
         relays: &[String],
         proxy: Option<SocketAddr>,
         relay_opts: RelayOptions,
+        pinning: Option<TlsPinning>,
     ) -> Result<Self> {
-        let client = match proxy {
-            Some(addr) => {
-                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
-                let opts = ClientOptions::new().connection(connection);
-                Client::builder().signer(keys.clone()).opts(opts).build()
-            }
-            None => Client::new(keys.clone()),
-        };
+        let client = crate::pinned_transport::build_client(&keys, proxy, pinning)?;
 
         for relay in relays {
             client
