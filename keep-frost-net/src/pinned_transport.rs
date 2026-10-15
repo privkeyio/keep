@@ -20,9 +20,12 @@
 //!
 //! Only [`ConnectionMode::Direct`] can be pinned here: the proxy and Tor modes
 //! build their streams inside the relay stack's own websocket crate, which this
-//! transport does not drive. Those modes therefore fall back to the default
-//! (unpinned) transport, and under [`TlsPinning::require_pinned`] they are
-//! refused outright rather than silently left unpinned.
+//! transport does not drive. Under [`TlsPinning::require_pinned`] those modes
+//! are refused outright. Without it they fall back to the default (unpinned)
+//! transport, which is a real downgrade to CA-only validation on the data
+//! socket even when a pin for that host is on record, so the fallback is logged
+//! at warn rather than taken quietly. Pinning those modes needs the proxy and
+//! Tor stream construction brought into this transport.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -308,6 +311,14 @@ impl WebSocketTransport for PinnedWebSocketTransport {
                                 .into(),
                         )));
                     }
+                    // Not a silent downgrade: this socket gets CA-only
+                    // validation even if a pin for the host is on record, so it
+                    // is recorded where an operator can see it.
+                    tracing::warn!(
+                        relay = %url,
+                        "certificate pin NOT enforced on this connection: proxied or Tor \
+                         transport cannot be pinned; falling back to CA-only validation"
+                    );
                     DefaultWebsocketTransport.connect(url, mode, timeout).await
                 }
             }

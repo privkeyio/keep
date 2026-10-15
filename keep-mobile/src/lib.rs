@@ -3514,7 +3514,13 @@ impl KeepMobile {
             // traffic, not just on the pre-flight probe above.
             let (pinning, live_pins, pins_before) = self.live_pinning()?;
             let node = KfpNode::new_pinned(share, verified_relays, proxy, pinning).await?;
-            self.persist_new_live_pins(&live_pins, &pins_before)?;
+            // The node holds open relay websockets by this point and has no
+            // `Drop` cleanup, so returning here would leak them. A pin we
+            // failed to write down is not worth that; warn and carry on, as the
+            // DKG path does.
+            if let Err(e) = self.persist_new_live_pins(&live_pins, &pins_before) {
+                tracing::warn!("failed to persist pins observed while connecting: {e}");
+            }
 
             let node = if let Some(path) = self
                 .session_store_path
