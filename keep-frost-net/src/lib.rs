@@ -130,7 +130,7 @@ pub use oprf_session::{
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 pub use pinned_transport::{PinnedWebSocketTransport, TlsPinning};
-pub use pinning::{OnNewPin, PinningServerCertVerifier};
+pub use pinning::PinningServerCertVerifier;
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,

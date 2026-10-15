@@ -18,15 +18,23 @@
 //! handshake. It plugs in through nostr-sdk's public
 //! [`WebSocketTransport`] seam, so no fork of the relay stack is needed.
 //!
+//! This path only ever *enforces* a pin; it never records one. Learning a pin on
+//! first use stays with the pre-flight probe, which runs under the caller's pin
+//! lock and is allowed to touch storage. Recording trust from inside a handshake
+//! would let an on-path attacker holding any CA-valid certificate pin itself,
+//! and would silently re-add a pin the user had just cleared.
+//!
 //! Only [`ConnectionMode::Direct`] can be pinned here: the proxy and Tor modes
 //! build their streams inside the relay stack's own websocket crate, which this
 //! transport does not drive. Under [`TlsPinning::require_pinned`] those modes
 //! are refused outright. Without it they fall back to the default (unpinned)
 //! transport, which is a real downgrade to CA-only validation on the data
 //! socket even when a pin for that host is on record, so the fallback is logged
-//! at warn rather than taken quietly. Pinning those modes needs the proxy and
-//! Tor stream construction brought into this transport.
+//! rather than taken quietly (once per host: the pool reconnects on a timer).
+//! Pinning those modes needs the proxy and Tor stream construction brought into
+//! this transport.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -53,57 +61,42 @@ use keep_core::relay::{is_internal_ip, ALLOW_INTERNAL_HOSTS};
 
 use crate::cert_pin::CertificatePinSet;
 use crate::error::{FrostNetError, Result};
-use crate::pinning::{OnNewPin, PinningServerCertVerifier};
+use crate::pinning::PinningServerCertVerifier;
 
-/// How the pin set, strict-mode flag and trust-on-first-use hook are handed to
-/// the transport.
+/// How the pin set and the strict-mode flag are handed to the transport.
 ///
-/// `pins` is shared (not copied) so a pin recorded on a live handshake is
-/// visible to the owner once the connection is up. That is how callers persist
-/// trust-on-first-use pins without doing storage I/O inside a TLS handshake:
-/// connect, then read the set back and write it out if it grew. `on_new_pin` is
-/// available for callers that would rather be notified, but it runs on the
-/// handshake path and must stay cheap and non-blocking.
+/// `pins` is shared rather than copied, and read-only on this path: the live
+/// handshake enforces whatever is on record but never writes to it. Sharing
+/// rather than snapshotting means a pin staged or cleared through the UI is
+/// picked up by the next full handshake, including an automatic reconnect,
+/// without tearing the node down. Nothing has to be written back afterwards, so
+/// there is no window in which a connection can clobber a concurrent edit.
 #[derive(Clone)]
 pub struct TlsPinning {
     pins: Arc<Mutex<CertificatePinSet>>,
     require_pinned: bool,
-    on_new_pin: Option<OnNewPin>,
 }
 
 impl fmt::Debug for TlsPinning {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsPinning")
             .field("require_pinned", &self.require_pinned)
-            .field("has_on_new_pin", &self.on_new_pin.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl TlsPinning {
-    /// Pin against `pins`. With `require_pinned` set, a host with no
-    /// pre-provisioned pin is refused instead of trusted on first use, which is
-    /// what closes the first-connection window.
+    /// Pin against `pins`. With `require_pinned` set, a host with no pin on
+    /// record is refused rather than accepted on standard validation alone,
+    /// which is what closes the first-connection window.
     pub fn new(pins: Arc<Mutex<CertificatePinSet>>, require_pinned: bool) -> Self {
         Self {
             pins,
             require_pinned,
-            on_new_pin: None,
         }
     }
 
-    /// Add a trust-on-first-use notification hook. Runs inside the handshake.
-    pub fn with_on_new_pin(mut self, on_new_pin: OnNewPin) -> Self {
-        self.on_new_pin = Some(on_new_pin);
-        self
-    }
-
-    /// The shared pin set, for reading back pins recorded on a live handshake.
-    pub fn pins(&self) -> &Arc<Mutex<CertificatePinSet>> {
-        &self.pins
-    }
-
-    /// Whether an un-pinned host is refused rather than trusted on first use.
+    /// Whether a host with no pin on record is refused.
     pub fn require_pinned(&self) -> bool {
         self.require_pinned
     }
@@ -138,6 +131,9 @@ pub(crate) fn build_client(
 pub struct PinnedWebSocketTransport {
     config: Arc<ClientConfig>,
     require_pinned: bool,
+    /// Hosts already logged as un-pinnable (proxy/Tor). The pool retries on a
+    /// timer, so this keeps one downgrade from filling the log for a session.
+    warned_unpinnable: Mutex<HashSet<String>>,
 }
 
 impl fmt::Debug for PinnedWebSocketTransport {
@@ -163,13 +159,26 @@ impl PinnedWebSocketTransport {
             Arc::new(roots),
             pinning.pins,
             require_pinned,
-            pinning.on_new_pin,
         )
         .map_err(|e| {
             FrostNetError::Transport(format!("Failed to build pinning certificate verifier: {e}"))
         })?;
 
-        let config = ClientConfig::builder()
+        // `ClientConfig::builder()` PANICS when no process-default crypto
+        // provider is installed, and the default is not inferable here because
+        // both `ring` and `aws-lc-rs` end up enabled on rustls through the relay
+        // stack. Resolve it explicitly: this is a library entry point reached
+        // across the UniFFI boundary, where an abort would take the host app
+        // down instead of returning an error.
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| {
+                FrostNetError::Transport(format!("Failed to configure TLS versions: {e}"))
+            })?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
@@ -177,6 +186,7 @@ impl PinnedWebSocketTransport {
         Ok(Self {
             config: Arc::new(config),
             require_pinned,
+            warned_unpinnable: Mutex::new(HashSet::new()),
         })
     }
 
@@ -233,7 +243,7 @@ impl PinnedWebSocketTransport {
                 )));
             }
 
-            let tcp = TcpStream::connect(&addrs[..]).await.map_err(|e| {
+            let tcp = happy_eyeballs_connect(&addrs).await.map_err(|e| {
                 FrostNetError::Transport(format!("TCP connect to {host}:{port}: {e}"))
             })?;
 
@@ -284,6 +294,93 @@ fn split_stream(
     (sink, stream)
 }
 
+/// Head start the first address family gets before the other is raced, per
+/// RFC 8305.
+const HAPPY_EYEBALLS_HEAD_START: Duration = Duration::from_millis(250);
+
+/// Try each address in turn, returning the last error if none connect.
+async fn connect_sequential(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "no connectable addresses",
+        )
+    }))
+}
+
+/// Connect with RFC 8305 "happy eyeballs" racing: start on IPv6, and if it has
+/// not answered within [`HAPPY_EYEBALLS_HEAD_START`], race IPv4 alongside it.
+///
+/// The default transport this replaces did the same (`async-wsocket`'s
+/// `happy_eyeballs_connect`). Connecting strictly in sequence instead would let
+/// a blackholed IPv6 route burn the full SYN timeout before IPv4 is tried,
+/// which on the node's wait-for-any-relay budget turns a working dual-stack
+/// network into a failed connect.
+async fn happy_eyeballs_connect(addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    let (v6, v4): (Vec<SocketAddr>, Vec<SocketAddr>) =
+        addrs.iter().copied().partition(|a| a.is_ipv6());
+    if v6.is_empty() || v4.is_empty() {
+        return connect_sequential(addrs).await;
+    }
+
+    let v6_attempt = connect_sequential(&v6);
+    let v4_attempt = async {
+        tokio::time::sleep(HAPPY_EYEBALLS_HEAD_START).await;
+        connect_sequential(&v4).await
+    };
+    tokio::pin!(v6_attempt);
+    tokio::pin!(v4_attempt);
+
+    // Whichever family connects first wins; if one fails outright, fall back to
+    // waiting on the other rather than failing the whole connect.
+    tokio::select! {
+        result = &mut v6_attempt => match result {
+            Ok(stream) => Ok(stream),
+            Err(_) => v4_attempt.await,
+        },
+        result = &mut v4_attempt => match result {
+            Ok(stream) => Ok(stream),
+            Err(_) => v6_attempt.await,
+        },
+    }
+}
+
+impl PinnedWebSocketTransport {
+    /// Log an un-pinnable (proxied or Tor) connection once per host. The pool
+    /// reconnects on a timer, so logging every attempt would repeat the line for
+    /// the life of the process.
+    fn log_once_unpinnable(&self, url: &Url, strict: bool) {
+        let host = url.host_str().unwrap_or("unknown").to_string();
+        let mut warned = self
+            .warned_unpinnable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !warned.insert(host) {
+            return;
+        }
+        if strict {
+            tracing::error!(
+                relay = %url,
+                "strict pinning REFUSES this relay: a proxied or Tor connection cannot be \
+                 pinned. Disable the proxy or strict pinning to connect."
+            );
+        } else {
+            tracing::warn!(
+                relay = %url,
+                "certificate pin NOT enforced on this connection: proxied or Tor transport \
+                 cannot be pinned; falling back to CA-only validation"
+            );
+        }
+    }
+}
+
 impl WebSocketTransport for PinnedWebSocketTransport {
     fn support_ping(&self) -> bool {
         true
@@ -305,6 +402,11 @@ impl WebSocketTransport for PinnedWebSocketTransport {
                 // pinning instead of quietly dropping to CA-only validation.
                 _ => {
                     if self.require_pinned {
+                        // Logged as well as refused: every relay is affected
+                        // when a proxy is configured, and the caller surfaces
+                        // only a generic "timed out waiting for relay", so
+                        // without this the cause is invisible.
+                        self.log_once_unpinnable(url, true);
                         return Err(TransportError::backend(FrostNetError::Transport(
                             "strict pinning: refusing a proxied or Tor relay connection, which \
                              this transport cannot pin"
@@ -314,11 +416,7 @@ impl WebSocketTransport for PinnedWebSocketTransport {
                     // Not a silent downgrade: this socket gets CA-only
                     // validation even if a pin for the host is on record, so it
                     // is recorded where an operator can see it.
-                    tracing::warn!(
-                        relay = %url,
-                        "certificate pin NOT enforced on this connection: proxied or Tor \
-                         transport cannot be pinned; falling back to CA-only validation"
-                    );
+                    self.log_once_unpinnable(url, false);
                     DefaultWebsocketTransport.connect(url, mode, timeout).await
                 }
             }

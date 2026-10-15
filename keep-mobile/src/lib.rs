@@ -1571,10 +1571,17 @@ impl KeepMobile {
 
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
-        let relays = {
+        // The probe and the live transport's pin set are read under one lock
+        // acquisition, and both before the single-use subkey below is consumed:
+        // a storage fault while reading pins must not strand a half-started
+        // ceremony, and a concurrent FFI pin edit must not land between the two
+        // reads.
+        let (relays, pinning) = {
             let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
-            self.runtime
-                .block_on(self.verify_and_pin_relays(&config.relays))?
+            let relays = self
+                .runtime
+                .block_on(self.verify_and_pin_relays(&config.relays))?;
+            (relays, self.live_pinning()?)
         };
 
         // Route through the configured loopback SOCKS proxy when enabled (§7),
@@ -1614,7 +1621,6 @@ impl KeepMobile {
 
         let passphrase = Zeroizing::new(passphrase);
         let timeout = Duration::from_secs(timeout_secs.max(30));
-        let (pinning, live_pins, pins_before) = self.live_pinning()?;
         let outcome = self.runtime.block_on(dkg::run_dkg(
             &subkey,
             &config,
@@ -1627,16 +1633,6 @@ impl KeepMobile {
             progress.clone(),
             Some(pinning),
         ));
-
-        // Record any pin the ceremony's own handshakes learned. Re-taken
-        // briefly rather than held for the whole run, and a failure here is not
-        // worth failing a completed ceremony over.
-        {
-            let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
-            if let Err(e) = self.persist_new_live_pins(&live_pins, &pins_before) {
-                tracing::warn!("failed to persist pins observed during DKG: {e}");
-            }
-        }
 
         match outcome {
             // §6: persist first, and surface `Complete` only once the share is
@@ -3325,6 +3321,27 @@ impl KeepMobile {
         }
     }
 
+    /// Pin configuration for the live relay sockets.
+    ///
+    /// The stored pin set is handed to the transport, which only ever reads it:
+    /// enforcing the pin on the live handshake is the transport's job, while
+    /// learning one on first use stays with `verify_and_pin_relays` below,
+    /// which runs under `cert_pin_lock` and is allowed to touch storage. Since
+    /// the handshake records nothing, there is nothing to write back after
+    /// connecting, and so no way for a connection to clobber a pin staged or
+    /// cleared through the FFI while it was coming up.
+    fn live_pinning(&self) -> Result<keep_frost_net::TlsPinning, KeepMobileError> {
+        let require_pinned =
+            persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
+                .unwrap_or_default()
+                .enabled;
+        let pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        Ok(keep_frost_net::TlsPinning::new(
+            Arc::new(std::sync::Mutex::new(pins)),
+            require_pinned,
+        ))
+    }
+
     /// Verify each relay's TLS certificate against the stored pins (trust-on-
     /// first-use, or strict when configured), persist any newly learned pins,
     /// and return the subset that passed. Fails closed if none pass.
@@ -3332,75 +3349,6 @@ impl KeepMobile {
     /// The caller must hold `cert_pin_lock` across this call so the read-modify-
     /// write of the persisted pin set cannot lose an update to a concurrent
     /// stage/remove/clear FFI call.
-    /// Pin configuration for the live relay sockets.
-    ///
-    /// The pin set is shared with the transport rather than copied, so a
-    /// trust-on-first-use pin recorded inside a TLS handshake is visible here
-    /// once the connection is up. Persisting goes through
-    /// [`Self::persist_new_live_pins`] afterwards instead of a handshake
-    /// callback: storage is a foreign platform implementation and must not be
-    /// called from inside the handshake.
-    #[allow(clippy::type_complexity)]
-    fn live_pinning(
-        &self,
-    ) -> Result<
-        (
-            keep_frost_net::TlsPinning,
-            Arc<std::sync::Mutex<keep_frost_net::CertificatePinSet>>,
-            std::collections::HashMap<String, Vec<keep_frost_net::SpkiHash>>,
-        ),
-        KeepMobileError,
-    > {
-        let require_pinned =
-            persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
-                .unwrap_or_default()
-                .enabled;
-        let loaded = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        let before = loaded.pins().clone();
-        let pins = Arc::new(std::sync::Mutex::new(loaded));
-        Ok((
-            keep_frost_net::TlsPinning::new(pins.clone(), require_pinned),
-            pins,
-            before,
-        ))
-    }
-
-    /// Persist pins the live handshake added by trust-on-first-use.
-    ///
-    /// Merges onto whatever is stored *now* rather than writing the snapshot
-    /// taken before connecting, so a pin staged, removed or cleared through the
-    /// FFI while the connection was being established is not clobbered. Caller
-    /// holds `cert_pin_lock` across the read-modify-write.
-    fn persist_new_live_pins(
-        &self,
-        pins: &Arc<std::sync::Mutex<keep_frost_net::CertificatePinSet>>,
-        before: &std::collections::HashMap<String, Vec<keep_frost_net::SpkiHash>>,
-    ) -> Result<(), KeepMobileError> {
-        let observed = {
-            let guard = pins.lock().unwrap_or_else(|p| p.into_inner());
-            guard.pins().clone()
-        };
-
-        let mut current = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        let mut changed = false;
-        for (hostname, hashes) in observed {
-            // Only hosts the handshake pinned for the first time; an existing
-            // entry was already stored, and one the FFI touched meanwhile wins.
-            if before.contains_key(&hostname) || current.is_pinned(&hostname) {
-                continue;
-            }
-            for hash in hashes {
-                current.add_pin(hostname.clone(), hash);
-                changed = true;
-            }
-        }
-
-        if changed {
-            persistence::persist_cert_pins(&self.storage, &current)?;
-        }
-        Ok(())
-    }
-
     async fn verify_and_pin_relays(
         &self,
         relays: &[String],
@@ -3512,15 +3460,8 @@ impl KeepMobile {
 
             // Enforce the SPKI pin on the sockets that carry share and signing
             // traffic, not just on the pre-flight probe above.
-            let (pinning, live_pins, pins_before) = self.live_pinning()?;
+            let pinning = self.live_pinning()?;
             let node = KfpNode::new_pinned(share, verified_relays, proxy, pinning).await?;
-            // The node holds open relay websockets by this point and has no
-            // `Drop` cleanup, so returning here would leak them. A pin we
-            // failed to write down is not worth that; warn and carry on, as the
-            // DKG path does.
-            if let Err(e) = self.persist_new_live_pins(&live_pins, &pins_before) {
-                tracing::warn!("failed to persist pins observed while connecting: {e}");
-            }
 
             let node = if let Some(path) = self
                 .session_store_path

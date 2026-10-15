@@ -333,9 +333,10 @@ pub(crate) async fn setup_frost_node(
     let nonce_store = keep_frost_net::FileNonceStore::new(&nonce_store_path)
         .map_err(|e| format!("Failed to create nonce store: {e}"))?;
     // Enforce the SPKI pin inside the handshake of the sockets that carry
-    // coordination traffic, not only on the pre-flight probe above. The pin set
-    // is shared, so a trust-on-first-use pin learned on a live handshake is
-    // saved below alongside the probe's.
+    // coordination traffic, not only on the pre-flight probe above. The set is
+    // shared, not snapshotted, so a pin staged or cleared in Settings takes
+    // effect on the next full handshake; the verifier only ever reads it, so a
+    // reconnect cannot re-add a pin the user just cleared.
     let pinning = keep_frost_net::TlsPinning::new(net.certificate_pins.clone(), net.require_pinned);
     let node = KfpNode::with_nonce_store_pinned(
         share,
@@ -347,16 +348,6 @@ pub(crate) async fn setup_frost_node(
     )
     .await
     .map_err(|e| format!("Connection failed: {e}"))?;
-
-    // Persist anything the live handshakes pinned for the first time.
-    {
-        let pins_snapshot = net
-            .certificate_pins
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        crate::app::save_cert_pins(&net.keep_path, &pins_snapshot);
-    }
 
     let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep_arc.clone()))
         as Arc<dyn keep_frost_net::PersistedDescriptorLookup>);

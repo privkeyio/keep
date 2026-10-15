@@ -17,6 +17,7 @@
 //! is configured, matching a typical TLS client; any OCSP staple the peer sends
 //! is still passed through to the standard validator.)
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -27,11 +28,6 @@ use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::cert_pin::{self, CertificatePinSet, SpkiHash};
 
-/// Callback invoked when a host is pinned for the first time (trust-on-first-use),
-/// so the caller can persist the newly observed pin. Runs inside the handshake;
-/// keep it cheap and non-blocking.
-pub type OnNewPin = Arc<dyn Fn(&str, &SpkiHash) + Send + Sync>;
-
 /// A `rustls` server-certificate verifier that adds SPKI pinning on top of
 /// standard WebPKI validation. See the module docs for the layering guarantee.
 #[derive(Clone)]
@@ -39,22 +35,25 @@ pub struct PinningServerCertVerifier {
     /// Standard validator, consulted first. A `dyn` so the pin logic can be
     /// unit-tested against a stub validator without a live certificate chain.
     inner: Arc<dyn ServerCertVerifier>,
-    /// Accepted pins, shared with the caller. On trust-on-first-use the observed
-    /// pin is inserted here so later connections in this process enforce it.
+    /// Accepted pins, shared with the caller and only ever READ here. The live
+    /// handshake enforces what is on record; it never records anything itself.
+    /// Learning a pin belongs to the pre-flight probe, which runs under the
+    /// caller's pin lock and can do storage I/O. Keeping this path read-only is
+    /// what stops a handshake from writing trust into the set the UI owns.
     pins: Arc<Mutex<CertificatePinSet>>,
-    /// Strict mode: reject a host with no pre-provisioned pin instead of
-    /// trust-on-first-use, closing the first-connection window. Supplied by the
-    /// caller's policy, mirroring `verify_relay_certificate`'s `require_pinned`.
+    /// Strict mode: reject a host with no pin on record instead of accepting it
+    /// on standard validation alone, closing the first-connection window.
+    /// Mirrors `verify_relay_certificate`'s `require_pinned`.
     require_pinned: bool,
-    /// Optional persistence hook for trust-on-first-use pins.
-    on_new_pin: Option<OnNewPin>,
+    /// Hosts already logged as accepted-with-no-pin, so the relay pool's
+    /// reconnect loop does not repeat the same warning for the whole session.
+    warned_unpinned: Arc<Mutex<HashSet<String>>>,
 }
 
 impl fmt::Debug for PinningServerCertVerifier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PinningServerCertVerifier")
             .field("require_pinned", &self.require_pinned)
-            .field("has_on_new_pin", &self.on_new_pin.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -68,51 +67,77 @@ impl PinningServerCertVerifier {
         roots: Arc<RootCertStore>,
         pins: Arc<Mutex<CertificatePinSet>>,
         require_pinned: bool,
-        on_new_pin: Option<OnNewPin>,
     ) -> Result<Self, rustls::client::VerifierBuilderError> {
         let inner = WebPkiServerVerifier::builder(roots).build()?;
         Ok(Self {
             inner,
             pins,
             require_pinned,
-            on_new_pin,
+            warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     /// Enforce the SPKI pin for `hostname` against the observed `spki_hash`,
     /// after standard validation has already accepted the certificate.
     ///
-    /// Delegates the accept/reject/trust-on-first-use decision to the shared
-    /// [`cert_pin::evaluate_pin`] so pinning behaves identically here and in
-    /// `verify_relay_certificate`. On first sighting the pin is recorded (and
-    /// the persistence hook fired); a mismatch or a strict-mode unpinned host is
-    /// rejected with an application verification failure.
+    /// Delegates the accept/reject decision to the shared
+    /// [`cert_pin::evaluate_pin`] so a pin behaves identically here and in
+    /// `verify_relay_certificate`. A mismatch, or a strict-mode host with no
+    /// pin, is rejected with an application verification failure.
+    ///
+    /// Unlike the probe, this path never records a pin: see the `pins` field.
     fn enforce_pin(&self, hostname: &str, spki_hash: SpkiHash) -> Result<(), Error> {
         // Recover a poisoned lock rather than panicking: a prior panic while the
         // guard was held must not turn every later handshake into a panic (DoS).
-        // `add_pin` is the only write and is a single atomic push, so the set is
-        // never observed half-written.
-        let mut pins = self.pins.lock().unwrap_or_else(|p| p.into_inner());
         let decision = {
+            let pins = self.pins.lock().unwrap_or_else(|p| p.into_inner());
             let expected = pins.get_pins(hostname);
             cert_pin::evaluate_pin(hostname, spki_hash, expected, self.require_pinned)
         };
         match decision {
-            Ok((_, Some((host, hash)))) => {
-                // Trust-on-first-use: no pin yet and strict mode is off. Record
-                // the observed pin so subsequent connections this process makes
-                // enforce it, then hand it to the caller to persist.
-                pins.add_pin(host.clone(), hash);
-                drop(pins);
-                if let Some(cb) = &self.on_new_pin {
-                    cb(&host, &hash);
-                }
+            // No pin on record and strict mode is off, so standard validation
+            // is all there is to go on. Accept, but deliberately do NOT record
+            // the observed key: recording trust from inside a handshake is how
+            // an on-path attacker holding any CA-valid certificate would get
+            // itself pinned, and it would silently re-add a pin the user had
+            // just cleared. Both shipped callers pre-pin every `wss` host on
+            // the probe, so reaching this arm means the probe did not cover
+            // this host, which is worth saying out loud.
+            Ok((_, Some(_))) => {
+                self.warn_once_unpinned(hostname);
                 Ok(())
             }
             Ok((_, None)) => Ok(()),
-            Err(_) => Err(Error::InvalidCertificate(
-                CertificateError::ApplicationVerificationFailure,
-            )),
+            Err(e) => {
+                // The only signal a selective man-in-the-middle produces: the
+                // pool just records a failed connection and the node carries on
+                // over its other relays, so without this line the attempt is
+                // invisible.
+                tracing::warn!(
+                    relay_host = %hostname,
+                    "TLS certificate pin check FAILED on the live relay connection; refusing it: {e}"
+                );
+                Err(Error::InvalidCertificate(
+                    CertificateError::ApplicationVerificationFailure,
+                ))
+            }
+        }
+    }
+
+    /// Warn the first time a host is accepted with no pin on record. The relay
+    /// pool reconnects on a timer, so warning unconditionally here would repeat
+    /// the same line for the life of the process.
+    fn warn_once_unpinned(&self, hostname: &str) {
+        let mut warned = self
+            .warned_unpinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if warned.insert(hostname.to_string()) {
+            tracing::warn!(
+                relay_host = %hostname,
+                "no TLS certificate pin on record for this relay; accepted on CA validation \
+                 alone. Enable strict pinning to refuse un-pinned relays instead."
+            );
         }
     }
 }
@@ -196,7 +221,6 @@ impl ServerCertVerifier for PinningServerCertVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     // A P-256 self-signed cert (from cert_pin's fixtures), used only for its
     // parseable SPKI bytes. The stub validator below stands in for chain
@@ -260,13 +284,12 @@ mod tests {
         accept: bool,
         pins: CertificatePinSet,
         require_pinned: bool,
-        on_new_pin: Option<OnNewPin>,
     ) -> PinningServerCertVerifier {
         PinningServerCertVerifier {
             inner: Arc::new(StubInner { accept }),
             pins: Arc::new(Mutex::new(pins)),
             require_pinned,
-            on_new_pin,
+            warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -290,7 +313,7 @@ mod tests {
         // Even with a matching pin present, an untrusted chain must fail.
         let mut pins = CertificatePinSet::new();
         pins.add_pin("relay.example.com".into(), cert_spki_hash());
-        let v = verifier(false, pins, false, None);
+        let v = verifier(false, pins, false);
         let err = run(&v, "relay.example.com").unwrap_err();
         assert!(matches!(err, Error::InvalidCertificate(_)));
     }
@@ -299,7 +322,7 @@ mod tests {
     fn accepts_validated_cert_matching_existing_pin() {
         let mut pins = CertificatePinSet::new();
         pins.add_pin("relay.example.com".into(), cert_spki_hash());
-        let v = verifier(true, pins, false, None);
+        let v = verifier(true, pins, false);
         assert!(run(&v, "relay.example.com").is_ok());
     }
 
@@ -307,7 +330,7 @@ mod tests {
     fn rejects_validated_cert_with_mismatched_pin() {
         let mut pins = CertificatePinSet::new();
         pins.add_pin("relay.example.com".into(), [0xAAu8; 32]);
-        let v = verifier(true, pins, false, None);
+        let v = verifier(true, pins, false);
         let err = run(&v, "relay.example.com").unwrap_err();
         assert!(matches!(
             err,
@@ -316,27 +339,25 @@ mod tests {
     }
 
     #[test]
-    fn tofu_pins_unknown_host_and_fires_callback() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let hits2 = hits.clone();
-        let cb: OnNewPin = Arc::new(move |host, hash| {
-            assert_eq!(host, "relay.example.com");
-            assert_eq!(*hash, cert_spki_hash());
-            hits2.fetch_add(1, Ordering::SeqCst);
-        });
-        let v = verifier(true, CertificatePinSet::new(), false, Some(cb));
+    fn lenient_mode_accepts_unpinned_host_without_recording_a_pin() {
+        // The live handshake must never write trust into the shared pin set:
+        // that is what would let an on-path attacker with a CA-valid cert pin
+        // itself, and what would resurrect a pin the user had just cleared.
+        let v = verifier(true, CertificatePinSet::new(), false);
         assert!(run(&v, "relay.example.com").is_ok());
-        assert_eq!(hits.load(Ordering::SeqCst), 1, "callback fired once");
-        // The observed pin is now recorded, so a second connection enforces it.
-        assert_eq!(
-            v.pins.lock().unwrap().get_pins("relay.example.com"),
-            &[cert_spki_hash()]
+        assert!(
+            v.pins
+                .lock()
+                .unwrap()
+                .get_pins("relay.example.com")
+                .is_empty(),
+            "live handshake recorded a pin; it must only ever enforce them"
         );
     }
 
     #[test]
     fn strict_mode_rejects_unpinned_host_even_after_valid_chain() {
-        let v = verifier(true, CertificatePinSet::new(), true, None);
+        let v = verifier(true, CertificatePinSet::new(), true);
         let err = run(&v, "relay.example.com").unwrap_err();
         assert!(matches!(
             err,
@@ -348,7 +369,7 @@ mod tests {
     fn strict_mode_accepts_matching_provisioned_pin() {
         let mut pins = CertificatePinSet::new();
         pins.add_pin("relay.example.com".into(), cert_spki_hash());
-        let v = verifier(true, pins, true, None);
+        let v = verifier(true, pins, true);
         assert!(run(&v, "relay.example.com").is_ok());
     }
 
@@ -357,7 +378,7 @@ mod tests {
         // A cert can pass the standard validator yet not parse under the SPKI
         // extractor (different parsers). That path must fail closed, never pin
         // a wrong/empty SPKI. Stub validator accepts; the leaf bytes are junk.
-        let v = verifier(true, CertificatePinSet::new(), false, None);
+        let v = verifier(true, CertificatePinSet::new(), false);
         let end_entity = CertificateDer::from(b"not a certificate".to_vec());
         let name = ServerName::try_from("relay.example.com").unwrap();
         let err = v
@@ -381,18 +402,18 @@ mod tests {
         // TLS ServerName carries mixed case, mirroring url::host_str() keying.
         let mut pins = CertificatePinSet::new();
         pins.add_pin("relay.example.com".into(), cert_spki_hash());
-        let v = verifier(true, pins, true, None); // strict: only a keyed pin passes
+        let v = verifier(true, pins, true); // strict: only a keyed pin passes
         assert!(run(&v, "Relay.EXAMPLE.com").is_ok());
     }
 
     #[test]
-    fn ip_address_server_name_is_pinned_under_its_literal() {
-        // The IpAddress arm keys the pin under the address literal (IPv4 here).
-        let v = verifier(true, CertificatePinSet::new(), false, None);
+    fn ip_address_server_name_is_keyed_under_its_literal() {
+        // The IpAddress arm must key the pin under the address literal (IPv4
+        // here). Strict mode proves the key matched: an un-keyed host is
+        // rejected, so acceptance can only mean the provisioned pin resolved.
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("127.0.0.1".into(), cert_spki_hash());
+        let v = verifier(true, pins, true);
         assert!(run(&v, "127.0.0.1").is_ok());
-        assert_eq!(
-            v.pins.lock().unwrap().get_pins("127.0.0.1"),
-            &[cert_spki_hash()]
-        );
     }
 }

@@ -10,16 +10,18 @@
 //! ```
 //!
 //! What they establish, which no offline test can: relay traffic actually flows
-//! over a socket whose handshake ran our pinning verifier, and a wrong pin stops
-//! that socket from ever coming up. Those are the two claims the data-channel
-//! pin rests on.
+//! over a socket whose handshake ran our pinning verifier, a pin the pre-flight
+//! probe learned is then enforced on that socket, and a wrong pin stops the
+//! socket from ever coming up. Those are the claims the data-channel pin rests
+//! on. They also pin down the read-only contract: the live handshake must never
+//! write a pin into the shared set.
 
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use keep_frost_net::{
-    install_default_crypto_provider, CertificatePinSet, PinnedWebSocketTransport, SpkiHash,
-    TlsPinning,
+    install_default_crypto_provider, verify_relay_certificate, CertificatePinSet,
+    PinnedWebSocketTransport, SpkiHash, TlsPinning,
 };
 use nostr_sdk::prelude::*;
 
@@ -60,11 +62,12 @@ async fn reaches_connected(client: &Client, within: Duration) -> bool {
     .is_ok()
 }
 
-/// Trust-on-first-use over the live socket: the connection comes up, real
-/// events flow, and the pin recorded is the one from that very handshake.
+/// The connection comes up through our verifier and real events flow over it,
+/// and with no pin on record the handshake accepts on CA validation alone
+/// WITHOUT recording anything into the shared set.
 #[tokio::test]
 #[ignore = "requires network access to a public relay"]
-async fn pinned_transport_connects_and_records_the_live_pin() {
+async fn pinned_transport_connects_without_recording_a_pin() {
     setup();
 
     let pins = Arc::new(Mutex::new(CertificatePinSet::new()));
@@ -88,54 +91,50 @@ async fn pinned_transport_connects_and_records_the_live_pin() {
         .expect("fetch events over the pinned connection");
     println!("fetched {} event(s) over the pinned socket", events.len());
 
+    // The read-only contract, over a real handshake: learning a pin belongs to
+    // the probe, so a live connection must leave the set exactly as it found it.
+    // This is what stops a reconnect from re-adding a pin the user cleared.
     let recorded = {
         let guard = pins.lock().unwrap();
         guard.get_pins(RELAY_HOST).to_vec()
     };
-    assert_eq!(
-        recorded.len(),
-        1,
-        "exactly one pin should have been recorded for {RELAY_HOST}, got {recorded:?}"
+    assert!(
+        recorded.is_empty(),
+        "the live handshake recorded {recorded:?}; it must only ever enforce pins"
     );
 
     client.disconnect().await;
 }
 
-/// The pin recorded on a live handshake is accepted by a later strict-mode
-/// connection, so trust-on-first-use and enforcement agree on the same value.
+/// The pin the pre-flight probe learns is the one the live socket enforces.
+///
+/// This is the end-to-end shape the product actually runs: the probe learns and
+/// persists under the caller's lock, then the data socket enforces that value in
+/// strict mode. If the two keyed or hashed a certificate differently, strict
+/// mode here would reject the relay the probe had just accepted.
 #[tokio::test]
 #[ignore = "requires network access to a public relay"]
-async fn a_pin_learned_live_is_accepted_in_strict_mode() {
+async fn a_pin_learned_by_the_probe_is_enforced_on_the_live_socket() {
     setup();
 
-    // Learn the pin.
-    let learned = Arc::new(Mutex::new(CertificatePinSet::new()));
-    let first = pinned_client(learned.clone(), false);
-    first.add_relay(RELAY).await.expect("add relay");
-    first.connect().await;
-    assert!(
-        reaches_connected(&first, Duration::from_secs(20)).await,
-        "first (trust-on-first-use) connection never came up"
-    );
-    first.disconnect().await;
-
-    let hashes = {
-        let guard = learned.lock().unwrap();
-        guard.get_pins(RELAY_HOST).to_vec()
-    };
-    assert!(!hashes.is_empty(), "no pin was learned to re-use");
+    // Learn the pin the way the shipped callers do: on the pre-flight probe.
+    let empty = CertificatePinSet::new();
+    let (observed, learned) = verify_relay_certificate(RELAY, &empty, false)
+        .await
+        .expect("probe should trust the relay on first use");
+    let (host, hash) = learned.expect("probe should surface a pin to record");
+    assert_eq!(host, RELAY_HOST);
+    assert_eq!(hash, observed);
 
     // Re-connect in strict mode against exactly that pin.
     let mut provisioned = CertificatePinSet::new();
-    for hash in hashes {
-        provisioned.add_pin(RELAY_HOST.to_string(), hash);
-    }
+    provisioned.add_pin(host, hash);
     let strict = pinned_client(Arc::new(Mutex::new(provisioned)), true);
     strict.add_relay(RELAY).await.expect("add relay");
     strict.connect().await;
     assert!(
         reaches_connected(&strict, Duration::from_secs(20)).await,
-        "strict mode rejected the pin it had just learned from the same relay"
+        "strict mode rejected the pin the probe had just learned from the same relay"
     );
 
     strict.disconnect().await;
