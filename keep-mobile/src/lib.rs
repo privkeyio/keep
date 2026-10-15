@@ -1893,22 +1893,40 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.storage
-            .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.storage
+                .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())?;
+        }
+        // A live node holds the pin set it loaded when it was built, and the
+        // relay pool reconnects on a timer, so without this a pin edit would not
+        // reach it: a cleared pin would stay accepted on the next reconnect and a
+        // staged one would not be honored until re-init. Tearing the node down is
+        // also the right answer for a removal specifically, since the existing
+        // socket was authenticated with a pin the user no longer trusts.
+        // Called after the cert-pin guard drops: lock order is
+        // node_lifecycle_lock -> cert_pin_lock, so taking them the other way
+        // round here would deadlock against `do_initialize`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        pins.remove_pin(&hostname);
-        persistence::persist_cert_pins(&self.storage, &pins)
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            pins.remove_pin(&hostname);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+        }
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     /// Stage an additional accepted SPKI pin for `hostname` (RFC 7469 backup pin)
@@ -1923,13 +1941,18 @@ impl KeepMobile {
     ) -> Result<(), KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        pins.add_pin(hostname, hash);
-        persistence::persist_cert_pins(&self.storage, &pins)
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            pins.add_pin(hostname, hash);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+        }
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     /// Remove a single SPKI pin from `hostname`, retiring a rotated-out key while
@@ -1944,18 +1967,23 @@ impl KeepMobile {
     ) -> Result<CertPinRemovalResult, KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        let pin_removed = pins.remove_specific_pin(&hostname, &hash);
-        let host_now_unpinned = !pins.is_pinned(&hostname);
-        persistence::persist_cert_pins(&self.storage, &pins)?;
-        Ok(CertPinRemovalResult {
-            pin_removed,
-            host_now_unpinned,
-        })
+        let result = {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            let pin_removed = pins.remove_specific_pin(&hostname, &hash);
+            let host_now_unpinned = !pins.is_pinned(&hostname);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+            CertPinRemovalResult {
+                pin_removed,
+                host_now_unpinned,
+            }
+        };
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(result)
     }
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
@@ -2522,14 +2550,19 @@ impl KeepMobile {
     }
 
     /// Enable or disable strict certificate pinning (see `get_strict_cert_pinning`).
-    /// Takes effect on the next connection.
+    ///
+    /// A live node captured the old setting when it was built, so it is torn
+    /// down here rather than left running with the previous policy until the
+    /// next re-init.
     pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
         let config = persistence::StoredStrictPinConfig { enabled };
         persistence::persist_strict_pin_config(
             &self.storage,
             STRICT_PIN_CONFIG_STORAGE_KEY,
             &config,
-        )
+        )?;
+        self.invalidate_live_node();
+        Ok(())
     }
 
     pub fn get_bunker_config(&self) -> Result<BunkerConfigInfo, KeepMobileError> {
