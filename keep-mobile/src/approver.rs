@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use keep_approval::approver::{
-    clock_skew, shown, Alert, AnchorTracker, RequestGate, FREEZE_RESEND_SECS, GATEWAY_TEXT_CHARS,
+    clock_skew, shown, Alert, AnchorTracker, Refused, RequestGate, FREEZE_RESEND_SECS,
+    GATEWAY_TEXT_CHARS,
 };
 use keep_approval::binding::check_request;
 use keep_approval::change::{Change, Scope};
@@ -95,9 +96,15 @@ struct Waiting {
     /// The scope an unfreeze request lifts, which its approved outcome
     /// explains.
     unfreeze: Option<Scope>,
-    /// The request while the owner has not decided it; dropped (and wiped)
-    /// once this phone's decision is sent, keeping only what the outcome
-    /// needs.
+    /// The gateway's clock and this phone's differed when it arrived;
+    /// measured then, since later the time waited would count as skew.
+    #[serde(default)]
+    skew: bool,
+    /// This phone's decision was sent.
+    #[serde(default)]
+    decided: bool,
+    /// The request while it can be decided; dropped (and wiped) once it is
+    /// decided or past its time, keeping only what the outcome needs.
     request: Option<Request>,
 }
 
@@ -107,15 +114,27 @@ impl Waiting {
     }
 }
 
-/// Whether `w` is still kept at `local_now`: a little past its time, and
-/// once decided, for as long as its outcome can still arrive.
-fn still_kept(w: &Waiting, local_now: u64) -> bool {
-    let grace = if w.request.is_none() {
-        WINDOW_PAST_SECS
-    } else {
-        OUTCOME_GRACE_SECS
-    };
-    w.until.saturating_add(grace) > local_now
+/// Keep what the outcomes still need at `local_now`: a request past its
+/// time a little longer, without its payload, and a decided one for as long
+/// as its outcome can still arrive. Whether anything changed.
+fn prune(waiting: &mut Vec<Waiting>, local_now: u64) -> bool {
+    let before = waiting.len();
+    waiting.retain(|w| {
+        let grace = if w.decided {
+            WINDOW_PAST_SECS
+        } else {
+            OUTCOME_GRACE_SECS
+        };
+        w.until.saturating_add(grace) > local_now
+    });
+    let mut changed = waiting.len() != before;
+    for w in waiting.iter_mut() {
+        if w.request.is_some() && w.until <= local_now {
+            w.request = None;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// An unfreeze whose digest was handed out and not yet sent.
@@ -851,11 +870,20 @@ impl ApproverHandler {
                         return fx;
                     }
                 };
-                if let Err(e) = stored.gate.admit(&request, &stored.tracker, local_now) {
-                    tracing::debug!(error = %e, "a request not shown");
-                    return fx;
+                match stored.gate.admit(&request, &stored.tracker, local_now) {
+                    Ok(()) => {}
+                    Err(Refused::Full) => {
+                        fx.events.push(ApproverEvent::RequestRefused {
+                            reason: Refused::Full.to_string(),
+                        });
+                        return fx;
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "a request not shown");
+                        return fx;
+                    }
                 }
-                stored.waiting.retain(|w| still_kept(w, local_now));
+                prune(&mut stored.waiting, local_now);
                 if stored
                     .waiting
                     .iter()
@@ -876,16 +904,14 @@ impl ApproverHandler {
                 {
                     stored.alert(alert_text(&alert), &mut fx);
                 }
-                let view = view::view(
-                    &request,
-                    &checked,
-                    clock_skew(request.created_at, local_now),
-                    request.deadline_secs,
-                );
+                let skew = clock_skew(request.created_at, local_now);
+                let view = view::view(&request, &checked, skew, request.deadline_secs);
                 stored.waiting.push(Waiting {
                     id: request.request_id,
                     until: local_now.saturating_add(request.deadline_secs),
                     unfreeze: unfreeze_scope(&request),
+                    skew,
+                    decided: false,
                     request: Some(request),
                 });
                 self.persist_or_log(stored);
@@ -971,9 +997,7 @@ impl ApproverHandler {
         if !stored.paired {
             return fx;
         }
-        let waiting_before = stored.waiting.len();
-        stored.waiting.retain(|w| still_kept(w, local_now));
-        let mut changed = stored.waiting.len() != waiting_before;
+        let mut changed = prune(&mut stored.waiting, local_now);
         for alert in stored.tracker.due_alerts(local_now) {
             stored.alert(alert_text(&alert), &mut fx);
             changed = true;
@@ -1126,12 +1150,7 @@ impl ApproverHandler {
             .filter_map(|w| {
                 let request = w.open(local_now)?;
                 let checked = check_request(request, &stored.channel.0).ok()?;
-                Some(view::view(
-                    request,
-                    &checked,
-                    clock_skew(request.created_at, local_now),
-                    w.until - local_now,
-                ))
+                Some(view::view(request, &checked, w.skew, w.until - local_now))
             })
             .collect()
     }
@@ -1363,16 +1382,11 @@ impl ApproverHandler {
         let mut inner = self.lock();
         if let Some(stored) = inner.stored.as_mut() {
             if let Some(w) = stored.waiting.iter_mut().find(|w| w.id == id) {
+                w.decided = true;
                 w.request = None;
             }
-            if stored
-                .waiting
-                .iter()
-                .filter(|w| w.request.is_none())
-                .count()
-                > MAX_WAITING
-            {
-                if let Some(i) = stored.waiting.iter().position(|w| w.request.is_none()) {
+            if stored.waiting.iter().filter(|w| w.decided).count() > MAX_WAITING {
+                if let Some(i) = stored.waiting.iter().position(|w| w.decided) {
                     stored.waiting.remove(i);
                 }
             }

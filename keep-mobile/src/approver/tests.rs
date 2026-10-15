@@ -329,7 +329,10 @@ fn a_decision_names_a_request_that_is_waiting() {
             .send_decision(id, true, signature.clone())
             .is_err());
     }
-    phone.stored(|s| s.waiting[0].request = None);
+    phone.stored(|s| {
+        s.waiting[0].decided = true;
+        s.waiting[0].request = None;
+    });
     assert!(
         phone
             .handler
@@ -768,7 +771,11 @@ fn a_tick_drops_requests_past_their_time_and_saves_only_changes() {
     // Past its time: no longer decidable, but kept a while for the
     // gateway's `expired` outcome.
     phone.handler.tick_at(now() + 121);
-    assert!(phone.stored(|s| s.waiting.len() == 1 && s.waiting[0].open(now() + 121).is_none()));
+    assert!(phone.stored(|s| s.waiting.len() == 1 && !s.waiting[0].decided));
+    assert!(
+        phone.stored(|s| s.waiting[0].request.is_none()),
+        "its payload goes"
+    );
     phone.handler.tick_at(now() + 120 + OUTCOME_GRACE_SECS + 1);
     assert!(phone.stored(|s| s.waiting.is_empty()));
     assert!(phone
@@ -790,6 +797,8 @@ fn too_many_waiting_requests_are_refused() {
                 id: r.request_id,
                 until: now() + 100,
                 unfreeze: None,
+                skew: false,
+                decided: false,
                 request: Some(r),
             })
         });
@@ -810,7 +819,10 @@ fn too_many_waiting_requests_are_refused() {
         shown_request(&events).is_some(),
         "an expired one does not count"
     );
-    phone.stored(|s| s.waiting[0].request = None);
+    phone.stored(|s| {
+        s.waiting[0].decided = true;
+        s.waiting[0].request = None;
+    });
     let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(201, "x", 10)));
     assert!(
         shown_request(&events).is_some(),
@@ -942,7 +954,10 @@ fn a_decided_unfreeze_explains_the_freeze_it_clears() {
         .unwrap();
         let events = phone.take(kind::REQUEST, &wire::to_text(&request));
         assert!(shown_request(&events).is_some(), "{events:?}");
-        phone.stored(|s| s.waiting[0].request = None);
+        phone.stored(|s| {
+            s.waiting[0].decided = true;
+            s.waiting[0].request = None;
+        });
         if decided_outcome {
             phone.take(
                 kind::OUTCOME,
@@ -1013,7 +1028,9 @@ fn a_decision_is_decided_once_a_relay_takes_it_and_its_payload_goes() {
     assert!(phone.handler.decision_digest(id, true).is_err());
     let phone = phone.reopen();
     assert!(
-        phone.stored(|s| s.waiting.len() == 1 && s.waiting[0].request.is_none()),
+        phone.stored(|s| s.waiting.len() == 1
+            && s.waiting[0].decided
+            && s.waiting[0].request.is_none()),
         "kept for its outcome, without the request"
     );
     let stored = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
@@ -1183,4 +1200,64 @@ fn settling_a_pairing_leaves_another_alone() {
         .settle_pairing(Ok(()), channel, transport, [7; 32])
         .unwrap();
     assert!(phone.handler.lock().begun.is_none());
+}
+
+#[test]
+fn the_skew_warning_is_measured_when_a_request_arrives() {
+    let phone = paired();
+    let request = phone.request(17, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let skewed = |p: &Phone| {
+        p.handler.waiting_requests()[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("clock"))
+    };
+    assert!(!skewed(&phone));
+    // Read back long after it was created: still no skew.
+    phone.stored(|s| {
+        if let Some(r) = s.waiting[0].request.as_mut() {
+            r.created_at -= 1_000;
+        }
+    });
+    assert!(!skewed(&phone));
+    phone.stored(|s| s.waiting[0].skew = true);
+    assert!(skewed(&phone));
+}
+
+#[test]
+fn a_full_request_gate_is_told_to_the_app() {
+    let phone = paired();
+    let mut admitted = 0;
+    let mut n: u32 = 0;
+    phone.stored(|s| {
+        while admitted < keep_approval::approver::MAX_SEEN_REQUESTS {
+            let mut r = phone.request(0, "x", 10);
+            r.request_id.0[..4].copy_from_slice(&n.to_le_bytes());
+            n += 1;
+            if s.gate.admit(&r, &s.tracker, now()).is_ok() {
+                admitted += 1;
+            }
+        }
+    });
+    let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(203, "x", 10)));
+    assert!(shown_request(&events).is_none());
+    assert!(events.iter().any(
+        |e| matches!(e, ApproverEvent::RequestRefused { reason } if reason.contains("open at once"))
+    ));
+}
+
+#[test]
+fn a_decided_request_waits_for_its_outcome_past_its_time() {
+    let phone = paired();
+    let request = phone.request(18, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    phone.stored(|s| {
+        s.waiting[0].decided = true;
+        s.waiting[0].request = None;
+    });
+    phone.handler.tick_at(now() + 120 + OUTCOME_GRACE_SECS + 60);
+    assert!(phone.stored(|s| s.waiting.len() == 1));
+    phone.handler.tick_at(now() + 120 + WINDOW_PAST_SECS + 1);
+    assert!(phone.stored(|s| s.waiting.is_empty()));
 }
