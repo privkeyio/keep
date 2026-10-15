@@ -812,6 +812,8 @@ fn too_many_waiting_requests_are_refused() {
     assert!(phone
         .take(kind::REQUEST, &wire::to_text(&phone.request(200, "x", 10)))
         .is_empty());
+    // Refused, but its time was observed.
+    assert!(phone.stored(|s| s.tracker.latest_gateway_time()) > 0);
     // Nor does one past its time, kept only for its outcome.
     phone.stored(|s| s.waiting[1].until = now() - 1);
     let events = phone.take(kind::REQUEST, &wire::to_text(&phone.request(202, "x", 10)));

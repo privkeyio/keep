@@ -430,7 +430,8 @@ impl RequestGate {
             return Err(Refused::Expired);
         }
         if self.seen.len() >= MAX_SEEN_REQUESTS {
-            let latest = latest.max(request.created_at);
+            // Only by a time the tracker holds, which every replay is then
+            // checked against.
             self.seen.retain(|_, (_, exp)| *exp >= latest);
             if self.seen.len() >= MAX_SEEN_REQUESTS {
                 return Err(Refused::Full);
@@ -1339,15 +1340,17 @@ mod tests {
             Err(Refused::Full)
         );
         assert_eq!(gate.admit(&numbered(0), &t, 0), Err(Refused::Seen));
-        // A request made after they expired lets them go.
+        // A later request alone does not let them go: its time is not yet
+        // the tracker's.
         let mut later = numbered(MAX_SEEN_REQUESTS);
         later.created_at = 900 + 121;
-        assert!(gate.admit(&later, &t, 1).is_ok());
-        assert_eq!(gate.seen.len(), 1);
-        // A replay of one let go is refused as expired once the tracker
-        // holds the later time.
+        assert_eq!(gate.admit(&later, &t, 1), Err(Refused::Full));
+        // Once the tracker holds a time past their expiry, they go, and a
+        // replay of one is refused as expired.
         let mut t = t;
         t.observe(later.created_at, &anchor_after(None, 1, 1, &[]), None, 1);
+        assert!(gate.admit(&later, &t, 1).is_ok());
+        assert_eq!(gate.seen.len(), 1);
         assert_eq!(gate.admit(&numbered(0), &t, 1), Err(Refused::Expired));
     }
 }

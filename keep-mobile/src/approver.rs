@@ -883,6 +883,15 @@ impl ApproverHandler {
                         return fx;
                     }
                 }
+                // Observed once admitted, shown or not, so the tracker's time,
+                // which the gate lets ids go by, keeps up with every request.
+                for alert in
+                    stored
+                        .tracker
+                        .observe(request.created_at, &request.anchor, None, local_now)
+                {
+                    stored.alert(alert_text(&alert), &mut fx);
+                }
                 prune(&mut stored.waiting, local_now);
                 if stored
                     .waiting
@@ -896,13 +905,6 @@ impl ApproverHandler {
                         reason: "too many requests are waiting: decide some first".into(),
                     });
                     return fx;
-                }
-                for alert in
-                    stored
-                        .tracker
-                        .observe(request.created_at, &request.anchor, None, local_now)
-                {
-                    stored.alert(alert_text(&alert), &mut fx);
                 }
                 let skew = clock_skew(request.created_at, local_now);
                 let view = view::view(&request, &checked, skew, request.deadline_secs);
