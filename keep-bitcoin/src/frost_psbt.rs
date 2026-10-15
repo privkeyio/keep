@@ -171,8 +171,11 @@ impl FrostWallet {
         spent: &ScriptBuf,
         change_only: bool,
     ) -> Result<Option<Vec<u32>>> {
-        // Each origin naming the group costs a derivation and a tweak below; a
-        // key-path output has one key.
+        if !spent.is_p2tr() {
+            return Ok(None);
+        }
+        // Each origin naming the group costs a tweak below, and the one whose
+        // key is the output's a derivation; a key-path output has one key.
         let named = origins
             .values()
             .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
@@ -182,7 +185,7 @@ impl FrostWallet {
                 "an input or output names this group's keys {named} times; at most {MAX_WALLET_ORIGINS} are read"
             )));
         }
-        for (leaves, (fp, path)) in origins.values() {
+        for (key, (leaves, (fp, path))) in origins {
             if !leaves.is_empty() || *fp != self.fingerprint {
                 continue;
             }
@@ -192,7 +195,12 @@ impl FrostWallet {
             if change_only && !matches!(group_path.as_slice(), [1, i] if *i < CHANGE_INDEX_LIMIT) {
                 continue;
             }
-            if self.bip86_script(&group_path)? == *spent {
+            // A forged origin is dropped after one tweak; only the origin
+            // whose key makes the output is derived, to prove the path.
+            let named_output = TaprootTweak::default()
+                .script_pubkey(&key.serialize())
+                .map_err(keep_error)?;
+            if named_output == *spent && self.bip86_script(&group_path)? == *spent {
                 return Ok(Some(group_path));
             }
         }
@@ -889,5 +897,36 @@ mod tests {
         assert!(wallet
             .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, "86'/1'/0'/0/3"))
             .is_ok());
+        // Inputs count too, on any wallet path.
+        let (_, spk) = child(&group, &[0, 3]);
+        let inputs = |n: usize| {
+            let mut p = psbt(vec![(spk.clone(), None); n], None);
+            let all = forged(&group, 4 * n as u32, "86'/1'/0'/0/9");
+            for (input, chunk) in p.inputs.iter_mut().zip(all.chunks(4)) {
+                input.tap_key_origins = chunk.iter().cloned().collect();
+            }
+            p
+        };
+        assert!(wallet.analyze(&inputs(MAX_PSBT_WALLET_ORIGINS / 4)).is_ok());
+        assert!(wallet
+            .analyze(&inputs(MAX_PSBT_WALLET_ORIGINS / 4 + 1))
+            .is_err());
+    }
+
+    #[test]
+    fn origins_are_not_read_for_an_output_that_is_not_taproot() {
+        let (_, group) = new_group();
+        let wallet = bip86(&group);
+        let (k0, _) = child(&group, &[0, 3]);
+        let p2wpkh = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([7; 20]));
+        let mut p = psbt(
+            vec![(p2wpkh, Some(origin(&group, k0, "86'/1'/0'/0/3")))],
+            None,
+        );
+        for (k, o) in forged(&group, MAX_WALLET_ORIGINS as u32, "86'/1'/0'/0/9") {
+            p.inputs[0].tap_key_origins.insert(k, o);
+        }
+        let (_, spends) = wallet.analyze(&p).unwrap();
+        assert!(spends.is_empty());
     }
 }
