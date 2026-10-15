@@ -27,7 +27,10 @@ type TapKeyOrigins =
 use crate::address::coin_type;
 use crate::descriptor::{descriptor_address_at_index, DescriptorExport};
 use crate::error::{BitcoinError, Result};
-use crate::psbt::{requested_sighash_type, OutputInfo, PsbtAnalysis, CHANGE_INDEX_LIMIT};
+use crate::psbt::{
+    requested_sighash_type, OutputInfo, PsbtAnalysis, CHANGE_INDEX_LIMIT, MAX_PSBT_WALLET_ORIGINS,
+    MAX_WALLET_ORIGINS,
+};
 
 /// One input the group signs: the path below the group key, the BIP-341 tweak,
 /// the scriptPubKey it spends and the sighash type the PSBT asks for.
@@ -168,6 +171,17 @@ impl FrostWallet {
         spent: &ScriptBuf,
         change_only: bool,
     ) -> Result<Option<Vec<u32>>> {
+        // Each origin naming the group costs a derivation and a tweak below; a
+        // key-path output has one key.
+        let named = origins
+            .values()
+            .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
+            .count();
+        if named > MAX_WALLET_ORIGINS {
+            return Err(BitcoinError::InvalidPsbt(format!(
+                "an input or output names this group's keys {named} times; at most {MAX_WALLET_ORIGINS} are read"
+            )));
+        }
         for (leaves, (fp, path)) in origins.values() {
             if !leaves.is_empty() || *fp != self.fingerprint {
                 continue;
@@ -219,10 +233,41 @@ impl FrostWallet {
                     .is_ok_and(|path| path.is_some()))
     }
 
+    /// Refuse a PSBT whose origins naming the group on a path that would be
+    /// derived (a wallet path on an input, a change path on an output), over
+    /// all its inputs and outputs, are more than [`MAX_PSBT_WALLET_ORIGINS`].
+    fn check_group_origins(&self, psbt: &Psbt) -> Result<()> {
+        let named = |origins: &TapKeyOrigins, change: bool| {
+            origins
+                .values()
+                .filter(|(leaves, (fp, path))| {
+                    leaves.is_empty()
+                        && *fp == self.fingerprint
+                        && self.group_path(path).is_some_and(|p| {
+                            !change || matches!(p.as_slice(), [1, i] if *i < CHANGE_INDEX_LIMIT)
+                        })
+                })
+                .count()
+        };
+        let named = psbt
+            .inputs
+            .iter()
+            .map(|i| named(&i.tap_key_origins, false))
+            .chain(psbt.outputs.iter().map(|o| named(&o.tap_key_origins, true)))
+            .sum::<usize>();
+        if named > MAX_PSBT_WALLET_ORIGINS {
+            return Err(BitcoinError::InvalidPsbt(format!(
+                "the PSBT names this group's keys {named} times; at most {MAX_PSBT_WALLET_ORIGINS} are read"
+            )));
+        }
+        Ok(())
+    }
+
     /// What the PSBT spends and pays, and the inputs the group signs. Every
     /// input needs its UTXO (BIP-341 sighashes commit to all of them), and the
     /// group's inputs may only ask for SIGHASH_DEFAULT or ALL.
     pub fn analyze(&self, psbt: &Psbt) -> Result<(PsbtAnalysis, Vec<KeyPathSpend>)> {
+        self.check_group_origins(psbt)?;
         let mut input_sats = Vec::with_capacity(psbt.inputs.len());
         let mut total_input_sats = 0u64;
         let mut spends = Vec::new();
@@ -760,5 +805,89 @@ mod tests {
             !wallet.analyze(&to_bip86_change).unwrap().0.outputs[1].is_change,
             "the BIP-86 chain is change only when it is the latest version"
         );
+    }
+    /// `n` distinct keys, each named by an origin of the group at `path`.
+    fn forged(group: &[u8; 32], n: u32, path: &str) -> Vec<Origin> {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        (1..=n)
+            .map(|i| {
+                let mut sk = [1u8; 32];
+                sk[28..].copy_from_slice(&i.to_be_bytes());
+                let key = bitcoin::secp256k1::SecretKey::from_slice(&sk)
+                    .unwrap()
+                    .x_only_public_key(&secp)
+                    .0;
+                origin(group, key.serialize(), path)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn origins_naming_the_group_are_bounded_per_input_and_output() {
+        let (_, group) = new_group();
+        let wallet = bip86(&group);
+        let (k0, s0) = child(&group, &[0, 3]);
+        let (kc, sc) = child(&group, &[1, 8]);
+        let padded = |extra: u32| {
+            let mut p = psbt(
+                vec![(s0.clone(), Some(origin(&group, k0, "86'/1'/0'/0/3")))],
+                Some((sc.clone(), origin(&group, kc, "86'/1'/0'/1/8"))),
+            );
+            for (k, o) in forged(&group, extra, "86'/1'/0'/0/9") {
+                p.inputs[0].tap_key_origins.insert(k, o.clone());
+            }
+            for (k, o) in forged(&group, extra, "86'/1'/0'/1/9") {
+                p.outputs[1].tap_key_origins.insert(k, o);
+            }
+            p
+        };
+        let (analysis, spends) = wallet
+            .analyze(&padded(MAX_WALLET_ORIGINS as u32 - 1))
+            .unwrap();
+        assert_eq!(spends.len(), 1);
+        assert!(analysis.outputs[1].is_change);
+        // Past the limit an input is refused, and an output is not read as
+        // change, so it counts as leaving the wallet.
+        assert!(wallet.analyze(&padded(MAX_WALLET_ORIGINS as u32)).is_err());
+        let mut p = padded(MAX_WALLET_ORIGINS as u32);
+        p.inputs[0].tap_key_origins = [origin(&group, k0, "86'/1'/0'/0/3")].into();
+        let (analysis, _) = wallet.analyze(&p).unwrap();
+        assert!(!analysis.outputs[1].is_change);
+        // Origins of other groups cost nothing and are not counted.
+        let (_, other) = new_group();
+        let mut p = padded(0);
+        for (k, o) in forged(&other, 32, "86'/1'/0'/0/9") {
+            p.inputs[0].tap_key_origins.insert(k, o);
+        }
+        assert_eq!(wallet.analyze(&p).unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn origins_naming_the_group_are_bounded_across_the_whole_psbt() {
+        let (_, group) = new_group();
+        let wallet = bip86(&group);
+        // Outputs each under their own limit, together over the PSBT's.
+        let spread = |outputs: usize, path: &str| {
+            let mut p = psbt(vec![(foreign(), None)], None);
+            let mut template = p.unsigned_tx.output[0].clone();
+            template.value = Amount::from_sat(10);
+            p.unsigned_tx.output = vec![template; outputs];
+            p.outputs = vec![Default::default(); outputs];
+            let all = forged(&group, 4 * outputs as u32, path);
+            for (output, chunk) in p.outputs.iter_mut().zip(all.chunks(4)) {
+                output.tap_key_origins = chunk.iter().cloned().collect();
+            }
+            p
+        };
+        assert!(wallet
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4, "86'/1'/0'/1/3"))
+            .is_ok());
+        assert!(wallet
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, "86'/1'/0'/1/3"))
+            .is_err());
+        // Outputs naming a receive path are never derived, so not counted.
+        assert!(wallet
+            .analyze(&spread(MAX_PSBT_WALLET_ORIGINS / 4 + 1, "86'/1'/0'/0/3"))
+            .is_ok());
     }
 }
