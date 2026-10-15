@@ -156,6 +156,18 @@ pub fn sign_p256(key: &ApproverSigningKey, digest: &[u8; 32]) -> Hex64 {
     Hex64(out)
 }
 
+/// A P-256 signature over a digest as Android's Keystore returns it from
+/// `SHA256withECDSA` (ASN.1 DER, `s` as it came), in the form a message
+/// carries: `r || s` with a low `s`. The Keystore never normalizes `s`, and
+/// [`verify_p256`] refuses a high one.
+pub fn p256_from_der(der: &[u8]) -> Result<Hex64> {
+    let sig = p256::ecdsa::Signature::from_der(der).map_err(|_| invalid("not a DER signature"))?;
+    let sig = sig.normalize_s().unwrap_or(sig);
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&sig.to_bytes());
+    Ok(Hex64(out))
+}
+
 /// P-256 verify `sig` over `digest` under the compressed approver key
 /// `approver`, refusing a high `s`.
 pub fn verify_p256(approver: &[u8; 33], digest: &[u8; 32], sig: &Hex64) -> Result<()> {
@@ -433,6 +445,23 @@ pub fn pair(
 pub(crate) mod tests {
     use super::*;
     use crate::Hex16;
+
+    #[test]
+    fn a_keystore_der_signature_verifies_once_its_s_is_made_low() {
+        use p256::ecdsa::signature::Signer;
+        let key = approver_signing_key(7);
+        let digest = [9u8; 32];
+        let sig: p256::ecdsa::Signature = key.sign(&digest);
+        let (r, s) = sig.split_scalars();
+        // Both s and n - s, as a Keystore may return either.
+        for s in [*s, -*s] {
+            let sig = p256::ecdsa::Signature::from_scalars(r.to_bytes(), s.to_bytes()).unwrap();
+            let raw = p256_from_der(sig.to_der().as_bytes()).unwrap();
+            verify_p256(&approver_key(&key), &digest, &raw).unwrap();
+        }
+        assert!(p256_from_der(&[0x30, 0x00]).is_err());
+        assert!(p256_from_der(&sig.to_bytes()).is_err(), "raw is not DER");
+    }
 
     pub fn approver_signing_key(byte: u8) -> ApproverSigningKey {
         ApproverSigningKey::from_slice(&[byte; 32]).expect("a valid P-256 scalar")

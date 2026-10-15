@@ -19,6 +19,7 @@
 //! All of it is plain data the approver persists between runs.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use unicode_normalization::char::{canonical_combining_class, is_combining_mark};
 
 use serde::{Deserialize, Serialize};
@@ -31,7 +32,7 @@ use crate::wrap::{WINDOW_FUTURE_SECS, WINDOW_PAST_SECS};
 /// carrying it can still be accepted, one dated up to the future limit
 /// included.
 const REPLAY_KEEP_SECS: u64 = WINDOW_PAST_SECS + WINDOW_FUTURE_SECS;
-use crate::{invalid, Hex32, Result};
+use crate::Hex32;
 
 /// How long without a newer anchor before the approver alerts. Anchors come
 /// every 15 minutes.
@@ -341,6 +342,11 @@ impl AnchorTracker {
             .is_some_and(|at| local_now.saturating_sub(at) >= SILENCE_SECS)
     }
 
+    /// The anchor kept, with the gateway time it was taken at.
+    pub fn kept(&self) -> Option<(u64, &AnchorState)> {
+        self.kept.as_ref().map(|k| (k.at, &k.anchor))
+    }
+
     /// The latest gateway time from any anchor or request accepted.
     pub fn latest_gateway_time(&self) -> u64 {
         self.latest_gateway_time
@@ -363,13 +369,38 @@ pub fn clock_skew(at: u64, local_now: u64) -> bool {
     at.abs_diff(local_now) > SKEW_WARNING_SECS
 }
 
+/// The most request ids a [`RequestGate`] keeps, so a gateway flooding
+/// requests cannot grow an approver's stored state without bound.
+pub const MAX_SEEN_REQUESTS: usize = 4_096;
+
+/// Why [`RequestGate::admit`] turned a request away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// Seen before: a replay.
+    Seen,
+    /// The gateway has already expired it.
+    Expired,
+    /// [`MAX_SEEN_REQUESTS`] requests are all still open at once.
+    Full,
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Refused::Seen => "request already seen",
+            Refused::Expired => "the gateway has already expired this request",
+            Refused::Full => "too many requests are open at once",
+        })
+    }
+}
+
 /// The requests an approver has seen, so it shows each once and never one
 /// the gateway has already expired.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestGate {
-    /// Request ids, with the approver's clock when each arrived; kept for
-    /// the wrap time window.
-    seen: BTreeMap<Hex32, u64>,
+    /// Request ids, with the approver's clock when each arrived and the
+    /// gateway time it expires; kept for the wrap time window.
+    seen: BTreeMap<Hex32, (u64, u64)>,
 }
 
 impl RequestGate {
@@ -377,22 +408,36 @@ impl RequestGate {
     /// when `created_at + deadline_secs` is earlier than the latest gateway
     /// time `tracker` holds. An admitted request's anchor is then observed
     /// with the tracker by the caller.
+    ///
+    /// When [`MAX_SEEN_REQUESTS`] ids are kept, those whose requests have
+    /// expired by the gateway's time are let go: a replay of one is refused
+    /// as expired whether or not its id is kept. Only requests all still
+    /// open at once fill the gate, and that passes with their deadlines.
     pub fn admit(
         &mut self,
         request: &Request,
         tracker: &AnchorTracker,
         local_now: u64,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), Refused> {
         self.seen
-            .retain(|_, at| local_now.saturating_sub(*at) <= REPLAY_KEEP_SECS);
+            .retain(|_, (at, _)| local_now.saturating_sub(*at) <= REPLAY_KEEP_SECS);
         if self.seen.contains_key(&request.request_id) {
-            return Err(invalid("request already seen"));
+            return Err(Refused::Seen);
         }
         let expires = request.created_at.saturating_add(request.deadline_secs);
-        if expires < tracker.latest_gateway_time() {
-            return Err(invalid("the gateway has already expired this request"));
+        let latest = tracker.latest_gateway_time();
+        if expires < latest {
+            return Err(Refused::Expired);
         }
-        self.seen.insert(request.request_id, local_now);
+        if self.seen.len() >= MAX_SEEN_REQUESTS {
+            // Only by a time the tracker holds, which every replay is then
+            // checked against.
+            self.seen.retain(|_, (_, exp)| *exp >= latest);
+            if self.seen.len() >= MAX_SEEN_REQUESTS {
+                return Err(Refused::Full);
+            }
+        }
+        self.seen.insert(request.request_id, (local_now, expires));
         Ok(())
     }
 }
@@ -1275,5 +1320,37 @@ mod tests {
         assert!(gate
             .admit(&request(1, 2_000, 120), &t, REPLAY_KEEP_SECS + 1)
             .is_ok());
+    }
+
+    #[test]
+    fn the_gate_keeps_a_bounded_number_of_ids() {
+        let mut gate = RequestGate::default();
+        let t = AnchorTracker::default();
+        let numbered = |n: usize| {
+            let mut r = request(0, 900, 120);
+            r.request_id.0[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            r
+        };
+        for n in 0..MAX_SEEN_REQUESTS {
+            assert!(gate.admit(&numbered(n), &t, 0).is_ok());
+        }
+        // All still open: full.
+        assert_eq!(
+            gate.admit(&numbered(MAX_SEEN_REQUESTS), &t, 0),
+            Err(Refused::Full)
+        );
+        assert_eq!(gate.admit(&numbered(0), &t, 0), Err(Refused::Seen));
+        // A later request alone does not let them go: its time is not yet
+        // the tracker's.
+        let mut later = numbered(MAX_SEEN_REQUESTS);
+        later.created_at = 900 + 121;
+        assert_eq!(gate.admit(&later, &t, 1), Err(Refused::Full));
+        // Once the tracker holds a time past their expiry, they go, and a
+        // replay of one is refused as expired.
+        let mut t = t;
+        t.observe(later.created_at, &anchor_after(None, 1, 1, &[]), None, 1);
+        assert!(gate.admit(&later, &t, 1).is_ok());
+        assert_eq!(gate.seen.len(), 1);
+        assert_eq!(gate.admit(&numbered(0), &t, 1), Err(Refused::Expired));
     }
 }

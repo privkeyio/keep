@@ -7,13 +7,14 @@ description = "UniFFI bindings for Keep mobile platforms"
 license = "MIT"
 
 [lib]
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 keep-core = { path = "../keep-core" }
 keep-bitcoin = { path = "../keep-bitcoin" }
 keep-frost-net = { path = "../keep-frost-net", default-features = false }
 keep-nip46 = { path = "../keep-nip46" }
+keep-approval = { path = "../keep-approval" }
 bitcoin = { version = "0.32", features = ["serde", "base64"] }
 frost-secp256k1-tr = { version = "3.0", default-features = false }
 uniffi = { version = "0.32" }
@@ -36,6 +37,10 @@ nostr-sdk = { version = "0.44", default-features = false }
 
 [target.'cfg(target_os = "android")'.dependencies]
 tracing-android = "0.2"
+
+[dev-dependencies]
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
+nostr-relay-builder = "0.44"
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }
