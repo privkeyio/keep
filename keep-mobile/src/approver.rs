@@ -81,7 +81,9 @@ const UNFREEZE_HOLD_SECS: u64 = 60;
 /// storage that only reports a write done once it is durable prevents. It is
 /// spent only when a freeze or unfreeze is signed, never by loading alone,
 /// so app restarts do not use up the gateway's step limit
-/// ([`sig::MAX_COUNTER_STEP`]).
+/// ([`sig::MAX_COUNTER_STEP`]). An unfreeze whose digest was handed out
+/// before the load keeps the counter it was signed for; if a rollback brought
+/// it back, the gateway refuses it as old and the scope stays frozen.
 const COUNTER_MARGIN: u64 = 1 << 10;
 const _: () = assert!(COUNTER_MARGIN < sig::MAX_COUNTER_STEP);
 
@@ -213,7 +215,7 @@ impl Stored {
 
     /// Move to the next freeze counter, past the floor set at load.
     fn next_counter(&mut self) {
-        self.counter = self.counter.max(self.counter_floor) + 1;
+        self.counter = self.counter.max(self.counter_floor).saturating_add(1);
     }
 
     fn fingerprint(&self) -> Result<String, KeepMobileError> {

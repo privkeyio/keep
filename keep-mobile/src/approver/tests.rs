@@ -883,6 +883,12 @@ fn an_unfreeze_is_signed_for_what_was_asked() {
     // The asked unfreeze survives a restart; a freeze after it counts on.
     let phone = phone.reopen();
     assert!(phone.stored(|s| s.unfreeze.is_some()));
+    // Still sendable: loading did not move the counter it was signed for.
+    let err = phone
+        .handler
+        .send_unfreeze(Some(credential.clone()), phone.sign(&digest, false))
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
     // A freeze signed meanwhile voids it: its counter is now old.
     assert!(phone.handler.freeze(Some(credential.clone())).is_err());
     assert_eq!(phone.stored(|s| s.counter), 1 + COUNTER_MARGIN + 1);
@@ -1274,8 +1280,12 @@ fn the_first_counter_after_a_load_skips_past_a_rollback() {
     let phone = paired();
     assert!(phone.handler.freeze(None).is_err());
     assert_eq!(saved(&phone), 1);
-    // Loading alone spends nothing, however often.
+    // Loading alone spends nothing, however often, even when the state is
+    // saved again without signing anything.
     let phone = phone.reopen().reopen().reopen();
+    assert_eq!(saved(&phone), 1);
+    phone.handler.acknowledge_alerts(0).unwrap();
+    let phone = phone.reopen();
     assert_eq!(saved(&phone), 1);
     assert!(phone.handler.freeze(None).is_err());
     assert_eq!(saved(&phone), 1 + COUNTER_MARGIN + 1);
@@ -1298,4 +1308,17 @@ fn the_first_counter_after_a_load_skips_past_a_rollback() {
     let asked = phone.stored(|s| s.unfreeze.unwrap().counter);
     assert_eq!(asked, sent + COUNTER_MARGIN + 1);
     assert!(asked > last);
+    // At the boundary: a rollback of exactly the margin is still covered.
+    let base = phone.stored(|s| s.counter);
+    for _ in 0..COUNTER_MARGIN {
+        assert!(phone.handler.freeze(None).is_err());
+    }
+    let last = base + COUNTER_MARGIN;
+    phone.stored(|s| {
+        s.counter = base;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    assert!(phone.handler.freeze(None).is_err());
+    assert!(saved(&phone) > last);
 }
