@@ -212,9 +212,14 @@ pub enum StorageRead {
 /// must therefore treat `false` as "I do not know what is stored" and repair it
 /// by re-asserting the stricter of the old and new selections (or `Manual`),
 /// rather than assuming the change simply did not happen.
+///
+/// `load` must tell a key that is not there ([`StorageRead::Absent`]) from one
+/// that could not be read or decrypted ([`StorageRead::Unavailable`]). An
+/// unreadable override reported as absent would fall back to the global
+/// selection, which can be looser than the override the owner set.
 #[uniffi::export(with_foreign)]
 pub trait SignPolicySelectionStorage: Send + Sync {
-    fn load(&self, key: String) -> Option<String>;
+    fn load(&self, key: String) -> StorageRead;
     /// Persist `value` under `key`. Returns whether it durably persisted.
     fn save(&self, key: String, value: String) -> bool;
     /// Delete `key`. Returns whether the deletion reached the durable store.
@@ -243,6 +248,23 @@ pub struct SignPolicyStore {
     storage: Arc<dyn SignPolicySelectionStorage>,
 }
 
+impl SignPolicyStore {
+    /// What `key` holds: `None` when absent, `Some(None)` when it is there but
+    /// cannot be read or parsed, `Some(Some(selection))` otherwise.
+    fn selection(&self, key: String) -> Option<Option<SignPolicySelection>> {
+        match self.storage.load(key) {
+            StorageRead::Absent => None,
+            StorageRead::Unavailable => Some(None),
+            StorageRead::Found { value } => Some(
+                value
+                    .parse::<u8>()
+                    .ok()
+                    .map(SignPolicySelection::from_ordinal),
+            ),
+        }
+    }
+}
+
 #[uniffi::export]
 impl SignPolicyStore {
     #[uniffi::constructor]
@@ -250,13 +272,11 @@ impl SignPolicyStore {
         Self { storage }
     }
 
-    /// The global sign-policy selection, defaulting to `Manual` when unset or
-    /// unparseable (fail safe).
+    /// The global sign-policy selection, defaulting to `Manual` when unset,
+    /// unreadable or unparseable (fail safe).
     pub fn global_policy(&self) -> SignPolicySelection {
-        self.storage
-            .load(GLOBAL_SIGN_POLICY_KEY.to_string())
-            .and_then(|s| s.parse::<u8>().ok())
-            .map(SignPolicySelection::from_ordinal)
+        self.selection(GLOBAL_SIGN_POLICY_KEY.to_string())
+            .flatten()
             .unwrap_or(SignPolicySelection::Manual)
     }
 
@@ -274,11 +294,12 @@ impl SignPolicyStore {
     }
 
     /// The per-app override, or `None` if the app follows the global policy.
+    /// An override that is stored but cannot be read or parsed is `Manual`:
+    /// it may be stricter than the global policy, so it is never taken as
+    /// absent.
     pub fn app_override(&self, package: String) -> Option<SignPolicySelection> {
-        self.storage
-            .load(app_override_key(&package))
-            .and_then(|s| s.parse::<u8>().ok())
-            .map(SignPolicySelection::from_ordinal)
+        self.selection(app_override_key(&package))
+            .map(|s| s.unwrap_or(SignPolicySelection::Manual))
     }
 
     /// Set (`Some`) or clear (`None`) the per-app override. Returns whether the
@@ -299,7 +320,8 @@ impl SignPolicyStore {
         }
     }
 
-    /// Resolve the effective selection for a package: per-app override, else the
+    /// Resolve the effective selection for a package: per-app override (`Manual`
+    /// when stored but unreadable), else the
     /// global policy, else `Manual`. Mirrors keep-android's precedence.
     pub fn effective_policy(&self, package: String) -> SignPolicySelection {
         self.app_override(package)
@@ -1592,6 +1614,9 @@ mod tests {
         }
     }
 
+    /// A stored value [`MockPolicyStorage`] reports as unreadable.
+    const UNREADABLE: &str = "\u{0}unreadable";
+
     struct MockPolicyStorage {
         map: Mutex<HashMap<String, String>>,
     }
@@ -1603,8 +1628,14 @@ mod tests {
         }
     }
     impl SignPolicySelectionStorage for MockPolicyStorage {
-        fn load(&self, key: String) -> Option<String> {
-            self.map.lock().unwrap().get(&key).cloned()
+        fn load(&self, key: String) -> StorageRead {
+            match self.map.lock().unwrap().get(&key) {
+                Some(value) if value == UNREADABLE => StorageRead::Unavailable,
+                Some(value) => StorageRead::Found {
+                    value: value.clone(),
+                },
+                None => StorageRead::Absent,
+            }
         }
         fn save(&self, key: String, value: String) -> bool {
             self.map.lock().unwrap().insert(key, value);
@@ -1621,8 +1652,8 @@ mod tests {
     /// the failure instead of it being invisible.
     struct FailingPolicyStorage;
     impl SignPolicySelectionStorage for FailingPolicyStorage {
-        fn load(&self, _key: String) -> Option<String> {
-            None
+        fn load(&self, _key: String) -> StorageRead {
+            StorageRead::Unavailable
         }
         fn save(&self, _key: String, _value: String) -> bool {
             false
@@ -1691,6 +1722,46 @@ mod tests {
         assert_eq!(
             SignPolicyStore::new(storage).global_policy(),
             SignPolicySelection::Basic
+        );
+    }
+
+    #[test]
+    fn an_override_that_cannot_be_read_is_manual_never_the_global() {
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        store.set_global_policy(SignPolicySelection::Auto);
+        assert_eq!(
+            store.effective_policy("com.app".into()),
+            SignPolicySelection::Auto,
+            "absent: the global"
+        );
+        for stored in [UNREADABLE, "", "auto", "300", "-1"] {
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .insert(app_override_key("com.app"), stored.into());
+            assert_eq!(
+                store.app_override("com.app".into()),
+                Some(SignPolicySelection::Manual),
+                "{stored:?}"
+            );
+            assert_eq!(
+                store.effective_policy("com.app".into()),
+                SignPolicySelection::Manual,
+                "{stored:?}"
+            );
+        }
+        // An unreadable global is Manual too.
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .insert(GLOBAL_SIGN_POLICY_KEY.into(), UNREADABLE.into());
+        assert_eq!(store.global_policy(), SignPolicySelection::Manual);
+        assert_eq!(
+            store.effective_policy("com.other".into()),
+            SignPolicySelection::Manual
         );
     }
 
