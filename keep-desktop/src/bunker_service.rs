@@ -470,6 +470,7 @@ impl App {
                     &cert_pins,
                     &keep_path,
                     require_pinned,
+                    proxy,
                 )
                 .await?;
 

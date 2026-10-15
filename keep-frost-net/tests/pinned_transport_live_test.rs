@@ -119,7 +119,7 @@ async fn a_pin_learned_by_the_probe_is_enforced_on_the_live_socket() {
 
     // Learn the pin the way the shipped callers do: on the pre-flight probe.
     let empty = CertificatePinSet::new();
-    let (observed, learned) = verify_relay_certificate(RELAY, &empty, false)
+    let (observed, learned) = verify_relay_certificate(RELAY, &empty, false, None)
         .await
         .expect("probe should trust the relay on first use");
     let (host, hash) = learned.expect("probe should surface a pin to record");

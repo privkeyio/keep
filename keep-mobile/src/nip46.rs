@@ -575,7 +575,7 @@ impl BunkerHandler {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let result = self.mobile.runtime.block_on(async {
-            let verified_relays = self.mobile.verify_and_pin_relays(&relays).await?;
+            let verified_relays = self.mobile.verify_and_pin_relays(&relays, proxy).await?;
 
             let node_guard = self.mobile.node.read().await;
             let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;

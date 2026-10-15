@@ -224,7 +224,7 @@ async fn a_bunker_enforces_a_probe_learned_pin_on_its_live_socket() {
     install_default_crypto_provider();
 
     let empty = CertificatePinSet::new();
-    let (_observed, learned) = verify_relay_certificate(LIVE_RELAY, &empty, false)
+    let (_observed, learned) = verify_relay_certificate(LIVE_RELAY, &empty, false, None)
         .await
         .expect("probe should trust the relay on first use");
     let (host, hash) = learned.expect("probe should surface a pin to record");

@@ -728,10 +728,11 @@ impl ClientTransport {
         let client = crate::pinned_transport::build_client(keys, proxy, pinning)
             .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
 
+        let relay_opts = crate::pinned_transport::with_proxy(default_relay_opts(), proxy);
         for relay in relays {
             client
                 .pool()
-                .add_relay(relay, default_relay_opts())
+                .add_relay(relay, relay_opts.clone())
                 .await
                 .map_err(|e| {
                     KeepError::NetworkErr(NetworkError::relay(format!("add relay {relay}: {e}")))
@@ -1447,6 +1448,32 @@ pub async fn run_software_dkg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Same shape as the node transport's proxy test: a relay reachable
+    /// directly must stay unreachable once a proxy is configured, or the
+    /// ceremony sockets are dropping the proxy and going direct.
+    #[tokio::test]
+    async fn a_configured_proxy_reaches_the_dkg_relay_sockets() {
+        use nostr_relay_builder::MockRelay;
+
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let relays = vec![url.to_string()];
+        let keys = Keys::generate();
+
+        let direct = ClientTransport::connect_hardened_pinned(&keys, &relays, None, None)
+            .await
+            .expect("the mock relay must be reachable without a proxy, or the negative below proves nothing");
+        direct.disconnect().await;
+
+        let proxy: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            ClientTransport::connect_hardened_pinned(&keys, &relays, Some(proxy), None)
+                .await
+                .is_err(),
+            "connected through a dead proxy, so the ceremony socket ignored it"
+        );
+    }
 
     fn make_pubkey(seed: u8) -> (String, PublicKey) {
         let secp = nostr_sdk::secp256k1::Secp256k1::new();

@@ -1576,22 +1576,23 @@ impl KeepMobile {
         // a storage fault while reading pins must not strand a half-started
         // ceremony, and a concurrent FFI pin edit must not land between the two
         // reads.
-        let (relays, pinning) = {
-            let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
-            let relays = self
-                .runtime
-                .block_on(self.verify_and_pin_relays(&config.relays))?;
-            (relays, self.live_pinning()?)
-        };
-
         // Route through the configured loopback SOCKS proxy when enabled (§7),
-        // mirroring the signing path's proxy.
+        // mirroring the signing path's proxy. Resolved before the probe below,
+        // which dials through the same proxy.
         let stored_proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
             .unwrap_or_default();
         let proxy = if stored_proxy.enabled {
             Some(parse_loopback_proxy("127.0.0.1", stored_proxy.port)?)
         } else {
             None
+        };
+
+        let (relays, pinning) = {
+            let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
+            let relays = self
+                .runtime
+                .block_on(self.verify_and_pin_relays(&config.relays, proxy))?;
+            (relays, self.live_pinning()?)
         };
 
         // Preflight has passed and the ceremony is about to start, so consume the
@@ -3382,9 +3383,13 @@ impl KeepMobile {
     /// The caller must hold `cert_pin_lock` across this call so the read-modify-
     /// write of the persisted pin set cannot lose an update to a concurrent
     /// stage/remove/clear FFI call.
+    /// `proxy` MUST be the address the live sockets get: the probe is its own
+    /// TCP connection, so one that dials direct reveals the host address on
+    /// every connect even when the data socket is proxied.
     async fn verify_and_pin_relays(
         &self,
         relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
     ) -> Result<Vec<String>, KeepMobileError> {
         // Opt-in strict pinning: when enabled, an un-pinned relay is not
         // trusted-on-first-use; it is skipped (see the per-relay handling
@@ -3407,7 +3412,9 @@ impl KeepMobile {
                 );
                 continue;
             }
-            match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned).await {
+            match keep_frost_net::verify_relay_certificate(relay, &pins, require_pinned, proxy)
+                .await
+            {
                 Ok((_hash, new_pin)) => {
                     if let Some((hostname, hash)) = new_pin {
                         if !pins.is_pinned(&hostname) {
@@ -3489,7 +3496,7 @@ impl KeepMobile {
         let share = self.load_share_package()?;
 
         self.runtime.block_on(async {
-            let verified_relays = self.verify_and_pin_relays(&relays).await?;
+            let verified_relays = self.verify_and_pin_relays(&relays, proxy).await?;
 
             // Enforce the SPKI pin on the sockets that carry share and signing
             // traffic, not just on the pre-flight probe above.
