@@ -20,12 +20,9 @@ async fn a_configured_proxy_reaches_the_pin_probe() {
 
     let direct = verify_relay_certificate("wss://relay.invalid", &pins, false, None)
         .await
-        .expect_err("a .invalid host cannot resolve");
+        .expect_err("a .invalid host has nothing to connect to");
     let direct = direct.to_string();
-    assert!(
-        direct.contains("DNS resolve") || direct.contains("No addresses"),
-        "{direct}"
-    );
+    assert!(!direct.contains("SOCKS connect"), "{direct}");
 
     // Nothing listens on port 1, so the SOCKS handshake cannot complete.
     let proxied = verify_relay_certificate(

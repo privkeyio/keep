@@ -22,6 +22,15 @@ use crate::error::{FrostNetError, Result};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Budget for a probe that goes through a proxy, where building a Tor circuit
+/// and then handshaking over it routinely costs more than a direct dial. Ten
+/// seconds is a normal cold-circuit time, so reusing [`CONNECT_TIMEOUT`] here
+/// would make turning the proxy on look like the relay is down, and the
+/// cheapest way out of that for a user is to turn the proxy back off, which is
+/// the exposure this is supposed to prevent. Bounded well under the 90s desktop
+/// allows a proxied session so a dead proxy still fails rather than hangs.
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub type SpkiHash = [u8; 32];
 
 /// Upper bound on accepted pins per host. A handful covers current + staged
@@ -234,6 +243,14 @@ pub async fn verify_relay_certificate(
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
+    // Both the dial and the handshake below cross the proxy, so both take the
+    // proxied budget.
+    let connect_timeout = if proxy.is_some() {
+        PROXY_CONNECT_TIMEOUT
+    } else {
+        CONNECT_TIMEOUT
+    };
+
     let tcp_stream = match proxy {
         // Hand the relay name to the proxy rather than resolving it here: a
         // local lookup would leak the relay being contacted even though the
@@ -243,7 +260,7 @@ pub async fn verify_relay_certificate(
         // reaches, exactly as for the live relay sockets, which build their
         // proxied streams the same way.
         Some(socks) => tokio::time::timeout(
-            CONNECT_TIMEOUT,
+            connect_timeout,
             Socks5Stream::connect(socks, (hostname.as_str(), port)),
         )
         .await
@@ -286,7 +303,7 @@ pub async fn verify_relay_certificate(
     };
 
     let tls_stream =
-        tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
+        tokio::time::timeout(connect_timeout, connector.connect(server_name, tcp_stream))
             .await
             .map_err(|_| FrostNetError::Timeout(format!("TLS handshake with {hostname}")))?
             .map_err(|e| FrostNetError::Transport(format!("TLS handshake with {hostname}: {e}")))?;

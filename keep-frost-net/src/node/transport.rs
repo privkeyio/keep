@@ -164,18 +164,16 @@ mod tests {
         let url = relay.url().await;
         let relays = vec![url.to_string()];
 
-        assert!(
-            NostrTransport::connect(
-                Keys::generate(),
-                &relays,
-                None,
-                RelayOptions::default(),
-                None,
-            )
-            .await
-            .is_ok(),
-            "the mock relay must be reachable without a proxy, or the negative below proves nothing"
-        );
+        let direct = NostrTransport::connect(
+            Keys::generate(),
+            &relays,
+            None,
+            RelayOptions::default(),
+            None,
+        )
+        .await
+        .expect("the mock relay must be reachable without a proxy, or the negative below proves nothing");
+        direct.client.shutdown().await;
 
         let proxy: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(

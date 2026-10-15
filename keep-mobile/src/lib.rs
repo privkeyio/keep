@@ -1569,13 +1569,6 @@ impl KeepMobile {
             nostr_sdk::Keys::new(sk.into())
         };
 
-        // Verify + pin each relay's TLS cert before connecting (§7), holding the
-        // cert-pin lock only for that brief read-modify-write, not the whole run.
-        // The probe and the live transport's pin set are read under one lock
-        // acquisition, and both before the single-use subkey below is consumed:
-        // a storage fault while reading pins must not strand a half-started
-        // ceremony, and a concurrent FFI pin edit must not land between the two
-        // reads.
         // Route through the configured loopback SOCKS proxy when enabled (§7),
         // mirroring the signing path's proxy. Resolved before the probe below,
         // which dials through the same proxy.
@@ -1587,6 +1580,13 @@ impl KeepMobile {
             None
         };
 
+        // Verify + pin each relay's TLS cert before connecting (§7), holding the
+        // cert-pin lock only for that brief read-modify-write, not the whole run.
+        // The probe and the live transport's pin set are read under one lock
+        // acquisition, and both before the single-use subkey below is consumed:
+        // a storage fault while reading pins must not strand a half-started
+        // ceremony, and a concurrent FFI pin edit must not land between the two
+        // reads.
         let (relays, pinning) = {
             let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
             let relays = self

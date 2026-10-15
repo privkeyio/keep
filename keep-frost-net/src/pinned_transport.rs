@@ -135,6 +135,9 @@ pub fn build_client(
 /// need their own relay options therefore go through the pool and have to carry
 /// the mode themselves, or the proxy is silently dropped and the socket is
 /// direct.
+///
+/// `keep-agent` keeps its own copy of this in `relay_opts`; it does not depend
+/// on this crate, so the two have to be kept in step by hand.
 pub fn with_proxy(opts: RelayOptions, proxy: Option<SocketAddr>) -> RelayOptions {
     match proxy {
         Some(addr) => opts.connection_mode(ConnectionMode::Proxy(addr)),
