@@ -98,6 +98,7 @@ fn paired() -> Phone {
         relays: vec!["wss://relay.example".into()],
         paired: true,
         counter: 0,
+        counter_floor: 0,
         tracker: AnchorTracker::default(),
         gate: RequestGate::default(),
         waiting: Vec::new(),
@@ -882,9 +883,15 @@ fn an_unfreeze_is_signed_for_what_was_asked() {
     // The asked unfreeze survives a restart; a freeze after it counts on.
     let phone = phone.reopen();
     assert!(phone.stored(|s| s.unfreeze.is_some()));
+    // Still sendable: loading did not move the counter it was signed for.
+    let err = phone
+        .handler
+        .send_unfreeze(Some(credential.clone()), phone.sign(&digest, false))
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
     // A freeze signed meanwhile voids it: its counter is now old.
     assert!(phone.handler.freeze(Some(credential.clone())).is_err());
-    assert_eq!(phone.stored(|s| s.counter), 2);
+    assert_eq!(phone.stored(|s| s.counter), 1 + COUNTER_MARGIN + 1);
     let signature = phone.sign(&digest, false);
     assert!(phone
         .handler
@@ -1262,4 +1269,56 @@ fn a_decided_request_waits_for_its_outcome_past_its_time() {
     assert!(phone.stored(|s| s.waiting.len() == 1));
     phone.handler.tick_at(now() + 120 + WINDOW_PAST_SECS + 1);
     assert!(phone.stored(|s| s.waiting.is_empty()));
+}
+
+#[test]
+fn the_first_counter_after_a_load_skips_past_a_rollback() {
+    let saved = |p: &Phone| -> u64 {
+        let data = p.memory.0.lock().unwrap()[STATE_KEY].clone();
+        serde_json::from_slice::<Stored>(&data).unwrap().counter
+    };
+    let phone = paired();
+    assert!(phone.handler.freeze(None).is_err());
+    assert_eq!(saved(&phone), 1);
+    // Loading alone spends nothing, however often, even when the state is
+    // saved again without signing anything.
+    let phone = phone.reopen().reopen().reopen();
+    assert_eq!(saved(&phone), 1);
+    phone.handler.acknowledge_alerts(0).unwrap();
+    let phone = phone.reopen();
+    assert_eq!(saved(&phone), 1);
+    assert!(phone.handler.freeze(None).is_err());
+    assert_eq!(saved(&phone), 1 + COUNTER_MARGIN + 1);
+    assert!(phone.handler.freeze(None).is_err());
+    assert_eq!(saved(&phone), 1 + COUNTER_MARGIN + 2, "then by one");
+    // Freezes sent after that load, then storage rolled back a few writes:
+    // the next load signs past every counter sent since.
+    let sent = phone.stored(|s| s.counter);
+    for _ in 0..5 {
+        assert!(phone.handler.freeze(None).is_err());
+    }
+    let last = sent + 5;
+    assert_eq!(saved(&phone), last);
+    phone.stored(|s| {
+        s.counter = sent;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    phone.handler.unfreeze_digest(None).unwrap();
+    let asked = phone.stored(|s| s.unfreeze.unwrap().counter);
+    assert_eq!(asked, sent + COUNTER_MARGIN + 1);
+    assert!(asked > last);
+    // At the boundary: a rollback of exactly the margin is still covered.
+    let base = phone.stored(|s| s.counter);
+    for _ in 0..COUNTER_MARGIN {
+        assert!(phone.handler.freeze(None).is_err());
+    }
+    let last = base + COUNTER_MARGIN;
+    phone.stored(|s| {
+        s.counter = base;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    assert!(phone.handler.freeze(None).is_err());
+    assert!(saved(&phone) > last);
 }

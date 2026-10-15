@@ -71,6 +71,22 @@ const OUTCOME_GRACE_SECS: u64 = 120;
 /// so a resend's new counter does not void the unfreeze being signed.
 const UNFREEZE_HOLD_SECS: u64 = 60;
 
+/// How far past the stored freeze counter the first freeze or unfreeze after
+/// a load signs. Storage can roll back to an earlier copy (a backup, or a
+/// write lost to power after it was reported done), which would have this
+/// phone sign a counter it already sent, and the gateway refuses an old
+/// counter: the owner's freeze would be ignored. This covers a rollback of
+/// up to this many counters to a copy saved since the last such jump; a
+/// rollback of the write that saved a jump itself is not covered, which
+/// storage that only reports a write done once it is durable prevents. It is
+/// spent only when a freeze or unfreeze is signed, never by loading alone,
+/// so app restarts do not use up the gateway's step limit
+/// ([`sig::MAX_COUNTER_STEP`]). An unfreeze whose digest was handed out
+/// before the load keeps the counter it was signed for; if a rollback brought
+/// it back, the gateway refuses it as old and the scope stays frozen.
+const COUNTER_MARGIN: u64 = 1 << 10;
+const _: () = assert!(COUNTER_MARGIN < sig::MAX_COUNTER_STEP);
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -169,6 +185,10 @@ struct Stored {
     paired: bool,
     /// The last freeze counter used.
     counter: u64,
+    /// The least counter the next freeze or unfreeze signs, set when the
+    /// state is loaded: see [`COUNTER_MARGIN`]. Never stored.
+    #[serde(skip)]
+    counter_floor: u64,
     tracker: AnchorTracker,
     gate: RequestGate,
     #[serde(default)]
@@ -191,6 +211,11 @@ struct Stored {
 impl Stored {
     fn keys(&self) -> Result<Keys, KeepMobileError> {
         Keys::parse(&self.transport).map_err(|_| invalid("the stored transport key is damaged"))
+    }
+
+    /// Move to the next freeze counter, past the floor set at load.
+    fn next_counter(&mut self) {
+        self.counter = self.counter.max(self.counter_floor).saturating_add(1);
     }
 
     fn fingerprint(&self) -> Result<String, KeepMobileError> {
@@ -437,7 +462,7 @@ fn signed_freeze(
     local_now: u64,
 ) -> Result<String, KeepMobileError> {
     let keys = stored.keys()?;
-    stored.counter += 1;
+    stored.next_counter();
     let freeze = sig::freeze(&keys, &stored.channel.0, stored.counter, epoch, scope);
     stored.tracker.freeze_sent(scope, epoch, local_now);
     Ok(wire::to_text(&freeze))
@@ -1059,7 +1084,10 @@ impl ApproverHandler {
         }
         let stored = match mobile.storage.load_share_by_key(STATE_KEY.into()) {
             Ok(data) => match serde_json::from_slice::<Stored>(&Zeroizing::new(data)) {
-                Ok(stored) => Some(stored),
+                Ok(mut stored) => {
+                    stored.counter_floor = stored.counter.saturating_add(COUNTER_MARGIN);
+                    Some(stored)
+                }
                 Err(e) => {
                     mobile.approver_live.store(false, Ordering::SeqCst);
                     return Err(KeepMobileError::StorageError {
@@ -1192,6 +1220,7 @@ impl ApproverHandler {
             relays: uri.relays.clone(),
             paired: false,
             counter: 0,
+            counter_floor: 0,
             tracker: AnchorTracker::default(),
             gate: RequestGate::default(),
             waiting: Vec::new(),
@@ -1428,7 +1457,7 @@ impl ApproverHandler {
             .filter(|s| s.paired)
             .ok_or_else(|| invalid("not paired"))?;
         let epoch = stored.tracker.epoch().unwrap_or(0);
-        stored.counter += 1;
+        stored.next_counter();
         let asked = AskedUnfreeze {
             scope,
             counter: stored.counter,
