@@ -72,6 +72,7 @@ mod nonce_pool;
 mod nonce_store;
 mod oprf_session;
 mod peer;
+mod pinned_transport;
 mod pinning;
 pub mod proof;
 mod protocol;
@@ -128,7 +129,8 @@ pub use oprf_session::{
     OprfUnlockSessionState, MAX_OPRF_EVALS_PER_WINDOW, OPRF_EVAL_WINDOW,
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
-pub use pinning::{OnNewPin, PinningServerCertVerifier};
+pub use pinned_transport::{PinnedWebSocketTransport, TlsPinning};
+pub use pinning::PinningServerCertVerifier;
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,

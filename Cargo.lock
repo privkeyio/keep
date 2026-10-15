@@ -4800,6 +4800,7 @@ dependencies = [
 name = "keep-frost-net"
 version = "0.12.1"
 dependencies = [
+ "async-wsocket",
  "base64 0.23.1",
  "bitcoin",
  "chrono",
@@ -4829,6 +4830,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-test",
+ "tokio-tungstenite 0.26.2",
  "tracing",
  "tss-esapi",
  "url",

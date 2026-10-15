@@ -287,6 +287,10 @@ fn export_share(
 /// `verify_and_pin_relays` output); `proxy` is the configured loopback SOCKS
 /// proxy, if any. `cancel` is polled by the coordinator so a UI cancel aborts the
 /// run promptly. The transport is disconnected on every exit path (§7).
+///
+/// `pinning` makes the ceremony's own relay sockets enforce the SPKI pin inside
+/// their TLS handshake, so the group key is not negotiated over a connection
+/// only a pre-flight probe vouched for.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_dkg(
     subkey: &Keys,
@@ -298,6 +302,7 @@ pub async fn run_dkg(
     timeout: Duration,
     cancel: &AtomicBool,
     progress: Arc<dyn DkgProgressCallback>,
+    pinning: Option<keep_frost_net::TlsPinning>,
 ) -> Result<DkgResult, KeepMobileError> {
     for relay in relays {
         validate_relay_url(relay)?;
@@ -324,7 +329,8 @@ pub async fn run_dkg(
     let mut session = SoftwareDkgSession::init(config.threshold, config.participants, our_index)
         .map_err(|e| frost_err(format!("init DKG: {e}")))?;
 
-    let transport = ClientTransport::connect_hardened(subkey, relays, proxy).await?;
+    let transport =
+        ClientTransport::connect_hardened_pinned(subkey, relays, proxy, pinning).await?;
 
     let sink = CallbackProgress {
         cb: progress.clone(),

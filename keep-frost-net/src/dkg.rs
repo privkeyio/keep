@@ -713,14 +713,20 @@ impl ClientTransport {
         relays: &[String],
         proxy: Option<std::net::SocketAddr>,
     ) -> Result<Self> {
-        let client = match proxy {
-            Some(addr) => {
-                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
-                let opts = ClientOptions::new().connection(connection);
-                Client::builder().signer(keys.clone()).opts(opts).build()
-            }
-            None => Client::new(keys.clone()),
-        };
+        Self::connect_hardened_pinned(keys, relays, proxy, None).await
+    }
+
+    /// As [`Self::connect_hardened`], but with the SPKI pin enforced inside the
+    /// TLS handshake of the sockets that carry the ceremony, rather than only
+    /// on the caller's pre-flight probe.
+    pub async fn connect_hardened_pinned(
+        keys: &Keys,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+        pinning: Option<crate::TlsPinning>,
+    ) -> Result<Self> {
+        let client = crate::pinned_transport::build_client(keys, proxy, pinning)
+            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
 
         for relay in relays {
             client

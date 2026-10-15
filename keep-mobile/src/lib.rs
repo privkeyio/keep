@@ -1571,10 +1571,17 @@ impl KeepMobile {
 
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
-        let relays = {
+        // The probe and the live transport's pin set are read under one lock
+        // acquisition, and both before the single-use subkey below is consumed:
+        // a storage fault while reading pins must not strand a half-started
+        // ceremony, and a concurrent FFI pin edit must not land between the two
+        // reads.
+        let (relays, pinning) = {
             let _cert = self.cert_pin_lock.lock().unwrap_or_else(|p| p.into_inner());
-            self.runtime
-                .block_on(self.verify_and_pin_relays(&config.relays))?
+            let relays = self
+                .runtime
+                .block_on(self.verify_and_pin_relays(&config.relays))?;
+            (relays, self.live_pinning()?)
         };
 
         // Route through the configured loopback SOCKS proxy when enabled (§7),
@@ -1624,6 +1631,7 @@ impl KeepMobile {
             timeout,
             &cancel,
             progress.clone(),
+            Some(pinning),
         ));
 
         match outcome {
@@ -1885,22 +1893,40 @@ impl KeepMobile {
     }
 
     pub fn clear_certificate_pins(&self) -> Result<(), KeepMobileError> {
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.storage
-            .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.storage
+                .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())?;
+        }
+        // A live node holds the pin set it loaded when it was built, and the
+        // relay pool reconnects on a timer, so without this a pin edit would not
+        // reach it: a cleared pin would stay accepted on the next reconnect and a
+        // staged one would not be honored until re-init. Tearing the node down is
+        // also the right answer for a removal specifically, since the existing
+        // socket was authenticated with a pin the user no longer trusts.
+        // Called after the cert-pin guard drops: lock order is
+        // node_lifecycle_lock -> cert_pin_lock, so taking them the other way
+        // round here would deadlock against `do_initialize`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        pins.remove_pin(&hostname);
-        persistence::persist_cert_pins(&self.storage, &pins)
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            pins.remove_pin(&hostname);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+        }
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     /// Stage an additional accepted SPKI pin for `hostname` (RFC 7469 backup pin)
@@ -1915,13 +1941,18 @@ impl KeepMobile {
     ) -> Result<(), KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        pins.add_pin(hostname, hash);
-        persistence::persist_cert_pins(&self.storage, &pins)
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            pins.add_pin(hostname, hash);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+        }
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(())
     }
 
     /// Remove a single SPKI pin from `hostname`, retiring a rotated-out key while
@@ -1936,18 +1967,23 @@ impl KeepMobile {
     ) -> Result<CertPinRemovalResult, KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
         let hash = parse_spki_hash(&spki_hash)?;
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-        let pin_removed = pins.remove_specific_pin(&hostname, &hash);
-        let host_now_unpinned = !pins.is_pinned(&hostname);
-        persistence::persist_cert_pins(&self.storage, &pins)?;
-        Ok(CertPinRemovalResult {
-            pin_removed,
-            host_now_unpinned,
-        })
+        let result = {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            let pin_removed = pins.remove_specific_pin(&hostname, &hash);
+            let host_now_unpinned = !pins.is_pinned(&hostname);
+            persistence::persist_cert_pins(&self.storage, &pins)?;
+            CertPinRemovalResult {
+                pin_removed,
+                host_now_unpinned,
+            }
+        };
+        // See `clear_certificate_pins`.
+        self.invalidate_live_node();
+        Ok(result)
     }
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
@@ -2514,14 +2550,19 @@ impl KeepMobile {
     }
 
     /// Enable or disable strict certificate pinning (see `get_strict_cert_pinning`).
-    /// Takes effect on the next connection.
+    ///
+    /// A live node captured the old setting when it was built, so it is torn
+    /// down here rather than left running with the previous policy until the
+    /// next re-init.
     pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
         let config = persistence::StoredStrictPinConfig { enabled };
         persistence::persist_strict_pin_config(
             &self.storage,
             STRICT_PIN_CONFIG_STORAGE_KEY,
             &config,
-        )
+        )?;
+        self.invalidate_live_node();
+        Ok(())
     }
 
     pub fn get_bunker_config(&self) -> Result<BunkerConfigInfo, KeepMobileError> {
@@ -3313,6 +3354,27 @@ impl KeepMobile {
         }
     }
 
+    /// Pin configuration for the live relay sockets.
+    ///
+    /// The stored pin set is handed to the transport, which only ever reads it:
+    /// enforcing the pin on the live handshake is the transport's job, while
+    /// learning one on first use stays with `verify_and_pin_relays` below,
+    /// which runs under `cert_pin_lock` and is allowed to touch storage. Since
+    /// the handshake records nothing, there is nothing to write back after
+    /// connecting, and so no way for a connection to clobber a pin staged or
+    /// cleared through the FFI while it was coming up.
+    fn live_pinning(&self) -> Result<keep_frost_net::TlsPinning, KeepMobileError> {
+        let require_pinned =
+            persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
+                .unwrap_or_default()
+                .enabled;
+        let pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        Ok(keep_frost_net::TlsPinning::new(
+            Arc::new(std::sync::Mutex::new(pins)),
+            require_pinned,
+        ))
+    }
+
     /// Verify each relay's TLS certificate against the stored pins (trust-on-
     /// first-use, or strict when configured), persist any newly learned pins,
     /// and return the subset that passed. Fails closed if none pass.
@@ -3429,10 +3491,10 @@ impl KeepMobile {
         self.runtime.block_on(async {
             let verified_relays = self.verify_and_pin_relays(&relays).await?;
 
-            let node = match proxy {
-                Some(addr) => KfpNode::new_with_proxy(share, verified_relays, addr).await?,
-                None => KfpNode::new(share, verified_relays).await?,
-            };
+            // Enforce the SPKI pin on the sockets that carry share and signing
+            // traffic, not just on the pre-flight probe above.
+            let pinning = self.live_pinning()?;
+            let node = KfpNode::new_pinned(share, verified_relays, proxy, pinning).await?;
 
             let node = if let Some(path) = self
                 .session_store_path
