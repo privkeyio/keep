@@ -1,12 +1,12 @@
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_relay_builder::prelude::*;
 use nostr_sdk::prelude::*;
-use tokio::sync::Mutex;
 
-use keep_core::keyring::Keyring;
-use keep_core::keys::{KeyType, NostrKeypair};
+use common::{extract_bunker_secret, setup_keyring};
 use keep_nip46::types::{ApprovalRequest, ApprovalResult, LogEvent, ServerCallbacks};
 use keep_nip46::{Server, ServerConfig};
 
@@ -20,29 +20,6 @@ impl ServerCallbacks for AlwaysApprove {
     fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
         ApprovalResult::approved_once()
     }
-}
-
-fn extract_bunker_secret(bunker_url: &str) -> Option<String> {
-    let url = url::Url::parse(bunker_url).ok()?;
-    url.query_pairs()
-        .find(|(k, _)| k == "secret")
-        .map(|(_, v)| v.to_string())
-}
-
-fn setup_keyring() -> (Arc<Mutex<Keyring>>, PublicKey) {
-    let mut keyring = Keyring::new();
-    let keypair = NostrKeypair::generate().unwrap();
-    let pubkey_bytes = *keypair.public_bytes();
-    keyring
-        .load_key(
-            *keypair.public_bytes(),
-            *keypair.secret_bytes(),
-            KeyType::Nostr,
-            "test".to_string(),
-        )
-        .unwrap();
-    let pubkey = PublicKey::from_slice(&pubkey_bytes).unwrap();
-    (Arc::new(Mutex::new(keyring)), pubkey)
 }
 
 #[tokio::test]

@@ -482,9 +482,17 @@ impl App {
                 let callbacks: Arc<dyn keep_nip46::types::ServerCallbacks> =
                     Arc::new(DesktopCallbacks { tx: event_tx });
 
+                // Enforce the SPKI pin inside the handshake of the socket that
+                // carries remote-signing traffic, not only on the probe above.
+                // The set is shared, not snapshotted, so a pin staged or cleared
+                // in Settings takes effect on the next full handshake; the
+                // verifier only ever reads it, so a reconnect cannot re-add a pin
+                // the user just cleared.
+                let pinning = keep_frost_net::TlsPinning::new(cert_pins, require_pinned);
                 let config = keep_nip46::ServerConfig {
                     rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
                     kill_switch: Some(kill_switch),
+                    tls_pinning: Some(pinning),
                     ..Default::default()
                 };
                 let mut server = keep_nip46::Server::new_with_config_and_proxy(

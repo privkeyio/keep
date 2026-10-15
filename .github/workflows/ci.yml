@@ -99,6 +99,11 @@ jobs:
       # only to subscribers already listening and never stores them.
       - run: cargo test -p keep-frost-net --test dkg_relay_e2e_test
       - run: cargo test -p keep-enclave-host --test integration_tests
+      # keep-nip46's suites live in tests/, which `--workspace --lib --bins`
+      # above does not build, so without this step the bunker and NIP-46 client
+      # integration tests never run in CI. `#[ignore]`d live-relay tests stay
+      # excluded.
+      - run: cargo test -p keep-nip46
       # keep-enclave-bin (the Nitro Enclave binary) is a separate workspace excluded
       # from the root workspace, so `cargo test --workspace` never builds it. It is
       # target_os=linux gated (vsock), so build and test it explicitly on Linux only,

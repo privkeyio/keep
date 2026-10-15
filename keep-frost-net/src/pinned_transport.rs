@@ -51,7 +51,8 @@ use nostr_sdk::prelude::transport::websocket::{
     WebSocketTransport,
 };
 use nostr_sdk::prelude::{
-    BoxedFuture, Client, ClientOptions, Connection, ConnectionMode, ConnectionTarget, Keys, Url,
+    BoxedFuture, Client, ClientOptions, Connection, ConnectionMode, ConnectionTarget, Keys,
+    RelayStatus, Url,
 };
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
@@ -107,7 +108,7 @@ impl TlsPinning {
 ///
 /// `Client::new(signer)` is itself `Client::builder().signer(signer).build()`,
 /// so the unpinned result here is identical to what the callers built before.
-pub(crate) fn build_client(
+pub fn build_client(
     keys: &Keys,
     proxy: Option<SocketAddr>,
     pinning: Option<TlsPinning>,
@@ -124,6 +125,31 @@ pub(crate) fn build_client(
     }
 
     Ok(builder.build())
+}
+
+/// Wait for at least one relay to reach `Connected`, or fail.
+///
+/// `Client::connect` only spawns background attempts and a `subscribe` queues
+/// against an empty pool, so both return `Ok` while every socket is being
+/// refused. A caller that installed [`PinnedWebSocketTransport`] has to know
+/// the difference: a pin mismatch or a scheme the transport cannot pin refuses
+/// every relay, and without this the caller reports success and then carries no
+/// traffic at all.
+pub async fn wait_for_any_relay(client: &Client, within: Duration) -> Result<()> {
+    tokio::time::timeout(within, async {
+        loop {
+            let relays = client.relays().await;
+            if relays
+                .values()
+                .any(|r| matches!(r.status(), RelayStatus::Connected))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| FrostNetError::Transport("Timed out waiting for relay connection".into()))
 }
 
 /// A [`WebSocketTransport`] that enforces the SPKI pin on the handshake
@@ -155,24 +181,27 @@ impl PinnedWebSocketTransport {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-        let verifier = PinningServerCertVerifier::new(
+        // Both `ClientConfig::builder()` and `WebPkiServerVerifier::builder()`
+        // PANIC when no process-default crypto provider is installed, and the
+        // default is not inferable here because both `ring` and `aws-lc-rs` end
+        // up enabled on rustls through the relay stack. Resolve it explicitly
+        // and hand it to BOTH builders: this is a library entry point reached
+        // across the UniFFI boundary, where an abort would take the host app
+        // down instead of returning an error. Resolving it before the verifier
+        // is built is load-bearing, not cosmetic.
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+        let verifier = PinningServerCertVerifier::new_with_provider(
             Arc::new(roots),
             pinning.pins,
             require_pinned,
+            provider.clone(),
         )
         .map_err(|e| {
             FrostNetError::Transport(format!("Failed to build pinning certificate verifier: {e}"))
         })?;
-
-        // `ClientConfig::builder()` PANICS when no process-default crypto
-        // provider is installed, and the default is not inferable here because
-        // both `ring` and `aws-lc-rs` end up enabled on rustls through the relay
-        // stack. Resolve it explicitly: this is a library entry point reached
-        // across the UniFFI boundary, where an abort would take the host app
-        // down instead of returning an error.
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 
         let config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

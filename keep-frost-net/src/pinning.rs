@@ -63,18 +63,46 @@ impl PinningServerCertVerifier {
     /// roots) and then enforces the SPKI pin. Returns an error if no root
     /// anchors are supplied (an empty root store is rejected by rustls rather
     /// than silently trusting everything).
+    ///
+    /// Resolves the crypto provider from the process default, which panics if
+    /// none is installed. Library entry points reached across the UniFFI
+    /// boundary must use [`Self::new_with_provider`] instead.
     pub fn new(
         roots: Arc<RootCertStore>,
         pins: Arc<Mutex<CertificatePinSet>>,
         require_pinned: bool,
     ) -> Result<Self, rustls::client::VerifierBuilderError> {
         let inner = WebPkiServerVerifier::builder(roots).build()?;
-        Ok(Self {
+        Ok(Self::from_parts(inner, pins, require_pinned))
+    }
+
+    /// As [`Self::new`], but with the crypto provider supplied rather than
+    /// resolved from the process default. `WebPkiServerVerifier::builder`
+    /// resolves it with `get_default_or_install_from_crate_features`, which
+    /// PANICS when nothing is installed and the crate features are ambiguous,
+    /// and they are ambiguous here because both `ring` and `aws-lc-rs` reach
+    /// rustls through the relay stack.
+    pub fn new_with_provider(
+        roots: Arc<RootCertStore>,
+        pins: Arc<Mutex<CertificatePinSet>>,
+        require_pinned: bool,
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Result<Self, rustls::client::VerifierBuilderError> {
+        let inner = WebPkiServerVerifier::builder_with_provider(roots, provider).build()?;
+        Ok(Self::from_parts(inner, pins, require_pinned))
+    }
+
+    fn from_parts(
+        inner: Arc<WebPkiServerVerifier>,
+        pins: Arc<Mutex<CertificatePinSet>>,
+        require_pinned: bool,
+    ) -> Self {
+        Self {
             inner,
             pins,
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
-        })
+        }
     }
 
     /// Enforce the SPKI pin for `hostname` against the observed `spki_hash`,

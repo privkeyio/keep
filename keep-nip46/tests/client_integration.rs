@@ -1,30 +1,13 @@
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
 use nostr_relay_builder::prelude::*;
-use nostr_sdk::prelude::{Keys, PublicKey};
-use tokio::sync::Mutex;
+use nostr_sdk::prelude::Keys;
 
+use common::setup_keyring;
 use keep_core::error::{KeepError, NetworkError};
-use keep_core::keyring::Keyring;
-use keep_core::keys::{KeyType, NostrKeypair};
 use keep_nip46::{generate_bunker_url, Nip46Client, Server, ServerConfig};
-
-fn setup_keyring() -> (Arc<Mutex<Keyring>>, PublicKey) {
-    let mut keyring = Keyring::new();
-    let keypair = NostrKeypair::generate().unwrap();
-    let pubkey_bytes = *keypair.public_bytes();
-    keyring
-        .load_key(
-            *keypair.public_bytes(),
-            *keypair.secret_bytes(),
-            KeyType::Nostr,
-            "test".to_string(),
-        )
-        .unwrap();
-    let pubkey = PublicKey::from_slice(&pubkey_bytes).unwrap();
-    (Arc::new(Mutex::new(keyring)), pubkey)
-}
 
 #[tokio::test]
 async fn test_nip46_client_rejects_unknown_method() {

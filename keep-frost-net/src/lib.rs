@@ -129,7 +129,9 @@ pub use oprf_session::{
     OprfUnlockSessionState, MAX_OPRF_EVALS_PER_WINDOW, OPRF_EVAL_WINDOW,
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
-pub use pinned_transport::{PinnedWebSocketTransport, TlsPinning};
+pub use pinned_transport::{
+    build_client, wait_for_any_relay, PinnedWebSocketTransport, TlsPinning,
+};
 pub use pinning::PinningServerCertVerifier;
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,

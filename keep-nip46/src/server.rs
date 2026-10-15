@@ -51,6 +51,11 @@ pub struct ServerConfig {
     /// way so connected web clients sign without per-request prompts while
     /// unconnected apps get no blanket grant.
     pub connect_auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
+    /// Enforces the relay's SPKI pin inside the TLS handshake of the sockets
+    /// that carry remote-signing traffic, not only on a pre-flight probe. Left
+    /// `None` the client does standard WebPKI validation only, which is what
+    /// every caller got before this existed.
+    pub tls_pinning: Option<keep_frost_net::TlsPinning>,
 }
 
 /// A NIP-46 client app whose permissions are loaded into the
@@ -140,6 +145,7 @@ impl Default for ServerConfig {
             pre_grants: Vec::new(),
             auto_approve_kinds: std::collections::HashSet::from([nostr_sdk::Kind::Reaction]),
             connect_auto_approve_kinds: std::collections::HashSet::new(),
+            tls_pinning: None,
         }
     }
 }
@@ -344,14 +350,8 @@ impl Server {
             Keys::new(secret)
         };
 
-        let client = match proxy {
-            Some(addr) => {
-                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
-                let opts = ClientOptions::new().connection(connection);
-                Client::builder().signer(keys.clone()).opts(opts).build()
-            }
-            None => Client::new(keys.clone()),
-        };
+        let client = keep_frost_net::build_client(&keys, proxy, config.tls_pinning.clone())
+            .map_err(|e| NetworkError::connection(format!("relay client: {e}")))?;
         add_relays(&client, relay_urls).await?;
 
         let permissions = Arc::new(Mutex::new(PermissionManager::new()));
@@ -468,14 +468,8 @@ impl Server {
             .map_err(|e| CryptoError::invalid_key(format!("transport key: {e}")))?;
         let keys = Keys::new(secret);
 
-        let client = match proxy {
-            Some(addr) => {
-                let connection = Connection::new().proxy(addr).target(ConnectionTarget::All);
-                let opts = ClientOptions::new().connection(connection);
-                Client::builder().signer(keys.clone()).opts(opts).build()
-            }
-            None => Client::new(keys.clone()),
-        };
+        let client = keep_frost_net::build_client(&keys, proxy, config.tls_pinning.clone())
+            .map_err(|e| NetworkError::connection(format!("relay client: {e}")))?;
         add_relays(&client, relay_urls).await?;
 
         let keyring = Arc::new(Mutex::new(Keyring::new()));
@@ -538,6 +532,22 @@ impl Server {
         info!(relay = %self.relay_url, "connecting to relay");
 
         self.client.connect().await;
+
+        // `connect()` only spawns background attempts and `subscribe` queues
+        // against an empty pool, so both return `Ok` while the pinned transport
+        // is refusing every socket (a certificate that no longer matches the
+        // pin, or a scheme it cannot pin). Without this the bunker reports
+        // running and publishes a URL that can never receive a request.
+        //
+        // Gated on pinning being installed on purpose. The always-on bunkers in
+        // keep-cli and keep-web pass no pinning and are built to start before a
+        // relay is reachable and let the pool reconnect, so failing their start
+        // on a transient relay outage would trade availability for a diagnostic.
+        if self.config.tls_pinning.is_some() {
+            keep_frost_net::wait_for_any_relay(&self.client, std::time::Duration::from_secs(10))
+                .await
+                .map_err(|e| NetworkError::connection(e.to_string()))?;
+        }
 
         let filter = Filter::new()
             .kind(Kind::NostrConnect)
