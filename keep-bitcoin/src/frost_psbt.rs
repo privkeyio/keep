@@ -174,11 +174,19 @@ impl FrostWallet {
         if !spent.is_p2tr() {
             return Ok(None);
         }
-        // Each origin naming the group costs a tweak below, and the one whose
-        // key is the output's a derivation; a key-path output has one key.
+        // Each origin naming the group on a path read here costs a tweak
+        // below, and the one whose key is the output's a derivation; a
+        // key-path output has one key.
+        let read = |path: &DerivationPath| {
+            self.group_path(path).is_some_and(|p| {
+                !change_only || matches!(p.as_slice(), [1, i] if *i < CHANGE_INDEX_LIMIT)
+            })
+        };
         let named = origins
             .values()
-            .filter(|(leaves, (fp, _))| leaves.is_empty() && *fp == self.fingerprint)
+            .filter(|(leaves, (fp, path))| {
+                leaves.is_empty() && *fp == self.fingerprint && read(path)
+            })
             .count();
         if named > MAX_WALLET_ORIGINS {
             return Err(BitcoinError::InvalidPsbt(format!(
@@ -186,15 +194,12 @@ impl FrostWallet {
             )));
         }
         for (key, (leaves, (fp, path))) in origins {
-            if !leaves.is_empty() || *fp != self.fingerprint {
+            if !leaves.is_empty() || *fp != self.fingerprint || !read(path) {
                 continue;
             }
             let Some(group_path) = self.group_path(path) else {
                 continue;
             };
-            if change_only && !matches!(group_path.as_slice(), [1, i] if *i < CHANGE_INDEX_LIMIT) {
-                continue;
-            }
             // A forged origin is dropped after one tweak; only the origin
             // whose key makes the output is derived, to prove the path.
             let named_output = TaprootTweak::default()
@@ -861,6 +866,12 @@ mod tests {
         p.inputs[0].tap_key_origins = [origin(&group, k0, "86'/1'/0'/0/3")].into();
         let (analysis, _) = wallet.analyze(&p).unwrap();
         assert!(!analysis.outputs[1].is_change);
+        // Receive paths on an output are never read, so they do not count.
+        let mut p = padded(0);
+        for (k, o) in forged(&group, 32, "86'/1'/0'/0/9") {
+            p.outputs[1].tap_key_origins.insert(k, o);
+        }
+        assert!(wallet.analyze(&p).unwrap().0.outputs[1].is_change);
         // Origins of other groups cost nothing and are not counted.
         let (_, other) = new_group();
         let mut p = padded(0);
