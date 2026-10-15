@@ -2,42 +2,46 @@
 // SPDX-License-Identifier: MIT
 //! The bunker's relay socket carries remote-signing requests, so the SPKI pin
 //! has to be enforced on that socket's own TLS handshake and not only on the
-//! pre-flight probe the callers run first. These tests cover the two ends of
-//! that: the transport is actually installed on the bunker client and still
-//! serves traffic, and under strict pinning a socket that cannot be pinned
-//! carries nothing.
+//! pre-flight probe the callers run first.
+//!
+//! Every negative case here asserts that `Server::start` returns an error,
+//! never that a client merely failed to show up within some window. An
+//! absence-after-a-sleep assertion would pass on a slow runner even if the
+//! pinning field were ignored outright, which is the one way these tests could
+//! quietly stop testing anything.
+
+mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use nostr_relay_builder::prelude::*;
 use nostr_sdk::prelude::*;
-use tokio::sync::Mutex;
 
-use keep_core::keyring::Keyring;
-use keep_core::keys::{KeyType, NostrKeypair};
 use keep_frost_net::{
     install_default_crypto_provider, verify_relay_certificate, CertificatePinSet, SpkiHash,
     TlsPinning,
 };
 use keep_nip46::{Server, ServerConfig};
 
-fn setup_keyring() -> (Arc<Mutex<Keyring>>, PublicKey) {
-    let mut keyring = Keyring::new();
-    let keypair = NostrKeypair::generate().unwrap();
-    let pubkey_bytes = *keypair.public_bytes();
-    keyring
-        .load_key(
-            *keypair.public_bytes(),
-            *keypair.secret_bytes(),
-            KeyType::Nostr,
-            "test".to_string(),
-        )
-        .unwrap();
-    (
-        Arc::new(Mutex::new(keyring)),
-        PublicKey::from_slice(&pubkey_bytes).unwrap(),
-    )
+use common::{extract_bunker_secret, send_connect_request, setup_keyring};
+
+/// One mock relay for the whole binary. `MockRelay` picks a random port by
+/// binding a probe listener, dropping it, then binding again, so every extra
+/// instance is another chance for two relays to race onto the same port. These
+/// tests do not need their own relay, so they share one.
+static RELAY: tokio::sync::OnceCell<(MockRelay, String)> = tokio::sync::OnceCell::const_new();
+
+async fn shared_relay() -> &'static str {
+    let (_mock, url) = RELAY
+        .get_or_init(|| async {
+            install_default_crypto_provider();
+            let mock = MockRelay::run().await.expect("start mock relay");
+            let url = mock.url().await.to_string();
+            (mock, url)
+        })
+        .await;
+    url
 }
 
 fn pinning(require_pinned: bool) -> TlsPinning {
@@ -47,22 +51,43 @@ fn pinning(require_pinned: bool) -> TlsPinning {
     )
 }
 
-/// Drive the NIP-46 connect handshake over a local mock relay.
-async fn connect_handshake_reaches_bunker(config: ServerConfig) -> bool {
-    install_default_crypto_provider();
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
-    let relay_url = mock_relay.url().await.to_string();
-    connect_handshake_reaches_bunker_on(&relay_url, config).await
+fn config(tls_pinning: Option<TlsPinning>) -> ServerConfig {
+    ServerConfig {
+        auto_approve: true,
+        tls_pinning,
+        ..Default::default()
+    }
 }
 
-/// Drive the NIP-46 connect handshake from a plain client and report whether
-/// the bunker registered it, which is only possible if the bunker's own relay
-/// socket carried the event.
-async fn connect_handshake_reaches_bunker_on(relay_url: &str, config: ServerConfig) -> bool {
+/// Build a bunker against `relay_url` and try to start it. `Err` means the
+/// relay socket never came up, which under strict pinning is the refusal this
+/// file is about.
+async fn try_start(
+    relay_url: &str,
+    config: ServerConfig,
+) -> Result<(), keep_core::error::KeepError> {
     install_default_crypto_provider();
-    let relay_url = relay_url.to_string();
+    let (keyring, _) = setup_keyring();
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        None,
+        std::slice::from_ref(&relay_url.to_string()),
+        None,
+        config,
+    )
+    .await?;
+    server.start().await
+}
 
+/// Start a bunker, drive a real NIP-46 connect handshake at it, and report
+/// whether the bunker registered the client. That is only possible if the
+/// bunker's own relay socket carried the event, so it is the positive proof
+/// that installing the transport did not cost the bunker its relay.
+async fn connect_handshake_reaches_bunker(relay_url: &str, config: ServerConfig) -> bool {
+    install_default_crypto_provider();
     let (keyring, signer_pubkey) = setup_keyring();
+    let relay_url = relay_url.to_string();
     let mut server = Server::new_with_config(
         keyring,
         None,
@@ -74,101 +99,105 @@ async fn connect_handshake_reaches_bunker_on(relay_url: &str, config: ServerConf
     .await
     .expect("server creation failed");
 
-    let bunker_secret = url::Url::parse(&server.bunker_url())
-        .unwrap()
-        .query_pairs()
-        .find(|(k, _)| k == "secret")
-        .map(|(_, v)| v.to_string())
-        .expect("headless bunker URL must include secret");
-
+    let bunker_secret =
+        extract_bunker_secret(&server.bunker_url()).expect("headless bunker URL must have secret");
     let server_pubkey = server.pubkey();
     let server_handler = server.handler();
     let server_handle = tokio::spawn(async move {
         let _ = server.run().await;
     });
 
-    tokio::time::sleep(Duration::from_secs(1)).await;
-
     let client_keys = Keys::generate();
     let client = Client::new(client_keys.clone());
     client.add_relay(relay_url).await.unwrap();
     client.connect().await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let connect_json = serde_json::json!({
-        "id": "req-1",
-        "method": "connect",
-        "params": [signer_pubkey.to_hex(), bunker_secret]
+    // Bounded poll rather than a fixed sleep, so the positive case is fast and
+    // its deadline is explicit.
+    let reached = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            send_connect_request(
+                &client,
+                &client_keys,
+                server_pubkey,
+                signer_pubkey,
+                &bunker_secret,
+            )
+            .await;
+            for _ in 0..10 {
+                if !server_handler.list_clients().await.is_empty() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     })
-    .to_string();
-    let encrypted = nip44::encrypt(
-        client_keys.secret_key(),
-        &server_pubkey,
-        &connect_json,
-        nip44::Version::V2,
-    )
-    .unwrap();
-    let connect_event = EventBuilder::new(Kind::NostrConnect, &encrypted)
-        .tag(Tag::public_key(server_pubkey))
-        .sign_with_keys(&client_keys)
-        .unwrap();
-    client.send_event(&connect_event).await.unwrap();
-
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let connected = !server_handler.list_clients().await.is_empty();
+    .await
+    .is_ok();
 
     server_handle.abort();
     client.disconnect().await;
-    connected
+    reached
 }
 
 /// Installing the pinning transport must not cost the bunker its relay: with
-/// pinning lenient the socket behaves exactly as the default transport did, so
-/// the handshake still lands.
+/// pinning lenient the socket behaves as the default transport did, so a real
+/// connect handshake still lands.
 #[tokio::test]
 async fn a_pinned_bunker_still_serves_its_relay() {
-    let reached = connect_handshake_reaches_bunker(ServerConfig {
-        auto_approve: true,
-        tls_pinning: Some(pinning(false)),
-        ..Default::default()
-    })
-    .await;
+    let url = shared_relay().await;
 
     assert!(
-        reached,
+        connect_handshake_reaches_bunker(url, config(Some(pinning(false)))).await,
         "pinned bunker transport dropped the connect handshake"
     );
 }
 
 /// Strict pinning has nothing to pin on a cleartext socket, so the bunker must
-/// refuse it rather than serve signing requests over an unauthenticated
-/// channel. Failing here means the strict toggle is cosmetic on this path.
+/// refuse to start rather than publish a URL and serve signing requests over an
+/// unauthenticated channel.
+///
+/// The lenient start against the same relay is the timing witness: it proves
+/// the refusal below is attributable to `require_pinned` and not to a relay
+/// that was simply never reachable from this test.
 #[tokio::test]
-async fn strict_pinning_refuses_an_unpinnable_bunker_relay() {
-    let reached = connect_handshake_reaches_bunker(ServerConfig {
-        auto_approve: true,
-        tls_pinning: Some(pinning(true)),
-        ..Default::default()
-    })
-    .await;
+async fn strict_pinning_refuses_a_bunker_relay_it_cannot_pin() {
+    let url = shared_relay().await;
+
+    try_start(url, config(Some(pinning(false))))
+        .await
+        .expect("lenient pinning should start against the mock relay");
+
+    let err = try_start(url, config(Some(pinning(true))))
+        .await
+        .expect_err("strict pinning started a bunker over a socket it cannot pin");
+    println!("strict pinning refused the bunker start: {err}");
+}
+
+/// The unpinned default is what every caller that sets no pinning gets, and the
+/// always-on bunkers in keep-cli and keep-web depend on it starting without
+/// waiting for a relay. This is the control for the two tests above.
+#[tokio::test]
+async fn an_unpinned_bunker_is_unchanged() {
+    let url = shared_relay().await;
 
     assert!(
-        !reached,
-        "strict pinning served the bunker over a relay socket it could not pin"
+        connect_handshake_reaches_bunker(url, config(None)).await,
+        "default bunker transport dropped the handshake"
     );
 }
 
-/// The unpinned default is what every caller that sets no pinning gets, so it
-/// has to keep working: this is the control for the two tests above.
+/// An unpinned bunker must still start when no relay is reachable at all, since
+/// the pool reconnects in the background and the always-on deployments rely on
+/// that. This pins down the gate on the new start-time wait: it must apply only
+/// where pinning is installed.
 #[tokio::test]
-async fn an_unpinned_bunker_is_unchanged() {
-    let reached = connect_handshake_reaches_bunker(ServerConfig {
-        auto_approve: true,
-        ..Default::default()
-    })
-    .await;
+async fn an_unpinned_bunker_starts_without_a_reachable_relay() {
+    install_default_crypto_provider();
 
-    assert!(reached, "default bunker transport dropped the handshake");
+    try_start("ws://127.0.0.1:1", config(None))
+        .await
+        .expect("an unpinned bunker must start even with no relay reachable");
 }
 
 /// Live-relay checks, `#[ignore]`d like the rest of the TLS pinning tests
@@ -178,10 +207,10 @@ async fn an_unpinned_bunker_is_unchanged() {
 /// cargo test -p keep-nip46 --test bunker_pinned_transport -- --ignored
 /// ```
 ///
-/// The mock-relay tests above run over cleartext, so they cannot show the pin
-/// being checked at all. These do: remote-signing traffic crosses a socket
-/// whose TLS handshake ran the pinning verifier against a real certificate,
-/// and a wrong pin stops that socket from ever coming up.
+/// The mock-relay tests above run over cleartext, so they cannot show a pin
+/// value being checked at all. These do: remote-signing traffic crosses a
+/// socket whose TLS handshake ran the pinning verifier against a real
+/// certificate, and a wrong pin stops that socket from coming up.
 const LIVE_RELAY: &str = "wss://relay.damus.io";
 const LIVE_RELAY_HOST: &str = "relay.damus.io";
 
@@ -203,29 +232,17 @@ async fn a_bunker_enforces_a_probe_learned_pin_on_its_live_socket() {
 
     let mut provisioned = CertificatePinSet::new();
     provisioned.add_pin(host, hash);
-
-    let reached = connect_handshake_reaches_bunker_on(
-        LIVE_RELAY,
-        ServerConfig {
-            auto_approve: true,
-            tls_pinning: Some(TlsPinning::new(
-                Arc::new(std::sync::Mutex::new(provisioned)),
-                true,
-            )),
-            ..Default::default()
-        },
-    )
-    .await;
+    let strict = TlsPinning::new(Arc::new(std::sync::Mutex::new(provisioned)), true);
 
     assert!(
-        reached,
+        connect_handshake_reaches_bunker(LIVE_RELAY, config(Some(strict))).await,
         "strict pinning rejected the pin the probe had just learned from {LIVE_RELAY}"
     );
 }
 
 /// A wrong pin must stop the bunker's relay socket from coming up, which is
 /// exactly the case a pre-flight probe cannot cover on the connection that
-/// carries signing requests.
+/// carries signing requests. Asserted as a start failure, not as absence.
 #[tokio::test]
 #[ignore = "requires network access to a public relay"]
 async fn a_mismatched_pin_blocks_the_live_bunker_socket() {
@@ -233,22 +250,10 @@ async fn a_mismatched_pin_blocks_the_live_bunker_socket() {
 
     let mut wrong = CertificatePinSet::new();
     wrong.add_pin(LIVE_RELAY_HOST.to_string(), [0x42u8; 32] as SpkiHash);
+    let strict = TlsPinning::new(Arc::new(std::sync::Mutex::new(wrong)), true);
 
-    let reached = connect_handshake_reaches_bunker_on(
-        LIVE_RELAY,
-        ServerConfig {
-            auto_approve: true,
-            tls_pinning: Some(TlsPinning::new(
-                Arc::new(std::sync::Mutex::new(wrong)),
-                true,
-            )),
-            ..Default::default()
-        },
-    )
-    .await;
-
-    assert!(
-        !reached,
-        "the bunker served a relay whose certificate does not match the pin"
-    );
+    let err = try_start(LIVE_RELAY, config(Some(strict)))
+        .await
+        .expect_err("the bunker started against a relay whose certificate does not match the pin");
+    println!("mismatched pin refused the bunker start: {err}");
 }

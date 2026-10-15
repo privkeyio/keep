@@ -72,20 +72,7 @@ impl NostrTransport {
 
         client.connect().await;
 
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let relay_map = client.relays().await;
-                let any_connected = relay_map
-                    .values()
-                    .any(|r| matches!(r.status(), RelayStatus::Connected));
-                if any_connected {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .map_err(|_| FrostNetError::Transport("Timed out waiting for relay connection".into()))?;
+        crate::pinned_transport::wait_for_any_relay(&client, Duration::from_secs(10)).await?;
 
         Ok(Self { client })
     }

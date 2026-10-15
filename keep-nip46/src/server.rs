@@ -533,6 +533,22 @@ impl Server {
 
         self.client.connect().await;
 
+        // `connect()` only spawns background attempts and `subscribe` queues
+        // against an empty pool, so both return `Ok` while the pinned transport
+        // is refusing every socket (a certificate that no longer matches the
+        // pin, or a scheme it cannot pin). Without this the bunker reports
+        // running and publishes a URL that can never receive a request.
+        //
+        // Gated on pinning being installed on purpose. The always-on bunkers in
+        // keep-cli and keep-web pass no pinning and are built to start before a
+        // relay is reachable and let the pool reconnect, so failing their start
+        // on a transient relay outage would trade availability for a diagnostic.
+        if self.config.tls_pinning.is_some() {
+            keep_frost_net::wait_for_any_relay(&self.client, std::time::Duration::from_secs(10))
+                .await
+                .map_err(|e| NetworkError::connection(e.to_string()))?;
+        }
+
         let filter = Filter::new()
             .kind(Kind::NostrConnect)
             .pubkey(self.keys.public_key());

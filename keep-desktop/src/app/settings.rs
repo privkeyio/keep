@@ -129,6 +129,34 @@ impl App {
                 if let Screen::Settings(s) = &mut self.screen {
                     s.strict_cert_pinning = v;
                 }
+                // `require_pinned` is read once and snapshotted into the TLS
+                // verifier when the node and the bunker start, so without a
+                // reconnect the toggle the user just flipped does not reach
+                // either of them: strict mode would appear on while the live
+                // sockets still run lenient. Mirrors `ProxyToggled` above,
+                // which restarts for the same reason.
+                let frost_active = matches!(
+                    self.frost_status,
+                    ConnectionStatus::Connected | ConnectionStatus::Connecting
+                );
+                let bunker_active = self.bunker.is_some();
+                let mut tasks = Vec::new();
+                if frost_active {
+                    tasks.push(self.handle_reconnect_relay());
+                }
+                if bunker_active {
+                    self.stop_bunker();
+                    tasks.push(self.handle_bunker_start());
+                }
+                if !tasks.is_empty() {
+                    let label = if v { "enabled" } else { "disabled" };
+                    self.set_toast(
+                        format!("Strict pinning {label}, reconnecting..."),
+                        ToastKind::Success,
+                    );
+                }
+                save_settings(&self.keep_path, &self.settings);
+                return Task::batch(tasks);
             }
             Event::KillSwitchActivate => {
                 return self.handle_kill_switch_activate();
