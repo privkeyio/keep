@@ -1265,17 +1265,24 @@ impl KeepMobile {
             self.storage.set_active_share_key(None)?;
         }
 
-        // Unconditional, because the pointer does not say which share the live
-        // node was built from. `load_share_package` resolves the share when no
-        // pointer is set, so a node can be running on a share the pointer never
-        // named; gating teardown on the pointer left that node holding the
-        // deleted share's key material, still subscribed to the relays and
-        // still able to contribute signature shares, with any already-queued
-        // request still approvable. Tearing down for an unrelated delete costs
-        // a reconnect, which is the cheaper side of that trade.
-        self.invalidate_live_node();
-
         self.storage.delete_share_by_key(group_pubkey)?;
+
+        // Last, and unconditional. Unconditional because the pointer does not
+        // say which share the live node was built from: `load_share_package`
+        // resolves the share when no pointer is set, so a node can be running
+        // on a share the pointer never named, and gating teardown on the
+        // pointer left that node holding the deleted share's key material,
+        // still subscribed to the relays and still able to contribute signature
+        // shares, with any already-queued request still approvable. Last
+        // because `do_initialize` holds `node_lifecycle_lock` across both the
+        // share load and the node install while taking no `active_share_lock`,
+        // so tearing down before the record is gone leaves a window where a
+        // concurrent initialize resolves the still-present share and installs a
+        // node on it. Running the teardown after the removal means such an
+        // initialize either no longer finds the record or is serialized behind
+        // this teardown by that same lock. Tearing down for an unrelated delete
+        // costs a reconnect, which is the cheaper side of the trade.
+        self.invalidate_live_node();
 
         Ok(())
     }
@@ -2221,8 +2228,18 @@ impl KeepMobile {
         }
         self.runtime.block_on(async {
             let (group_pubkey, result) = {
-                let node_guard = self.node.read().await;
-                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                // Clone the handle and drop the guard before the ping. The ping
+                // waits out its full timeout (up to 300s) when peers do not
+                // answer, and tokio's RwLock is write-preferring, so holding
+                // the guard across it stalls `invalidate_live_node` and with it
+                // every caller that tears the node down: a share delete, an
+                // active-share switch, each cert-pin edit, all of which hold
+                // their own locks meanwhile. A node that is torn down mid-ping
+                // is why this takes a handle rather than a guard.
+                let node = {
+                    let node_guard = self.node.read().await;
+                    Arc::clone(node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?)
+                };
                 let gp = hex::encode(node.group_pubkey());
                 let r = node
                     .health_check(Duration::from_secs(timeout_secs))
@@ -4780,6 +4797,75 @@ mod import_teardown_tests {
                 mobile.pending_requests.lock().await.is_empty(),
                 "deleting a share must run node teardown whether or not the \
                  pointer named it"
+            );
+        });
+    }
+
+    // The observable consequence of tearing the node down after the record is
+    // removed rather than before: a delete that fails leaves the share in
+    // place, so the node that may be running on it must stay up. Tearing down
+    // first also left a window where a concurrent initialize could resolve the
+    // still-present share and install a node on it, which this ordering closes
+    // but a single-threaded test cannot show directly.
+    #[test]
+    fn a_failed_share_delete_leaves_the_live_node_alone() {
+        struct UndeletableStorage(MemStorage);
+
+        impl SecureStorage for UndeletableStorage {
+            fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+                self.0.store_share(d, m)
+            }
+            fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+                self.0.load_share()
+            }
+            fn has_share(&self) -> bool {
+                self.0.has_share()
+            }
+            fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+                self.0.get_share_metadata()
+            }
+            fn delete_share(&self) -> Result<(), KeepMobileError> {
+                self.0.delete_share()
+            }
+            fn store_share_by_key(
+                &self,
+                k: String,
+                d: Vec<u8>,
+                m: ShareMetadataInfo,
+            ) -> Result<(), KeepMobileError> {
+                self.0.store_share_by_key(k, d, m)
+            }
+            fn load_share_by_key(&self, k: String) -> Result<Vec<u8>, KeepMobileError> {
+                self.0.load_share_by_key(k)
+            }
+            fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+                self.0.list_all_shares()
+            }
+            fn delete_share_by_key(&self, _: String) -> Result<(), KeepMobileError> {
+                Err(KeepMobileError::StorageError {
+                    msg: "cannot delete right now".into(),
+                })
+            }
+            fn get_active_share_key(&self) -> Option<String> {
+                self.0.get_active_share_key()
+            }
+            fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
+                self.0.set_active_share_key(k)
+            }
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(UndeletableStorage(MemStorage::default()));
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+        mobile
+            .delete_share_by_key(hex::encode([0xaau8; 32]))
+            .expect_err("the storage delete fails");
+        mobile.runtime.block_on(async {
+            assert!(
+                !mobile.pending_requests.lock().await.is_empty(),
+                "the share survived the failed delete, so the node must not have \
+                 been torn down under it"
             );
         });
     }
