@@ -2014,13 +2014,16 @@ impl KeepMobile {
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
         // The exported signature cannot carry the error, so an unreadable index
-        // still shows as an empty list. What matters is that the index is no
-        // longer rewritten from that empty read, so the next save keeps every
-        // descriptor reference and the list recovers once storage does.
-        persistence::load_descriptors(&self.storage).unwrap_or_else(|e| {
-            tracing::warn!("Cannot read the descriptor index, reporting no descriptors: {e}");
-            Vec::new()
-        })
+        // still shows as an empty list. What it no longer does is drive a write:
+        // neither this call nor a later save rewrites the index from a partial
+        // read. Making the failure visible here needs a fallible signature,
+        // which is a binding change for the Android consumer.
+        persistence::load_descriptors(&self.storage)
+            .map(|load| load.loaded)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Cannot read the descriptor index, reporting no descriptors: {e}");
+                Vec::new()
+            })
     }
 
     pub fn wallet_descriptor_export(
@@ -2746,7 +2749,20 @@ impl KeepMobile {
             });
         }
 
-        let descriptors = persistence::load_descriptors(&self.storage)?;
+        // A backup is a durable artifact the user restores from and then wipes
+        // the device trusting it, so an incomplete one is worse than none. The
+        // list view can afford to hide a descriptor it cannot read; this cannot.
+        let load = persistence::load_descriptors(&self.storage)?;
+        if !load.unreadable.is_empty() {
+            return Err(KeepMobileError::BackupError {
+                msg: format!(
+                    "refusing to back up an incomplete descriptor set: {} of {} records could not be read",
+                    load.unreadable.len(),
+                    load.unreadable.len() + load.loaded.len()
+                ),
+            });
+        }
+        let descriptors = load.loaded;
         let mut core_descriptors = Vec::with_capacity(descriptors.len());
         for d in &descriptors {
             let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;
@@ -3136,6 +3152,14 @@ impl KeepMobile {
                     msg: format!("key/share already exists for group {group_hex}"),
                 });
             }
+        }
+
+        // Checked here rather than at the descriptor writes below, which run
+        // after the shares and keys have landed: a refusal there leaves the
+        // shares stored, and the duplicate guard above then rejects every
+        // retry, so the descriptors in this backup could never be restored.
+        if !prepared_descriptors.is_empty() {
+            persistence::require_writable_descriptor_index(&self.storage)?;
         }
 
         for (group_hex, serialized, metadata) in prepared_shares {

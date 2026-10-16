@@ -273,22 +273,88 @@ pub(crate) fn storage_metadata(name: &str) -> ShareMetadataInfo {
     }
 }
 
-/// Read the descriptor index, distinguishing "no index yet" from "cannot read
-/// the index right now".
+/// A descriptor index read that is safe to rewrite, or the reason it is not.
 ///
-/// Every caller rewrites the index from what this returns, so collapsing a
-/// decrypt or I/O failure into an empty vec made the next write drop every
-/// descriptor reference the device had. Only a positive absence is an empty
-/// index; anything else is an error the caller must refuse to write over.
+/// `WalletDescriptorInfo` has a hand-written `Debug` that redacts the
+/// descriptors, so deriving here does not widen what a log can carry.
+#[derive(Debug)]
+pub(crate) struct DescriptorLoad {
+    pub(crate) loaded: Vec<WalletDescriptorInfo>,
+    /// Group hexes the index references whose record could not be read. Their
+    /// index entries are kept; callers building a durable artifact must refuse
+    /// rather than treat the remainder as the whole set.
+    pub(crate) unreadable: Vec<String>,
+}
+
+/// Probe for any descriptor record that exists independently of the index.
+///
+/// Descriptors are keyed by group pubkey hex and `list_all_shares` yields those
+/// hexes, so this is the only source of truth about the index that does not go
+/// through the index key itself. It is used to tell a genuine first run from an
+/// index the platform is failing to produce.
+fn any_descriptor_record_exists(storage: &Arc<dyn SecureStorage>) -> Option<String> {
+    storage.list_all_shares().into_iter().find_map(|meta| {
+        let group_hex = hex::encode(&meta.group_pubkey);
+        storage
+            .load_share_by_key(descriptor_key(&group_hex))
+            .is_ok()
+            .then_some(group_hex)
+    })
+}
+
+/// Read the descriptor index, yielding a value only when it is safe for a
+/// caller to rewrite the index from it.
+///
+/// Every caller rewrites the index from what this returns, so anything short of
+/// a cleanly parsed index has to be refused: a rewrite from a partial read
+/// drops every reference the read did not produce, and the records it dropped
+/// are then unreachable because nothing enumerates keys.
+///
+/// `StorageNotFound` cannot be taken as proof of absence. The Android
+/// implementation reads metadata through a path that collapses "key absent" and
+/// "value unreadable" into the same `null` (`KeystoreEncryptedPrefs`
+/// `getTypedValue`), so an index that exists but cannot be decrypted arrives
+/// here as `StorageNotFound`. Hence the probe: a first run has no descriptor
+/// records, so finding one means this empty read is a fault and must not be
+/// written over. The probe goes through `list_all_shares`, which has no error
+/// channel of its own, so a fault that hides both the index and the records
+/// still reads as a first run. Closing that needs the platform to distinguish
+/// absent from unreadable; see `KeepMobileError::StorageNotFound`.
 fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>, KeepMobileError> {
     match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
         Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to deserialize descriptor index: {e}"),
+            msg: format!("{DESCRIPTOR_INDEX_CORRUPT_MSG}: {e}"),
         }),
-        Err(KeepMobileError::StorageNotFound) => Ok(Vec::new()),
+        Err(KeepMobileError::StorageNotFound) => match any_descriptor_record_exists(storage) {
+            Some(group_hex) => Err(KeepMobileError::StorageError {
+                msg: format!(
+                    "descriptor index reads as absent while a descriptor record for \
+                     {group_hex} exists, so it is unreadable rather than unset"
+                ),
+            }),
+            None => Ok(Vec::new()),
+        },
         Err(e) => Err(e),
     }
 }
+
+/// Refuse early when the descriptor index cannot be rewritten.
+///
+/// For a caller that writes other records before it reaches a descriptor: the
+/// index read is the step most likely to refuse, and discovering that after the
+/// shares have landed leaves a half-applied restore that the duplicate guard
+/// then rejects on every retry.
+pub(crate) fn require_writable_descriptor_index(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<(), KeepMobileError> {
+    load_descriptor_index(storage).map(|_| ())
+}
+
+/// Prefix of the error a corrupt index blob produces. A corrupt index refuses
+/// every descriptor write, and recovering needs an explicit user-confirmed
+/// reset rather than a rebuild from a list that can under-report, so the
+/// message has to be recognizable to the layer that offers it.
+pub(crate) const DESCRIPTOR_INDEX_CORRUPT_MSG: &str = "Descriptor index is unreadable";
 
 fn persist_descriptor_index(
     storage: &Arc<dyn SecureStorage>,
@@ -304,49 +370,38 @@ fn persist_descriptor_index(
     )
 }
 
-/// Load every descriptor the index references, pruning only the entries whose
-/// record is positively gone.
+/// Load every descriptor the index references, without ever writing to it.
 ///
-/// Pruning is a write that makes an absence permanent, so it must be driven by
-/// proof of absence. A decrypt or I/O failure is not proof: one unreadable
-/// prefs key fails every record in a single pass and used to empty the index
-/// outright, leaving the surviving records unreferenced. A record that reads
-/// but will not deserialize is also kept, because a version skew looks the
-/// same as corruption and dropping the reference removes the only path back to
-/// it. Either way the descriptor is left out of the returned list, so a fault
-/// hides descriptors for this call instead of deleting their references.
+/// A read path must not prune. Pruning is a write that makes an absence
+/// permanent, and nothing available here proves absence: `StorageNotFound` also
+/// covers a record the platform cannot decrypt, and on Android a metadata
+/// decrypt failure wipes the entry outright, so a kept reference is not even a
+/// reliable path back to the record. An entry whose record is gone therefore
+/// stays, costing one failed read per call, which is the cheap half of the
+/// trade. `delete_descriptor` is the one place an entry is removed, because it
+/// is the one place a descriptor is known to be going away.
 pub(crate) fn load_descriptors(
     storage: &Arc<dyn SecureStorage>,
-) -> Result<Vec<WalletDescriptorInfo>, KeepMobileError> {
+) -> Result<DescriptorLoad, KeepMobileError> {
     let index = load_descriptor_index(storage)?;
-    let mut result = Vec::with_capacity(index.len());
-    let mut missing = Vec::new();
-    for group_hex in &index {
-        match storage.load_share_by_key(descriptor_key(group_hex)) {
+    let mut loaded = Vec::with_capacity(index.len());
+    let mut unreadable = Vec::new();
+    for group_hex in index {
+        match storage.load_share_by_key(descriptor_key(&group_hex)) {
             Ok(data) => match serde_json::from_slice::<StoredDescriptor>(&data) {
-                Ok(stored) => {
-                    result.push(stored_to_info(stored));
-                }
+                Ok(stored) => loaded.push(stored_to_info(stored)),
                 Err(e) => {
-                    tracing::warn!(
-                        "Unreadable descriptor for {group_hex}, keeping index entry: {e}"
-                    );
+                    tracing::warn!("Descriptor for {group_hex} will not deserialize: {e}");
+                    unreadable.push(group_hex);
                 }
             },
-            Err(KeepMobileError::StorageNotFound) => {
-                tracing::warn!("Descriptor record for {group_hex} is gone, pruning index entry");
-                missing.push(group_hex.clone());
-            }
             Err(e) => {
-                tracing::warn!("Cannot read descriptor for {group_hex}, keeping index entry: {e}");
+                tracing::warn!("Cannot read the descriptor for {group_hex}: {e}");
+                unreadable.push(group_hex);
             }
         }
     }
-    if !missing.is_empty() {
-        let cleaned: Vec<String> = index.into_iter().filter(|k| !missing.contains(k)).collect();
-        let _ = persist_descriptor_index(storage, &cleaned);
-    }
-    Ok(result)
+    Ok(DescriptorLoad { loaded, unreadable })
 }
 
 pub(crate) fn load_descriptor(
@@ -390,13 +445,16 @@ pub(crate) fn persist_descriptor(
     let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize descriptor: {e}"),
     })?;
+
+    // Read the index before writing the record. Failing after the record is
+    // stored leaves it orphaned: `wallet_descriptor_get` finds it by key while
+    // `wallet_descriptor_list` never shows it, and nothing cleans it up.
+    let mut index = load_descriptor_index(storage)?;
     storage.store_share_by_key(
         descriptor_key(&info.group_pubkey),
         data,
         storage_metadata("descriptor"),
     )?;
-
-    let mut index = load_descriptor_index(storage)?;
     if !index.contains(&info.group_pubkey) {
         index.push(info.group_pubkey.clone());
         persist_descriptor_index(storage, &index)?;
@@ -479,9 +537,11 @@ pub(crate) fn delete_descriptor(
     storage: &Arc<dyn SecureStorage>,
     group_pubkey_hex: &str,
 ) -> Result<(), KeepMobileError> {
+    // Read the index before deleting the record, or a refusal here reports a
+    // failure for a descriptor that is already gone and that no list can show.
+    let mut index = load_descriptor_index(storage)?;
     storage.delete_share_by_key(descriptor_key(group_pubkey_hex))?;
 
-    let mut index = load_descriptor_index(storage)?;
     if let Some(pos) = index.iter().position(|k| k == group_pubkey_hex) {
         index.swap_remove(pos);
         persist_descriptor_index(storage, &index)?;
@@ -918,30 +978,61 @@ mod descriptor_index_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
-    /// Keyed storage whose reads can be made to fail for chosen keys, the way a
-    /// prefs HMAC key that will not decrypt right now fails them: the record is
-    /// still there, it just cannot be read.
+    /// Keyed storage reproducing the fault modes the Android backend actually
+    /// produces, which are not the same as "the read returns an error".
     #[derive(Default)]
     struct FaultyStorage {
         records: Mutex<HashMap<String, Vec<u8>>>,
+        /// Reads of these keys fail with `StorageError`, the record intact.
         unreadable: Mutex<HashSet<String>>,
+        /// Reads of these keys answer `StorageNotFound` while the record is
+        /// still there. This is what Android does for a value it cannot
+        /// decrypt: `KeystoreEncryptedPrefs::getTypedValue` collapses absent
+        /// and unreadable into the same `null`, and `loadMetadata` turns that
+        /// `null` into `StorageNotFound`.
+        unreadable_as_not_found: Mutex<HashSet<String>>,
+        /// Reads of these keys delete the record and then fail, which is what
+        /// Android's `loadMetadata` does on a metadata decrypt failure: it
+        /// clears the per-key prefs file before throwing, and only the DKG
+        /// marker is exempt.
+        wipe_on_read: Mutex<HashSet<String>>,
+        listed: Mutex<Vec<ShareMetadataInfo>>,
     }
 
     impl FaultyStorage {
-        fn make_unreadable(&self, key: &str) {
-            self.unreadable.lock().unwrap().insert(key.into());
-        }
-
-        fn make_readable(&self, key: &str) {
-            self.unreadable.lock().unwrap().remove(key);
+        fn raw(&self, key: &str) -> Option<Vec<u8>> {
+            self.records.lock().unwrap().get(key).cloned()
         }
 
         fn index(&self) -> Vec<String> {
-            let records = self.records.lock().unwrap();
-            let data = records
-                .get(DESCRIPTOR_INDEX_KEY)
+            let data = self
+                .raw(DESCRIPTOR_INDEX_KEY)
                 .expect("index was never written");
-            serde_json::from_slice(data).expect("index is not valid json")
+            serde_json::from_slice(&data).expect("index is not valid json")
+        }
+
+        fn fault(&self, field: &Mutex<HashSet<String>>, key: &str) {
+            field.lock().unwrap().insert(key.into());
+        }
+
+        fn clear_faults(&self) {
+            self.unreadable.lock().unwrap().clear();
+            self.unreadable_as_not_found.lock().unwrap().clear();
+            self.wipe_on_read.lock().unwrap().clear();
+        }
+
+        fn set_listed(&self, groups: &[&str]) {
+            *self.listed.lock().unwrap() = groups
+                .iter()
+                .map(|g| ShareMetadataInfo {
+                    name: (*g).into(),
+                    identifier: 1,
+                    threshold: 2,
+                    total_shares: 3,
+                    group_pubkey: hex::decode(g).expect("group must be hex"),
+                    did_backup: false,
+                })
+                .collect();
         }
     }
 
@@ -971,6 +1062,15 @@ mod descriptor_index_tests {
             Ok(())
         }
         fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            if self.wipe_on_read.lock().unwrap().contains(&key) {
+                self.records.lock().unwrap().remove(&key);
+                return Err(KeepMobileError::StorageError {
+                    msg: "decrypt failed, entry wiped".into(),
+                });
+            }
+            if self.unreadable_as_not_found.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageNotFound);
+            }
             if self.unreadable.lock().unwrap().contains(&key) {
                 return Err(KeepMobileError::StorageError {
                     msg: "cannot decrypt right now".into(),
@@ -984,7 +1084,7 @@ mod descriptor_index_tests {
                 .ok_or(KeepMobileError::StorageNotFound)
         }
         fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
-            vec![]
+            self.listed.lock().unwrap().clone()
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.records.lock().unwrap().remove(&key);
@@ -997,6 +1097,10 @@ mod descriptor_index_tests {
             Ok(())
         }
     }
+
+    const AA: &str = "aa";
+    const BB: &str = "bb";
+    const CC: &str = "cc";
 
     fn descriptor(group_hex: &str) -> WalletDescriptorInfo {
         WalletDescriptorInfo {
@@ -1023,92 +1127,177 @@ mod descriptor_index_tests {
         (faulty, storage)
     }
 
-    // An unreadable record is not an absent one. One prefs key that will not
-    // decrypt fails every descriptor in a single pass, so pruning on it emptied
-    // the index and left every surviving record unreferenced.
+    // One prefs key that will not decrypt fails every descriptor in a single
+    // pass, so pruning on a read failure emptied the index and left every
+    // surviving record unreferenced.
     #[test]
     fn an_unreadable_descriptor_keeps_its_index_entry() {
-        let (faulty, storage) = storage_with(&["aa", "bb"]);
-        faulty.make_unreadable(&descriptor_key("aa"));
-        faulty.make_unreadable(&descriptor_key("bb"));
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.unreadable, &descriptor_key(AA));
+        faulty.fault(&faulty.unreadable, &descriptor_key(BB));
 
-        assert!(load_descriptors(&storage).unwrap().is_empty());
-        assert_eq!(
-            faulty.index().len(),
-            2,
-            "a read failure must not prune the index"
-        );
+        let load = load_descriptors(&storage).unwrap();
+        assert!(load.loaded.is_empty());
+        assert_eq!(load.unreadable, vec![AA.to_string(), BB.to_string()]);
+        assert_eq!(faulty.index().len(), 2, "a read path must not prune");
 
-        faulty.make_readable(&descriptor_key("aa"));
-        faulty.make_readable(&descriptor_key("bb"));
+        faulty.clear_faults();
         assert_eq!(
-            load_descriptors(&storage).unwrap().len(),
+            load_descriptors(&storage).unwrap().loaded.len(),
             2,
             "both descriptors come back once storage recovers"
         );
     }
 
-    // A record that is positively gone is still pruned: that is proof of
-    // absence, and leaving the entry would warn on every list forever.
+    // The fault Android actually produces for a record it cannot decrypt: the
+    // read answers `StorageNotFound` while the record is still on disk. Pruning
+    // on `StorageNotFound` treated this as proof of absence.
     #[test]
-    fn a_deleted_descriptor_is_pruned_from_the_index() {
-        let (faulty, storage) = storage_with(&["aa", "bb"]);
-        storage
-            .delete_share_by_key(descriptor_key("aa"))
-            .expect("delete the record behind the index entry");
+    fn a_descriptor_that_reads_as_absent_keeps_its_index_entry() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.unreadable_as_not_found, &descriptor_key(AA));
 
-        let loaded = load_descriptors(&storage).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].group_pubkey, "bb");
-        assert_eq!(faulty.index(), vec!["bb".to_string()]);
+        let load = load_descriptors(&storage).unwrap();
+        assert_eq!(load.loaded.len(), 1);
+        assert_eq!(load.unreadable, vec![AA.to_string()]);
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
+
+        faulty.clear_faults();
+        assert_eq!(load_descriptors(&storage).unwrap().loaded.len(), 2);
     }
 
-    // The worst of the three index writers: persist read the index, got an
-    // empty vec from the failure, and wrote back an index holding only the new
-    // descriptor, dropping every other wallet reference the device had.
+    // A record that reads but will not deserialize is kept too: a version skew
+    // looks the same as corruption from here.
     #[test]
-    fn persisting_a_descriptor_refuses_an_unreadable_index() {
-        let (faulty, storage) = storage_with(&["aa", "bb"]);
-        faulty.make_unreadable(DESCRIPTOR_INDEX_KEY);
+    fn a_descriptor_that_will_not_deserialize_keeps_its_index_entry() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        storage
+            .store_share_by_key(
+                descriptor_key(AA),
+                b"not json".to_vec(),
+                storage_metadata("descriptor"),
+            )
+            .unwrap();
 
-        let err = persist_descriptor(&storage, &descriptor("cc"))
-            .expect_err("an unreadable index must not be rewritten");
-        assert!(matches!(err, KeepMobileError::StorageError { .. }));
+        let load = load_descriptors(&storage).unwrap();
+        assert_eq!(load.loaded.len(), 1);
+        assert_eq!(load.unreadable, vec![AA.to_string()]);
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
+    }
 
-        faulty.make_readable(DESCRIPTOR_INDEX_KEY);
+    // Even a record that is genuinely gone keeps its entry, because nothing
+    // available here proves absence and the entry costs one failed read.
+    // `delete_descriptor` is the one place an entry is removed.
+    #[test]
+    fn a_read_path_never_prunes_the_index() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        storage.delete_share_by_key(descriptor_key(AA)).unwrap();
+
+        let load = load_descriptors(&storage).unwrap();
+        assert_eq!(load.loaded.len(), 1);
+        assert_eq!(load.loaded[0].group_pubkey, BB);
+        assert_eq!(load.unreadable, vec![AA.to_string()]);
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
+    }
+
+    // Android wipes the entry before it reports the failure, so keeping the
+    // index entry is not a path back to the record. What it does buy is that
+    // the reference is still there to be refused over, instead of a later save
+    // silently rebuilding the index without it.
+    #[test]
+    fn a_wiped_descriptor_still_keeps_its_index_entry() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.wipe_on_read, &descriptor_key(AA));
+
+        let load = load_descriptors(&storage).unwrap();
+        assert_eq!(load.unreadable, vec![AA.to_string()]);
+        assert!(
+            faulty.raw(&descriptor_key(AA)).is_none(),
+            "the backend destroyed the record on the failed read"
+        );
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
+    }
+
+    // The index read answering `StorageNotFound` is not proof of a first run,
+    // because that is also what Android reports for an index it cannot decrypt.
+    // A descriptor record for a listed share is independent evidence that this
+    // device is not on its first run, so the empty read must be refused rather
+    // than written over.
+    #[test]
+    fn an_index_reading_as_absent_is_refused_when_a_descriptor_record_exists() {
+        let (faulty, storage) = storage_with(&[AA]);
+        faulty.set_listed(&[AA]);
+        faulty.fault(&faulty.unreadable_as_not_found, DESCRIPTOR_INDEX_KEY);
+
+        load_descriptors(&storage)
+            .expect_err("an index that reads as absent while records exist is a fault");
+        persist_descriptor(&storage, &descriptor(BB))
+            .expect_err("and it must not be rewritten from that read");
+
+        faulty.clear_faults();
         assert_eq!(
             faulty.index(),
-            vec!["aa".to_string(), "bb".to_string()],
-            "the existing references survive the failed save"
+            vec![AA.to_string()],
+            "the existing reference survives"
         );
+        assert!(
+            faulty.raw(&descriptor_key(BB)).is_none(),
+            "and the refused save wrote nothing"
+        );
+    }
+
+    // The worst of the index writers: persist read the index, got an empty vec
+    // from the swallowed failure, and wrote back an index holding only the new
+    // descriptor, dropping every other wallet reference on the device.
+    #[test]
+    fn persisting_a_descriptor_refuses_an_unreadable_index() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.unreadable, DESCRIPTOR_INDEX_KEY);
+
+        let err = persist_descriptor(&storage, &descriptor(CC))
+            .expect_err("an unreadable index must not be rewritten");
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("cannot decrypt")),
+            "the index read is what refused, not a validation check: {err}"
+        );
+        assert!(
+            faulty.raw(&descriptor_key(CC)).is_none(),
+            "the index is read before the record is written, so a refusal leaves no orphan"
+        );
+
+        faulty.clear_faults();
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
     }
 
     #[test]
     fn deleting_a_descriptor_refuses_an_unreadable_index() {
-        let (faulty, storage) = storage_with(&["aa", "bb"]);
-        faulty.make_unreadable(DESCRIPTOR_INDEX_KEY);
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.unreadable, DESCRIPTOR_INDEX_KEY);
 
-        persist_descriptor(&storage, &descriptor("cc"))
-            .expect_err("precondition: index unreadable");
-        delete_descriptor(&storage, "aa").expect_err("an unreadable index must not be rewritten");
+        delete_descriptor(&storage, AA).expect_err("an unreadable index must not be rewritten");
+        assert!(
+            faulty.raw(&descriptor_key(AA)).is_some(),
+            "the index is read before the delete, so a refused delete destroys nothing"
+        );
 
-        faulty.make_readable(DESCRIPTOR_INDEX_KEY);
-        assert_eq!(faulty.index(), vec!["aa".to_string(), "bb".to_string()]);
+        faulty.clear_faults();
+        assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
     }
 
-    // A missing index is a first run, not a fault, so the first save still works.
+    // A first run has no index and no descriptor records, so the first save
+    // still works.
     #[test]
-    fn a_missing_index_reads_as_empty() {
+    fn a_missing_index_reads_as_empty_on_a_first_run() {
         let faulty = Arc::new(FaultyStorage::default());
         let storage: Arc<dyn SecureStorage> = faulty.clone();
 
-        assert!(load_descriptors(&storage).unwrap().is_empty());
-        persist_descriptor(&storage, &descriptor("aa")).unwrap();
-        assert_eq!(faulty.index(), vec!["aa".to_string()]);
+        assert!(load_descriptors(&storage).unwrap().loaded.is_empty());
+        persist_descriptor(&storage, &descriptor(AA)).unwrap();
+        assert_eq!(faulty.index(), vec![AA.to_string()]);
     }
 
-    // A corrupt index blob is not an empty one: rewriting it from a parse
-    // failure is the same reference loss as rewriting it from a read failure.
+    // A corrupt index is not an empty one, and its error is recognizable so the
+    // layer above can offer an explicit reset.
     #[test]
     fn a_corrupt_index_is_not_treated_as_empty() {
         let faulty = Arc::new(FaultyStorage::default());
@@ -1121,8 +1310,27 @@ mod descriptor_index_tests {
             )
             .unwrap();
 
-        load_descriptors(&storage).expect_err("a corrupt index must surface, not read as empty");
-        persist_descriptor(&storage, &descriptor("aa"))
+        let err = load_descriptors(&storage)
+            .expect_err("a corrupt index must surface, not read as empty");
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains(DESCRIPTOR_INDEX_CORRUPT_MSG)),
+            "a corrupt index needs a recognizable error: {err}"
+        );
+        persist_descriptor(&storage, &descriptor(AA))
             .expect_err("a corrupt index must not be overwritten");
+        assert_eq!(
+            faulty.raw(DESCRIPTOR_INDEX_KEY).unwrap(),
+            b"not json".to_vec()
+        );
+    }
+
+    #[test]
+    fn require_writable_rejects_what_persist_would_reject() {
+        let (faulty, storage) = storage_with(&[AA]);
+        require_writable_descriptor_index(&storage).expect("a readable index is writable");
+
+        faulty.fault(&faulty.unreadable, DESCRIPTOR_INDEX_KEY);
+        require_writable_descriptor_index(&storage)
+            .expect_err("an unreadable index is not writable");
     }
 }
