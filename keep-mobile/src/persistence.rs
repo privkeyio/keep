@@ -307,7 +307,12 @@ pub(crate) struct DescriptorLoad {
 /// `loadMetadata`, which destroys the record it cannot decrypt.
 ///
 /// So what this function guarantees is narrower than "no reference is ever
-/// lost": a corrupt index is never parsed as empty, and no read ever writes.
+/// lost": a corrupt index is never parsed as empty, and no read on this side
+/// writes. The backend is a separate matter: the index key is itself a metadata
+/// key, so a read of it that cannot decrypt destroys it before reporting, and
+/// the next read then answers `StorageNotFound` and is believed empty. That
+/// chain starts in a read this layer performs and ends in a write it cannot
+/// see, and only the platform can break it.
 fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>, KeepMobileError> {
     match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
         Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
@@ -316,18 +321,6 @@ fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>
         Err(KeepMobileError::StorageNotFound) => Ok(Vec::new()),
         Err(e) => Err(e),
     }
-}
-
-/// Refuse early when the descriptor index cannot be rewritten.
-///
-/// For a caller that writes other records before it reaches a descriptor: the
-/// index read is the step most likely to refuse, and discovering that after the
-/// shares have landed leaves a half-applied restore that the duplicate guard
-/// then rejects on every retry.
-pub(crate) fn require_writable_descriptor_index(
-    storage: &Arc<dyn SecureStorage>,
-) -> Result<(), KeepMobileError> {
-    load_descriptor_index(storage).map(|_| ())
 }
 
 /// Prefix of the error a corrupt index blob produces. A corrupt index refuses
@@ -990,7 +983,6 @@ mod descriptor_index_tests {
         wipe_on_read: Mutex<HashSet<String>>,
         /// Writes to these keys fail, the previous contents intact.
         unwritable: Mutex<HashSet<String>>,
-        listed: Mutex<Vec<ShareMetadataInfo>>,
     }
 
     impl FaultyStorage {
@@ -1014,20 +1006,6 @@ mod descriptor_index_tests {
             self.unreadable.lock().unwrap().clear();
             self.unreadable_as_not_found.lock().unwrap().clear();
             self.wipe_on_read.lock().unwrap().clear();
-        }
-
-        fn set_listed(&self, groups: &[&str]) {
-            *self.listed.lock().unwrap() = groups
-                .iter()
-                .map(|g| ShareMetadataInfo {
-                    name: (*g).into(),
-                    identifier: 1,
-                    threshold: 2,
-                    total_shares: 3,
-                    group_pubkey: hex::decode(g).expect("group must be hex"),
-                    did_backup: false,
-                })
-                .collect();
         }
     }
 
@@ -1084,7 +1062,7 @@ mod descriptor_index_tests {
                 .ok_or(KeepMobileError::StorageNotFound)
         }
         fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
-            self.listed.lock().unwrap().clone()
+            vec![]
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.records.lock().unwrap().remove(&key);
@@ -1231,7 +1209,6 @@ mod descriptor_index_tests {
     #[test]
     fn an_index_that_reads_as_absent_is_treated_as_a_first_run() {
         let (faulty, storage) = storage_with(&[AA]);
-        faulty.set_listed(&[AA]);
         faulty.fault(&faulty.unreadable_as_not_found, DESCRIPTOR_INDEX_KEY);
 
         assert!(
@@ -1368,15 +1345,5 @@ mod descriptor_index_tests {
             "with no duplicate entry"
         );
         assert_eq!(load_descriptors(&storage).unwrap().loaded.len(), 2);
-    }
-
-    #[test]
-    fn require_writable_rejects_what_persist_would_reject() {
-        let (faulty, storage) = storage_with(&[AA]);
-        require_writable_descriptor_index(&storage).expect("a readable index is writable");
-
-        faulty.fault(&faulty.unreadable, DESCRIPTOR_INDEX_KEY);
-        require_writable_descriptor_index(&storage)
-            .expect_err("an unreadable index is not writable");
     }
 }
