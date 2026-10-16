@@ -286,54 +286,34 @@ pub(crate) struct DescriptorLoad {
     pub(crate) unreadable: Vec<String>,
 }
 
-/// Probe for any descriptor record that exists independently of the index.
-///
-/// Descriptors are keyed by group pubkey hex and `list_all_shares` yields those
-/// hexes, so this is the only source of truth about the index that does not go
-/// through the index key itself. It is used to tell a genuine first run from an
-/// index the platform is failing to produce.
-fn any_descriptor_record_exists(storage: &Arc<dyn SecureStorage>) -> Option<String> {
-    storage.list_all_shares().into_iter().find_map(|meta| {
-        let group_hex = hex::encode(&meta.group_pubkey);
-        storage
-            .load_share_by_key(descriptor_key(&group_hex))
-            .is_ok()
-            .then_some(group_hex)
-    })
-}
-
 /// Read the descriptor index, yielding a value only when it is safe for a
 /// caller to rewrite the index from it.
 ///
 /// Every caller rewrites the index from what this returns, so anything short of
 /// a cleanly parsed index has to be refused: a rewrite from a partial read
 /// drops every reference the read did not produce, and the records it dropped
-/// are then unreachable because nothing enumerates keys.
+/// are then unreachable, because nothing enumerates keys.
 ///
-/// `StorageNotFound` cannot be taken as proof of absence. The Android
-/// implementation reads metadata through a path that collapses "key absent" and
-/// "value unreadable" into the same `null` (`KeystoreEncryptedPrefs`
-/// `getTypedValue`), so an index that exists but cannot be decrypted arrives
-/// here as `StorageNotFound`. Hence the probe: a first run has no descriptor
-/// records, so finding one means this empty read is a fault and must not be
-/// written over. The probe goes through `list_all_shares`, which has no error
-/// channel of its own, so a fault that hides both the index and the records
-/// still reads as a first run. Closing that needs the platform to distinguish
-/// absent from unreadable; see `KeepMobileError::StorageNotFound`.
+/// The one case that cannot be refused is `StorageNotFound`, because a device
+/// on its first run has to be able to write its first descriptor, and this
+/// layer has no way to tell that apart from an index it merely cannot read.
+/// The Android implementation reads metadata through a path that collapses "key
+/// absent" and "value unreadable" into the same `null` (`KeystoreEncryptedPrefs`
+/// `getTypedValue`), so an index that exists but will not decrypt arrives here
+/// as `StorageNotFound` and is believed. Closing that needs the platform to
+/// report the two cases apart; there is no sound check on this side, because
+/// every independent signal available here reads through the same collapsing
+/// getter, and probing for a surviving descriptor record would route through
+/// `loadMetadata`, which destroys the record it cannot decrypt.
+///
+/// So what this function guarantees is narrower than "no reference is ever
+/// lost": a corrupt index is never parsed as empty, and no read ever writes.
 fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>, KeepMobileError> {
     match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
         Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
             msg: format!("{DESCRIPTOR_INDEX_CORRUPT_MSG}: {e}"),
         }),
-        Err(KeepMobileError::StorageNotFound) => match any_descriptor_record_exists(storage) {
-            Some(group_hex) => Err(KeepMobileError::StorageError {
-                msg: format!(
-                    "descriptor index reads as absent while a descriptor record for \
-                     {group_hex} exists, so it is unreadable rather than unset"
-                ),
-            }),
-            None => Ok(Vec::new()),
-        },
+        Err(KeepMobileError::StorageNotFound) => Ok(Vec::new()),
         Err(e) => Err(e),
     }
 }
@@ -454,6 +434,13 @@ pub(crate) fn persist_descriptor(
     // it is invisible to every list, and on a device whose index did not exist
     // yet it is indistinguishable from the index being unreadable, which the
     // read below refuses, so a retry would stay refused.
+    // For a group already in the index this read is a pure gate: nothing below
+    // writes the index. A transient index fault therefore refuses an update
+    // that would have been safe, which costs the caller its work (a device
+    // registration discards the HMAC it just obtained from the signer and has
+    // to repeat the exchange). Accepted because the alternative is another
+    // metadata read to decide, carrying the same wipe-on-decrypt-failure
+    // hazard, to save a retry rather than any data.
     let mut index = load_descriptor_index(storage)?;
     if !index.contains(&info.group_pubkey) {
         index.push(info.group_pubkey.clone());
@@ -1231,31 +1218,38 @@ mod descriptor_index_tests {
         assert_eq!(faulty.index(), vec![AA.to_string(), BB.to_string()]);
     }
 
-    // The index read answering `StorageNotFound` is not proof of a first run,
-    // because that is also what Android reports for an index it cannot decrypt.
-    // A descriptor record for a listed share is independent evidence that this
-    // device is not on its first run, so the empty read must be refused rather
-    // than written over.
+    // Characterization, not an endorsement: an index that reads as absent is
+    // treated as a first run, which is what lets a genuine first device save its
+    // first descriptor. On Android that same read is what an index it cannot
+    // decrypt produces, so this is the path by which a fault can still cost
+    // references, and it is deliberately not defended here: every independent
+    // signal available to this layer reads through the same collapsing getter,
+    // and probing for a surviving record would route through the platform call
+    // that destroys the record it cannot decrypt. This test exists so the
+    // behavior is visible and fails loudly when the platform starts reporting
+    // absent and unreadable apart.
     #[test]
-    fn an_index_reading_as_absent_is_refused_when_a_descriptor_record_exists() {
+    fn an_index_that_reads_as_absent_is_treated_as_a_first_run() {
         let (faulty, storage) = storage_with(&[AA]);
         faulty.set_listed(&[AA]);
         faulty.fault(&faulty.unreadable_as_not_found, DESCRIPTOR_INDEX_KEY);
 
-        load_descriptors(&storage)
-            .expect_err("an index that reads as absent while records exist is a fault");
-        persist_descriptor(&storage, &descriptor(BB))
-            .expect_err("and it must not be rewritten from that read");
+        assert!(
+            load_descriptors(&storage).unwrap().loaded.is_empty(),
+            "the surviving reference is not reported"
+        );
+        persist_descriptor(&storage, &descriptor(BB)).expect("and the save proceeds");
 
         faulty.clear_faults();
         assert_eq!(
             faulty.index(),
-            vec![AA.to_string()],
-            "the existing reference survives"
+            vec![BB.to_string()],
+            "losing the reference the unreadable index held, which only the \
+             platform can prevent"
         );
         assert!(
-            faulty.raw(&descriptor_key(BB)).is_none(),
-            "and the refused save wrote nothing"
+            faulty.raw(&descriptor_key(AA)).is_some(),
+            "the record itself survives, so the platform fix recovers it"
         );
     }
 

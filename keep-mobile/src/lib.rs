@@ -2752,13 +2752,24 @@ impl KeepMobile {
         // A backup is a durable artifact the user restores from and then wipes
         // the device trusting it, so an incomplete one is worse than none. The
         // list view can afford to hide a descriptor it cannot read; this cannot.
+        //
+        // The groups are named because this cannot tell an unreadable record
+        // from an index entry whose record is simply gone, and nothing prunes
+        // the latter any more, so a stale entry would otherwise block every
+        // future backup with no way for the user to learn which descriptor to
+        // clear. Naming them makes `wallet_descriptor_delete` the escape hatch.
+        // keep-android settled the same question the same way for shares: a
+        // share listed but never stored "would otherwise block backups
+        // forever". Group pubkeys are public, so naming them discloses nothing.
         let load = persistence::load_descriptors(&self.storage)?;
         if !load.unreadable.is_empty() {
             return Err(KeepMobileError::BackupError {
                 msg: format!(
-                    "refusing to back up an incomplete descriptor set: {} of {} records could not be read",
+                    "refusing to back up an incomplete descriptor set: {} of {} records \
+                     could not be read. Clear or repair these groups and retry: {}",
                     load.unreadable.len(),
-                    load.unreadable.len() + load.loaded.len()
+                    load.unreadable.len() + load.loaded.len(),
+                    load.unreadable.join(", ")
                 ),
             });
         }
@@ -4929,6 +4940,38 @@ mod import_teardown_tests {
                  node must not be left holding it"
             );
         });
+    }
+
+    // A backup missing a wallet descriptor is the dangerous kind of incomplete,
+    // because the user restores from it elsewhere and then wipes the device
+    // trusting it. The refusal has to name the groups: this layer cannot tell an
+    // unreadable record from an index entry whose record is gone, and nothing
+    // prunes the latter, so without the names a stale entry blocks every future
+    // backup and the user cannot learn which descriptor to clear.
+    #[test]
+    fn create_backup_refuses_an_incomplete_descriptor_set_and_names_the_groups() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let orphan = "aa".repeat(32);
+
+        // An index entry whose record never landed, which is what a failed
+        // descriptor save or a platform wipe leaves behind.
+        storage
+            .store_share_by_key(
+                DESCRIPTOR_INDEX_KEY.into(),
+                serde_json::to_vec(&vec![orphan.clone()]).unwrap(),
+                persistence::storage_metadata("descriptor_index"),
+            )
+            .unwrap();
+
+        let err = mobile
+            .create_backup("a-sufficiently-long-passphrase".into())
+            .expect_err("an incomplete descriptor set must not be backed up");
+        let msg = err.to_string() + &format!("{err:?}");
+        assert!(
+            msg.contains(&orphan),
+            "the refusal must name the group to clear, got: {msg}"
+        );
     }
 
     // A corrupt active-share record must degrade gracefully to `None` without
