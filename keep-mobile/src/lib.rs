@@ -2012,6 +2012,13 @@ impl KeepMobile {
         Ok(result)
     }
 
+    /// List the stored wallet descriptors.
+    ///
+    /// Every returned `DeviceRegistrationInfo` has its `hmac` field cleared, as
+    /// `wallet_register_on_device` does, so no caller of this list receives a
+    /// raw registration token. A foreign `SecureStorage` implementation still
+    /// holds the token at rest inside the descriptor record it persists, which
+    /// is why that trait requires platform secure storage.
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
         // The exported signature cannot carry the error, so an unreadable index
         // still shows as an empty list. What it no longer does is drive a write:
@@ -2019,7 +2026,25 @@ impl KeepMobile {
         // read. Making the failure visible here needs a fallible signature,
         // which is a binding change for the Android consumer.
         persistence::load_descriptors(&self.storage)
-            .map(|load| load.loaded)
+            .map(|load| {
+                // Strip the raw registration tokens, as `wallet_register_on_device`
+                // does: no list caller needs a value it could log or display, and
+                // the generated binding gives the foreign record its own
+                // `toString` over every field. The strip cannot move into
+                // `stored_to_info`, because `create_backup` reads `hmac` from
+                // that same value, and a backup without the tokens restores
+                // registrations stripped of the opaque value the device
+                // returned, which nothing can regenerate.
+                load.loaded
+                    .into_iter()
+                    .map(|mut d| {
+                        for reg in &mut d.device_registrations {
+                            reg.hmac = None;
+                        }
+                        d
+                    })
+                    .collect()
+            })
             .unwrap_or_else(|e| {
                 tracing::warn!("Cannot read the descriptor index, reporting no descriptors: {e}");
                 Vec::new()
@@ -4960,6 +4985,74 @@ mod import_teardown_tests {
         mobile
             .create_backup("a-sufficiently-long-passphrase".into())
             .expect("an unreadable descriptor must not deny the share backup");
+    }
+
+    // The list surface must not hand foreign code a raw registration token,
+    // while the internal path that needs it must still see it: `create_backup`
+    // reads `hmac` off the same `load_descriptors` value, and a backup stripped
+    // of the tokens loses for good the opaque value the device returned.
+    #[test]
+    fn listing_descriptors_does_not_expose_the_registration_hmac() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let group = "bb".repeat(32);
+        let token = "cd".repeat(32);
+
+        let mut desc = WalletDescriptorInfo {
+            group_pubkey: group.clone(),
+            external_descriptor: "wpkh(xpub.../0/*)".into(),
+            internal_descriptor: "wpkh(xpub.../1/*)".into(),
+            network: "bitcoin".into(),
+            created_at: 1_700_000_000,
+            device_registrations: vec![],
+            policy_hash_hex: None,
+            version: 1,
+            previous_descriptor_hash_hex: None,
+            policy_json: None,
+        };
+        desc.device_registrations.push(DeviceRegistrationInfo {
+            signer_pubkey: "ee".repeat(32),
+            wallet_name: "signer".into(),
+            hmac: Some(token.clone()),
+            registered_at: 1_700_000_000,
+            device_kind: None,
+            fingerprint_hex: None,
+            firmware_version: None,
+        });
+        persistence::persist_descriptor(&storage, &desc).unwrap();
+
+        let listed = mobile.wallet_descriptor_list();
+        assert_eq!(listed.len(), 1, "the descriptor is listed");
+        assert_eq!(
+            listed[0].device_registrations.len(),
+            1,
+            "the registration itself is still reported"
+        );
+        assert!(
+            listed[0].device_registrations[0].hmac.is_none(),
+            "the raw registration token must not cross the UniFFI boundary"
+        );
+
+        let load = persistence::load_descriptors(&storage).unwrap();
+        assert_eq!(
+            load.loaded[0].device_registrations[0].hmac.as_deref(),
+            Some(token.as_str()),
+            "the backup path must still see the token the list hides"
+        );
+
+        // Pin the token into the backup itself, not just into the shared
+        // conversion: a `create_backup` rewritten to read the stripped list
+        // would drop the tokens from every backup, and the assertion above
+        // would not catch it.
+        let pass = "a-sufficiently-long-passphrase";
+        let bytes = mobile.create_backup(pass.into()).unwrap();
+        let decrypted = decrypt_backup_data(&bytes, pass).unwrap();
+        let backed_up = &decrypted.wallet_descriptors[0].device_registrations[0];
+        assert_eq!(
+            backed_up.hmac.as_deref().map(|h| hex::encode(h.as_slice())),
+            Some(token.clone()),
+            "the backup must carry the registration token"
+        );
     }
 
     // A corrupt active-share record must degrade gracefully to `None` without
