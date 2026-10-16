@@ -740,6 +740,10 @@ mod tests {
     // relay -> subscribe -> apply -> decrypt -- with no mocking of the pieces under test.
     #[tokio::test]
     async fn active_write_reaches_standby_end_to_end() {
+        // The only relay this binary starts, so it cannot lose the port race
+        // the other crates' tests retry around (nostr-relay-builder probes a
+        // random port with a listener it drops before the real bind). A second
+        // relay test in this crate needs that retry.
         let relay = MockRelay::run().await.unwrap();
         let url = relay.url().await.to_string();
         let identity = Keys::generate();
