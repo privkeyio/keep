@@ -1230,6 +1230,44 @@ mod descriptor_index_tests {
         );
     }
 
+    // The one fault-to-destructive-write chain this layer cannot break, start to
+    // finish. The index key is itself a metadata key, so a platform read of it
+    // that cannot decrypt destroys it before reporting; the next read then
+    // answers `StorageNotFound`, which is indistinguishable from a first run,
+    // and the save after that writes an index holding only the new descriptor.
+    // Every step after the first is this code behaving exactly as documented,
+    // which is why the break has to come from the platform reporting absent and
+    // unreadable apart. This test fails loudly when it does.
+    #[test]
+    fn a_wiped_index_read_leads_to_a_truncated_index_on_the_next_save() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty.fault(&faulty.wipe_on_read, DESCRIPTOR_INDEX_KEY);
+
+        load_descriptors(&storage).expect_err("the read refuses, having destroyed the index");
+        assert!(
+            faulty.raw(DESCRIPTOR_INDEX_KEY).is_none(),
+            "the backend wiped the index on the failed read"
+        );
+
+        faulty.clear_faults();
+        assert!(
+            load_descriptors(&storage).unwrap().loaded.is_empty(),
+            "the index is now genuinely gone, so it reads as a first run"
+        );
+        persist_descriptor(&storage, &descriptor(CC)).unwrap();
+        assert_eq!(
+            faulty.index(),
+            vec![CC.to_string()],
+            "and the next save writes only the new descriptor"
+        );
+        for group in [AA, BB] {
+            assert!(
+                faulty.raw(&descriptor_key(group)).is_some(),
+                "while both records survive, now unreferenced and unreachable"
+            );
+        }
+    }
+
     // The worst of the index writers: persist read the index, got an empty vec
     // from the swallowed failure, and wrote back an index holding only the new
     // descriptor, dropping every other wallet reference on the device.
