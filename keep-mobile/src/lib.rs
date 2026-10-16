@@ -2013,7 +2013,14 @@ impl KeepMobile {
     }
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
-        persistence::load_descriptors(&self.storage)
+        // The exported signature cannot carry the error, so an unreadable index
+        // still shows as an empty list. What matters is that the index is no
+        // longer rewritten from that empty read, so the next save keeps every
+        // descriptor reference and the list recovers once storage does.
+        persistence::load_descriptors(&self.storage).unwrap_or_else(|e| {
+            tracing::warn!("Cannot read the descriptor index, reporting no descriptors: {e}");
+            Vec::new()
+        })
     }
 
     pub fn wallet_descriptor_export(
@@ -2739,7 +2746,7 @@ impl KeepMobile {
             });
         }
 
-        let descriptors = persistence::load_descriptors(&self.storage);
+        let descriptors = persistence::load_descriptors(&self.storage)?;
         let mut core_descriptors = Vec::with_capacity(descriptors.len());
         for d in &descriptors {
             let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;

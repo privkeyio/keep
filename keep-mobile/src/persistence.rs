@@ -273,10 +273,20 @@ pub(crate) fn storage_metadata(name: &str) -> ShareMetadataInfo {
     }
 }
 
-fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Vec<String> {
+/// Read the descriptor index, distinguishing "no index yet" from "cannot read
+/// the index right now".
+///
+/// Every caller rewrites the index from what this returns, so collapsing a
+/// decrypt or I/O failure into an empty vec made the next write drop every
+/// descriptor reference the device had. Only a positive absence is an empty
+/// index; anything else is an error the caller must refuse to write over.
+fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>, KeepMobileError> {
     match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
-        Ok(data) => serde_json::from_slice(&data).unwrap_or_default(),
-        Err(_) => Vec::new(),
+        Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to deserialize descriptor index: {e}"),
+        }),
+        Err(KeepMobileError::StorageNotFound) => Ok(Vec::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -294,10 +304,23 @@ fn persist_descriptor_index(
     )
 }
 
-pub(crate) fn load_descriptors(storage: &Arc<dyn SecureStorage>) -> Vec<WalletDescriptorInfo> {
-    let index = load_descriptor_index(storage);
+/// Load every descriptor the index references, pruning only the entries whose
+/// record is positively gone.
+///
+/// Pruning is a write that makes an absence permanent, so it must be driven by
+/// proof of absence. A decrypt or I/O failure is not proof: one unreadable
+/// prefs key fails every record in a single pass and used to empty the index
+/// outright, leaving the surviving records unreferenced. A record that reads
+/// but will not deserialize is also kept, because a version skew looks the
+/// same as corruption and dropping the reference removes the only path back to
+/// it. Either way the descriptor is left out of the returned list, so a fault
+/// hides descriptors for this call instead of deleting their references.
+pub(crate) fn load_descriptors(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<Vec<WalletDescriptorInfo>, KeepMobileError> {
+    let index = load_descriptor_index(storage)?;
     let mut result = Vec::with_capacity(index.len());
-    let mut stale = Vec::new();
+    let mut missing = Vec::new();
     for group_hex in &index {
         match storage.load_share_by_key(descriptor_key(group_hex)) {
             Ok(data) => match serde_json::from_slice::<StoredDescriptor>(&data) {
@@ -305,21 +328,25 @@ pub(crate) fn load_descriptors(storage: &Arc<dyn SecureStorage>) -> Vec<WalletDe
                     result.push(stored_to_info(stored));
                 }
                 Err(e) => {
-                    tracing::warn!("Corrupt descriptor for {group_hex}: {e}");
-                    stale.push(group_hex.clone());
+                    tracing::warn!(
+                        "Unreadable descriptor for {group_hex}, keeping index entry: {e}"
+                    );
                 }
             },
+            Err(KeepMobileError::StorageNotFound) => {
+                tracing::warn!("Descriptor record for {group_hex} is gone, pruning index entry");
+                missing.push(group_hex.clone());
+            }
             Err(e) => {
-                tracing::warn!("Missing descriptor for {group_hex}: {e}");
-                stale.push(group_hex.clone());
+                tracing::warn!("Cannot read descriptor for {group_hex}, keeping index entry: {e}");
             }
         }
     }
-    if !stale.is_empty() {
-        let cleaned: Vec<String> = index.into_iter().filter(|k| !stale.contains(k)).collect();
+    if !missing.is_empty() {
+        let cleaned: Vec<String> = index.into_iter().filter(|k| !missing.contains(k)).collect();
         let _ = persist_descriptor_index(storage, &cleaned);
     }
-    result
+    Ok(result)
 }
 
 pub(crate) fn load_descriptor(
@@ -369,7 +396,7 @@ pub(crate) fn persist_descriptor(
         storage_metadata("descriptor"),
     )?;
 
-    let mut index = load_descriptor_index(storage);
+    let mut index = load_descriptor_index(storage)?;
     if !index.contains(&info.group_pubkey) {
         index.push(info.group_pubkey.clone());
         persist_descriptor_index(storage, &index)?;
@@ -454,7 +481,7 @@ pub(crate) fn delete_descriptor(
 ) -> Result<(), KeepMobileError> {
     storage.delete_share_by_key(descriptor_key(group_pubkey_hex))?;
 
-    let mut index = load_descriptor_index(storage);
+    let mut index = load_descriptor_index(storage)?;
     if let Some(pos) = index.iter().position(|k| k == group_pubkey_hex) {
         index.swap_remove(pos);
         persist_descriptor_index(storage, &index)?;
@@ -882,5 +909,220 @@ pub(crate) fn delete_pending_dkg_stash(
     match storage.delete_share_by_key(marker_key.into()) {
         Ok(()) | Err(KeepMobileError::StorageNotFound) => Ok(()),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod descriptor_index_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+
+    /// Keyed storage whose reads can be made to fail for chosen keys, the way a
+    /// prefs HMAC key that will not decrypt right now fails them: the record is
+    /// still there, it just cannot be read.
+    #[derive(Default)]
+    struct FaultyStorage {
+        records: Mutex<HashMap<String, Vec<u8>>>,
+        unreadable: Mutex<HashSet<String>>,
+    }
+
+    impl FaultyStorage {
+        fn make_unreadable(&self, key: &str) {
+            self.unreadable.lock().unwrap().insert(key.into());
+        }
+
+        fn make_readable(&self, key: &str) {
+            self.unreadable.lock().unwrap().remove(key);
+        }
+
+        fn index(&self) -> Vec<String> {
+            let records = self.records.lock().unwrap();
+            let data = records
+                .get(DESCRIPTOR_INDEX_KEY)
+                .expect("index was never written");
+            serde_json::from_slice(data).expect("index is not valid json")
+        }
+    }
+
+    impl SecureStorage for FaultyStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            unimplemented!()
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            unimplemented!()
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            unimplemented!()
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            self.records.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            if self.unreadable.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "cannot decrypt right now".into(),
+                });
+            }
+            self.records
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            vec![]
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.records.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            None
+        }
+        fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+    }
+
+    fn descriptor(group_hex: &str) -> WalletDescriptorInfo {
+        WalletDescriptorInfo {
+            group_pubkey: group_hex.into(),
+            external_descriptor: "wpkh(xpub.../0/*)".into(),
+            internal_descriptor: "wpkh(xpub.../1/*)".into(),
+            network: "bitcoin".into(),
+            created_at: 1_700_000_000,
+            device_registrations: vec![],
+            policy_hash_hex: None,
+            version: 1,
+            previous_descriptor_hash_hex: None,
+            policy_json: None,
+        }
+    }
+
+    fn storage_with(groups: &[&str]) -> (Arc<FaultyStorage>, Arc<dyn SecureStorage>) {
+        let faulty = Arc::new(FaultyStorage::default());
+        let storage: Arc<dyn SecureStorage> = faulty.clone();
+        for group in groups {
+            persist_descriptor(&storage, &descriptor(group)).unwrap();
+        }
+        assert_eq!(faulty.index().len(), groups.len());
+        (faulty, storage)
+    }
+
+    // An unreadable record is not an absent one. One prefs key that will not
+    // decrypt fails every descriptor in a single pass, so pruning on it emptied
+    // the index and left every surviving record unreferenced.
+    #[test]
+    fn an_unreadable_descriptor_keeps_its_index_entry() {
+        let (faulty, storage) = storage_with(&["aa", "bb"]);
+        faulty.make_unreadable(&descriptor_key("aa"));
+        faulty.make_unreadable(&descriptor_key("bb"));
+
+        assert!(load_descriptors(&storage).unwrap().is_empty());
+        assert_eq!(
+            faulty.index().len(),
+            2,
+            "a read failure must not prune the index"
+        );
+
+        faulty.make_readable(&descriptor_key("aa"));
+        faulty.make_readable(&descriptor_key("bb"));
+        assert_eq!(
+            load_descriptors(&storage).unwrap().len(),
+            2,
+            "both descriptors come back once storage recovers"
+        );
+    }
+
+    // A record that is positively gone is still pruned: that is proof of
+    // absence, and leaving the entry would warn on every list forever.
+    #[test]
+    fn a_deleted_descriptor_is_pruned_from_the_index() {
+        let (faulty, storage) = storage_with(&["aa", "bb"]);
+        storage
+            .delete_share_by_key(descriptor_key("aa"))
+            .expect("delete the record behind the index entry");
+
+        let loaded = load_descriptors(&storage).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].group_pubkey, "bb");
+        assert_eq!(faulty.index(), vec!["bb".to_string()]);
+    }
+
+    // The worst of the three index writers: persist read the index, got an
+    // empty vec from the failure, and wrote back an index holding only the new
+    // descriptor, dropping every other wallet reference the device had.
+    #[test]
+    fn persisting_a_descriptor_refuses_an_unreadable_index() {
+        let (faulty, storage) = storage_with(&["aa", "bb"]);
+        faulty.make_unreadable(DESCRIPTOR_INDEX_KEY);
+
+        let err = persist_descriptor(&storage, &descriptor("cc"))
+            .expect_err("an unreadable index must not be rewritten");
+        assert!(matches!(err, KeepMobileError::StorageError { .. }));
+
+        faulty.make_readable(DESCRIPTOR_INDEX_KEY);
+        assert_eq!(
+            faulty.index(),
+            vec!["aa".to_string(), "bb".to_string()],
+            "the existing references survive the failed save"
+        );
+    }
+
+    #[test]
+    fn deleting_a_descriptor_refuses_an_unreadable_index() {
+        let (faulty, storage) = storage_with(&["aa", "bb"]);
+        faulty.make_unreadable(DESCRIPTOR_INDEX_KEY);
+
+        persist_descriptor(&storage, &descriptor("cc"))
+            .expect_err("precondition: index unreadable");
+        delete_descriptor(&storage, "aa").expect_err("an unreadable index must not be rewritten");
+
+        faulty.make_readable(DESCRIPTOR_INDEX_KEY);
+        assert_eq!(faulty.index(), vec!["aa".to_string(), "bb".to_string()]);
+    }
+
+    // A missing index is a first run, not a fault, so the first save still works.
+    #[test]
+    fn a_missing_index_reads_as_empty() {
+        let faulty = Arc::new(FaultyStorage::default());
+        let storage: Arc<dyn SecureStorage> = faulty.clone();
+
+        assert!(load_descriptors(&storage).unwrap().is_empty());
+        persist_descriptor(&storage, &descriptor("aa")).unwrap();
+        assert_eq!(faulty.index(), vec!["aa".to_string()]);
+    }
+
+    // A corrupt index blob is not an empty one: rewriting it from a parse
+    // failure is the same reference loss as rewriting it from a read failure.
+    #[test]
+    fn a_corrupt_index_is_not_treated_as_empty() {
+        let faulty = Arc::new(FaultyStorage::default());
+        let storage: Arc<dyn SecureStorage> = faulty.clone();
+        storage
+            .store_share_by_key(
+                DESCRIPTOR_INDEX_KEY.into(),
+                b"not json".to_vec(),
+                storage_metadata("descriptor_index"),
+            )
+            .unwrap();
+
+        load_descriptors(&storage).expect_err("a corrupt index must surface, not read as empty");
+        persist_descriptor(&storage, &descriptor("aa"))
+            .expect_err("a corrupt index must not be overwritten");
     }
 }
