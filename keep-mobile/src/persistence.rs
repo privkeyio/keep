@@ -446,19 +446,24 @@ pub(crate) fn persist_descriptor(
         msg: format!("Failed to serialize descriptor: {e}"),
     })?;
 
-    // Read the index before writing the record. Failing after the record is
-    // stored leaves it orphaned: `wallet_descriptor_get` finds it by key while
-    // `wallet_descriptor_list` never shows it, and nothing cleans it up.
+    // Index first, then the record. Both orders can fail in between, so the
+    // choice is which half-applied state to leave. An index entry with no
+    // record is benign and self-correcting: the load path reports it as
+    // unreadable without pruning it, and a retry finds the entry already
+    // present and just writes the record. A record with no index entry is not:
+    // it is invisible to every list, and on a device whose index did not exist
+    // yet it is indistinguishable from the index being unreadable, which the
+    // read below refuses, so a retry would stay refused.
     let mut index = load_descriptor_index(storage)?;
+    if !index.contains(&info.group_pubkey) {
+        index.push(info.group_pubkey.clone());
+        persist_descriptor_index(storage, &index)?;
+    }
     storage.store_share_by_key(
         descriptor_key(&info.group_pubkey),
         data,
         storage_metadata("descriptor"),
     )?;
-    if !index.contains(&info.group_pubkey) {
-        index.push(info.group_pubkey.clone());
-        persist_descriptor_index(storage, &index)?;
-    }
     Ok(())
 }
 
@@ -996,6 +1001,8 @@ mod descriptor_index_tests {
         /// clears the per-key prefs file before throwing, and only the DKG
         /// marker is exempt.
         wipe_on_read: Mutex<HashSet<String>>,
+        /// Writes to these keys fail, the previous contents intact.
+        unwritable: Mutex<HashSet<String>>,
         listed: Mutex<Vec<ShareMetadataInfo>>,
     }
 
@@ -1016,6 +1023,7 @@ mod descriptor_index_tests {
         }
 
         fn clear_faults(&self) {
+            self.unwritable.lock().unwrap().clear();
             self.unreadable.lock().unwrap().clear();
             self.unreadable_as_not_found.lock().unwrap().clear();
             self.wipe_on_read.lock().unwrap().clear();
@@ -1058,6 +1066,11 @@ mod descriptor_index_tests {
             data: Vec<u8>,
             _: ShareMetadataInfo,
         ) -> Result<(), KeepMobileError> {
+            if self.unwritable.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "cannot write right now".into(),
+                });
+            }
             self.records.lock().unwrap().insert(key, data);
             Ok(())
         }
@@ -1322,6 +1335,45 @@ mod descriptor_index_tests {
             faulty.raw(DESCRIPTOR_INDEX_KEY).unwrap(),
             b"not json".to_vec()
         );
+    }
+
+    // The half-applied state the write order is chosen for. An index entry whose
+    // record never landed is reported, never pruned, and a retry completes the
+    // save; the reverse order would leave a record no list can see, on a device
+    // whose absent index the read path then refuses, so the retry stays refused.
+    #[test]
+    fn an_index_entry_whose_record_failed_to_write_is_recoverable() {
+        let (faulty, storage) = storage_with(&[AA]);
+        faulty.fault(&faulty.unwritable, &descriptor_key(BB));
+
+        persist_descriptor(&storage, &descriptor(BB)).expect_err("the record write fails");
+        assert_eq!(
+            faulty.index(),
+            vec![AA.to_string(), BB.to_string()],
+            "the index entry landed first"
+        );
+        assert!(
+            faulty.raw(&descriptor_key(BB)).is_none(),
+            "the record did not"
+        );
+
+        let load = load_descriptors(&storage).unwrap();
+        assert_eq!(load.loaded.len(), 1);
+        assert_eq!(load.unreadable, vec![BB.to_string()]);
+        assert_eq!(
+            faulty.index(),
+            vec![AA.to_string(), BB.to_string()],
+            "and the read path still does not prune it"
+        );
+
+        faulty.clear_faults();
+        persist_descriptor(&storage, &descriptor(BB)).expect("the retry completes the save");
+        assert_eq!(
+            faulty.index(),
+            vec![AA.to_string(), BB.to_string()],
+            "with no duplicate entry"
+        );
+        assert_eq!(load_descriptors(&storage).unwrap().loaded.len(), 2);
     }
 
     #[test]
