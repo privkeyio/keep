@@ -4426,14 +4426,21 @@ impl KeepMobile {
         })
     }
 
+    /// Resolve the active share when no pointer is set, without writing one.
+    ///
+    /// `list_all_shares` has no error channel, so a platform storage fault is
+    /// indistinguishable from a genuinely short set: a fault that leaves one
+    /// readable share looks exactly like owning one share. Persisting the
+    /// inferred pointer turned that transient fault into a permanent repoint of
+    /// the active account, which outlived the fault and was never surfaced,
+    /// while the same fault leaving two entries errors cleanly below. Resolving
+    /// per call keeps the convenience and lets the next call see the full set
+    /// once storage recovers, at which point it errors rather than silently
+    /// standing on a stale choice.
     fn resolve_active_share(&self) -> Result<String, KeepMobileError> {
         let shares = self.storage.list_all_shares();
         match shares.len() {
-            1 => {
-                let key = hex::encode(&shares[0].group_pubkey);
-                self.storage.set_active_share_key(Some(key.clone()))?;
-                Ok(key)
-            }
+            1 => Ok(hex::encode(&shares[0].group_pubkey)),
             0 => self.migrate_legacy_share(),
             _ => Err(KeepMobileError::StorageError {
                 msg: "Multiple shares found, please select one".into(),
@@ -4627,6 +4634,92 @@ mod import_teardown_tests {
             full.verifying_shares()
         );
         assert_eq!(completed.metadata.name, "learned");
+    }
+
+    // A platform storage fault that hides shares makes `list_all_shares`
+    // return a short list, and a short list holding exactly one entry is
+    // indistinguishable from owning one share. Resolving it is fine; writing
+    // it is not, because the pointer outlives the fault and silently repoints
+    // the active account. The same fault leaving two entries already errored,
+    // so this closes the asymmetry that made the one-entry case the quiet one.
+    #[test]
+    fn resolving_an_active_share_does_not_persist_the_pointer() {
+        struct TruncatingStorage {
+            inner: MemStorage,
+            listed: Vec<ShareMetadataInfo>,
+        }
+
+        impl SecureStorage for TruncatingStorage {
+            fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+                self.inner.store_share(d, m)
+            }
+            fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share()
+            }
+            fn has_share(&self) -> bool {
+                self.inner.has_share()
+            }
+            fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+                self.inner.get_share_metadata()
+            }
+            fn delete_share(&self) -> Result<(), KeepMobileError> {
+                self.inner.delete_share()
+            }
+            fn store_share_by_key(
+                &self,
+                k: String,
+                d: Vec<u8>,
+                m: ShareMetadataInfo,
+            ) -> Result<(), KeepMobileError> {
+                self.inner.store_share_by_key(k, d, m)
+            }
+            fn load_share_by_key(&self, k: String) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share_by_key(k)
+            }
+            // The fault: one readable entry while two shares are on disk.
+            fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+                self.listed.clone()
+            }
+            fn delete_share_by_key(&self, k: String) -> Result<(), KeepMobileError> {
+                self.inner.delete_share_by_key(k)
+            }
+            fn get_active_share_key(&self) -> Option<String> {
+                self.inner.get_active_share_key()
+            }
+            fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
+                self.inner.set_active_share_key(k)
+            }
+        }
+
+        let meta = |name: &str, b: u8| ShareMetadataInfo {
+            name: name.into(),
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: vec![b; 32],
+            did_backup: false,
+        };
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(TruncatingStorage {
+            inner: MemStorage::default(),
+            listed: vec![meta("survivor", 0xaa)],
+        });
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "precondition: no pointer is set, so resolve runs"
+        );
+        assert_eq!(
+            mobile.resolve_active_share().unwrap(),
+            hex::encode([0xaau8; 32]),
+            "the single listed share still resolves for this call"
+        );
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "a pointer inferred from an untrusted list must not be written: once \
+             storage recovers, the full set has to be seen again"
+        );
     }
 
     // A corrupt active-share record must degrade gracefully to `None` without
