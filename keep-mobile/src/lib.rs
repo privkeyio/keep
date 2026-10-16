@@ -1265,26 +1265,35 @@ impl KeepMobile {
             self.storage.set_active_share_key(None)?;
         }
 
-        self.storage.delete_share_by_key(group_pubkey)?;
-
-        // Last, and unconditional. Unconditional because the pointer does not
-        // say which share the live node was built from: `load_share_package`
+        // Attempt the removal first, then tear down whatever the outcome.
+        //
+        // Unconditional over the pointer, because the pointer does not say
+        // which share the live node was built from: `load_share_package`
         // resolves the share when no pointer is set, so a node can be running
         // on a share the pointer never named, and gating teardown on the
         // pointer left that node holding the deleted share's key material,
         // still subscribed to the relays and still able to contribute signature
-        // shares, with any already-queued request still approvable. Last
-        // because `do_initialize` holds `node_lifecycle_lock` across both the
-        // share load and the node install while taking no `active_share_lock`,
-        // so tearing down before the record is gone leaves a window where a
-        // concurrent initialize resolves the still-present share and installs a
-        // node on it. Running the teardown after the removal means such an
-        // initialize either no longer finds the record or is serialized behind
-        // this teardown by that same lock. Tearing down for an unrelated delete
-        // costs a reconnect, which is the cheaper side of the trade.
+        // shares, with any already-queued request still approvable.
+        //
+        // After the removal, because `do_initialize` holds
+        // `node_lifecycle_lock` across both the share load and the node install
+        // while taking no `active_share_lock`. Tearing down before the record is
+        // gone leaves a window where a concurrent initialize resolves the
+        // still-present share and installs a node on it; doing it after means
+        // such an initialize either no longer finds the record or is serialized
+        // behind this teardown by that lock.
+        //
+        // Unconditional over the result too, because `delete_share_by_key` is
+        // not atomic. The Android implementation clears the share data, then
+        // deletes the keystore aliases, then rewrites the registry, and either
+        // of the last two can fail after the data is already gone. So an `Err`
+        // does not mean the share survived, and skipping the teardown on it
+        // would leave the live node holding the only remaining copy of a share
+        // the platform has already destroyed, while the caller is told the
+        // delete failed. Tearing down costs a reconnect either way.
+        let deleted = self.storage.delete_share_by_key(group_pubkey);
         self.invalidate_live_node();
-
-        Ok(())
+        deleted
     }
 
     // Load-modify-store without locking; acceptable in single-user mobile context
@@ -2227,15 +2236,17 @@ impl KeepMobile {
             });
         }
         self.runtime.block_on(async {
-            let (group_pubkey, result) = {
+            let (node, group_pubkey, result) = {
                 // Clone the handle and drop the guard before the ping. The ping
-                // waits out its full timeout (up to 300s) when peers do not
-                // answer, and tokio's RwLock is write-preferring, so holding
-                // the guard across it stalls `invalidate_live_node` and with it
-                // every caller that tears the node down: a share delete, an
-                // active-share switch, each cert-pin edit, all of which hold
-                // their own locks meanwhile. A node that is torn down mid-ping
-                // is why this takes a handle rather than a guard.
+                // sleeps out its full timeout unconditionally, up to 300s, and
+                // tokio's RwLock is write-preferring, so a pending writer also
+                // blocks new readers: holding this guard across the ping stalled
+                // `invalidate_live_node` and every `node.read()` caller for the
+                // whole window, on a healthy group. A share delete, an
+                // active-share switch and each cert-pin edit all tear the node
+                // down while holding their own locks, so the stall spread to
+                // those too. Taking a handle lets the teardown proceed under us,
+                // which is what the staleness check after the ping is for.
                 let node = {
                     let node_guard = self.node.read().await;
                     Arc::clone(node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?)
@@ -2245,8 +2256,25 @@ impl KeepMobile {
                     .health_check(Duration::from_secs(timeout_secs))
                     .await
                     .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
-                (gp, r)
+                (node, gp, r)
             };
+
+            // Pongs are only processed by the node's run task, so a teardown
+            // during the ping means nothing could answer and every peer comes
+            // back unresponsive. Reporting that would persist "all co-signers
+            // dead" for a healthy group, which in a multisig pushes a user
+            // toward recovery or rotation. Dropping the guard above is what
+            // allows the teardown, so the result has to be checked against the
+            // node that is live now before it is believed.
+            let still_current = match self.node.read().await.as_ref() {
+                Some(current) => Arc::ptr_eq(current, &node),
+                None => false,
+            };
+            if !still_current {
+                return Err(KeepMobileError::NetworkError {
+                    msg: "node was replaced during the health check".into(),
+                });
+            }
 
             if let Some(cb) = self.health_callbacks.read().await.as_ref() {
                 if let Err(e) = cb.on_health_check_complete(
@@ -4801,14 +4829,16 @@ mod import_teardown_tests {
         });
     }
 
-    // The observable consequence of tearing the node down after the record is
-    // removed rather than before: a delete that fails leaves the share in
-    // place, so the node that may be running on it must stay up. Tearing down
-    // first also left a window where a concurrent initialize could resolve the
-    // still-present share and install a node on it, which this ordering closes
-    // but a single-threaded test cannot show directly.
+    // A delete that reports failure must still tear the node down, because
+    // `SecureStorage::delete_share_by_key` is not atomic: the Android
+    // implementation clears the share data, then deletes the keystore aliases,
+    // then rewrites the registry, and either of the last two fails after the
+    // data is already gone. So an `Err` does not mean the share survived, and
+    // skipping the teardown on it would leave the live node holding the only
+    // remaining copy of a share the platform had already destroyed, still on
+    // the relays, while the caller is told the delete failed.
     #[test]
-    fn a_failed_share_delete_leaves_the_live_node_alone() {
+    fn a_failed_share_delete_still_tears_down_the_live_node() {
         struct UndeletableStorage(MemStorage);
 
         impl SecureStorage for UndeletableStorage {
@@ -4863,9 +4893,9 @@ mod import_teardown_tests {
             .expect_err("the storage delete fails");
         mobile.runtime.block_on(async {
             assert!(
-                !mobile.pending_requests.lock().await.is_empty(),
-                "the share survived the failed delete, so the node must not have \
-                 been torn down under it"
+                mobile.pending_requests.lock().await.is_empty(),
+                "a failed delete may already have destroyed the share, so the \
+                 node must not be left holding it"
             );
         });
     }
