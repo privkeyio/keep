@@ -160,6 +160,13 @@ impl From<keep_nip46::types::ConnectAuthorization> for ConnectAuthorization {
 #[uniffi::export(with_foreign)]
 pub trait BunkerCallbacks: Send + Sync {
     fn on_log(&self, event: BunkerLogEvent);
+    /// Asks the operator to allow one request, blocking the caller until it is
+    /// answered.
+    ///
+    /// The implementation must bound that wait and reject when it expires
+    /// (keep-android waits 60 seconds). The NIP-46 handler reads one request at
+    /// a time, so a wait that never ends stops every later request from every
+    /// client, not just this one.
     fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
@@ -184,20 +191,47 @@ impl ServerCallbacks for CallbackBridge {
     }
 
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
-        self.callbacks
-            .request_approval(BunkerApprovalRequest {
-                app_pubkey: request.app_pubkey.to_hex(),
-                app_name: request.app_name,
-                method: request.method,
-                event_kind: request.event_kind.map(|k| k.as_u16() as u32),
-                event_content: request.event_content,
-                requested_permissions: request.requested_permissions,
-                http_auth: request.http_auth.map(|d| BunkerHttpAuthDetails {
-                    url: d.url,
-                    method: d.method,
-                }),
-            })
-            .into()
+        let request = BunkerApprovalRequest {
+            app_pubkey: request.app_pubkey.to_hex(),
+            app_name: request.app_name,
+            method: request.method,
+            event_kind: request.event_kind.map(|k| k.as_u16() as u32),
+            event_content: request.event_content,
+            requested_permissions: request.requested_permissions,
+            http_auth: request.http_auth.map(|d| BunkerHttpAuthDetails {
+                url: d.url,
+                method: d.method,
+            }),
+        };
+        // The foreign implementation blocks until the operator answers or its
+        // own timeout fires, so hand this worker's core off for the wait, as
+        // the FROST approval path does in `lib.rs`. Queued tasks on the worker
+        // are stealable either way; what `block_in_place` adds is moving the
+        // one task in the LIFO slot back to the run queue and sending the core
+        // to another thread, so the worker's work keeps draining instead of
+        // waiting out the prompt. Later NIP-46 requests stall regardless, since
+        // the handler's notification loop reads one at a time.
+        //
+        // It also leaves the runtime for the duration of the call, so a foreign
+        // callback that re-enters an exported method built on
+        // `runtime.block_on` stops panicking and can deadlock instead if it
+        // waits on this runtime. Nothing in keep-android does that today.
+        //
+        // The gate reads the flavor rather than just `try_current`, because
+        // `block_in_place` panics on a current-thread runtime where
+        // `try_current` succeeds. It is still narrower than tokio's real
+        // precondition, which also forbids a `LocalSet` on a multi-thread
+        // runtime; nothing in-tree uses one.
+        let blocking = matches!(
+            tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        );
+        if blocking {
+            tokio::task::block_in_place(|| self.callbacks.request_approval(request))
+        } else {
+            self.callbacks.request_approval(request)
+        }
+        .into()
     }
 
     fn on_connect(
@@ -741,6 +775,7 @@ mod tests {
     use crate::BUNKER_CONFIG_STORAGE_KEY;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct MemStorage {
@@ -888,6 +923,99 @@ mod tests {
         let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*transport, *transport2);
         assert_eq!(*secret, *secret2);
+    }
+
+    // Two properties of the approval bridge, in the two runtime shapes that
+    // can reach it.
+    //
+    // On one worker thread, the foreign callback blocks on a channel that only
+    // another spawned task can feed. That task is queued behind the blocking
+    // call, so it runs only because `block_in_place` sends the core to another
+    // thread: without it the single worker is occupied, the feeder never runs
+    // and the callback reports the refusal its timeout produces.
+    //
+    // On a current-thread runtime the same call must not panic, which is what
+    // the flavor gate buys over the bare `Handle::try_current()` the FROST path
+    // in `lib.rs` uses. `block_in_place` would abort there.
+    #[test]
+    fn the_approval_bridge_leaves_the_worker_and_survives_a_current_thread_runtime() {
+        struct Waiter(Mutex<Option<std::sync::mpsc::Receiver<()>>>);
+        impl BunkerCallbacks for Waiter {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                let rx = self.0.lock().unwrap().take().expect("one call per Waiter");
+                BunkerApprovalResult {
+                    approved: rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+                    remember: BunkerRememberDuration::OneHour,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let bridge = |rx| CallbackBridge {
+            callbacks: Arc::new(Waiter(Mutex::new(Some(rx)))),
+            mobile: Arc::clone(&mobile),
+        };
+        let ask = |bridge: &CallbackBridge| {
+            ServerCallbacks::request_approval(
+                bridge,
+                ApprovalRequest {
+                    app_pubkey: PublicKey::from_slice(
+                        keep_core::keys::NostrKeypair::generate()
+                            .unwrap()
+                            .public_bytes(),
+                    )
+                    .unwrap(),
+                    app_name: "an app".into(),
+                    method: "sign_event".into(),
+                    event_kind: None,
+                    event_content: None,
+                    requested_permissions: None,
+                    http_auth: None,
+                },
+            )
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = bridge(rx);
+        let result = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                tokio::spawn(async move {
+                    tokio::spawn(async move {
+                        let _ = tx.send(());
+                    });
+                    ask(&worker)
+                })
+                .await
+                .unwrap()
+            });
+        assert!(
+            result.approved,
+            "the blocking callback kept the only worker, so the task that answers it never ran"
+        );
+        assert!(
+            matches!(
+                result.remember,
+                keep_nip46::types::RememberDuration::OneHour
+            ),
+            "the remember duration must survive the bridge unchanged"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(()).unwrap();
+        let single = bridge(rx);
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async { ask(&single) });
+        assert!(result.approved, "the answer must survive the fallback path");
     }
 
     // Rotating replaces both persisted secrets, so the derived bunker:// URL
