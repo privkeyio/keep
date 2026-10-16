@@ -9,6 +9,63 @@ use common::setup_keyring;
 use keep_core::error::{KeepError, NetworkError};
 use keep_nip46::{generate_bunker_url, Nip46Client, Server, ServerConfig};
 
+/// The outbound client is the direction where Keep dials someone else's
+/// bunker, and that socket carries sighashes and signing requests. Strict
+/// pinning has nothing to pin on a cleartext socket, so the connect must fail
+/// rather than return a client that silently carries nothing: `connect` only
+/// spawns attempts and `subscribe` queues against an empty pool, so both
+/// resolve `Ok` while every socket is being refused.
+///
+/// The lenient connect against the same relay is the timing witness: it proves
+/// the refusal is attributable to `require_pinned` and not to a relay this test
+/// could never reach.
+#[tokio::test]
+async fn strict_pinning_refuses_an_outbound_client_relay_it_cannot_pin() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let relay_url = mock_relay.url().await.to_string();
+    let signer = Keys::generate().public_key();
+
+    let pinning = |require_pinned| {
+        keep_frost_net::TlsPinning::new(
+            std::sync::Arc::new(std::sync::Mutex::new(
+                keep_frost_net::CertificatePinSet::default(),
+            )),
+            require_pinned,
+        )
+    };
+
+    let lenient = Nip46Client::connect_with(
+        signer,
+        vec![relay_url.clone()],
+        None,
+        None,
+        Some(pinning(false)),
+    )
+    .await
+    .expect("lenient pinning must reach the mock relay, or the refusal below proves nothing");
+    lenient.disconnect().await;
+
+    let err = Nip46Client::connect_with(
+        signer,
+        vec![relay_url.clone()],
+        None,
+        None,
+        Some(pinning(true)),
+    )
+    .await
+    .err()
+    .expect("strict pinning cannot pin a cleartext socket, so the connect must fail");
+    let err = err.to_string();
+    assert!(
+        err.to_lowercase().contains("relay"),
+        "the failure should name the relay connection, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_nip46_client_rejects_unknown_method() {
     rustls::crypto::ring::default_provider()
@@ -46,9 +103,15 @@ async fn test_nip46_client_rejects_unknown_method() {
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    let client = Nip46Client::connect_with(server_pubkey, vec![relay_url.clone()], bunker_secret)
-        .await
-        .expect("client connect");
+    let client = Nip46Client::connect_with(
+        server_pubkey,
+        vec![relay_url.clone()],
+        bunker_secret,
+        None,
+        None,
+    )
+    .await
+    .expect("client connect");
     client.connect().await.expect("connect handshake");
 
     // The keep-nip46 server does not implement register_wallet, so it should
@@ -79,7 +142,7 @@ async fn test_nip46_client_parses_bunker_url() {
         .install_default()
         .ok();
 
-    let bad = Nip46Client::connect_to("not-a-bunker-url").await;
+    let bad = Nip46Client::connect_to("not-a-bunker-url", None, None).await;
     assert!(bad.is_err(), "invalid URL must be rejected");
 
     let mock_relay = MockRelay::run().await.expect("mock relay");
@@ -87,7 +150,7 @@ async fn test_nip46_client_parses_bunker_url() {
     let keys = Keys::generate();
     let url = generate_bunker_url(&keys.public_key(), &[relay_url], Some("topsecretbunker12"));
 
-    let client = Nip46Client::connect_to(&url)
+    let client = Nip46Client::connect_to(&url, None, None)
         .await
         .expect("well-formed bunker URL connects");
     client.disconnect().await;
@@ -186,7 +249,7 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
         run_stub_signer(signer_keys, relay_url.clone(), hmac_hex.clone()).await;
     signer_ready.await.expect("stub signer ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("client connect");
     client.connect().await.expect("connect handshake");

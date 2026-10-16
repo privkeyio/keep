@@ -98,7 +98,7 @@ async fn test_get_device_info_happy_path() {
         run_stub_signer(signer_keys, relay_url.clone(), info_json).await;
     signer_ready.await.expect("stub signer ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("client connect");
     client.connect().await.expect("connect handshake");
@@ -139,7 +139,7 @@ async fn test_get_device_info_malformed_payload_errors() {
     .await;
     signer_ready.await.expect("stub signer ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("client connect");
     client.connect().await.expect("connect handshake");
@@ -244,7 +244,7 @@ async fn test_get_device_info_unknown_method_errors() {
         run_unknown_method_signer(signer_keys, relay_url.clone()).await;
     signer_ready.await.expect("stub signer ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("client connect");
     client.connect().await.expect("connect handshake");
@@ -274,7 +274,7 @@ async fn expect_error_for_payload(payload: String) -> KeepError {
     let (handle, ready) = run_stub_signer(signer_keys, relay_url.clone(), payload).await;
     ready.await.expect("ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("connect");
     client.connect().await.expect("handshake");
@@ -380,7 +380,7 @@ async fn test_get_device_info_normalizes_other_to_known_kind() {
     let (handle, ready) = run_stub_signer(signer_keys, relay_url.clone(), payload).await;
     ready.await.expect("ready");
 
-    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None)
+    let client = Nip46Client::connect_with(signer_pubkey, vec![relay_url], None, None, None)
         .await
         .expect("connect");
     client.connect().await.expect("handshake");
