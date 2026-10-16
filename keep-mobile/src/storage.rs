@@ -76,6 +76,14 @@ pub trait SecureStorage: Send + Sync {
     ) -> Result<(), KeepMobileError>;
     fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError>;
     fn list_all_shares(&self) -> Vec<ShareMetadataInfo>;
+    /// Delete the record under `key`.
+    ///
+    /// Callers must not read an `Err` as "nothing was removed". An
+    /// implementation that destroys the record and then fails a later step, for
+    /// example clearing the stored bytes before dropping a key alias or
+    /// rewriting an index, reports failure for a record that is already gone,
+    /// so anything holding that record in memory has to be torn down on the
+    /// error path too.
     fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError>;
     fn get_active_share_key(&self) -> Option<String>;
     fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError>;

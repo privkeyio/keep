@@ -1263,12 +1263,37 @@ impl KeepMobile {
 
         if is_active {
             self.storage.set_active_share_key(None)?;
-            self.invalidate_live_node();
         }
 
-        self.storage.delete_share_by_key(group_pubkey)?;
-
-        Ok(())
+        // Attempt the removal first, then tear down whatever the outcome.
+        //
+        // Unconditional over the pointer, because the pointer does not say
+        // which share the live node was built from: `load_share_package`
+        // resolves the share when no pointer is set, so a node can be running
+        // on a share the pointer never named, and gating teardown on the
+        // pointer left that node holding the deleted share's key material,
+        // still subscribed to the relays and still able to contribute signature
+        // shares, with any already-queued request still approvable.
+        //
+        // After the removal, because `do_initialize` holds
+        // `node_lifecycle_lock` across both the share load and the node install
+        // while taking no `active_share_lock`. Tearing down before the record is
+        // gone leaves a window where a concurrent initialize resolves the
+        // still-present share and installs a node on it; doing it after means
+        // such an initialize either no longer finds the record or is serialized
+        // behind this teardown by that lock.
+        //
+        // Unconditional over the result too, because `delete_share_by_key` is
+        // not atomic. The Android implementation clears the share data, then
+        // deletes the keystore aliases, then rewrites the registry, and either
+        // of the last two can fail after the data is already gone. So an `Err`
+        // does not mean the share survived, and skipping the teardown on it
+        // would leave the live node holding the only remaining copy of a share
+        // the platform has already destroyed, while the caller is told the
+        // delete failed. Tearing down costs a reconnect either way.
+        let deleted = self.storage.delete_share_by_key(group_pubkey);
+        self.invalidate_live_node();
+        deleted
     }
 
     // Load-modify-store without locking; acceptable in single-user mobile context
@@ -2211,16 +2236,45 @@ impl KeepMobile {
             });
         }
         self.runtime.block_on(async {
-            let (group_pubkey, result) = {
-                let node_guard = self.node.read().await;
-                let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+            let (node, group_pubkey, result) = {
+                // Clone the handle and drop the guard before the ping. The ping
+                // sleeps out its full timeout unconditionally, up to 300s, and
+                // tokio's RwLock is write-preferring, so a pending writer also
+                // blocks new readers: holding this guard across the ping stalled
+                // `invalidate_live_node` and every `node.read()` caller for the
+                // whole window, on a healthy group. A share delete, an
+                // active-share switch and each cert-pin edit all tear the node
+                // down while holding their own locks, so the stall spread to
+                // those too. Taking a handle lets the teardown proceed under us,
+                // which is what the staleness check after the ping is for.
+                let node = {
+                    let node_guard = self.node.read().await;
+                    Arc::clone(node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?)
+                };
                 let gp = hex::encode(node.group_pubkey());
                 let r = node
                     .health_check(Duration::from_secs(timeout_secs))
                     .await
                     .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
-                (gp, r)
+                (node, gp, r)
             };
+
+            // Pongs are only processed by the node's run task, so a teardown
+            // during the ping means nothing could answer and every peer comes
+            // back unresponsive. Reporting that would persist "all co-signers
+            // dead" for a healthy group, which in a multisig pushes a user
+            // toward recovery or rotation. Dropping the guard above is what
+            // allows the teardown, so the result has to be checked against the
+            // node that is live now before it is believed.
+            let still_current = match self.node.read().await.as_ref() {
+                Some(current) => Arc::ptr_eq(current, &node),
+                None => false,
+            };
+            if !still_current {
+                return Err(KeepMobileError::NetworkError {
+                    msg: "node was replaced during the health check".into(),
+                });
+            }
 
             if let Some(cb) = self.health_callbacks.read().await.as_ref() {
                 if let Err(e) = cb.on_health_check_complete(
@@ -4426,14 +4480,29 @@ impl KeepMobile {
         })
     }
 
+    /// Resolve an active share for this call, without writing a pointer.
+    ///
+    /// `list_all_shares` has no error channel, so a platform storage fault is
+    /// indistinguishable from a genuinely short set: a fault that leaves one
+    /// readable share looks exactly like owning one share. Persisting the
+    /// inferred pointer turned that transient fault into a permanent repoint of
+    /// the active account, which outlived the fault and was never surfaced.
+    /// Resolving per call keeps the convenience and lets a later call see the
+    /// full set once storage recovers, at which point the `_` arm errors rather
+    /// than standing on a stale choice.
+    ///
+    /// Two things this does not achieve, both needing work outside this layer.
+    /// `load_share_package` consults `get_active_share_key` first, and the
+    /// Android implementation of that getter is itself a resolver that infers a
+    /// pointer from its registry and persists it, for any share count, so the
+    /// write still happens one layer down and the `_` arm below is not reached
+    /// through it. And the `0` arm calls `migrate_legacy_share`, which writes a
+    /// share and a pointer off the same untrusted list; telling that empty list
+    /// from a fault needs the error channel `list_all_shares` lacks.
     fn resolve_active_share(&self) -> Result<String, KeepMobileError> {
         let shares = self.storage.list_all_shares();
         match shares.len() {
-            1 => {
-                let key = hex::encode(&shares[0].group_pubkey);
-                self.storage.set_active_share_key(Some(key.clone()))?;
-                Ok(key)
-            }
+            1 => Ok(hex::encode(&shares[0].group_pubkey)),
             0 => self.migrate_legacy_share(),
             _ => Err(KeepMobileError::StorageError {
                 msg: "Multiple shares found, please select one".into(),
@@ -4627,6 +4696,208 @@ mod import_teardown_tests {
             full.verifying_shares()
         );
         assert_eq!(completed.metadata.name, "learned");
+    }
+
+    // A platform storage fault that hides shares makes `list_all_shares` return
+    // a short list, and a short list holding exactly one entry is
+    // indistinguishable from owning one share. Resolving it is fine; writing it
+    // is not, because the pointer outlives the fault and silently repoints the
+    // active account.
+    #[test]
+    fn resolving_an_active_share_does_not_persist_the_pointer() {
+        struct TruncatingStorage {
+            inner: MemStorage,
+            listed: StdMutex<Vec<ShareMetadataInfo>>,
+        }
+
+        impl SecureStorage for TruncatingStorage {
+            fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+                self.inner.store_share(d, m)
+            }
+            fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share()
+            }
+            fn has_share(&self) -> bool {
+                self.inner.has_share()
+            }
+            fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+                self.inner.get_share_metadata()
+            }
+            fn delete_share(&self) -> Result<(), KeepMobileError> {
+                self.inner.delete_share()
+            }
+            fn store_share_by_key(
+                &self,
+                k: String,
+                d: Vec<u8>,
+                m: ShareMetadataInfo,
+            ) -> Result<(), KeepMobileError> {
+                self.inner.store_share_by_key(k, d, m)
+            }
+            fn load_share_by_key(&self, k: String) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share_by_key(k)
+            }
+            // The fault, and its recovery: the records stay put while this
+            // reports a subset of them.
+            fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+                self.listed.lock().unwrap().clone()
+            }
+            fn delete_share_by_key(&self, k: String) -> Result<(), KeepMobileError> {
+                self.inner.delete_share_by_key(k)
+            }
+            fn get_active_share_key(&self) -> Option<String> {
+                self.inner.get_active_share_key()
+            }
+            fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
+                self.inner.set_active_share_key(k)
+            }
+        }
+
+        let meta = |name: &str, b: u8| ShareMetadataInfo {
+            name: name.into(),
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: vec![b; 32],
+            did_backup: false,
+        };
+        let survivor = meta("survivor", 0xaa);
+        let hidden = meta("hidden", 0xbb);
+
+        let faulty = Arc::new(TruncatingStorage {
+            inner: MemStorage::default(),
+            listed: StdMutex::new(vec![survivor.clone()]),
+        });
+        let storage: Arc<dyn SecureStorage> = faulty.clone();
+        // Both shares are on disk throughout; only the listing is short.
+        for m in [&survivor, &hidden] {
+            storage
+                .store_share_by_key(hex::encode(&m.group_pubkey), b"share".to_vec(), m.clone())
+                .unwrap();
+        }
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "precondition: no pointer is set, so resolve runs"
+        );
+        assert_eq!(
+            mobile.resolve_active_share().unwrap(),
+            hex::encode([0xaau8; 32]),
+            "the single listed share still resolves for this call"
+        );
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "a pointer inferred from an untrusted list must not be written"
+        );
+
+        *faulty.listed.lock().unwrap() = vec![survivor, hidden];
+        assert!(
+            mobile.resolve_active_share().is_err(),
+            "once the fault clears, the ambiguity is reported rather than resolved \
+             silently from the earlier short list"
+        );
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "and no stale pointer is left behind to stand on"
+        );
+    }
+
+    // Deleting a share must tear the live node down even when no pointer names
+    // it. `load_share_package` resolves the share when the pointer is absent, so
+    // a node can be running on a share the pointer never named; gating teardown
+    // on the pointer left that node holding the deleted share's key material
+    // with its queued requests still approvable.
+    #[test]
+    fn deleting_a_share_tears_down_a_node_the_pointer_never_named() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let group_hex = hex::encode([0xaau8; 32]);
+
+        assert!(
+            storage.get_active_share_key().is_none(),
+            "precondition: the node was built from a resolved share, not a pointer"
+        );
+        seed_pending_request(&mobile);
+        mobile.delete_share_by_key(group_hex).unwrap();
+        mobile.runtime.block_on(async {
+            assert!(
+                mobile.pending_requests.lock().await.is_empty(),
+                "deleting a share must run node teardown whether or not the \
+                 pointer named it"
+            );
+        });
+    }
+
+    // A delete that reports failure must still tear the node down, because
+    // `SecureStorage::delete_share_by_key` is not atomic: the Android
+    // implementation clears the share data, then deletes the keystore aliases,
+    // then rewrites the registry, and either of the last two fails after the
+    // data is already gone. So an `Err` does not mean the share survived, and
+    // skipping the teardown on it would leave the live node holding the only
+    // remaining copy of a share the platform had already destroyed, still on
+    // the relays, while the caller is told the delete failed.
+    #[test]
+    fn a_failed_share_delete_still_tears_down_the_live_node() {
+        struct UndeletableStorage(MemStorage);
+
+        impl SecureStorage for UndeletableStorage {
+            fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+                self.0.store_share(d, m)
+            }
+            fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+                self.0.load_share()
+            }
+            fn has_share(&self) -> bool {
+                self.0.has_share()
+            }
+            fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+                self.0.get_share_metadata()
+            }
+            fn delete_share(&self) -> Result<(), KeepMobileError> {
+                self.0.delete_share()
+            }
+            fn store_share_by_key(
+                &self,
+                k: String,
+                d: Vec<u8>,
+                m: ShareMetadataInfo,
+            ) -> Result<(), KeepMobileError> {
+                self.0.store_share_by_key(k, d, m)
+            }
+            fn load_share_by_key(&self, k: String) -> Result<Vec<u8>, KeepMobileError> {
+                self.0.load_share_by_key(k)
+            }
+            fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+                self.0.list_all_shares()
+            }
+            fn delete_share_by_key(&self, _: String) -> Result<(), KeepMobileError> {
+                Err(KeepMobileError::StorageError {
+                    msg: "cannot delete right now".into(),
+                })
+            }
+            fn get_active_share_key(&self) -> Option<String> {
+                self.0.get_active_share_key()
+            }
+            fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
+                self.0.set_active_share_key(k)
+            }
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(UndeletableStorage(MemStorage::default()));
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        seed_pending_request(&mobile);
+        mobile
+            .delete_share_by_key(hex::encode([0xaau8; 32]))
+            .expect_err("the storage delete fails");
+        mobile.runtime.block_on(async {
+            assert!(
+                mobile.pending_requests.lock().await.is_empty(),
+                "a failed delete may already have destroyed the share, so the \
+                 node must not be left holding it"
+            );
+        });
     }
 
     // A corrupt active-share record must degrade gracefully to `None` without
