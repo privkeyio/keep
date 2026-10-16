@@ -290,9 +290,9 @@ mod tests {
     // identity receives it and reconstructs the record.
     #[tokio::test]
     async fn state_event_round_trips_over_a_relay() {
-        use nostr_relay_builder::MockRelay;
+        use crate::test_relay::start_mock_relay;
 
-        let relay = MockRelay::run().await.unwrap();
+        let relay = start_mock_relay().await;
         let url = relay.url().await;
         let keys = Keys::generate();
 

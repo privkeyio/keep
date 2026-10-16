@@ -12,7 +12,6 @@ use std::time::Duration;
 use keep_approval::change::Scope;
 use keep_approval::messages::{self as wire, Request, Verdict};
 use keep_approval::{kind, Hex32};
-use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::{Client, Event, Filter, Kind, PublicKey, RelayPoolNotification};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -109,7 +108,7 @@ async fn line(read: &mut tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadH
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approvals_travel_through_the_helper_and_a_relay() {
-    let relay = MockRelay::run().await.unwrap();
+    let relay = super::test_relay::start_mock_relay().await;
     let url = relay.url().await.to_string();
     let root = tempfile::tempdir().unwrap();
     let uid = me();

@@ -25,7 +25,7 @@ async fn strict_pinning_refuses_an_outbound_client_relay_it_cannot_pin() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let signer = Keys::generate().public_key();
 
@@ -96,7 +96,7 @@ async fn test_nip46_client_rejects_unknown_method() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let (keyring, _signer_pubkey) = setup_keyring();
@@ -169,7 +169,7 @@ async fn test_nip46_client_parses_bunker_url() {
     let bad = Nip46Client::connect_to("not-a-bunker-url", None, None).await;
     assert!(bad.is_err(), "invalid URL must be rejected");
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let keys = Keys::generate();
     let url = generate_bunker_url(&keys.public_key(), &[relay_url], Some("topsecretbunker12"));
@@ -262,7 +262,7 @@ async fn test_nip46_client_register_wallet_returns_hmac() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let signer_keys = Keys::generate();

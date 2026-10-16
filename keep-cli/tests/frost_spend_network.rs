@@ -76,7 +76,7 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    let relay = nostr_relay_builder::MockRelay::run().await.expect("relay");
+    let relay = common::start_mock_relay().await;
     let relay_url = relay.url().await.to_string();
     let dir = TempDir::new().unwrap();
     let (requester, cosigner) = (dir.path().join("requester"), dir.path().join("cosigner"));

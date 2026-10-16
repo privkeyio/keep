@@ -10,16 +10,17 @@
 //! test pins down whether the publish-then-fetch flow the CLI's `--publish` path
 //! depends on can work.
 
+mod common;
+
 use std::time::Duration;
 
 use keep_frost_net::dkg::{fetch_group_roster, frost_group_id, DKG_KIND_ANNOUNCE};
-use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 
 /// Publish an announcement, then discover it the way the CLI does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn published_roster_can_be_discovered_from_a_relay() {
-    let relay = MockRelay::run().await.expect("mock relay");
+    let relay = common::start_mock_relay().await;
     let url = relay.url().await.to_string();
 
     let k1 = Keys::generate();

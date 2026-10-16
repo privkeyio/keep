@@ -13,6 +13,8 @@
 //! broadcast and returned early, never saved), so these tests exercise the
 //! republish path against a relay that genuinely drops stored history.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -21,7 +23,6 @@ use keep_core::frost::dkg::SoftwareDkgSession;
 use keep_frost_net::dkg::{
     frost_group_id, run_software_dkg, ClientTransport, DkgPhase, DkgProgress, DkgRoster,
 };
-use nostr_relay_builder::MockRelay;
 use nostr_sdk::prelude::*;
 
 struct SilentProgress;
@@ -101,7 +102,7 @@ async fn run_participant(
 /// each holding a certificate that verifies against the shared roster.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_party_dkg_completes_over_a_real_relay() {
-    let relay = MockRelay::run().await.expect("mock relay");
+    let relay = common::start_mock_relay().await;
     let url = relay.url().await.to_string();
     let (keys, roster) = build_roster(3, 2);
     let group = hex::encode(roster.group_id);
@@ -152,7 +153,7 @@ async fn three_party_dkg_completes_over_a_real_relay() {
 /// running peers rebuild and resend their round packages on each poll.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_joiner_is_not_starved_by_unstored_ephemeral_events() {
-    let relay = MockRelay::run().await.expect("mock relay");
+    let relay = common::start_mock_relay().await;
     let url = relay.url().await.to_string();
     let (keys, roster) = build_roster(3, 2);
     let group = hex::encode(roster.group_id);

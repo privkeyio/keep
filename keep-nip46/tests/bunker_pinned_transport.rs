@@ -35,7 +35,7 @@ use common::{extract_bunker_secret, send_connect_request, setup_keyring};
 /// test.
 async fn mock_relay() -> (MockRelay, String) {
     install_default_crypto_provider();
-    let mock = MockRelay::run().await.expect("start mock relay");
+    let mock = common::start_mock_relay().await;
     let url = mock.url().await.to_string();
     (mock, url)
 }

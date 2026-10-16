@@ -81,6 +81,8 @@ mod recovery_signers;
 mod session;
 mod state_event;
 mod structured_payload;
+#[cfg(test)]
+mod test_relay;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
 mod tpm_policy;

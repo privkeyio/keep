@@ -568,7 +568,7 @@ mod tests {
     /// reaches the relay.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_publish_under_way_when_the_gateway_goes_away_still_goes_out() {
-        let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let relay = crate::gateway::daemon::test_relay::start_mock_relay().await;
         let url = relay.url().await.to_string();
         let dir = socket_dir();
         let path = dir.path().join("relay.sock");
@@ -614,13 +614,25 @@ mod tests {
         use nostr_sdk::prelude::{EventBuilder, Keys, Tag};
         use tokio::io::AsyncBufReadExt;
         const PER_RELAY: usize = 3_000;
+        // Retried for the same port race as `test_relay::start_mock_relay`, and
+        // the relay is rebuilt per attempt because that is what draws a new
+        // port.
         let relay = || async {
-            let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
-                max_reqs: 500,
-                notes_per_minute: 100_000_000,
-            }));
-            relay.run().await.unwrap();
-            relay
+            let mut last = None;
+            for _ in 0..8 {
+                let relay = LocalRelay::new(RelayBuilder::default().rate_limit(RateLimit {
+                    max_reqs: 500,
+                    notes_per_minute: 100_000_000,
+                }));
+                match relay.run().await {
+                    Ok(()) => return relay,
+                    Err(e) => last = Some(e),
+                }
+            }
+            panic!(
+                "rate-limited relay start: {}",
+                last.expect("a failure to report")
+            );
         };
         // Kept to the end: a relay dropped stops serving subscriptions.
         let relays = [relay().await, relay().await];

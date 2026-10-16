@@ -1489,6 +1489,7 @@ mod gate_tests {
 
     use super::*;
     use crate::node::PeerPolicy;
+    use crate::test_relay::start_mock_relay;
     use keep_core::frost::{ThresholdConfig, TrustedDealer};
     use nostr_relay_builder::MockRelay;
 
@@ -1496,7 +1497,7 @@ mod gate_tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay = mock.url().await.to_string();
         let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
         let (mut shares, _) = dealer.generate("descriptor-gate-test").unwrap();

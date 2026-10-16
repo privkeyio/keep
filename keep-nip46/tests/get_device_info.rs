@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
+mod common;
+
 use nostr_relay_builder::prelude::*;
 use nostr_sdk::prelude::{
     nip44, Client, EventBuilder, Filter, Keys, Kind, RelayPoolNotification, Tag, Timestamp,
@@ -87,7 +89,7 @@ async fn test_get_device_info_happy_path() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let signer_keys = Keys::generate();
@@ -120,7 +122,7 @@ async fn test_get_device_info_malformed_payload_errors() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let signer_keys = Keys::generate();
@@ -234,7 +236,7 @@ async fn test_get_device_info_unknown_method_errors() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let signer_keys = Keys::generate();
@@ -267,7 +269,7 @@ async fn expect_error_for_payload(payload: String) -> KeepError {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let signer_keys = Keys::generate();
     let signer_pubkey = signer_keys.public_key();
@@ -371,7 +373,7 @@ async fn test_get_device_info_normalizes_other_to_known_kind() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    let mock_relay = MockRelay::run().await.expect("mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let signer_keys = Keys::generate();
     let signer_pubkey = signer_keys.public_key();
