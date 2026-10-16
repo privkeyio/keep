@@ -2059,10 +2059,50 @@ impl KeepMobile {
                 msg: format!("build multipath descriptor: {e}"),
             })?;
 
+        // The relay list comes from the device URI, so it is attacker-
+        // influenceable: pin it before anything is sent. Resolved here, off the
+        // async block, so the probe and the live socket get the same proxy.
+        let stored_proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+        let proxy = if stored_proxy.enabled {
+            Some(parse_loopback_proxy("127.0.0.1", stored_proxy.port)?)
+        } else {
+            None
+        };
+        let (device_signer, uri_relays, uri_secret) = keep_nip46::parse_bunker_url(&device_uri)
+            .map_err(|e| KeepMobileError::InvalidInput {
+                msg: format!("invalid device URI: {e}"),
+            })?;
+        // Only the pin read-modify-write needs the lock, so it is released
+        // before the session below: that waits on a remote human pressing a
+        // button (REGISTER_WALLET_TIMEOUT), and holding `cert_pin_lock` across
+        // it would block every cert-pin FFI call, init and bunker start for
+        // minutes on a URI naming unreachable relays. `live_pinning` snapshots
+        // the pins into its own handle, so a later edit cannot reach this
+        // socket whether the lock is held or not. Connect only to what the
+        // probe verified: under strict pinning it drops an un-pinned relay
+        // from the set rather than failing the whole call.
+        let (verified_relays, pinning) = {
+            let _cert = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let relays = self
+                .runtime
+                .block_on(self.verify_and_pin_relays(&uri_relays, proxy))?;
+            (relays, self.live_pinning()?)
+        };
+
         let (signer_hex, hmac_hex, device_info) = self.runtime.block_on(async {
-            let client = keep_nip46::Nip46Client::connect_to(&device_uri)
-                .await
-                .map_err(nip46_to_mobile_error)?;
+            let client = keep_nip46::Nip46Client::connect_with(
+                device_signer,
+                verified_relays,
+                uri_secret,
+                proxy,
+                Some(pinning),
+            )
+            .await
+            .map_err(nip46_to_mobile_error)?;
             let signer_hex = hex::encode(client.signer_pubkey().to_bytes());
 
             let outcome: Result<(Option<String>, Option<keep_nip46::DeviceInfo>), KeepMobileError> =

@@ -375,10 +375,15 @@ impl App {
 
         let keep_arc = self.keep.clone();
         let group_hex = hex::encode(group_pubkey);
+        let net = self.network_config();
 
         Task::perform(
             async move {
-                let client = keep_nip46::Nip46Client::connect_to(&device_uri)
+                // Flattened to a string because this task's result type is
+                // `Result<_, String>`, so a `PinMismatch` reaches the user as
+                // text rather than the clear-and-retry dialog the other probe
+                // call sites get. Fails closed either way.
+                let client = crate::frost::connect_pinned_nip46(&net, &device_uri)
                     .await
                     .map_err(|e| {
                         warn!(group = %group_hex, "NIP-46 connect failed: {e}");
@@ -587,6 +592,7 @@ impl App {
             ));
         };
         let keep_arc = self.keep.clone();
+        let net = self.network_config();
         Task::perform(
             async move {
                 let (initiator_pubkey, session_descriptor_hash, tier_index) = node
@@ -699,9 +705,12 @@ impl App {
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
 
-                let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
+                // Flattened as in the registration path: this task's result
+                // type is `Result<_, String>`, so a `PinMismatch` does not
+                // reach the dedicated cert-failure dialog.
+                let client = crate::frost::connect_pinned_nip46(&net, &bunker_uri)
                     .await
-                    .map_err(|e| format!("NIP-46 connect: {e}"))?;
+                    .map_err(|e| format!("{e}"))?;
                 let outcome: Result<(), String> = async {
                     client
                         .connect()

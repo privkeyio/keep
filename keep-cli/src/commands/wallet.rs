@@ -463,7 +463,7 @@ pub fn cmd_wallet_register(
 
     let register_outcome = rt.block_on(async {
         let spinner = out.spinner("Connecting to signer...");
-        let client = keep_nip46::Nip46Client::connect_to(device_uri)
+        let client = keep_nip46::Nip46Client::connect_to(device_uri, None, None)
             .await
             .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
         spinner.finish();
@@ -2076,7 +2076,7 @@ async fn approve_psbt_session(
         local_fp
     ));
 
-    let client = keep_nip46::Nip46Client::connect_to(&bunker_uri)
+    let client = keep_nip46::Nip46Client::connect_to(&bunker_uri, None, None)
         .await
         .map_err(|e| KeepError::Frost(format!("NIP-46 connect: {e}")))?;
     let signed_outcome = async {

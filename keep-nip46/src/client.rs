@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
@@ -17,6 +18,12 @@ use crate::error::Result;
 use crate::types::Nip46Response;
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on waiting for a pinned relay socket to come up, matching the other
+/// relay waits in the workspace. Every caller that installs pinning runs the
+/// pre-flight probe first, and the probe carries its own larger budget for a
+/// proxied dial, so by the time this runs the path to the relay is already
+/// warm and a cold Tor circuit is not being paid for here.
+const RELAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REGISTER_WALLET_TIMEOUT: Duration = Duration::from_secs(180);
 /// Default timeout for the best-effort `get_device_info` probe. Kept short so a
 /// silent or hostile signer cannot stall registration UX. Callers that need to
@@ -228,16 +235,30 @@ pub struct Nip46Client {
 }
 
 impl Nip46Client {
-    pub async fn connect_to(uri: &str) -> Result<Self> {
+    /// `proxy` and `pinning` are required rather than defaulted so a call site
+    /// cannot quietly opt out: this socket carries sighashes and signing
+    /// requests to a remote signer, and the relay list comes from the bunker
+    /// URI, which is as attacker-influenceable as a nostrconnect one. A caller
+    /// that holds a pin store runs its own pre-flight probe first (the probe
+    /// learns and persists, which is platform-specific) and passes the
+    /// resulting handle through; `parse_bunker_url` is public so the relays can
+    /// be probed before this is called.
+    pub async fn connect_to(
+        uri: &str,
+        proxy: Option<SocketAddr>,
+        pinning: Option<keep_frost_net::TlsPinning>,
+    ) -> Result<Self> {
         let (signer_pubkey, relays, secret) = parse_bunker_url(uri)
             .map_err(|e| KeepError::InvalidInput(format!("invalid NIP-46 URI: {e}")))?;
-        Self::connect_with(signer_pubkey, relays, secret).await
+        Self::connect_with(signer_pubkey, relays, secret, proxy, pinning).await
     }
 
     pub async fn connect_with(
         signer_pubkey: PublicKey,
         relays: Vec<String>,
         secret: Option<String>,
+        proxy: Option<SocketAddr>,
+        pinning: Option<keep_frost_net::TlsPinning>,
     ) -> Result<Self> {
         if relays.is_empty() {
             return Err(NetworkError::relay("at least one relay required").into());
@@ -258,7 +279,9 @@ impl Nip46Client {
         let relays = normalized;
 
         let client_keys = Keys::generate();
-        let client = Client::new(client_keys.clone());
+        let pinned = pinning.is_some();
+        let client = keep_frost_net::build_client(&client_keys, proxy, pinning)
+            .map_err(|e| NetworkError::connection(format!("relay client: {e}")))?;
 
         let setup = async {
             for relay in &relays {
@@ -268,6 +291,16 @@ impl Nip46Client {
                     .map_err(|e| NetworkError::relay(format!("add relay: {e}")))?;
             }
             client.connect().await;
+
+            // `connect` only spawns attempts and `subscribe` queues against an
+            // empty pool, so both resolve `Ok` while the pinned transport is
+            // refusing every socket. Without this a pin mismatch looks like a
+            // working client that happens to time out on its first request.
+            if pinned {
+                keep_frost_net::wait_for_any_relay(&client, RELAY_CONNECT_TIMEOUT)
+                    .await
+                    .map_err(|e| NetworkError::connection(e.to_string()))?;
+            }
 
             let filter = Filter::new()
                 .kind(Kind::NostrConnect)
