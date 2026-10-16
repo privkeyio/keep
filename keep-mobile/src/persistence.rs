@@ -281,8 +281,8 @@ pub(crate) fn storage_metadata(name: &str) -> ShareMetadataInfo {
 pub(crate) struct DescriptorLoad {
     pub(crate) loaded: Vec<WalletDescriptorInfo>,
     /// Group hexes the index references whose record could not be read. Their
-    /// index entries are kept; callers building a durable artifact must refuse
-    /// rather than treat the remainder as the whole set.
+    /// index entries are kept and they are absent from `loaded`, so `loaded` is
+    /// not the whole set whenever this is non-empty.
     pub(crate) unreadable: Vec<String>,
 }
 
