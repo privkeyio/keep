@@ -32,6 +32,9 @@ mod approval_tests;
 mod relay_tests;
 
 #[cfg(test)]
+mod test_relay;
+
+#[cfg(test)]
 mod inject_tests;
 
 #[cfg(test)]

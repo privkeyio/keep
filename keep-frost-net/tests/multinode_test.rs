@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+mod common;
+
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -27,7 +29,7 @@ async fn graceful_shutdown(
 
 #[tokio::test]
 async fn test_node_creation_and_announcement() {
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -54,7 +56,7 @@ async fn test_node_creation_and_announcement() {
 
 #[tokio::test]
 async fn test_peer_discovery_with_running_nodes() {
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -309,7 +311,7 @@ async fn test_session_management() {
 async fn test_full_signing_flow() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -406,7 +408,7 @@ async fn test_full_signing_flow() {
 async fn test_health_check_then_sign_no_deadlock() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -504,7 +506,7 @@ async fn test_health_check_then_sign_no_deadlock() {
 async fn test_failover_when_cosigner_dropped_mid_session() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -605,7 +607,7 @@ async fn test_imported_share_can_initiate_signing() {
     use keep_core::frost::ShareExport;
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -697,7 +699,7 @@ async fn test_descriptor_coordination_flow() {
     use keep_bitcoin::{xpub_to_x_only, DescriptorExport, Network};
     use keep_frost_net::{derive_policy_hash, XpubContribution};
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -988,7 +990,7 @@ async fn test_psbt_recovery_spend_end_to_end() {
     };
     use keep_frost_net::{SignerId, WalletPolicy};
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -1380,7 +1382,7 @@ async fn test_psbt_recovery_spend_end_to_end() {
 
 #[tokio::test]
 async fn test_request_descriptor_fails_with_no_peers() {
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -1421,7 +1423,7 @@ async fn test_request_descriptor_fails_with_no_peers() {
 async fn test_signing_flow_with_nonce_pre_exchange() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -1564,7 +1566,7 @@ async fn test_signing_flow_with_nonce_pre_exchange() {
 async fn test_repeated_signing() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -1645,7 +1647,7 @@ async fn test_repeated_signing() {
 async fn test_ecdh_request_completes_with_one_cosigner() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -1871,7 +1873,7 @@ async fn test_psbt_migration_sweep_end_to_end() {
     };
     use keep_frost_net::{DescriptorSession, FinalizedDescriptor, SignerId, WalletPolicy};
 
-    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2338,7 +2340,7 @@ fn split_oprf_key_2of3() -> Vec<keep_core::oprf::threshold::KeyShare> {
 async fn test_oprf_unlock_completes_with_one_holder() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -2468,7 +2470,7 @@ async fn test_oprf_unlock_completes_with_one_holder() {
 async fn test_oprf_unlock_fails_over_when_one_holder_silent() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -2612,7 +2614,7 @@ fn make_oprf_request(
 /// no share, so a box with only its own partial never reaches quorum.
 #[tokio::test]
 async fn test_oprf_eval_declined_by_hook_sends_no_share() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2684,7 +2686,7 @@ async fn test_oprf_eval_declined_by_hook_sends_no_share() {
 /// share -> box drops below threshold).
 #[tokio::test]
 async fn test_duress_frozen_holder_refuses_oprf_eval() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2738,7 +2740,7 @@ async fn test_duress_frozen_holder_refuses_oprf_eval() {
 /// produced, and the holder emits no `OprfEvalRequested`.
 #[tokio::test]
 async fn test_oprf_eval_rejects_unattested_requester() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2777,7 +2779,7 @@ async fn test_oprf_eval_rejects_unattested_requester() {
 /// session_ids share one budget.
 #[tokio::test]
 async fn test_oprf_eval_rate_limited_after_budget() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2821,7 +2823,7 @@ async fn test_oprf_eval_rate_limited_after_budget() {
 /// share is produced.
 #[tokio::test]
 async fn test_oprf_eval_rejects_replayed_request() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -2870,7 +2872,7 @@ async fn test_oprf_enroll_distributes_share_and_completes() {
     use std::sync::Arc;
     use zeroize::Zeroizing;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -3015,7 +3017,7 @@ fn make_oprf_enroll(holder: &KfpNode) -> (nostr_sdk::PublicKey, keep_frost_net::
 /// into custody, and the holder emits no `OprfShareReceived` (and sends no ack).
 #[tokio::test]
 async fn test_oprf_enroll_rejects_unattested_dealer() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3049,7 +3051,7 @@ async fn test_oprf_enroll_rejects_unattested_dealer() {
 /// sender is attested (defense in depth against a compromised-but-attested group member).
 #[tokio::test]
 async fn test_oprf_enroll_rejects_non_designated_dealer() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3086,7 +3088,7 @@ async fn test_oprf_enroll_rejects_non_designated_dealer() {
 /// distinct from the timeout arm that fires when no subscriber touches the sender at all.
 #[tokio::test]
 async fn test_oprf_enroll_withholds_ack_when_seal_sender_dropped() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3155,7 +3157,7 @@ async fn test_oprf_enroll_withholds_ack_when_seal_sender_dropped() {
 /// count is not enough; here there are zero receivers, so the broadcast send fails outright.
 #[tokio::test]
 async fn test_oprf_enroll_no_subscriber_refuses_ack() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3184,7 +3186,7 @@ async fn test_oprf_enroll_no_subscriber_refuses_ack() {
 /// `ReplayDetected` at the replay gate, before any custody is taken.
 #[tokio::test]
 async fn test_oprf_enroll_rejects_stale_created_at() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3217,7 +3219,7 @@ async fn test_oprf_enroll_rejects_stale_created_at() {
 /// Build a dealer node (FROST id 1) over a mock relay. The relay handle is returned so the caller
 /// keeps it alive for the node's lifetime.
 async fn make_dealer_node() -> (KfpNode, MockRelay) {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
     let (mut shares, _pkg) = dealer.generate("test-oprf-distribute").unwrap();
@@ -3320,7 +3322,7 @@ async fn test_distribute_oprf_shares_rejects_duplicate_target() {
 async fn test_unappraisable_tpm_evidence_is_failed_not_downgraded() {
     use keep_frost_net::{AttestationStatus, ExpectedPcrs, TpmQuoteEvidence};
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3409,7 +3411,7 @@ impl keep_frost_net::AnnounceAttestor for RecordingAttestor {
 /// over the node's group, share index, transport key, and the announce's own timestamp.
 #[tokio::test]
 async fn test_announce_binds_tpm_quote_nonce_to_announce() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3455,7 +3457,7 @@ async fn test_announce_binds_tpm_quote_nonce_to_announce() {
 /// that pins a policy, so emitting it is pointless and masks the failure).
 #[tokio::test]
 async fn test_announce_fails_closed_when_quote_fails() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3550,7 +3552,7 @@ impl keep_frost_net::AnnounceAttestor for ValidQuoteAttestor {
 async fn test_oprf_unlock_with_real_tpm_attestation_2of3() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3649,7 +3651,7 @@ async fn test_oprf_unlock_with_real_tpm_attestation_2of3() {
 async fn test_oprf_unlock_blocked_when_box_unattested() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3807,7 +3809,7 @@ async fn test_slow_announce_quote_does_not_block_event_loop() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -3957,7 +3959,7 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -4071,7 +4073,7 @@ async fn test_single_flight_suppresses_concurrent_announce_quotes() {
 async fn test_full_signing_flow_at_derivation_path() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let config = ThresholdConfig::two_of_three();
@@ -4185,7 +4187,7 @@ async fn test_migration_sweep_destination_and_fee_guards() {
     use keep_bitcoin::{DescriptorExport, SweepUtxo};
     use keep_frost_net::{DescriptorSession, FinalizedDescriptor, WalletPolicy};
 
-    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -4492,7 +4494,7 @@ async fn test_migration_sweep_destination_and_fee_guards() {
 /// announce reaches that peer through its relay subscription and freezes it.
 #[tokio::test]
 async fn test_duress_beacon_to_learned_transport_key_freezes_peer_over_relay() {
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
 
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
@@ -4642,7 +4644,7 @@ async fn test_signing_over_real_relay() {
 async fn test_bech32_imported_share_binds_peers_above_two_of_n() {
     use keep_core::frost::ShareExport;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
     let dealer = TrustedDealer::new(ThresholdConfig::new(3, 5).unwrap());
     let (mut shares, _pkg) = dealer.generate("test-bech32-import").unwrap();
@@ -4701,7 +4703,7 @@ async fn test_share_without_verifying_set_learns_it_and_signs() {
     use keep_core::frost::ShareExport;
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
     let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
     let (mut shares, _pkg) = dealer.generate("test-learn-set").unwrap();
@@ -4806,9 +4808,9 @@ async fn test_share_without_verifying_set_learns_it_from_relayed_proofs() {
     use keep_core::frost::ShareExport;
     use std::sync::Arc;
 
-    let group_relay = MockRelay::run().await.expect("relay");
+    let group_relay = common::start_mock_relay().await;
     let group_relay = group_relay.url().await.to_string();
-    let learner_relay = MockRelay::run().await.expect("relay");
+    let learner_relay = common::start_mock_relay().await;
     let learner_relay = learner_relay.url().await.to_string();
     let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
     let (mut shares, _pkg) = dealer.generate("test-relayed-proofs").unwrap();
@@ -4918,7 +4920,7 @@ async fn test_share_without_verifying_set_learns_it_from_relayed_proofs() {
 async fn test_three_signers_without_pre_exchanged_nonces() {
     use std::sync::Arc;
 
-    let mock_relay = MockRelay::run().await.expect("relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay = mock_relay.url().await.to_string();
     let dealer = TrustedDealer::new(ThresholdConfig::new(3, 4).unwrap());
     let (mut shares, _pkg) = dealer.generate("interactive").unwrap();

@@ -3504,8 +3504,8 @@ fn derive_audit_hmac_key(keys: &Keys, group_pubkey: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_relay::start_mock_relay;
     use keep_core::frost::{ThresholdConfig, TrustedDealer};
-    use nostr_relay_builder::MockRelay;
 
     #[tokio::test]
     async fn test_node_creation() {
@@ -3513,7 +3513,7 @@ mod tests {
             .install_default()
             .ok();
 
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
 
         let config = ThresholdConfig::two_of_three();
@@ -3648,7 +3648,7 @@ mod tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
         let first = shares.remove(0);
         let ours = if bech32_import {
@@ -3922,7 +3922,7 @@ mod tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
         let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
         let (mut shares, _) = dealer.generate("duress-test").unwrap();
@@ -4379,7 +4379,7 @@ mod tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
         let (shares, _) = TrustedDealer::new(ThresholdConfig::two_of_three())
             .generate("refresh-announce")
@@ -4617,7 +4617,7 @@ mod tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
         let mut shares = dealer_shares(2, 3);
         let mut node = KfpNode::new(shares.remove(0), vec![relay_url.clone()])
@@ -4778,7 +4778,7 @@ mod tests {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .ok();
-        let mock = MockRelay::run().await.unwrap();
+        let mock = start_mock_relay().await;
         let relay_url = mock.url().await.to_string();
         let result = KfpNode::new(
             single_entry(&dealer_shares(8, 9)[0]),

@@ -28,7 +28,7 @@ async fn test_bunker_e2e_connect_and_sign() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let (keyring, signer_pubkey) = setup_keyring();
@@ -167,7 +167,7 @@ async fn test_bunker_rejects_without_auto_approve() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let (keyring, _signer_pubkey) = setup_keyring();
 
@@ -205,7 +205,7 @@ async fn test_bunker_permission_scoping() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("Failed to start mock relay");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
     let (keyring, signer_pubkey) = setup_keyring();
 
@@ -342,7 +342,7 @@ async fn test_bunker_e2e_returned_event_signature_verifies() {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let (keyring, signer_pubkey) = setup_keyring();
@@ -507,7 +507,7 @@ async fn bunker_with_connected_client() -> ConnectedBunker {
         .install_default()
         .ok();
 
-    let mock_relay = MockRelay::run().await.expect("MockRelay start");
+    let mock_relay = common::start_mock_relay().await;
     let relay_url = mock_relay.url().await.to_string();
 
     let (keyring, signer_pubkey) = setup_keyring();

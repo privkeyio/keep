@@ -158,9 +158,9 @@ mod tests {
     /// cannot complete and no relay reaches `Connected`.
     #[tokio::test]
     async fn a_configured_proxy_reaches_the_node_relay_sockets() {
-        use nostr_relay_builder::MockRelay;
+        use crate::test_relay::start_mock_relay;
 
-        let relay = MockRelay::run().await.unwrap();
+        let relay = start_mock_relay().await;
         let url = relay.url().await;
         let relays = vec![url.to_string()];
 

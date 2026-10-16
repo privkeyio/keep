@@ -109,23 +109,6 @@ impl KeepCmd {
     }
 }
 
-// `MockRelay::run` asks nostr-relay-builder for a random free port, which it
-// probes with a listener it then drops before binding the address for real.
-// Two starts racing in this binary's parallel tests can pick the same port and
-// the loser gets `AddrInUse`. Each retry draws a fresh port, so a few attempts
-// are enough. Binding port 0 instead is not an option: the relay reports the
-// address it was given, so the URL would say port 0.
-async fn start_mock_relay() -> nostr_relay_builder::MockRelay {
-    let mut last = None;
-    for _ in 0..8 {
-        match nostr_relay_builder::MockRelay::run().await {
-            Ok(relay) => return relay,
-            Err(e) => last = Some(e),
-        }
-    }
-    panic!("mock relay start: {}", last.expect("a failure to report"));
-}
-
 fn assert_success(output: &Output) {
     if output.status.success() {
         return;
@@ -2197,7 +2180,7 @@ async fn test_serve_bunker_e2e_sign_verifies() {
             .run(),
     );
 
-    let mock = start_mock_relay().await;
+    let mock = common::start_mock_relay().await;
     let relay_url = mock.url().await.to_string();
 
     // Launch the headless bunker against the mock relay and read its bunker:// URL.
@@ -2358,7 +2341,7 @@ async fn test_list_coexists_with_running_daemon() {
     assert!(output_contains(&before, "daemonkey"));
 
     // Start the daemon (holds the writer lock + serves the inspect socket).
-    let mock = start_mock_relay().await;
+    let mock = common::start_mock_relay().await;
     let relay = mock.url().await.to_string();
     let (_serve, _bunker_url) = spawn_bunker(&bin, &vault, &relay);
     // Let the inspect socket bind after the bunker URL is printed.
@@ -2397,7 +2380,7 @@ async fn test_software_dkg_ceremony_creates_one_group() {
         .install_default()
         .ok();
 
-    let mock = start_mock_relay().await;
+    let mock = common::start_mock_relay().await;
     let relay = mock.url().await.to_string();
     let dir = TempDir::new().unwrap();
     let names = ["alice-group", "bob-group", "carol-group"];

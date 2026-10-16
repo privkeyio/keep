@@ -15,6 +15,26 @@ use p256::ecdsa::signature::Signer;
 use super::*;
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 
+/// Start a `MockRelay`, retrying a start that lost the race for its port.
+///
+/// `nostr-relay-builder` picks a random free port by binding a probe listener
+/// and dropping it before binding the address for real, so two starts racing in
+/// this binary's parallel tests can pick the same port and the loser gets
+/// `AddrInUse`. Each attempt is a fresh `MockRelay`, which is what draws a new
+/// port: the chosen port is memoized per relay. Binding port 0 instead is not
+/// an option, because the relay reports the address it was given, so its URL
+/// would say port 0.
+async fn start_mock_relay() -> nostr_relay_builder::MockRelay {
+    let mut last = None;
+    for _ in 0..8 {
+        match nostr_relay_builder::MockRelay::run().await {
+            Ok(relay) => return relay,
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("mock relay start: {}", last.expect("a failure to report"));
+}
+
 #[derive(Default)]
 struct Memory(Mutex<Map<String, Vec<u8>>>, AtomicBool);
 
@@ -1018,11 +1038,7 @@ fn serve(phone: &Phone, relay: String) {
 #[test]
 fn a_decision_is_decided_once_a_relay_takes_it_and_its_payload_goes() {
     let phone = paired();
-    let relay = phone
-        .mobile
-        .runtime
-        .block_on(nostr_relay_builder::MockRelay::run())
-        .unwrap();
+    let relay = phone.mobile.runtime.block_on(start_mock_relay());
     let url = phone.mobile.runtime.block_on(relay.url()).to_string();
     serve(&phone, url);
     let request = phone.request(14, "x", 10);
@@ -1095,10 +1111,7 @@ fn close_gives_the_slot_back_and_ends_the_handler() {
 fn a_pairing_a_relay_takes_waits_for_the_gateway() {
     let storage: Arc<dyn SecureStorage> = Arc::new(Memory::default());
     let mobile = Arc::new(KeepMobile::new(storage).unwrap());
-    let relay = mobile
-        .runtime
-        .block_on(nostr_relay_builder::MockRelay::run())
-        .unwrap();
+    let relay = mobile.runtime.block_on(start_mock_relay());
     let url = mobile.runtime.block_on(relay.url()).to_string();
     let handler = ApproverHandler::new(mobile).unwrap();
     let uri = PairingUri {
