@@ -2013,7 +2013,17 @@ impl KeepMobile {
     }
 
     pub fn wallet_descriptor_list(&self) -> Vec<WalletDescriptorInfo> {
+        // The exported signature cannot carry the error, so an unreadable index
+        // still shows as an empty list. What it no longer does is drive a write:
+        // neither this call nor a later save rewrites the index from a partial
+        // read. Making the failure visible here needs a fallible signature,
+        // which is a binding change for the Android consumer.
         persistence::load_descriptors(&self.storage)
+            .map(|load| load.loaded)
+            .unwrap_or_else(|e| {
+                tracing::warn!("Cannot read the descriptor index, reporting no descriptors: {e}");
+                Vec::new()
+            })
     }
 
     pub fn wallet_descriptor_export(
@@ -2739,7 +2749,26 @@ impl KeepMobile {
             });
         }
 
-        let descriptors = persistence::load_descriptors(&self.storage);
+        // Reported, not refused. A backup missing a descriptor is a real hazard,
+        // because the user restores from it elsewhere and then wipes the device
+        // trusting it, but refusing the whole backup denies the shares too, and
+        // the shares are the irreplaceable part while a descriptor is public
+        // xpub data. Refusing also has no exit on the shipped consumer: the
+        // error text is replaced by a static string and the one
+        // `wallet_descriptor_delete` call site can only pass a group the list
+        // returned, which by construction excludes the entry that is blocking.
+        // So a single unreadable record would permanently deny every backup of
+        // the share material behind a generic failure. Surfacing this properly
+        // needs a channel the exported signature does not have; `unreadable` is
+        // the seam for it.
+        let load = persistence::load_descriptors(&self.storage)?;
+        if !load.unreadable.is_empty() {
+            tracing::warn!(
+                unreadable = %load.unreadable.join(", "),
+                "backup omits descriptors whose records could not be read"
+            );
+        }
+        let descriptors = load.loaded;
         let mut core_descriptors = Vec::with_capacity(descriptors.len());
         for d in &descriptors {
             let bytes = decode_hex(&d.group_pubkey, "descriptor group_pubkey")?;
@@ -3131,6 +3160,16 @@ impl KeepMobile {
             }
         }
 
+        // Descriptors before the shares and keys. Only the share and key writes
+        // are covered by the duplicate guard above, so a failure after them is
+        // terminal: the retry sees the shares it wrote and refuses. Running the
+        // descriptor writes first means a descriptor failure leaves nothing
+        // behind, and `persist_descriptor` is idempotent for a group already in
+        // the index, so the retry completes instead of being rejected.
+        for desc_info in prepared_descriptors {
+            persistence::persist_descriptor(&self.storage, &desc_info)?;
+        }
+
         for (group_hex, serialized, metadata) in prepared_shares {
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata)?;
@@ -3139,10 +3178,6 @@ impl KeepMobile {
         for (group_hex, serialized, metadata_info) in prepared_keys {
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata_info)?;
-        }
-
-        for desc_info in prepared_descriptors {
-            persistence::persist_descriptor(&self.storage, &desc_info)?;
         }
 
         for (group_hex, stored_relay) in prepared_relays {
@@ -4900,6 +4935,33 @@ mod import_teardown_tests {
         });
     }
 
+    // A backup must still be produced when a descriptor record cannot be read.
+    // Refusing denies the shares too, and the shares are the irreplaceable part
+    // while a descriptor is public xpub data; the shipped consumer also has no
+    // way to act on a refusal, since it shows a static error and can only pass
+    // `wallet_descriptor_delete` a group the list returned, which excludes the
+    // entry that is blocking. The incompleteness is reported instead.
+    #[test]
+    fn create_backup_proceeds_when_a_descriptor_record_cannot_be_read() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let orphan = "aa".repeat(32);
+
+        // An index entry whose record never landed, which is what a failed
+        // descriptor save or a platform wipe leaves behind.
+        storage
+            .store_share_by_key(
+                DESCRIPTOR_INDEX_KEY.into(),
+                serde_json::to_vec(&vec![orphan]).unwrap(),
+                persistence::storage_metadata("descriptor_index"),
+            )
+            .unwrap();
+
+        mobile
+            .create_backup("a-sufficiently-long-passphrase".into())
+            .expect("an unreadable descriptor must not deny the share backup");
+    }
+
     // A corrupt active-share record must degrade gracefully to `None` without
     // panicking: the active-share pointer is set, but its backing bytes are not
     // valid share data. `get_active_share` returning `None` here is the fail-safe
@@ -5443,6 +5505,113 @@ mod restore_backup_metadata_tests {
             ciphersuite: Default::default(),
             group_subkey_secret: None,
         }
+    }
+
+    // A descriptor write that fails must leave nothing behind, because only the
+    // share and key writes are covered by the duplicate guard: a failure after
+    // them is terminal, since the retry finds the shares it wrote and refuses.
+    // Running the descriptors first is what makes the retry work.
+    #[test]
+    fn a_failed_descriptor_write_leaves_a_restore_retryable() {
+        struct IndexUnwritableStorage {
+            inner: RecordingStorage,
+            block_index: StdMutex<bool>,
+        }
+
+        impl SecureStorage for IndexUnwritableStorage {
+            fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+                self.inner.store_share(d, m)
+            }
+            fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share()
+            }
+            fn has_share(&self) -> bool {
+                self.inner.has_share()
+            }
+            fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+                self.inner.get_share_metadata()
+            }
+            fn delete_share(&self) -> Result<(), KeepMobileError> {
+                self.inner.delete_share()
+            }
+            fn store_share_by_key(
+                &self,
+                k: String,
+                d: Vec<u8>,
+                m: ShareMetadataInfo,
+            ) -> Result<(), KeepMobileError> {
+                if k == DESCRIPTOR_INDEX_KEY && *self.block_index.lock().unwrap() {
+                    return Err(KeepMobileError::StorageError {
+                        msg: "cannot write the descriptor index".into(),
+                    });
+                }
+                self.inner.store_share_by_key(k, d, m)
+            }
+            fn load_share_by_key(&self, k: String) -> Result<Vec<u8>, KeepMobileError> {
+                self.inner.load_share_by_key(k)
+            }
+            fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+                self.inner.list_all_shares()
+            }
+            fn delete_share_by_key(&self, k: String) -> Result<(), KeepMobileError> {
+                self.inner.delete_share_by_key(k)
+            }
+            fn get_active_share_key(&self) -> Option<String> {
+                self.inner.get_active_share_key()
+            }
+            fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
+                self.inner.set_active_share_key(k)
+            }
+        }
+
+        let group = [7u8; 32];
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(false)],
+            vec![keep_core::wallet::WalletDescriptor {
+                group_pubkey: group,
+                external_descriptor: "wpkh(xpub.../0/*)".into(),
+                internal_descriptor: "wpkh(xpub.../1/*)".into(),
+                network: "bitcoin".into(),
+                created_at: 1_700_000_000,
+                device_registrations: vec![],
+                policy_hash: [9u8; 32],
+                version: 1,
+                previous_descriptor_hash: None,
+                policy: None,
+            }],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build");
+
+        let faulty = Arc::new(IndexUnwritableStorage {
+            inner: RecordingStorage::default(),
+            block_index: StdMutex::new(true),
+        });
+        let storage: Arc<dyn SecureStorage> = faulty.clone();
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+
+        mobile
+            .restore_backup(bytes.clone(), "correct horse battery staple".into())
+            .expect_err("the descriptor write fails");
+        assert!(
+            storage.load_share_by_key(hex::encode(group)).is_err(),
+            "no share may land before the descriptors, or the duplicate guard \
+             makes the retry terminal"
+        );
+
+        *faulty.block_index.lock().unwrap() = false;
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("the retry completes the restore");
+        assert!(storage.load_share_by_key(hex::encode(group)).is_ok());
     }
 
     fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {
