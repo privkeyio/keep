@@ -108,6 +108,35 @@ pub(crate) async fn verify_relay_certificates(
     Ok(())
 }
 
+/// Probe the relays named in a NIP-46 bunker URI, then dial it with the pin
+/// enforced inside the socket's own handshake.
+///
+/// The relay list comes from the URI, so it is as attacker-influenceable as a
+/// nostrconnect one: the pin is established or enforced before anything is
+/// sent. The pin set is shared rather than snapshotted, so a pin staged or
+/// cleared in Settings reaches the next handshake.
+pub(crate) async fn connect_pinned_nip46(
+    net: &NetworkConfig,
+    uri: &str,
+) -> Result<keep_nip46::Nip46Client, crate::message::ConnectionError> {
+    use crate::message::ConnectionError;
+
+    let (signer, relays, secret) = keep_nip46::parse_bunker_url(uri)
+        .map_err(|e| ConnectionError::Other(format!("invalid bunker URI: {e}")))?;
+    verify_relay_certificates(
+        &relays,
+        &net.certificate_pins,
+        &net.keep_path,
+        net.require_pinned,
+        net.proxy,
+    )
+    .await?;
+    let pinning = keep_frost_net::TlsPinning::new(net.certificate_pins.clone(), net.require_pinned);
+    keep_nip46::Nip46Client::connect_with(signer, relays, secret, net.proxy, Some(pinning))
+        .await
+        .map_err(|e| ConnectionError::Other(format!("NIP-46 connect: {e}")))
+}
+
 fn parse_bitcoin_network(net: &str) -> Result<bitcoin::Network, String> {
     net.parse::<bitcoin::Network>().map_err(|e| format!("{e}"))
 }

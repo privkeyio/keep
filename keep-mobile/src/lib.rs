@@ -2073,20 +2073,27 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::InvalidInput {
                 msg: format!("invalid device URI: {e}"),
             })?;
-        // Held on the sync stack across the block_on, as do_initialize does, so
-        // the trust-on-first-use pin persist cannot race a concurrent cert-pin
-        // FFI call.
-        let _cert_pins = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Only the pin read-modify-write needs the lock, so it is released
+        // before the session below: that waits on a remote human pressing a
+        // button (REGISTER_WALLET_TIMEOUT), and holding `cert_pin_lock` across
+        // it would block every cert-pin FFI call, init and bunker start for
+        // minutes on a URI naming unreachable relays. `live_pinning` snapshots
+        // the pins into its own handle, so a later edit cannot reach this
+        // socket whether the lock is held or not. Connect only to what the
+        // probe verified: under strict pinning it drops an un-pinned relay
+        // from the set rather than failing the whole call.
+        let (verified_relays, pinning) = {
+            let _cert = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let relays = self
+                .runtime
+                .block_on(self.verify_and_pin_relays(&uri_relays, proxy))?;
+            (relays, self.live_pinning()?)
+        };
 
         let (signer_hex, hmac_hex, device_info) = self.runtime.block_on(async {
-            // Connect only to what the probe verified: under strict pinning it
-            // drops an un-pinned relay from the set rather than failing the
-            // whole call, and the live socket would refuse it anyway.
-            let verified_relays = self.verify_and_pin_relays(&uri_relays, proxy).await?;
-            let pinning = self.live_pinning()?;
             let client = keep_nip46::Nip46Client::connect_with(
                 device_signer,
                 verified_relays,

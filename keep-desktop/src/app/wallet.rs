@@ -375,31 +375,15 @@ impl App {
 
         let keep_arc = self.keep.clone();
         let group_hex = hex::encode(group_pubkey);
-        let proxy = self.proxy_addr();
-        let cert_pins = self.certificate_pins.clone();
-        let keep_path = self.keep_path.clone();
-        let require_pinned = self.settings.strict_cert_pinning;
+        let net = self.network_config();
 
         Task::perform(
             async move {
-                // The relay list comes from the bunker URI, so it is as
-                // attacker-influenceable as a nostrconnect one: establish or
-                // enforce the SPKI pin before anything is sent, then hand the
-                // live pin set to the socket so the pin is checked inside its
-                // own handshake rather than only on this probe.
-                let (_, uri_relays, _) = keep_nip46::parse_bunker_url(&device_uri)
-                    .map_err(|e| format!("invalid bunker URI: {e}"))?;
-                crate::frost::verify_relay_certificates(
-                    &uri_relays,
-                    &cert_pins,
-                    &keep_path,
-                    require_pinned,
-                    proxy,
-                )
-                .await
-                .map_err(|e| format!("relay certificate: {e}"))?;
-                let pinning = keep_frost_net::TlsPinning::new(cert_pins.clone(), require_pinned);
-                let client = keep_nip46::Nip46Client::connect_to(&device_uri, proxy, Some(pinning))
+                // Flattened to a string because this task's result type is
+                // `Result<_, String>`, so a `PinMismatch` reaches the user as
+                // text rather than the clear-and-retry dialog the other probe
+                // call sites get. Fails closed either way.
+                let client = crate::frost::connect_pinned_nip46(&net, &device_uri)
                     .await
                     .map_err(|e| {
                         warn!(group = %group_hex, "NIP-46 connect failed: {e}");
@@ -608,10 +592,7 @@ impl App {
             ));
         };
         let keep_arc = self.keep.clone();
-        let proxy = self.proxy_addr();
-        let cert_pins = self.certificate_pins.clone();
-        let keep_path = self.keep_path.clone();
-        let require_pinned = self.settings.strict_cert_pinning;
+        let net = self.network_config();
         Task::perform(
             async move {
                 let (initiator_pubkey, session_descriptor_hash, tier_index) = node
@@ -724,26 +705,12 @@ impl App {
                 .await
                 .map_err(|_| "Background task failed".to_string())??;
 
-                // The relay list comes from the bunker URI, so it is as
-                // attacker-influenceable as a nostrconnect one: establish or
-                // enforce the SPKI pin before anything is sent, then hand the
-                // live pin set to the socket so the pin is checked inside its
-                // own handshake rather than only on this probe.
-                let (_, uri_relays, _) = keep_nip46::parse_bunker_url(&bunker_uri)
-                    .map_err(|e| format!("invalid bunker URI: {e}"))?;
-                crate::frost::verify_relay_certificates(
-                    &uri_relays,
-                    &cert_pins,
-                    &keep_path,
-                    require_pinned,
-                    proxy,
-                )
-                .await
-                .map_err(|e| format!("relay certificate: {e}"))?;
-                let pinning = keep_frost_net::TlsPinning::new(cert_pins.clone(), require_pinned);
-                let client = keep_nip46::Nip46Client::connect_to(&bunker_uri, proxy, Some(pinning))
+                // Flattened as in the registration path: this task's result
+                // type is `Result<_, String>`, so a `PinMismatch` does not
+                // reach the dedicated cert-failure dialog.
+                let client = crate::frost::connect_pinned_nip46(&net, &bunker_uri)
                     .await
-                    .map_err(|e| format!("NIP-46 connect: {e}"))?;
+                    .map_err(|e| format!("{e}"))?;
                 let outcome: Result<(), String> = async {
                     client
                         .connect()

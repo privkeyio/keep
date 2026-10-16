@@ -61,9 +61,33 @@ async fn strict_pinning_refuses_an_outbound_client_relay_it_cannot_pin() {
     .expect("strict pinning cannot pin a cleartext socket, so the connect must fail");
     let err = err.to_string();
     assert!(
-        err.to_lowercase().contains("relay"),
-        "the failure should name the relay connection, got: {err}"
+        err.contains("Timed out waiting for relay connection"),
+        "the failure must be the refused socket, not a rejected URL or an empty relay list: {err}"
     );
+}
+
+/// The wait above is gated on pinning being installed, and that gate is
+/// load-bearing for a caller that passes none: `keep-cli` has no pin store, and
+/// it must keep the old behavior of returning a client without waiting for a
+/// relay. Mirrors `an_unpinned_bunker_starts_without_a_reachable_relay` on the
+/// serving side.
+#[tokio::test]
+async fn an_unpinned_outbound_client_connects_without_a_reachable_relay() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    // Nothing is listening on port 1, so no relay can ever reach `Connected`.
+    let client = Nip46Client::connect_with(
+        Keys::generate().public_key(),
+        vec!["ws://127.0.0.1:1".to_string()],
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("an unpinned client must not wait for a relay");
+    client.disconnect().await;
 }
 
 #[tokio::test]
