@@ -248,6 +248,19 @@ mod memory_transport_tests {
 /// `sighash_type`: the key-spend sighash a requester asks to have signed and the
 /// [`crate::BitcoinSighashPayload`] (JSON) co-signers recompute it from.
 pub fn key_spend_payload(spent: &bitcoin::ScriptBuf, sighash_type: u8) -> ([u8; 32], Vec<u8>) {
+    key_spend_payload_of(spent, sighash_type, 0)
+}
+
+/// As [`key_spend_payload`], spending output `vout` of the funding transaction
+/// so a caller can build genuinely distinct transactions. The sighash type
+/// alone does not: it changes the digest but not the transaction, so two
+/// payloads differing only in it carry the same txid, which anything
+/// accumulating per transaction treats as one spend.
+pub fn key_spend_payload_of(
+    spent: &bitcoin::ScriptBuf,
+    sighash_type: u8,
+    vout: u32,
+) -> ([u8; 32], Vec<u8>) {
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -262,7 +275,7 @@ pub fn key_spend_payload(spent: &bitcoin::ScriptBuf, sighash_type: u8) -> ([u8; 
         version: Version::TWO,
         lock_time: LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), vout),
             script_sig: bitcoin::ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),

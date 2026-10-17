@@ -72,6 +72,7 @@ pub fn cmd_frost_network_serve(
     key_spend_to: &[String],
     key_spend_max_sats: Option<u64>,
     key_spend_max_fee_sats: Option<u64>,
+    key_spend_max_daily_sats: Option<u64>,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
@@ -107,29 +108,39 @@ pub fn cmd_frost_network_serve(
     // destinations but no cap, or the reverse, asked for a policy and would
     // instead get the blanket refusal, which is worth an error rather than a
     // surprise.
-    let key_path_spend = match (
+    // The window is built here beside the policy rather than 200 lines below, so
+    // the meaning of a zero total is established once, in the same place as the
+    // zero caps it sits with.
+    let (key_path_spend, key_spend_window) = match (
         key_spend_to.is_empty(),
         key_spend_max_sats,
         key_spend_max_fee_sats,
+        key_spend_max_daily_sats,
     ) {
-        (true, None, None) => keep_frost_net::KeySpendPolicy::default(),
-        (false, Some(0), _) | (false, _, Some(0)) => {
+        (true, None, None, None) => (
+            keep_frost_net::KeySpendPolicy::default(),
+            keep_frost_net::KeySpendWindow::daily(0),
+        ),
+        (false, Some(0), _, _) | (false, _, Some(0), _) | (false, _, _, Some(0)) => {
             return Err(KeepError::Frost(
-                "a zero --key-spend-max-sats or --key-spend-max-fee-sats refuses every \
-                 key-path spend; drop all three flags to serve the default refusal, or \
-                 give bounds this node may spend within"
+                "a zero --key-spend-max-sats, --key-spend-max-fee-sats or \
+                 --key-spend-max-daily-sats refuses every key-path spend; drop all four \
+                 flags to serve the default refusal, or give bounds this node may spend \
+                 within"
                     .into(),
             ))
         }
-        (false, Some(max), Some(max_fee)) => {
+        (false, Some(max), Some(max_fee), Some(max_daily)) => (
             keep_frost_net::KeySpendPolicy::from_addresses(key_spend_to, max, max_fee)
-                .map_err(|e| KeepError::Frost(format!("--key-spend-to: {e}")))?
-        }
+                .map_err(|e| KeepError::Frost(format!("--key-spend-to: {e}")))?,
+            keep_frost_net::KeySpendWindow::daily(max_daily),
+        ),
         _ => {
             return Err(KeepError::Frost(
-                "--key-spend-to, --key-spend-max-sats and --key-spend-max-fee-sats go \
-                 together; with any one missing this node refuses every key-path spend, \
-                 so serve none of them to mean that deliberately"
+                "--key-spend-to, --key-spend-max-sats, --key-spend-max-fee-sats and \
+                 --key-spend-max-daily-sats go together; with any one missing this node \
+                 refuses every key-path spend, so serve none of them to mean that \
+                 deliberately"
                     .into(),
             ))
         }
@@ -354,6 +365,7 @@ pub fn cmd_frost_network_serve(
                 require_structured_payload: require_structured_sign,
                 auto_approve_oprf_eval: oprf_auto_approve,
                 key_path_spend: key_path_spend.clone(),
+                spend_window: key_spend_window,
             }));
         }
         if !key_path_spend.refuses_everything() {
@@ -361,10 +373,18 @@ pub fn cmd_frost_network_serve(
                 "co-signing key-path spends of the group's taproot outputs, unattended, \
                  for spends consuming up to {} sats (outputs plus fee), leaving at \
                  most {} sats in fees, whose every output pays one of these \
-                 destinations. There is no limit across spends yet, so this is a \
-                 per-spend bound.",
+                 destinations, and up to {} sats in total over any rolling 24 hours. \
+                 That total bounds THIS node: a refused request fails over to another \
+                 co-signer, whose total is its own, so divide by the number that opt \
+                 in. It is held in memory and starts empty after a restart. It bounds \
+                 signatures issued rather than funds at risk, since a signature does \
+                 not expire and a member can broadcast a day's worth at once; and \
+                 because the amounts come from prevouts the requester asserts, any \
+                 share holder can fill it with a sham request and stop this node \
+                 co-signing until the window rolls.",
                 key_spend_max_sats.unwrap_or(0),
                 key_spend_max_fee_sats.unwrap_or(0),
+                key_spend_max_daily_sats.unwrap_or(0),
             ));
             // Echoed one per line: an operator who fat-fingers an address gets a
             // node that silently refuses, and a count alone gives them nothing to
@@ -2405,6 +2425,7 @@ mod tests {
                 false,
                 false,
                 &[],
+                None,
                 None,
                 None,
                 None,

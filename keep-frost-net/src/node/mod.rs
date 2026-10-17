@@ -595,6 +595,11 @@ pub struct ServeHooks {
     /// group's taproot outputs for, unattended. The default refuses every
     /// spend; see [`KeySpendPolicy`](crate::KeySpendPolicy).
     pub key_path_spend: crate::KeySpendPolicy,
+    /// Rolling total across the spends `key_path_spend` approves, so a member
+    /// that passes the per-spend bounds cannot simply pass them again. Held in
+    /// memory, so it starts empty on a restart, and it bounds this node rather
+    /// than the group; see [`KeySpendWindow`](crate::KeySpendWindow).
+    pub spend_window: crate::KeySpendWindow,
 }
 
 impl SigningHooks for ServeHooks {
@@ -624,6 +629,36 @@ impl SigningHooks for ServeHooks {
             .approve(session.structured_payload.as_deref())
         {
             Ok(approved) => {
+                // Charged at approval, which is not the same as at signature.
+                // Nothing the per-spend bounds refused is charged, but a session
+                // that fails after this point is: a `pre_sign` refusal (the kill
+                // switch, a human prompt), a stale nonce, an incomplete
+                // pre-exchange, or a requester that simply stops. Those cost
+                // budget with no signature. A retry of the SAME transaction is
+                // free, since its txid is already recorded and the increase is
+                // zero; what pays again is a rebuild, so a fee bump is a new
+                // txid charged in full.
+                //
+                // That is deliberate rather than merely convenient. Charging
+                // here keeps the check and the record under one lock, so two
+                // concurrent sessions cannot both see room and both sign.
+                // Charging at `post_sign` would be exact but racy, and there is
+                // no failure hook to release a reservation from, so the
+                // alternative is over-counting rather than exactness.
+                if !self
+                    .spend_window
+                    .check_and_record(approved.txid, approved.consumed)
+                {
+                    warn!(
+                        session_id = %hex::encode(session.session_id),
+                        requester = session.requester,
+                        consumed_sats = approved.consumed.to_sat(),
+                        recorded_sats = self.spend_window.recorded().to_sat(),
+                        txid = %approved.txid,
+                        "Refusing to co-sign a key-path spend: it does not fit the rolling window"
+                    );
+                    return false;
+                }
                 // An unattended node logs what it co-signed, not only what it
                 // refused: the operator has no other record of where the
                 // group's money went.
@@ -4075,6 +4110,7 @@ mod tests {
             require_structured_payload: false,
             auto_approve_oprf_eval: true,
             key_path_spend: crate::KeySpendPolicy::default(),
+            spend_window: crate::KeySpendWindow::daily(0),
         };
         assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
 
@@ -4083,6 +4119,7 @@ mod tests {
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
             key_path_spend: crate::KeySpendPolicy::default(),
+            spend_window: crate::KeySpendWindow::daily(0),
         };
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
@@ -4094,6 +4131,7 @@ mod tests {
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
             key_path_spend: crate::KeySpendPolicy::default(),
+            spend_window: crate::KeySpendWindow::daily(0),
         };
 
         let raw = raw_session();

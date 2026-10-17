@@ -68,6 +68,7 @@ mod enroll_session;
 mod error;
 mod event;
 mod key_spend_policy;
+mod key_spend_window;
 mod node;
 mod nonce_pool;
 mod nonce_store;
@@ -117,6 +118,7 @@ pub use enroll_session::{
 pub use error::{FrostNetError, Result};
 pub use event::{verify_unwrapped_duress_beacon, KfpEventBuilder};
 pub use key_spend_policy::{Approved, KeySpendPolicy};
+pub use key_spend_window::{KeySpendWindow, KEY_SPEND_WINDOW};
 #[cfg(feature = "testing")]
 pub use node::CosignTransport;
 pub use node::{

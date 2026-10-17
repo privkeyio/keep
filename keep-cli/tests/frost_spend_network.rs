@@ -46,7 +46,12 @@ fn run(cmd: &mut Command) -> Output {
 struct CoSigner(Child);
 
 impl CoSigner {
-    fn start(vault: &Path, npub: &str, relay: &str, policy: Option<(&[String], u64, u64)>) -> Self {
+    fn start(
+        vault: &Path,
+        npub: &str,
+        relay: &str,
+        policy: Option<(&[String], u64, u64, u64)>,
+    ) -> Self {
         let mut cmd = keep(vault);
         cmd.args([
             "frost",
@@ -62,12 +67,13 @@ impl CoSigner {
         // otherwise show up only as the 60s sign timeout further down.
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-        if let Some((destinations, max_sats, max_fee_sats)) = policy {
+        if let Some((destinations, max_sats, max_fee_sats, max_daily_sats)) = policy {
             for destination in destinations {
                 cmd.args(["--key-spend-to", destination]);
             }
             cmd.args(["--key-spend-max-sats", &max_sats.to_string()]);
             cmd.args(["--key-spend-max-fee-sats", &max_fee_sats.to_string()]);
+            cmd.args(["--key-spend-max-daily-sats", &max_daily_sats.to_string()]);
         }
         let mut child = cmd.spawn().expect("spawn serve");
         // A clap error exits immediately; a serving node does not exit at all.
@@ -203,7 +209,8 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
             &cosigner,
             &npub,
             &relay_url,
-            Some((&destinations, consumed, fee)),
+            // The daily total has room for this spend and no more.
+            Some((&destinations, consumed, fee, consumed)),
         );
         let signed = dir.path().join("signed.psbt");
         let out = sign(&signed);

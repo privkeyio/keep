@@ -44,6 +44,15 @@ pub struct Approved {
     pub paid: Amount,
     /// What is left for miners, the quantity `max_fee` bounds.
     pub fee: Amount,
+    /// The unsigned transaction this spend signs an input of.
+    ///
+    /// One transaction with several of the group's inputs is several signing
+    /// sessions over the same transaction, each reporting the same `consumed`,
+    /// so anything accumulating across spends has to tell them apart from
+    /// genuinely separate transactions. The txid is the identity that does it,
+    /// and it is as authentic as the rest: it is computed from the unsigned
+    /// transaction the digest commits to.
+    pub txid: bitcoin::Txid,
 }
 
 impl KeySpendPolicy {
@@ -237,6 +246,7 @@ impl KeySpendPolicy {
             consumed,
             paid,
             fee,
+            txid: psbt.unsigned_tx.compute_txid(),
         })
     }
 }
@@ -316,6 +326,18 @@ mod tests {
         )
     }
 
+    /// The txid of the transaction a payload carries. It computes the same way
+    /// the code does, so on its own it only rules out a constant or the wrong
+    /// PSBT; the property it exists to support is pinned by
+    /// `the_txid_identifies_the_transaction_not_the_digest` below.
+    fn payload_txid(payload: &[u8]) -> bitcoin::Txid {
+        let parsed: BitcoinSighashPayload = serde_json::from_slice(payload).unwrap();
+        Psbt::deserialize(&parsed.psbt)
+            .unwrap()
+            .unsigned_tx
+            .compute_txid()
+    }
+
     #[test]
     fn a_spend_to_allowed_destinations_within_the_cap_is_approved() {
         let p = payload(&[(spk(1), 60_000), (spk(2), 30_000)]);
@@ -325,6 +347,7 @@ mod tests {
                 consumed: Amount::from_sat(91_000),
                 paid: Amount::from_sat(90_000),
                 fee: Amount::from_sat(1_000),
+                txid: payload_txid(&p),
             }),
             "the amounts reported back are what the node logs as co-signed"
         );
@@ -359,6 +382,7 @@ mod tests {
                 consumed: Amount::from_sat(100_000),
                 paid: Amount::from_sat(99_000),
                 fee: Amount::from_sat(1_000),
+                txid: payload_txid(&p),
             })
         );
         let over = payload_spending(100_001, &[(spk(1), 99_000)]);
@@ -379,6 +403,7 @@ mod tests {
                 consumed: Amount::from_sat(91_000),
                 paid: Amount::from_sat(90_000),
                 fee: Amount::from_sat(1_000),
+                txid: payload_txid(&duplicated),
             }),
             "two outputs to one destination pay the sum of both"
         );
@@ -390,8 +415,33 @@ mod tests {
                 consumed: Amount::from_sat(91_000),
                 paid: Amount::from_sat(90_000),
                 fee: Amount::from_sat(1_000),
+                txid: payload_txid(&with_zero),
             }),
             "a zero-value output moves nothing in either direction"
+        );
+    }
+
+    // What the dedupe in the rolling window rests on, asserted rather than left
+    // in prose: the txid identifies the transaction, so it changes when the
+    // transaction does and does NOT change with the sighash type, which alters
+    // the digest but not the transaction. If the sighash type moved it, two
+    // requests for one transaction would look like two spends; if the funding
+    // output did not, two transactions would look like one and the second would
+    // ride in free.
+    #[test]
+    fn the_txid_identifies_the_transaction_not_the_digest() {
+        let payload_of = |sighash_type, vout| {
+            crate::test_support::key_spend_payload_of(&spk(1), sighash_type, vout).1
+        };
+        assert_eq!(
+            payload_txid(&payload_of(0x00, 0)),
+            payload_txid(&payload_of(0x01, 0)),
+            "the sighash type changes the digest, not the transaction"
+        );
+        assert_ne!(
+            payload_txid(&payload_of(0x00, 0)),
+            payload_txid(&payload_of(0x00, 1)),
+            "a different funding output is a different transaction"
         );
     }
 
@@ -456,6 +506,7 @@ mod tests {
                 consumed: Amount::from_sat(10_000_000),
                 paid: Amount::from_sat(1),
                 fee: Amount::from_sat(9_999_999),
+                txid: payload_txid(&p),
             }),
             "the operator asked for this, and the log says what it cost"
         );
@@ -498,6 +549,7 @@ mod tests {
                 consumed: Amount::from_sat(100_000),
                 paid: Amount::from_sat(1),
                 fee: Amount::from_sat(99_999),
+                txid: payload_txid(&p),
             })
         );
     }
