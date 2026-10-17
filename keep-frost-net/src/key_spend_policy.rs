@@ -42,6 +42,8 @@ pub struct Approved {
     pub consumed: Amount,
     /// What the outputs pay to allowed destinations.
     pub paid: Amount,
+    /// What is left for miners, the quantity `max_fee` bounds.
+    pub fee: Amount,
 }
 
 impl KeySpendPolicy {
@@ -231,7 +233,11 @@ impl KeySpendPolicy {
                 consumed.to_sat()
             ));
         }
-        Ok(Approved { consumed, paid })
+        Ok(Approved {
+            consumed,
+            paid,
+            fee,
+        })
     }
 }
 
@@ -318,6 +324,7 @@ mod tests {
             Ok(Approved {
                 consumed: Amount::from_sat(91_000),
                 paid: Amount::from_sat(90_000),
+                fee: Amount::from_sat(1_000),
             }),
             "the amounts reported back are what the node logs as co-signed"
         );
@@ -351,10 +358,41 @@ mod tests {
             Ok(Approved {
                 consumed: Amount::from_sat(100_000),
                 paid: Amount::from_sat(99_000),
+                fee: Amount::from_sat(1_000),
             })
         );
         let over = payload_spending(100_001, &[(spk(1), 99_000)]);
         assert!(policy().approve(Some(&over)).is_err());
+    }
+
+    // `fee = consumed - paid` is only exact if `paid` is the true sum over
+    // outputs, so pin the two shapes that could perturb it: two outputs to one
+    // allowed destination must count twice, and a zero-value output must count
+    // as nothing. A refactor that grouped outputs by script would break the
+    // first and silently understate the fee.
+    #[test]
+    fn paid_sums_every_output_including_duplicates_and_zero_values() {
+        let duplicated = payload_spending(91_000, &[(spk(1), 40_000), (spk(1), 50_000)]);
+        assert_eq!(
+            policy().approve(Some(&duplicated)),
+            Ok(Approved {
+                consumed: Amount::from_sat(91_000),
+                paid: Amount::from_sat(90_000),
+                fee: Amount::from_sat(1_000),
+            }),
+            "two outputs to one destination pay the sum of both"
+        );
+
+        let with_zero = payload_spending(91_000, &[(spk(1), 90_000), (spk(2), 0)]);
+        assert_eq!(
+            policy().approve(Some(&with_zero)),
+            Ok(Approved {
+                consumed: Amount::from_sat(91_000),
+                paid: Amount::from_sat(90_000),
+                fee: Amount::from_sat(1_000),
+            }),
+            "a zero-value output moves nothing in either direction"
+        );
     }
 
     // Operator input is addresses, and a given witness program is the same
@@ -417,6 +455,7 @@ mod tests {
             Ok(Approved {
                 consumed: Amount::from_sat(10_000_000),
                 paid: Amount::from_sat(1),
+                fee: Amount::from_sat(9_999_999),
             }),
             "the operator asked for this, and the log says what it cost"
         );
@@ -458,6 +497,7 @@ mod tests {
             Ok(Approved {
                 consumed: Amount::from_sat(100_000),
                 paid: Amount::from_sat(1),
+                fee: Amount::from_sat(99_999),
             })
         );
     }
@@ -524,11 +564,11 @@ mod tests {
         assert!(err.contains("prevouts for"), "{err}");
     }
 
-    // Half a policy signs nothing. An operator who names destinations but no
-    // cap, or a cap but no destinations, gets the default refusal rather than
-    // the permissive reading of the missing half.
+    // A partial policy signs nothing. An operator who names destinations but
+    // no cap, or either cap without destinations, gets the default refusal
+    // rather than the permissive reading of whatever is missing.
     #[test]
-    fn a_policy_missing_either_half_refuses_everything() {
+    fn a_policy_missing_any_part_refuses_everything() {
         let p = payload(&[(spk(1), 1)]);
         let no_destinations = KeySpendPolicy::new(
             Vec::new(),

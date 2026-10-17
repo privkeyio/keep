@@ -627,11 +627,15 @@ impl SigningHooks for ServeHooks {
                 // An unattended node logs what it co-signed, not only what it
                 // refused: the operator has no other record of where the
                 // group's money went.
+                // Satoshis, matching the flags the operator set, and the fee
+                // alongside them because that is the quantity a compromised
+                // member can destroy within policy.
                 info!(
                     session_id = %hex::encode(session.session_id),
                     requester = session.requester,
-                    consumed = %approved.consumed,
-                    paid = %approved.paid,
+                    consumed_sats = approved.consumed.to_sat(),
+                    paid_sats = approved.paid.to_sat(),
+                    fee_sats = approved.fee.to_sat(),
                     "Co-signing a key-path spend within policy"
                 );
                 true
