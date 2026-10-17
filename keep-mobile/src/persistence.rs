@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::KeepMobileError;
-use crate::policy::{PolicyBundle, POLICY_PUBKEY_LEN};
+use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::VelocityTracker;
@@ -54,9 +54,21 @@ pub(crate) fn load_policy(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<PolicyBundle, KeepMobileError> {
     let data = storage.load_share_by_key(POLICY_STORAGE_KEY.into())?;
-    serde_json::from_slice(&data).map_err(|e| KeepMobileError::InvalidPolicy {
-        msg: format!("Failed to deserialize policy: {e}"),
-    })
+    // Deliberately without serde's message, for the same reason load_velocity
+    // drops it: serde quotes the value it tripped on, the record is attacker
+    // controlled before it has verified, and this error reaches a log.
+    let bundle: PolicyBundle =
+        serde_json::from_slice(&data).map_err(|_| KeepMobileError::InvalidPolicy {
+            msg: "Failed to deserialize policy".into(),
+        })?;
+    // The wire format caps the rules and the import path caps its input, but a
+    // record read straight out of storage has been through neither.
+    if bundle.rules_json.len() > POLICY_MAX_RULES_LEN {
+        return Err(KeepMobileError::InvalidPolicy {
+            msg: "Stored policy rules exceed the maximum length".into(),
+        });
+    }
+    Ok(bundle)
 }
 
 pub(crate) fn persist_policy(

@@ -44,7 +44,7 @@ pub use nip55_decision::{
     evaluate_nip55_request, nip55_needs_biometric, Nip55DecisionInputs, Nip55Outcome,
     Nip55VelocityCheck,
 };
-pub use policy::{PolicyDecision, PolicyInfo, TransactionContext};
+pub use policy::{PolicyDecision, PolicyFault, PolicyInfo, PolicyStatus, TransactionContext};
 pub use psbt::{PsbtInfo, PsbtInputSighash, PsbtOutputInfo, PsbtParser};
 pub use signing_policy::{
     assess_signing_risk, evaluate_sign_policy, evaluate_sign_policy_selection, is_sensitive_kind,
@@ -832,22 +832,7 @@ impl KeepMobile {
         let velocity = Arc::new(std::sync::Mutex::new(velocity));
 
         let mut evaluator = PolicyEvaluator::new(velocity.clone());
-
-        if let Ok(wardens) = persistence::load_trusted_wardens(&storage) {
-            evaluator.set_trusted_wardens(wardens);
-        }
-
-        if let Ok(bundle) = persistence::load_policy(&storage) {
-            if bundle.verify_signature().is_ok()
-                && bundle.verify_hash().is_ok()
-                && bundle.verify_timestamp().is_ok()
-                && bundle
-                    .verify_trusted_warden(evaluator.trusted_wardens())
-                    .is_ok()
-            {
-                evaluator.set_policy(bundle);
-            }
-        }
+        Self::load_policy_into(&storage, &mut evaluator);
 
         let policy = Arc::new(std::sync::RwLock::new(evaluator));
 
@@ -1852,9 +1837,32 @@ impl KeepMobile {
         bundle.verify_hash()?;
         bundle.verify_timestamp()?;
 
+        // A transient fault must not push the caller into discarding a
+        // warden-signed policy, so the record gets another read first.
+        self.reload_policy_if_transient()?;
+
         let mut policy = self.policy_write_lock()?;
+        // Refused when the stored record cannot say how old it is, rather than
+        // installed over it. The rollback check below needs a baseline, and a
+        // record that failed verification is not one: accepting the install
+        // would let anyone who can corrupt the record roll the policy back to
+        // an older bundle that still carries a real warden signature. An
+        // expired bundle is attributed, so it is still a baseline and a
+        // replacement installs over it normally.
+        //
+        // Worth being exact about what this buys: `delete_policy` needs no
+        // authorization, so this raises the cost of that rollback from nothing
+        // to one more call rather than closing it. Closing it needs an epoch
+        // that outlives deletion, which is follow-up work.
+        if policy.fault().is_some() && policy.rollback_baseline().is_none() {
+            return Err(KeepMobileError::InvalidPolicy {
+                msg: "Refusing to replace a policy that cannot be checked against. \
+                      Delete the stored policy first."
+                    .into(),
+            });
+        }
         bundle.verify_trusted_warden(policy.trusted_wardens())?;
-        bundle.verify_version_upgrade(policy.policy())?;
+        bundle.verify_version_upgrade(policy.rollback_baseline())?;
 
         let info = bundle.to_policy_info();
         policy.set_policy(bundle.clone());
@@ -1863,6 +1871,9 @@ impl KeepMobile {
         Ok(info)
     }
 
+    /// The policy in force, which is `None` both when none is configured and
+    /// when the stored one cannot be trusted. Use [`Self::policy_status`] to
+    /// tell those apart; they behave as opposites.
     pub fn get_policy_info(&self) -> Option<PolicyInfo> {
         self.policy
             .read()
@@ -1871,9 +1882,31 @@ impl KeepMobile {
             .map(|b| b.to_policy_info())
     }
 
+    /// Whether a policy is configured, in force, or stored and untrustworthy.
+    ///
+    /// A faulted record refuses every spend, so reporting it as no policy would
+    /// leave a caller unable to explain the refusals. Retries an unreadable
+    /// record first, so a transient read fault is not reported as a fault.
+    pub fn policy_status(&self) -> Result<PolicyStatus, KeepMobileError> {
+        self.reload_policy_if_transient()?;
+        Ok(self.policy_read_lock()?.status())
+    }
+
+    /// Removes the stored policy, and is the only way out of a record that will
+    /// not verify. Deliberately an explicit act: it discards a policy a warden
+    /// signed, so it should not happen as a side effect of a corrupt record.
     pub fn delete_policy(&self) -> Result<(), KeepMobileError> {
-        self.policy_write_lock()?.clear_policy();
-        let _ = self.storage.delete_share_by_key(POLICY_STORAGE_KEY.into());
+        // The record goes first and the error is surfaced. Clearing memory on a
+        // delete that did not happen reports success, opens the gate for this
+        // process, and faults again at the next launch. One guard spans both,
+        // so a reload cannot land between them and re-arm the fault after this
+        // has already returned.
+        let mut policy = self.policy_write_lock()?;
+        match self.storage.delete_share_by_key(POLICY_STORAGE_KEY.into()) {
+            Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
+            Err(e) => return Err(e),
+        }
+        policy.clear_policy();
         Ok(())
     }
 
@@ -1882,6 +1915,7 @@ impl KeepMobile {
         ctx: TransactionContext,
     ) -> Result<PolicyDecision, KeepMobileError> {
         self.reload_velocity_if_unknown()?;
+        self.reload_policy_if_transient()?;
         self.policy_read_lock()?.evaluate(&ctx)
     }
 
@@ -1914,18 +1948,38 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// Trusting a warden re-runs the stored policy against the new set, which
+    /// is how a policy faulted for an untrusted signer comes back into force
+    /// after a key rotation without its rules being discarded.
     pub fn add_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
         let pubkey = network::parse_warden_pubkey(&pubkey_hex)?;
         let mut policy = self.policy_write_lock()?;
-        policy.add_trusted_warden(pubkey);
-        persistence::persist_trusted_wardens(&self.storage, policy.trusted_wardens())
+        if policy.trusted_wardens().contains(&pubkey) {
+            return Ok(());
+        }
+        let mut wardens = policy.trusted_wardens().clone();
+        wardens.insert(pubkey);
+        persistence::persist_trusted_wardens(&self.storage, &wardens)?;
+        policy.set_trusted_wardens(wardens);
+        Self::load_policy_into(&self.storage, &mut policy);
+        Ok(())
     }
 
+    /// Untrusting a warden re-runs the stored policy too, so a policy that only
+    /// that warden vouched for stops being in force rather than staying in
+    /// memory after the signer behind it was withdrawn.
     pub fn remove_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
         let pubkey = network::parse_warden_pubkey(&pubkey_hex)?;
         let mut policy = self.policy_write_lock()?;
-        policy.remove_trusted_warden(&pubkey);
-        persistence::persist_trusted_wardens(&self.storage, policy.trusted_wardens())
+        if !policy.trusted_wardens().contains(&pubkey) {
+            return Ok(());
+        }
+        let mut wardens = policy.trusted_wardens().clone();
+        wardens.remove(&pubkey);
+        persistence::persist_trusted_wardens(&self.storage, &wardens)?;
+        policy.set_trusted_wardens(wardens);
+        Self::load_policy_into(&self.storage, &mut policy);
+        Ok(())
     }
 
     pub fn list_trusted_wardens(&self) -> Result<Vec<String>, KeepMobileError> {
@@ -3949,6 +4003,113 @@ impl KeepMobile {
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Policy lock poisoned".into(),
             })
+    }
+
+    /// Loads the stored wardens and policy into `evaluator`, deciding which of
+    /// the three states the records put it in.
+    ///
+    /// An absent record and an unreadable one are different statements.
+    /// `load_share_by_key` answers `StorageNotFound` for absent, and a fault
+    /// means the backend tried and could not, which on Android means the record
+    /// is there and did not decrypt. So:
+    ///
+    /// - no policy record: no rules, nothing to enforce or to be unsure about.
+    /// - policy unreadable: the rules are unknown, so every rule refuses.
+    /// - policy present, wardens unreadable: the bundle cannot be attributed to
+    ///   a signer, and an unattributable policy is not an absent one.
+    /// - policy present and wardens known: verified, or faulted.
+    ///
+    /// Wardens absent and wardens unreadable both land on a refusal for a
+    /// stored bundle on a fresh evaluator, because `verify_trusted_warden`
+    /// refuses an empty set. A bundle can only have been stored while some
+    /// warden was trusted, so an empty set with a bundle present means the
+    /// record was lost, which is exactly the case that must not read as "no
+    /// policy".
+    fn load_policy_into(storage: &Arc<dyn SecureStorage>, evaluator: &mut PolicyEvaluator) {
+        match persistence::load_trusted_wardens(storage) {
+            Ok(wardens) => evaluator.set_trusted_wardens(wardens),
+            Err(KeepMobileError::StorageNotFound) => {
+                evaluator.set_trusted_wardens(std::collections::HashSet::new())
+            }
+            // Keep whatever set is already in memory rather than replacing it
+            // with an empty one. On a fresh evaluator that set is empty anyway,
+            // so a stored bundle still refuses for want of a signer; on a live
+            // one it means a warden just added does not disappear because the
+            // record could not be read back.
+            Err(e) => tracing::error!(
+                "Trusted wardens unreadable, keeping the set already in memory; a \
+                 stored policy needing a warden outside it will refuse: {e}"
+            ),
+        }
+
+        let bundle = match persistence::load_policy(storage) {
+            Ok(bundle) => bundle,
+            Err(KeepMobileError::StorageNotFound) => {
+                evaluator.clear_policy();
+                return;
+            }
+            // A record that will not parse will not parse next time either, so
+            // it is not the retryable arm. Calling it unreadable would put two
+            // Keystore decrypts on every decision for the life of the process
+            // and tell the caller to wait out a fault that never clears.
+            Err(e @ KeepMobileError::InvalidPolicy { .. }) => {
+                tracing::error!("Stored policy could not be parsed, every rule will refuse: {e}");
+                evaluator.set_policy_faulted(PolicyFault::Unverified, None);
+                return;
+            }
+            Err(e) => {
+                tracing::error!("Policy unreadable, every rule will refuse: {e}");
+                evaluator.set_policy_faulted(PolicyFault::Unreadable, None);
+                return;
+            }
+        };
+
+        // Attribution before the clock, and in that order deliberately. The
+        // signature, hash and signer are what make the bundle evidence; only
+        // once they hold is its own `created_at` worth anything, which is what
+        // lets a replacement be measured against an expired bundle rather than
+        // the expired one having to be thrown away first.
+        let attributed = bundle
+            .verify_signature()
+            .and_then(|()| bundle.verify_hash())
+            .and_then(|()| bundle.verify_trusted_warden(evaluator.trusted_wardens()));
+        if let Err(e) = attributed {
+            tracing::error!("Stored policy did not verify, every rule will refuse: {e}");
+            evaluator.set_policy_faulted(PolicyFault::Unverified, None);
+            return;
+        }
+
+        match bundle.timestamp_fault() {
+            None => evaluator.set_policy(bundle),
+            Some(fault) => {
+                tracing::error!(
+                    "Stored policy is authentic but outside its validity window ({fault}), \
+                     every rule will refuse"
+                );
+                evaluator.set_policy_faulted(fault, Some(bundle));
+            }
+        }
+    }
+
+    /// Reads the stored policy again if reading it again could change the
+    /// answer.
+    ///
+    /// Only the transient faults are retried. A record that will not parse, or
+    /// that is signed by nobody we trust, answers the same way every time, so
+    /// retrying it would be two storage reads per decision for nothing; that
+    /// one changes when the trusted wardens do, and both warden mutations
+    /// re-run the load themselves.
+    fn reload_policy_if_transient(&self) -> Result<(), KeepMobileError> {
+        // Bound to a local first. Folding this into the `if` condition, or into
+        // a `match`, keeps the read guard alive across `policy_write_lock` and
+        // self-deadlocks on a lock that is not reentrant.
+        let fault = self.policy_read_lock()?.fault();
+        if !fault.is_some_and(PolicyFault::is_transient) {
+            return Ok(());
+        }
+        let mut policy = self.policy_write_lock()?;
+        Self::load_policy_into(&self.storage, &mut policy);
+        Ok(())
     }
 
     /// Reads the stored counters again if they are still unknown.
@@ -6673,6 +6834,8 @@ mod velocity_fault_tests {
         records: StdMutex<HashMap<String, Vec<u8>>>,
         unreadable: StdMutex<Vec<String>>,
         unwritable: StdMutex<Vec<String>>,
+        undeletable: StdMutex<Vec<String>>,
+        reads: StdMutex<HashMap<String, usize>>,
     }
 
     impl FaultingStorage {
@@ -6687,6 +6850,16 @@ mod velocity_fault_tests {
         fn heal(&self) {
             self.unreadable.lock().unwrap().clear();
             self.unwritable.lock().unwrap().clear();
+        }
+
+        fn fault_delete(&self, key: &str) {
+            self.undeletable.lock().unwrap().push(key.into());
+        }
+
+        /// How many reads of `key` the backend has served, for pinning that a
+        /// permanent fault is not re-read on every decision.
+        fn reads_of(&self, key: &str) -> usize {
+            *self.reads.lock().unwrap().get(key).unwrap_or(&0)
         }
 
         fn plant(&self, key: &str, data: Vec<u8>) {
@@ -6729,6 +6902,7 @@ mod velocity_fault_tests {
             Ok(())
         }
         fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            *self.reads.lock().unwrap().entry(key.clone()).or_insert(0) += 1;
             if self.unreadable.lock().unwrap().contains(&key) {
                 return Err(KeepMobileError::StorageError {
                     msg: "cannot decrypt right now".into(),
@@ -6745,6 +6919,11 @@ mod velocity_fault_tests {
             Vec::new()
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            if self.undeletable.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "cannot delete right now".into(),
+                });
+            }
             self.records.lock().unwrap().remove(&key);
             Ok(())
         }
@@ -6853,5 +7032,479 @@ mod velocity_fault_tests {
             5_000,
             "the recovered history must be the stored one, not an empty one"
         );
+    }
+    use crate::policy::{
+        create_test_bundle, create_test_bundle_at, create_test_bundle_with, PolicyRules,
+    };
+
+    fn plant_policy(storage: &FaultingStorage, rules: &PolicyRules, trust_warden: bool) -> Vec<u8> {
+        let bundle = create_test_bundle(rules);
+        storage.plant(
+            POLICY_STORAGE_KEY,
+            serde_json::to_vec(&bundle).expect("serialize policy"),
+        );
+        if trust_warden {
+            let hex_list = vec![hex::encode(bundle.warden_pubkey)];
+            storage.plant(
+                TRUSTED_WARDENS_KEY,
+                serde_json::to_vec(&hex_list).expect("serialize wardens"),
+            );
+        }
+        bundle.warden_pubkey.to_vec()
+    }
+
+    fn a_spend() -> TransactionContext {
+        TransactionContext {
+            amount_sats: 1,
+            fee_sats: 1,
+            destinations: vec![],
+            has_unknown_destination: false,
+        }
+    }
+
+    fn capped_rules() -> PolicyRules {
+        PolicyRules {
+            max_amount: Some(100_000),
+            ..Default::default()
+        }
+    }
+
+    /// The headline case, through the real load. One flipped byte in the stored
+    /// record used to leave the evaluator holding no policy, which allowed
+    /// everything; a policy whose own tamper evidence disarms the policy is
+    /// worse than no policy, because the result reads like configuration.
+    ///
+    /// Deliberately asserts only that it faults. Where the flipped byte lands
+    /// decides whether the record stops parsing or survives and fails the
+    /// signature, and that moves with the generated key, so the arm is pinned
+    /// by `a_record_whose_rules_were_edited_faults_as_unverified` and
+    /// `an_unparseable_record_is_not_re_read_on_every_decision` instead. What
+    /// this one is for is the broad property: any corruption refuses.
+    #[test]
+    fn a_tampered_policy_record_refuses_instead_of_vanishing() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+
+        let mut tampered = storage.raw(POLICY_STORAGE_KEY).expect("planted");
+        let at = tampered.len() / 2;
+        tampered[at] ^= 0x01;
+        storage.plant(POLICY_STORAGE_KEY, tampered);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        let PolicyDecision::Deny { reason } = mobile.evaluate_policy(a_spend()).unwrap() else {
+            panic!("a tampered policy record must refuse, not allow everything");
+        };
+        assert!(reason.contains("policy"), "{reason}");
+        assert!(
+            matches!(
+                mobile.policy_status().unwrap(),
+                PolicyStatus::Faulted { .. }
+            ),
+            "the refusal has to be explainable, so it must not report as unconfigured"
+        );
+        assert!(mobile.get_policy_info().is_none());
+    }
+
+    /// A verified record still works, so the refusals above cannot be a policy
+    /// engine that simply says no.
+    #[test]
+    fn a_verified_policy_record_is_enforced() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+        assert_eq!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Allow
+        );
+        let over = TransactionContext {
+            amount_sats: 200_000,
+            ..a_spend()
+        };
+        assert!(matches!(
+            mobile.evaluate_policy(over).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    /// No record at all is the one state that means there are no rules.
+    #[test]
+    fn no_policy_record_allows() {
+        let storage = Arc::new(FaultingStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::NotConfigured
+        ));
+        assert_eq!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    /// An unreadable record is retried, because a Keystore decrypt fault can be
+    /// transient with the record intact. Until it reads it refuses, and when it
+    /// reads the real rules come back rather than the policy being discarded.
+    #[test]
+    fn an_unreadable_policy_record_refuses_and_then_recovers() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.fault(POLICY_STORAGE_KEY);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unreadable
+            }
+        ));
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        storage.heal();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+        assert_eq!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Allow
+        );
+    }
+
+    /// A bundle can only have been stored while some warden was trusted, so a
+    /// stored bundle with the wardens gone is a policy that cannot be
+    /// attributed to a signer. Unattributable is not absent.
+    #[test]
+    fn a_stored_policy_with_the_wardens_lost_refuses() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), false);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    /// The lockout this refusal could otherwise cause has a way out that keeps
+    /// the rules: trust the signer and the stored bundle verifies again. This is
+    /// the warden-rotation path, and it is why refusing an unattributable policy
+    /// does not require throwing it away.
+    #[test]
+    fn trusting_the_warden_brings_the_stored_policy_back_into_force() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = plant_policy(&storage, &capped_rules(), false);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted { .. }
+        ));
+
+        mobile.add_trusted_warden(hex::encode(&warden)).unwrap();
+
+        assert!(
+            matches!(mobile.policy_status().unwrap(), PolicyStatus::Active { .. }),
+            "trusting the signer must re-run the stored policy, not leave it faulted"
+        );
+        let over = TransactionContext {
+            amount_sats: 200_000,
+            ..a_spend()
+        };
+        assert!(matches!(
+            mobile.evaluate_policy(over).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    /// Installing over a record that cannot be checked against would hand a
+    /// rollback to anyone able to corrupt storage: the downgrade check compares
+    /// against the policy in force, and a faulted record has none, so an older
+    /// bundle carrying a real warden signature would install cleanly.
+    #[test]
+    fn a_policy_cannot_be_installed_over_one_that_will_not_verify() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.fault(POLICY_STORAGE_KEY);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        let replacement = create_test_bundle(&PolicyRules::default());
+        let hex_bundle = hex::encode(replacement.to_bytes());
+        let err = mobile
+            .import_policy(hex_bundle)
+            .expect_err("installing over an unverifiable record must be refused");
+        // `InvalidPolicy`'s Display drops `msg`, so the reason is only in the
+        // field a caller destructures.
+        let KeepMobileError::InvalidPolicy { msg } = err else {
+            panic!("expected the install to be refused for the fault, got {err:?}");
+        };
+        assert!(msg.contains("Delete the stored policy first"), "{msg}");
+
+        mobile.delete_policy().unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::NotConfigured
+        ));
+    }
+    /// An unreadable wardens record leaves a stored bundle unattributable on a
+    /// fresh evaluator, which is a refusal and not an absence.
+    #[test]
+    fn an_unreadable_wardens_record_refuses_a_stored_policy() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.fault(TRUSTED_WARDENS_KEY);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    /// The warden set in memory survives a wardens record that cannot be read
+    /// back. Without that, adding a warden would persist it and then lose it on
+    /// the very reload meant to put the policy back in force, so the rotation
+    /// recovery would fail exactly when storage is already misbehaving.
+    #[test]
+    fn adding_a_warden_survives_a_wardens_record_that_cannot_be_read_back() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = plant_policy(&storage, &capped_rules(), false);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted { .. }
+        ));
+
+        storage.fault(TRUSTED_WARDENS_KEY);
+        mobile.add_trusted_warden(hex::encode(&warden)).unwrap();
+
+        assert!(
+            matches!(mobile.policy_status().unwrap(), PolicyStatus::Active { .. }),
+            "the warden just added must not be dropped by the reload that follows it"
+        );
+        assert_eq!(
+            mobile.list_trusted_wardens().unwrap(),
+            vec![hex::encode(&warden)]
+        );
+    }
+    /// Deterministic, unlike flipping a byte at the record's midpoint: a byte
+    /// inside `rules_json` always survives parsing and always breaks the hash,
+    /// so this pins the arm and not merely that something faulted.
+    #[test]
+    fn a_record_whose_rules_were_edited_faults_as_unverified() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+
+        let raw = storage.raw(POLICY_STORAGE_KEY).expect("planted");
+        let text = String::from_utf8(raw).expect("json");
+        let edited = text.replace("100000", "900000");
+        assert_ne!(edited, text, "the fixture must contain the cap to edit");
+        storage.plant(POLICY_STORAGE_KEY, edited.into_bytes());
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+        let over = TransactionContext {
+            amount_sats: 500_000,
+            ..a_spend()
+        };
+        assert!(
+            matches!(
+                mobile.evaluate_policy(over).unwrap(),
+                PolicyDecision::Deny { .. }
+            ),
+            "the raised cap must not take effect, and the record must not read as no policy"
+        );
+    }
+
+    /// A record that will not parse will not parse next time either, so it must
+    /// not be the retryable arm. Classified as unreadable it would put two
+    /// Keystore decrypts on every decision for the life of the process, for a
+    /// condition that cannot resolve.
+    #[test]
+    fn an_unparseable_record_is_not_re_read_on_every_decision() {
+        let storage = Arc::new(FaultingStorage::default());
+        storage.plant(POLICY_STORAGE_KEY, b"not json at all".to_vec());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+        let after_load = storage.reads_of(POLICY_STORAGE_KEY);
+        for _ in 0..5 {
+            assert!(matches!(
+                mobile.evaluate_policy(a_spend()).unwrap(),
+                PolicyDecision::Deny { .. }
+            ));
+        }
+        assert_eq!(
+            storage.reads_of(POLICY_STORAGE_KEY),
+            after_load,
+            "a permanent fault must not be re-read per decision"
+        );
+    }
+
+    /// A device that boots before its clock syncs dates a good policy in the
+    /// future. That resolves by itself within seconds, so it refuses meanwhile
+    /// and keeps looking, rather than holding the refusal for the whole process
+    /// and offering only deletion as the way out.
+    #[test]
+    fn a_policy_dated_ahead_of_the_clock_refuses_and_keeps_retrying() {
+        let storage = Arc::new(FaultingStorage::default());
+        let ahead = chrono::Utc::now().timestamp() as u64 + 7 * 24 * 60 * 60;
+        let bundle = create_test_bundle_at(&capped_rules(), ahead);
+        storage.plant(POLICY_STORAGE_KEY, serde_json::to_vec(&bundle).unwrap());
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(bundle.warden_pubkey)]).unwrap(),
+        );
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::NotYetValid
+            }
+        ));
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        let after_load = storage.reads_of(POLICY_STORAGE_KEY);
+        mobile.evaluate_policy(a_spend()).unwrap();
+        assert!(
+            storage.reads_of(POLICY_STORAGE_KEY) > after_load,
+            "a fault that resolves on its own has to be looked at again"
+        );
+    }
+
+    /// Renewal must not require destroying the policy first. By the time the
+    /// clock check fails the signature and signer already held, so the expired
+    /// bundle is still a sound baseline to measure the replacement against.
+    #[test]
+    fn a_replacement_installs_over_an_expired_policy_without_deleting_it() {
+        let storage = Arc::new(FaultingStorage::default());
+        let long_ago = chrono::Utc::now().timestamp() as u64 - 400 * 24 * 60 * 60;
+        let old = create_test_bundle_at(&capped_rules(), long_ago);
+        storage.plant(POLICY_STORAGE_KEY, serde_json::to_vec(&old).unwrap());
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(old.warden_pubkey)]).unwrap(),
+        );
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Expired
+            }
+        ));
+        assert!(
+            matches!(
+                mobile.evaluate_policy(a_spend()).unwrap(),
+                PolicyDecision::Deny { .. }
+            ),
+            "stale rules are neither enforced nor ignored"
+        );
+
+        let fresh = create_test_bundle(&capped_rules());
+        mobile
+            .add_trusted_warden(hex::encode(fresh.warden_pubkey))
+            .unwrap();
+        mobile
+            .import_policy(hex::encode(fresh.to_bytes()))
+            .expect("a replacement must install over an expired policy");
+
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    /// The escape hatch must not report success on a delete that did not
+    /// happen: memory would open the gate for this process while the record
+    /// stayed put and faulted again at the next launch.
+    #[test]
+    fn a_delete_that_fails_leaves_the_policy_refusing() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.fault(POLICY_STORAGE_KEY);
+        storage.fault_delete(POLICY_STORAGE_KEY);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(mobile.delete_policy().is_err());
+        assert!(
+            matches!(
+                mobile.policy_status().unwrap(),
+                PolicyStatus::Faulted { .. }
+            ),
+            "a failed delete must not leave memory reading as no policy"
+        );
+    }
+
+    /// A transient fault must not push the caller into discarding a
+    /// warden-signed policy, so an install reads the record again first.
+    ///
+    /// Both bundles come from one warden on purpose. Trusting a new warden
+    /// re-runs the load itself, which would mask whether the install does, so
+    /// this leaves the install as the only thing that can clear the fault.
+    #[test]
+    fn an_install_retries_a_fault_that_has_already_healed() {
+        let warden = k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let now = chrono::Utc::now().timestamp() as u64;
+        let stored = create_test_bundle_with(&warden, &capped_rules(), now - 60);
+
+        let storage = Arc::new(FaultingStorage::default());
+        storage.plant(POLICY_STORAGE_KEY, serde_json::to_vec(&stored).unwrap());
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(stored.warden_pubkey)]).unwrap(),
+        );
+        storage.fault(POLICY_STORAGE_KEY);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unreadable
+            }
+        ));
+
+        storage.heal();
+        let replacement = create_test_bundle_with(&warden, &capped_rules(), now);
+        mobile
+            .import_policy(hex::encode(replacement.to_bytes()))
+            .expect("a healed fault must not force a delete");
+        assert!(matches!(
+            mobile.policy_status().unwrap(),
+            PolicyStatus::Active { .. }
+        ));
     }
 }
