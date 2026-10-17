@@ -10,6 +10,7 @@ pub mod bip32_signing;
 mod coordinator;
 mod dealer;
 pub mod dkg;
+mod nonce;
 mod recover;
 mod refresh;
 mod share;
@@ -23,6 +24,7 @@ pub mod ed25519;
 
 pub use coordinator::Coordinator;
 pub use dealer::{ThresholdConfig, TrustedDealer};
+pub use nonce::commit_checked;
 pub use recover::recover_nsec;
 pub use refresh::refresh_shares;
 pub use share::{Ciphersuite, ShareMetadata, SharePackage, StoredShare};

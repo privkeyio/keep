@@ -1,0 +1,7 @@
+# A FROST nonce must come from a draw that was checked; see
+# keep-core/src/frost/nonce.rs for why. The checked path is
+# keep_core::frost::commit_checked, and nonce.rs allows these two for itself.
+disallowed-methods = [
+    { path = "frost_secp256k1_tr::round1::commit", reason = "use keep_core::frost::commit_checked so the draw behind the nonce is checked" },
+    { path = "frost_ed25519::round1::commit", reason = "use keep_core::frost::commit_checked_ed25519 so the draw behind the nonce is checked" },
+]

@@ -7,7 +7,6 @@ use std::collections::BTreeMap;
 
 use frost::{
     keys::{KeyPackage, PublicKeyPackage},
-    rand_core::OsRng,
     round1::{SigningCommitments, SigningNonces},
     round2::SignatureShare,
     Identifier, Signature, SigningPackage,
@@ -110,7 +109,7 @@ impl SigningSession {
             ));
         }
 
-        let (nonces, commitments) = frost::round1::commit(key_package.signing_share(), &mut OsRng);
+        let (nonces, commitments) = super::nonce::commit_checked(key_package.signing_share())?;
 
         self.our_nonces = Some(nonces);
         self.commitments
@@ -269,7 +268,7 @@ pub(super) fn aggregate_local(kps: &[KeyPackage], message: &[u8]) -> Result<[u8;
     let mut verifying_shares: BTreeMap<Identifier, frost::keys::VerifyingShare> = BTreeMap::new();
 
     for kp in kps {
-        let (nonces, commitments) = round1::commit(kp.signing_share(), &mut OsRng);
+        let (nonces, commitments) = super::nonce::commit_checked(kp.signing_share())?;
         nonces_map.insert(*kp.identifier(), nonces);
         commitments_map.insert(*kp.identifier(), commitments);
         verifying_shares.insert(*kp.identifier(), *kp.verifying_share());

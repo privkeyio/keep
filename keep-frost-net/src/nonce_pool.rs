@@ -303,7 +303,7 @@ mod tests {
             generate_with_dealer(2, 2, IdentifierList::Default, OsRng).unwrap();
         let secret = shares.into_values().next().unwrap();
         let kp = KeyPackage::try_from(secret).unwrap();
-        frost_secp256k1_tr::round1::commit(kp.signing_share(), &mut OsRng)
+        keep_core::frost::commit_checked(kp.signing_share()).unwrap()
     }
 
     /// Discarding own nonces makes the advertised commitments unusable too:

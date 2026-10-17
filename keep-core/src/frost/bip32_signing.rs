@@ -442,8 +442,7 @@ mod tests {
     /// branch of the aggregation-side tweak is only hit ~50% of the time.
     #[test]
     fn odd_y_tweaked_pubkey_package_aggregates_under_child() {
-        use frost_secp256k1_tr::rand_core::OsRng;
-        use frost_secp256k1_tr::{round1, round2, SigningPackage};
+        use frost_secp256k1_tr::{round2, SigningPackage};
         use std::collections::BTreeMap;
 
         let message = [0x88u8; 32];
@@ -476,7 +475,8 @@ mod tests {
             let mut nonces_map = BTreeMap::new();
             let mut commitments_map = BTreeMap::new();
             for kp in &tweaked_kps {
-                let (nonces, commitments) = round1::commit(kp.signing_share(), &mut OsRng);
+                let (nonces, commitments) =
+                    crate::frost::nonce::commit_checked(kp.signing_share()).unwrap();
                 nonces_map.insert(*kp.identifier(), nonces);
                 commitments_map.insert(*kp.identifier(), commitments);
             }

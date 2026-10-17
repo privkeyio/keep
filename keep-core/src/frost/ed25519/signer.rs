@@ -8,7 +8,6 @@
 //! both FROST rounds locally and aggregates a detached 64-byte signature.
 use std::collections::BTreeMap;
 
-use frost::rand_core::OsRng;
 use frost::{keys::PublicKeyPackage, round1, round2, Identifier, SigningPackage};
 use frost_ed25519 as frost;
 
@@ -39,12 +38,15 @@ struct FreshNonces {
 
 impl FreshNonces {
     /// Generate fresh single-use nonces for the given signing share.
-    fn generate(signing_share: &frost::keys::SigningShare) -> Self {
-        let (nonces, commitments) = round1::commit(signing_share, &mut OsRng);
-        Self {
+    ///
+    /// Fallible because the draw the nonces are built from is checked; see
+    /// [`crate::frost::nonce`] for why that check is at the draw.
+    fn generate(signing_share: &frost::keys::SigningShare) -> Result<Self> {
+        let (nonces, commitments) = crate::frost::nonce::commit_checked_ed25519(signing_share)?;
+        Ok(Self {
             nonces,
             commitments,
-        }
+        })
     }
 }
 
@@ -89,7 +91,7 @@ pub fn sign_with_local_shares(shares: &[SharePackage], message: &[u8]) -> Result
     for share in signing_shares {
         let kp = ed25519_key_package(share)?;
         let id = *kp.identifier();
-        let nonces = FreshNonces::generate(kp.signing_share());
+        let nonces = FreshNonces::generate(kp.signing_share())?;
         commitments_map.insert(id, nonces.commitments);
         verifying_shares.insert(id, *kp.verifying_share());
         fresh.insert(id, nonces);
