@@ -335,6 +335,23 @@ fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
         .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING)
 }
 
+/// The health criteria that two draws can carry, for a caller judging the bytes
+/// it was handed rather than a sample drawn beside them.
+///
+/// [`check_entropy_health`] takes three samples, which is what lets it also
+/// reject a byte position that is `0x00` or `0xff` across all of them. Two
+/// samples cannot carry that test: a position fails it when both draws happen
+/// to hold the same extreme byte, which for two healthy draws is about one pair
+/// in a thousand across the 32 positions, and a caller that latches on the
+/// verdict would take itself out of service about that often. What is left is
+/// what a stuck or barely-moving source fails anyway: neither draw all-zero,
+/// the two distinct, and at least [`MIN_HAMMING`] bits apart, which a source
+/// repeating itself with a handful of bits flipped still fails.
+pub(crate) fn pair_looks_random(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let nonzero = |s: &[u8; 32]| s.iter().any(|&b| b != 0);
+    nonzero(a) && nonzero(b) && a != b && hamming_distance(a, b) >= MIN_HAMMING
+}
+
 /// Draws three samples straight from the OS RNG, with nothing mixed in.
 fn os_samples() -> Result<[[u8; 32]; 3], EntropyHealthError> {
     let mut samples = [[0u8; 32]; 3];
@@ -410,6 +427,44 @@ mod tests {
         assert_ne!(b1, b2);
         assert_ne!(b2, b3);
         assert_ne!(b1, b3);
+    }
+
+    /// The pair criteria, including where the Hamming threshold sits. A
+    /// security parameter with no test on its boundary is one that drifts.
+    #[test]
+    fn pair_criteria_reject_what_they_must() {
+        let a = [0xaau8; 32];
+        assert!(!pair_looks_random(&[0u8; 32], &a), "a zero draw");
+        assert!(!pair_looks_random(&a, &[0u8; 32]), "a zero second draw");
+        assert!(!pair_looks_random(&a, &a), "two identical draws");
+
+        let mut one_byte_apart = a;
+        one_byte_apart[0] ^= 0xff;
+        assert!(!pair_looks_random(&a, &one_byte_apart), "eight bits apart");
+
+        let ones = [0xffu8; 32];
+        let mut exactly_at_threshold = ones;
+        for b in exactly_at_threshold.iter_mut().take(8) {
+            *b = 0x00;
+        }
+        assert_eq!(hamming_distance(&ones, &exactly_at_threshold), MIN_HAMMING);
+        assert!(pair_looks_random(&ones, &exactly_at_threshold));
+
+        let mut one_bit_short = ones;
+        for b in one_bit_short.iter_mut().take(7) {
+            *b = 0x00;
+        }
+        one_bit_short[7] = 0x01;
+        assert_eq!(
+            hamming_distance(&ones, &one_bit_short),
+            MIN_HAMMING - 1,
+            "the case this pins is one bit under, not near it"
+        );
+        assert!(!pair_looks_random(&ones, &one_bit_short));
+
+        let x = random_bytes_mixed().unwrap();
+        let y = random_bytes_mixed().unwrap();
+        assert!(pair_looks_random(&x, &y), "two real draws must pass");
     }
 
     #[test]

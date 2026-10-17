@@ -3,7 +3,6 @@
 
 use std::time::Duration;
 
-use frost_secp256k1_tr::rand_core::OsRng;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -236,14 +235,9 @@ impl KfpNode {
             // so the health failure keeps its own type. The wrapper flattens it
             // into a stringly-typed encryption error, and deciding to stop
             // signing on a string match is exactly the guess this refuses to make.
-            let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>().map_err(|e| {
-                if Self::latches_signing(e) {
-                    self.mark_entropy_degraded();
-                }
-                FrostNetError::Session(format!("nonce id: {e}"))
-            })?;
-            let (nonces, commitment) =
-                frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+            let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>()
+                .map_err(|e| self.entropy_refusal("nonce id", e))?;
+            let (nonces, commitment) = self.commit_nonces(key_package.signing_share())?;
             self.nonce_pool.store_own(nonce_id, nonces);
             fresh.push((nonce_id, commitment));
         }
@@ -496,10 +490,10 @@ impl KfpNode {
             return Ok(());
         }
 
-        // Fail closed on a degraded RNG. Round 1 draws this node's nonce from
-        // OsRng, which is not health-checked at the point of use, so once the
-        // source is known bad the only safe move is to stop signing: two shares
-        // over one nonce recover the key.
+        // Fail closed on a degraded RNG. Once the source is known bad the only
+        // safe move is to stop signing: two shares over one nonce recover the
+        // key. The latch read here is set by `probe_entropy_health` and by
+        // `commit_nonces`, which checks the draw each nonce is built from.
         if self.is_entropy_degraded() {
             debug!("Rejecting sign request: OS RNG degraded");
             return Err(FrostNetError::PolicyViolation(
@@ -871,7 +865,16 @@ impl KfpNode {
         // `None` signals that the pre-exchange path required a pooled nonce that
         // vanished (consumed, evicted, or lost on restart) between validation
         // and consume, so the session cannot proceed and must be torn down.
-        let commit_result = {
+        // A failed draw must not latch from inside this block.
+        // `mark_entropy_degraded` takes this same write lock to abandon
+        // in-flight sessions, and `parking_lot`'s lock is neither reentrant nor
+        // able to detect the case, so latching under the guard would park this
+        // thread on itself while holding the global sessions lock: the fault
+        // this exists to catch would hang the node rather than refuse the
+        // request. The fault leaves the block and is latched once the guard is
+        // gone.
+        let mut draw_fault = None;
+        let commit_result = 'commit: {
             let mut sessions = self.sessions.write();
 
             let session = sessions.get_or_create_session_salted(
@@ -919,9 +922,17 @@ impl KfpNode {
                         let commitment = *nonces.commitments();
                         (nonces, commitment)
                     }
-                    None => {
-                        frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng)
-                    }
+                    None => match keep_core::frost::commit_checked(key_package.signing_share()) {
+                        Ok(drawn) => drawn,
+                        Err(e) => {
+                            // Same teardown as a vanished pooled nonce: the
+                            // session was created above and must not be left
+                            // filling the active slot cap.
+                            sessions.abandon_session(&request.session_id);
+                            draw_fault = Some(e);
+                            break 'commit None;
+                        }
+                    },
                 };
 
                 session.set_our_nonces(nonces);
@@ -952,6 +963,10 @@ impl KfpNode {
                 Some((commitment, proceed))
             }
         };
+
+        if let Some(e) = draw_fault {
+            return Err(self.entropy_refusal("nonce draw", e));
+        }
 
         let (commitment, proceed_to_round2) = match commit_result {
             Some(ready) => ready,
@@ -1885,8 +1900,9 @@ impl KfpNode {
                 "tweak on requester key package failed: {e}"
             )))
         })?;
-        let (nonces, our_commitment) =
-            frost_secp256k1_tr::round1::commit(key_package.signing_share(), &mut OsRng);
+        let (nonces, our_commitment) = self
+            .commit_nonces(key_package.signing_share())
+            .map_err(SigningRoundError::fatal)?;
 
         // Try to use pre-exchanged commitments for the selected peers. If every
         // peer has a pooled commitment, reserve them (single-use; removed from
@@ -2442,10 +2458,9 @@ mod gate_tests {
         let session_id = crate::session::derive_session_id(&message, &participants, 2);
         let our_kp = node.share.key_package().unwrap();
         let peer_kp = peer_share.key_package().unwrap();
-        let (our_nonces, our_c) =
-            frost_secp256k1_tr::round1::commit(our_kp.signing_share(), &mut OsRng);
+        let (our_nonces, our_c) = keep_core::frost::commit_checked(our_kp.signing_share()).unwrap();
         let (peer_nonces, peer_c) =
-            frost_secp256k1_tr::round1::commit(peer_kp.signing_share(), &mut OsRng);
+            keep_core::frost::commit_checked(peer_kp.signing_share()).unwrap();
         {
             let mut sessions = node.sessions.write();
             let session = sessions
@@ -3107,11 +3122,9 @@ mod gate_tests {
         ));
     }
 
-    /// A node whose RNG failed its health check refuses to co-sign. Round 1
-    /// draws this node's nonce from `OsRng`, which is not health-checked where
-    /// it is used, so the latch is the only thing standing between a degraded
-    /// source and a signature. Two shares over one nonce recover the key, which
-    /// is why this refuses rather than degrades.
+    /// A node whose RNG failed its health check refuses to co-sign. Two shares
+    /// over one nonce recover the key, which is why this refuses rather than
+    /// degrades.
     #[tokio::test]
     async fn handle_sign_request_refused_when_entropy_degraded() {
         let (node, _relay) = test_node().await;
@@ -3194,6 +3207,83 @@ mod gate_tests {
 
         assert!(KfpNode::latches_signing(EntropyHealthError::Degraded));
         assert!(!KfpNode::latches_signing(EntropyHealthError::Unavailable));
+    }
+
+    /// Latching abandons in-flight sessions, which takes the sessions write
+    /// lock. A refusal raised while that lock is already held would therefore
+    /// wait on itself: `parking_lot`'s lock is not reentrant and does not
+    /// detect the case, so the node hangs holding the global sessions lock,
+    /// taking every other handler with it, instead of refusing the request.
+    /// The nonce draw inside `handle_sign_request` runs under exactly that
+    /// guard, which is why the fault leaves the guarded block before it latches.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn latching_while_the_sessions_lock_is_held_does_not_hang() {
+        use keep_core::entropy::EntropyHealthError;
+
+        let (node, _relay) = test_node().await;
+        node.replenish_nonce_pool().await.expect("pool fixture");
+        assert!(node.nonce_pool.own_available() > 0, "pool fixture");
+
+        let node = std::sync::Arc::new(node);
+        let held = std::sync::Arc::clone(&node);
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let _guard = held.sessions.write();
+            held.entropy_refusal("nonce draw", EntropyHealthError::Degraded);
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("latching under the sessions lock must not wait on itself");
+        assert!(node.is_entropy_degraded(), "the latch must still be set");
+        assert_eq!(
+            node.nonce_pool.own_available(),
+            0,
+            "the pool uses a different lock and must be cleared even when the \
+             session teardown had to be given up on"
+        );
+    }
+
+    /// The draw a nonce is built from is what sets the latch, not only the
+    /// probe beside it. Before this the latch was fed by a different RNG than
+    /// the nonce, so a source that went bad between a passing probe and the
+    /// draw produced a nonce nothing had looked at.
+    #[tokio::test]
+    async fn a_nonce_drawn_from_a_degraded_source_latches_the_node() {
+        use keep_core::entropy::EntropyHealthError;
+
+        let (node, _relay) = test_node().await;
+        assert!(!node.is_entropy_degraded(), "must start healthy");
+
+        node.entropy_refusal("nonce draw", EntropyHealthError::Degraded);
+        assert!(node.is_entropy_degraded(), "a bad draw must latch");
+    }
+
+    /// A draw that could not be completed is not a source that answered badly,
+    /// so it refuses this request without stopping the node for good.
+    ///
+    /// Defensive, and worth saying so rather than letting this read as
+    /// assurance: the nonce draw cannot currently produce this verdict, because
+    /// frost-core fills through `fill_bytes` and `OsRng::fill_bytes` panics
+    /// instead of reporting a source it could not read. What this pins is the
+    /// classification rule, for the day a draw can report it.
+    #[tokio::test]
+    async fn an_entropy_draw_that_could_not_complete_does_not_latch() {
+        use keep_core::entropy::EntropyHealthError;
+
+        let (node, _relay) = test_node().await;
+        node.entropy_refusal("nonce draw", EntropyHealthError::Unavailable);
+        assert!(!node.is_entropy_degraded());
+    }
+
+    /// The healthy case, so the check cannot pass by refusing everything.
+    #[tokio::test]
+    async fn the_nonce_draw_passes_on_a_healthy_source() {
+        let (node, _relay) = test_node().await;
+        let kp = node.share.key_package().unwrap();
+        assert!(node.commit_nonces(kp.signing_share()).is_ok());
+        assert!(!node.is_entropy_degraded());
     }
 
     /// A latched node stops handing its pooled commitments to newly discovered
@@ -3357,10 +3447,10 @@ mod gate_tests {
 
         let message = vec![7u8; 32];
         let session_id = crate::session::derive_session_id(&message, &[1, 2], 2);
-        let (_nonces, commitment) = frost_secp256k1_tr::round1::commit(
+        let (_nonces, commitment) = keep_core::frost::commit_checked(
             requester_share.key_package().unwrap().signing_share(),
-            &mut frost_secp256k1_tr::rand_core::OsRng,
-        );
+        )
+        .unwrap();
         let early = CommitmentPayload::new(session_id, 2, commitment.serialize().unwrap());
         node.handle_commitment(from, early).await.unwrap();
         assert!(node.early_commitments.read().contains_key(&session_id));
@@ -3385,10 +3475,9 @@ mod gate_tests {
     #[tokio::test]
     async fn held_commitments_are_capped_per_sender() {
         let (node, _relay) = test_node().await;
-        let (_, commitment) = frost_secp256k1_tr::round1::commit(
-            node.share.key_package().unwrap().signing_share(),
-            &mut frost_secp256k1_tr::rand_core::OsRng,
-        );
+        let (_, commitment) =
+            keep_core::frost::commit_checked(node.share.key_package().unwrap().signing_share())
+                .unwrap();
         for i in 0..10u8 {
             node.hold_early_commitment([i; 32], 2, commitment);
         }

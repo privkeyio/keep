@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use frost_secp256k1_tr::rand_core::OsRng;
 use frost_secp256k1_tr::round1::SigningCommitments;
 use parking_lot::RwLock;
 
@@ -132,7 +131,7 @@ impl FaultInjector for ReorderInjector {
 // TEST ONLY: Real keys must never be generated from predictable byte patterns
 fn generate_test_commitment(index: u16) -> SigningCommitments {
     let secret = frost_secp256k1_tr::keys::SigningShare::deserialize(&[index as u8; 32]).unwrap();
-    frost_secp256k1_tr::round1::commit(&secret, &mut OsRng).1
+    keep_core::frost::commit_checked(&secret).unwrap().1
 }
 
 #[test]

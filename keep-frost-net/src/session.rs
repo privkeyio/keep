@@ -1127,7 +1127,6 @@ mod tests {
     // missing (which used to produce `Aggregation failed: Unknown identifier`).
     #[test]
     fn test_aggregation_tolerates_reordered_share_before_commitment() {
-        use frost_secp256k1_tr::rand_core::OsRng;
         use keep_core::frost::{ThresholdConfig, TrustedDealer};
 
         let (shares, pubkey_pkg) = TrustedDealer::new(ThresholdConfig::two_of_three())
@@ -1137,10 +1136,8 @@ mod tests {
         // Participants 1 and 2 (identifiers from shares[0], shares[1]).
         let kp1 = shares[0].key_package().unwrap();
         let kp2 = shares[1].key_package().unwrap();
-        let (nonces1, commit1) =
-            frost_secp256k1_tr::round1::commit(kp1.signing_share(), &mut OsRng);
-        let (nonces2, commit2) =
-            frost_secp256k1_tr::round1::commit(kp2.signing_share(), &mut OsRng);
+        let (nonces1, commit1) = keep_core::frost::commit_checked(kp1.signing_share()).unwrap();
+        let (nonces2, commit2) = keep_core::frost::commit_checked(kp2.signing_share()).unwrap();
 
         let message = b"reorder message".to_vec();
         let participants = vec![1u16, 2u16];

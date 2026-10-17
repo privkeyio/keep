@@ -214,8 +214,7 @@ mod tests {
     use super::*;
     use crate::frost::{ThresholdConfig, TrustedDealer};
     use bitcoin::key::TapTweak;
-    use frost_secp256k1_tr::rand_core::OsRng;
-    use frost_secp256k1_tr::{round1, round2, SigningPackage};
+    use frost_secp256k1_tr::{round2, SigningPackage};
     use std::collections::BTreeMap;
 
     fn dealer_shares(threshold: u16, total: u16) -> Vec<SharePackage> {
@@ -396,7 +395,7 @@ mod tests {
             let mut nonces = BTreeMap::new();
             let mut commitments = BTreeMap::new();
             for kp in &kps {
-                let (n, c) = round1::commit(kp.signing_share(), &mut OsRng);
+                let (n, c) = crate::frost::nonce::commit_checked(kp.signing_share()).unwrap();
                 nonces.insert(*kp.identifier(), n);
                 commitments.insert(*kp.identifier(), c);
             }

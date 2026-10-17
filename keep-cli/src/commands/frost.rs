@@ -625,8 +625,7 @@ fn cmd_frost_sign_interactive(
     let session_id: [u8; 32] = keep_core::crypto::blake2b_256(message);
 
     out.info("Round 1: Generating commitment...");
-    let (our_nonces, our_commitment) =
-        round1::commit(kp.signing_share(), &mut frost::rand_core::OsRng);
+    let (our_nonces, our_commitment) = keep_core::frost::commit_checked(kp.signing_share())?;
 
     let commit_bytes = our_commitment
         .serialize()

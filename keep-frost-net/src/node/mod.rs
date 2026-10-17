@@ -1717,19 +1717,83 @@ impl KfpNode {
         // flight may be holding nonces drawn inside that window, and a round
         // that reaches round 2 emits a share over one. Both are torn down here
         // rather than left to expire.
-        let abandoned = self.sessions.write().abandon_all();
+        //
+        // Never a plain `write()`. This can be reached from a caller that
+        // already holds the sessions lock, and `parking_lot`'s lock is neither
+        // reentrant nor able to detect that, so a plain acquisition parks this
+        // thread on itself while holding the global sessions lock and hangs
+        // every other handler with it: the failure this function exists to
+        // contain would become a node-wide outage. The wait covers ordinary
+        // contention, which clears in microseconds, and gives up rather than
+        // hang if the caller is the holder. Callers should still drop the lock
+        // first, since giving up means in-flight sessions are left to the
+        // expiry sweep instead of being torn down now.
+        let abandoned = self
+            .sessions
+            .try_write_for(Duration::from_millis(100))
+            .map(|mut sessions| sessions.abandon_all());
         self.nonce_pool.clear_own();
 
-        error!(
-            abandoned_sessions = abandoned,
-            "OS RNG HEALTH CHECK FAILED: refusing to sign, abandoning in-flight \
-             sessions and discarding pooled nonces. Nonces drawn from a degraded \
-             source can be reused, and a reused nonce recovers this node's \
-             signing share."
-        );
+        match abandoned {
+            Some(abandoned) => error!(
+                abandoned_sessions = abandoned,
+                "OS RNG HEALTH CHECK FAILED: refusing to sign, abandoning in-flight \
+                 sessions and discarding pooled nonces. Nonces drawn from a degraded \
+                 source can be reused, and a reused nonce recovers this node's \
+                 signing share."
+            ),
+            None => error!(
+                "OS RNG HEALTH CHECK FAILED: refusing to sign and discarding pooled \
+                 nonces. Nonces drawn from a degraded source can be reused, and a \
+                 reused nonce recovers this node's signing share. In-flight sessions \
+                 could NOT be abandoned because the sessions lock stayed held, so they \
+                 are left to the expiry sweep; signing is already refused, but a \
+                 session that reaches round 2 before it expires would emit a share \
+                 over a nonce from the degraded source."
+            ),
+        }
         if self.event_tx.send(KfpNodeEvent::EntropyDegraded).is_err() {
             warn!("no subscriber for the entropy alert; the signing refusal still holds");
         }
+    }
+
+    /// Draw this node's signing nonces, latching if the draw behind them was
+    /// bad.
+    ///
+    /// This is the detector that watches the source the nonce actually comes
+    /// from. [`Self::probe_entropy_health`] and the gate on each sign request
+    /// read the latch; between a passing probe and the draw a moment later
+    /// there is a window neither can see into, and a nonce drawn inside it is
+    /// derived from the bytes without anything having looked at them. A nonce
+    /// repeated across two messages recovers this node's signing share, so the
+    /// window is worth closing even though it is narrow.
+    pub(crate) fn commit_nonces(
+        &self,
+        share: &frost_secp256k1_tr::keys::SigningShare,
+    ) -> Result<(
+        frost_secp256k1_tr::round1::SigningNonces,
+        frost_secp256k1_tr::round1::SigningCommitments,
+    )> {
+        keep_core::frost::commit_checked(share).map_err(|e| self.entropy_refusal("nonce draw", e))
+    }
+
+    /// Turn a failed entropy draw into the refusal, latching first when the
+    /// source itself is what answered badly. Separate from the draw so the
+    /// branch can be tested without a bad source, which the draw deliberately
+    /// gives no way to supply.
+    ///
+    /// `PolicyViolation` to match every other entropy refusal in this crate, so
+    /// that an operator filtering on it to find "this node refused to sign, its
+    /// RNG is bad" sees the draw-time refusals too.
+    pub(crate) fn entropy_refusal(
+        &self,
+        what: &str,
+        e: keep_core::entropy::EntropyHealthError,
+    ) -> FrostNetError {
+        if Self::latches_signing(e) {
+            self.mark_entropy_degraded();
+        }
+        FrostNetError::PolicyViolation(format!("{what}: {e}"))
     }
 
     /// Probe the OS RNG directly and latch if it is degraded.
