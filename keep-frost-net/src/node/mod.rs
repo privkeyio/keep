@@ -591,11 +591,10 @@ pub struct ServeHooks {
     pub refuse_raw_sign: bool,
     pub require_structured_payload: bool,
     pub auto_approve_oprf_eval: bool,
-    /// Co-sign key-path spends of the group's taproot outputs unattended. This
-    /// node then signs any spend a group member requests that passes its own
-    /// checks (the input is the group's output, sighash DEFAULT or ALL), with no
-    /// limit on destination or amount.
-    pub allow_key_path_spend: bool,
+    /// Where and how much this node will co-sign a key-path spend of the
+    /// group's taproot outputs for, unattended. The default refuses every
+    /// spend; see [`KeySpendPolicy`](crate::KeySpendPolicy).
+    pub key_path_spend: crate::KeySpendPolicy,
 }
 
 impl SigningHooks for ServeHooks {
@@ -619,8 +618,37 @@ impl SigningHooks for ServeHooks {
         let approve = self.auto_approve_oprf_eval;
         Box::pin(async move { approve })
     }
-    fn approve_key_path_spend(&self, _session: &SessionInfo) -> bool {
-        self.allow_key_path_spend
+    fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
+        match self
+            .key_path_spend
+            .approve(session.structured_payload.as_deref())
+        {
+            Ok(approved) => {
+                // An unattended node logs what it co-signed, not only what it
+                // refused: the operator has no other record of where the
+                // group's money went.
+                info!(
+                    session_id = %hex::encode(session.session_id),
+                    requester = session.requester,
+                    consumed = %approved.consumed,
+                    paid = %approved.paid,
+                    "Co-signing a key-path spend within policy"
+                );
+                true
+            }
+            Err(reason) => {
+                // Logged here rather than returned: the requester is told only
+                // that this co-signer declined, so a member probing for the
+                // allowlist and the cap learns nothing from the refusals.
+                warn!(
+                    session_id = %hex::encode(session.session_id),
+                    requester = session.requester,
+                    reason,
+                    "Refusing to co-sign a key-path spend"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -4042,7 +4070,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: true,
-            allow_key_path_spend: false,
+            key_path_spend: crate::KeySpendPolicy::default(),
         };
         assert!(approving.approve_oprf_eval(2, [0u8; 32]).await);
 
@@ -4050,7 +4078,7 @@ mod tests {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
-            allow_key_path_spend: false,
+            key_path_spend: crate::KeySpendPolicy::default(),
         };
         assert!(!declining.approve_oprf_eval(2, [0u8; 32]).await);
     }
@@ -4061,7 +4089,7 @@ mod tests {
             refuse_raw_sign: true,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
-            allow_key_path_spend: false,
+            key_path_spend: crate::KeySpendPolicy::default(),
         };
 
         let raw = raw_session();

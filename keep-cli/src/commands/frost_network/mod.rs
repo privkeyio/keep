@@ -69,7 +69,8 @@ pub fn cmd_frost_network_serve(
     auto_contribute_descriptor: bool,
     refuse_raw_sign: bool,
     require_structured_sign: bool,
-    allow_key_path_spend: bool,
+    key_spend_to: &[String],
+    key_spend_max_sats: Option<u64>,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
@@ -98,6 +99,40 @@ pub fn cmd_frost_network_serve(
                 .into(),
         ));
     }
+
+    // Resolve the key-path spend policy before the password prompt, so a bad
+    // address or half a policy fails there and not after the operator has
+    // typed it. Both halves are required together: an operator who names
+    // destinations but no cap, or the reverse, asked for a policy and would
+    // instead get the blanket refusal, which is worth an error rather than a
+    // surprise.
+    let key_path_spend = match (key_spend_to.is_empty(), key_spend_max_sats) {
+        (true, None) => keep_frost_net::KeySpendPolicy::default(),
+        (false, Some(0)) => {
+            return Err(KeepError::Frost(
+                "--key-spend-max-sats 0 refuses every key-path spend; drop both flags \
+                 to serve the default refusal, or give a cap this node may spend \
+                 within"
+                    .into(),
+            ))
+        }
+        (false, Some(max)) => keep_frost_net::KeySpendPolicy::from_addresses(key_spend_to, max)
+            .map_err(|e| KeepError::Frost(format!("--key-spend-to: {e}")))?,
+        (false, None) => {
+            return Err(KeepError::Frost(
+                "--key-spend-to needs --key-spend-max-sats; without a cap this node \
+                 refuses every key-path spend"
+                    .into(),
+            ))
+        }
+        (true, Some(_)) => {
+            return Err(KeepError::Frost(
+                "--key-spend-max-sats needs at least one --key-spend-to; without a \
+                 destination this node refuses every key-path spend"
+                    .into(),
+            ))
+        }
+    };
 
     // Producer side: when this node attests via a TPM, attach a quote to every
     // announce so peers can verify it (and a holder can pin it via
@@ -308,20 +343,32 @@ pub fn cmd_frost_network_serve(
                 "duress beacon recipients recorded"
             );
         }
-        if refuse_raw_sign || require_structured_sign || oprf_auto_approve || allow_key_path_spend
+        if refuse_raw_sign
+            || require_structured_sign
+            || oprf_auto_approve
+            || !key_path_spend.refuses_everything()
         {
             node.set_hooks(Arc::new(keep_frost_net::ServeHooks {
                 refuse_raw_sign,
                 require_structured_payload: require_structured_sign,
                 auto_approve_oprf_eval: oprf_auto_approve,
-                allow_key_path_spend,
+                key_path_spend: key_path_spend.clone(),
             }));
         }
-        if allow_key_path_spend {
-            out.warn(
-                "co-signing key-path spends of the group's taproot outputs to any \
-                 destination and amount a member requests",
-            );
+        if !key_path_spend.refuses_everything() {
+            out.warn(&format!(
+                "co-signing key-path spends of the group's taproot outputs, unattended, \
+                 for spends consuming up to {} sats (outputs plus fee) whose every \
+                 output pays one of these destinations. There is no limit across \
+                 spends yet, so this is a per-spend bound.",
+                key_spend_max_sats.unwrap_or(0),
+            ));
+            // Echoed one per line: an operator who fat-fingers an address gets a
+            // node that silently refuses, and a count alone gives them nothing to
+            // check against.
+            for destination in key_spend_to {
+                out.field("Key-spend destination", destination);
+            }
         }
         if refuse_raw_sign {
             out.field(
@@ -2354,7 +2401,8 @@ mod tests {
                 false,
                 false,
                 false,
-                false,
+                &[],
+                None,
                 None,
                 true,
                 None,
