@@ -40,9 +40,10 @@ impl FreshNonces {
     /// Generate fresh single-use nonces for the given signing share.
     ///
     /// Fallible because the draw the nonces are built from is checked; see
-    /// [`crate::frost::nonce`] for why that check is at the draw.
+    /// [`crate::frost::checked_rng`] for why that check is at the draw.
     fn generate(signing_share: &frost::keys::SigningShare) -> Result<Self> {
-        let (nonces, commitments) = crate::frost::nonce::commit_checked_ed25519(signing_share)?;
+        let (nonces, commitments) =
+            crate::frost::checked_rng::commit_checked_ed25519(signing_share)?;
         Ok(Self {
             nonces,
             commitments,

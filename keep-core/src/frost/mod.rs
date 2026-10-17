@@ -7,10 +7,10 @@
 //! allowing multiple parties to collaboratively sign messages without
 //! any single party having access to the complete private key.
 pub mod bip32_signing;
+mod checked_rng;
 mod coordinator;
 mod dealer;
 pub mod dkg;
-mod nonce;
 mod recover;
 mod refresh;
 mod share;
@@ -22,9 +22,9 @@ mod verifying_set;
 #[cfg(feature = "ed25519")]
 pub mod ed25519;
 
+pub use checked_rng::{checked_draw, commit_checked, CheckedRng};
 pub use coordinator::Coordinator;
 pub use dealer::{ThresholdConfig, TrustedDealer};
-pub use nonce::commit_checked;
 pub use recover::recover_nsec;
 pub use refresh::refresh_shares;
 pub use share::{Ciphersuite, ShareMetadata, SharePackage, StoredShare};

@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use frost::keys::refresh::{compute_refreshing_shares, refresh_share};
 use frost::keys::{KeyPackage, PublicKeyPackage, VerifyingShare};
-use frost::rand_core::OsRng;
 use frost::Identifier;
 use frost_secp256k1_tr as frost;
 use zeroize::Zeroizing;
@@ -116,9 +115,14 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
 
     let identifiers: Vec<Identifier> = key_packages.iter().map(|kp| *kp.identifier()).collect();
 
-    let (refreshing_shares, new_pubkey_pkg) =
-        compute_refreshing_shares(pubkey_pkg, &identifiers, &mut OsRng)
-            .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;
+    // A refresh is run to make an old share useless. The delta is what does
+    // that, so a degraded draw here produces a guessable delta and the refresh
+    // does not heal the compromise it was run for, while reporting success.
+    let (refreshing_shares, new_pubkey_pkg) = crate::frost::checked_draw(|rng| {
+        #[allow(clippy::disallowed_methods)] // drawn through the checked source
+        compute_refreshing_shares(pubkey_pkg, &identifiers, rng)
+    })?
+    .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;
 
     if refreshing_shares.len() != identifiers.len() {
         return Err(KeepError::Frost(format!(

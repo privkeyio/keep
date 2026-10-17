@@ -42,7 +42,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
+      # --all-targets so test code is linted too, and the features named
+      # explicitly rather than arriving through workspace feature unification,
+      # which silently decided whether the ed25519 module was linted at all.
+      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519 -- -D warnings
       # The reproducible and Debian builds run only on pushes and tags, so a
       # workspace member missing from their Dockerfiles is caught here instead.
       - run: scripts/check-dockerfile-members.sh

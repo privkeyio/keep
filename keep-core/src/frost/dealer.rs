@@ -3,7 +3,6 @@
 
 //! Trusted dealer key generation for FROST.
 use frost::keys::{IdentifierList, KeyPackage, PublicKeyPackage};
-use frost::rand_core::OsRng;
 use frost_secp256k1_tr as frost;
 
 use crate::error::{KeepError, Result};
@@ -80,12 +79,17 @@ impl TrustedDealer {
     ///
     /// Returns (share packages, public key package).
     pub fn generate(&self, name: &str) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
-        let (shares, pubkey_pkg) = frost::keys::generate_with_dealer(
-            self.config.total_shares,
-            self.config.threshold,
-            IdentifierList::Default,
-            OsRng,
-        )
+        // This draw is the group key. Nothing later can recover from it being
+        // predictable, so it is the one draw in the crate most worth checking.
+        let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
+            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            frost::keys::generate_with_dealer(
+                self.config.total_shares,
+                self.config.threshold,
+                IdentifierList::Default,
+                rng,
+            )
+        })?
         .map_err(|e| KeepError::Frost(format!("Key generation failed: {e}")))?;
 
         let group_pubkey = extract_group_pubkey(&pubkey_pkg)?;
@@ -123,13 +127,18 @@ impl TrustedDealer {
         let signing_key = frost::SigningKey::deserialize(secret)
             .map_err(|e| KeepError::Frost(format!("Invalid signing key: {e}")))?;
 
-        let (shares, pubkey_pkg) = frost::keys::split(
-            &signing_key,
-            self.config.total_shares,
-            self.config.threshold,
-            IdentifierList::Default,
-            &mut OsRng,
-        )
+        // The key is the caller's here, but the polynomial that splits it is
+        // drawn, and a predictable polynomial gives away the other shares.
+        let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
+            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            frost::keys::split(
+                &signing_key,
+                self.config.total_shares,
+                self.config.threshold,
+                IdentifierList::Default,
+                rng,
+            )
+        })?
         .map_err(|e| KeepError::Frost(format!("Key split failed: {e}")))?;
 
         let group_pubkey = extract_group_pubkey(&pubkey_pkg)?;
