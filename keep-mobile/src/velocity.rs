@@ -67,10 +67,6 @@ impl VelocityTracker {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.transactions.clear();
-    }
-
     #[allow(dead_code)]
     pub fn transaction_count(&self) -> usize {
         self.transactions.len()
@@ -124,16 +120,6 @@ mod tests {
         tracker.record(1000);
         tracker.cleanup_old();
         assert_eq!(tracker.transaction_count(), 1);
-    }
-
-    #[test]
-    fn test_clear() {
-        let mut tracker = VelocityTracker::new();
-        tracker.record(1000);
-        tracker.record(2000);
-        tracker.clear();
-        assert_eq!(tracker.transaction_count(), 0);
-        assert_eq!(tracker.daily_total(), 0);
     }
 
     #[test]
