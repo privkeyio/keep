@@ -637,7 +637,7 @@ pub struct KeepMobile {
     dkg_in_flight: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) runtime: tokio::runtime::Runtime,
     policy: Arc<std::sync::RwLock<PolicyEvaluator>>,
-    velocity: Arc<std::sync::Mutex<VelocityTracker>>,
+    velocity: Arc<std::sync::Mutex<Option<VelocityTracker>>>,
     descriptor_callbacks: Arc<RwLock<Option<Arc<dyn DescriptorCallbacks>>>>,
     health_callbacks: Arc<RwLock<Option<Arc<dyn HealthCallbacks>>>>,
     descriptor_networks: Arc<std::sync::Mutex<HashMap<[u8; 32], String>>>,
@@ -818,7 +818,17 @@ impl KeepMobile {
                 msg: format!("Runtime: {e}"),
             })?;
 
-        let velocity = persistence::load_velocity(&storage)?;
+        // A read fault here must not stop the app opening: without a KeepMobile
+        // there is no account switcher, no export and no kill switch, and the
+        // same read faults on every launch. The counters are left unknown, which
+        // refuses the rules that consult them, rather than read as empty.
+        let velocity = match persistence::load_velocity(&storage) {
+            Ok(velocity) => Some(velocity),
+            Err(e) => {
+                tracing::error!("Velocity counters unreadable, spending limits will refuse: {e}");
+                None
+            }
+        };
         let velocity = Arc::new(std::sync::Mutex::new(velocity));
 
         let mut evaluator = PolicyEvaluator::new(velocity.clone());
@@ -1871,18 +1881,37 @@ impl KeepMobile {
         &self,
         ctx: TransactionContext,
     ) -> Result<PolicyDecision, KeepMobileError> {
+        self.reload_velocity_if_unknown()?;
         self.policy_read_lock()?.evaluate(&ctx)
     }
 
     pub fn record_policy_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
+        self.reload_velocity_if_unknown()?;
         self.policy_read_lock()?.record_transaction(amount_sats)?;
-        persistence::persist_velocity(&self.storage, &*self.velocity_lock()?)
+        let velocity = self.velocity_lock()?;
+        let tracker = velocity
+            .as_ref()
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "Velocity counters went unknown between recording and persisting".into(),
+            })?;
+        persistence::persist_velocity(&self.storage, tracker)
     }
 
+    /// Resets the spending counters, and is one of the two ways back from
+    /// counters that could not be read: it overwrites the unreadable record, so
+    /// the limits go from refusing to enforcing a known-empty history. The other
+    /// is [`Self::reload_velocity_if_unknown`], which keeps the real history and
+    /// so is tried first on every decision.
+    ///
+    /// The write lands before the counters change. Nothing here may leave them
+    /// reading as empty on a path that returns an error, because that is the
+    /// refusal lifted against a history still unknown.
     pub fn clear_velocity_tracker(&self) -> Result<(), KeepMobileError> {
         let mut velocity = self.velocity_lock()?;
-        velocity.clear();
-        persistence::persist_velocity(&self.storage, &velocity)
+        let fresh = VelocityTracker::new();
+        persistence::persist_velocity(&self.storage, &fresh)?;
+        *velocity = Some(fresh);
+        Ok(())
     }
 
     pub fn add_trusted_warden(&self, pubkey_hex: String) -> Result<(), KeepMobileError> {
@@ -3922,7 +3951,31 @@ impl KeepMobile {
             })
     }
 
-    fn velocity_lock(&self) -> Result<std::sync::MutexGuard<'_, VelocityTracker>, KeepMobileError> {
+    /// Reads the stored counters again if they are still unknown.
+    ///
+    /// The fault that made them unknown can be transient: the Android Keystore
+    /// backend documents a decrypt failure that leaves the record intact. Held
+    /// for the life of the process, the refusal would outlast its cause and the
+    /// only way out would be discarding the real history. Retried before each
+    /// decision, a recovered Keystore restores the actual counters.
+    ///
+    /// A retry that fails changes nothing, so the counters are never read as
+    /// empty by reaching here.
+    fn reload_velocity_if_unknown(&self) -> Result<(), KeepMobileError> {
+        let mut velocity = self.velocity_lock()?;
+        if velocity.is_some() {
+            return Ok(());
+        }
+        match persistence::load_velocity(&self.storage) {
+            Ok(tracker) => *velocity = Some(tracker),
+            Err(e) => tracing::warn!("Velocity counters still unreadable: {e}"),
+        }
+        Ok(())
+    }
+
+    fn velocity_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<VelocityTracker>>, KeepMobileError> {
         self.velocity
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
@@ -6602,5 +6655,203 @@ mod dkg_pending_share_tests {
 
         // Stash gone: the guard reports nothing pending, so a new run is unblocked.
         assert!(mobile.pending_dkg_share().unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod velocity_fault_tests {
+    use super::*;
+    use crate::storage::{SecureStorage, ShareMetadataInfo};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    // Reads of `unreadable` fault rather than report absence, which is the
+    // distinction the fix turns on: an absent record is a history of nothing,
+    // a faulted one is a history we do not know.
+    #[derive(Default)]
+    struct FaultingStorage {
+        records: StdMutex<HashMap<String, Vec<u8>>>,
+        unreadable: StdMutex<Vec<String>>,
+        unwritable: StdMutex<Vec<String>>,
+    }
+
+    impl FaultingStorage {
+        fn fault(&self, key: &str) {
+            self.unreadable.lock().unwrap().push(key.into());
+        }
+
+        fn fault_write(&self, key: &str) {
+            self.unwritable.lock().unwrap().push(key.into());
+        }
+
+        fn heal(&self) {
+            self.unreadable.lock().unwrap().clear();
+            self.unwritable.lock().unwrap().clear();
+        }
+
+        fn plant(&self, key: &str, data: Vec<u8>) {
+            self.records.lock().unwrap().insert(key.into(), data);
+        }
+
+        fn raw(&self, key: &str) -> Option<Vec<u8>> {
+            self.records.lock().unwrap().get(key).cloned()
+        }
+    }
+
+    impl SecureStorage for FaultingStorage {
+        fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
+            unimplemented!()
+        }
+        fn load_share(&self) -> Result<Vec<u8>, KeepMobileError> {
+            Err(KeepMobileError::StorageNotFound)
+        }
+        fn has_share(&self) -> bool {
+            false
+        }
+        fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            None
+        }
+        fn delete_share(&self) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+        fn store_share_by_key(
+            &self,
+            key: String,
+            data: Vec<u8>,
+            _: ShareMetadataInfo,
+        ) -> Result<(), KeepMobileError> {
+            if self.unwritable.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "cannot write right now".into(),
+                });
+            }
+            self.records.lock().unwrap().insert(key, data);
+            Ok(())
+        }
+        fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
+            if self.unreadable.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "cannot decrypt right now".into(),
+                });
+            }
+            self.records
+                .lock()
+                .unwrap()
+                .get(&key)
+                .cloned()
+                .ok_or(KeepMobileError::StorageNotFound)
+        }
+        fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
+            Vec::new()
+        }
+        fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            self.records.lock().unwrap().remove(&key);
+            Ok(())
+        }
+        fn get_active_share_key(&self) -> Option<String> {
+            None
+        }
+        fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
+            Ok(())
+        }
+    }
+
+    // The constructor used to propagate this read fault, and keep-android
+    // builds KeepMobile before it assigns anything, so the throw left the app
+    // with no account switcher, no import, no export and no kill switch, every
+    // launch, because the same read faults every time. Its neighbours in the
+    // constructor already degraded instead.
+    #[test]
+    fn an_unreadable_velocity_record_still_opens_the_app() {
+        let storage = Arc::new(FaultingStorage::default());
+        storage.fault(VELOCITY_STORAGE_KEY);
+
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>)
+            .expect("an unreadable velocity record must not stop the app opening");
+        assert!(mobile.velocity_lock().unwrap().is_none());
+    }
+
+    // Degrading is only safe because the counters stay unknown: recording into
+    // them is refused rather than silently starting a fresh history, and
+    // clearing them is the deliberate way back.
+    #[test]
+    fn clearing_the_counters_recovers_from_an_unreadable_record() {
+        let storage = Arc::new(FaultingStorage::default());
+        storage.fault(VELOCITY_STORAGE_KEY);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(mobile.record_policy_transaction(1_000).is_err());
+        assert!(storage.raw(VELOCITY_STORAGE_KEY).is_none());
+
+        mobile.clear_velocity_tracker().unwrap();
+
+        let stored = storage
+            .raw(VELOCITY_STORAGE_KEY)
+            .expect("clearing must overwrite the unreadable record");
+        assert!(VelocityTracker::from_bytes(&stored).is_ok());
+        mobile.record_policy_transaction(1_000).unwrap();
+        assert_eq!(
+            mobile
+                .velocity_lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .daily_total(),
+            1_000
+        );
+    }
+    // The recovery path must not half-complete. A Keystore that cannot decrypt
+    // the record is the same fault class as one that cannot write it, so these
+    // two arrive together: if clearing flipped the counters to known-empty and
+    // then failed to persist, the refusal would be lifted for the rest of the
+    // process against a history that is still unknown, which is the fail-open
+    // the refusal exists to close, reached through its own recovery.
+    #[test]
+    fn a_clear_that_cannot_be_persisted_leaves_the_counters_unknown() {
+        let storage = Arc::new(FaultingStorage::default());
+        storage.fault(VELOCITY_STORAGE_KEY);
+        storage.fault_write(VELOCITY_STORAGE_KEY);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        assert!(mobile.clear_velocity_tracker().is_err());
+        assert!(
+            mobile.velocity_lock().unwrap().is_none(),
+            "a failed clear must not leave the counters reading as empty"
+        );
+    }
+    // A Keystore decrypt failure can be transient with the record intact, so
+    // the refusal must not outlast its cause and must not cost the history to
+    // leave. The retry recovers the real counters, which clearing cannot.
+    #[test]
+    fn counters_that_become_readable_again_are_the_real_ones() {
+        let storage = Arc::new(FaultingStorage::default());
+        let mut seeded = VelocityTracker::new();
+        seeded.record(5_000);
+        storage.plant(VELOCITY_STORAGE_KEY, seeded.to_bytes().unwrap());
+        storage.fault(VELOCITY_STORAGE_KEY);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(mobile.velocity_lock().unwrap().is_none());
+
+        storage.heal();
+        mobile
+            .evaluate_policy(TransactionContext {
+                amount_sats: 1,
+                fee_sats: 1,
+                destinations: vec![],
+                has_unknown_destination: false,
+            })
+            .unwrap();
+
+        assert_eq!(
+            mobile
+                .velocity_lock()
+                .unwrap()
+                .as_ref()
+                .expect("a readable record must be adopted")
+                .daily_total(),
+            5_000,
+            "the recovered history must be the stored one, not an empty one"
+        );
     }
 }

@@ -410,12 +410,16 @@ impl PolicyBundle {
 
 pub struct PolicyEvaluator {
     policy: Option<PolicyBundle>,
-    velocity: Arc<Mutex<VelocityTracker>>,
+    /// `None` means the stored counters could not be read, which is not the
+    /// same as counters that read as empty: the spending history is unknown
+    /// rather than known to be nothing, so the rules that consult it refuse
+    /// instead of treating it as zero.
+    velocity: Arc<Mutex<Option<VelocityTracker>>>,
     trusted_wardens: HashSet<[u8; POLICY_PUBKEY_LEN]>,
 }
 
 impl PolicyEvaluator {
-    pub fn new(velocity: Arc<Mutex<VelocityTracker>>) -> Self {
+    pub fn new(velocity: Arc<Mutex<Option<VelocityTracker>>>) -> Self {
         Self {
             policy: None,
             velocity,
@@ -481,6 +485,12 @@ impl PolicyEvaluator {
                 .map_err(|_| KeepMobileError::StorageError {
                     msg: "Velocity lock poisoned".into(),
                 })?;
+
+            let Some(velocity) = velocity.as_ref() else {
+                return Ok(PolicyDecision::Deny {
+                    reason: "Spending history unreadable, cannot enforce limit".into(),
+                });
+            };
 
             if let Some(daily_limit) = rules.daily_limit {
                 if velocity.daily_total().saturating_add(ctx.amount_sats) > daily_limit {
@@ -560,6 +570,11 @@ impl PolicyEvaluator {
             .lock()
             .map_err(|_| KeepMobileError::StorageError {
                 msg: "Velocity lock poisoned".into(),
+            })?;
+        let velocity = velocity
+            .as_mut()
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "Spending history unreadable, cannot record transaction".into(),
             })?;
         velocity.record(amount_sats);
         Ok(())
@@ -701,7 +716,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -733,7 +748,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -765,7 +780,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -797,7 +812,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -823,7 +838,7 @@ mod tests {
 
     #[test]
     fn test_no_policy_allows_all() {
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let evaluator = PolicyEvaluator::new(velocity);
 
         let ctx = TransactionContext {
@@ -903,7 +918,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -932,7 +947,7 @@ mod tests {
         };
         let bundle = create_test_bundle(&rules);
 
-        let velocity = Arc::new(Mutex::new(VelocityTracker::new()));
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
         let mut evaluator = PolicyEvaluator::new(velocity);
         evaluator.set_policy(bundle);
 
@@ -964,5 +979,90 @@ mod tests {
         assert_eq!(parsed.policy_hash, bundle.policy_hash);
         assert_eq!(parsed.created_at, bundle.created_at);
         assert_eq!(parsed.signature, bundle.signature);
+    }
+    // No test covered the velocity rules at all before the unreadable case
+    // needed one, so this pins the enforcement the refusal below stands in for.
+    #[test]
+    fn a_daily_limit_refuses_once_the_history_fills_it() {
+        let rules = PolicyRules {
+            daily_limit: Some(5_000),
+            ..Default::default()
+        };
+        let mut tracker = VelocityTracker::new();
+        tracker.record(4_000);
+        let mut evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(Some(tracker))));
+        evaluator.set_policy(create_test_bundle(&rules));
+
+        let ctx = TransactionContext {
+            amount_sats: 500,
+            fee_sats: 100,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+
+        let ctx = TransactionContext {
+            amount_sats: 2_000,
+            fee_sats: 100,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        assert!(matches!(
+            evaluator.evaluate(&ctx).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
+
+    // Counters that could not be read are not counters that read as empty.
+    // Taking them for empty would pass every spend under the limit, which is
+    // the limit silently off; the amount here is trivially under it.
+    #[test]
+    fn an_unreadable_history_refuses_a_daily_limit() {
+        let rules = PolicyRules {
+            daily_limit: Some(5_000_000),
+            ..Default::default()
+        };
+        let mut evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(None)));
+        evaluator.set_policy(create_test_bundle(&rules));
+
+        let ctx = TransactionContext {
+            amount_sats: 1,
+            fee_sats: 1,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        let PolicyDecision::Deny { reason } = evaluator.evaluate(&ctx).unwrap() else {
+            panic!("an unreadable history must not pass a daily limit");
+        };
+        assert!(reason.contains("unreadable"), "{reason}");
+    }
+
+    // Scoped to the rules that consult it: a policy with no velocity rule has
+    // nothing to be unsure about, so it must still decide.
+    #[test]
+    fn an_unreadable_history_does_not_refuse_a_policy_that_ignores_it() {
+        let rules = PolicyRules {
+            max_amount: Some(100_000),
+            ..Default::default()
+        };
+        let mut evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(None)));
+        evaluator.set_policy(create_test_bundle(&rules));
+
+        let ctx = TransactionContext {
+            amount_sats: 50_000,
+            fee_sats: 500,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+    }
+
+    // Recording into a tracker conjured at record time would make the counters
+    // readable again while missing everything spent before the fault, which is
+    // the fail-open the refusal above closes, reached by a side door.
+    #[test]
+    fn an_unreadable_history_refuses_to_record() {
+        let evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(None)));
+        assert!(evaluator.record_transaction(1_000).is_err());
     }
 }

@@ -73,8 +73,12 @@ pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<VelocityTracker, KeepMobileError> {
     match storage.load_share_by_key(VELOCITY_STORAGE_KEY.into()) {
-        Ok(data) => VelocityTracker::from_bytes(&data).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to deserialize velocity: {e}"),
+        // Deliberately without serde's message. It quotes the value it tripped
+        // on, which here is an amount or a timestamp out of the record, and this
+        // error reaches a log. What a caller can act on is that the record did
+        // not parse, which is the same either way.
+        Ok(data) => VelocityTracker::from_bytes(&data).map_err(|_| KeepMobileError::StorageError {
+            msg: "Failed to deserialize velocity".into(),
         }),
         Err(KeepMobileError::StorageNotFound) => Ok(VelocityTracker::new()),
         Err(e) => Err(KeepMobileError::StorageError {
