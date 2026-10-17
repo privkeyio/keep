@@ -24,9 +24,24 @@ struct Group {
     nodes: Vec<Arc<KfpNode>>,
 }
 
-/// A 2-of-3 group whose two co-signers do (`allow`) or do not opt in to
-/// key-path spends; node 3 requests.
-async fn group_with(allow: bool) -> Group {
+/// The single output `key_spend_payload` pays, 99 000 sats to an OP_RETURN.
+/// A co-signer policy has to allow it by script like any other destination.
+fn payload_destination() -> bitcoin::ScriptBuf {
+    bitcoin::ScriptBuf::new_op_return([0u8; 4])
+}
+
+/// What `key_spend_payload`'s transaction consumes: one 100 000 sat input, of
+/// which 99 000 reaches the output and 1 000 is the fee. The cap is on this,
+/// not on the 99 000, so a policy that allows the spend has to cover the fee.
+const PAYLOAD_CONSUMES: bitcoin::Amount = bitcoin::Amount::from_sat(100_000);
+
+/// The fee that leaves in `key_spend_payload`'s transaction: 100 000 in less
+/// the 99 000 the output pays.
+const PAYLOAD_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000);
+
+/// A 2-of-3 group whose two co-signers run `policy` on key-path spends; node 3
+/// requests.
+async fn group_with(policy: keep_frost_net::KeySpendPolicy) -> Group {
     let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
     let (shares, _) = dealer.generate("mem-taproot-spend").unwrap();
     let group_pubkey = *shares[0].group_pubkey();
@@ -48,7 +63,7 @@ async fn group_with(allow: bool) -> Group {
             refuse_raw_sign: false,
             require_structured_payload: false,
             auto_approve_oprf_eval: false,
-            allow_key_path_spend: allow,
+            key_path_spend: policy.clone(),
         }));
     }
     let mut rx = nodes[2].subscribe();
@@ -80,7 +95,12 @@ async fn group_with(allow: bool) -> Group {
 }
 
 async fn group() -> Group {
-    group_with(true).await
+    group_with(keep_frost_net::KeySpendPolicy::new(
+        vec![payload_destination()],
+        PAYLOAD_CONSUMES,
+        PAYLOAD_FEE,
+    ))
+    .await
 }
 
 async fn spend(
@@ -142,10 +162,11 @@ async fn a_recovery_tree_output_is_spent_on_the_key_path() {
     verify_key_path_signature(&sig, &sighash, &spent).unwrap();
 }
 
-/// Co-signers that have not opted in refuse, even for the group's own output.
+/// Co-signers running the default policy refuse, even for the group's own
+/// output.
 #[tokio::test]
 async fn co_signers_refuse_key_path_spends_unless_they_opt_in() {
-    let g = group_with(false).await;
+    let g = group_with(keep_frost_net::KeySpendPolicy::default()).await;
     let path = [0u32, 3];
     let child = derive_child(&g.group_pubkey, &path).unwrap().child_pubkey;
     let spent = TaprootTweak::default().script_pubkey(&child).unwrap();
@@ -162,6 +183,55 @@ async fn co_signers_refuse_key_path_spends_unless_they_opt_in() {
             !co_signer.audit_log().refusals().is_empty(),
             "each co-signer that was asked must record its refusal"
         );
+    }
+}
+
+/// The destination and the cap are enforced where it counts, by the co-signers
+/// on the real request path, not only in the policy's own unit tests. Both
+/// cases spend the group's own output at a path the node accepts, so the only
+/// thing refusing is the policy.
+#[tokio::test]
+async fn co_signers_enforce_the_destination_and_the_cap_on_a_key_path_spend() {
+    let path = [0u32, 3];
+    let elsewhere = bitcoin::ScriptBuf::new_op_return([9u8; 4]);
+    let cases = [
+        (
+            keep_frost_net::KeySpendPolicy::new(vec![elsewhere], PAYLOAD_CONSUMES, PAYLOAD_FEE),
+            "a destination the policy does not list",
+        ),
+        (
+            keep_frost_net::KeySpendPolicy::new(
+                vec![payload_destination()],
+                PAYLOAD_CONSUMES - bitcoin::Amount::from_sat(1),
+                PAYLOAD_FEE,
+            ),
+            "a spend consuming one sat over the cap",
+        ),
+        (
+            keep_frost_net::KeySpendPolicy::new(
+                vec![payload_destination()],
+                PAYLOAD_CONSUMES,
+                PAYLOAD_FEE - bitcoin::Amount::from_sat(1),
+            ),
+            "a spend leaving one sat more in fees than the fee cap",
+        ),
+    ];
+    for (policy, case) in cases {
+        let g = group_with(policy).await;
+        let child = derive_child(&g.group_pubkey, &path).unwrap().child_pubkey;
+        let spent = TaprootTweak::default().script_pubkey(&child).unwrap();
+        let (_, result) = spend(&g, &spent, 0x00, &path, Default::default()).await;
+        let e = result.expect_err(case);
+        assert!(
+            e.to_string().contains("does not approve key-path spends"),
+            "{case}: {e}"
+        );
+        for co_signer in &g.nodes[..2] {
+            assert!(
+                !co_signer.audit_log().refusals().is_empty(),
+                "{case}: each co-signer that was asked must record its refusal"
+            );
+        }
     }
 }
 

@@ -1021,8 +1021,11 @@ pub(crate) enum FrostCommands {
         group: String,
     },
     Network {
+        // Boxed because `Serve` carries enough flags to make this the enum's
+        // largest variant by a wide margin, and every other `FrostCommands`
+        // would then be padded to its size.
         #[command(subcommand)]
-        command: FrostNetworkCommands,
+        command: Box<FrostNetworkCommands>,
     },
     Hardware {
         #[command(subcommand)]
@@ -1056,12 +1059,32 @@ pub(crate) enum FrostNetworkCommands {
         /// structured payloads.
         #[arg(long)]
         require_structured_sign: bool,
-        /// Co-sign key-path spends of the group's taproot outputs without asking.
-        /// The node checks the input is the group's own output and the sighash is
-        /// DEFAULT or ALL, but signs any destination and amount a group member
-        /// requests. Off by default: key-path spends are refused.
-        #[arg(long)]
-        allow_key_path_spend: bool,
+        /// A destination this node may co-sign a key-path spend to, repeatable.
+        /// Every output of the spend must pay one of these, change included, so
+        /// list the group's change address too. Only the output script is
+        /// compared, so the address network prefix is not enforced. With no
+        /// destination given, key-path spends are refused.
+        #[arg(long, value_name = "ADDRESS")]
+        key_spend_to: Vec<String>,
+        /// The most, in satoshis, that one key-path spend may consume for this
+        /// node to co-sign it: its outputs plus its fee, so a spend cannot pay
+        /// an allowed destination a token amount and burn the rest to miners.
+        /// Change counts too, so this has to cover what the inputs supply.
+        /// Required for --key-spend-to to take effect: without it, key-path
+        /// spends are refused. Per spend, with no limit across spends, and it
+        /// bounds only key-path spends: raw digests and nostr events are
+        /// governed separately by --refuse-raw-sign and
+        /// --require-structured-sign.
+        #[arg(long, value_name = "SATS")]
+        key_spend_max_sats: Option<u64>,
+        /// The most, in satoshis, that one key-path spend may leave in fees for
+        /// this node to co-sign it. Required alongside the other two: the
+        /// consumed cap alone cannot bound the fee, because a cap large enough
+        /// to permit a real spend is at least the value of that spend's inputs,
+        /// and within such a cap a request can pay a token amount to an allowed
+        /// destination and burn the rest to miners.
+        #[arg(long, value_name = "SATS")]
+        key_spend_max_fee_sats: Option<u64>,
         /// TOML file pinning each peer's TPM attestation key and the reference
         /// PCRs they must quote. The node verifies a peer's measured-boot state
         /// against this before answering its OPRF evaluation requests. Required
@@ -1704,6 +1727,7 @@ mod tests {
         let FrostCommands::Network { command } = command else {
             panic!("expected frost network command");
         };
+        let command = *command;
         let FrostNetworkCommands::Serve {
             duress_recipients_file,
             ..
