@@ -1085,6 +1085,29 @@ pub(crate) enum FrostNetworkCommands {
         /// destination and burn the rest to miners.
         #[arg(long, value_name = "SATS")]
         key_spend_max_fee_sats: Option<u64>,
+        /// The most, in satoshis, that the key-path spends this node co-signs
+        /// may consume in total over any rolling 24 hours. Required alongside
+        /// the other three: the per-spend bounds say nothing about how many
+        /// spends there are, and with the group's change address allowed a
+        /// member can repeat a passing spend until the balance is gone.
+        ///
+        /// This bounds the node's own participation, not the group's spending. A
+        /// refused request makes the requester fail over to another co-signer,
+        /// whose total is its own, so divide by the number of co-signers that
+        /// opt in. Held in memory, so it starts empty after a restart.
+        ///
+        /// It bounds signatures issued, not funds at risk: a signature does not
+        /// expire, so a member can take the full total every day and broadcast
+        /// everything it collected at once. Read it as how much this node is
+        /// willing to have signed per day.
+        ///
+        /// It is also a denial-of-service surface, unavoidably: the amounts come
+        /// from prevouts the requester asserts and this node has no chain access
+        /// to check them, so any share holder can fill the total with one sham
+        /// request at no cost in real satoshis and stop this node co-signing
+        /// until the window rolls.
+        #[arg(long, value_name = "SATS")]
+        key_spend_max_daily_sats: Option<u64>,
         /// TOML file pinning each peer's TPM attestation key and the reference
         /// PCRs they must quote. The node verifies a peer's measured-boot state
         /// against this before answering its OPRF evaluation requests. Required

@@ -712,6 +712,9 @@ impl KfpNode {
             }
         }
 
+        // After the key-path check, not before: this hook is where a human
+        // approval prompt and the kill switch refuse, and a prompt must never be
+        // shown for a spend the policy already refused.
         if let Err(e) = hooks.pre_sign(&session_info) {
             // Notify the requester so it fails fast instead of hanging until
             // timeout/failover exhaustion, mirroring the stale-nonce path below.
