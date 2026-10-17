@@ -1021,8 +1021,11 @@ pub(crate) enum FrostCommands {
         group: String,
     },
     Network {
+        // Boxed because `Serve` carries enough flags to make this the enum's
+        // largest variant by a wide margin, and every other `FrostCommands`
+        // would then be padded to its size.
         #[command(subcommand)]
-        command: FrostNetworkCommands,
+        command: Box<FrostNetworkCommands>,
     },
     Hardware {
         #[command(subcommand)]
@@ -1074,6 +1077,14 @@ pub(crate) enum FrostNetworkCommands {
         /// --require-structured-sign.
         #[arg(long, value_name = "SATS")]
         key_spend_max_sats: Option<u64>,
+        /// The most, in satoshis, that one key-path spend may leave in fees for
+        /// this node to co-sign it. Required alongside the other two: the
+        /// consumed cap alone cannot bound the fee, because a cap large enough
+        /// to permit a real spend is at least the value of that spend's inputs,
+        /// and within such a cap a request can pay a token amount to an allowed
+        /// destination and burn the rest to miners.
+        #[arg(long, value_name = "SATS")]
+        key_spend_max_fee_sats: Option<u64>,
         /// TOML file pinning each peer's TPM attestation key and the reference
         /// PCRs they must quote. The node verifies a peer's measured-boot state
         /// against this before answering its OPRF evaluation requests. Required
@@ -1716,6 +1727,7 @@ mod tests {
         let FrostCommands::Network { command } = command else {
             panic!("expected frost network command");
         };
+        let command = *command;
         let FrostNetworkCommands::Serve {
             duress_recipients_file,
             ..

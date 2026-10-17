@@ -30,6 +30,7 @@ use crate::structured_payload::BitcoinSighashPayload;
 pub struct KeySpendPolicy {
     allowed_destinations: Vec<ScriptBuf>,
     max_consumed: Amount,
+    max_fee: Amount,
 }
 
 /// What an approved spend moves: what the inputs supply and what the outputs
@@ -63,13 +64,25 @@ impl KeySpendPolicy {
     /// leaves the group and so errs toward refusing. Making the cap mean
     /// exactly "value leaving the group" needs change recognition.
     ///
-    /// An empty `allowed_destinations` or a zero `max_consumed` refuses every
-    /// spend. That is deliberate: the safe state is the default one, so a node
-    /// configured with half a policy signs nothing rather than anything.
-    pub fn new(allowed_destinations: Vec<ScriptBuf>, max_consumed: Amount) -> Self {
+    /// `max_fee` bounds the fee on its own, because `max_consumed` cannot. A
+    /// cap that permits any real spend is at least the value of the inputs that
+    /// spend consumes, and at that cap a request paying one satoshi to an
+    /// allowed destination and the rest to miners is within the cap. So the
+    /// split between what reaches the destinations and what the miners get
+    /// needs its own bound.
+    ///
+    /// Any part left empty or zero refuses every spend. That is deliberate: the
+    /// safe state is the default one, so a node configured with a partial
+    /// policy signs nothing rather than anything.
+    pub fn new(
+        allowed_destinations: Vec<ScriptBuf>,
+        max_consumed: Amount,
+        max_fee: Amount,
+    ) -> Self {
         Self {
             allowed_destinations,
             max_consumed,
+            max_fee,
         }
     }
 
@@ -80,7 +93,11 @@ impl KeySpendPolicy {
     /// encodes to the same script on every network, so the address prefix
     /// carries no authority here and is not enforced against a configured
     /// network.
-    pub fn from_addresses(addresses: &[String], max_consumed_sats: u64) -> Result<Self, String> {
+    pub fn from_addresses(
+        addresses: &[String],
+        max_consumed_sats: u64,
+        max_fee_sats: u64,
+    ) -> Result<Self, String> {
         let mut destinations = Vec::with_capacity(addresses.len());
         for address in addresses {
             let parsed = bitcoin::Address::from_str(address)
@@ -88,13 +105,19 @@ impl KeySpendPolicy {
                 .assume_checked();
             destinations.push(parsed.script_pubkey());
         }
-        Ok(Self::new(destinations, Amount::from_sat(max_consumed_sats)))
+        Ok(Self::new(
+            destinations,
+            Amount::from_sat(max_consumed_sats),
+            Amount::from_sat(max_fee_sats),
+        ))
     }
 
     /// True when this policy cannot approve anything, so a caller can report
     /// "key-path spends refused" rather than describe a policy that is not one.
     pub fn refuses_everything(&self) -> bool {
-        self.allowed_destinations.is_empty() || self.max_consumed == Amount::ZERO
+        self.allowed_destinations.is_empty()
+            || self.max_consumed == Amount::ZERO
+            || self.max_fee == Amount::ZERO
     }
 
     /// `Ok` only if the request's own outputs satisfy the policy. The `Err` is
@@ -111,6 +134,9 @@ impl KeySpendPolicy {
         if self.max_consumed == Amount::ZERO {
             return Err("the spend cap is zero, so no key-path spend can be approved".into());
         }
+        if self.max_fee == Amount::ZERO {
+            return Err("the fee cap is zero, so no key-path spend can be approved".into());
+        }
         let payload = structured_payload.ok_or_else(|| {
             "a key-path spend without its PSBT payload cannot be checked".to_owned()
         })?;
@@ -119,9 +145,25 @@ impl KeySpendPolicy {
         let psbt = bitcoin::Psbt::deserialize(&payload.psbt)
             .map_err(|e| format!("bitcoin-sighash payload PSBT decode failed: {e}"))?;
 
+        // Everything below reads the outputs and the prevouts as authentic
+        // because the digest commits to all of them, which holds only for these
+        // two flags: ANYONECANPAY binds one input's amount, SINGLE and NONE
+        // bind no outputs or only one. `verify_taproot_key_spend` already
+        // refuses anything else ahead of this on the request path; repeated
+        // here so this public method is sound wherever it is called from.
+        if !matches!(payload.sighash_type, 0x00 | 0x01) {
+            return Err(format!(
+                "a key-path spend must use SIGHASH_DEFAULT or SIGHASH_ALL, not {:#x}",
+                payload.sighash_type
+            ));
+        }
+
         let outputs = &psbt.unsigned_tx.output;
         if outputs.is_empty() {
             return Err("a spend with no outputs sends the whole input to fees".into());
+        }
+        if psbt.unsigned_tx.input.is_empty() {
+            return Err("a spend with no inputs consumes nothing and signs nothing".into());
         }
         let mut paid = Amount::ZERO;
         for (i, out) in outputs.iter().enumerate() {
@@ -157,16 +199,36 @@ impl KeySpendPolicy {
                 .checked_add(prevout.value)
                 .ok_or_else(|| "the input total overflows".to_owned())?;
         }
-        if paid > consumed {
-            return Err(format!(
-                "the outputs pay {paid} from {consumed} of inputs, which cannot be signed"
-            ));
-        }
+        // `Amount`'s `Sub` panics on underflow, so the fee is taken with
+        // `checked_sub` rather than relying on this refusal staying above it.
+        // Outputs paying more than the inputs supply is consensus-invalid, so
+        // no honest request looks like this.
+        let fee = consumed.checked_sub(paid).ok_or_else(|| {
+            format!(
+                "the outputs pay {} sats from {} sats of inputs, which cannot be signed",
+                paid.to_sat(),
+                consumed.to_sat()
+            )
+        })?;
+
+        // Satoshis, not `Amount`'s BTC rendering, so these read in the unit the
+        // operator configured on the command line.
         if consumed > self.max_consumed {
             return Err(format!(
-                "the spend consumes {consumed} ({paid} to destinations, {} in fees), over the {} cap",
-                consumed - paid,
-                self.max_consumed
+                "the spend consumes {} sats ({} sats to destinations, {} sats in fees), over the {} sats cap",
+                consumed.to_sat(),
+                paid.to_sat(),
+                fee.to_sat(),
+                self.max_consumed.to_sat()
+            ));
+        }
+        if fee > self.max_fee {
+            return Err(format!(
+                "the spend leaves {} sats in fees, over the {} sats fee cap, paying {} sats of {} sats consumed",
+                fee.to_sat(),
+                self.max_fee.to_sat(),
+                paid.to_sat(),
+                consumed.to_sat()
             ));
         }
         Ok(Approved { consumed, paid })
@@ -239,8 +301,13 @@ mod tests {
         .unwrap()
     }
 
+    /// Allows two destinations, 100 000 sats consumed and 2 000 sats of fee.
     fn policy() -> KeySpendPolicy {
-        KeySpendPolicy::new(vec![spk(1), spk(2)], Amount::from_sat(100_000))
+        KeySpendPolicy::new(
+            vec![spk(1), spk(2)],
+            Amount::from_sat(100_000),
+            Amount::from_sat(2_000),
+        )
     }
 
     #[test]
@@ -304,21 +371,27 @@ mod tests {
                 .to_string()
         };
         let from_mainnet =
-            KeySpendPolicy::from_addresses(&[encode(bitcoin::Network::Bitcoin)], 10_000).unwrap();
+            KeySpendPolicy::from_addresses(&[encode(bitcoin::Network::Bitcoin)], 10_000, 1_000)
+                .unwrap();
         let from_testnet =
-            KeySpendPolicy::from_addresses(&[encode(bitcoin::Network::Testnet)], 10_000).unwrap();
+            KeySpendPolicy::from_addresses(&[encode(bitcoin::Network::Testnet)], 10_000, 1_000)
+                .unwrap();
         assert_eq!(
             from_mainnet, from_testnet,
             "the same witness program must give the same policy"
         );
         assert_eq!(
             from_mainnet,
-            KeySpendPolicy::new(vec![program], Amount::from_sat(10_000)),
+            KeySpendPolicy::new(
+                vec![program],
+                Amount::from_sat(10_000),
+                Amount::from_sat(1_000)
+            ),
             "an address must resolve to exactly its output script"
         );
 
-        let err =
-            KeySpendPolicy::from_addresses(&["not-an-address".to_owned()], 10_000).unwrap_err();
+        let err = KeySpendPolicy::from_addresses(&["not-an-address".to_owned()], 10_000, 1_000)
+            .unwrap_err();
         assert!(err.contains("not an address"), "{err}");
     }
 
@@ -334,7 +407,11 @@ mod tests {
         assert!(err.contains("in fees"), "{err}");
 
         // The same transaction is fine once the cap covers what it consumes.
-        let generous = KeySpendPolicy::new(vec![spk(1)], Amount::from_sat(10_000_000));
+        let generous = KeySpendPolicy::new(
+            vec![spk(1)],
+            Amount::from_sat(10_000_000),
+            Amount::from_sat(10_000_000),
+        );
         assert_eq!(
             generous.approve(Some(&p)),
             Ok(Approved {
@@ -346,16 +423,92 @@ mod tests {
     }
 
     // The cap is on what the inputs supply, so the fee counts and a spend that
-    // pays out under the cap can still exceed it.
+    // pays out under the cap can still exceed it. Asserted in satoshis: an
+    // earlier version matched on "90000", which `Amount`'s BTC-denominated
+    // Display satisfies with "0.00090000" for any magnitude, so it could not
+    // tell 90 000 from 900 000 and proved almost nothing.
     #[test]
     fn the_cap_covers_the_outputs_plus_the_fee() {
         let p = payload_spending(150_000, &[(spk(1), 90_000)]);
         let err = policy().approve(Some(&p)).unwrap_err();
-        assert!(err.contains("90000"), "{err}");
-        assert!(
-            err.contains("60000"),
-            "the fee belongs in the reason: {err}"
+        assert!(err.contains("consumes 150000 sats"), "{err}");
+        assert!(err.contains("90000 sats to destinations"), "{err}");
+        assert!(err.contains("60000 sats in fees"), "{err}");
+    }
+
+    // The fee needs its own bound, because the consumed cap cannot carry it: a
+    // cap that permits any real spend is at least the inputs that spend
+    // consumes, and at that cap this request is inside it. 99 999 of a 100 000
+    // sat input to miners, 1 sat to an allowed destination.
+    #[test]
+    fn a_fee_burn_inside_the_consumed_cap_is_still_refused() {
+        let p = payload_spending(100_000, &[(spk(1), 1)]);
+        let err = policy().approve(Some(&p)).unwrap_err();
+        assert!(err.contains("99999 sats in fees"), "{err}");
+        assert!(err.contains("2000 sats fee cap"), "{err}");
+
+        // The same spend is approved once the operator allows that fee.
+        let tolerant = KeySpendPolicy::new(
+            vec![spk(1)],
+            Amount::from_sat(100_000),
+            Amount::from_sat(99_999),
         );
+        assert_eq!(
+            tolerant.approve(Some(&p)),
+            Ok(Approved {
+                consumed: Amount::from_sat(100_000),
+                paid: Amount::from_sat(1),
+            })
+        );
+    }
+
+    // Outputs paying more than the inputs supply is consensus-invalid, and the
+    // refusal is what keeps the fee subtraction from underflowing: `Amount`'s
+    // `Sub` panics, so without `checked_sub` this would be a remote panic in
+    // the request handler of an unattended node.
+    #[test]
+    fn outputs_paying_more_than_the_inputs_supply_are_refused_not_panicked_on() {
+        let p = payload_spending(50_000, &[(spk(1), 90_000)]);
+        let err = policy().approve(Some(&p)).unwrap_err();
+        assert!(err.contains("cannot be signed"), "{err}");
+        assert!(err.contains("90000 sats from 50000 sats"), "{err}");
+    }
+
+    // Both totals are only authentic under the two flags that bind every input
+    // and output. `verify_taproot_key_spend` enforces this ahead of the policy
+    // on the request path, but `approve` is public, so it does not assume it.
+    #[test]
+    fn a_sighash_type_that_does_not_bind_every_input_and_output_is_refused() {
+        let mut parsed: BitcoinSighashPayload =
+            serde_json::from_slice(&payload(&[(spk(1), 1_000)])).unwrap();
+        for sighash_type in [0x02, 0x03, 0x81, 0x82, 0x83] {
+            parsed.sighash_type = sighash_type;
+            let p = serde_json::to_vec(&parsed).unwrap();
+            let err = policy().approve(Some(&p)).unwrap_err();
+            assert!(err.contains("SIGHASH_DEFAULT or SIGHASH_ALL"), "{err}");
+        }
+    }
+
+    // The input total has its own overflow guard, reachable only with more than
+    // one input, so the single-input fixture never exercised it.
+    #[test]
+    fn an_input_total_that_overflows_is_refused() {
+        let mut parsed: BitcoinSighashPayload =
+            serde_json::from_slice(&payload(&[(spk(1), 1_000)])).unwrap();
+        let huge = bitcoin::consensus::serialize(&TxOut {
+            value: Amount::from_sat(u64::MAX),
+            script_pubkey: spk(9),
+        });
+        parsed.prevouts = vec![huge.clone(), huge];
+        let mut psbt = Psbt::deserialize(&parsed.psbt).unwrap();
+        let input = psbt.unsigned_tx.input[0].clone();
+        psbt.unsigned_tx.input.push(input);
+        let first = psbt.inputs[0].clone();
+        psbt.inputs.push(first);
+        parsed.psbt = psbt.serialize();
+        let p = serde_json::to_vec(&parsed).unwrap();
+        let err = policy().approve(Some(&p)).unwrap_err();
+        assert!(err.contains("input total overflows"), "{err}");
     }
 
     // Prevouts are authentic (the digest was recomputed from them) but their
@@ -377,12 +530,19 @@ mod tests {
     #[test]
     fn a_policy_missing_either_half_refuses_everything() {
         let p = payload(&[(spk(1), 1)]);
-        let no_destinations = KeySpendPolicy::new(Vec::new(), Amount::from_sat(100_000));
-        let no_cap = KeySpendPolicy::new(vec![spk(1)], Amount::ZERO);
+        let no_destinations = KeySpendPolicy::new(
+            Vec::new(),
+            Amount::from_sat(100_000),
+            Amount::from_sat(2_000),
+        );
+        let no_cap = KeySpendPolicy::new(vec![spk(1)], Amount::ZERO, Amount::from_sat(2_000));
+        let no_fee_cap = KeySpendPolicy::new(vec![spk(1)], Amount::from_sat(100_000), Amount::ZERO);
         assert!(no_destinations.refuses_everything());
         assert!(no_cap.refuses_everything());
+        assert!(no_fee_cap.refuses_everything());
         assert!(no_destinations.approve(Some(&p)).is_err());
         assert!(no_cap.approve(Some(&p)).is_err());
+        assert!(no_fee_cap.approve(Some(&p)).is_err());
         assert!(KeySpendPolicy::default().refuses_everything());
         assert!(KeySpendPolicy::default().approve(Some(&p)).is_err());
         assert!(!policy().refuses_everything());

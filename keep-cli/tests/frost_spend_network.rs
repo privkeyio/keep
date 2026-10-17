@@ -46,7 +46,7 @@ fn run(cmd: &mut Command) -> Output {
 struct CoSigner(Child);
 
 impl CoSigner {
-    fn start(vault: &Path, npub: &str, relay: &str, policy: Option<(&[String], u64)>) -> Self {
+    fn start(vault: &Path, npub: &str, relay: &str, policy: Option<(&[String], u64, u64)>) -> Self {
         let mut cmd = keep(vault);
         cmd.args([
             "frost",
@@ -62,11 +62,12 @@ impl CoSigner {
         // otherwise show up only as the 60s sign timeout further down.
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-        if let Some((destinations, max_sats)) = policy {
+        if let Some((destinations, max_sats, max_fee_sats)) = policy {
             for destination in destinations {
                 cmd.args(["--key-spend-to", destination]);
             }
             cmd.args(["--key-spend-max-sats", &max_sats.to_string()]);
+            cmd.args(["--key-spend-max-fee-sats", &max_fee_sats.to_string()]);
         }
         let mut child = cmd.spawn().expect("spawn serve");
         // A clap error exits immediately; a serving node does not exit at all.
@@ -78,6 +79,13 @@ impl CoSigner {
                 let _ = pipe.read_to_string(&mut stderr);
             }
             panic!("serve exited with {status}: {stderr}");
+        }
+        // Drained for the rest of the test: the pipe holds about 64 KiB, and a
+        // serve that filled it would block instead of co-signing.
+        if let Some(mut pipe) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+            });
         }
         Self(child)
     }
@@ -156,6 +164,16 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
         .iter()
         .map(|i| i.witness_utxo.as_ref().unwrap().value.to_sat())
         .sum::<u64>();
+    let paid = spend
+        .unsigned_tx
+        .output
+        .iter()
+        .map(|o| o.value.to_sat())
+        .sum::<u64>();
+    // This fixture is not fee-realistic: three 100 000 sat inputs pay out
+    // 99 000, so the operator has to allow the 201 000 sat remainder for it to
+    // be co-signed at all.
+    let fee = consumed - paid;
     write_psbt(&psbt_file, &spend);
     let sign = |output: &Path| {
         let mut cmd = keep(&requester);
@@ -185,7 +203,7 @@ async fn wallet_sign_spends_with_a_co_signer_that_opts_in() {
             &cosigner,
             &npub,
             &relay_url,
-            Some((&destinations, consumed)),
+            Some((&destinations, consumed, fee)),
         );
         let signed = dir.path().join("signed.psbt");
         let out = sign(&signed);

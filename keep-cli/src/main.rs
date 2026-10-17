@@ -439,7 +439,7 @@ fn dispatch_frost(
             warden_url.as_deref(),
         ),
         FrostCommands::Refresh { group } => commands::frost::cmd_frost_refresh(out, path, &group),
-        FrostCommands::Network { command } => dispatch_frost_network(out, path, cfg, command),
+        FrostCommands::Network { command } => dispatch_frost_network(out, path, cfg, *command),
         FrostCommands::Hardware { command } => dispatch_frost_hardware(out, path, command),
     }
 }
@@ -461,6 +461,7 @@ fn dispatch_frost_network(
             require_structured_sign,
             key_spend_to,
             key_spend_max_sats,
+            key_spend_max_fee_sats,
             attestation_config,
             insecure_no_attestation,
             oprf_share_file,
@@ -485,6 +486,7 @@ fn dispatch_frost_network(
                 require_structured_sign,
                 &key_spend_to,
                 key_spend_max_sats,
+                key_spend_max_fee_sats,
                 attestation_config.as_deref(),
                 insecure_no_attestation,
                 oprf_share_file.as_deref(),

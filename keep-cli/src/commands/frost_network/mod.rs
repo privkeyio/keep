@@ -71,6 +71,7 @@ pub fn cmd_frost_network_serve(
     require_structured_sign: bool,
     key_spend_to: &[String],
     key_spend_max_sats: Option<u64>,
+    key_spend_max_fee_sats: Option<u64>,
     attestation_config: Option<&Path>,
     insecure_no_attestation: bool,
     oprf_share_file: Option<&Path>,
@@ -106,29 +107,29 @@ pub fn cmd_frost_network_serve(
     // destinations but no cap, or the reverse, asked for a policy and would
     // instead get the blanket refusal, which is worth an error rather than a
     // surprise.
-    let key_path_spend = match (key_spend_to.is_empty(), key_spend_max_sats) {
-        (true, None) => keep_frost_net::KeySpendPolicy::default(),
-        (false, Some(0)) => {
+    let key_path_spend = match (
+        key_spend_to.is_empty(),
+        key_spend_max_sats,
+        key_spend_max_fee_sats,
+    ) {
+        (true, None, None) => keep_frost_net::KeySpendPolicy::default(),
+        (false, Some(0), _) | (false, _, Some(0)) => {
             return Err(KeepError::Frost(
-                "--key-spend-max-sats 0 refuses every key-path spend; drop both flags \
-                 to serve the default refusal, or give a cap this node may spend \
-                 within"
+                "a zero --key-spend-max-sats or --key-spend-max-fee-sats refuses every \
+                 key-path spend; drop all three flags to serve the default refusal, or \
+                 give bounds this node may spend within"
                     .into(),
             ))
         }
-        (false, Some(max)) => keep_frost_net::KeySpendPolicy::from_addresses(key_spend_to, max)
-            .map_err(|e| KeepError::Frost(format!("--key-spend-to: {e}")))?,
-        (false, None) => {
-            return Err(KeepError::Frost(
-                "--key-spend-to needs --key-spend-max-sats; without a cap this node \
-                 refuses every key-path spend"
-                    .into(),
-            ))
+        (false, Some(max), Some(max_fee)) => {
+            keep_frost_net::KeySpendPolicy::from_addresses(key_spend_to, max, max_fee)
+                .map_err(|e| KeepError::Frost(format!("--key-spend-to: {e}")))?
         }
-        (true, Some(_)) => {
+        _ => {
             return Err(KeepError::Frost(
-                "--key-spend-max-sats needs at least one --key-spend-to; without a \
-                 destination this node refuses every key-path spend"
+                "--key-spend-to, --key-spend-max-sats and --key-spend-max-fee-sats go \
+                 together; with any one missing this node refuses every key-path spend, \
+                 so serve none of them to mean that deliberately"
                     .into(),
             ))
         }
@@ -358,10 +359,12 @@ pub fn cmd_frost_network_serve(
         if !key_path_spend.refuses_everything() {
             out.warn(&format!(
                 "co-signing key-path spends of the group's taproot outputs, unattended, \
-                 for spends consuming up to {} sats (outputs plus fee) whose every \
-                 output pays one of these destinations. There is no limit across \
-                 spends yet, so this is a per-spend bound.",
+                 for spends consuming up to {} sats (outputs plus fee), leaving at \
+                 most {} sats in fees, whose every output pays one of these \
+                 destinations. There is no limit across spends yet, so this is a \
+                 per-spend bound.",
                 key_spend_max_sats.unwrap_or(0),
+                key_spend_max_fee_sats.unwrap_or(0),
             ));
             // Echoed one per line: an operator who fat-fingers an address gets a
             // node that silently refuses, and a count alone gives them nothing to
@@ -2402,6 +2405,7 @@ mod tests {
                 false,
                 false,
                 &[],
+                None,
                 None,
                 None,
                 true,

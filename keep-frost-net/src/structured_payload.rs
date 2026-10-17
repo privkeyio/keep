@@ -87,10 +87,15 @@ pub const MAX_KEY_SPEND_PAYLOAD_BYTES: usize = 16 * 1024;
 
 impl BitcoinSighashPayload {
     /// The payload for a key-path spend of input `input_index` of `psbt`, with
-    /// the PSBT reduced to what co-signers recompute the sighash from and what a
-    /// spend policy reads: the unsigned transaction, every input's UTXO and the
-    /// outputs' key origins. The prevouts come from the inputs' UTXOs. Returns
-    /// the payload as JSON, refusing one too large for a sign request.
+    /// the PSBT reduced to what co-signers recompute the sighash from: the
+    /// unsigned transaction, every input's UTXO and the outputs' key origins.
+    /// The prevouts come from the inputs' UTXOs. Returns the payload as JSON,
+    /// refusing one too large for a sign request.
+    ///
+    /// A spend policy reads the unsigned transaction's outputs and the
+    /// `prevouts` vector, and must not read the per-output PSBT fields: the
+    /// digest commits to the transaction and to those prevouts, so a key origin
+    /// a requester attached is unauthenticated and can say anything.
     pub fn for_key_spend(
         psbt: &Psbt,
         input_index: usize,

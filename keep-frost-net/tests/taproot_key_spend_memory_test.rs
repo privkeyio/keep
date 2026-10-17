@@ -35,6 +35,10 @@ fn payload_destination() -> bitcoin::ScriptBuf {
 /// not on the 99 000, so a policy that allows the spend has to cover the fee.
 const PAYLOAD_CONSUMES: bitcoin::Amount = bitcoin::Amount::from_sat(100_000);
 
+/// The fee that leaves in `key_spend_payload`'s transaction: 100 000 in less
+/// the 99 000 the output pays.
+const PAYLOAD_FEE: bitcoin::Amount = bitcoin::Amount::from_sat(1_000);
+
 /// A 2-of-3 group whose two co-signers run `policy` on key-path spends; node 3
 /// requests.
 async fn group_with(policy: keep_frost_net::KeySpendPolicy) -> Group {
@@ -94,6 +98,7 @@ async fn group() -> Group {
     group_with(keep_frost_net::KeySpendPolicy::new(
         vec![payload_destination()],
         PAYLOAD_CONSUMES,
+        PAYLOAD_FEE,
     ))
     .await
 }
@@ -191,15 +196,24 @@ async fn co_signers_enforce_the_destination_and_the_cap_on_a_key_path_spend() {
     let elsewhere = bitcoin::ScriptBuf::new_op_return([9u8; 4]);
     let cases = [
         (
-            keep_frost_net::KeySpendPolicy::new(vec![elsewhere], PAYLOAD_CONSUMES),
+            keep_frost_net::KeySpendPolicy::new(vec![elsewhere], PAYLOAD_CONSUMES, PAYLOAD_FEE),
             "a destination the policy does not list",
         ),
         (
             keep_frost_net::KeySpendPolicy::new(
                 vec![payload_destination()],
                 PAYLOAD_CONSUMES - bitcoin::Amount::from_sat(1),
+                PAYLOAD_FEE,
             ),
             "a spend consuming one sat over the cap",
+        ),
+        (
+            keep_frost_net::KeySpendPolicy::new(
+                vec![payload_destination()],
+                PAYLOAD_CONSUMES,
+                PAYLOAD_FEE - bitcoin::Amount::from_sat(1),
+            ),
+            "a spend leaving one sat more in fees than the fee cap",
         ),
     ];
     for (policy, case) in cases {
