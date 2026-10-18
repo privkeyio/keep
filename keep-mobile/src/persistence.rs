@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::error::KeepMobileError;
-use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN};
+use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN, POLICY_VERSION};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::VelocityTracker;
@@ -50,10 +50,27 @@ impl Default for StoredProxyConfig {
     }
 }
 
+/// Loose ceiling on the stored policy record, applied before it is parsed.
+///
+/// The rules are the only variable-length field, so this is their cap plus
+/// slack for the JSON envelope: the fixed fields, the hex for the 32-byte
+/// pubkey and hash, and the field names.
+const POLICY_RECORD_MAX_LEN: usize = POLICY_MAX_RULES_LEN + 1024;
+
 pub(crate) fn load_policy(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<PolicyBundle, KeepMobileError> {
     let data = storage.load_share_by_key(POLICY_STORAGE_KEY.into())?;
+    // Ahead of the parse, so the cap bounds what serde is asked to allocate
+    // rather than only what it produced. The JSON carries the fixed fields plus
+    // hex for the pubkey and hash, so the record cannot be smaller than the
+    // rules it holds; this bounds it loosely and the exact field check below
+    // still applies.
+    if data.len() > POLICY_RECORD_MAX_LEN {
+        return Err(KeepMobileError::InvalidPolicy {
+            msg: "Stored policy record exceeds the maximum length".into(),
+        });
+    }
     // Deliberately without serde's message, for the same reason load_velocity
     // drops it: serde quotes the value it tripped on, the record is attacker
     // controlled before it has verified, and this error reaches a log.
@@ -61,8 +78,16 @@ pub(crate) fn load_policy(
         serde_json::from_slice(&data).map_err(|_| KeepMobileError::InvalidPolicy {
             msg: "Failed to deserialize policy".into(),
         })?;
-    // The wire format caps the rules and the import path caps its input, but a
-    // record read straight out of storage has been through neither.
+    // The wire format caps the rules and checks the version, and the import
+    // path caps its input, but a record read straight out of storage has been
+    // through neither. The version is covered by `signed_data`, so a mismatch
+    // here is not forgeable; without the check a warden-signed v2 record would
+    // be enforced under v1 rule semantics instead of faulting.
+    if bundle.version != POLICY_VERSION {
+        return Err(KeepMobileError::InvalidPolicy {
+            msg: "Stored policy has an unsupported version".into(),
+        });
+    }
     if bundle.rules_json.len() > POLICY_MAX_RULES_LEN {
         return Err(KeepMobileError::InvalidPolicy {
             msg: "Stored policy rules exceed the maximum length".into(),

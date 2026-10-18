@@ -20,8 +20,8 @@ pub const POLICY_HASH_LEN: usize = 32;
 const POLICY_HEADER_LEN: usize = 1 + POLICY_PUBKEY_LEN + POLICY_HASH_LEN + 4;
 const POLICY_MIN_LEN: usize = POLICY_HEADER_LEN + 8 + POLICY_SIGNATURE_LEN;
 
-const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
-const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
+pub(crate) const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+pub(crate) const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyBundle {
@@ -196,12 +196,15 @@ pub enum PolicyFault {
     Unverified,
     /// Attributed, and dated further ahead than the clock allows for. A device
     /// that boots before its clock syncs does this to a perfectly good policy,
-    /// so it is retried.
+    /// so it is retried. Not a rollback baseline: its `created_at` is a time
+    /// that has not happened, so it is no evidence of age, and treating it as
+    /// one refuses every correctly dated replacement for being older.
     NotYetValid,
     /// Attributed, and past its maximum age. Not retried, because it will not
     /// come back, but a replacement can be installed over it: by the time this
     /// is reached the signature and signer already held, so the bundle's
-    /// `created_at` is still a sound baseline to measure a downgrade against.
+    /// `created_at` is still a sound baseline to measure a downgrade against,
+    /// and it is the only fault that supplies one.
     Expired,
 }
 
@@ -439,10 +442,23 @@ impl PolicyBundle {
     ///
     /// Reported apart from [`Self::verify_timestamp`]'s single error because
     /// the two call for opposite handling: being dated ahead of the clock
-    /// resolves by itself, expiring does not. Saturating, so a clock set before
-    /// 1970 cannot make the comparison wrap.
+    /// resolves by itself, expiring does not.
     pub fn timestamp_fault(&self) -> Option<PolicyFault> {
-        let now = Utc::now().timestamp() as u64;
+        self.timestamp_fault_at(Utc::now().timestamp())
+    }
+
+    /// The clock is a parameter so the bounds can be tested at an exact instant
+    /// either side of them, including a negative one, which `Utc::now` cannot
+    /// be made to return.
+    ///
+    /// A clock before 1970 clamps to the epoch rather than casting: `as u64` on
+    /// a negative turns it into roughly 1.8e19, which clears the future bound
+    /// and trips the age bound, landing a perfectly good bundle on `Expired`,
+    /// the arm that is never retried. Clamping sends it to `NotYetValid`
+    /// instead, which is both true of a pre-1970 clock and retried once the
+    /// clock is set.
+    fn timestamp_fault_at(&self, now_secs: i64) -> Option<PolicyFault> {
+        let now = u64::try_from(now_secs).unwrap_or(0);
 
         if self.created_at > now.saturating_add(MAX_POLICY_FUTURE_SECS) {
             return Some(PolicyFault::NotYetValid);
@@ -567,8 +583,18 @@ impl PolicyEvaluator {
     pub fn rollback_baseline(&self) -> Option<&PolicyBundle> {
         match &self.policy {
             PolicyState::Active(bundle) => Some(bundle),
-            PolicyState::Faulted { attributed, .. } => attributed.as_deref(),
-            PolicyState::NotConfigured => None,
+            // A future-dated bundle is attributed and still not a baseline, so
+            // this cannot be `attributed.as_deref()` for every fault. Its
+            // `created_at` is ahead of the clock, so every honestly dated
+            // replacement reads as a downgrade and is refused, and nothing can
+            // be installed until the record is deleted outright. Dropping the
+            // baseline here sends that case to `import_policy`'s own refusal,
+            // which says what to do about it.
+            PolicyState::Faulted {
+                fault: PolicyFault::Expired,
+                attributed,
+            } => attributed.as_deref(),
+            PolicyState::Faulted { .. } | PolicyState::NotConfigured => None,
         }
     }
 
@@ -601,9 +627,10 @@ impl PolicyEvaluator {
         let bundle = match &self.policy {
             PolicyState::NotConfigured => return Ok(PolicyDecision::Allow),
             // The reason says only that it did not verify. Which check failed
-            // is logged where the record is read, because the record's contents
-            // are attacker-controlled once it has failed verification and this
-            // string reaches a caller.
+            // is logged as a fixed string where the record is read, never the
+            // error's own message: the record's contents are attacker
+            // controlled once it has failed verification, and this string
+            // reaches a caller.
             PolicyState::Faulted { fault, .. } => {
                 return Ok(PolicyDecision::Deny {
                     reason: format!("Cannot evaluate the spending policy: {fault}"),
@@ -820,9 +847,45 @@ pub(crate) fn create_test_bundle_with(
     bundle
 }
 
+/// Re-signs a bundle after a test has altered a signed field, so a test can
+/// isolate a check that would otherwise be masked by the signature failing
+/// first. `signed_data` covers the version, so a test for the version gate
+/// needs a bundle genuinely signed at that version.
+#[cfg(test)]
+pub(crate) fn resign_test_bundle(
+    signing_key: &k256::schnorr::SigningKey,
+    bundle: &mut PolicyBundle,
+) {
+    use k256::schnorr::signature::Signer;
+
+    let signed_data = bundle.signed_data();
+    let mut hasher = Sha256::new();
+    hasher.update(&signed_data);
+    let message: [u8; 32] = hasher.finalize().into();
+    let signature = signing_key.sign(&message);
+    bundle.signature.copy_from_slice(&signature.to_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock set before 1970 must land on the retried fault, not the
+    /// permanent one. `as u64` on a negative turns it into roughly 1.8e19,
+    /// which clears the future bound and trips the age bound, so a perfectly
+    /// good bundle reads as `Expired` and is never re-read for the life of the
+    /// process even once the clock is set.
+    #[test]
+    fn a_clock_before_1970_is_not_yet_valid_rather_than_expired() {
+        let rules = PolicyRules::default();
+        let bundle = create_test_bundle_at(&rules, 1_700_000_000);
+
+        assert_eq!(
+            bundle.timestamp_fault_at(-86_400),
+            Some(PolicyFault::NotYetValid)
+        );
+        assert!(PolicyFault::NotYetValid.is_transient());
+    }
 
     #[test]
     fn test_bundle_roundtrip() {
