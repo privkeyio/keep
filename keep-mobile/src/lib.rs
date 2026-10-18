@@ -2066,12 +2066,40 @@ impl KeepMobile {
         // process, and faults again at the next launch. One guard spans both,
         // so a reload cannot land between them and re-arm the fault after this
         // has already returned.
+        //
+        // The floor lock is taken first, the order `policy_now` uses.
+        let _floor = FLOOR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut policy = self.policy_write_lock()?;
         match self.storage.delete_share_by_key(POLICY_STORAGE_KEY.into()) {
             Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
             Err(e) => return Err(e),
         }
         policy.clear_policy();
+
+        // The time floor goes with it. A floor is seeded from the wall clock
+        // when it is first written, before any monotonic reading can bound it,
+        // so a device whose clock was far ahead at that moment holds a floor in
+        // the future: every bundle reads as expired, including one a warden
+        // signs today, and nothing lowers it. Without this, deleting the policy,
+        // the way out of every other fault, left that in place, and no policy
+        // could be installed until real time caught up.
+        //
+        // Safe because with no policy the floor guards nothing. Resetting it
+        // does let an older bundle install that the old floor would have
+        // refused, but the deletion above already left the device with no
+        // policy, which is looser than any bundle; the gap is that deleting is
+        // unauthenticated, not this. A floor that will not delete is reported
+        // and does not undo the deletion: the policy is gone either way, and
+        // calling this again retries it.
+        match self
+            .storage
+            .delete_share_by_key(CLOCK_FLOOR_STORAGE_KEY.into())
+        {
+            Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
+            Err(_) => tracing::warn!("The time floor could not be reset; delete the policy again"),
+        }
         Ok(())
     }
 
@@ -8492,5 +8520,34 @@ mod velocity_fault_tests {
             ),
             "{status:?}"
         );
+    }
+
+    /// A floor seeded from a clock that was far ahead must have a way out. It is
+    /// written from the wall clock before anything can bound it, so it holds a
+    /// time in the future that nothing lowers, and every bundle, including one
+    /// signed today, reads as expired. Deleting the policy is that way out.
+    #[test]
+    fn deleting_the_policy_resets_a_floor_seeded_from_a_clock_far_ahead() {
+        let now = Utc::now().timestamp() as u64;
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+        let bundle = create_test_bundle_with(&warden, &capped_rules(), now);
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(bundle.warden_pubkey)]).unwrap(),
+        );
+        storage.plant(
+            CLOCK_FLOOR_STORAGE_KEY,
+            serde_json::to_vec(&crate::clock_floor::ClockFloor::new(
+                now + 40 * 24 * 3600,
+                None,
+            ))
+            .unwrap(),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let _ = mobile.delete_policy();
+        mobile
+            .import_policy(hex::encode(bundle.to_bytes()))
+            .expect("deleting the policy must be a way out of a floor parked ahead");
     }
 }
