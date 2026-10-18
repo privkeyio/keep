@@ -241,6 +241,57 @@ fn finalize_handler(
     Ok((handler, bunker_secret))
 }
 
+/// Why the notification loop stopped on its own.
+#[derive(Debug, PartialEq, Eq)]
+enum NotificationsEnded {
+    /// The pool shut down, which a caller asked for.
+    Shutdown,
+    /// The stream closed with no shutdown, which nothing asked for.
+    Closed,
+}
+
+/// Feeds each relay notification to `on_notification` until the pool shuts
+/// down, and says why it stopped.
+///
+/// Driven here rather than through `Client::handle_notifications`, which loops
+/// on `while let Ok(..) = receiver.recv()`. A broadcast receiver that falls
+/// more than the channel's capacity behind (4096 in nostr-relay-pool 0.44.3)
+/// answers `Err(Lagged)`, and that loop treats it exactly like a clean stop:
+/// it returns `Ok(())`, so the bunker stopped answering and reported a
+/// successful, intentional exit with nothing logged. Requests are handled one
+/// at a time and an approval can hold one for a minute, which is long enough
+/// to fall that far behind on a busy relay.
+///
+/// A lag now costs only what it skipped: the receiver resumes from the oldest
+/// notification still held, the count is logged, and clients whose requests
+/// were dropped time out and retry. Restarting instead would lose the queued
+/// ones too. A stream that closes without a shutdown is reported as an error,
+/// so the caller can tell it from a requested stop.
+async fn drive_notifications<F, Fut>(
+    mut notifications: tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+    mut on_notification: F,
+) -> NotificationsEnded
+where
+    F: FnMut(RelayPoolNotification) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use tokio::sync::broadcast::error::RecvError;
+
+    loop {
+        match notifications.recv().await {
+            Ok(RelayPoolNotification::Shutdown) => return NotificationsEnded::Shutdown,
+            Ok(notification) => on_notification(notification).await,
+            Err(RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "NIP-46 notifications fell behind and some were dropped; still serving"
+                );
+            }
+            Err(RecvError::Closed) => return NotificationsEnded::Closed,
+        }
+    }
+}
+
 impl Server {
     fn build(
         keys: Keys,
@@ -581,40 +632,41 @@ impl Server {
         let callbacks = self.callbacks.clone();
         let max_event_json_size = self.config.max_event_json_size;
 
-        let result = self
-            .client
-            .handle_notifications(|notification| {
-                let handler = handler.clone();
-                let keys = keys.clone();
-                let client = client.clone();
-                let callbacks = callbacks.clone();
+        let ended = drive_notifications(self.client.notifications(), |notification| {
+            let handler = handler.clone();
+            let keys = keys.clone();
+            let client = client.clone();
+            let callbacks = callbacks.clone();
 
-                async move {
-                    if let RelayPoolNotification::Event { event, .. } = notification {
-                        if event.kind == Kind::NostrConnect {
-                            if let Err(e) = Self::handle_nip46_event(
-                                &handler,
-                                &keys,
-                                &client,
-                                &event,
-                                callbacks.as_deref(),
-                                max_event_json_size,
-                            )
-                            .await
-                            {
-                                warn!(error = %e, "error handling NIP-46 event");
-                            }
+            async move {
+                if let RelayPoolNotification::Event { event, .. } = notification {
+                    if event.kind == Kind::NostrConnect {
+                        if let Err(e) = Self::handle_nip46_event(
+                            &handler,
+                            &keys,
+                            &client,
+                            &event,
+                            callbacks.as_deref(),
+                            max_event_json_size,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "error handling NIP-46 event");
                         }
                     }
-                    Ok(false)
                 }
-            })
-            .await;
+            }
+        })
+        .await;
 
         self.running = false;
-        result.map_err(|e| NetworkError::relay(format!("notification handler: {e}")))?;
-
-        Ok(())
+        match ended {
+            NotificationsEnded::Shutdown => Ok(()),
+            NotificationsEnded::Closed => Err(NetworkError::relay(
+                "the relay notification stream closed without a shutdown",
+            )
+            .into()),
+        }
     }
 
     async fn handle_nip46_event(
@@ -1283,5 +1335,69 @@ mod tests {
             sec.expect("explicit secret should surface").as_str(),
             "operator-supplied"
         );
+    }
+
+    fn an_event_notification() -> RelayPoolNotification {
+        let event = EventBuilder::text_note("x")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        RelayPoolNotification::Event {
+            relay_url: RelayUrl::parse("wss://relay.example").unwrap(),
+            subscription_id: SubscriptionId::new("nip46"),
+            event: Box::new(event),
+        }
+    }
+
+    /// A receiver that falls behind keeps serving rather than stopping. The
+    /// channel here holds two, and six are sent before the loop reads any, so
+    /// its first read is `Lagged`. The old loop ended on that read and
+    /// returned as if shut down, handling nothing; this one logs the loss,
+    /// handles what is still held, and stops only on the real shutdown.
+    #[tokio::test]
+    async fn a_lagged_receiver_keeps_serving_until_the_real_shutdown() {
+        let (tx, rx) = tokio::sync::broadcast::channel(2);
+        for _ in 0..5 {
+            tx.send(an_event_notification()).unwrap();
+        }
+        tx.send(RelayPoolNotification::Shutdown).unwrap();
+
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&handled);
+        let ended = drive_notifications(rx, move |_| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .await;
+
+        assert_eq!(ended, NotificationsEnded::Shutdown);
+        assert_eq!(
+            handled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the event still held after the lag is handled, not dropped with it"
+        );
+    }
+
+    /// A stream that ends with no shutdown is reported as such, so a caller can
+    /// tell it from a stop it asked for instead of going quietly deaf.
+    #[tokio::test]
+    async fn a_stream_closing_without_a_shutdown_is_not_a_clean_stop() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        tx.send(an_event_notification()).unwrap();
+        drop(tx);
+
+        let ended = drive_notifications(rx, |_| async {}).await;
+        assert_eq!(ended, NotificationsEnded::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_is_a_clean_stop() {
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        tx.send(an_event_notification()).unwrap();
+        tx.send(RelayPoolNotification::Shutdown).unwrap();
+
+        let ended = drive_notifications(rx, |_| async {}).await;
+        assert_eq!(ended, NotificationsEnded::Shutdown);
     }
 }
