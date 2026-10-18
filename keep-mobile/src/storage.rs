@@ -74,6 +74,19 @@ pub trait SecureStorage: Send + Sync {
         data: Vec<u8>,
         metadata: ShareMetadataInfo,
     ) -> Result<(), KeepMobileError>;
+    /// Read the record under `key`.
+    ///
+    /// Absence and failure are different answers and an implementation must
+    /// not collapse them. `StorageNotFound` means there is no record. A record
+    /// that exists and could not be produced, because it would not decrypt,
+    /// because a key alias was invalidated, or because only part of it is
+    /// there, must come back as some other `Err`.
+    ///
+    /// This is load bearing rather than tidiness. Callers that hold a record
+    /// unreadable are built to refuse rather than to proceed: no policy means
+    /// no rules, and no spending history means nothing spent, so an
+    /// implementation that reports an unreadable record as absent turns a
+    /// refusal into exactly the permission it was there to withhold.
     fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError>;
     fn list_all_shares(&self) -> Vec<ShareMetadataInfo>;
     /// Delete the record under `key`.

@@ -20,8 +20,8 @@ pub const POLICY_HASH_LEN: usize = 32;
 const POLICY_HEADER_LEN: usize = 1 + POLICY_PUBKEY_LEN + POLICY_HASH_LEN + 4;
 const POLICY_MIN_LEN: usize = POLICY_HEADER_LEN + 8 + POLICY_SIGNATURE_LEN;
 
-const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
-const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
+pub(crate) const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+pub(crate) const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PolicyBundle {
@@ -175,6 +175,91 @@ impl<'de> Deserialize<'de> for HourRange {
 pub enum PolicyDecision {
     Allow,
     Deny { reason: String },
+}
+
+/// Why a stored policy record could not be turned into rules worth trusting.
+///
+/// Every arm refuses. They are kept apart because the way out differs, and two
+/// of them clear on their own: a decrypt fault can be transient, and a clock
+/// that has not synced yet dates a good policy in the future and corrects
+/// itself within seconds. Collapsing those into "did not verify" would hold a
+/// refusal for the life of the process over a condition that had already gone.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyFault {
+    /// The record could not be read. On Android a decrypt fault can be
+    /// transient with the record intact, so this is retried.
+    Unreadable,
+    /// The record was read and could not be attributed: a signature, hash or
+    /// signer that does not hold. Its contents are evidence of nothing,
+    /// including its own age, so they cannot serve as a rollback baseline.
+    /// Retrying cannot help; trusting the signer or deleting the record can.
+    Unverified,
+    /// Attributed, and dated further ahead than the clock allows for. A device
+    /// that boots before its clock syncs does this to a perfectly good policy,
+    /// so it is retried. Not a rollback baseline: its `created_at` is a time
+    /// that has not happened, so it is no evidence of age, and treating it as
+    /// one refuses every correctly dated replacement for being older.
+    NotYetValid,
+    /// Attributed, and past its maximum age. Not retried, because it will not
+    /// come back, but a replacement can be installed over it: by the time this
+    /// is reached the signature and signer already held, so the bundle's
+    /// `created_at` is still a sound baseline to measure a downgrade against,
+    /// and it is the only fault that supplies one.
+    Expired,
+}
+
+impl PolicyFault {
+    /// Whether reading the record again could change the answer.
+    pub(crate) fn is_transient(self) -> bool {
+        matches!(self, Self::Unreadable | Self::NotYetValid)
+    }
+}
+
+impl std::fmt::Display for PolicyFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable => write!(f, "the stored policy could not be read"),
+            Self::Unverified => write!(f, "the stored policy did not verify"),
+            Self::NotYetValid => {
+                write!(f, "the stored policy is dated ahead of this device's clock")
+            }
+            Self::Expired => write!(f, "the stored policy has expired"),
+        }
+    }
+}
+
+/// What the stored policy record says, as distinct from what it holds.
+///
+/// The distinction [`Self::NotConfigured`] draws against [`Self::Faulted`] is
+/// the whole point: no record means no rules, and a record that cannot be
+/// trusted means the rules are unknown. Reading the second as the first is what
+/// made a single flipped byte switch off every rule.
+#[derive(Clone, Debug)]
+pub(crate) enum PolicyState {
+    NotConfigured,
+    Active(Box<PolicyBundle>),
+    /// `attributed` carries the bundle only when its signature, hash and signer
+    /// all held, which is the one case where an unenforceable record can still
+    /// say truthfully how old it is.
+    Faulted {
+        fault: PolicyFault,
+        attributed: Option<Box<PolicyBundle>>,
+    },
+}
+
+/// The stored policy as a caller can act on it.
+///
+/// Separate from [`PolicyInfo`] because a faulted record has no info to show
+/// and must not be reported as no policy: a UI saying "no policy" while every
+/// spend is refused leaves nobody able to work out why.
+#[derive(uniffi::Enum, Clone, Debug)]
+pub enum PolicyStatus {
+    /// No record, so no rules.
+    NotConfigured,
+    /// A record that was read and verified.
+    Active { info: PolicyInfo },
+    /// A record that exists and cannot be trusted. Every rule refuses.
+    Faulted { fault: PolicyFault },
 }
 
 #[derive(uniffi::Record, Clone, Debug)]
@@ -353,22 +438,46 @@ impl PolicyBundle {
         Ok(())
     }
 
+    /// Which validity bound the bundle falls outside, if either.
+    ///
+    /// Reported apart from [`Self::verify_timestamp`]'s single error because
+    /// the two call for opposite handling: being dated ahead of the clock
+    /// resolves by itself, expiring does not.
+    pub fn timestamp_fault(&self) -> Option<PolicyFault> {
+        self.timestamp_fault_at(Utc::now().timestamp())
+    }
+
+    /// The clock is a parameter so the bounds can be tested at an exact instant
+    /// either side of them, including a negative one, which `Utc::now` cannot
+    /// be made to return.
+    ///
+    /// A clock before 1970 clamps to the epoch rather than casting: `as u64` on
+    /// a negative turns it into roughly 1.8e19, which clears the future bound
+    /// and trips the age bound, landing a perfectly good bundle on `Expired`,
+    /// the arm that is never retried. Clamping sends it to `NotYetValid`
+    /// instead, which is both true of a pre-1970 clock and retried once the
+    /// clock is set.
+    fn timestamp_fault_at(&self, now_secs: i64) -> Option<PolicyFault> {
+        let now = u64::try_from(now_secs).unwrap_or(0);
+
+        if self.created_at > now.saturating_add(MAX_POLICY_FUTURE_SECS) {
+            return Some(PolicyFault::NotYetValid);
+        }
+
+        if now > self.created_at.saturating_add(MAX_POLICY_AGE_SECS) {
+            return Some(PolicyFault::Expired);
+        }
+
+        None
+    }
+
     pub fn verify_timestamp(&self) -> Result<(), KeepMobileError> {
-        let now = Utc::now().timestamp() as u64;
-
-        if self.created_at > now + MAX_POLICY_FUTURE_SECS {
-            return Err(KeepMobileError::InvalidPolicy {
-                msg: "Policy timestamp is in the future".into(),
-            });
+        match self.timestamp_fault() {
+            None => Ok(()),
+            Some(fault) => Err(KeepMobileError::InvalidPolicy {
+                msg: fault.to_string(),
+            }),
         }
-
-        if now > self.created_at + MAX_POLICY_AGE_SECS {
-            return Err(KeepMobileError::InvalidPolicy {
-                msg: "Policy has expired".into(),
-            });
-        }
-
-        Ok(())
     }
 
     pub fn verify_version_upgrade(
@@ -409,7 +518,7 @@ impl PolicyBundle {
 }
 
 pub struct PolicyEvaluator {
-    policy: Option<PolicyBundle>,
+    policy: PolicyState,
     /// `None` means the stored counters could not be read, which is not the
     /// same as counters that read as empty: the spending history is unknown
     /// rather than known to be nothing, so the rules that consult it refuse
@@ -421,18 +530,10 @@ pub struct PolicyEvaluator {
 impl PolicyEvaluator {
     pub fn new(velocity: Arc<Mutex<Option<VelocityTracker>>>) -> Self {
         Self {
-            policy: None,
+            policy: PolicyState::NotConfigured,
             velocity,
             trusted_wardens: HashSet::new(),
         }
-    }
-
-    pub fn add_trusted_warden(&mut self, pubkey: [u8; POLICY_PUBKEY_LEN]) {
-        self.trusted_wardens.insert(pubkey);
-    }
-
-    pub fn remove_trusted_warden(&mut self, pubkey: &[u8; POLICY_PUBKEY_LEN]) {
-        self.trusted_wardens.remove(pubkey);
     }
 
     pub fn trusted_wardens(&self) -> &HashSet<[u8; POLICY_PUBKEY_LEN]> {
@@ -444,20 +545,98 @@ impl PolicyEvaluator {
     }
 
     pub fn set_policy(&mut self, bundle: PolicyBundle) {
-        self.policy = Some(bundle);
+        self.policy = PolicyState::Active(Box::new(bundle));
+    }
+
+    /// Record that a policy exists and cannot be enforced, which refuses every
+    /// rule until it reads and verifies again or is deleted outright.
+    ///
+    /// `attributed` is the bundle when signature, hash and signer held and only
+    /// the clock did not, and `None` when the record itself is not evidence.
+    pub fn set_policy_faulted(&mut self, fault: PolicyFault, attributed: Option<PolicyBundle>) {
+        self.policy = PolicyState::Faulted {
+            fault,
+            attributed: attributed.map(Box::new),
+        };
     }
 
     pub fn clear_policy(&mut self) {
-        self.policy = None;
+        self.policy = PolicyState::NotConfigured;
     }
 
+    /// The bundle in force, which exists only when one verified. A faulted
+    /// record answers `None`, so nothing can read its unverified contents as
+    /// though they meant something, its `created_at` included.
     pub fn policy(&self) -> Option<&PolicyBundle> {
-        self.policy.as_ref()
+        match &self.policy {
+            PolicyState::Active(bundle) => Some(bundle),
+            PolicyState::NotConfigured | PolicyState::Faulted { .. } => None,
+        }
     }
 
+    /// The bundle a replacement's `created_at` has to beat, when the stored
+    /// record can be trusted to supply one.
+    ///
+    /// Separate from [`Self::policy`] because these answer different questions.
+    /// An expired bundle must not be enforced and is still authentic, so it is
+    /// a baseline but not a policy; one that failed verification is neither.
+    pub fn rollback_baseline(&self) -> Option<&PolicyBundle> {
+        match &self.policy {
+            PolicyState::Active(bundle) => Some(bundle),
+            // A future-dated bundle is attributed and still not a baseline, so
+            // this cannot be `attributed.as_deref()` for every fault. Its
+            // `created_at` is ahead of the clock, so every honestly dated
+            // replacement reads as a downgrade and is refused, and nothing can
+            // be installed until the record is deleted outright. Dropping the
+            // baseline here sends that case to `import_policy`'s own refusal,
+            // which says what to do about it.
+            PolicyState::Faulted {
+                fault: PolicyFault::Expired,
+                attributed,
+            } => attributed.as_deref(),
+            PolicyState::Faulted { .. } | PolicyState::NotConfigured => None,
+        }
+    }
+
+    pub fn fault(&self) -> Option<PolicyFault> {
+        match &self.policy {
+            PolicyState::Faulted { fault, .. } => Some(*fault),
+            PolicyState::NotConfigured | PolicyState::Active(_) => None,
+        }
+    }
+
+    pub fn status(&self) -> PolicyStatus {
+        match &self.policy {
+            PolicyState::NotConfigured => PolicyStatus::NotConfigured,
+            PolicyState::Active(bundle) => PolicyStatus::Active {
+                info: bundle.to_policy_info(),
+            },
+            PolicyState::Faulted { fault, .. } => PolicyStatus::Faulted { fault: *fault },
+        }
+    }
+
+    /// Decide on a transaction against the policy in force.
+    ///
+    /// An `Err` is not a decision and must never be read as one. The state
+    /// machine guarantees that uncertainty answers [`PolicyDecision::Deny`],
+    /// not that a decision always arrives: a poisoned lock, or rules that will
+    /// not parse out of a bundle that verified, come back as `Err`. A caller
+    /// that treats the error as anything but a refusal gives back exactly the
+    /// fail-open this type exists to close.
     pub fn evaluate(&self, ctx: &TransactionContext) -> Result<PolicyDecision, KeepMobileError> {
-        let Some(bundle) = &self.policy else {
-            return Ok(PolicyDecision::Allow);
+        let bundle = match &self.policy {
+            PolicyState::NotConfigured => return Ok(PolicyDecision::Allow),
+            // The reason says only that it did not verify. Which check failed
+            // is logged as a fixed string where the record is read, never the
+            // error's own message: the record's contents are attacker
+            // controlled once it has failed verification, and this string
+            // reaches a caller.
+            PolicyState::Faulted { fault, .. } => {
+                return Ok(PolicyDecision::Deny {
+                    reason: format!("Cannot evaluate the spending policy: {fault}"),
+                })
+            }
+            PolicyState::Active(bundle) => bundle,
         };
 
         let rules = bundle.parse_rules()?;
@@ -615,41 +794,97 @@ fn weekday_abbrev(weekday: chrono::Weekday) -> &'static str {
     }
 }
 
+/// A bundle signed by a warden generated for the call, so a test that wants
+/// it trusted reads `warden_pubkey` off the result.
+#[cfg(test)]
+pub(crate) fn create_test_bundle(rules: &PolicyRules) -> PolicyBundle {
+    create_test_bundle_at(rules, Utc::now().timestamp() as u64)
+}
+
+/// A bundle dated `created_at`, signed over that date, so a test can put one
+/// outside its validity window without the signature stopping being genuine.
+#[cfg(test)]
+pub(crate) fn create_test_bundle_at(rules: &PolicyRules, created_at: u64) -> PolicyBundle {
+    let key = k256::schnorr::SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
+    create_test_bundle_with(&key, rules, created_at)
+}
+
+/// A bundle signed by a given warden, for a test that needs two bundles from
+/// one signer, such as a replacement installing over what is already stored.
+#[cfg(test)]
+pub(crate) fn create_test_bundle_with(
+    signing_key: &k256::schnorr::SigningKey,
+    rules: &PolicyRules,
+    created_at: u64,
+) -> PolicyBundle {
+    use k256::schnorr::signature::Signer;
+
+    let rules_json = serde_json::to_string(rules).unwrap();
+    let mut rules_hasher = Sha256::new();
+    rules_hasher.update(rules_json.as_bytes());
+    let policy_hash: [u8; 32] = rules_hasher.finalize().into();
+
+    let verifying_key = signing_key.verifying_key();
+    let mut warden_pubkey = [0u8; 32];
+    warden_pubkey.copy_from_slice(&verifying_key.to_bytes());
+
+    let mut bundle = PolicyBundle {
+        version: POLICY_VERSION,
+        warden_pubkey,
+        policy_hash,
+        rules_json,
+        created_at,
+        signature: [0u8; 64],
+    };
+
+    let signed_data = bundle.signed_data();
+    let mut hasher = Sha256::new();
+    hasher.update(&signed_data);
+    let message: [u8; 32] = hasher.finalize().into();
+    let signature = signing_key.sign(&message);
+    bundle.signature.copy_from_slice(&signature.to_bytes());
+
+    bundle
+}
+
+/// Re-signs a bundle after a test has altered a signed field, so a test can
+/// isolate a check that would otherwise be masked by the signature failing
+/// first. `signed_data` covers the version, so a test for the version gate
+/// needs a bundle genuinely signed at that version.
+#[cfg(test)]
+pub(crate) fn resign_test_bundle(
+    signing_key: &k256::schnorr::SigningKey,
+    bundle: &mut PolicyBundle,
+) {
+    use k256::schnorr::signature::Signer;
+
+    let signed_data = bundle.signed_data();
+    let mut hasher = Sha256::new();
+    hasher.update(&signed_data);
+    let message: [u8; 32] = hasher.finalize().into();
+    let signature = signing_key.sign(&message);
+    bundle.signature.copy_from_slice(&signature.to_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::schnorr::{signature::Signer, SigningKey};
 
-    fn create_test_bundle(rules: &PolicyRules) -> PolicyBundle {
-        let rules_json = serde_json::to_string(rules).unwrap();
-        let mut rules_hasher = Sha256::new();
-        rules_hasher.update(rules_json.as_bytes());
-        let policy_hash: [u8; 32] = rules_hasher.finalize().into();
+    /// A clock set before 1970 must land on the retried fault, not the
+    /// permanent one. `as u64` on a negative turns it into roughly 1.8e19,
+    /// which clears the future bound and trips the age bound, so a perfectly
+    /// good bundle reads as `Expired` and is never re-read for the life of the
+    /// process even once the clock is set.
+    #[test]
+    fn a_clock_before_1970_is_not_yet_valid_rather_than_expired() {
+        let rules = PolicyRules::default();
+        let bundle = create_test_bundle_at(&rules, 1_700_000_000);
 
-        let signing_key = SigningKey::random(&mut k256::elliptic_curve::rand_core::OsRng);
-        let verifying_key = signing_key.verifying_key();
-        let mut warden_pubkey = [0u8; 32];
-        warden_pubkey.copy_from_slice(&verifying_key.to_bytes());
-
-        let created_at = Utc::now().timestamp() as u64;
-
-        let mut bundle = PolicyBundle {
-            version: POLICY_VERSION,
-            warden_pubkey,
-            policy_hash,
-            rules_json,
-            created_at,
-            signature: [0u8; 64],
-        };
-
-        let signed_data = bundle.signed_data();
-        let mut hasher = Sha256::new();
-        hasher.update(&signed_data);
-        let message: [u8; 32] = hasher.finalize().into();
-        let signature = signing_key.sign(&message);
-        bundle.signature.copy_from_slice(&signature.to_bytes());
-
-        bundle
+        assert_eq!(
+            bundle.timestamp_fault_at(-86_400),
+            Some(PolicyFault::NotYetValid)
+        );
+        assert!(PolicyFault::NotYetValid.is_transient());
     }
 
     #[test]
@@ -1064,5 +1299,97 @@ mod tests {
     fn an_unreadable_history_refuses_to_record() {
         let evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(None)));
         assert!(evaluator.record_transaction(1_000).is_err());
+    }
+    /// The defect this state machine exists for. An unverifiable record used to
+    /// be dropped on the floor, which left the evaluator indistinguishable from
+    /// one with no policy, so a single flipped byte in storage switched off
+    /// max_amount, max_fee, the whitelist and the hour window at once. Tamper
+    /// evidence that answers "no rules" is worse than none, because it reads as
+    /// a configuration state rather than an attack.
+    #[test]
+    fn a_faulted_policy_refuses_every_rule_rather_than_reading_as_no_policy() {
+        let rules = PolicyRules {
+            max_amount: Some(100_000),
+            ..Default::default()
+        };
+        let mut evaluator =
+            PolicyEvaluator::new(Arc::new(Mutex::new(Some(VelocityTracker::new()))));
+        evaluator.set_policy(create_test_bundle(&rules));
+
+        let ctx = TransactionContext {
+            amount_sats: 50_000,
+            fee_sats: 500,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        assert_eq!(
+            evaluator.evaluate(&ctx).unwrap(),
+            PolicyDecision::Allow,
+            "under the limit, so a verified policy allows it"
+        );
+
+        evaluator.set_policy_faulted(PolicyFault::Unverified, None);
+        let PolicyDecision::Deny { reason } = evaluator.evaluate(&ctx).unwrap() else {
+            panic!("a policy that cannot be trusted must refuse, not fall back to no policy");
+        };
+        assert!(reason.contains("did not verify"), "{reason}");
+    }
+
+    /// No record is a different statement from a record that cannot be read,
+    /// and only the first means there are no rules.
+    #[test]
+    fn no_policy_still_allows() {
+        let evaluator = PolicyEvaluator::new(Arc::new(Mutex::new(Some(VelocityTracker::new()))));
+        let ctx = TransactionContext {
+            amount_sats: u64::MAX,
+            fee_sats: u64::MAX,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+    }
+
+    /// A faulted record must not be readable as a policy through any accessor.
+    /// `policy()` feeds the rollback check, and an unverified bundle's
+    /// `created_at` is worth nothing, so answering with it would let a corrupted
+    /// record become the baseline a downgrade is measured against.
+    #[test]
+    fn a_faulted_policy_is_not_reachable_as_a_bundle() {
+        let rules = PolicyRules::default();
+        let mut evaluator =
+            PolicyEvaluator::new(Arc::new(Mutex::new(Some(VelocityTracker::new()))));
+        evaluator.set_policy(create_test_bundle(&rules));
+        assert!(evaluator.policy().is_some());
+        assert!(evaluator.fault().is_none());
+
+        evaluator.set_policy_faulted(PolicyFault::Unreadable, None);
+        assert!(
+            evaluator.policy().is_none(),
+            "an unverified bundle must not be readable as the policy in force"
+        );
+        assert_eq!(evaluator.fault(), Some(PolicyFault::Unreadable));
+        assert!(matches!(evaluator.status(), PolicyStatus::Faulted { .. }));
+    }
+
+    /// The two faults are reported apart because only one of them is worth
+    /// retrying, and a caller has to be able to tell a storage fault it can
+    /// wait out from a verification failure it cannot.
+    #[test]
+    fn the_two_faults_are_reported_apart() {
+        let mut evaluator =
+            PolicyEvaluator::new(Arc::new(Mutex::new(Some(VelocityTracker::new()))));
+        assert!(matches!(evaluator.status(), PolicyStatus::NotConfigured));
+
+        evaluator.set_policy_faulted(PolicyFault::Unreadable, None);
+        let PolicyStatus::Faulted { fault } = evaluator.status() else {
+            panic!("expected a fault");
+        };
+        assert_eq!(fault, PolicyFault::Unreadable);
+
+        evaluator.set_policy_faulted(PolicyFault::Unverified, None);
+        let PolicyStatus::Faulted { fault } = evaluator.status() else {
+            panic!("expected a fault");
+        };
+        assert_eq!(fault, PolicyFault::Unverified);
     }
 }
