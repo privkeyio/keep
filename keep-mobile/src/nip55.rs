@@ -232,10 +232,13 @@ pub fn nip55_extract_relay_host(event_json: String) -> Option<String> {
     nip55_normalize_relay_host(relay_url?.to_string())
 }
 
-// Applies the relay-auth whitelist gate. An empty whitelist defers to normal grant
-// resolution; otherwise a request is auto-accepted iff its relay is whitelisted,
-// and auto-rejected otherwise (including when the relay could not be determined).
-// Whitelist entries are expected to be pre-normalized via nip55_normalize_relay_host.
+// Classifies a relay-auth request against the whitelist. An empty whitelist
+// defers to normal grant resolution; otherwise a request is classified as
+// whitelisted iff its relay is on the list, and auto-rejected otherwise
+// (including when the relay could not be determined). Whitelisted lifts that
+// rejection and authorizes nothing: signing still needs a standing permission
+// or a prompt. Whitelist entries are expected to be pre-normalized via
+// nip55_normalize_relay_host.
 #[uniffi::export]
 pub fn nip55_relay_auth_gate(
     relay_host: Option<String>,
@@ -1496,7 +1499,8 @@ mod tests {
             nip55_relay_auth_gate(Some("relay.example.com".into()), vec![]),
             Nip55RelayAuthGate::Defer
         );
-        // Whitelisted relay auto-accepts.
+        // A whitelisted relay is classified as such, which lifts the rejection
+        // and grants nothing.
         assert_eq!(
             nip55_relay_auth_gate(
                 Some("relay.example.com".into()),
