@@ -466,11 +466,10 @@ impl PolicyBundle {
     /// Reported apart from [`Self::verify_timestamp`]'s single error because
     /// the two call for opposite handling: being dated ahead of the clock
     /// resolves by itself, expiring does not.
-    pub fn timestamp_fault(&self) -> Option<PolicyFault> {
-        self.timestamp_fault_at(Utc::now().timestamp())
-    }
-
-    /// The clock is a parameter so the bounds can be tested at an exact instant
+    /// The clock is a parameter, not read here, and that is what keeps the
+    /// stored time floor on the path: a bundle's validity is judged at the time
+    /// the caller establishes, so no call site can fall back to the raw device
+    /// clock by accident. It also lets the bounds be tested at an exact instant
     /// either side of them, including a negative one, which `Utc::now` cannot
     /// be made to return.
     ///
@@ -480,7 +479,7 @@ impl PolicyBundle {
     /// the arm that is never retried. Clamping sends it to `NotYetValid`
     /// instead, which is both true of a pre-1970 clock and retried once the
     /// clock is set.
-    fn timestamp_fault_at(&self, now_secs: i64) -> Option<PolicyFault> {
+    pub(crate) fn timestamp_fault_at(&self, now_secs: i64) -> Option<PolicyFault> {
         let now = u64::try_from(now_secs).unwrap_or(0);
 
         if self.created_at > now.saturating_add(MAX_POLICY_FUTURE_SECS) {
@@ -494,8 +493,10 @@ impl PolicyBundle {
         None
     }
 
-    pub fn verify_timestamp(&self) -> Result<(), KeepMobileError> {
-        match self.timestamp_fault() {
+    /// Judged at the instant the caller establishes, so an import is measured
+    /// against the stored time floor rather than the raw clock.
+    pub(crate) fn verify_timestamp_at(&self, now_secs: i64) -> Result<(), KeepMobileError> {
+        match self.timestamp_fault_at(now_secs) {
             None => Ok(()),
             Some(fault) => Err(KeepMobileError::InvalidPolicy {
                 msg: fault.to_string(),
@@ -1169,13 +1170,13 @@ mod tests {
         let rules = PolicyRules::default();
         let mut bundle = create_test_bundle(&rules);
 
-        assert!(bundle.verify_timestamp().is_ok());
+        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_ok());
 
         bundle.created_at = Utc::now().timestamp() as u64 + MAX_POLICY_FUTURE_SECS + 3600;
-        assert!(bundle.verify_timestamp().is_err());
+        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_err());
 
         bundle.created_at = Utc::now().timestamp() as u64 - MAX_POLICY_AGE_SECS - 3600;
-        assert!(bundle.verify_timestamp().is_err());
+        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_err());
     }
 
     #[test]

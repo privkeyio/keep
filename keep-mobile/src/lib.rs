@@ -5,6 +5,7 @@
 
 mod approver;
 mod audit;
+mod clock_floor;
 mod dkg;
 mod error;
 mod network;
@@ -349,6 +350,7 @@ fn lock_pre_approved(
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
+const CLOCK_FLOOR_STORAGE_KEY: &str = "__keep_clock_floor_v1";
 const CERT_PINS_STORAGE_KEY: &str = "__keep_cert_pins_v1";
 const DESCRIPTOR_INDEX_KEY: &str = "__keep_descriptor_index_v1";
 const DESCRIPTOR_KEY_PREFIX: &str = "__keep_descriptor_";
@@ -832,7 +834,20 @@ impl KeepMobile {
         let velocity = Arc::new(std::sync::Mutex::new(velocity));
 
         let mut evaluator = PolicyEvaluator::new(velocity.clone());
-        Self::load_policy_into(&storage, &mut evaluator);
+        // The floor is consulted and not advanced here: no monotonic reading is
+        // available at construction, and advancing needs one. A floor that
+        // cannot be read faults the policy instead of failing construction,
+        // because refusing to open the app is not better than refusing every
+        // spend, and the fault is retried before each decision.
+        match Self::startup_policy_now(&storage) {
+            Ok(now_secs) => Self::load_policy_into(&storage, &mut evaluator, now_secs),
+            Err(_) => {
+                tracing::error!(
+                    "Time floor unreadable, every policy rule will refuse until it is read"
+                );
+                evaluator.set_policy_faulted(PolicyFault::Unreadable, None);
+            }
+        }
 
         let policy = Arc::new(std::sync::RwLock::new(evaluator));
 
@@ -1835,11 +1850,15 @@ impl KeepMobile {
         let bundle = PolicyBundle::from_bytes(&bundle_bytes)?;
         bundle.verify_signature()?;
         bundle.verify_hash()?;
-        bundle.verify_timestamp()?;
+        // Judged against the floor, not the raw clock, so a bundle that is
+        // already expired cannot be installed by winding the date back to
+        // inside its window.
+        let now_secs = self.policy_now(None)?;
+        bundle.verify_timestamp_at(now_secs)?;
 
         // A transient fault must not push the caller into discarding a
         // warden-signed policy, so the record gets another read first.
-        self.reload_policy_if_transient()?;
+        self.reload_policy_if_transient(None)?;
 
         let mut policy = self.policy_write_lock()?;
         // Refused when the stored record cannot say how old it is, rather than
@@ -1898,8 +1917,13 @@ impl KeepMobile {
     /// A faulted record refuses every spend, so reporting it as no policy would
     /// leave a caller unable to explain the refusals. Retries an unreadable
     /// record first, so a transient read fault is not reported as a fault.
-    pub fn policy_status(&self) -> Result<PolicyStatus, KeepMobileError> {
-        self.reload_policy_if_transient()?;
+    /// `now_elapsed_ms` is the platform's monotonic clock, as
+    /// `SigningRateLimiter::check_and_record` already takes: on Android,
+    /// `SystemClock.elapsedRealtime()`. It is what lets the stored time floor
+    /// advance, so passing a stale or invented value holds the floor still
+    /// rather than moving it anywhere useful.
+    pub fn policy_status(&self, now_elapsed_ms: u64) -> Result<PolicyStatus, KeepMobileError> {
+        self.reload_policy_if_transient(Some(now_elapsed_ms))?;
         Ok(self.policy_read_lock()?.status())
     }
 
@@ -1921,12 +1945,15 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// `now_elapsed_ms` is the platform's monotonic clock; see
+    /// [`Self::policy_status`].
     pub fn evaluate_policy(
         &self,
         ctx: TransactionContext,
+        now_elapsed_ms: u64,
     ) -> Result<PolicyDecision, KeepMobileError> {
         self.reload_velocity_if_unknown()?;
-        self.reload_policy_if_transient()?;
+        self.reload_policy_if_transient(Some(now_elapsed_ms))?;
         self.policy_read_lock()?.evaluate(&ctx)
     }
 
@@ -3540,6 +3567,7 @@ impl KeepMobile {
         pubkey: [u8; POLICY_PUBKEY_LEN],
         trust: bool,
     ) -> Result<(), KeepMobileError> {
+        let now_secs = self.policy_now(None)?;
         let mut policy = self.policy_write_lock()?;
         if policy.trusted_wardens().contains(&pubkey) == trust {
             return Ok(());
@@ -3552,7 +3580,7 @@ impl KeepMobile {
         }
         persistence::persist_trusted_wardens(&self.storage, &wardens)?;
         policy.set_trusted_wardens(wardens);
-        Self::load_policy_into(&self.storage, &mut policy);
+        Self::load_policy_into(&self.storage, &mut policy, now_secs);
         Ok(())
     }
 
@@ -4064,7 +4092,52 @@ impl KeepMobile {
     /// warden was trusted, so an empty set with a bundle present means the
     /// record was lost, which is exactly the case that must not read as "no
     /// policy".
-    fn load_policy_into(storage: &Arc<dyn SecureStorage>, evaluator: &mut PolicyEvaluator) {
+    /// The time to judge policy validity at, never earlier than the floor.
+    ///
+    /// `now_elapsed_ms` is the platform's monotonic reading, as
+    /// [`SigningRateLimiter::check_and_record`] already takes. `None` means the
+    /// caller has none, which consults the floor without advancing it: raising
+    /// it needs proof that time passed, and reading it does not.
+    ///
+    /// A floor that cannot be read is an error, not an absence. Nothing then
+    /// says the clock was not wound back, and the callers turn that into a
+    /// refusal, because the alternative is trusting the one input this exists
+    /// to distrust.
+    ///
+    /// [`SigningRateLimiter::check_and_record`]: crate::SigningRateLimiter::check_and_record
+    fn policy_now(&self, now_elapsed_ms: Option<u64>) -> Result<i64, KeepMobileError> {
+        Self::floor_now(&self.storage, now_elapsed_ms)
+    }
+
+    /// [`Self::policy_now`] before there is a `self`, for the load the
+    /// constructor does.
+    fn startup_policy_now(storage: &Arc<dyn SecureStorage>) -> Result<i64, KeepMobileError> {
+        Self::floor_now(storage, None)
+    }
+
+    fn floor_now(
+        storage: &Arc<dyn SecureStorage>,
+        now_elapsed_ms: Option<u64>,
+    ) -> Result<i64, KeepMobileError> {
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let stored = persistence::load_clock_floor(storage)?;
+        let floor = stored
+            .unwrap_or_else(|| clock_floor::ClockFloor::new(now_secs, now_elapsed_ms.unwrap_or(0)));
+        let (observed, changed) = floor.observe(now_secs, now_elapsed_ms);
+        // A first write counts as changed, so the floor exists from here on.
+        if changed || stored.is_none() {
+            persistence::persist_clock_floor(storage, &observed)?;
+        }
+        // Back to the signed seconds the validity checks take. The advance is
+        // bounded, so the floor cannot reach the saturating case.
+        Ok(i64::try_from(observed.effective_secs(now_secs)).unwrap_or(i64::MAX))
+    }
+
+    fn load_policy_into(
+        storage: &Arc<dyn SecureStorage>,
+        evaluator: &mut PolicyEvaluator,
+        now_secs: i64,
+    ) {
         match persistence::load_trusted_wardens(storage) {
             Ok(wardens) => evaluator.set_trusted_wardens(wardens),
             Err(KeepMobileError::StorageNotFound) => {
@@ -4132,7 +4205,7 @@ impl KeepMobile {
             return;
         }
 
-        match bundle.timestamp_fault() {
+        match bundle.timestamp_fault_at(now_secs) {
             None => evaluator.set_policy(bundle),
             Some(fault) => {
                 tracing::error!(
@@ -4152,7 +4225,10 @@ impl KeepMobile {
     /// retrying it would be two storage reads per decision for nothing; that
     /// one changes when the trusted wardens do, and both warden mutations
     /// re-run the load themselves.
-    fn reload_policy_if_transient(&self) -> Result<(), KeepMobileError> {
+    fn reload_policy_if_transient(
+        &self,
+        now_elapsed_ms: Option<u64>,
+    ) -> Result<(), KeepMobileError> {
         // Bound to a local first. Folding this into the `if` condition, or into
         // a `match`, keeps the read guard alive across `policy_write_lock` and
         // self-deadlocks on a lock that is not reentrant.
@@ -4160,8 +4236,9 @@ impl KeepMobile {
         if !fault.is_some_and(PolicyFault::is_transient) {
             return Ok(());
         }
+        let now_secs = self.policy_now(now_elapsed_ms)?;
         let mut policy = self.policy_write_lock()?;
-        Self::load_policy_into(&self.storage, &mut policy);
+        Self::load_policy_into(&self.storage, &mut policy, now_secs);
         Ok(())
     }
 
@@ -7067,12 +7144,15 @@ mod velocity_fault_tests {
 
         storage.heal();
         mobile
-            .evaluate_policy(TransactionContext {
-                amount_sats: 1,
-                fee_sats: 1,
-                destinations: vec![],
-                has_unknown_destination: false,
-            })
+            .evaluate_policy(
+                TransactionContext {
+                    amount_sats: 1,
+                    fee_sats: 1,
+                    destinations: vec![],
+                    has_unknown_destination: false,
+                },
+                0,
+            )
             .unwrap();
 
         assert_eq!(
@@ -7147,13 +7227,13 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
 
-        let PolicyDecision::Deny { reason } = mobile.evaluate_policy(a_spend()).unwrap() else {
+        let PolicyDecision::Deny { reason } = mobile.evaluate_policy(a_spend(), 0).unwrap() else {
             panic!("a tampered policy record must refuse, not allow everything");
         };
         assert!(reason.contains("policy"), "{reason}");
         assert!(
             matches!(
-                mobile.policy_status().unwrap(),
+                mobile.policy_status(0).unwrap(),
                 PolicyStatus::Faulted { .. }
             ),
             "the refusal has to be explainable, so it must not report as unconfigured"
@@ -7170,11 +7250,11 @@ mod velocity_fault_tests {
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
 
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Active { .. }
         ));
         assert_eq!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Allow
         );
         let over = TransactionContext {
@@ -7182,7 +7262,7 @@ mod velocity_fault_tests {
             ..a_spend()
         };
         assert!(matches!(
-            mobile.evaluate_policy(over).unwrap(),
+            mobile.evaluate_policy(over, 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -7193,11 +7273,11 @@ mod velocity_fault_tests {
         let storage = Arc::new(FaultingStorage::default());
         let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::NotConfigured
         ));
         assert_eq!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Allow
         );
     }
@@ -7213,23 +7293,23 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unreadable
             }
         ));
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
 
         storage.heal();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Active { .. }
         ));
         assert_eq!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Allow
         );
     }
@@ -7244,13 +7324,13 @@ mod velocity_fault_tests {
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
 
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
         ));
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -7265,14 +7345,17 @@ mod velocity_fault_tests {
         let warden = plant_policy(&storage, &capped_rules(), false);
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted { .. }
         ));
 
         mobile.add_trusted_warden(hex::encode(&warden)).unwrap();
 
         assert!(
-            matches!(mobile.policy_status().unwrap(), PolicyStatus::Active { .. }),
+            matches!(
+                mobile.policy_status(0).unwrap(),
+                PolicyStatus::Active { .. }
+            ),
             "trusting the signer must re-run the stored policy, not leave it faulted"
         );
         let over = TransactionContext {
@@ -7280,7 +7363,7 @@ mod velocity_fault_tests {
             ..a_spend()
         };
         assert!(matches!(
-            mobile.evaluate_policy(over).unwrap(),
+            mobile.evaluate_policy(over, 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -7310,7 +7393,7 @@ mod velocity_fault_tests {
 
         mobile.delete_policy().unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::NotConfigured
         ));
     }
@@ -7324,13 +7407,13 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
         ));
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -7345,7 +7428,7 @@ mod velocity_fault_tests {
         let warden = plant_policy(&storage, &capped_rules(), false);
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted { .. }
         ));
 
@@ -7353,7 +7436,10 @@ mod velocity_fault_tests {
         mobile.add_trusted_warden(hex::encode(&warden)).unwrap();
 
         assert!(
-            matches!(mobile.policy_status().unwrap(), PolicyStatus::Active { .. }),
+            matches!(
+                mobile.policy_status(0).unwrap(),
+                PolicyStatus::Active { .. }
+            ),
             "the warden just added must not be dropped by the reload that follows it"
         );
         assert_eq!(
@@ -7377,7 +7463,7 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
@@ -7388,7 +7474,7 @@ mod velocity_fault_tests {
         };
         assert!(
             matches!(
-                mobile.evaluate_policy(over).unwrap(),
+                mobile.evaluate_policy(over, 0).unwrap(),
                 PolicyDecision::Deny { .. }
             ),
             "the raised cap must not take effect, and the record must not read as no policy"
@@ -7406,7 +7492,7 @@ mod velocity_fault_tests {
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
 
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
@@ -7414,7 +7500,7 @@ mod velocity_fault_tests {
         let after_load = storage.reads_of(POLICY_STORAGE_KEY);
         for _ in 0..5 {
             assert!(matches!(
-                mobile.evaluate_policy(a_spend()).unwrap(),
+                mobile.evaluate_policy(a_spend(), 0).unwrap(),
                 PolicyDecision::Deny { .. }
             ));
         }
@@ -7442,18 +7528,18 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::NotYetValid
             }
         ));
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
 
         let after_load = storage.reads_of(POLICY_STORAGE_KEY);
-        mobile.evaluate_policy(a_spend()).unwrap();
+        mobile.evaluate_policy(a_spend(), 0).unwrap();
         assert!(
             storage.reads_of(POLICY_STORAGE_KEY) > after_load,
             "a fault that resolves on its own has to be looked at again"
@@ -7476,14 +7562,14 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Expired
             }
         ));
         assert!(
             matches!(
-                mobile.evaluate_policy(a_spend()).unwrap(),
+                mobile.evaluate_policy(a_spend(), 0).unwrap(),
                 PolicyDecision::Deny { .. }
             ),
             "stale rules are neither enforced nor ignored"
@@ -7498,7 +7584,7 @@ mod velocity_fault_tests {
             .expect("a replacement must install over an expired policy");
 
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Active { .. }
         ));
     }
@@ -7517,7 +7603,7 @@ mod velocity_fault_tests {
         assert!(mobile.delete_policy().is_err());
         assert!(
             matches!(
-                mobile.policy_status().unwrap(),
+                mobile.policy_status(0).unwrap(),
                 PolicyStatus::Faulted { .. }
             ),
             "a failed delete must not leave memory reading as no policy"
@@ -7546,7 +7632,7 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unreadable
             }
@@ -7558,7 +7644,7 @@ mod velocity_fault_tests {
             .import_policy(hex::encode(replacement.to_bytes()))
             .expect("a healed fault must not force a delete");
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Active { .. }
         ));
     }
@@ -7584,7 +7670,7 @@ mod velocity_fault_tests {
         );
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Expired
             }
@@ -7599,11 +7685,11 @@ mod velocity_fault_tests {
         // The refusal has to outlive the failed write, or the gate is open for
         // the life of the process on a policy storage never accepted.
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted { .. }
         ));
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -7628,7 +7714,7 @@ mod velocity_fault_tests {
         );
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Active { .. }
         ));
 
@@ -7661,7 +7747,7 @@ mod velocity_fault_tests {
             "memory must not hold a warden storage refused"
         );
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted { .. }
         ));
     }
@@ -7690,7 +7776,7 @@ mod velocity_fault_tests {
         );
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::NotYetValid
             }
@@ -7738,7 +7824,7 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
@@ -7771,7 +7857,7 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.policy_status().unwrap(),
+            mobile.policy_status(0).unwrap(),
             PolicyStatus::Faulted {
                 fault: PolicyFault::Unverified
             }
@@ -7814,8 +7900,78 @@ mod velocity_fault_tests {
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
-            mobile.evaluate_policy(a_spend()).unwrap(),
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
             PolicyDecision::Deny { .. }
         ));
+    }
+
+    /// Winding the device clock back must not put an expired policy back in
+    /// force. The stored floor is the time already known to have passed, so
+    /// validity is judged against it rather than against the date setting.
+    ///
+    /// The attack cannot be staged by moving the real clock under test, so it
+    /// is staged from the other side: the bundle is dated now, and the floor
+    /// says a time past its window has already been observed, which is the same
+    /// relation as a bundle whose window closed while the clock was later and
+    /// has now been wound back inside it.
+    #[test]
+    fn a_clock_wound_back_does_not_revive_an_expired_policy() {
+        let now = Utc::now().timestamp() as u64;
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        // Past the thirty-day window, and the anchor is ahead of the reading
+        // the test passes in, so the reload takes the reboot path and leaves
+        // the floor where it was planted.
+        storage.plant(
+            CLOCK_FLOOR_STORAGE_KEY,
+            serde_json::to_vec(&crate::clock_floor::ClockFloor {
+                floor_secs: now + 40 * 24 * 3600,
+                anchor_elapsed_ms: 5_000,
+            })
+            .unwrap(),
+        );
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(
+            matches!(
+                mobile.policy_status(0).unwrap(),
+                PolicyStatus::Faulted {
+                    fault: PolicyFault::Expired
+                }
+            ),
+            "a bundle whose window closed against the floor must stay expired"
+        );
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend(), 0).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+
+        // And it cannot be reinstalled by the same wound-back clock: the import
+        // is judged against the floor too.
+        let bundle = create_test_bundle(&capped_rules());
+        mobile
+            .import_policy(hex::encode(bundle.to_bytes()))
+            .expect_err("an import judged against the floor is expired too");
+    }
+
+    /// A floor that cannot be read leaves the policy refusing rather than
+    /// enforcing, because nothing then says the clock was not wound back.
+    #[test]
+    fn an_unreadable_floor_refuses_every_rule() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.plant(CLOCK_FLOOR_STORAGE_KEY, b"not json".to_vec());
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status(0).unwrap_or(PolicyStatus::Faulted {
+                fault: PolicyFault::Unreadable
+            }),
+            PolicyStatus::Faulted { .. }
+        ));
+        assert!(mobile
+            .evaluate_policy(a_spend(), 0)
+            .map(|d| matches!(d, PolicyDecision::Deny { .. }))
+            .unwrap_or(true));
     }
 }

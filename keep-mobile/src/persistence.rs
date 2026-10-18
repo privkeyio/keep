@@ -7,14 +7,16 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::clock_floor::ClockFloor;
 use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN, POLICY_VERSION};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::{VelocityTracker, MAX_TRACKED_TRANSACTIONS};
 use crate::{
-    CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, HEALTH_STATUS_INDEX_KEY,
-    HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
+    CERT_PINS_STORAGE_KEY, CLOCK_FLOOR_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX,
+    HEALTH_STATUS_INDEX_KEY, HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY,
+    VELOCITY_STORAGE_KEY,
 };
 
 #[derive(Serialize, Deserialize, Default)]
@@ -114,6 +116,40 @@ pub(crate) fn persist_policy(
 /// checked after the parse; this bounds what serde is asked to allocate first,
 /// at a generous 128 bytes per entry against a worst case nearer 75.
 const VELOCITY_RECORD_MAX_LEN: usize = 128 * MAX_TRACKED_TRANSACTIONS + 1024;
+
+/// Reads the stored time floor, or `None` when none has been written yet.
+///
+/// A read failure is an error rather than an absence, and the caller refuses on
+/// it, for the reason the whole module exists: without the floor there is
+/// nothing to say the clock was not wound back.
+pub(crate) fn load_clock_floor(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<Option<ClockFloor>, KeepMobileError> {
+    match storage.load_share_by_key(CLOCK_FLOOR_STORAGE_KEY.into()) {
+        Ok(data) => serde_json::from_slice(&data)
+            .map(Some)
+            // Without serde's message, which quotes the value it tripped on.
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "Failed to deserialize the clock floor".into(),
+            }),
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn persist_clock_floor(
+    storage: &Arc<dyn SecureStorage>,
+    floor: &ClockFloor,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(floor).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize the clock floor: {e}"),
+    })?;
+    storage.store_share_by_key(
+        CLOCK_FLOOR_STORAGE_KEY.into(),
+        data,
+        storage_metadata("clock_floor"),
+    )
+}
 
 pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
