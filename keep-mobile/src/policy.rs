@@ -20,7 +20,30 @@ pub const POLICY_HASH_LEN: usize = 32;
 const POLICY_HEADER_LEN: usize = 1 + POLICY_PUBKEY_LEN + POLICY_HASH_LEN + 4;
 const POLICY_MIN_LEN: usize = POLICY_HEADER_LEN + 8 + POLICY_SIGNATURE_LEN;
 
-pub(crate) const MAX_POLICY_AGE_SECS: u64 = 365 * 24 * 60 * 60;
+/// How long a signed policy stays enforceable.
+///
+/// This is what bounds a rollback. The policy record sits in app-private
+/// storage encrypted under a key the app itself can use without the operator
+/// present, so anyone able to restore an older copy of that record can put
+/// older, more permissive rules back in force, and a floor kept beside the
+/// record is rewritten by the same access that rolled it back. Nothing stored
+/// on the device prevents that; what limits it is how far back a bundle is
+/// still accepted, because an older one meets the expiry check and is refused.
+///
+/// So the window is the reachable set. At a year, rules retired eleven months
+/// ago were still enforceable. Thirty days means a warden renews monthly and a
+/// rollback can reach back at most that far.
+///
+/// The cost is an idle device: past this, a policy that was never replaced
+/// expires and every rule refuses until a warden signs a new bundle. That is
+/// the direction to fail in, and [`PolicyFault::Expired`] keeps the old bundle
+/// readable so a replacement installs over it rather than needing the record
+/// deleted first.
+///
+/// Preventing rollback rather than bounding it needs a witness the device
+/// cannot roll back by itself, which means a warden-issued epoch checked at
+/// import, tracked separately.
+pub(crate) const MAX_POLICY_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const MAX_POLICY_FUTURE_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -869,6 +892,28 @@ pub(crate) fn resign_test_bundle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The validity window is pinned in days here rather than against
+    /// [`MAX_POLICY_AGE_SECS`], because it is the value that bounds how far a
+    /// rollback can reach and every other test expresses its dates in terms of
+    /// the constant, so all of them would pass at any window.
+    #[test]
+    fn a_policy_expires_thirty_days_after_it_was_signed() {
+        const DAY: i64 = 24 * 60 * 60;
+        let created_at = 1_700_000_000;
+        let bundle = create_test_bundle_at(&PolicyRules::default(), created_at as u64);
+
+        assert_eq!(
+            bundle.timestamp_fault_at(created_at + 29 * DAY),
+            None,
+            "a bundle inside the window is enforceable"
+        );
+        assert_eq!(
+            bundle.timestamp_fault_at(created_at + 31 * DAY),
+            Some(PolicyFault::Expired),
+            "past the window it must refuse rather than enforce retired rules"
+        );
+    }
 
     /// A clock set before 1970 must land on the retried fault, not the
     /// permanent one. `as u64` on a negative turns it into roughly 1.8e19,
