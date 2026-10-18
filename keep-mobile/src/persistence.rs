@@ -119,28 +119,33 @@ const VELOCITY_RECORD_MAX_LEN: usize = 128 * MAX_TRACKED_TRANSACTIONS + 1024;
 
 const CLOCK_FLOOR_RECORD_MAX_LEN: usize = 256;
 
-/// Reads the stored time floor, or `None` when none has been written yet.
+/// What reading the stored time floor found.
 ///
-/// A read failure is an error rather than an absence, and the caller refuses on
-/// it, for the reason the whole module exists: without the floor there is
-/// nothing to say the clock was not wound back.
+/// A record that is there and will not parse is a different statement from one
+/// that could not be read. A read failure may clear on the next attempt, so it
+/// refuses and is retried. A corrupt record will not, and treating it as a read
+/// failure left it in place forever: nothing rewrites it, so a device that hit
+/// it could never install a policy again, even after deleting the old one.
+/// Reporting it apart lets the caller replace it where that is safe.
+pub(crate) enum ClockFloorRead {
+    Found(ClockFloor),
+    Absent,
+    Corrupt,
+}
+
+/// Reads the stored time floor. `Err` is a read that did not complete, which
+/// the caller refuses on.
 pub(crate) fn load_clock_floor(
     storage: &Arc<dyn SecureStorage>,
-) -> Result<Option<ClockFloor>, KeepMobileError> {
+) -> Result<ClockFloorRead, KeepMobileError> {
     match storage.load_share_by_key(CLOCK_FLOOR_STORAGE_KEY.into()) {
         // Bounded before the parse, as the policy and counter records are. Two
-        // integer fields, so the ceiling is generous and still refuses anything
-        // that is not this record.
-        Ok(data) if data.len() > CLOCK_FLOOR_RECORD_MAX_LEN => Err(KeepMobileError::StorageError {
-            msg: "Clock floor record exceeds the maximum length".into(),
-        }),
-        Ok(data) => serde_json::from_slice(&data)
-            .map(Some)
-            // Without serde's message, which quotes the value it tripped on.
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "Failed to deserialize the clock floor".into(),
-            }),
-        Err(KeepMobileError::StorageNotFound) => Ok(None),
+        // integer fields, so anything this long is not this record.
+        Ok(data) if data.len() > CLOCK_FLOOR_RECORD_MAX_LEN => Ok(ClockFloorRead::Corrupt),
+        Ok(data) => Ok(serde_json::from_slice(&data)
+            .map(ClockFloorRead::Found)
+            .unwrap_or(ClockFloorRead::Corrupt)),
+        Err(KeepMobileError::StorageNotFound) => Ok(ClockFloorRead::Absent),
         Err(e) => Err(e),
     }
 }

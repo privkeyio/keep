@@ -658,6 +658,12 @@ impl PolicyEvaluator {
         }
     }
 
+    /// Whether any policy record is held, in force or not. Asked without a
+    /// clock because the answer does not depend on one.
+    pub(crate) fn is_configured(&self) -> bool {
+        !matches!(self.policy, PolicyState::NotConfigured)
+    }
+
     /// The bundle in force at `clock`, which is `None` once its window closes
     /// even while this evaluator still holds it.
     pub(crate) fn policy_at(&self, clock: PolicyClock) -> Option<&PolicyBundle> {

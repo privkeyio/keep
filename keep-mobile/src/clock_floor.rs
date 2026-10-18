@@ -53,6 +53,26 @@ pub(crate) struct PolicyClock {
     pub(crate) effective_secs: i64,
 }
 
+/// How far the floor has to move before it is worth storing.
+const PERSIST_QUANTUM_SECS: u64 = 60;
+
+/// A monotonic reading, or `None` when there is no usable one.
+///
+/// Zero is treated as no reading. `elapsedRealtime()` cannot be zero by the time
+/// an app is running, so a zero is a caller with no monotonic source that put
+/// something in the argument rather than a real reading. Taken at face value it
+/// is the worst value there is: it is below any stored anchor, so it re-anchors
+/// the floor to boot, and the next genuine reading then credits the whole
+/// device uptime as elapsed and advances the floor by weeks. The `Option` anchor
+/// closes that on construction; this closes it on every other call.
+///
+/// A caller that fabricates a small nonzero reading can still do it. That is a
+/// caller lying about the monotonic clock, which this cannot detect, and why
+/// the readings have to come from the platform.
+fn reading(now_elapsed_ms: Option<u64>) -> Option<u64> {
+    now_elapsed_ms.filter(|&ms| ms > 0)
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct ClockFloor {
     /// The latest wall-clock second the app accepts as already past.
@@ -72,7 +92,7 @@ impl ClockFloor {
     pub(crate) fn new(now_secs: u64, now_elapsed_ms: Option<u64>) -> Self {
         Self {
             floor_secs: now_secs,
-            anchor_elapsed_ms: now_elapsed_ms,
+            anchor_elapsed_ms: reading(now_elapsed_ms),
         }
     }
 
@@ -83,7 +103,7 @@ impl ClockFloor {
     /// then consulted and not advanced: raising it needs proof that time
     /// passed, and reading it does not.
     pub(crate) fn observe(self, now_secs: u64, now_elapsed_ms: Option<u64>) -> (Self, bool) {
-        let Some(now_elapsed_ms) = now_elapsed_ms else {
+        let Some(now_elapsed_ms) = reading(now_elapsed_ms) else {
             return (self, false);
         };
 
@@ -114,38 +134,40 @@ impl ClockFloor {
         if proven_secs == 0 {
             // Nothing proven, so nothing to advance by, and the anchor stays
             // where it is so the next observation measures from the same point
-            // rather than restarting the measurement. Not storing this is also
-            // what keeps a decision from writing to storage every time.
+            // rather than restarting the measurement.
             return (self, false);
         }
 
         let ceiling = self.floor_secs.saturating_add(proven_secs);
         let floor_secs = self.floor_secs.max(now_secs.min(ceiling));
-        // The anchor moves by the whole seconds that were credited, not to the
-        // reading itself, so the remainder below a second is carried instead of
-        // discarded. Moving it to the reading would throw away up to 999 ms on
-        // every advance, and a caller asking just under every two seconds would
-        // then credit one second per two and hold the floor at half of real
-        // time.
-        let anchor_elapsed_ms = anchor.saturating_add(proven_secs.saturating_mul(1_000));
-        // Stored only when the floor itself moved. When it did not, which is
-        // every call while the clock reads behind the floor, keeping the old
-        // anchor is what lets the proven time accrue rather than being consumed
-        // by a call that could not use it. It also keeps a decision from
-        // writing to storage every time one is more than a second after the
-        // last.
-        let changed = floor_secs != self.floor_secs;
-        (
-            Self {
-                floor_secs,
-                anchor_elapsed_ms: if changed {
-                    Some(anchor_elapsed_ms)
-                } else {
-                    self.anchor_elapsed_ms
-                },
-            },
-            changed,
-        )
+        let credited_secs = floor_secs - self.floor_secs;
+
+        // The anchor moves by what was credited to the floor, not by what was
+        // proven. When the clock reading is the binding constraint the two
+        // differ, and moving by the proof would spend all of it on the little
+        // the clock allowed: one call that nudges the floor a second after a
+        // long idle would burn the whole accrual, and a later call could then
+        // raise the floor no further. Moving by the credit keeps the surplus
+        // for when the clock catches up, and still carries the remainder below
+        // a second, because only whole seconds are credited.
+        //
+        // The total advance still never exceeds the monotonic time proven since
+        // the original anchor: every second credited is a second of proof
+        // spent, and proof is only spent by crediting it.
+        let advanced = Self {
+            floor_secs,
+            anchor_elapsed_ms: Some(anchor.saturating_add(credited_secs.saturating_mul(1_000))),
+        };
+
+        // Worth storing once the floor has moved by a quantum, not on every
+        // second it moves. On a healthy device the floor follows the wall clock
+        // and so moves every second, and storing each of those would be an
+        // encrypted read and write per decision for as long as anything polls.
+        // Skipping a small move is safe: the stored pair stays consistent, and
+        // the next call measures from the older anchor and credits the same
+        // time again. The cost is that a rewind shorter than the quantum, made
+        // between two stores, is not caught.
+        (advanced, credited_secs >= PERSIST_QUANTUM_SECS)
     }
 
     /// The readings to judge validity with: the clock as given, and an expiry
@@ -169,11 +191,14 @@ mod tests {
 
     const MIN: u64 = 60;
     const DAY: u64 = 24 * 3600;
+    /// A genuine post-boot monotonic reading. Zero is not one: it is read as no
+    /// reading at all, so tests that need a real anchor start here.
+    const BOOT: u64 = 1_000;
 
     #[test]
     fn winding_the_clock_back_does_not_move_the_expiry_time_back() {
-        let floor = ClockFloor::new(1_000_000, Some(0));
-        let (floor, _) = floor.observe(1_000_000 + 10 * MIN, Some(10 * MIN * 1_000));
+        let floor = ClockFloor::new(1_000_000, Some(BOOT));
+        let (floor, _) = floor.observe(1_000_000 + 10 * MIN, Some(BOOT + 10 * MIN * 1_000));
 
         // The attack: the date is set back a week. Expiry is judged against the
         // floor, so an expired policy stays expired.
@@ -257,12 +282,12 @@ mod tests {
     /// two and hold the floor at half of real time.
     #[test]
     fn accrual_below_a_second_is_carried_rather_than_discarded() {
-        let mut floor = ClockFloor::new(1_000_000, Some(0));
+        let mut floor = ClockFloor::new(1_000_000, Some(BOOT));
 
         // Ten asks at 1,900 ms apart: 19 s of real time, and each ask on its
         // own proves only one whole second.
         for i in 1..=10u64 {
-            let reading = i * 1_900;
+            let reading = BOOT + i * 1_900;
             let (next, _) = floor.observe(1_000_000 + 19, Some(reading));
             floor = next;
         }
@@ -277,22 +302,81 @@ mod tests {
     /// storage and keeps the unused proven time accruing.
     #[test]
     fn an_advance_that_cannot_happen_is_not_stored() {
-        let floor = ClockFloor::new(1_000_000, Some(0));
+        let floor = ClockFloor::new(1_000_000, Some(BOOT));
 
         // The clock reads behind the floor, so there is nothing to advance to.
-        let (same, changed) = floor.observe(999_000, Some(60_000));
+        let (same, changed) = floor.observe(999_000, Some(BOOT + 60_000));
         assert!(!changed, "nothing moved, so nothing to store");
         assert_eq!(same.floor_secs, 1_000_000);
         assert_eq!(
             same.anchor_elapsed_ms,
-            Some(0),
+            Some(BOOT),
             "the anchor stays so the minute still counts once the clock is back"
         );
 
         // Once the clock is restored the whole minute is still available.
-        let (advanced, changed) = same.observe(1_000_060, Some(60_000));
+        let (advanced, changed) = same.observe(1_000_060, Some(BOOT + 60_000));
         assert!(changed);
         assert_eq!(advanced.floor_secs, 1_000_060);
+    }
+
+    /// Proof the clock did not let the floor use is kept, not spent. One call
+    /// that nudges the floor a second after a long idle used to consume the
+    /// whole accrual, after which the floor could rise no further even once
+    /// the clock caught up, which is the difference between catching and
+    /// missing a rewind made after that.
+    #[test]
+    fn proof_the_clock_did_not_allow_is_carried_to_a_later_call() {
+        let floor = ClockFloor::new(1_000, Some(BOOT));
+
+        // A minute proven, but the clock reads only a second past the floor.
+        let (nudged, _) = floor.observe(1_001, Some(BOOT + 60_000));
+        assert_eq!(nudged.floor_secs, 1_001);
+
+        // The clock catches up within the same monotonic reading: the other
+        // 59 seconds of proof are still there to credit.
+        let (caught_up, _) = nudged.observe(2_000_000, Some(BOOT + 60_000));
+        assert_eq!(caught_up.floor_secs, 1_060);
+    }
+
+    /// A zero reading is no reading. Taken at face value it is below any
+    /// stored anchor, so it re-anchors the floor to boot, and the next genuine
+    /// reading then credits the whole device uptime: the floor parks weeks
+    /// ahead and every bundle, including one a warden signs today, is expired.
+    #[test]
+    fn a_zero_reading_cannot_re_anchor_the_floor_to_boot() {
+        let floor = ClockFloor::new(1_000_000, Some(5_000));
+
+        let (held, changed) = floor.observe(1_000_000, Some(0));
+        assert!(!changed, "a zero is no reading, so nothing to store");
+        assert_eq!(held.anchor_elapsed_ms, Some(5_000));
+
+        // The next genuine reading on a device up for 40 days, clock set far
+        // forward. Measured from the real anchor, not from a planted zero.
+        let (after, _) = held.observe(4_000_000_000, Some(5_000 + 1_000));
+        assert_eq!(after.floor_secs, 1_000_001);
+
+        // And construction reads zero the same way.
+        assert_eq!(ClockFloor::new(1_000_000, Some(0)).anchor_elapsed_ms, None);
+    }
+
+    /// A move smaller than the quantum is used for the decision but not
+    /// stored, so a device whose floor follows the clock does not write on
+    /// every call.
+    #[test]
+    fn only_a_move_of_a_quantum_or_more_is_worth_storing() {
+        let floor = ClockFloor::new(1_000_000, Some(BOOT));
+
+        let (small, store) = floor.observe(1_000_030, Some(BOOT + 30_000));
+        assert!(!store, "thirty seconds is under the quantum");
+        assert_eq!(small.floor_secs, 1_000_030, "still used for this decision");
+
+        let (large, store) = floor.observe(
+            1_000_000 + PERSIST_QUANTUM_SECS,
+            Some(BOOT + PERSIST_QUANTUM_SECS * 1_000),
+        );
+        assert!(store);
+        assert_eq!(large.floor_secs, 1_000_000 + PERSIST_QUANTUM_SECS);
     }
 
     #[test]
