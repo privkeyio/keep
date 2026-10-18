@@ -23,30 +23,35 @@
 //! criteria apply to them, and a polynomial of several coefficients gives more
 //! consecutive draws to compare than a commitment does.
 //!
-//! What this catches: a source stuck on any constant, because a commitment
-//! draws twice and the two come back equal; an all-zero fill of any width; and
-//! two draws in one commitment closer than the Hamming floor, which is a source
-//! that moves but barely.
+//! What this catches, within one call: a source stuck on any constant; an
+//! all-zero fill of any width; two blocks closer than the Hamming floor, which
+//! is a source that moves but barely; a source cycling through a handful of
+//! values, because every block is compared against all the blocks before it
+//! and not just the one immediately before; and a source that is random except
+//! for a byte position it never moves. A call that draws fewer blocks than the
+//! criteria need draws more from the same source until it has them, so a call
+//! that makes a single draw is judged rather than waved through. Bytes drawn
+//! that no whole block could be formed from are refused outright instead of
+//! being certified by those extra draws.
 //!
 //! What it does not catch, stated here so the check is not trusted past its
-//! reach. It compares only the draws inside one commitment, since the judge is
-//! built per call, so a source that replays a sequence across commitments emits
-//! the same nonce pair in every session and passes every comparison made here.
-//! That is the case that recovers the share, and it is the gap tracked as
-//! follow-up work; within one commitment, hiding and binding matching does not
-//! by itself recover anything. It also cannot see a source that is compromised
-//! rather than broken: bytes an attacker chose but that look statistically
-//! healthy pass every criterion, and no test at the draw can do better. The
-//! three-sample probe in keep-frost-net covers a short cycle that this misses,
-//! but it is periodic and exists only there, so keep-core and keep-cli callers
-//! have the within-commitment check alone.
+//! reach. The judge is built per call, so a source that replays the same
+//! sequence across calls emits the same nonce pair in every session and passes
+//! every comparison made here. That is the case that recovers the share, and it
+//! is the gap tracked as follow-up work; within one call, hiding and binding
+//! matching does not by itself recover anything. It also cannot see a source
+//! that is compromised rather than broken: bytes an attacker chose but that
+//! look statistically healthy pass every criterion, and no test at the draw can
+//! do better. At a site that makes a single draw the only comparison is against
+//! bytes drawn after the secret, which catches a source that is still degraded
+//! when probed but not one that emits a single chosen value and then recovers.
 //!
 //! [`check_entropy_health`]: crate::entropy::check_entropy_health
 
 use frost_secp256k1_tr::rand_core::{impls, CryptoRng, Error as RngError, OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::entropy::{pair_looks_random, EntropyHealthError};
+use crate::entropy::{check_bit_distribution, pair_looks_random, EntropyHealthError};
 
 /// An RNG that holds every fill it hands out to the health criteria.
 ///
@@ -57,24 +62,53 @@ use crate::entropy::{pair_looks_random, EntropyHealthError};
 /// consults the verdict.
 pub struct CheckedRng<R> {
     inner: R,
-    /// The last 32-byte block judged, for the next one to be compared against.
+    /// The blocks judged so far, so each new one is compared against all of
+    /// them and not just against its neighbor. Holding one block alone makes
+    /// the comparisons adjacent-only, which a source alternating two values
+    /// passes: it is never asked whether a block it already emitted came back.
     /// Cleared on drop, though frost-core leaves its own copy of the same
     /// bytes, and the serialized signing share beside them, unscrubbed on the
     /// heap, so this is hygiene rather than a boundary anything should lean on.
-    previous: Option<[u8; 32]>,
-    /// How many 32-byte blocks have been judged, which is what decides whether
-    /// any comparison actually happened.
+    judged: Vec<Zeroizing<[u8; 32]>>,
+    /// Bytes from a fill that did not end on a block boundary, held so the
+    /// remainder joins the next fill instead of going unjudged. Never 32 or
+    /// more: a full block is judged and this resets.
+    pending: Zeroizing<[u8; 32]>,
+    pending_len: usize,
+    /// How many 32-byte blocks have been judged, counted separately from
+    /// `judged` because that one stops growing at [`MAX_RETAINED`].
     blocks: usize,
     /// How many fills the closure asked for, at any width.
     fills: usize,
     fault: Option<EntropyHealthError>,
 }
 
+/// How many judged blocks are kept for comparison.
+///
+/// Every new block is compared against all of these, so the work is quadratic
+/// in what is retained. Well past the widest draw any call here makes: a
+/// threshold-5 DKG polynomial is 6 blocks, and an Ed25519 dealer split at that
+/// threshold is 6 too, so in practice nothing is ever dropped.
+const MAX_RETAINED: usize = 8;
+
+/// How many blocks a call must have judged before its verdict is trusted.
+///
+/// Two allow exactly one comparison, which a source alternating two values
+/// passes: draw A, probe B, A against B looks healthy while the source holds
+/// one bit of entropy. Three is the smallest number that catches it, because
+/// the third block is A again and A against A fails. It also matches what
+/// [`check_entropy_health`] applies to its own samples.
+///
+/// [`check_entropy_health`]: crate::entropy::check_entropy_health
+const MIN_JUDGED: usize = 3;
+
 impl<R: RngCore> CheckedRng<R> {
     fn new(inner: R) -> Self {
         Self {
             inner,
-            previous: None,
+            judged: Vec::new(),
+            pending: Zeroizing::new([0u8; 32]),
+            pending_len: 0,
             blocks: 0,
             fills: 0,
             fault: None,
@@ -90,22 +124,38 @@ impl<R: RngCore> CheckedRng<R> {
             self.fault = Some(EntropyHealthError::Degraded);
             return;
         }
-        // Block by block, so a fill wider than one block is judged against
-        // itself rather than skipped. That matters: a secp256k1 scalar is one
-        // 32-byte fill (k256 0.13.4, `arithmetic/scalar.rs:195-205`) while an
-        // Ed25519 scalar is a single 64-byte one (curve25519-dalek 4.1.3,
-        // `scalar.rs:597-601`), so a rule written for one width alone would
-        // quietly judge nothing at all on the other.
-        let (blocks, _partial) = drawn.as_chunks::<32>();
-        for block in blocks {
-            let block = Zeroizing::new(*block);
-            if let Some(previous) = &self.previous {
-                if !pair_looks_random(previous, &block) {
-                    self.fault = Some(EntropyHealthError::Degraded);
-                }
+        // Accumulated into whole blocks rather than judged per fill, so the
+        // width a consumer happens to use cannot leave bytes unexamined. That
+        // matters: a secp256k1 scalar is one 32-byte fill (k256 0.13.4,
+        // `arithmetic/scalar.rs:195-205`) while an Ed25519 scalar is a single
+        // 64-byte one (curve25519-dalek 4.1.3, `scalar.rs:597-601`), and a rule
+        // written for one width alone judges nothing at all on the other.
+        // Anything left over at the end of the call is accounted for in
+        // `finish`, so a ragged total cannot pass as checked.
+        let mut rest = drawn;
+        while !rest.is_empty() {
+            let take = (32 - self.pending_len).min(rest.len());
+            self.pending[self.pending_len..self.pending_len + take].copy_from_slice(&rest[..take]);
+            self.pending_len += take;
+            rest = &rest[take..];
+            if self.pending_len == 32 {
+                self.judge_block(Zeroizing::new(*self.pending));
+                self.pending_len = 0;
             }
-            self.previous = Some(*block);
-            self.blocks += 1;
+        }
+    }
+
+    fn judge_block(&mut self, block: Zeroizing<[u8; 32]>) {
+        let repeats = self
+            .judged
+            .iter()
+            .any(|previous| !pair_looks_random(previous, &block));
+        if repeats {
+            self.fault = Some(EntropyHealthError::Degraded);
+        }
+        self.blocks += 1;
+        if self.judged.len() < MAX_RETAINED {
+            self.judged.push(block);
         }
     }
 
@@ -123,25 +173,57 @@ impl<R: RngCore> CheckedRng<R> {
     /// that matters is often the only one a short-lived process makes, and
     /// would keep bytes that fed a secret alive process-wide for nothing. The
     /// probe is never used for anything and goes out of scope here.
-    fn probe_until_comparable(&mut self) {
-        // Zero fills means the closure never touched this source, so whatever
-        // it drew went unjudged. Not a verdict on the source, so not a fault:
-        // a debug assertion, which is where a draw written against `OsRng`
-        // instead of the source handed to it gets caught.
-        debug_assert!(
-            self.fills > 0,
-            "checked_draw drew nothing through the checked source"
-        );
-        while self.fault.is_none() && self.blocks < 2 {
+    ///
+    /// Worth being exact about what a probe buys at a one-block site: the only
+    /// comparison is the secret block against bytes drawn after it. That
+    /// catches a source stuck, cycling or barely moving, because such a source
+    /// is still that way when probed. It says nothing about a source that emits
+    /// one chosen value and then healthy bytes, which no check at the draw can
+    /// see.
+    fn finish(&mut self) {
+        // The closure never touched this source, so it drew no secret here and
+        // there is nothing to judge. Reached on an ordinary error path:
+        // frost-core validates signer counts before it draws, so a refused
+        // threshold returns without a fill. Not a verdict, so not a fault, and
+        // not an assertion either: asserting here turns that validation error
+        // into a panic in any build with debug assertions on.
+        if self.fills == 0 {
+            return;
+        }
+        // Bytes were drawn that no block could be formed from, so the criteria
+        // never saw them. `Unavailable` rather than `Degraded` because this is
+        // the absence of a verdict, not a bad one: nothing was learned about
+        // the source, so a caller should refuse this draw without concluding
+        // the machine is broken. No call here can reach it today, since every
+        // fill behind these secrets is 32 or 64 bytes wide; it is what stops a
+        // narrower draw from being certified by probe blocks alone, which would
+        // read as assurance over bytes nothing examined.
+        if self.pending_len > 0 || self.blocks == 0 {
+            self.fault = Some(EntropyHealthError::Unavailable);
+            return;
+        }
+        while self.fault.is_none() && self.blocks < MIN_JUDGED {
             let mut probe = Zeroizing::new([0u8; 32]);
             self.fill_bytes(probe.as_mut());
+        }
+        // The one criterion a pair cannot carry. `pair_looks_random` drops it
+        // because across two draws a byte position holds the same extreme value
+        // about once in a thousand tries, which would refuse healthy draws at
+        // that rate; across three or more it is the test that catches a source
+        // whose output is random except for a position it never moves.
+        if self.fault.is_none() && self.judged.len() >= MIN_JUDGED {
+            let blocks = Zeroizing::new(self.judged.iter().map(|b| **b).collect::<Vec<_>>());
+            if !check_bit_distribution(&blocks) {
+                self.fault = Some(EntropyHealthError::Degraded);
+            }
         }
     }
 }
 
 impl<R> Drop for CheckedRng<R> {
     fn drop(&mut self) {
-        self.previous.zeroize();
+        self.judged.zeroize();
+        self.pending.zeroize();
     }
 }
 
@@ -199,7 +281,7 @@ fn checked_draw_from<R: CryptoRng + RngCore, T>(
 ) -> Result<T, EntropyHealthError> {
     let mut rng = CheckedRng::new(source);
     let drawn = draw(&mut rng);
-    rng.probe_until_comparable();
+    rng.finish();
     match rng.fault {
         Some(e) => Err(e),
         None => Ok(drawn),
@@ -217,7 +299,7 @@ pub fn commit_checked(
     EntropyHealthError,
 > {
     checked_draw(|rng| {
-        #[allow(clippy::disallowed_methods)] // the one sanctioned draw
+        #[expect(clippy::disallowed_methods)] // the one sanctioned draw
         frost_secp256k1_tr::round1::commit(share, rng)
     })
 }
@@ -234,7 +316,7 @@ pub fn commit_checked_ed25519(
     EntropyHealthError,
 > {
     checked_draw(|rng| {
-        #[allow(clippy::disallowed_methods)] // the one sanctioned draw
+        #[expect(clippy::disallowed_methods)] // the one sanctioned draw
         frost_ed25519::round1::commit(share, rng)
     })
 }
@@ -309,6 +391,41 @@ mod tests {
         dest.fill(s.0);
     });
 
+    /// Alternates between two values that are far apart, so every comparison
+    /// against the block immediately before it passes while the source holds
+    /// one bit of entropy. Only comparing a block against every block already
+    /// judged, over at least three of them, can see it.
+    struct CyclingRng(bool);
+
+    impl_rng!(CyclingRng, |s, dest| {
+        dest.fill(if s.0 { 0x00 } else { 0xff });
+        dest[0] = if s.0 { 0x01 } else { 0xfe };
+        s.0 = !s.0;
+    });
+
+    /// Healthy everywhere except one byte position it never moves, which is
+    /// the one failure a pair of draws cannot carry: the two are distinct, both
+    /// nonzero and far apart, so only a test across three or more blocks sees
+    /// the position that never changes.
+    struct ConstantPositionRng;
+
+    impl_rng!(ConstantPositionRng, |_s, dest| {
+        OsRng.fill_bytes(dest);
+        for block in dest.chunks_mut(32) {
+            block[5] = 0x00;
+        }
+    });
+
+    /// Healthy, and counts the bytes drawn through it, for pinning how much a
+    /// call draws beyond the secret itself.
+    #[derive(Default)]
+    struct CountingRng(usize);
+
+    impl_rng!(CountingRng, |s, dest| {
+        s.0 += dest.len();
+        OsRng.fill_bytes(dest);
+    });
+
     impl_rng!(CreepingRng, |s, dest| {
         dest.fill(0x5a);
         dest[0] = s.0;
@@ -323,7 +440,7 @@ mod tests {
     fn a_commitment_from_a_stuck_source_is_refused() {
         assert_eq!(
             checked_draw_from(StuckRng(0xab), |rng| {
-                #[allow(clippy::disallowed_methods)] // drawn through the checked source
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
                 frost_secp256k1_tr::round1::commit(&test_share(3), rng)
             }),
             Err(EntropyHealthError::Degraded)
@@ -356,7 +473,7 @@ mod tests {
     fn a_commitment_from_a_barely_moving_source_is_refused() {
         assert_eq!(
             checked_draw_from(CreepingRng(0), |rng| {
-                #[allow(clippy::disallowed_methods)] // drawn through the checked source
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
                 frost_secp256k1_tr::round1::commit(&test_share(3), rng)
             }),
             Err(EntropyHealthError::Degraded)
@@ -392,7 +509,7 @@ mod tests {
     fn a_group_key_from_a_stuck_source_is_refused() {
         assert_eq!(
             checked_draw_from(StuckRng(0xab), |rng| {
-                #[allow(clippy::disallowed_methods)] // drawn through the checked source
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
                 frost_secp256k1_tr::keys::generate_with_dealer(
                     3,
                     2,
@@ -410,7 +527,7 @@ mod tests {
     #[test]
     fn the_os_source_produces_a_group_key() {
         let (shares, _) = checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             frost_secp256k1_tr::keys::generate_with_dealer(
                 3,
                 2,
@@ -483,7 +600,7 @@ mod tests {
     fn an_ed25519_group_key_from_a_stuck_source_is_refused() {
         assert_eq!(
             checked_draw_from(StuckRng(0xab), |rng| {
-                #[allow(clippy::disallowed_methods)] // drawn through the checked source
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
                 frost_ed25519::keys::generate_with_dealer(
                     3,
                     2,
@@ -501,7 +618,7 @@ mod tests {
     #[test]
     fn the_os_source_produces_an_ed25519_group_key() {
         let (shares, _) = checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             frost_ed25519::keys::generate_with_dealer(
                 3,
                 2,
@@ -521,5 +638,119 @@ mod tests {
         let mut checked = CheckedRng::new(OsRng);
         checked.judge(&[]);
         assert_eq!(checked.fault, None);
+    }
+
+    /// A source alternating two values passes every adjacent comparison, so
+    /// retaining one block is not enough. Three secp256k1 coefficients come
+    /// back A, B, A, and only a block compared against every earlier one
+    /// catches the repeat.
+    #[test]
+    fn a_source_alternating_two_values_is_refused() {
+        let mut rng = CheckedRng::new(CyclingRng(true));
+        let mut block = [0u8; 32];
+        for _ in 0..3 {
+            rng.fill_bytes(&mut block);
+        }
+        rng.finish();
+        assert_eq!(
+            rng.fault,
+            Some(EntropyHealthError::Degraded),
+            "a period-two source must not pass"
+        );
+    }
+
+    /// The same source through a real key generation, so the refusal is not
+    /// just a property of the criteria in isolation.
+    #[test]
+    fn a_group_key_from_an_alternating_source_is_refused() {
+        assert_eq!(
+            checked_draw_from(CyclingRng(true), |rng| {
+                #[expect(clippy::disallowed_methods)]
+                frost_secp256k1_tr::keys::generate_with_dealer(
+                    3,
+                    2,
+                    frost_secp256k1_tr::keys::IdentifierList::Default,
+                    rng,
+                )
+            })
+            .err(),
+            Some(EntropyHealthError::Degraded)
+        );
+    }
+
+    /// Bytes too narrow to form a block cannot be judged, and must not be
+    /// certified by the probe blocks drawn after them. Without this the verdict
+    /// would be `Ok` over bytes no criterion looked at, which reads as
+    /// assurance and is worse than no check.
+    #[test]
+    fn a_draw_too_narrow_to_judge_is_refused() {
+        let verdict = checked_draw_from(OsRng, |rng| {
+            let mut narrow = [0u8; 8];
+            rng.fill_bytes(&mut narrow);
+        });
+        assert_eq!(verdict.err(), Some(EntropyHealthError::Unavailable));
+    }
+
+    /// A fill that does not end on a block boundary leaves a remainder, and the
+    /// remainder is secret material too. Either it joins the next fill or the
+    /// call is refused; it is never silently dropped.
+    #[test]
+    fn a_ragged_fill_is_not_passed_as_checked() {
+        let verdict = checked_draw_from(OsRng, |rng| {
+            let mut ragged = [0u8; 48];
+            rng.fill_bytes(&mut ragged);
+        });
+        assert_eq!(verdict.err(), Some(EntropyHealthError::Unavailable));
+
+        // Two of them do complete a block between them, so the remainder is
+        // carried rather than discarded.
+        let verdict = checked_draw_from(OsRng, |rng| {
+            let mut ragged = [0u8; 48];
+            rng.fill_bytes(&mut ragged);
+            rng.fill_bytes(&mut ragged);
+        });
+        assert!(verdict.is_ok(), "a carried remainder must complete a block");
+    }
+
+    /// A closure that never draws is an ordinary error path, not a fault and
+    /// not a panic: frost-core validates signer counts before it touches the
+    /// source, so a refused threshold returns without a fill.
+    #[test]
+    fn a_closure_that_never_draws_is_not_a_fault() {
+        let verdict = checked_draw_from(OsRng, |_| 7);
+        assert_eq!(verdict, Ok(7));
+    }
+
+    /// A one-block draw is probed up to the three blocks the criteria need, and
+    /// the probes come from the same source rather than being invented.
+    #[test]
+    fn a_single_draw_is_probed_up_to_three_blocks() {
+        let mut counter = CountingRng::default();
+        let verdict = {
+            let rng = &mut counter;
+            checked_draw_from(rng, |rng| {
+                let mut block = [0u8; 32];
+                rng.fill_bytes(&mut block);
+            })
+        };
+        assert!(verdict.is_ok());
+        assert_eq!(
+            counter.0, 96,
+            "one secret block plus two probes, all from the judged source"
+        );
+    }
+
+    /// A source random except for a byte position it never moves is refused.
+    /// That position is the one criterion a pair cannot carry, so this is what
+    /// the third block buys beyond catching a repeat.
+    #[test]
+    fn a_source_with_a_frozen_byte_position_is_refused() {
+        let mut rng = CheckedRng::new(ConstantPositionRng);
+        let mut block = [0u8; 32];
+        for _ in 0..3 {
+            rng.fill_bytes(&mut block);
+        }
+        rng.finish();
+        assert_eq!(rng.fault, Some(EntropyHealthError::Degraded));
     }
 }

@@ -1,7 +1,13 @@
 # A secret must come from a draw that was checked; see
 # keep-core/src/frost/checked_rng.rs for why. Route these through
-# keep_core::frost::checked_draw, or commit_checked for a nonce, and allow the
-# lint at that one call site so the decision is visible where it is made.
+# keep_core::frost::checked_draw, or commit_checked for a nonce, and mark the
+# lint `expect` at that one call site so the decision is visible where it is
+# made. `expect` rather than `allow` deliberately: an entry that stops
+# resolving, after a dependency bump moves a function or if clippy runs without
+# the features that bring these paths into scope, would silently stop guarding
+# anything. With `expect`, the unfulfilled expectation at the call site is a
+# warning, and CI runs clippy with `-D warnings`, so the guard going quiet is a
+# build failure rather than nothing at all.
 disallowed-methods = [
     { path = "frost_secp256k1_tr::round1::commit", reason = "use keep_core::frost::commit_checked so the draw behind the nonce is checked" },
     { path = "frost_ed25519::round1::commit", reason = "use keep_core::frost::commit_checked_ed25519 so the draw behind the nonce is checked" },
@@ -13,6 +19,10 @@ disallowed-methods = [
     { path = "frost_ed25519::keys::split", reason = "draw the splitting polynomial through keep_core::frost::checked_draw" },
     { path = "frost_ed25519::keys::dkg::part1", reason = "draw the secret polynomial through keep_core::frost::checked_draw" },
     { path = "frost_ed25519::keys::refresh::compute_refreshing_shares", reason = "draw the refresh delta through keep_core::frost::checked_draw" },
+    { path = "frost_secp256k1_tr::keys::refresh::refresh_dkg_part1", reason = "draw the refresh polynomial through keep_core::frost::checked_draw" },
+    { path = "frost_ed25519::keys::refresh::refresh_dkg_part1", reason = "draw the refresh polynomial through keep_core::frost::checked_draw" },
+    { path = "frost_secp256k1_tr::keys::repairable::repair_share_part1", reason = "draw the repair deltas through keep_core::frost::checked_draw" },
+    { path = "frost_ed25519::keys::repairable::repair_share_part1", reason = "draw the repair deltas through keep_core::frost::checked_draw" },
 ]
 # Not listed, because the path does not resolve through the ciphersuite crates'
 # type aliases and clippy warns on an entry it cannot reach:

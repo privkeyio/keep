@@ -299,7 +299,7 @@ mod tests {
 
     fn make_pair() -> (SigningNonces, SigningCommitments) {
         let (shares, _pubkeys) = keep_core::frost::checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             generate_with_dealer(2, 2, IdentifierList::Default, rng)
         })
         .unwrap()

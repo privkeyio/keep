@@ -82,7 +82,7 @@ impl TrustedDealer {
         // This draw is the group key. Nothing later can recover from it being
         // predictable, so it is the one draw in the crate most worth checking.
         let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             frost::keys::generate_with_dealer(
                 self.config.total_shares,
                 self.config.threshold,
@@ -130,7 +130,7 @@ impl TrustedDealer {
         // The key is the caller's here, but the polynomial that splits it is
         // drawn, and a predictable polynomial gives away the other shares.
         let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             frost::keys::split(
                 &signing_key,
                 self.config.total_shares,

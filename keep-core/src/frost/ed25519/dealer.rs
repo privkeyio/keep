@@ -30,7 +30,7 @@ impl TrustedDealer {
     pub fn generate(&self, name: &str) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
         // This draw is the group key; see `crate::frost::checked_rng`.
         let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             frost::keys::generate_with_dealer(
                 self.config.total_shares,
                 self.config.threshold,

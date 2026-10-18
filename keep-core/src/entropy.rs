@@ -308,7 +308,7 @@ fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
     a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
-fn check_bit_distribution(samples: &[[u8; 32]]) -> bool {
+pub(crate) fn check_bit_distribution(samples: &[[u8; 32]]) -> bool {
     (0..32).all(|pos| {
         let all_zeros = samples.iter().all(|s| s[pos] == 0x00);
         let all_ones = samples.iter().all(|s| s[pos] == 0xff);

@@ -40,6 +40,16 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
 
     let threshold = shares[0].metadata.threshold;
     let total = shares[0].metadata.total_shares;
+    // The threshold comes out of stored share metadata, which carries no floor
+    // of its own, and is handed to frost-core as `min_signers`. Refused here so
+    // a share claiming a threshold of one is keep-core's own error rather than
+    // one raised inside the draw, matching the floor `SoftwareDkgSession::init`
+    // applies.
+    if threshold < 2 {
+        return Err(KeepError::Frost(format!(
+            "threshold must be at least 2, share metadata says {threshold}"
+        )));
+    }
     let name = shares[0].metadata.name.clone();
 
     let group_pubkey = *shares[0].group_pubkey();
@@ -119,7 +129,7 @@ pub fn refresh_shares(shares: &[SharePackage]) -> Result<(Vec<SharePackage>, Pub
     // that, so a degraded draw here produces a guessable delta and the refresh
     // does not heal the compromise it was run for, while reporting success.
     let (refreshing_shares, new_pubkey_pkg) = crate::frost::checked_draw(|rng| {
-        #[allow(clippy::disallowed_methods)] // drawn through the checked source
+        #[expect(clippy::disallowed_methods)] // drawn through the checked source
         compute_refreshing_shares(pubkey_pkg, &identifiers, rng)
     })?
     .map_err(|e| KeepError::Frost(format!("Compute refreshing shares failed: {e}")))?;

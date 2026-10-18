@@ -192,7 +192,7 @@ impl SoftwareDkgSession {
         // participant's contribution to the group key, so a degraded draw here
         // outlives every session rather than one of them.
         let (secret, package) = crate::frost::checked_draw(|rng| {
-            #[allow(clippy::disallowed_methods)] // drawn through the checked source
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
             part1(self.identifier, self.max_signers, self.min_signers, rng)
         })?
         .map_err(|e| KeepError::Frost(format!("DKG part1 failed: {e}")))?;
