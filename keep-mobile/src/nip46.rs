@@ -13,7 +13,27 @@ use keep_nip46::{
 use nostr_sdk::{Kind, PublicKey};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
+
+/// How long this side waits for the foreign prompt before denying.
+///
+/// The same 60 seconds keep-cli, keep-web and keep-desktop each apply to their
+/// own approval channel, so no answer means a denial on every surface rather
+/// than on three of four.
+///
+/// [`BunkerCallbacks::request_approval`] still requires the implementation to
+/// bound its own wait, and keep-android does. This is the backstop for one that
+/// does not: without it the contract is unenforceable from here, and an
+/// implementation that waits forever stops every later request from every
+/// client, because the handler reads one at a time.
+///
+/// Worth knowing when reading a denial: this and the platform's own 60 seconds
+/// are two timers started at nearly the same moment, so an answer that arrives
+/// within a hair of the deadline can be denied here after the operator
+/// approved it. Both orderings end in a denial when nobody answers, which is
+/// the direction that matters, and the window is a few milliseconds wide.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
 const STATUS_STOPPED: u8 = 0;
 const STATUS_STARTING: u8 = 1;
@@ -167,6 +187,11 @@ pub trait BunkerCallbacks: Send + Sync {
     /// (keep-android waits 60 seconds). The NIP-46 handler reads one request at
     /// a time, so a wait that never ends stops every later request from every
     /// client, not just this one.
+    ///
+    /// That requirement is now backed rather than merely stated: an answer that
+    /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal. An
+    /// implementation that bounds its own wait, as keep-android does, decides
+    /// its own outcome; one that does not gets denied for it.
     fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
@@ -178,6 +203,10 @@ pub trait BunkerCallbacks: Send + Sync {
 struct CallbackBridge {
     callbacks: Arc<dyn BunkerCallbacks>,
     mobile: Arc<KeepMobile>,
+    /// How long to wait for the foreign prompt. A field rather than the
+    /// constant directly so a test can reach the timeout without taking a
+    /// minute to do it.
+    approval_timeout: Duration,
 }
 
 impl ServerCallbacks for CallbackBridge {
@@ -203,16 +232,31 @@ impl ServerCallbacks for CallbackBridge {
                 method: d.method,
             }),
         };
-        // The foreign implementation blocks until the operator answers or its
-        // own timeout fires, so hand this worker's core off for the wait, as
-        // the FROST approval path does in `lib.rs`. Queued tasks on the worker
-        // are stealable either way; what `block_in_place` adds is moving the
-        // one task in the LIFO slot back to the run queue and sending the core
-        // to another thread, so the worker's work keeps draining instead of
-        // waiting out the prompt. Later NIP-46 requests stall regardless, since
-        // the handler's notification loop reads one at a time.
+        // A synchronous foreign call cannot be interrupted, so the wait is
+        // bounded by making it somebody else's thread and timing out the
+        // answer. The thread outlives the timeout: it stays parked in the
+        // platform prompt until that returns, and its answer is dropped. That
+        // is the cost of bounding a call that offers no cancellation, and it is
+        // preferable to the alternative, where one unanswered prompt holds the
+        // handler forever.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let callbacks = Arc::clone(&self.callbacks);
+        std::thread::spawn(move || {
+            // Ignored deliberately: a send fails only once the timeout below
+            // has already answered for this request and dropped the receiver.
+            let _ = tx.send(callbacks.request_approval(request));
+        });
+
+        // Hand this worker's core off for the wait, as the FROST approval path
+        // does in `lib.rs`. Queued tasks on the worker are stealable either
+        // way; what `block_in_place` adds is moving the one task in the LIFO
+        // slot back to the run queue and sending the core to another thread, so
+        // the worker's work keeps draining instead of waiting out the prompt.
+        // Later NIP-46 requests stall regardless, since the handler's
+        // notification loop reads one at a time; what the timeout changes is
+        // that the stall is now bounded.
         //
-        // It also leaves the runtime for the duration of the call, so a foreign
+        // It also leaves the runtime for the duration of the wait, so a foreign
         // callback that re-enters an exported method built on
         // `runtime.block_on` stops panicking and can deadlock instead if it
         // waits on this runtime. Nothing in keep-android does that today.
@@ -226,12 +270,25 @@ impl ServerCallbacks for CallbackBridge {
             tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()),
             Ok(tokio::runtime::RuntimeFlavor::MultiThread)
         );
-        if blocking {
-            tokio::task::block_in_place(|| self.callbacks.request_approval(request))
+        let answered = if blocking {
+            tokio::task::block_in_place(|| rx.recv_timeout(self.approval_timeout))
         } else {
-            self.callbacks.request_approval(request)
+            rx.recv_timeout(self.approval_timeout)
+        };
+
+        match answered {
+            Ok(result) => result.into(),
+            // Denied, not retried. The operator did not answer, and the
+            // request's own rate limiting decides whether the client gets
+            // another prompt.
+            Err(e) => {
+                tracing::warn!("Approval prompt went unanswered ({e}), denying the request");
+                ApprovalResult {
+                    approved: false,
+                    remember: RememberDuration::JustThisTime,
+                }
+            }
         }
-        .into()
     }
 
     fn on_connect(
@@ -682,6 +739,7 @@ impl BunkerHandler {
             };
 
             let server_callbacks = Some(Arc::new(CallbackBridge {
+                approval_timeout: APPROVAL_TIMEOUT,
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
             }) as Arc<dyn ServerCallbacks>);
@@ -925,6 +983,79 @@ mod tests {
         assert_eq!(*secret, *secret2);
     }
 
+    /// A prompt that is never answered is a denial, not a wait without end.
+    ///
+    /// The implementation is required to bound its own wait and keep-android
+    /// does, so this is the backstop for one that does not. Before it, the
+    /// handler read the foreign answer straight through and a callback that
+    /// never returned stopped every later request from every client.
+    #[test]
+    fn an_unanswered_prompt_is_denied_rather_than_waited_on() {
+        struct NeverAnswers(Mutex<std::sync::mpsc::Receiver<()>>);
+        impl BunkerCallbacks for NeverAnswers {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                // Parked until the test ends, which is what an implementation
+                // with no timeout of its own does.
+                let _ = self.0.lock().unwrap().recv();
+                BunkerApprovalResult {
+                    approved: true,
+                    remember: BunkerRememberDuration::Forever,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        // Held so the sender outlives the call and the callback stays parked
+        // rather than waking on a disconnect.
+        let (_hold, rx) = std::sync::mpsc::channel();
+        // `mobile` stays owned here: it holds a runtime of its own, and
+        // letting the bridge carry the last reference into the async block
+        // below drops that runtime from inside an async context, which panics.
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(NeverAnswers(Mutex::new(rx))),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_millis(200),
+        };
+
+        let started = std::time::Instant::now();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result =
+            rt.block_on(async { ServerCallbacks::request_approval(&bridge, an_approval()) });
+
+        assert!(
+            !result.approved,
+            "an unanswered prompt must not be approved"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must be bounded by the timeout, not by the callback"
+        );
+    }
+
+    fn an_approval() -> ApprovalRequest {
+        ApprovalRequest {
+            app_pubkey: PublicKey::from_slice(
+                keep_core::keys::NostrKeypair::generate()
+                    .unwrap()
+                    .public_bytes(),
+            )
+            .unwrap(),
+            app_name: "an app".into(),
+            method: "sign_event".into(),
+            event_kind: None,
+            event_content: None,
+            requested_permissions: None,
+            http_auth: None,
+        }
+    }
+
     // Two properties of the approval bridge, in the two runtime shapes that
     // can reach it.
     //
@@ -957,6 +1088,7 @@ mod tests {
         let bridge = |rx| CallbackBridge {
             callbacks: Arc::new(Waiter(Mutex::new(Some(rx)))),
             mobile: Arc::clone(&mobile),
+            approval_timeout: APPROVAL_TIMEOUT,
         };
         let ask = |bridge: &CallbackBridge| {
             ServerCallbacks::request_approval(
