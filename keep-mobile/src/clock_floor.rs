@@ -120,11 +120,32 @@ impl ClockFloor {
         }
 
         let ceiling = self.floor_secs.saturating_add(proven_secs);
-        let advanced = Self {
-            floor_secs: self.floor_secs.max(now_secs.min(ceiling)),
-            anchor_elapsed_ms: Some(now_elapsed_ms),
-        };
-        (advanced, true)
+        let floor_secs = self.floor_secs.max(now_secs.min(ceiling));
+        // The anchor moves by the whole seconds that were credited, not to the
+        // reading itself, so the remainder below a second is carried instead of
+        // discarded. Moving it to the reading would throw away up to 999 ms on
+        // every advance, and a caller asking just under every two seconds would
+        // then credit one second per two and hold the floor at half of real
+        // time.
+        let anchor_elapsed_ms = anchor.saturating_add(proven_secs.saturating_mul(1_000));
+        // Stored only when the floor itself moved. When it did not, which is
+        // every call while the clock reads behind the floor, keeping the old
+        // anchor is what lets the proven time accrue rather than being consumed
+        // by a call that could not use it. It also keeps a decision from
+        // writing to storage every time one is more than a second after the
+        // last.
+        let changed = floor_secs != self.floor_secs;
+        (
+            Self {
+                floor_secs,
+                anchor_elapsed_ms: if changed {
+                    Some(anchor_elapsed_ms)
+                } else {
+                    self.anchor_elapsed_ms
+                },
+            },
+            changed,
+        )
     }
 
     /// The readings to judge validity with: the clock as given, and an expiry
@@ -227,6 +248,51 @@ mod tests {
         assert!(changed);
         assert_eq!(floor.floor_secs, 1_000_000 + 30 * MIN);
         assert_eq!(floor.anchor_elapsed_ms, Some(5_000 + 30 * MIN * 1_000));
+        // Exactly the credited seconds, so nothing is carried here.
+    }
+
+    /// Time below a whole second is carried, not discarded. Moving the anchor
+    /// to the reading would throw away the remainder on every advance, so a
+    /// caller asking just under every two seconds would credit one second per
+    /// two and hold the floor at half of real time.
+    #[test]
+    fn accrual_below_a_second_is_carried_rather_than_discarded() {
+        let mut floor = ClockFloor::new(1_000_000, Some(0));
+
+        // Ten asks at 1,900 ms apart: 19 s of real time, and each ask on its
+        // own proves only one whole second.
+        for i in 1..=10u64 {
+            let reading = i * 1_900;
+            let (next, _) = floor.observe(1_000_000 + 19, Some(reading));
+            floor = next;
+        }
+
+        assert_eq!(
+            floor.floor_secs, 1_000_019,
+            "the carried remainders have to add up to the real elapsed time"
+        );
+    }
+
+    /// A floor that did not move is not written, which keeps a decision off
+    /// storage and keeps the unused proven time accruing.
+    #[test]
+    fn an_advance_that_cannot_happen_is_not_stored() {
+        let floor = ClockFloor::new(1_000_000, Some(0));
+
+        // The clock reads behind the floor, so there is nothing to advance to.
+        let (same, changed) = floor.observe(999_000, Some(60_000));
+        assert!(!changed, "nothing moved, so nothing to store");
+        assert_eq!(same.floor_secs, 1_000_000);
+        assert_eq!(
+            same.anchor_elapsed_ms,
+            Some(0),
+            "the anchor stays so the minute still counts once the clock is back"
+        );
+
+        // Once the clock is restored the whole minute is still available.
+        let (advanced, changed) = same.observe(1_000_060, Some(60_000));
+        assert!(changed);
+        assert_eq!(advanced.floor_secs, 1_000_060);
     }
 
     #[test]

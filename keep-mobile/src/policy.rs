@@ -638,14 +638,31 @@ impl PolicyEvaluator {
         }
     }
 
-    pub fn status(&self) -> PolicyStatus {
+    /// Takes the clock for the same reason [`Self::evaluate`] does, so the two
+    /// cannot disagree. Reporting the stored state alone would say `Active`,
+    /// with the retired limits, about a bundle `evaluate` has started refusing
+    /// because its window closed while this process stayed up. A caller shown
+    /// an active policy while every spend is denied is left unable to explain
+    /// the refusals, which is the failure the `Faulted` state exists to
+    /// prevent.
+    pub fn status(&self, clock: PolicyClock) -> PolicyStatus {
         match &self.policy {
             PolicyState::NotConfigured => PolicyStatus::NotConfigured,
-            PolicyState::Active(bundle) => PolicyStatus::Active {
-                info: bundle.to_policy_info(),
+            PolicyState::Active(bundle) => match bundle.timestamp_fault_at(clock) {
+                Some(fault) => PolicyStatus::Faulted { fault },
+                None => PolicyStatus::Active {
+                    info: bundle.to_policy_info(),
+                },
             },
             PolicyState::Faulted { fault, .. } => PolicyStatus::Faulted { fault: *fault },
         }
+    }
+
+    /// The bundle in force at `clock`, which is `None` once its window closes
+    /// even while this evaluator still holds it.
+    pub(crate) fn policy_at(&self, clock: PolicyClock) -> Option<&PolicyBundle> {
+        self.policy()
+            .filter(|bundle| bundle.timestamp_fault_at(clock).is_none())
     }
 
     /// Decide on a transaction against the policy in force.
@@ -1523,7 +1540,10 @@ mod tests {
             "an unverified bundle must not be readable as the policy in force"
         );
         assert_eq!(evaluator.fault(), Some(PolicyFault::Unreadable));
-        assert!(matches!(evaluator.status(), PolicyStatus::Faulted { .. }));
+        assert!(matches!(
+            evaluator.status(at(Utc::now().timestamp())),
+            PolicyStatus::Faulted { .. }
+        ));
     }
 
     /// The two faults are reported apart because only one of them is worth
@@ -1533,16 +1553,19 @@ mod tests {
     fn the_two_faults_are_reported_apart() {
         let mut evaluator =
             PolicyEvaluator::new(Arc::new(Mutex::new(Some(VelocityTracker::new()))));
-        assert!(matches!(evaluator.status(), PolicyStatus::NotConfigured));
+        assert!(matches!(
+            evaluator.status(at(Utc::now().timestamp())),
+            PolicyStatus::NotConfigured
+        ));
 
         evaluator.set_policy_faulted(PolicyFault::Unreadable, None);
-        let PolicyStatus::Faulted { fault } = evaluator.status() else {
+        let PolicyStatus::Faulted { fault } = evaluator.status(at(Utc::now().timestamp())) else {
             panic!("expected a fault");
         };
         assert_eq!(fault, PolicyFault::Unreadable);
 
         evaluator.set_policy_faulted(PolicyFault::Unverified, None);
-        let PolicyStatus::Faulted { fault } = evaluator.status() else {
+        let PolicyStatus::Faulted { fault } = evaluator.status(at(Utc::now().timestamp())) else {
             panic!("expected a fault");
         };
         assert_eq!(fault, PolicyFault::Unverified);
