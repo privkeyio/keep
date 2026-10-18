@@ -230,6 +230,13 @@ pub enum PolicyFault {
     /// `created_at` is still a sound baseline to measure a downgrade against,
     /// and it is the only fault that supplies one.
     Expired,
+    /// The policy itself is fine, but the stored time floor it is judged
+    /// against is corrupt, so nothing says the clock was not wound back. Not
+    /// retried, because a record that will not parse will not parse next time
+    /// either, and reporting it as [`Self::Unreadable`] would tell a caller to
+    /// wait for a fault that never clears. Deleting the policy is the way out:
+    /// with no policy the floor guards nothing and is replaced.
+    ClockUntrusted,
 }
 
 impl PolicyFault {
@@ -248,6 +255,10 @@ impl std::fmt::Display for PolicyFault {
                 write!(f, "the stored policy is dated ahead of this device's clock")
             }
             Self::Expired => write!(f, "the stored policy has expired"),
+            Self::ClockUntrusted => write!(
+                f,
+                "this device's record of the current time is corrupt; delete the policy to reset it"
+            ),
         }
     }
 }
