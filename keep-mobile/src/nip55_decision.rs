@@ -350,8 +350,15 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         )
     };
 
-    // An ASK row is only ever set by the user, to be asked; neither the sign
-    // policy nor a whitelisted relay (gate 8) overrides that choice.
+    // An ASK row is only ever set by the user, to be asked, and the sign policy
+    // does not override that choice.
+    //
+    // `None` passes here, unlike at gate 8, and deliberately: a sign-policy
+    // auto-approval is the user opting a tier into signing low-risk requests
+    // without a prompt, which is not a per-app grant. It is bounded instead by
+    // the tier, the risk score and `is_sensitive_kind`, which sends every
+    // sensitive kind to the UI, relay auth among them, so this cannot approve
+    // what gate 8 now refuses.
     if policy_result == SignPolicyEvaluation::AutoApprove
         && decision != Some(Nip55PermissionDecision::Ask)
     {
@@ -715,7 +722,7 @@ mod tests {
 
     #[test]
     fn opted_in_limiter_unavailable_still_honors_stored_allow() {
-        // Limiter unavailable falls to gate 8, which can still auto-approve on a
+        // Limiter unavailable falls to gate 8, which auto-approves only on a
         // standing ALLOW grant.
         let mut i = base();
         i.is_opted_in = true;
