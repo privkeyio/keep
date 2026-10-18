@@ -53,7 +53,7 @@ tokio-socks = "0.5"
 # pin is enforced on the handshake that carries data. Version and TLS backend
 # must match what the relay stack uses (rustls 0.23) so the message type and
 # connector unify.
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 # The relay stack's own socket type, so the pinned stream is handed back in the
 # exact shape nostr-sdk expects and its message conversion is reused rather
 # than re-implemented. Must stay the version nostr-sdk resolves, or the two
