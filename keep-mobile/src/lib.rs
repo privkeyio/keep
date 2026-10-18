@@ -7760,4 +7760,45 @@ mod velocity_fault_tests {
             }
         ));
     }
+
+    /// A counters record holding more than the cap is refused, not trimmed.
+    /// Trimming on load is the shape that let a moved clock erase the history,
+    /// and the counters already deny every rule that depends on them while they
+    /// are unknown.
+    #[test]
+    fn an_over_capacity_velocity_record_refuses_rather_than_being_trimmed() {
+        use crate::velocity::MAX_TRACKED_TRANSACTIONS;
+
+        let storage = Arc::new(FaultingStorage::default());
+        let mut tracker = VelocityTracker::new();
+        for _ in 0..MAX_TRACKED_TRANSACTIONS + 1 {
+            tracker.record(1);
+        }
+        // `record` enforces the cap, so the over-capacity record has to be
+        // built by hand: this is a record that arrived from somewhere the cap
+        // was not applied.
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&tracker.to_bytes().expect("serialize")).unwrap();
+        let entries = raw
+            .get_mut("transactions")
+            .and_then(|t| t.as_array_mut())
+            .expect("transactions array");
+        let one = entries[0].clone();
+        while entries.len() <= MAX_TRACKED_TRANSACTIONS {
+            entries.push(one.clone());
+        }
+        storage.plant(VELOCITY_STORAGE_KEY, serde_json::to_vec(&raw).unwrap());
+
+        let rules = PolicyRules {
+            daily_limit: Some(100_000),
+            ..Default::default()
+        };
+        plant_policy(&storage, &rules, true);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.evaluate_policy(a_spend()).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+    }
 }

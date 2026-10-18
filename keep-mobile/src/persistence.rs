@@ -11,7 +11,7 @@ use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN, POLICY_VERSION};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
-use crate::velocity::VelocityTracker;
+use crate::velocity::{VelocityTracker, MAX_TRACKED_TRANSACTIONS};
 use crate::{
     CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, HEALTH_STATUS_INDEX_KEY,
     HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
@@ -106,17 +106,43 @@ pub(crate) fn persist_policy(
     storage.store_share_by_key(POLICY_STORAGE_KEY.into(), data, storage_metadata("policy"))
 }
 
+/// Loose ceiling on the stored counters, applied before they are parsed.
+///
+/// `record` is the only place the entry cap is enforced, and it evicts one
+/// entry per call, so a record that arrives over the cap would be loaded whole
+/// and would not come back under it for thousands of spends. The count is
+/// checked after the parse; this bounds what serde is asked to allocate first,
+/// at a generous 128 bytes per entry against a worst case nearer 75.
+const VELOCITY_RECORD_MAX_LEN: usize = 128 * MAX_TRACKED_TRANSACTIONS + 1024;
+
 pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<VelocityTracker, KeepMobileError> {
     match storage.load_share_by_key(VELOCITY_STORAGE_KEY.into()) {
+        Ok(data) if data.len() > VELOCITY_RECORD_MAX_LEN => Err(KeepMobileError::StorageError {
+            msg: "Velocity record exceeds the maximum length".into(),
+        }),
         // Deliberately without serde's message. It quotes the value it tripped
         // on, which here is an amount or a timestamp out of the record, and this
         // error reaches a log. What a caller can act on is that the record did
         // not parse, which is the same either way.
-        Ok(data) => VelocityTracker::from_bytes(&data).map_err(|_| KeepMobileError::StorageError {
-            msg: "Failed to deserialize velocity".into(),
-        }),
+        Ok(data) => {
+            let tracker =
+                VelocityTracker::from_bytes(&data).map_err(|_| KeepMobileError::StorageError {
+                    msg: "Failed to deserialize velocity".into(),
+                })?;
+            // Refused, not trimmed. Trimming here would put a destructive write
+            // back on the read path, which is the shape that made a moved clock
+            // erase the history in the first place; see the note on
+            // `load_descriptors`. Refusing leaves the counters unknown, and
+            // unknown already denies every rule that depends on them.
+            if tracker.over_capacity() {
+                return Err(KeepMobileError::StorageError {
+                    msg: "Velocity record holds more entries than the cap allows".into(),
+                });
+            }
+            Ok(tracker)
+        }
         Err(KeepMobileError::StorageNotFound) => Ok(VelocityTracker::new()),
         Err(e) => Err(KeepMobileError::StorageError {
             msg: format!("Failed to load velocity tracker: {e}"),

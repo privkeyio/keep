@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 /// window when they are asked, so nothing needed the stored history to be
 /// pruned by time for the limits to be right; the prune only bounded the size,
 /// which this does without trusting anything.
-const MAX_TRACKED_TRANSACTIONS: usize = 10_000;
+pub(crate) const MAX_TRACKED_TRANSACTIONS: usize = 10_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct TrackedTransaction {
@@ -79,6 +79,10 @@ impl VelocityTracker {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(data)
+    }
+
+    pub(crate) fn over_capacity(&self) -> bool {
+        self.transactions.len() > MAX_TRACKED_TRANSACTIONS
     }
 }
 
