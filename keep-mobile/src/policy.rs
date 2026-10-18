@@ -236,8 +236,8 @@ pub enum PolicyFault {
     /// floor. Not
     /// retried, because a record that will not parse will not parse next time
     /// either, and reporting it as [`Self::Unreadable`] would tell a caller to
-    /// wait for a fault that never clears. Deleting the policy is the way out:
-    /// with no policy the floor guards nothing and is replaced.
+    /// wait for a fault that never clears. A trusted warden revoking the policy
+    /// is the way out: with no policy the floor guards nothing and is replaced.
     ClockUntrusted,
 }
 
@@ -259,7 +259,8 @@ impl std::fmt::Display for PolicyFault {
             Self::Expired => write!(f, "the stored policy has expired"),
             Self::ClockUntrusted => write!(
                 f,
-                "this device's record of the current time is corrupt; delete the policy to reset it"
+                "this device's record of the current time is corrupt; a trusted warden has to \
+                 revoke the policy to reset it"
             ),
         }
     }
@@ -417,6 +418,14 @@ impl PolicyBundle {
         data.extend_from_slice(&self.created_at.to_le_bytes());
 
         data
+    }
+
+    /// The digest of everything the warden signed, which is what a revocation
+    /// names to say which policy it removes. It covers the version, signer,
+    /// rules and timestamp, so it identifies one issued bundle and not just a
+    /// rule set that two bundles could share.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        Sha256::digest(self.signed_data()).into()
     }
 
     pub fn verify_signature(&self) -> Result<(), KeepMobileError> {
