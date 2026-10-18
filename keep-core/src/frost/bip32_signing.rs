@@ -476,7 +476,7 @@ mod tests {
             let mut commitments_map = BTreeMap::new();
             for kp in &tweaked_kps {
                 let (nonces, commitments) =
-                    crate::frost::nonce::commit_checked(kp.signing_share()).unwrap();
+                    crate::frost::checked_rng::commit_checked(kp.signing_share()).unwrap();
                 nonces_map.insert(*kp.identifier(), nonces);
                 commitments_map.insert(*kp.identifier(), commitments);
             }

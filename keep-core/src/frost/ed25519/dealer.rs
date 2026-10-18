@@ -3,7 +3,6 @@
 
 //! Trusted dealer key generation for FROST over Ed25519.
 use frost::keys::{IdentifierList, KeyPackage, PublicKeyPackage};
-use frost::rand_core::OsRng;
 use frost_ed25519 as frost;
 
 use crate::error::{KeepError, Result};
@@ -29,12 +28,16 @@ impl TrustedDealer {
 
     /// Generate a new threshold key and split into shares.
     pub fn generate(&self, name: &str) -> Result<(Vec<SharePackage>, PublicKeyPackage)> {
-        let (shares, pubkey_pkg) = frost::keys::generate_with_dealer(
-            self.config.total_shares,
-            self.config.threshold,
-            IdentifierList::Default,
-            OsRng,
-        )
+        // This draw is the group key; see `crate::frost::checked_rng`.
+        let (shares, pubkey_pkg) = crate::frost::checked_draw(|rng| {
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
+            frost::keys::generate_with_dealer(
+                self.config.total_shares,
+                self.config.threshold,
+                IdentifierList::Default,
+                rng,
+            )
+        })?
         .map_err(|e| KeepError::Frost(format!("Key generation failed: {e}")))?;
 
         let group_pubkey = extract_group_pubkey(&pubkey_pkg)?;

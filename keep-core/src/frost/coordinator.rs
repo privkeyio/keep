@@ -63,7 +63,7 @@ impl Coordinator {
         let kp = share.key_package()?;
         let id = *kp.identifier();
 
-        let (nonces, commitment) = super::nonce::commit_checked(kp.signing_share())?;
+        let (nonces, commitment) = super::checked_rng::commit_checked(kp.signing_share())?;
 
         self.our_identifier = Some(id);
         self.our_nonces = Some(nonces);
@@ -220,7 +220,8 @@ mod tests {
         let _msg1 = coord.add_local_share(&shares[0]).unwrap();
 
         let kp1 = shares[1].key_package().unwrap();
-        let (nonces1, commit1) = crate::frost::nonce::commit_checked(kp1.signing_share()).unwrap();
+        let (nonces1, commit1) =
+            crate::frost::checked_rng::commit_checked(kp1.signing_share()).unwrap();
         let commit1_bytes = commit1.serialize().unwrap();
         let msg1 = FrostMessage::commitment(coord.session_id(), 2, &commit1_bytes);
         coord.add_remote_commitment(&msg1).unwrap();

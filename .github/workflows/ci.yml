@@ -42,7 +42,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt -- --check
-      - run: cargo clippy -- -D warnings
+      # --all-targets so test code is linted too, and the features named
+      # explicitly rather than arriving through workspace feature unification,
+      # which silently decided whether the ed25519 module was linted at all.
+      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519 -- -D warnings
       # The reproducible and Debian builds run only on pushes and tags, so a
       # workspace member missing from their Dockerfiles is caught here instead.
       - run: scripts/check-dockerfile-members.sh
@@ -92,6 +95,10 @@ jobs:
           key: ${{ matrix.os }}
       - run: cargo build --release
       - run: cargo test --workspace --lib --bins
+      # The ed25519 module is behind a feature nothing else here enables, so its
+      # tests were type-checked by clippy and never run. That is the ciphersuite
+      # whose 64-byte scalar fill the draw criteria are written around.
+      - run: cargo test -p keep-core --features ed25519 --lib
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
       - run: cargo test -p keep-frost-net --features testing --test taproot_key_spend_memory_test

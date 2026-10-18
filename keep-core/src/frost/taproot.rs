@@ -395,7 +395,7 @@ mod tests {
             let mut nonces = BTreeMap::new();
             let mut commitments = BTreeMap::new();
             for kp in &kps {
-                let (n, c) = crate::frost::nonce::commit_checked(kp.signing_share()).unwrap();
+                let (n, c) = crate::frost::checked_rng::commit_checked(kp.signing_share()).unwrap();
                 nonces.insert(*kp.identifier(), n);
                 commitments.insert(*kp.identifier(), c);
             }

@@ -296,11 +296,14 @@ impl Default for NoncePool {
 mod tests {
     use super::*;
     use frost_secp256k1_tr::keys::{generate_with_dealer, IdentifierList, KeyPackage};
-    use frost_secp256k1_tr::rand_core::OsRng;
 
     fn make_pair() -> (SigningNonces, SigningCommitments) {
-        let (shares, _pubkeys) =
-            generate_with_dealer(2, 2, IdentifierList::Default, OsRng).unwrap();
+        let (shares, _pubkeys) = keep_core::frost::checked_draw(|rng| {
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
+            generate_with_dealer(2, 2, IdentifierList::Default, rng)
+        })
+        .unwrap()
+        .unwrap();
         let secret = shares.into_values().next().unwrap();
         let kp = KeyPackage::try_from(secret).unwrap();
         keep_core::frost::commit_checked(kp.signing_share()).unwrap()

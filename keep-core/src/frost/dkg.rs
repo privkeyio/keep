@@ -41,7 +41,6 @@ use std::collections::BTreeMap;
 use frost_secp256k1_tr::{
     keys::dkg::{part1, part2, part3, round1, round2},
     keys::{KeyPackage, PublicKeyPackage},
-    rand_core::OsRng,
     Identifier,
 };
 use zeroize::Zeroizing;
@@ -188,8 +187,15 @@ impl SoftwareDkgSession {
                 "SoftwareDkgSession::round1 called out of order (already past round 1)".into(),
             ));
         }
-        let (secret, package) = part1(self.identifier, self.max_signers, self.min_signers, OsRng)
-            .map_err(|e| KeepError::Frost(format!("DKG part1 failed: {e}")))?;
+        // The secret polynomial and the proof-of-knowledge nonce both come out
+        // of this draw, and the polynomial's constant term is this
+        // participant's contribution to the group key, so a degraded draw here
+        // outlives every session rather than one of them.
+        let (secret, package) = crate::frost::checked_draw(|rng| {
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
+            part1(self.identifier, self.max_signers, self.min_signers, rng)
+        })?
+        .map_err(|e| KeepError::Frost(format!("DKG part1 failed: {e}")))?;
         let package_bytes = package
             .serialize()
             .map_err(|e| KeepError::Frost(format!("serialize round1 package: {e}")))?;
