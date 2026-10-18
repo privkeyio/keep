@@ -27,8 +27,7 @@
 //! all-zero fill of any width; two blocks closer than the Hamming floor, which
 //! is a source that moves but barely; a source cycling through a handful of
 //! values, because every block is compared against all the blocks before it
-//! and not just the one immediately before; and a source that is random except
-//! for a byte position it never moves. A call that draws fewer blocks than the
+//! and not just the one immediately before. A call that draws fewer blocks than the
 //! criteria need draws more from the same source until it has them, so a call
 //! that makes a single draw is judged rather than waved through. Bytes drawn
 //! that no whole block could be formed from are refused outright instead of
@@ -51,7 +50,9 @@
 use frost_secp256k1_tr::rand_core::{impls, CryptoRng, Error as RngError, OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::entropy::{check_bit_distribution, pair_looks_random, EntropyHealthError};
+use crate::entropy::{
+    frozen_positions, pair_looks_random, EntropyHealthError, MAX_FROZEN_POSITIONS,
+};
 
 /// An RNG that holds every fill it hands out to the health criteria.
 ///
@@ -96,10 +97,7 @@ const MAX_RETAINED: usize = 8;
 /// Two allow exactly one comparison, which a source alternating two values
 /// passes: draw A, probe B, A against B looks healthy while the source holds
 /// one bit of entropy. Three is the smallest number that catches it, because
-/// the third block is A again and A against A fails. It also matches what
-/// [`check_entropy_health`] applies to its own samples.
-///
-/// [`check_entropy_health`]: crate::entropy::check_entropy_health
+/// the third block is A again and A against A fails.
 const MIN_JUDGED: usize = 3;
 
 impl<R: RngCore> CheckedRng<R> {
@@ -159,7 +157,8 @@ impl<R: RngCore> CheckedRng<R> {
         }
     }
 
-    /// Draw extra blocks from the same source until two have been judged.
+    /// Draw extra blocks from the same source until [`MIN_JUDGED`] have been
+    /// judged.
     ///
     /// One draw can be checked for nothing beyond being all zero, because the
     /// criteria compare one draw against another. Some calls make exactly one:
@@ -206,14 +205,15 @@ impl<R: RngCore> CheckedRng<R> {
             let mut probe = Zeroizing::new([0u8; 32]);
             self.fill_bytes(probe.as_mut());
         }
-        // The one criterion a pair cannot carry. `pair_looks_random` drops it
-        // because across two draws a byte position holds the same extreme value
-        // about once in a thousand tries, which would refuse healthy draws at
-        // that rate; across three or more it is the test that catches a source
-        // whose output is random except for a position it never moves.
+        // A source that fills only part of what it is asked for leaves the rest
+        // as it was, so the same byte positions hold the same value in every
+        // block. The pairwise checks miss that until about half the bytes are
+        // frozen, and several draws here take bytes straight into a scalar,
+        // so it is counted across every block judged. The threshold and why it
+        // does not latch a healthy node are on `frozen_positions`.
         if self.fault.is_none() && self.judged.len() >= MIN_JUDGED {
             let blocks = Zeroizing::new(self.judged.iter().map(|b| **b).collect::<Vec<_>>());
-            if !check_bit_distribution(&blocks) {
+            if frozen_positions(&blocks) > MAX_FROZEN_POSITIONS {
                 self.fault = Some(EntropyHealthError::Degraded);
             }
         }
@@ -403,11 +403,43 @@ mod tests {
         s.0 = !s.0;
     });
 
-    /// Healthy everywhere except one byte position it never moves, which is
-    /// the one failure a pair of draws cannot carry: the two are distinct, both
-    /// nonzero and far apart, so only a test across three or more blocks sees
-    /// the position that never changes.
+    /// Random except for one byte position that holds the same value in every
+    /// block. A position matching across three blocks happens to healthy
+    /// randomness once in 65,536 per position, so one or a few must not be
+    /// refused; see `frozen_positions` for where the line is.
     struct ConstantPositionRng;
+
+    /// Fills only the first `.0` bytes of every 32-byte block and leaves the
+    /// rest at `.1`, which is a source that does part of what it is asked and
+    /// is the case the frozen-position count exists for.
+    struct PartialFillRng(usize, u8);
+
+    /// Three blocks with exactly `.0` positions frozen and no others, built
+    /// rather than drawn. The unfrozen bytes take a different value in each
+    /// block, so none of them can match by chance and push the count past
+    /// `.0`, which is what made a random head flaky at the boundary. Every pair
+    /// is still nonzero, distinct and at least 112 bits apart, so the count is
+    /// the only criterion in play.
+    struct ExactlyFrozenRng(usize, usize);
+
+    impl_rng!(ExactlyFrozenRng, |s, dest| {
+        const UNFROZEN: [u8; 3] = [0x0f, 0xf0, 0x33];
+        for block in dest.chunks_mut(32) {
+            let value = UNFROZEN[s.1 % UNFROZEN.len()];
+            for (pos, byte) in block.iter_mut().enumerate() {
+                *byte = if pos < s.0 { 0x00 } else { value };
+            }
+            s.1 += 1;
+        }
+    });
+
+    impl_rng!(PartialFillRng, |s, dest| {
+        for block in dest.chunks_mut(32) {
+            let (head, tail) = block.split_at_mut(s.0.min(block.len()));
+            OsRng.fill_bytes(head);
+            tail.fill(s.1);
+        }
+    });
 
     impl_rng!(ConstantPositionRng, |_s, dest| {
         OsRng.fill_bytes(dest);
@@ -740,17 +772,69 @@ mod tests {
         );
     }
 
-    /// A source random except for a byte position it never moves is refused.
-    /// That position is the one criterion a pair cannot carry, so this is what
-    /// the third block buys beyond catching a repeat.
+    /// A byte position that repeats across the blocks of one call is not a
+    /// fault on its own. The test this replaces refused a single position held
+    /// at `0x00` or `0xff`, which healthy randomness does about once in 260,000
+    /// three-block calls, and since a refusal latches a co-signer, a node making
+    /// nonce commitments took itself out of service at that rate.
     #[test]
-    fn a_source_with_a_frozen_byte_position_is_refused() {
+    fn a_byte_position_repeating_across_blocks_is_not_a_fault() {
         let mut rng = CheckedRng::new(ConstantPositionRng);
         let mut block = [0u8; 32];
         for _ in 0..3 {
             rng.fill_bytes(&mut block);
         }
         rng.finish();
-        assert_eq!(rng.fault, Some(EntropyHealthError::Degraded));
+        assert_eq!(rng.fault, None);
+    }
+
+    fn verdict_of(source: impl RngCore + CryptoRng) -> Option<EntropyHealthError> {
+        let mut rng = CheckedRng::new(source);
+        let mut block = [0u8; 32];
+        for _ in 0..3 {
+            rng.fill_bytes(&mut block);
+        }
+        rng.finish();
+        rng.fault
+    }
+
+    /// A source that fills twenty bytes of each block and leaves twelve zero is
+    /// refused. Every pair is still distinct, nonzero and well past the
+    /// Hamming floor, so nothing but the frozen-position count sees it, and
+    /// before that count existed it passed. A draw that turns bytes straight
+    /// into a scalar would then hold 96 known bits.
+    #[test]
+    fn a_source_filling_only_part_of_each_block_is_refused() {
+        assert_eq!(
+            verdict_of(PartialFillRng(20, 0x00)),
+            Some(EntropyHealthError::Degraded)
+        );
+    }
+
+    /// The count is of positions frozen at any value. The test it replaces
+    /// only ever looked for `0x00` and `0xff`, so a source leaving its unfilled
+    /// bytes at anything else passed it.
+    #[test]
+    fn a_frozen_region_of_any_value_is_refused() {
+        assert_eq!(
+            verdict_of(PartialFillRng(20, 0x5a)),
+            Some(EntropyHealthError::Degraded)
+        );
+    }
+
+    /// The line is four frozen positions: three pass and four do not. Three
+    /// leaves at least 232 bits per block, and refusing at fewer would bring
+    /// back the rate the old test latched healthy nodes at.
+    ///
+    /// Built rather than drawn: with random unfrozen bytes, any one of them
+    /// matching across the three blocks by chance tips three into four, which
+    /// made this fail on a healthy source about once in 2,260 runs.
+    #[test]
+    fn three_frozen_positions_pass_and_four_are_refused() {
+        assert_eq!(verdict_of(ExactlyFrozenRng(3, 0)), None);
+        assert_eq!(
+            verdict_of(ExactlyFrozenRng(4, 0)),
+            Some(EntropyHealthError::Degraded)
+        );
     }
 }

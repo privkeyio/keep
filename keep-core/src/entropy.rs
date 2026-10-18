@@ -308,25 +308,65 @@ fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
     a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
-pub(crate) fn check_bit_distribution(samples: &[[u8; 32]]) -> bool {
-    (0..32).all(|pos| {
-        let all_zeros = samples.iter().all(|s| s[pos] == 0x00);
-        let all_ones = samples.iter().all(|s| s[pos] == 0xff);
-        !all_zeros && !all_ones
-    })
-}
-
 const MIN_HAMMING: u32 = 64;
 
+/// The most byte positions that may hold the same value in every sample before
+/// the samples are refused. Only meaningful across three or more samples.
+pub(crate) const MAX_FROZEN_POSITIONS: usize = 3;
+
+/// How many of the 32 byte positions hold the same value, whatever it is, in
+/// every one of `samples`.
+///
+/// This replaces a test that refused any position holding `0x00` or `0xff` in
+/// every sample, which got both its rate and its coverage wrong.
+///
+/// Its rate: that happens to healthy randomness about once in 260,000
+/// three-sample calls, measured at 12 in 3,000,000 checked draws against the
+/// analytic 11.4. Every failure latches a co-signing node, and the periodic
+/// check runs every 30 seconds, so a healthy always-on node took itself out of
+/// service about once a month.
+///
+/// Its coverage: it caught a frozen extreme byte, and any number of them, but
+/// never a frozen byte of any other value. A source that fills part of a buffer
+/// and leaves the rest as it was is the case that matters, because several
+/// draws turn bytes straight into a scalar with no hash between: the dealer's
+/// key, every polynomial coefficient, refresh and repair deltas, and the DKG
+/// proof-of-knowledge nonce. Twelve frozen bytes there leave 160 bits in known
+/// positions, about 2^80 work to recover, and the Hamming floor does not catch
+/// it until roughly half the bytes are frozen.
+///
+/// Counting positions frozen at any value, and refusing above
+/// [`MAX_FROZEN_POSITIONS`], fixes both. A position matches across three
+/// independent samples with probability 1 in 65,536, so four or more of 32
+/// doing so is a binomial tail of about 2e-15, the same order as the Hamming
+/// floor, and no healthy node latches on it. What it still lets through, one to
+/// three frozen positions, leaves at least 232 bits.
+///
+/// Three samples is the floor. Across two, a position matches with probability
+/// 1 in 256, and four of 32 matching becomes about 8e-6 per call, which is the
+/// rate this exists to get away from.
+pub(crate) fn frozen_positions(samples: &[[u8; 32]]) -> usize {
+    debug_assert!(
+        samples.len() >= 3,
+        "frozen_positions needs three samples; below that healthy input trips it"
+    );
+    let Some((first, rest)) = samples.split_first() else {
+        return 0;
+    };
+    (0..32)
+        .filter(|&pos| rest.iter().all(|s| s[pos] == first[pos]))
+        .count()
+}
+
 /// Applies the health criteria to three samples: none all-zero, all distinct,
-/// no byte position constant across all three, and every pair at least
-/// [`MIN_HAMMING`] bits apart.
+/// no more than [`MAX_FROZEN_POSITIONS`] byte positions holding the same value
+/// across all three, and every pair at least [`MIN_HAMMING`] bits apart.
 fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
     let all_nonzero = samples.iter().all(|s| s.iter().any(|&b| b != 0));
     let all_unique =
         samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
 
-    if !all_nonzero || !all_unique || !check_bit_distribution(samples) {
+    if !all_nonzero || !all_unique || frozen_positions(samples) > MAX_FROZEN_POSITIONS {
         return false;
     }
 
@@ -335,18 +375,15 @@ fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
         .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING)
 }
 
-/// The health criteria that two draws can carry, for a caller judging the bytes
-/// it was handed rather than a sample drawn beside them.
-///
-/// [`check_entropy_health`] takes three samples, which is what lets it also
-/// reject a byte position that is `0x00` or `0xff` across all of them. Two
-/// samples cannot carry that test: a position fails it when both draws happen
-/// to hold the same extreme byte, which for two healthy draws is about one pair
-/// in a thousand across the 32 positions, and a caller that latches on the
-/// verdict would take itself out of service about that often. What is left is
-/// what a stuck or barely-moving source fails anyway: neither draw all-zero,
+/// The health criteria for a pair of draws, for a caller judging the bytes it
+/// was handed rather than a sample drawn beside them: neither draw all-zero,
 /// the two distinct, and at least [`MIN_HAMMING`] bits apart, which a source
 /// repeating itself with a handful of bits flipped still fails.
+///
+/// These are the same criteria [`check_entropy_health`] applies to each of its
+/// pairs. The frozen-position count is not among them, because across two
+/// samples healthy randomness trips it often enough to latch a node; it needs
+/// three, see [`frozen_positions`].
 pub(crate) fn pair_looks_random(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let nonzero = |s: &[u8; 32]| s.iter().any(|&b| b != 0);
     nonzero(a) && nonzero(b) && a != b && hamming_distance(a, b) >= MIN_HAMMING
@@ -391,7 +428,7 @@ fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
 /// Generates multiple samples and checks:
 /// - Output is not all zeros
 /// - Different calls produce different output
-/// - Byte positions are not all 0x00 or 0xff across samples
+/// - At most three byte positions hold the same value across every sample
 /// - Hamming distance between samples is at least 64 bits
 pub fn check_entropy_health() -> Result<(), EntropyHealthError> {
     check_entropy_health_internal()
@@ -546,6 +583,33 @@ mod tests {
             samples_look_random(&masked),
             "if this ever fails the masking is gone and the pre-mix check may be redundant"
         );
+    }
+
+    /// The periodic check refuses a source that fills only part of each
+    /// sample, which the pairwise criteria pass: these are distinct, nonzero
+    /// and far apart, with twelve positions frozen at the same value.
+    #[test]
+    fn health_criteria_reject_a_source_filling_only_part_of_each_sample() {
+        let samples: [[u8; 32]; 3] = std::array::from_fn(|_| {
+            let mut s = [0x5au8; 32];
+            gather_os_entropy(&mut s[..20]).expect("the OS RNG is available");
+            s
+        });
+        assert!(!samples_look_random(&samples));
+
+        // The line itself, on built samples: unfrozen bytes take a different
+        // value in each sample so none can match by chance, which is what made
+        // a random version of this fail on healthy input about once in 2,260.
+        let exactly_frozen = |frozen: usize| -> [[u8; 32]; 3] {
+            std::array::from_fn(|k| {
+                let value = [0x0fu8, 0xf0, 0x33][k];
+                std::array::from_fn(|pos| if pos < frozen { 0x00 } else { value })
+            })
+        };
+        assert_eq!(frozen_positions(&exactly_frozen(3)), 3);
+        assert!(samples_look_random(&exactly_frozen(3)));
+        assert_eq!(frozen_positions(&exactly_frozen(4)), 4);
+        assert!(!samples_look_random(&exactly_frozen(4)));
     }
 
     #[test]
