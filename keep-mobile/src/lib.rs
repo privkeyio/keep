@@ -356,10 +356,28 @@ const CLOCK_FLOOR_STORAGE_KEY: &str = "__keep_clock_floor_v1";
 /// it is the fault that is not retried and that says deleting the policy is the
 /// way out; reporting it as unreadable would tell the caller to wait. A failed
 /// read may clear, so it stays the retried one.
+///
+/// Sound only because `floor_now` produces `InvalidPolicy` for a corrupt record
+/// and nothing else: storage errors are passed through `floor_storage_error`
+/// on the way out, so a storage implementation returning that variant cannot be
+/// read as corruption and turn a transient fault into one that is never retried.
 fn floor_fault(e: &KeepMobileError) -> PolicyFault {
     match e {
         KeepMobileError::InvalidPolicy { .. } => PolicyFault::ClockUntrusted,
         _ => PolicyFault::Unreadable,
+    }
+}
+
+/// A storage error reaching the time floor, with `InvalidPolicy` taken out of
+/// it. That variant is how `floor_now` says a record is corrupt, and the storage
+/// error type admits any variant, so one coming from storage is restated as the
+/// read failure it is.
+fn floor_storage_error(e: KeepMobileError) -> KeepMobileError {
+    match e {
+        KeepMobileError::InvalidPolicy { .. } => KeepMobileError::StorageError {
+            msg: "The time floor could not be read or written".into(),
+        },
+        other => other,
     }
 }
 
@@ -4289,11 +4307,11 @@ impl KeepMobile {
                     msg: "The time floor is corrupt and a policy depends on it".into(),
                 })
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(floor_storage_error(e)),
         };
         let (observed, changed) = floor.observe(now_secs, now_elapsed_ms);
         if changed || first_write {
-            persistence::persist_clock_floor(storage, &observed)?;
+            persistence::persist_clock_floor(storage, &observed).map_err(floor_storage_error)?;
         }
         Ok(observed.clock_at(now_secs))
     }
@@ -7147,6 +7165,9 @@ mod velocity_fault_tests {
     struct FaultingStorage {
         records: StdMutex<HashMap<String, Vec<u8>>>,
         unreadable: StdMutex<Vec<String>>,
+        /// Reads of these fault with `InvalidPolicy`, which the storage error
+        /// type admits, to pin that a caller does not read meaning into it.
+        misreported: StdMutex<Vec<String>>,
         unwritable: StdMutex<Vec<String>>,
         undeletable: StdMutex<Vec<String>>,
         reads: StdMutex<HashMap<String, usize>>,
@@ -7155,6 +7176,10 @@ mod velocity_fault_tests {
     impl FaultingStorage {
         fn fault(&self, key: &str) {
             self.unreadable.lock().unwrap().push(key.into());
+        }
+
+        fn misreport(&self, key: &str) {
+            self.misreported.lock().unwrap().push(key.into());
         }
 
         fn fault_write(&self, key: &str) {
@@ -7220,6 +7245,11 @@ mod velocity_fault_tests {
             if self.unreadable.lock().unwrap().contains(&key) {
                 return Err(KeepMobileError::StorageError {
                     msg: "cannot decrypt right now".into(),
+                });
+            }
+            if self.misreported.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::InvalidPolicy {
+                    msg: "reported by storage".into(),
                 });
             }
             self.records
@@ -8435,5 +8465,32 @@ mod velocity_fault_tests {
             mobile.policy_status(None).unwrap(),
             PolicyStatus::Active { .. }
         ));
+    }
+
+    /// A read failure the storage reports with `InvalidPolicy` is still a read
+    /// failure. That variant is how the floor says its record is corrupt, which
+    /// is a fault that is never retried, so taking it at face value from
+    /// storage would hold a transient fault for the life of the process.
+    #[test]
+    fn a_storage_error_is_not_mistaken_for_a_corrupt_floor() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        storage.plant(
+            CLOCK_FLOOR_STORAGE_KEY,
+            serde_json::to_vec(&crate::clock_floor::ClockFloor::new(1, None)).unwrap(),
+        );
+        storage.misreport(CLOCK_FLOOR_STORAGE_KEY);
+
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let status = mobile.policy_status(None).unwrap();
+        assert!(
+            matches!(
+                status,
+                PolicyStatus::Faulted {
+                    fault: PolicyFault::Unreadable
+                }
+            ),
+            "{status:?}"
+        );
     }
 }

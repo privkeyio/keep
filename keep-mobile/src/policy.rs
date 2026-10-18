@@ -230,8 +230,10 @@ pub enum PolicyFault {
     /// `created_at` is still a sound baseline to measure a downgrade against,
     /// and it is the only fault that supplies one.
     Expired,
-    /// The policy itself is fine, but the stored time floor it is judged
-    /// against is corrupt, so nothing says the clock was not wound back. Not
+    /// The stored time floor the policy is judged against is corrupt, so
+    /// nothing says the clock was not wound back. The policy may well be fine;
+    /// it was not checked, because its validity cannot be judged without a
+    /// floor. Not
     /// retried, because a record that will not parse will not parse next time
     /// either, and reporting it as [`Self::Unreadable`] would tell a caller to
     /// wait for a fault that never clears. Deleting the policy is the way out:
