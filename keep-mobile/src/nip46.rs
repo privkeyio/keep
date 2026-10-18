@@ -11,7 +11,7 @@ use keep_nip46::{
     ServerConfig, SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -34,6 +34,21 @@ use zeroize::{Zeroize, Zeroizing};
 /// approved it. Both orderings end in a denial when nobody answers, which is
 /// the direction that matters, and the window is a few milliseconds wide.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How many prompts may be waiting on the platform at once.
+///
+/// The handler reads one request at a time, so more than one is outstanding
+/// only when earlier prompts timed out and their threads are still parked in a
+/// platform call that never returned. Against such an implementation the
+/// threads accumulate at roughly one per [`APPROVAL_TIMEOUT`], each holding a
+/// stack, a JVM attachment and a copy of the request, which trades a stalled
+/// bunker for memory pressure on the whole app. Past this many, the answer is
+/// a refusal without asking.
+///
+/// keep-android bounds its own wait and caps its own concurrent prompts, so
+/// this is not reached in practice; it is the ceiling for an implementation
+/// that does neither.
+const MAX_OUTSTANDING_APPROVALS: usize = 4;
 
 const STATUS_STOPPED: u8 = 0;
 const STATUS_STARTING: u8 = 1;
@@ -200,6 +215,26 @@ pub trait BunkerCallbacks: Send + Sync {
     fn on_connect(&self, pubkey: String, name: String, authorization: ConnectAuthorization);
 }
 
+/// One outstanding prompt, released when the platform answers.
+struct OutstandingApproval(Arc<AtomicUsize>);
+
+impl OutstandingApproval {
+    fn take(count: &Arc<AtomicUsize>) -> Option<Self> {
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |in_flight| {
+                (in_flight < MAX_OUTSTANDING_APPROVALS).then_some(in_flight + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for OutstandingApproval {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct CallbackBridge {
     callbacks: Arc<dyn BunkerCallbacks>,
     mobile: Arc<KeepMobile>,
@@ -207,6 +242,20 @@ struct CallbackBridge {
     /// constant directly so a test can reach the timeout without taking a
     /// minute to do it.
     approval_timeout: Duration,
+    /// Prompts handed to the platform that have not come back, including the
+    /// ones this side has already stopped waiting for.
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl CallbackBridge {
+    /// A refusal that grants nothing. `JustThisTime` carries no duration, so
+    /// the handler cannot turn it into a stored denial or a grant.
+    fn refused() -> ApprovalResult {
+        ApprovalResult {
+            approved: false,
+            remember: RememberDuration::JustThisTime,
+        }
+    }
 }
 
 impl ServerCallbacks for CallbackBridge {
@@ -239,13 +288,50 @@ impl ServerCallbacks for CallbackBridge {
         // is the cost of bounding a call that offers no cancellation, and it is
         // preferable to the alternative, where one unanswered prompt holds the
         // handler forever.
+        //
+        // Kept for the log, because the request itself moves onto the thread
+        // and a refusal that does not say which app it refused is not much use
+        // when reading one back. The name is left out deliberately: it is
+        // remote-derived and unbounded, where the pubkey and method are
+        // neither.
+        let asked_by = request.app_pubkey.clone();
+        let asked_for = request.method.clone();
+
+        // A slot is taken before the thread exists, and released by the guard
+        // when the platform finally answers, so the count tracks threads still
+        // parked rather than requests still being waited on.
+        let slot = match OutstandingApproval::take(&self.outstanding) {
+            Some(slot) => slot,
+            None => {
+                tracing::warn!(
+                    "Refusing {asked_for} from {asked_by} without asking: \
+                     {MAX_OUTSTANDING_APPROVALS} earlier prompts have not come back"
+                );
+                return Self::refused();
+            }
+        };
+
         let (tx, rx) = std::sync::mpsc::channel();
         let callbacks = Arc::clone(&self.callbacks);
-        std::thread::spawn(move || {
-            // Ignored deliberately: a send fails only once the timeout below
-            // has already answered for this request and dropped the receiver.
-            let _ = tx.send(callbacks.request_approval(request));
-        });
+        // Named, and a failure to spawn is a refusal rather than a panic.
+        // `std::thread::spawn` panics when the OS refuses the thread, and that
+        // panic unwinds through the handler and out of the notification loop,
+        // which stops the bunker while its status still reads running.
+        if let Err(e) = std::thread::Builder::new()
+            .name("nip46-approval".into())
+            .spawn(move || {
+                // Dropped when the platform returns, however it returns, so a
+                // callback that panics releases its slot too.
+                let _slot = slot;
+                // Ignored deliberately: a send fails only once the timeout
+                // below has already answered for this request and dropped the
+                // receiver.
+                let _ = tx.send(callbacks.request_approval(request));
+            })
+        {
+            tracing::error!("Refusing {asked_for} from {asked_by}, no thread to ask on: {e}");
+            return Self::refused();
+        }
 
         // Hand this worker's core off for the wait, as the FROST approval path
         // does in `lib.rs`. Queued tasks on the worker are stealable either
@@ -280,13 +366,19 @@ impl ServerCallbacks for CallbackBridge {
             Ok(result) => result.into(),
             // Denied, not retried. The operator did not answer, and the
             // request's own rate limiting decides whether the client gets
-            // another prompt.
-            Err(e) => {
-                tracing::warn!("Approval prompt went unanswered ({e}), denying the request");
-                ApprovalResult {
-                    approved: false,
-                    remember: RememberDuration::JustThisTime,
-                }
+            // another prompt. The two errors are reported apart because they
+            // are different events: one is nobody answering, the other is the
+            // platform callback having panicked, which fails closed at once.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "Refusing {asked_for} from {asked_by}: no answer within {}s",
+                    self.approval_timeout.as_secs()
+                );
+                Self::refused()
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!("Refusing {asked_for} from {asked_by}: the prompt did not return");
+                Self::refused()
             }
         }
     }
@@ -740,6 +832,7 @@ impl BunkerHandler {
 
             let server_callbacks = Some(Arc::new(CallbackBridge {
                 approval_timeout: APPROVAL_TIMEOUT,
+                outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
             }) as Arc<dyn ServerCallbacks>);
@@ -1018,6 +1111,7 @@ mod tests {
             callbacks: Arc::new(NeverAnswers(Mutex::new(rx))),
             mobile: Arc::clone(&mobile),
             approval_timeout: Duration::from_millis(200),
+            outstanding: Arc::new(AtomicUsize::new(0)),
         };
 
         let started = std::time::Instant::now();
@@ -1036,6 +1130,100 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the wait must be bounded by the timeout, not by the callback"
+        );
+    }
+
+    /// Prompts that never came back do not accumulate without limit. Past the
+    /// ceiling the answer is a refusal without asking, so a platform that
+    /// never returns costs a bounded number of parked threads rather than
+    /// steady memory and thread pressure on the whole app.
+    #[test]
+    fn prompts_that_never_return_stop_being_asked() {
+        struct NeverAnswers(Mutex<std::sync::mpsc::Receiver<()>>);
+        impl BunkerCallbacks for NeverAnswers {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                let _ = self.0.lock().unwrap().recv();
+                BunkerApprovalResult {
+                    approved: true,
+                    remember: BunkerRememberDuration::Forever,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (_hold, rx) = std::sync::mpsc::channel();
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(NeverAnswers(Mutex::new(rx))),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_millis(50),
+            outstanding: Arc::clone(&outstanding),
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..MAX_OUTSTANDING_APPROVALS + 3 {
+                assert!(!ServerCallbacks::request_approval(&bridge, an_approval()).approved);
+            }
+        });
+
+        // Every slot is held by a thread still parked in the platform call, and
+        // nothing above the ceiling was handed out.
+        assert_eq!(
+            outstanding.load(Ordering::Acquire),
+            MAX_OUTSTANDING_APPROVALS,
+            "outstanding prompts must stop at the ceiling"
+        );
+    }
+
+    /// A slot is released however the platform call ends, including when it
+    /// panics, so a panicking callback does not retire a slot for good.
+    #[test]
+    fn a_panicking_prompt_releases_its_slot() {
+        struct Panics;
+        impl BunkerCallbacks for Panics {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                panic!("the platform callback failed");
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(Panics),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            outstanding: Arc::clone(&outstanding),
+        };
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for _ in 0..MAX_OUTSTANDING_APPROVALS + 2 {
+                assert!(
+                    !ServerCallbacks::request_approval(&bridge, an_approval()).approved,
+                    "a panicking prompt is a refusal"
+                );
+            }
+        });
+
+        assert_eq!(
+            outstanding.load(Ordering::Acquire),
+            0,
+            "a panicking callback must not retire its slot"
         );
     }
 
@@ -1089,6 +1277,7 @@ mod tests {
             callbacks: Arc::new(Waiter(Mutex::new(Some(rx)))),
             mobile: Arc::clone(&mobile),
             approval_timeout: APPROVAL_TIMEOUT,
+            outstanding: Arc::new(AtomicUsize::new(0)),
         };
         let ask = |bridge: &CallbackBridge| {
             ServerCallbacks::request_approval(
