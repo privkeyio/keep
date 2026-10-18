@@ -50,7 +50,9 @@
 use frost_secp256k1_tr::rand_core::{impls, CryptoRng, Error as RngError, OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::entropy::{pair_looks_random, EntropyHealthError};
+use crate::entropy::{
+    frozen_positions, pair_looks_random, EntropyHealthError, MAX_FROZEN_POSITIONS,
+};
 
 /// An RNG that holds every fill it hands out to the health criteria.
 ///
@@ -155,7 +157,8 @@ impl<R: RngCore> CheckedRng<R> {
         }
     }
 
-    /// Draw extra blocks from the same source until two have been judged.
+    /// Draw extra blocks from the same source until [`MIN_JUDGED`] have been
+    /// judged.
     ///
     /// One draw can be checked for nothing beyond being all zero, because the
     /// criteria compare one draw against another. Some calls make exactly one:
@@ -202,14 +205,18 @@ impl<R: RngCore> CheckedRng<R> {
             let mut probe = Zeroizing::new([0u8; 32]);
             self.fill_bytes(probe.as_mut());
         }
-        // No per-byte-position test across the blocks, deliberately. One used
-        // to run here and refused healthy draws: at three blocks a position
-        // holds the same extreme byte in all of them about once in 260,000
-        // calls, measured at 4 in a million on the OS source. Every nonce
-        // commitment passes through here and a `Degraded` verdict latches a
-        // co-signer, so a healthy node stopped signing at that rate. The
-        // source it caught, random except for one frozen byte, is not one worth
-        // stopping for; see `samples_look_random` in `entropy`.
+        // A source that fills only part of what it is asked for leaves the rest
+        // as it was, so the same byte positions hold the same value in every
+        // block. The pairwise checks miss that until about half the bytes are
+        // frozen, and several draws here take bytes straight into a scalar,
+        // so it is counted across every block judged. The threshold and why it
+        // does not latch a healthy node are on `frozen_positions`.
+        if self.fault.is_none() && self.judged.len() >= MIN_JUDGED {
+            let blocks = Zeroizing::new(self.judged.iter().map(|b| **b).collect::<Vec<_>>());
+            if frozen_positions(&blocks) > MAX_FROZEN_POSITIONS {
+                self.fault = Some(EntropyHealthError::Degraded);
+            }
+        }
     }
 }
 
@@ -397,9 +404,23 @@ mod tests {
     });
 
     /// Random except for one byte position that holds the same value in every
-    /// block. That is also what healthy randomness does by chance about once in
-    /// 260,000 three-block calls, which is why it must not be refused.
+    /// block. A position matching across three blocks happens to healthy
+    /// randomness once in 65,536 per position, so one or a few must not be
+    /// refused; see `frozen_positions` for where the line is.
     struct ConstantPositionRng;
+
+    /// Fills only the first `.0` bytes of every 32-byte block and leaves the
+    /// rest at `.1`, which is a source that does part of what it is asked and
+    /// is the case the frozen-position count exists for.
+    struct PartialFillRng(usize, u8);
+
+    impl_rng!(PartialFillRng, |s, dest| {
+        for block in dest.chunks_mut(32) {
+            let (head, tail) = block.split_at_mut(s.0.min(block.len()));
+            OsRng.fill_bytes(head);
+            tail.fill(s.1);
+        }
+    });
 
     impl_rng!(ConstantPositionRng, |_s, dest| {
         OsRng.fill_bytes(dest);
@@ -733,12 +754,10 @@ mod tests {
     }
 
     /// A byte position that repeats across the blocks of one call is not a
-    /// fault. Refusing it refused healthy randomness: a sound source produces
-    /// exactly this input about once in 260,000 three-block calls, and since a
-    /// refusal latches a co-signer, a node making nonce commitments took itself
-    /// out of service at that rate. The remaining criteria still catch the
-    /// sources that matter; the stuck, cycling and barely-moving tests above
-    /// are what pins that.
+    /// fault on its own. The test this replaces refused a single position held
+    /// at `0x00` or `0xff`, which healthy randomness does about once in 260,000
+    /// three-block calls, and since a refusal latches a co-signer, a node making
+    /// nonce commitments took itself out of service at that rate.
     #[test]
     fn a_byte_position_repeating_across_blocks_is_not_a_fault() {
         let mut rng = CheckedRng::new(ConstantPositionRng);
@@ -748,5 +767,51 @@ mod tests {
         }
         rng.finish();
         assert_eq!(rng.fault, None);
+    }
+
+    fn verdict_of(source: impl RngCore + CryptoRng) -> Option<EntropyHealthError> {
+        let mut rng = CheckedRng::new(source);
+        let mut block = [0u8; 32];
+        for _ in 0..3 {
+            rng.fill_bytes(&mut block);
+        }
+        rng.finish();
+        rng.fault
+    }
+
+    /// A source that fills twenty bytes of each block and leaves twelve zero is
+    /// refused. Every pair is still distinct, nonzero and well past the
+    /// Hamming floor, so nothing but the frozen-position count sees it, and
+    /// before that count existed it passed. A draw that turns bytes straight
+    /// into a scalar would then hold 96 known bits.
+    #[test]
+    fn a_source_filling_only_part_of_each_block_is_refused() {
+        assert_eq!(
+            verdict_of(PartialFillRng(20, 0x00)),
+            Some(EntropyHealthError::Degraded)
+        );
+    }
+
+    /// The count is of positions frozen at any value. The test it replaces
+    /// only ever looked for `0x00` and `0xff`, so a source leaving its unfilled
+    /// bytes at anything else passed it.
+    #[test]
+    fn a_frozen_region_of_any_value_is_refused() {
+        assert_eq!(
+            verdict_of(PartialFillRng(20, 0x5a)),
+            Some(EntropyHealthError::Degraded)
+        );
+    }
+
+    /// The line is four frozen positions: three pass and four do not. Three
+    /// leaves at least 232 bits per block, and refusing at fewer would bring
+    /// back the rate the old test latched healthy nodes at.
+    #[test]
+    fn three_frozen_positions_pass_and_four_are_refused() {
+        assert_eq!(verdict_of(PartialFillRng(29, 0x00)), None);
+        assert_eq!(
+            verdict_of(PartialFillRng(28, 0x00)),
+            Some(EntropyHealthError::Degraded)
+        );
     }
 }
