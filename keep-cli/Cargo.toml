@@ -34,7 +34,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "1.1"
 hex = "0.4"
-qrcode = { version = "0.13", default-features = false }
+qrcode = { version = "0.14", default-features = false }
 
 urlencoding = "2.1"
 url = "2.5"
