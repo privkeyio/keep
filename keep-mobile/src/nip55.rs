@@ -159,8 +159,12 @@ pub fn nip55_parse_permissions(json: Option<String>) -> Vec<Nip55DeclaredPermiss
 /// Outcome of the NIP-42 relay-auth whitelist gate for a kind-22242 request.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum Nip55RelayAuthGate {
-    /// Relay is whitelisted — auto-approve without prompting.
-    AutoAccept,
+    /// Relay is on the whitelist, which lifts [`Self::AutoReject`] and nothing
+    /// else. Membership is a constraint on which relays may be signed for, not
+    /// a grant: a request still needs a standing permission for the kind or a
+    /// prompt. Named for what it is rather than `AutoAccept`, which is what it
+    /// used to do and read as permission to sign.
+    Whitelisted,
     /// A non-empty whitelist does not contain this relay — auto-reject.
     AutoReject,
     /// No whitelist configured (or it is empty) — fall through to normal grant resolution.
@@ -241,7 +245,7 @@ pub fn nip55_relay_auth_gate(
         return Nip55RelayAuthGate::Defer;
     }
     match relay_host {
-        Some(host) if whitelist.contains(&host) => Nip55RelayAuthGate::AutoAccept,
+        Some(host) if whitelist.contains(&host) => Nip55RelayAuthGate::Whitelisted,
         _ => Nip55RelayAuthGate::AutoReject,
     }
 }
@@ -1498,7 +1502,7 @@ mod tests {
                 Some("relay.example.com".into()),
                 vec!["relay.example.com".into()]
             ),
-            Nip55RelayAuthGate::AutoAccept
+            Nip55RelayAuthGate::Whitelisted
         );
         // Non-empty whitelist without this relay auto-rejects.
         assert_eq!(
