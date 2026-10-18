@@ -346,6 +346,10 @@ pub(crate) const MAX_FROZEN_POSITIONS: usize = 3;
 /// 1 in 256, and four of 32 matching becomes about 8e-6 per call, which is the
 /// rate this exists to get away from.
 pub(crate) fn frozen_positions(samples: &[[u8; 32]]) -> usize {
+    debug_assert!(
+        samples.len() >= 3,
+        "frozen_positions needs three samples; below that healthy input trips it"
+    );
     let Some((first, rest)) = samples.split_first() else {
         return 0;
     };
@@ -593,13 +597,19 @@ mod tests {
         });
         assert!(!samples_look_random(&samples));
 
-        // And three frozen positions are under the line.
-        let samples: [[u8; 32]; 3] = std::array::from_fn(|_| {
-            let mut s = [0x5au8; 32];
-            gather_os_entropy(&mut s[..29]).expect("the OS RNG is available");
-            s
-        });
-        assert!(samples_look_random(&samples));
+        // The line itself, on built samples: unfrozen bytes take a different
+        // value in each sample so none can match by chance, which is what made
+        // a random version of this fail on healthy input about once in 2,260.
+        let exactly_frozen = |frozen: usize| -> [[u8; 32]; 3] {
+            std::array::from_fn(|k| {
+                let value = [0x0fu8, 0xf0, 0x33][k];
+                std::array::from_fn(|pos| if pos < frozen { 0x00 } else { value })
+            })
+        };
+        assert_eq!(frozen_positions(&exactly_frozen(3)), 3);
+        assert!(samples_look_random(&exactly_frozen(3)));
+        assert_eq!(frozen_positions(&exactly_frozen(4)), 4);
+        assert!(!samples_look_random(&exactly_frozen(4)));
     }
 
     #[test]

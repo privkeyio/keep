@@ -414,6 +414,25 @@ mod tests {
     /// is the case the frozen-position count exists for.
     struct PartialFillRng(usize, u8);
 
+    /// Three blocks with exactly `.0` positions frozen and no others, built
+    /// rather than drawn. The unfrozen bytes take a different value in each
+    /// block, so none of them can match by chance and push the count past
+    /// `.0`, which is what made a random head flaky at the boundary. Every pair
+    /// is still nonzero, distinct and at least 112 bits apart, so the count is
+    /// the only criterion in play.
+    struct ExactlyFrozenRng(usize, usize);
+
+    impl_rng!(ExactlyFrozenRng, |s, dest| {
+        const UNFROZEN: [u8; 3] = [0x0f, 0xf0, 0x33];
+        for block in dest.chunks_mut(32) {
+            let value = UNFROZEN[s.1 % UNFROZEN.len()];
+            for (pos, byte) in block.iter_mut().enumerate() {
+                *byte = if pos < s.0 { 0x00 } else { value };
+            }
+            s.1 += 1;
+        }
+    });
+
     impl_rng!(PartialFillRng, |s, dest| {
         for block in dest.chunks_mut(32) {
             let (head, tail) = block.split_at_mut(s.0.min(block.len()));
@@ -806,11 +825,15 @@ mod tests {
     /// The line is four frozen positions: three pass and four do not. Three
     /// leaves at least 232 bits per block, and refusing at fewer would bring
     /// back the rate the old test latched healthy nodes at.
+    ///
+    /// Built rather than drawn: with random unfrozen bytes, any one of them
+    /// matching across the three blocks by chance tips three into four, which
+    /// made this fail on a healthy source about once in 2,260 runs.
     #[test]
     fn three_frozen_positions_pass_and_four_are_refused() {
-        assert_eq!(verdict_of(PartialFillRng(29, 0x00)), None);
+        assert_eq!(verdict_of(ExactlyFrozenRng(3, 0)), None);
         assert_eq!(
-            verdict_of(PartialFillRng(28, 0x00)),
+            verdict_of(ExactlyFrozenRng(4, 0)),
             Some(EntropyHealthError::Degraded)
         );
     }
