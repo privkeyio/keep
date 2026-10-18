@@ -308,25 +308,29 @@ fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
     a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
 }
 
-pub(crate) fn check_bit_distribution(samples: &[[u8; 32]]) -> bool {
-    (0..32).all(|pos| {
-        let all_zeros = samples.iter().all(|s| s[pos] == 0x00);
-        let all_ones = samples.iter().all(|s| s[pos] == 0xff);
-        !all_zeros && !all_ones
-    })
-}
-
 const MIN_HAMMING: u32 = 64;
 
 /// Applies the health criteria to three samples: none all-zero, all distinct,
-/// no byte position constant across all three, and every pair at least
-/// [`MIN_HAMMING`] bits apart.
+/// and every pair at least [`MIN_HAMMING`] bits apart.
+///
+/// There used to be a fourth: no byte position holding `0x00`, or `0xff`,
+/// across all three. Healthy randomness fails it. A given position is `0x00` in
+/// three independent samples with probability 1 in 256³, and there are 32
+/// positions and two extreme values, so about 1 call in 260,000 fails on a
+/// sound source; measured at 13 in a million across this check's two calls.
+/// Every failure latches a co-signing node, and the check runs every 30
+/// seconds, so a healthy always-on node took itself out of service about once
+/// a month. What the criterion caught in exchange, a source random except for
+/// one frozen byte, still carries 248 bits per sample, which is not a failure
+/// worth stopping for. The failures that are, a source stuck, cycling or
+/// barely moving, fail the criteria that remain, which have no comparable rate
+/// on a healthy source.
 fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
     let all_nonzero = samples.iter().all(|s| s.iter().any(|&b| b != 0));
     let all_unique =
         samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
 
-    if !all_nonzero || !all_unique || !check_bit_distribution(samples) {
+    if !all_nonzero || !all_unique {
         return false;
     }
 
@@ -335,18 +339,15 @@ fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
         .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING)
 }
 
-/// The health criteria that two draws can carry, for a caller judging the bytes
-/// it was handed rather than a sample drawn beside them.
-///
-/// [`check_entropy_health`] takes three samples, which is what lets it also
-/// reject a byte position that is `0x00` or `0xff` across all of them. Two
-/// samples cannot carry that test: a position fails it when both draws happen
-/// to hold the same extreme byte, which for two healthy draws is about one pair
-/// in a thousand across the 32 positions, and a caller that latches on the
-/// verdict would take itself out of service about that often. What is left is
-/// what a stuck or barely-moving source fails anyway: neither draw all-zero,
+/// The health criteria for a pair of draws, for a caller judging the bytes it
+/// was handed rather than a sample drawn beside them: neither draw all-zero,
 /// the two distinct, and at least [`MIN_HAMMING`] bits apart, which a source
 /// repeating itself with a handful of bits flipped still fails.
+///
+/// These are the same criteria [`check_entropy_health`] applies to each of its
+/// pairs. Neither applies a per-byte-position test, because at any sample count
+/// a caller can afford, healthy randomness fails one often enough to latch a
+/// node; see `samples_look_random`.
 pub(crate) fn pair_looks_random(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let nonzero = |s: &[u8; 32]| s.iter().any(|&b| b != 0);
     nonzero(a) && nonzero(b) && a != b && hamming_distance(a, b) >= MIN_HAMMING
@@ -391,7 +392,6 @@ fn check_entropy_health_internal() -> Result<(), EntropyHealthError> {
 /// Generates multiple samples and checks:
 /// - Output is not all zeros
 /// - Different calls produce different output
-/// - Byte positions are not all 0x00 or 0xff across samples
 /// - Hamming distance between samples is at least 64 bits
 pub fn check_entropy_health() -> Result<(), EntropyHealthError> {
     check_entropy_health_internal()
