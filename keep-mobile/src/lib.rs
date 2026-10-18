@@ -1930,6 +1930,23 @@ impl KeepMobile {
         self.policy_read_lock()?.evaluate(&ctx)
     }
 
+    /// Counts a spend against the velocity limits.
+    ///
+    /// Call this before the spend completes, and do not complete it when this
+    /// returns an error. A spend that happened without being counted is one the
+    /// daily and weekly limits will not see again, so the limits under-count
+    /// from then on; refusing the spend is the only thing that keeps the
+    /// counters and reality in agreement. There is no caller yet, so the
+    /// contract is stated here before one exists rather than inferred later.
+    ///
+    /// The count lands in memory first and is persisted second, which is
+    /// deliberate and the opposite of what the policy record does. A failed
+    /// write leaves this process counting a spend that storage does not hold,
+    /// which enforces too strictly rather than too loosely; committing to
+    /// storage first would leave a failed write counting nothing anywhere, so
+    /// the live process would under-count immediately instead of only after a
+    /// restart. Neither ordering makes an uncounted spend safe, which is why
+    /// the caller has to refuse it.
     pub fn record_policy_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
         self.reload_velocity_if_unknown()?;
         self.policy_read_lock()?.record_transaction(amount_sats)?;
