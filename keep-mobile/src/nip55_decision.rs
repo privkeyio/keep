@@ -16,8 +16,9 @@
 //!   velocity -> relay-auth whitelist -> app expiry, permission lookup and
 //!   standing DENY -> sign policy -> standing permission. An expired app, an
 //!   unreadable permission store or an explicit per-app DENY rejects before the
-//!   sign policy or a whitelisted relay can approve, and an explicit per-app ASK
-//!   keeps the sign policy from auto-approving.
+//!   sign policy can approve, and an explicit per-app ASK keeps the sign policy
+//!   from auto-approving. The relay-auth whitelist only ever refuses: it rejects
+//!   a relay that is not on it and approves nothing.
 //!
 //! The function is pure: the Android layer gathers the platform inputs (verified
 //! caller, kill-switch/lock flags, the stateful front-door and opt-in rate-limit
@@ -238,8 +239,8 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         None
     };
 
-    // The NIP-42 relay-auth gate is only meaningful for a kind-22242 SignEvent;
-    // it is computed once and reused by the pre-policy gate and the grant lookup.
+    // The NIP-42 relay-auth gate is only meaningful for a kind-22242 SignEvent,
+    // and only gate 5 reads it.
     let is_relay_auth =
         inputs.request_type == Nip55RequestType::SignEvent && event_kind == Some(KIND_NIP42_AUTH);
     let relay_gate: Option<Nip55RelayAuthGate> = if is_relay_auth {
@@ -255,10 +256,17 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
 
     // Gate 5: enforce the relay-auth whitelist AUTO_REJECT before the sign policy,
     // so a non-whitelisted relay can never be auto-approved by an Auto sign policy.
-    if relay_gate == Some(Nip55RelayAuthGate::AutoReject) {
-        return Nip55Outcome::Reject {
-            reason: "deny_relay_whitelist".to_string(),
-        };
+    //
+    // Exhaustive rather than an equality test: this is the gate's only reader,
+    // so a variant added later would otherwise fall through a security gate in
+    // silence. Here it is a compile error until someone decides what it means.
+    match relay_gate {
+        Some(Nip55RelayAuthGate::AutoReject) => {
+            return Nip55Outcome::Reject {
+                reason: "deny_relay_whitelist".to_string(),
+            };
+        }
+        Some(Nip55RelayAuthGate::Whitelisted | Nip55RelayAuthGate::Defer) | None => {}
     }
 
     // Gate 6: app expiry, the permission lookup and a standing DENY, before the
@@ -350,31 +358,40 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         )
     };
 
-    // An ASK row is only ever set by the user, to be asked; neither the sign
-    // policy nor a whitelisted relay (gate 8) overrides that choice.
+    // An ASK row is only ever set by the user, to be asked, and the sign policy
+    // does not override that choice.
+    //
+    // `None` passes here, unlike at gate 8, and deliberately: a sign-policy
+    // auto-approval is the user opting a tier into signing low-risk requests
+    // without a prompt, which is not a per-app grant. It is bounded instead by
+    // the tier, the risk score and `is_sensitive_kind`, which sends every
+    // sensitive kind to the UI. Relay auth is one, so this cannot approve the
+    // relay auth that gate 8 refuses without a standing permission. It can
+    // still approve a non-sensitive kind with no standing permission, which is
+    // the tier doing what the user opted it into.
     if policy_result == SignPolicyEvaluation::AutoApprove
         && decision != Some(Nip55PermissionDecision::Ask)
     {
         return Nip55Outcome::AutoApprove;
     }
 
-    // Gate 8: standing permission. A whitelisted relay auto-signs unless the
-    // app's own decision is ASK (an explicit per-app DENY already rejected at
-    // gate 6).
-    // `decision` is the per-kind (kind-22242) resolution: because 22242 is a
-    // sensitive kind, a kind-agnostic DENY row never falls back here (matching
-    // how the standing-permission storage resolves it), so a blanket DENY does
-    // not block a whitelisted relay. The DENY checks here and below cannot be
-    // reached after gate 6 and stay as defense in depth.
-    if relay_gate == Some(Nip55RelayAuthGate::AutoAccept)
-        && !matches!(
-            decision,
-            Some(Nip55PermissionDecision::Deny | Nip55PermissionDecision::Ask)
-        )
-    {
-        return Nip55Outcome::AutoApprove;
-    }
-
+    // Gate 8: standing permission, and the only thing that authorizes a
+    // signature here.
+    //
+    // A whitelisted relay used to auto-approve on its own, excluding only an
+    // explicit DENY or ASK. `None` was not excluded, and `None` is an app that
+    // holds no standing permission at all, so membership of the relay
+    // whitelist authorized signing for an app that had never been granted
+    // anything. Nothing earlier stopped it: gate 6 passes an unknown app
+    // because absent settings read as not expired, and gate 7 resolves such an
+    // app to MANUAL, which does not auto-approve and so fell through to here
+    // rather than stopping it. Background only, since the foreground activity
+    // prompts, which is the case with no user present to notice.
+    //
+    // The whitelist is a constraint on which relays may be signed for, not a
+    // grant. AUTO_REJECT at gate 5 is what it is for: a non-whitelisted relay
+    // is refused. Membership removes that refusal and nothing more, so a
+    // request still needs a requester-scoped permission or a prompt.
     match decision {
         Some(Nip55PermissionDecision::Allow) => Nip55Outcome::AutoApprove,
         Some(Nip55PermissionDecision::Deny) => Nip55Outcome::Reject {
@@ -715,7 +732,7 @@ mod tests {
 
     #[test]
     fn opted_in_limiter_unavailable_still_honors_stored_allow() {
-        // Limiter unavailable falls to gate 8, which can still auto-approve on a
+        // Limiter unavailable falls to gate 8, which auto-approves only on a
         // standing ALLOW grant.
         let mut i = base();
         i.is_opted_in = true;
@@ -965,13 +982,46 @@ mod tests {
         assert!(is_require_ui(&evaluate_nip55_request(base())));
     }
 
-    // Gate 8: whitelisted-relay AUTO_ACCEPT; a per-app DENY rejects at gate 6.
+    // Gate 8: the relay whitelist constrains which relays may be signed for; it
+    // does not grant permission to sign.
     #[test]
-    fn whitelisted_relay_auto_approves() {
+    fn whitelist_membership_alone_does_not_authorize_signing() {
         let mut i = base();
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        // Same inputs as `no_stored_decision_requires_ui` plus the whitelist,
+        // so this pins that adding the whitelist changes nothing about
+        // authorization.
+        assert!(is_require_ui(&evaluate_nip55_request(i)));
+    }
+
+    /// The granted path still works: a whitelisted relay and a standing ALLOW
+    /// for the kind auto-approves, which is what the whitelist is combined with
+    /// rather than a substitute for.
+    #[test]
+    fn a_whitelisted_relay_with_a_standing_allow_auto_approves() {
+        let mut i = base();
+        i.event_json = relay_auth_event("relay.allowed.com");
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i.stored_exact_permission = Some(perm("allow"));
         assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+    }
+
+    /// A relay outside a configured whitelist is still refused, so the
+    /// constraint the whitelist exists for is untouched.
+    #[test]
+    fn a_relay_outside_the_whitelist_is_still_refused() {
+        let mut i = base();
+        i.event_json = relay_auth_event("relay.other.com");
+        i.relay_whitelist = vec!["relay.allowed.com".to_string()];
+        i.stored_exact_permission = Some(perm("allow"));
+        // The reason, not just the variant: any rejection would also satisfy a
+        // variant match, including a malformed event, and what this pins is that
+        // gate 5 refuses even over a standing ALLOW.
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i)),
+            "deny_relay_whitelist"
+        );
     }
 
     #[test]
@@ -995,19 +1045,20 @@ mod tests {
         ));
     }
 
-    // Relay auth is a sensitive kind, so a kind-agnostic DENY does not apply to
-    // it and a whitelisted relay still auto-signs.
+    // Relay auth is a sensitive kind, so a kind-agnostic DENY does not resolve
+    // for it. That leaves no standing decision, which is a prompt rather than a
+    // signature: the blanket row does not reject, and nothing grants either.
     #[test]
-    fn whitelisted_relay_ignores_a_kind_agnostic_deny() {
+    fn a_kind_agnostic_deny_leaves_relay_auth_without_a_decision() {
         let mut i = base();
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_generic_permission = Some(perm("deny"));
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert!(is_require_ui(&evaluate_nip55_request(i)));
     }
 
     // A whitelisted relay must not bypass the gate-6 fail-closed checks (expiry
-    // and lookup), which run before the AUTO_ACCEPT auto-sign.
+    // and lookup), which reject before any standing permission is considered.
     fn whitelisted_relay_base() -> Nip55DecisionInputs {
         let mut i = base();
         i.event_json = relay_auth_event("relay.allowed.com");
