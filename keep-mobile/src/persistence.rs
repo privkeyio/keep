@@ -7,14 +7,16 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::clock_floor::ClockFloor;
 use crate::error::KeepMobileError;
 use crate::policy::{PolicyBundle, POLICY_MAX_RULES_LEN, POLICY_PUBKEY_LEN, POLICY_VERSION};
 use crate::storage::{SecureStorage, ShareMetadataInfo};
 use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptorInfo};
 use crate::velocity::{VelocityTracker, MAX_TRACKED_TRANSACTIONS};
 use crate::{
-    CERT_PINS_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX, HEALTH_STATUS_INDEX_KEY,
-    HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
+    CERT_PINS_STORAGE_KEY, CLOCK_FLOOR_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX,
+    HEALTH_STATUS_INDEX_KEY, HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY,
+    VELOCITY_STORAGE_KEY,
 };
 
 #[derive(Serialize, Deserialize, Default)]
@@ -114,6 +116,53 @@ pub(crate) fn persist_policy(
 /// checked after the parse; this bounds what serde is asked to allocate first,
 /// at a generous 128 bytes per entry against a worst case nearer 75.
 const VELOCITY_RECORD_MAX_LEN: usize = 128 * MAX_TRACKED_TRANSACTIONS + 1024;
+
+const CLOCK_FLOOR_RECORD_MAX_LEN: usize = 256;
+
+/// What reading the stored time floor found.
+///
+/// A record that is there and will not parse is a different statement from one
+/// that could not be read. A read failure may clear on the next attempt, so it
+/// refuses and is retried. A corrupt record will not, and treating it as a read
+/// failure left it in place forever: nothing rewrites it, so a device that hit
+/// it could never install a policy again, even after deleting the old one.
+/// Reporting it apart lets the caller replace it where that is safe.
+pub(crate) enum ClockFloorRead {
+    Found(ClockFloor),
+    Absent,
+    Corrupt,
+}
+
+/// Reads the stored time floor. `Err` is a read that did not complete, which
+/// the caller refuses on.
+pub(crate) fn load_clock_floor(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<ClockFloorRead, KeepMobileError> {
+    match storage.load_share_by_key(CLOCK_FLOOR_STORAGE_KEY.into()) {
+        // Bounded before the parse, as the policy and counter records are. Two
+        // integer fields, so anything this long is not this record.
+        Ok(data) if data.len() > CLOCK_FLOOR_RECORD_MAX_LEN => Ok(ClockFloorRead::Corrupt),
+        Ok(data) => Ok(serde_json::from_slice(&data)
+            .map(ClockFloorRead::Found)
+            .unwrap_or(ClockFloorRead::Corrupt)),
+        Err(KeepMobileError::StorageNotFound) => Ok(ClockFloorRead::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn persist_clock_floor(
+    storage: &Arc<dyn SecureStorage>,
+    floor: &ClockFloor,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(floor).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize the clock floor: {e}"),
+    })?;
+    storage.store_share_by_key(
+        CLOCK_FLOOR_STORAGE_KEY.into(),
+        data,
+        storage_metadata("clock_floor"),
+    )
+}
 
 pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
