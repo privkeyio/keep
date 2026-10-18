@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
+use crate::clock_floor::PolicyClock;
 use crate::error::KeepMobileError;
 use crate::velocity::VelocityTracker;
 use chrono::{Datelike, Timelike, Utc};
@@ -463,15 +464,22 @@ impl PolicyBundle {
 
     /// Which validity bound the bundle falls outside, if either.
     ///
-    /// Reported apart from [`Self::verify_timestamp`]'s single error because
+    /// Reported apart from [`Self::verify_timestamp_at`]'s single error because
     /// the two call for opposite handling: being dated ahead of the clock
     /// resolves by itself, expiring does not.
-    /// The clock is a parameter, not read here, and that is what keeps the
+    ///
+    /// Both readings are parameters, not read here, and that is what keeps the
     /// stored time floor on the path: a bundle's validity is judged at the time
     /// the caller establishes, so no call site can fall back to the raw device
     /// clock by accident. It also lets the bounds be tested at an exact instant
     /// either side of them, including a negative one, which `Utc::now` cannot
     /// be made to return.
+    ///
+    /// Each bound uses the reading that can only refuse. Expiry takes the
+    /// floored time, because a later time can only make a bundle more expired.
+    /// The future bound takes the raw clock, because a floor ahead of the clock
+    /// would make a future-dated bundle look current and un-refuse it, which is
+    /// the one direction the floor must not be allowed to move a decision.
     ///
     /// A clock before 1970 clamps to the epoch rather than casting: `as u64` on
     /// a negative turns it into roughly 1.8e19, which clears the future bound
@@ -479,14 +487,15 @@ impl PolicyBundle {
     /// the arm that is never retried. Clamping sends it to `NotYetValid`
     /// instead, which is both true of a pre-1970 clock and retried once the
     /// clock is set.
-    pub(crate) fn timestamp_fault_at(&self, now_secs: i64) -> Option<PolicyFault> {
-        let now = u64::try_from(now_secs).unwrap_or(0);
+    pub(crate) fn timestamp_fault_at(&self, clock: PolicyClock) -> Option<PolicyFault> {
+        let now = u64::try_from(clock.clock_secs).unwrap_or(0);
+        let effective = u64::try_from(clock.effective_secs).unwrap_or(0);
 
         if self.created_at > now.saturating_add(MAX_POLICY_FUTURE_SECS) {
             return Some(PolicyFault::NotYetValid);
         }
 
-        if now > self.created_at.saturating_add(MAX_POLICY_AGE_SECS) {
+        if effective > self.created_at.saturating_add(MAX_POLICY_AGE_SECS) {
             return Some(PolicyFault::Expired);
         }
 
@@ -495,8 +504,8 @@ impl PolicyBundle {
 
     /// Judged at the instant the caller establishes, so an import is measured
     /// against the stored time floor rather than the raw clock.
-    pub(crate) fn verify_timestamp_at(&self, now_secs: i64) -> Result<(), KeepMobileError> {
-        match self.timestamp_fault_at(now_secs) {
+    pub(crate) fn verify_timestamp_at(&self, clock: PolicyClock) -> Result<(), KeepMobileError> {
+        match self.timestamp_fault_at(clock) {
             None => Ok(()),
             Some(fault) => Err(KeepMobileError::InvalidPolicy {
                 msg: fault.to_string(),
@@ -647,7 +656,11 @@ impl PolicyEvaluator {
     /// not parse out of a bundle that verified, come back as `Err`. A caller
     /// that treats the error as anything but a refusal gives back exactly the
     /// fail-open this type exists to close.
-    pub fn evaluate(&self, ctx: &TransactionContext) -> Result<PolicyDecision, KeepMobileError> {
+    pub fn evaluate(
+        &self,
+        ctx: &TransactionContext,
+        clock: PolicyClock,
+    ) -> Result<PolicyDecision, KeepMobileError> {
         let bundle = match &self.policy {
             PolicyState::NotConfigured => return Ok(PolicyDecision::Allow),
             // The reason says only that it did not verify. Which check failed
@@ -662,6 +675,17 @@ impl PolicyEvaluator {
             }
             PolicyState::Active(bundle) => bundle,
         };
+
+        // Validity is a function of time, so it is judged here and not only
+        // where the record was read. A process that loaded a bundle inside its
+        // window would otherwise keep enforcing it after it expired, for as
+        // long as it stayed running, because nothing re-reads a policy that is
+        // not faulted.
+        if let Some(fault) = bundle.timestamp_fault_at(clock) {
+            return Ok(PolicyDecision::Deny {
+                reason: format!("Cannot evaluate the spending policy: {fault}"),
+            });
+        }
 
         let rules = bundle.parse_rules()?;
 
@@ -894,6 +918,15 @@ pub(crate) fn resign_test_bundle(
 mod tests {
     use super::*;
 
+    /// A clock with no floor ahead of it, for the bounds that do not involve
+    /// one. The floor's own effect is covered in `clock_floor`.
+    fn at(now_secs: i64) -> PolicyClock {
+        PolicyClock {
+            clock_secs: now_secs,
+            effective_secs: now_secs,
+        }
+    }
+
     /// The validity window is pinned in days here rather than against
     /// [`MAX_POLICY_AGE_SECS`], because it is the value that bounds how far a
     /// rollback can reach and every other test expresses its dates in terms of
@@ -905,12 +938,12 @@ mod tests {
         let bundle = create_test_bundle_at(&PolicyRules::default(), created_at as u64);
 
         assert_eq!(
-            bundle.timestamp_fault_at(created_at + 29 * DAY),
+            bundle.timestamp_fault_at(at(created_at + 29 * DAY)),
             None,
             "a bundle inside the window is enforceable"
         );
         assert_eq!(
-            bundle.timestamp_fault_at(created_at + 31 * DAY),
+            bundle.timestamp_fault_at(at(created_at + 31 * DAY)),
             Some(PolicyFault::Expired),
             "past the window it must refuse rather than enforce retired rules"
         );
@@ -927,7 +960,7 @@ mod tests {
         let bundle = create_test_bundle_at(&rules, 1_700_000_000);
 
         assert_eq!(
-            bundle.timestamp_fault_at(-86_400),
+            bundle.timestamp_fault_at(at(-86_400)),
             Some(PolicyFault::NotYetValid)
         );
         assert!(PolicyFault::NotYetValid.is_transient());
@@ -1007,7 +1040,12 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 150_000,
@@ -1016,7 +1054,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1039,7 +1079,12 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 50_000,
@@ -1048,7 +1093,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1071,7 +1118,12 @@ mod tests {
             destinations: vec!["bc1allowed".to_string()],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 50_000,
@@ -1080,7 +1132,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1103,7 +1157,12 @@ mod tests {
             destinations: vec!["bc1allowed".to_string()],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 50_000,
@@ -1112,7 +1171,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1128,7 +1189,12 @@ mod tests {
             destinations: vec!["any".to_string()],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
@@ -1170,13 +1236,19 @@ mod tests {
         let rules = PolicyRules::default();
         let mut bundle = create_test_bundle(&rules);
 
-        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_ok());
+        assert!(bundle
+            .verify_timestamp_at(at(Utc::now().timestamp()))
+            .is_ok());
 
         bundle.created_at = Utc::now().timestamp() as u64 + MAX_POLICY_FUTURE_SECS + 3600;
-        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_err());
+        assert!(bundle
+            .verify_timestamp_at(at(Utc::now().timestamp()))
+            .is_err());
 
         bundle.created_at = Utc::now().timestamp() as u64 - MAX_POLICY_AGE_SECS - 3600;
-        assert!(bundle.verify_timestamp_at(Utc::now().timestamp()).is_err());
+        assert!(bundle
+            .verify_timestamp_at(at(Utc::now().timestamp()))
+            .is_err());
     }
 
     #[test]
@@ -1209,7 +1281,12 @@ mod tests {
             destinations: vec!["bc1qallowed".to_string()],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 50_000,
@@ -1217,7 +1294,12 @@ mod tests {
             destinations: vec!["BC1QALLOWED".to_string()],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
     }
 
     #[test]
@@ -1239,7 +1321,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1280,7 +1364,12 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
 
         let ctx = TransactionContext {
             amount_sats: 2_000,
@@ -1289,7 +1378,9 @@ mod tests {
             has_unknown_destination: false,
         };
         assert!(matches!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Deny { .. }
         ));
     }
@@ -1312,7 +1403,10 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        let PolicyDecision::Deny { reason } = evaluator.evaluate(&ctx).unwrap() else {
+        let PolicyDecision::Deny { reason } = evaluator
+            .evaluate(&ctx, at(Utc::now().timestamp()))
+            .unwrap()
+        else {
             panic!("an unreadable history must not pass a daily limit");
         };
         assert!(reason.contains("unreadable"), "{reason}");
@@ -1335,7 +1429,12 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
     }
 
     // Recording into a tracker conjured at record time would make the counters
@@ -1369,13 +1468,18 @@ mod tests {
             has_unknown_destination: false,
         };
         assert_eq!(
-            evaluator.evaluate(&ctx).unwrap(),
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
             PolicyDecision::Allow,
             "under the limit, so a verified policy allows it"
         );
 
         evaluator.set_policy_faulted(PolicyFault::Unverified, None);
-        let PolicyDecision::Deny { reason } = evaluator.evaluate(&ctx).unwrap() else {
+        let PolicyDecision::Deny { reason } = evaluator
+            .evaluate(&ctx, at(Utc::now().timestamp()))
+            .unwrap()
+        else {
             panic!("a policy that cannot be trusted must refuse, not fall back to no policy");
         };
         assert!(reason.contains("did not verify"), "{reason}");
@@ -1392,7 +1496,12 @@ mod tests {
             destinations: vec![],
             has_unknown_destination: false,
         };
-        assert_eq!(evaluator.evaluate(&ctx).unwrap(), PolicyDecision::Allow);
+        assert_eq!(
+            evaluator
+                .evaluate(&ctx, at(Utc::now().timestamp()))
+                .unwrap(),
+            PolicyDecision::Allow
+        );
     }
 
     /// A faulted record must not be readable as a policy through any accessor.

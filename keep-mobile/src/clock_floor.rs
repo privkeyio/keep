@@ -9,24 +9,33 @@
 //! the clock back inside the validity window turns an expired policy back into
 //! an enforced one, with no root and no prompt.
 //!
-//! What closes it is a time floor: the latest wall reading the app has ever
-//! seen, kept in storage and consulted on every decision. Expiry is evaluated
-//! at `max(now, floor)`, so winding the clock back leaves the floor in charge
-//! and an expired policy stays expired. The floor can only ever make the
-//! evaluated time later, which can expire a bundle but never un-expire one, so
-//! every way it can be wrong refuses rather than permits.
+//! What closes it is a time floor: the latest wall reading the app has seen,
+//! kept in storage and consulted on every decision. Expiry is judged at
+//! `max(now, floor)`, so winding the clock back leaves the floor in charge and
+//! an expired policy stays expired.
 //!
 //! This works here and would not work against a record rollback: that needs
 //! root or offline access to the data partition, which is also enough to
 //! rewrite this record, whereas the date setting is not.
 //!
+//! The floor applies to expiry only, not to the not-yet-valid bound. A floor
+//! ahead of the real clock makes a bundle look older, which can only expire
+//! one; applied to the future bound it would make a future-dated bundle look
+//! current, which would un-refuse it. So [`PolicyClock`] carries both readings
+//! and each bound uses the one that can only refuse.
+//!
 //! The reason the floor is bounded rather than simply raised to whatever the
 //! clock says is the failure [`crate::audit`]'s `monotonic_timestamp` is
-//! written around. One reading from a clock set to 2099 would park the floor
+//! written around. One reading from a clock set far ahead would park the floor
 //! there, and from then on every bundle is expired, including a replacement a
 //! warden signs today, so the policy refuses forever with no way back. The
-//! floor therefore advances only as far as monotonic time proves has elapsed: a
-//! jump to 2099 moves it by seconds, and the poisoning is not available.
+//! floor therefore advances only by as much as monotonic time proves has
+//! elapsed since the reading it was taken with.
+//!
+//! That proof is why there is no slack: a tolerance granted per observation is
+//! granted again on the next one, so a caller that asks repeatedly walks the
+//! floor forward at the tolerance per call regardless of how little time
+//! passed. Advancing strictly by proven elapsed time has no such rate.
 //!
 //! The monotonic reading comes from the caller, as it already does for
 //! [`crate::signing_policy::SigningRateLimiter`], because only the platform has
@@ -35,14 +44,14 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Slack allowed on top of the elapsed monotonic time when advancing the floor.
-///
-/// Covers the gap between the two readings being taken and a second of
-/// rounding, nothing more. It does not need to cover a legitimate forward
-/// correction, such as a device whose battery died resyncing by NTP: the floor
-/// is a lower bound, so lagging a real correction is harmless, and the
-/// evaluated time is `max(now, floor)`, which is the corrected reading itself.
-const ADVANCE_SLACK_SECS: u64 = 60;
+/// The two readings a validity decision needs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PolicyClock {
+    /// What the device clock says, used for the not-yet-valid bound.
+    pub(crate) clock_secs: i64,
+    /// Never earlier than the stored floor, used for the expiry bound.
+    pub(crate) effective_secs: i64,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub(crate) struct ClockFloor {
@@ -50,11 +59,17 @@ pub(crate) struct ClockFloor {
     pub(crate) floor_secs: u64,
     /// The monotonic reading taken alongside `floor_secs`, for measuring how
     /// much time has since been proven to pass.
-    pub(crate) anchor_elapsed_ms: u64,
+    ///
+    /// `None` when the floor was written without one, which is the case at
+    /// construction. An advance needs a reading to measure from, so the first
+    /// one only anchors. Storing a zero instead would claim the floor was taken
+    /// at boot, and the next reading would then credit the whole device uptime
+    /// as elapsed and advance the floor by it.
+    pub(crate) anchor_elapsed_ms: Option<u64>,
 }
 
 impl ClockFloor {
-    pub(crate) fn new(now_secs: u64, now_elapsed_ms: u64) -> Self {
+    pub(crate) fn new(now_secs: u64, now_elapsed_ms: Option<u64>) -> Self {
         Self {
             floor_secs: now_secs,
             anchor_elapsed_ms: now_elapsed_ms,
@@ -64,48 +79,66 @@ impl ClockFloor {
     /// The floor after observing `now_secs` alongside `now_elapsed_ms`, and
     /// whether it changed enough to be worth storing.
     ///
-    /// `None` for the monotonic reading means the caller had none, which is the
-    /// case at construction. The floor is then consulted and not advanced:
-    /// raising it needs proof that time passed, and reading it does not.
+    /// `None` for the monotonic reading means the caller had none. The floor is
+    /// then consulted and not advanced: raising it needs proof that time
+    /// passed, and reading it does not.
     pub(crate) fn observe(self, now_secs: u64, now_elapsed_ms: Option<u64>) -> (Self, bool) {
         let Some(now_elapsed_ms) = now_elapsed_ms else {
             return (self, false);
         };
 
-        // A monotonic reading below the anchor means the device rebooted, since
-        // the counter restarts there, so nothing can be proven about the gap.
-        // The anchor is moved to the new reading and the floor is left alone.
-        // That is safe because a stale floor is still a lower bound on real
-        // time: when the clock reads later than the floor, the clock is used.
-        // The cost is that the floor lags by however long the device was off,
-        // so a rewind that far back is not detected.
-        if now_elapsed_ms < self.anchor_elapsed_ms {
-            return (
-                Self {
-                    floor_secs: self.floor_secs,
-                    anchor_elapsed_ms: now_elapsed_ms,
-                },
-                true,
-            );
+        // No anchor yet, or a reading below the one held, which means the device
+        // rebooted since the counter restarts there. Either way nothing can be
+        // proven about the gap, so the reading is adopted as the anchor and the
+        // floor is left alone.
+        //
+        // Safe because the floor only has to be a lower bound on real time, and
+        // a stale lower bound is still valid: when the clock reads later than
+        // the floor, the clock is used. The cost is that the floor lags by
+        // however long the device was off, so a rewind that far back is not
+        // detected.
+        let anchor = match self.anchor_elapsed_ms {
+            Some(anchor) if now_elapsed_ms >= anchor => anchor,
+            _ => {
+                return (
+                    Self {
+                        floor_secs: self.floor_secs,
+                        anchor_elapsed_ms: Some(now_elapsed_ms),
+                    },
+                    true,
+                )
+            }
+        };
+
+        let proven_secs = (now_elapsed_ms - anchor) / 1_000;
+        if proven_secs == 0 {
+            // Nothing proven, so nothing to advance by, and the anchor stays
+            // where it is so the next observation measures from the same point
+            // rather than restarting the measurement. Not storing this is also
+            // what keeps a decision from writing to storage every time.
+            return (self, false);
         }
 
-        let proven_secs = (now_elapsed_ms - self.anchor_elapsed_ms) / 1_000;
-        let ceiling = self
-            .floor_secs
-            .saturating_add(proven_secs)
-            .saturating_add(ADVANCE_SLACK_SECS);
+        let ceiling = self.floor_secs.saturating_add(proven_secs);
         let advanced = Self {
             floor_secs: self.floor_secs.max(now_secs.min(ceiling)),
-            anchor_elapsed_ms: now_elapsed_ms,
+            anchor_elapsed_ms: Some(now_elapsed_ms),
         };
-        let changed = advanced.floor_secs != self.floor_secs
-            || advanced.anchor_elapsed_ms != self.anchor_elapsed_ms;
-        (advanced, changed)
+        (advanced, true)
     }
 
-    /// The time to evaluate validity at: never earlier than the floor.
-    pub(crate) fn effective_secs(&self, now_secs: u64) -> u64 {
-        now_secs.max(self.floor_secs)
+    /// The readings to judge validity with: the clock as given, and an expiry
+    /// time never earlier than the floor.
+    pub(crate) fn clock_at(&self, now_secs: u64) -> PolicyClock {
+        let effective = now_secs.max(self.floor_secs);
+        PolicyClock {
+            clock_secs: i64::try_from(now_secs).unwrap_or(i64::MAX),
+            // Saturating rather than unreachable: a floor this code produced is
+            // bounded, but one read back from a corrupt or tampered record can
+            // carry any `u64`. Saturating sends that to "everything expired",
+            // which refuses.
+            effective_secs: i64::try_from(effective).unwrap_or(i64::MAX),
+        }
     }
 }
 
@@ -114,73 +147,123 @@ mod tests {
     use super::*;
 
     const MIN: u64 = 60;
+    const DAY: u64 = 24 * 3600;
 
     #[test]
-    fn winding_the_clock_back_does_not_move_the_evaluated_time_back() {
-        let floor = ClockFloor::new(1_000_000, 0);
+    fn winding_the_clock_back_does_not_move_the_expiry_time_back() {
+        let floor = ClockFloor::new(1_000_000, Some(0));
         let (floor, _) = floor.observe(1_000_000 + 10 * MIN, Some(10 * MIN * 1_000));
 
-        // The attack: the date is set back a week. The floor is what validity
-        // is judged against, so an expired policy stays expired.
-        assert_eq!(
-            floor.effective_secs(1_000_000 - 7 * 24 * 3600),
-            1_000_000 + 10 * MIN
-        );
+        // The attack: the date is set back a week. Expiry is judged against the
+        // floor, so an expired policy stays expired.
+        let clock = floor.clock_at(1_000_000 - 7 * DAY);
+        assert_eq!(clock.effective_secs, (1_000_000 + 10 * MIN) as i64);
+        // The clock reading itself is reported as it is, because the
+        // not-yet-valid bound must not be moved later.
+        assert_eq!(clock.clock_secs, (1_000_000 - 7 * DAY) as i64);
     }
 
     #[test]
     fn a_clock_set_far_forward_cannot_park_the_floor_there() {
-        let floor = ClockFloor::new(1_000_000, 0);
+        let floor = ClockFloor::new(1_000_000, Some(5_000));
 
-        // One reading from a clock set decades ahead, a second of monotonic
+        // One reading from a clock set decades ahead, one second of monotonic
         // time after the anchor.
-        let (poisoned, _) = floor.observe(4_000_000_000, Some(1_000));
+        let (poisoned, _) = floor.observe(4_000_000_000, Some(6_000));
+        assert_eq!(
+            poisoned.floor_secs, 1_000_001,
+            "the floor may only advance by the proven second"
+        );
 
-        // The floor moved by the proven second plus the slack, not by decades,
-        // so a policy signed today is still inside its window afterwards.
-        assert!(
-            poisoned.floor_secs <= 1_000_000 + 1 + ADVANCE_SLACK_SECS,
-            "floor advanced to {}",
-            poisoned.floor_secs
+        // And the same reading on a device that has been up for weeks, which is
+        // the case a zero anchor used to credit in full.
+        let (poisoned, _) = floor.observe(4_000_000_000, Some(5_000 + 40 * DAY * 1_000));
+        assert_eq!(
+            poisoned.floor_secs,
+            1_000_000 + 40 * DAY,
+            "uptime past the anchor is proven time, but no more than that"
         );
     }
 
     #[test]
+    fn a_floor_written_without_a_reading_only_anchors_on_the_next_one() {
+        // What construction writes: a floor with no anchor.
+        let floor = ClockFloor::new(1_000_000, None);
+        assert_eq!(floor.anchor_elapsed_ms, None);
+
+        // A device up for 40 days, clock set far forward. Crediting the uptime
+        // here would move the floor past every validity window and refuse the
+        // warden replacement that would fix it.
+        let (anchored, changed) = floor.observe(4_000_000_000, Some(40 * DAY * 1_000));
+        assert!(changed);
+        assert_eq!(
+            anchored.floor_secs, 1_000_000,
+            "an unanchored floor cannot advance, only anchor"
+        );
+        assert_eq!(anchored.anchor_elapsed_ms, Some(40 * DAY * 1_000));
+    }
+
+    #[test]
+    fn repeated_observations_do_not_walk_the_floor_forward() {
+        let mut floor = ClockFloor::new(1_000_000, Some(1_000));
+
+        // The clock is set a month ahead and the caller asks 10,000 times
+        // within the same monotonic second. Granting any tolerance per call
+        // would walk the floor there; proven time grants none.
+        for _ in 0..10_000 {
+            let (next, changed) = floor.observe(1_000_000 + 30 * DAY, Some(1_000));
+            assert!(!changed, "nothing proven, so nothing to store");
+            floor = next;
+        }
+        assert_eq!(floor.floor_secs, 1_000_000);
+        assert_eq!(floor.anchor_elapsed_ms, Some(1_000));
+    }
+
+    #[test]
     fn the_floor_tracks_time_that_monotonic_proves_passed() {
-        let floor = ClockFloor::new(1_000_000, 5_000);
+        let floor = ClockFloor::new(1_000_000, Some(5_000));
         let (floor, changed) = floor.observe(1_000_000 + 30 * MIN, Some(5_000 + 30 * MIN * 1_000));
 
         assert!(changed);
         assert_eq!(floor.floor_secs, 1_000_000 + 30 * MIN);
-        assert_eq!(floor.anchor_elapsed_ms, 5_000 + 30 * MIN * 1_000);
+        assert_eq!(floor.anchor_elapsed_ms, Some(5_000 + 30 * MIN * 1_000));
     }
 
     #[test]
     fn a_reboot_re_anchors_without_advancing_the_floor() {
-        let floor = ClockFloor::new(1_000_000, 9_000_000);
-        let (floor, changed) = floor.observe(1_000_000 + 24 * 3600, Some(12_000));
+        let floor = ClockFloor::new(1_000_000, Some(9_000_000));
+        let (floor, changed) = floor.observe(1_000_000 + DAY, Some(12_000));
 
         assert!(changed, "the anchor has to follow the restarted counter");
         assert_eq!(
             floor.floor_secs, 1_000_000,
             "nothing proves the gap, so the floor cannot advance"
         );
-        assert_eq!(floor.anchor_elapsed_ms, 12_000);
+        assert_eq!(floor.anchor_elapsed_ms, Some(12_000));
         // Still usable: the clock reads later than the floor, so the clock wins.
         assert_eq!(
-            floor.effective_secs(1_000_000 + 24 * 3600),
-            1_000_000 + 24 * 3600
+            floor.clock_at(1_000_000 + DAY).effective_secs,
+            (1_000_000 + DAY) as i64
         );
     }
 
     #[test]
     fn no_monotonic_reading_consults_the_floor_without_advancing_it() {
-        let floor = ClockFloor::new(1_000_000, 4_000);
+        let floor = ClockFloor::new(1_000_000, Some(4_000));
         let (same, changed) = floor.observe(1_000_000 + 3600, None);
 
         assert!(!changed);
         assert_eq!(same.floor_secs, 1_000_000);
-        assert_eq!(same.anchor_elapsed_ms, 4_000);
-        assert_eq!(same.effective_secs(999_000), 1_000_000);
+        assert_eq!(same.anchor_elapsed_ms, Some(4_000));
+        assert_eq!(same.clock_at(999_000).effective_secs, 1_000_000);
+    }
+
+    #[test]
+    fn a_corrupt_floor_saturates_to_everything_expired() {
+        let floor = ClockFloor {
+            floor_secs: u64::MAX,
+            anchor_elapsed_ms: Some(0),
+        };
+        assert_eq!(floor.clock_at(1_000_000).effective_secs, i64::MAX);
     }
 }

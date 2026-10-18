@@ -840,7 +840,7 @@ impl KeepMobile {
         // because refusing to open the app is not better than refusing every
         // spend, and the fault is retried before each decision.
         match Self::startup_policy_now(&storage) {
-            Ok(now_secs) => Self::load_policy_into(&storage, &mut evaluator, now_secs),
+            Ok(clock) => Self::load_policy_into(&storage, &mut evaluator, clock),
             Err(_) => {
                 tracing::error!(
                     "Time floor unreadable, every policy rule will refuse until it is read"
@@ -1853,12 +1853,12 @@ impl KeepMobile {
         // Judged against the floor, not the raw clock, so a bundle that is
         // already expired cannot be installed by winding the date back to
         // inside its window.
-        let now_secs = self.policy_now(None)?;
-        bundle.verify_timestamp_at(now_secs)?;
+        let clock = self.policy_now(None)?;
+        bundle.verify_timestamp_at(clock)?;
 
         // A transient fault must not push the caller into discarding a
         // warden-signed policy, so the record gets another read first.
-        self.reload_policy_if_transient(None)?;
+        self.reload_policy_if_transient(clock)?;
 
         let mut policy = self.policy_write_lock()?;
         // Refused when the stored record cannot say how old it is, rather than
@@ -1923,7 +1923,22 @@ impl KeepMobile {
     /// advance, so passing a stale or invented value holds the floor still
     /// rather than moving it anywhere useful.
     pub fn policy_status(&self, now_elapsed_ms: u64) -> Result<PolicyStatus, KeepMobileError> {
-        self.reload_policy_if_transient(Some(now_elapsed_ms))?;
+        // The floor is advanced here, before anything can return early. It is
+        // what makes winding the clock back detectable, and a floor that only
+        // moved while the policy happened to be faulted would never move on a
+        // working install, which is the case the attack is run against.
+        let clock = match self.policy_now(Some(now_elapsed_ms)) {
+            Ok(clock) => clock,
+            // Reported as a fault rather than an error: a caller rendering
+            // status must be able to say the policy cannot be trusted, and
+            // without the floor nothing says the clock was not wound back.
+            Err(_) => {
+                return Ok(PolicyStatus::Faulted {
+                    fault: PolicyFault::Unreadable,
+                })
+            }
+        };
+        self.reload_policy_if_transient(clock)?;
         Ok(self.policy_read_lock()?.status())
     }
 
@@ -1953,8 +1968,23 @@ impl KeepMobile {
         now_elapsed_ms: u64,
     ) -> Result<PolicyDecision, KeepMobileError> {
         self.reload_velocity_if_unknown()?;
-        self.reload_policy_if_transient(Some(now_elapsed_ms))?;
-        self.policy_read_lock()?.evaluate(&ctx)
+        // As in `policy_status`: advanced before any early return, so the floor
+        // tracks on an install where nothing is faulted.
+        let clock = match self.policy_now(Some(now_elapsed_ms)) {
+            Ok(clock) => clock,
+            // A refusal, not an error. The contract on `evaluate` says an error
+            // is not a decision, so a floor that cannot be read would leave the
+            // guarantee resting on the foreign caller honoring that; answering
+            // `Deny` here keeps it on this side of the boundary.
+            Err(_) => {
+                return Ok(PolicyDecision::Deny {
+                    reason: "Cannot evaluate the spending policy: the time floor is unreadable"
+                        .into(),
+                })
+            }
+        };
+        self.reload_policy_if_transient(clock)?;
+        self.policy_read_lock()?.evaluate(&ctx, clock)
     }
 
     /// Counts a spend against the velocity limits.
@@ -3567,7 +3597,7 @@ impl KeepMobile {
         pubkey: [u8; POLICY_PUBKEY_LEN],
         trust: bool,
     ) -> Result<(), KeepMobileError> {
-        let now_secs = self.policy_now(None)?;
+        let clock = self.policy_now(None)?;
         let mut policy = self.policy_write_lock()?;
         if policy.trusted_wardens().contains(&pubkey) == trust {
             return Ok(());
@@ -3580,7 +3610,7 @@ impl KeepMobile {
         }
         persistence::persist_trusted_wardens(&self.storage, &wardens)?;
         policy.set_trusted_wardens(wardens);
-        Self::load_policy_into(&self.storage, &mut policy, now_secs);
+        Self::load_policy_into(&self.storage, &mut policy, clock);
         Ok(())
     }
 
@@ -4072,6 +4102,50 @@ impl KeepMobile {
             })
     }
 
+    /// The time to judge policy validity at, never earlier than the floor.
+    ///
+    /// `now_elapsed_ms` is the platform's monotonic reading, as
+    /// [`SigningRateLimiter::check_and_record`] already takes. `None` means the
+    /// caller has none, which consults the floor without advancing it: raising
+    /// it needs proof that time passed, and reading it does not.
+    ///
+    /// A floor that cannot be read is an error, not an absence. Nothing then
+    /// says the clock was not wound back, and the callers turn that into a
+    /// refusal, because the alternative is trusting the one input this exists
+    /// to distrust.
+    ///
+    /// [`SigningRateLimiter::check_and_record`]: crate::SigningRateLimiter::check_and_record
+    fn policy_now(
+        &self,
+        now_elapsed_ms: Option<u64>,
+    ) -> Result<clock_floor::PolicyClock, KeepMobileError> {
+        Self::floor_now(&self.storage, now_elapsed_ms)
+    }
+
+    /// [`Self::policy_now`] before there is a `self`, for the load the
+    /// constructor does.
+    fn startup_policy_now(
+        storage: &Arc<dyn SecureStorage>,
+    ) -> Result<clock_floor::PolicyClock, KeepMobileError> {
+        Self::floor_now(storage, None)
+    }
+
+    fn floor_now(
+        storage: &Arc<dyn SecureStorage>,
+        now_elapsed_ms: Option<u64>,
+    ) -> Result<clock_floor::PolicyClock, KeepMobileError> {
+        let now_secs = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
+        let stored = persistence::load_clock_floor(storage)?;
+        let floor =
+            stored.unwrap_or_else(|| clock_floor::ClockFloor::new(now_secs, now_elapsed_ms));
+        let (observed, changed) = floor.observe(now_secs, now_elapsed_ms);
+        // A first write counts as changed, so the floor exists from here on.
+        if changed || stored.is_none() {
+            persistence::persist_clock_floor(storage, &observed)?;
+        }
+        Ok(observed.clock_at(now_secs))
+    }
+
     /// Loads the stored wardens and policy into `evaluator`, deciding which of
     /// the three states the records put it in.
     ///
@@ -4092,51 +4166,10 @@ impl KeepMobile {
     /// warden was trusted, so an empty set with a bundle present means the
     /// record was lost, which is exactly the case that must not read as "no
     /// policy".
-    /// The time to judge policy validity at, never earlier than the floor.
-    ///
-    /// `now_elapsed_ms` is the platform's monotonic reading, as
-    /// [`SigningRateLimiter::check_and_record`] already takes. `None` means the
-    /// caller has none, which consults the floor without advancing it: raising
-    /// it needs proof that time passed, and reading it does not.
-    ///
-    /// A floor that cannot be read is an error, not an absence. Nothing then
-    /// says the clock was not wound back, and the callers turn that into a
-    /// refusal, because the alternative is trusting the one input this exists
-    /// to distrust.
-    ///
-    /// [`SigningRateLimiter::check_and_record`]: crate::SigningRateLimiter::check_and_record
-    fn policy_now(&self, now_elapsed_ms: Option<u64>) -> Result<i64, KeepMobileError> {
-        Self::floor_now(&self.storage, now_elapsed_ms)
-    }
-
-    /// [`Self::policy_now`] before there is a `self`, for the load the
-    /// constructor does.
-    fn startup_policy_now(storage: &Arc<dyn SecureStorage>) -> Result<i64, KeepMobileError> {
-        Self::floor_now(storage, None)
-    }
-
-    fn floor_now(
-        storage: &Arc<dyn SecureStorage>,
-        now_elapsed_ms: Option<u64>,
-    ) -> Result<i64, KeepMobileError> {
-        let now_secs = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or(0);
-        let stored = persistence::load_clock_floor(storage)?;
-        let floor = stored
-            .unwrap_or_else(|| clock_floor::ClockFloor::new(now_secs, now_elapsed_ms.unwrap_or(0)));
-        let (observed, changed) = floor.observe(now_secs, now_elapsed_ms);
-        // A first write counts as changed, so the floor exists from here on.
-        if changed || stored.is_none() {
-            persistence::persist_clock_floor(storage, &observed)?;
-        }
-        // Back to the signed seconds the validity checks take. The advance is
-        // bounded, so the floor cannot reach the saturating case.
-        Ok(i64::try_from(observed.effective_secs(now_secs)).unwrap_or(i64::MAX))
-    }
-
     fn load_policy_into(
         storage: &Arc<dyn SecureStorage>,
         evaluator: &mut PolicyEvaluator,
-        now_secs: i64,
+        clock: clock_floor::PolicyClock,
     ) {
         match persistence::load_trusted_wardens(storage) {
             Ok(wardens) => evaluator.set_trusted_wardens(wardens),
@@ -4205,7 +4238,7 @@ impl KeepMobile {
             return;
         }
 
-        match bundle.timestamp_fault_at(now_secs) {
+        match bundle.timestamp_fault_at(clock) {
             None => evaluator.set_policy(bundle),
             Some(fault) => {
                 tracing::error!(
@@ -4227,7 +4260,7 @@ impl KeepMobile {
     /// re-run the load themselves.
     fn reload_policy_if_transient(
         &self,
-        now_elapsed_ms: Option<u64>,
+        clock: clock_floor::PolicyClock,
     ) -> Result<(), KeepMobileError> {
         // Bound to a local first. Folding this into the `if` condition, or into
         // a `match`, keeps the read guard alive across `policy_write_lock` and
@@ -4236,9 +4269,8 @@ impl KeepMobile {
         if !fault.is_some_and(PolicyFault::is_transient) {
             return Ok(());
         }
-        let now_secs = self.policy_now(now_elapsed_ms)?;
         let mut policy = self.policy_write_lock()?;
-        Self::load_policy_into(&self.storage, &mut policy, now_secs);
+        Self::load_policy_into(&self.storage, &mut policy, clock);
         Ok(())
     }
 
@@ -7926,7 +7958,7 @@ mod velocity_fault_tests {
             CLOCK_FLOOR_STORAGE_KEY,
             serde_json::to_vec(&crate::clock_floor::ClockFloor {
                 floor_secs: now + 40 * 24 * 3600,
-                anchor_elapsed_ms: 5_000,
+                anchor_elapsed_ms: Some(5_000),
             })
             .unwrap(),
         );
@@ -7973,5 +8005,77 @@ mod velocity_fault_tests {
             .evaluate_policy(a_spend(), 0)
             .map(|d| matches!(d, PolicyDecision::Deny { .. }))
             .unwrap_or(true));
+    }
+
+    /// The floor has to advance on an install where nothing is wrong, which is
+    /// the only kind the attack is run against. A floor that moved only while
+    /// the policy happened to be faulted would never move at all on a working
+    /// device, so the record would keep the value it was written with at first
+    /// launch and a wound-back clock would sail past it.
+    #[test]
+    fn the_floor_advances_on_an_install_with_nothing_faulted() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        // Nothing is faulted, so the reload path returns without doing
+        // anything; only a floor advanced ahead of that check can move.
+        assert!(matches!(
+            mobile.policy_status(1_000).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+
+        let written: crate::clock_floor::ClockFloor =
+            serde_json::from_slice(&storage.raw(CLOCK_FLOOR_STORAGE_KEY).expect("floor written"))
+                .unwrap();
+        assert_eq!(
+            written.anchor_elapsed_ms,
+            Some(1_000),
+            "the reading has to reach the floor on a healthy install"
+        );
+
+        // And a later reading is adopted, so the measurement follows the device
+        // rather than staying pinned to the first call.
+        mobile.evaluate_policy(a_spend(), 3_601_000).unwrap();
+        let written: crate::clock_floor::ClockFloor =
+            serde_json::from_slice(&storage.raw(CLOCK_FLOOR_STORAGE_KEY).unwrap()).unwrap();
+        assert_eq!(written.anchor_elapsed_ms, Some(3_601_000));
+    }
+
+    /// A policy that was in force when it was read must stop being enforced
+    /// once it expires, without waiting for anything to re-read it. Nothing
+    /// re-reads a policy that is not faulted, so judging validity only where
+    /// the record is loaded leaves a running process enforcing retired rules
+    /// for as long as it stays up.
+    #[test]
+    fn an_active_policy_stops_being_enforced_once_it_expires() {
+        let now = Utc::now().timestamp() as u64;
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status(0).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+
+        // Time moves past the window. Staged through the floor because the real
+        // clock cannot be moved under test; the anchor is ahead of the reading
+        // passed in, so the observation leaves the planted floor alone.
+        storage.plant(
+            CLOCK_FLOOR_STORAGE_KEY,
+            serde_json::to_vec(&crate::clock_floor::ClockFloor {
+                floor_secs: now + 40 * 24 * 3600,
+                anchor_elapsed_ms: Some(9_000_000),
+            })
+            .unwrap(),
+        );
+
+        assert!(
+            matches!(
+                mobile.evaluate_policy(a_spend(), 0).unwrap(),
+                PolicyDecision::Deny { .. }
+            ),
+            "an expired bundle must refuse even while memory still holds it as active"
+        );
     }
 }

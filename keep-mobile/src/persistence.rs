@@ -117,6 +117,8 @@ pub(crate) fn persist_policy(
 /// at a generous 128 bytes per entry against a worst case nearer 75.
 const VELOCITY_RECORD_MAX_LEN: usize = 128 * MAX_TRACKED_TRANSACTIONS + 1024;
 
+const CLOCK_FLOOR_RECORD_MAX_LEN: usize = 256;
+
 /// Reads the stored time floor, or `None` when none has been written yet.
 ///
 /// A read failure is an error rather than an absence, and the caller refuses on
@@ -126,6 +128,12 @@ pub(crate) fn load_clock_floor(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<Option<ClockFloor>, KeepMobileError> {
     match storage.load_share_by_key(CLOCK_FLOOR_STORAGE_KEY.into()) {
+        // Bounded before the parse, as the policy and counter records are. Two
+        // integer fields, so the ceiling is generous and still refuses anything
+        // that is not this record.
+        Ok(data) if data.len() > CLOCK_FLOOR_RECORD_MAX_LEN => Err(KeepMobileError::StorageError {
+            msg: "Clock floor record exceeds the maximum length".into(),
+        }),
         Ok(data) => serde_json::from_slice(&data)
             .map(Some)
             // Without serde's message, which quotes the value it tripped on.
