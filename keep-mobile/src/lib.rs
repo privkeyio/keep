@@ -2294,8 +2294,10 @@ impl KeepMobile {
     ///
     /// The one exception is the first warden on a device that has never had
     /// one and holds no policy: there is no one yet to authorize it, and such a
-    /// device has nothing to protect. A device that holds a policy and has lost
-    /// every warden accepts no new one; wiping the app data is the way out.
+    /// device has nothing to protect. A device that holds a policy and has no
+    /// warden left in its set accepts no new one; wiping the app data is the
+    /// way out. One whose wardens record was lost outright gets the stored
+    /// policy's signer back instead.
     ///
     /// Trusting a warden re-runs the stored policy against the new set, which
     /// is how a policy faulted for an untrusted signer comes back into force
@@ -2312,9 +2314,9 @@ impl KeepMobile {
     /// Stops trusting a warden, on the authority of one trusted, which may be
     /// the warden being removed.
     ///
-    /// Untrusting a warden re-runs the stored policy too, so a policy that only
-    /// that warden vouched for stops being in force rather than staying in
-    /// memory after the signer behind it was withdrawn.
+    /// The signer of the stored policy cannot be removed while that policy is
+    /// stored; a rotation installs a replacement signed by another warden
+    /// first, or revokes the policy.
     pub fn remove_trusted_warden(
         &self,
         pubkey_hex: String,
@@ -3942,19 +3944,41 @@ impl KeepMobile {
             wardens.insert(pubkey);
         } else {
             wardens.remove(&pubkey);
+            let stored = match persistence::load_policy(&self.storage) {
+                Ok(bundle) => Some(Some(bundle)),
+                Err(KeepMobileError::StorageNotFound) => None,
+                Err(KeepMobileError::InvalidPolicy { .. }) => Some(None),
+                Err(e) => return Err(e),
+            };
+            // The signer of the stored policy stays while it is stored, which
+            // is what lets a lost wardens record be rebuilt from that signer
+            // without trusting a warden that was taken out. A rotation away
+            // from a compromised key installs a replacement signed by another
+            // warden first. A record that cannot be read now may verify later,
+            // so it refuses above; one that will never parse names no signer.
+            if let Some(Some(bundle)) = &stored {
+                if bundle.warden_pubkey == pubkey
+                    && bundle.verify_signature().is_ok()
+                    && bundle.verify_hash().is_ok()
+                {
+                    return Err(KeepMobileError::InvalidPolicy {
+                        msg: "The stored policy's signer stays trusted while that policy is \
+                              stored; install a replacement signed by another warden, or \
+                              revoke the policy first"
+                            .into(),
+                    });
+                }
+            }
             // Emptying the set under a stored policy leaves nothing able to
             // revoke it, so the only way out is a wipe that loses the share.
             // A rotation adds the new key first and never gets here; the way
             // to disengage entirely is to revoke the policy first. Only keys
             // that can sign count, since one stored before keys were checked
             // as curve points keeps the set non-empty and revokes nothing.
-            if !wardens
-                .iter()
-                .any(|key| k256::schnorr::VerifyingKey::from_bytes(key).is_ok())
-                && !matches!(
-                    persistence::load_policy(&self.storage),
-                    Err(KeepMobileError::StorageNotFound)
-                )
+            if stored.is_some()
+                && !wardens
+                    .iter()
+                    .any(|key| k256::schnorr::VerifyingKey::from_bytes(key).is_ok())
             {
                 return Err(KeepMobileError::InvalidPolicy {
                     msg: "Removing the last trusted warden would leave the stored policy with \
@@ -4034,13 +4058,16 @@ impl KeepMobile {
             Ok(bundle) if bundle.verify_signature().is_ok() && bundle.verify_hash().is_ok() => {
                 bundle.warden_pubkey
             }
-            _ => {
+            Ok(_) | Err(KeepMobileError::InvalidPolicy { .. }) => {
                 return Err(KeepMobileError::StorageError {
                     msg: "The trusted wardens record is missing beside a stored policy that \
                           does not verify; wipe the app data to recover"
                         .into(),
                 })
             }
+            // A read that failed may succeed on the next call, so it is
+            // reported as it is rather than as a reason to wipe.
+            Err(e) => return Err(e),
         };
         let set = persistence::WardenSet {
             wardens: std::collections::HashSet::from([signer]),
@@ -4669,7 +4696,8 @@ impl KeepMobile {
     /// refuses an empty set. A bundle can only have been stored while some
     /// warden was trusted, so an empty set with a bundle present means the
     /// record was lost, which is exactly the case that must not read as "no
-    /// policy".
+    /// policy". Construction rebuilds a lost record from the bundle's signer
+    /// before this runs, so absent here means that rebuild could not happen.
     fn load_policy_into(
         storage: &Arc<dyn SecureStorage>,
         evaluator: &mut PolicyEvaluator,
@@ -9565,13 +9593,14 @@ mod velocity_fault_tests {
         ));
     }
 
-    /// A policy whose signer was untrusted before it was replaced no longer
-    /// verifies, so the warden left is not expected to know its digest; it
-    /// revokes it by the fixed subject.
+    /// The stored policy's signer cannot be removed while that policy is in
+    /// place, so a lost wardens record rebuilt from the signer never trusts a
+    /// warden that was taken out. Installing a replacement signed by another
+    /// warden first lets the removal through.
     #[test]
-    fn a_policy_whose_signer_was_removed_is_revoked_by_the_remaining_warden() {
+    fn the_stored_policy_signer_stays_until_the_policy_is_replaced() {
         let storage = Arc::new(FaultingStorage::default());
-        let (signer, _bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        let (signer, bundle) = plant_signed_policy(&storage, &capped_rules(), true);
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         let other = new_warden();
         let add = warden_change(
@@ -9583,6 +9612,21 @@ mod velocity_fault_tests {
         mobile
             .add_trusted_warden(hex::encode(pubkey_of(&other)), Some(add))
             .unwrap();
+
+        let remove = warden_change(
+            &mobile,
+            &other,
+            WardenAction::RemoveWarden,
+            &pubkey_of(&signer),
+        );
+        assert!(mobile
+            .remove_trusted_warden(hex::encode(pubkey_of(&signer)), remove)
+            .is_err());
+
+        let replacement = create_test_bundle_with(&other, &capped_rules(), bundle.created_at + 1);
+        mobile
+            .import_policy(hex::encode(replacement.to_bytes()))
+            .unwrap();
         let remove = warden_change(
             &mobile,
             &other,
@@ -9592,6 +9636,29 @@ mod velocity_fault_tests {
         mobile
             .remove_trusted_warden(hex::encode(pubkey_of(&signer)), remove)
             .unwrap();
+        assert_eq!(
+            mobile.list_trusted_wardens().unwrap(),
+            vec![hex::encode(pubkey_of(&other))]
+        );
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    /// A policy whose signer is no longer trusted, as on a device that removed
+    /// it before the signer had to stay, does not verify, so the warden left is
+    /// not expected to know its digest; it revokes it by the fixed subject.
+    #[test]
+    fn a_policy_whose_signer_was_removed_is_revoked_by_the_remaining_warden() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_signed_policy(&storage, &capped_rules(), false);
+        let other = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&other))]).unwrap(),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         assert!(matches!(
             mobile.policy_status(None).unwrap(),
             PolicyStatus::Faulted {
