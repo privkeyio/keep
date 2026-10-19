@@ -4092,7 +4092,7 @@ dependencies = [
  "log",
  "num-traits",
  "ouroboros",
- "qrcode",
+ "qrcode 0.13.0",
  "rustc-hash 2.1.2",
  "thiserror 2.0.21",
  "unicode-segmentation",
@@ -4653,7 +4653,7 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "p256",
- "qrcode",
+ "qrcode 0.14.1",
  "ratatui",
  "reqwest",
  "rustls",
@@ -7272,6 +7272,12 @@ name = "qrcode"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"
