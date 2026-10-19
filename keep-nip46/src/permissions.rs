@@ -623,6 +623,7 @@ impl PermissionManager {
                     })
                     .collect(),
                 explicitly_remembered: Some(app.explicitly_remembered),
+                kinds_vetted: true,
             })
             .collect()
     }

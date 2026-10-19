@@ -77,13 +77,19 @@ pub struct StoredBunkerPermission {
     pub timed_kind_grants: Vec<StoredTimedKindGrant>,
     /// Whether the user made an explicit remember-decision for this app (picking
     /// a `Forever` or timed duration on the approval prompt), as opposed to a
-    /// bare connection or a client-requested connect-time kind scope. Only
+    /// bare connection or the kinds seeded at connect. Only
     /// remembered apps are persisted and restored, so a merely-connected client
     /// must re-present the connect secret after a restart. `None` marks a legacy
     /// row written before this field existed; the bunker falls back to inspecting
     /// the row's grants on restore.
     #[serde(default)]
     pub explicitly_remembered: Option<bool>,
+    /// Whether `auto_approve_kinds` holds only kinds the user or operator
+    /// granted. Rows written while a client's own connect request could still
+    /// add auto-approve kinds lack it, and since those kinds cannot be told
+    /// apart from the user's, a row without it restores with none.
+    #[serde(default)]
+    pub kinds_vetted: bool,
 }
 
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
@@ -271,6 +277,7 @@ impl RelayConfig {
                 connected_at: bp.connected_at,
                 timed_kind_grants: bp.timed_kind_grants,
                 explicitly_remembered: bp.explicitly_remembered,
+                kinds_vetted: bp.kinds_vetted,
             });
         }
 
