@@ -2525,6 +2525,40 @@ impl KeepMobile {
         }
     }
 
+    /// Repairs the descriptor index, which every descriptor save and delete
+    /// refuses while it cannot be read. Each group this device holds a share
+    /// of whose descriptor record is stored is added, and nothing is removed,
+    /// so running it again once more shares read back recovers what an earlier
+    /// run missed. Refused when no shares are listed. Returns how many
+    /// descriptors the index lists afterwards.
+    ///
+    /// An index that cannot be read or parsed is replaced only with
+    /// `replace_unreadable`, since the share list can under-report and a
+    /// failed read may succeed later; otherwise its error is returned, which
+    /// for one that will not parse starts with "Descriptor index is
+    /// unreadable". Replacing leaves the
+    /// descriptors it listed for groups not held here stored but unlisted
+    /// until saved again, so the app passes `replace_unreadable` only after
+    /// the user confirms, having retried first.
+    pub fn wallet_descriptor_repair_index(
+        &self,
+        replace_unreadable: bool,
+    ) -> Result<u32, KeepMobileError> {
+        let _guard =
+            self.descriptor_write_lock
+                .lock()
+                .map_err(|_| KeepMobileError::StorageError {
+                    msg: "descriptor lock poisoned".into(),
+                })?;
+        let held = self
+            .storage
+            .list_all_shares()
+            .into_iter()
+            .map(|meta| hex::encode(meta.group_pubkey));
+        let index = persistence::repair_descriptor_index(&self.storage, held, replace_unreadable)?;
+        Ok(u32::try_from(index.len()).unwrap_or(u32::MAX))
+    }
+
     pub fn wallet_descriptor_delete(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
         persistence::delete_descriptor(&self.storage, &group_pubkey)
@@ -3234,7 +3268,23 @@ impl KeepMobile {
         // the share material behind a generic failure. Surfacing this properly
         // needs a channel the exported signature does not have; `unreadable` is
         // the seam for it.
-        let load = persistence::load_descriptors(&self.storage)?;
+        // The same holds for an index that cannot be read, which no save or
+        // delete gets past until `wallet_descriptor_repair_index` runs: the
+        // descriptors of the groups held here are read without it, and any
+        // other group's is left out.
+        let load = match persistence::load_descriptors(&self.storage) {
+            Ok(load) => load,
+            Err(e) => {
+                tracing::warn!(
+                    "Descriptor index unreadable, backing up the descriptors of held groups only: {e}"
+                );
+                let held: std::collections::BTreeSet<String> = all_share_meta
+                    .iter()
+                    .map(|meta| hex::encode(&meta.group_pubkey))
+                    .collect();
+                persistence::load_listed_descriptors(&self.storage, held)
+            }
+        };
         if !load.unreadable.is_empty() {
             tracing::warn!(
                 unreadable = %load.unreadable.join(", "),
@@ -6480,8 +6530,16 @@ mod restore_backup_metadata_tests {
                 .cloned()
                 .ok_or(KeepMobileError::StorageNotFound)
         }
+        // Only writes that carry a group are shares, as on a platform store;
+        // the policy and descriptor records go through the same method.
         fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
-            self.metas.lock().unwrap().clone()
+            self.metas
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|m| !m.group_pubkey.is_empty())
+                .cloned()
+                .collect()
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.data.lock().unwrap().remove(&key);
@@ -6621,6 +6679,74 @@ mod restore_backup_metadata_tests {
             .restore_backup(bytes, "correct horse battery staple".into())
             .expect("the retry completes the restore");
         assert!(storage.load_share_by_key(hex::encode(group)).is_ok());
+    }
+
+    // An unreadable descriptor index refuses every descriptor save and delete,
+    // and must not cost the shares their backup as well. The descriptor of a
+    // group held here still goes into the backup, read without the index, and
+    // the reset lets descriptor writes through again.
+    #[test]
+    fn an_unreadable_descriptor_index_still_backs_up_and_can_be_reset() {
+        let group = [7u8; 32];
+        let pass = "correct horse battery staple";
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(true)],
+            [group, [8u8; 32]]
+                .map(|group_pubkey| keep_core::wallet::WalletDescriptor {
+                    group_pubkey,
+                    external_descriptor: "wpkh(xpub.../0/*)".into(),
+                    internal_descriptor: "wpkh(xpub.../1/*)".into(),
+                    network: "bitcoin".into(),
+                    created_at: 1_700_000_000,
+                    device_registrations: vec![],
+                    policy_hash: [9u8; 32],
+                    version: 1,
+                    previous_descriptor_hash: None,
+                    policy: None,
+                })
+                .to_vec(),
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            pass,
+        )
+        .expect("backup should build");
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        mobile.restore_backup(bytes, pass.into()).unwrap();
+        assert_eq!(mobile.wallet_descriptor_list().len(), 2);
+
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
+        assert!(mobile.wallet_descriptor_delete(hex::encode(group)).is_err());
+
+        let backup = mobile
+            .create_backup(pass.into())
+            .expect("an unreadable index must not deny the share backup");
+        let decrypted = decrypt_backup_data(&backup, pass).unwrap();
+        assert_eq!(decrypted.shares.len(), 1);
+        assert_eq!(
+            decrypted.wallet_descriptors.len(),
+            1,
+            "only the held group's descriptor is read without the index"
+        );
+        assert_eq!(decrypted.wallet_descriptors[0].group_pubkey, group);
+
+        assert!(mobile.wallet_descriptor_repair_index(false).is_err());
+        assert_eq!(mobile.wallet_descriptor_repair_index(true).unwrap(), 1);
+        assert_eq!(mobile.wallet_descriptor_list().len(), 1);
+        mobile
+            .wallet_descriptor_delete(hex::encode(group))
+            .expect("writes go through once the index is reset");
+        assert!(mobile.wallet_descriptor_list().is_empty());
     }
 
     fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {

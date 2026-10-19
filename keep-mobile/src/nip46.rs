@@ -28,12 +28,20 @@ use zeroize::{Zeroize, Zeroizing};
 /// implementation that waits forever stops every later request from every
 /// client, because the handler reads one at a time.
 ///
-/// Worth knowing when reading a denial: this and the platform's own 60 seconds
-/// are two timers started at nearly the same moment, so an answer that arrives
-/// within a hair of the deadline can be denied here after the operator
-/// approved it. Both orderings end in a denial when nobody answers, which is
-/// the direction that matters, and the window is a few milliseconds wide.
+/// The platform's own wait has to end before this one. Two timers of the same
+/// length started at nearly the same moment let an approval land on the
+/// platform side just after this side denied, and a platform that records the
+/// approval, such as trusting a client on connect, then holds state this side
+/// refused. [`nip46_approval_timeout_secs`] exports the value so a platform
+/// can derive its wait from it rather than copy it.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Seconds a bunker request waits for an answer before it is denied. A
+/// platform's [`BunkerCallbacks::request_approval`] has to give up sooner.
+#[uniffi::export]
+pub fn nip46_approval_timeout_secs() -> u64 {
+    APPROVAL_TIMEOUT.as_secs()
+}
 
 /// How many prompts may be waiting on the platform at once.
 ///
@@ -198,15 +206,15 @@ pub trait BunkerCallbacks: Send + Sync {
     /// Asks the operator to allow one request, blocking the caller until it is
     /// answered.
     ///
-    /// The implementation must bound that wait and reject when it expires
-    /// (keep-android waits 60 seconds). The NIP-46 handler reads one request at
-    /// a time, so a wait that never ends stops every later request from every
-    /// client, not just this one.
+    /// The implementation must bound that wait and reject when it expires,
+    /// sooner than [`nip46_approval_timeout_secs`]. The NIP-46 handler reads
+    /// one request at a time, so a wait that never ends stops every later
+    /// request from every client, not just this one.
     ///
-    /// That requirement is now backed rather than merely stated: an answer that
-    /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal. An
-    /// implementation that bounds its own wait, as keep-android does, decides
-    /// its own outcome; one that does not gets denied for it.
+    /// That requirement is backed rather than merely stated: an answer that
+    /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal, and
+    /// an approval the implementation records after that point is one this
+    /// side already refused.
     fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
