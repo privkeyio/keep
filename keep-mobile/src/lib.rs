@@ -3106,6 +3106,7 @@ impl KeepMobile {
             peer_policies: existing.peer_policies,
             kfp_v1_peer_policies: existing.kfp_v1_peer_policies,
             bunker_permissions: existing.bunker_permissions,
+            bunker_permissions_transport: existing.bunker_permissions_transport,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
@@ -3672,6 +3673,7 @@ impl KeepMobile {
                 peer_policies: rc.peer_policies.clone(),
                 kfp_v1_peer_policies: rc.kfp_v1_peer_policies.clone(),
                 bunker_permissions: rc.bunker_permissions.clone(),
+                bunker_permissions_transport: None,
             };
             prepared_relays.push((group_hex, stored_relay));
         }
@@ -4160,11 +4162,26 @@ impl KeepMobile {
 
     /// Load the persisted NIP-46 bunker permission grants from the global relay
     /// config, returning them ready to seed `ServerConfig::pre_grants` so
-    /// remembered grants survive a bunker restart.
-    pub(crate) fn load_bunker_permissions(&self) -> Vec<keep_core::relay::StoredBunkerPermission> {
+    /// remembered grants survive a bunker restart. Only grants made under
+    /// `transport_hex` are returned: a client remembered before a credential
+    /// rotation has to pair again.
+    pub(crate) fn load_bunker_permissions(
+        &self,
+        transport_hex: &str,
+    ) -> Vec<keep_core::relay::StoredBunkerPermission> {
         let key = relay_config_key(None);
         match persistence::load_relay_config(&self.storage, &key) {
-            Ok(Some(c)) => c.bunker_permissions,
+            Ok(Some(c)) if c.bunker_permissions_transport.as_deref() == Some(transport_hex) => {
+                c.bunker_permissions
+            }
+            Ok(Some(c)) => {
+                if !c.bunker_permissions.is_empty() {
+                    tracing::info!(
+                        "not restoring bunker grants made under other bunker credentials"
+                    );
+                }
+                Vec::new()
+            }
             Ok(None) => Vec::new(),
             // A real load error (decrypt/deserialize failure, corruption, or
             // tampering) is NOT the same as "no config yet". Seeding empty
@@ -4182,19 +4199,28 @@ impl KeepMobile {
         }
     }
 
-    /// Replace the persisted NIP-46 bunker permission grants with `grants`,
-    /// preserving the relay lists. Called from the engine's `persist_permissions`
-    /// callback after every grant write or revoke, so the durable store mirrors
-    /// the in-memory engine (the single source of truth).
+    /// Replace the persisted NIP-46 bunker permission grants with `grants`, made
+    /// under the bunker transport key `transport_hex`, preserving the relay
+    /// lists. Called from the engine's `persist_permissions` callback after
+    /// every grant write or revoke, so the durable store mirrors the in-memory
+    /// engine (the single source of truth). Nothing is written unless `serving`
+    /// holds once the lock is taken: a server still winding down after a stop
+    /// would otherwise write back grants a revoke cleared in the meantime.
     pub(crate) fn persist_bunker_permissions(
         &self,
         grants: Vec<keep_core::relay::StoredBunkerPermission>,
+        transport_hex: &str,
+        serving: impl FnOnce() -> bool,
     ) -> Result<(), KeepMobileError> {
         let key = relay_config_key(None);
         let _guard = self
             .relay_config_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if !serving() {
+            tracing::debug!("not persisting bunker grants from a stopped server");
+            return Ok(());
+        }
         let mut stored = match persistence::load_relay_config(&self.storage, &key) {
             Ok(Some(c)) => c,
             Ok(None) => persistence::StoredRelayConfig::default(),
@@ -4205,6 +4231,43 @@ impl KeepMobile {
             }
         };
         stored.bunker_permissions = grants;
+        stored.bunker_permissions_transport = Some(transport_hex.to_owned());
+        persistence::persist_relay_config(&self.storage, &key, &stored)
+    }
+
+    /// Drop the persisted NIP-46 grants of `client`, or of every client when
+    /// `None`, so a revoke holds when no bunker is running to persist it.
+    pub(crate) fn forget_bunker_permissions(
+        &self,
+        client: Option<&nostr_sdk::PublicKey>,
+    ) -> Result<(), KeepMobileError> {
+        let key = relay_config_key(None);
+        let _guard = self
+            .relay_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored = match persistence::load_relay_config(&self.storage, &key) {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(KeepMobileError::StorageError {
+                    msg: format!("failed to load existing relay config: {e}"),
+                });
+            }
+        };
+        let before = stored.bunker_permissions.len();
+        match client {
+            Some(client) => stored.bunker_permissions.retain(|grant| {
+                nostr_sdk::PublicKey::from_hex(&grant.pubkey_hex)
+                    .ok()
+                    .as_ref()
+                    != Some(client)
+            }),
+            None => stored.bunker_permissions.clear(),
+        }
+        if stored.bunker_permissions.len() == before {
+            return Ok(());
+        }
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 

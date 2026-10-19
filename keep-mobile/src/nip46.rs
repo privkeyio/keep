@@ -11,7 +11,7 @@ use keep_nip46::{
     ServerConfig, SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroize::{Zeroize, Zeroizing};
@@ -259,6 +259,11 @@ struct CallbackBridge {
     /// Prompts handed to the platform that have not come back, including the
     /// ones this side has already stopped waiting for.
     outstanding: Arc<AtomicUsize>,
+    /// The bunker transport pubkey this server serves, which the grants it
+    /// persists are tagged with.
+    transport_hex: String,
+    /// Cleared by `stop_bunker`, after which this server persists nothing.
+    serving: Arc<AtomicBool>,
 }
 
 impl CallbackBridge {
@@ -414,7 +419,14 @@ impl ServerCallbacks for CallbackBridge {
     }
 
     fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
-        if let Err(e) = self.mobile.persist_bunker_permissions(grants) {
+        let serving = || {
+            self.serving.load(Ordering::Acquire)
+                && *self.mobile.live_generation.borrow() == self.generation
+        };
+        if let Err(e) = self
+            .mobile
+            .persist_bunker_permissions(grants, &self.transport_hex, serving)
+        {
             tracing::warn!("failed to persist bunker permissions: {e}");
         }
     }
@@ -435,6 +447,9 @@ pub struct BunkerHandler {
     /// credential rotation cannot interleave with an in-flight start (which
     /// would otherwise finish serving the pre-rotation keys).
     start_rotate_lock: std::sync::Mutex<()>,
+    /// The `serving` flag of the server last started, which `stop_bunker`
+    /// clears.
+    serving: std::sync::Mutex<Arc<AtomicBool>>,
 }
 
 impl BunkerHandler {
@@ -444,6 +459,22 @@ impl BunkerHandler {
 
     fn load_status(&self) -> u8 {
         self.status.load(Ordering::Acquire)
+    }
+
+    fn start_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, KeepMobileError> {
+        self.start_rotate_lock
+            .lock()
+            .map_err(|_| KeepMobileError::StorageError {
+                msg: "bunker start/rotate lock poisoned".into(),
+            })
+    }
+
+    fn live_handler(&self) -> Option<Arc<SignerHandler>> {
+        self.handler
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
     }
 }
 
@@ -458,6 +489,7 @@ impl BunkerHandler {
             shutdown_tx: std::sync::Mutex::new(None),
             handler: std::sync::Mutex::new(None),
             start_rotate_lock: std::sync::Mutex::new(()),
+            serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
 
@@ -489,47 +521,42 @@ impl BunkerHandler {
         if let Some(tx) = tx {
             let _ = tx.send(());
         }
+        self.serving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(false, Ordering::Release);
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    /// Revokes a single client, dropping its in-memory permission grants in the
-    /// running engine so any remembered (auto-approved) kinds stop signing
-    /// immediately. No-op when the bunker is not running. The pubkey is the
-    /// client's hex-encoded x-only public key.
+    /// Revokes a single client: drops its grants in the running engine, so any
+    /// remembered (auto-approved) kinds stop signing immediately, and its
+    /// persisted grants, so a later start does not restore them. The pubkey is
+    /// the client's hex-encoded x-only public key.
     pub fn revoke_client(&self, pubkey: String) -> Result<(), KeepMobileError> {
-        let handler = self
-            .handler
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade);
-        let Some(handler) = handler else {
-            return Ok(());
-        };
         let pubkey = PublicKey::from_hex(&pubkey).map_err(|_| KeepMobileError::InvalidInput {
             msg: "Invalid client pubkey hex".into(),
         })?;
-        self.mobile
-            .runtime
-            .block_on(async { handler.revoke_client(&pubkey).await });
-        Ok(())
+        // A start between reading the persisted grants and publishing its
+        // handler would restore what this removes, unseen by either step.
+        let _start_guard = self.start_guard()?;
+        if let Some(handler) = self.live_handler() {
+            self.mobile
+                .runtime
+                .block_on(async { handler.revoke_client(&pubkey).await });
+        }
+        self.mobile.forget_bunker_permissions(Some(&pubkey))
     }
 
-    /// Revokes every client, clearing all in-memory permission grants in the
-    /// running engine. No-op when the bunker is not running.
-    pub fn revoke_all_clients(&self) {
-        let handler = self
-            .handler
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(std::sync::Weak::upgrade);
-        if let Some(handler) = handler {
+    /// Revokes every client, in the running engine and in the persisted grants.
+    pub fn revoke_all_clients(&self) -> Result<(), KeepMobileError> {
+        let _start_guard = self.start_guard()?;
+        if let Some(handler) = self.live_handler() {
             self.mobile
                 .runtime
                 .block_on(async { handler.revoke_all_clients().await });
         }
+        self.mobile.forget_bunker_permissions(None)
     }
 
     /// Rotate the bunker credentials: generate a fresh transport secret (new
@@ -549,12 +576,7 @@ impl BunkerHandler {
         // mid-flight: any concurrent start either completed (so `shutdown_tx` is
         // set and `stop_bunker` signals it) or is blocked here and will read the
         // freshly-persisted secrets when it proceeds.
-        let _start_guard =
-            self.start_rotate_lock
-                .lock()
-                .map_err(|_| KeepMobileError::StorageError {
-                    msg: "bunker start/rotate lock poisoned".into(),
-                })?;
+        let _start_guard = self.start_guard()?;
 
         // Signal the running bunker to stop so its old keys/URL and grants tear
         // down; server shutdown completes asynchronously in its own task.
@@ -640,6 +662,13 @@ fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
 /// matching Amber's UX without the silent-grant trade-off.
 fn bunker_connect_auto_approve_kinds() -> std::collections::HashSet<Kind> {
     std::collections::HashSet::new()
+}
+
+/// The bunker pubkey a transport secret serves under, as hex.
+fn transport_pubkey_hex(secret: &[u8; 32]) -> Result<String, KeepMobileError> {
+    nostr_sdk::SecretKey::from_slice(secret)
+        .map(|key| nostr_sdk::Keys::new(key).public_key().to_hex())
+        .map_err(|e| KeepMobileError::InitializationFailed { msg: e.to_string() })
 }
 
 /// Decodes a persisted transport secret, returning `None` when the stored value
@@ -750,12 +779,7 @@ impl BunkerHandler {
         // Held for the whole start so a concurrent `rotate_bunker_credentials`
         // cannot slip between the status CAS and `shutdown_tx` being set and
         // leave this start serving keys that rotation meant to revoke.
-        let _start_guard =
-            self.start_rotate_lock
-                .lock()
-                .map_err(|_| KeepMobileError::StorageError {
-                    msg: "bunker start/rotate lock poisoned".into(),
-                })?;
+        let _start_guard = self.start_guard()?;
 
         if self
             .status
@@ -818,6 +842,7 @@ impl BunkerHandler {
             };
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
+            let transport_hex = transport_pubkey_hex(&transport_secret)?;
 
             // Restore persisted per-(app, kind) remember-grants so they survive a
             // bunker restart. The engine is the single source of truth for these
@@ -825,7 +850,7 @@ impl BunkerHandler {
             // grant/revoke via the `persist_permissions` callback below.
             let pre_grants: Vec<PreGrantedApp> = self
                 .mobile
-                .load_bunker_permissions()
+                .load_bunker_permissions(&transport_hex)
                 .iter()
                 .filter_map(PreGrantedApp::from_stored)
                 .collect();
@@ -860,12 +885,15 @@ impl BunkerHandler {
                 ..ServerConfig::default()
             };
 
+            let serving = Arc::new(AtomicBool::new(true));
             let server_callbacks = Some(Arc::new(CallbackBridge {
                 approval_timeout: APPROVAL_TIMEOUT,
                 generation,
                 outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
+                transport_hex,
+                serving: Arc::clone(&serving),
             }) as Arc<dyn ServerCallbacks>);
 
             let server = if local_complete {
@@ -910,6 +938,7 @@ impl BunkerHandler {
             *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
             *self.handler.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(Arc::downgrade(&server.handler()));
+            *self.serving.lock().unwrap_or_else(|e| e.into_inner()) = serving;
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
@@ -1157,6 +1186,8 @@ mod tests {
             approval_timeout: Duration::from_millis(200),
             generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
+            transport_hex: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
         };
 
         let started = std::time::Instant::now();
@@ -1207,6 +1238,8 @@ mod tests {
             approval_timeout: Duration::from_millis(50),
             generation: 0,
             outstanding: Arc::clone(&outstanding),
+            transport_hex: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1251,6 +1284,8 @@ mod tests {
             approval_timeout: Duration::from_secs(5),
             generation: 0,
             outstanding: Arc::clone(&outstanding),
+            transport_hex: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
         };
 
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1326,6 +1361,8 @@ mod tests {
             approval_timeout: APPROVAL_TIMEOUT,
             generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
+            transport_hex: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
         };
         let ask = |bridge: &CallbackBridge| {
             ServerCallbacks::request_approval(
@@ -1407,6 +1444,128 @@ mod tests {
             "connect secret must rotate"
         );
         assert_eq!(transport2.len(), 32);
+    }
+
+    fn remembered(client: &PublicKey) -> keep_core::relay::StoredBunkerPermission {
+        keep_core::relay::StoredBunkerPermission {
+            pubkey_hex: client.to_hex(),
+            name: "client".into(),
+            permissions: keep_nip46::Permission::SIGN_EVENT.bits(),
+            auto_approve_kinds: vec![1],
+            duration: keep_core::relay::StoredPermissionDuration::Forever,
+            connected_at: 0,
+            timed_kind_grants: Vec::new(),
+            explicitly_remembered: Some(true),
+        }
+    }
+
+    fn restored_clients(mobile: &KeepMobile) -> Vec<String> {
+        let (transport, _) = load_or_create_bunker_keys(mobile).unwrap();
+        mobile
+            .load_bunker_permissions(&transport_pubkey_hex(&transport).unwrap())
+            .into_iter()
+            .map(|grant| grant.pubkey_hex)
+            .collect()
+    }
+
+    fn persist_remembered(mobile: &KeepMobile, clients: &[PublicKey]) {
+        let (transport, _) = load_or_create_bunker_keys(mobile).unwrap();
+        mobile
+            .persist_bunker_permissions(
+                clients.iter().map(remembered).collect(),
+                &transport_pubkey_hex(&transport).unwrap(),
+                || true,
+            )
+            .unwrap();
+    }
+
+    // With no bunker running there is no engine to persist a revoke, so the
+    // revoke has to reach the persisted grants itself, or the next start
+    // restores the client it revoked.
+    #[test]
+    fn a_revoke_while_stopped_removes_the_persisted_grants() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (a, b) = (
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+        );
+        persist_remembered(&mobile, &[a, b]);
+        assert_eq!(restored_clients(&mobile).len(), 2);
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        handler.revoke_client(a.to_hex()).unwrap();
+        assert_eq!(restored_clients(&mobile), vec![b.to_hex()]);
+        handler.revoke_all_clients().unwrap();
+        assert!(restored_clients(&mobile).is_empty());
+    }
+
+    // A client remembered before a rotation would otherwise sign its
+    // remembered kinds under the new bunker key without pairing again, since
+    // that key is public as the author of every response.
+    #[test]
+    fn grants_from_before_a_rotation_are_not_restored() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        persist_remembered(&mobile, &[nostr_sdk::Keys::generate().public_key()]);
+        assert_eq!(restored_clients(&mobile).len(), 1);
+
+        BunkerHandler::new(Arc::clone(&mobile))
+            .rotate_bunker_credentials()
+            .unwrap();
+        assert!(restored_clients(&mobile).is_empty());
+    }
+
+    // Grants saved before they were tagged with a bunker key cannot be told
+    // apart from grants made before a rotation.
+    #[test]
+    fn untagged_grants_are_not_restored() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let key = crate::relay_config_key(None);
+        let stored = crate::persistence::StoredRelayConfig {
+            bunker_permissions: vec![remembered(&nostr_sdk::Keys::generate().public_key())],
+            ..Default::default()
+        };
+        crate::persistence::persist_relay_config(&mobile.storage, &key, &stored).unwrap();
+        assert!(restored_clients(&mobile).is_empty());
+    }
+
+    // A server still winding down after a stop must not write back grants a
+    // revoke cleared in the meantime.
+    #[test]
+    fn a_stopped_server_persists_nothing() {
+        struct Silent;
+        impl BunkerCallbacks for Silent {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                BunkerApprovalResult {
+                    approved: false,
+                    remember: BunkerRememberDuration::JustThisTime,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, _) = load_or_create_bunker_keys(&mobile).unwrap();
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(Silent),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(1),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            transport_hex: transport_pubkey_hex(&transport).unwrap(),
+            serving: Arc::new(AtomicBool::new(true)),
+        };
+        let client = nostr_sdk::Keys::generate().public_key();
+        bridge.serving.store(false, Ordering::Release);
+        bridge.persist_permissions(vec![remembered(&client)]);
+        assert!(restored_clients(&mobile).is_empty());
+        bridge.serving.store(true, Ordering::Release);
+        bridge.persist_permissions(vec![remembered(&client)]);
+        assert_eq!(restored_clients(&mobile), vec![client.to_hex()]);
     }
 
     // A persisted transport secret that is valid 32-byte hex but not a valid
@@ -1635,6 +1794,8 @@ mod tests {
             approval_timeout: Duration::from_secs(5),
             generation: *mobile.live_generation.borrow(),
             outstanding: Arc::new(AtomicUsize::new(0)),
+            transport_hex: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
         };
         let result = ServerCallbacks::request_approval(&bridge, an_approval());
         assert!(!result.approved, "the share changed while it was asked");
