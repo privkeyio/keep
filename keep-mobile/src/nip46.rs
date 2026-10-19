@@ -1536,6 +1536,7 @@ mod tests {
             connected_at: 0,
             timed_kind_grants: Vec::new(),
             explicitly_remembered: Some(true),
+            kinds_vetted: true,
         }
     }
 
