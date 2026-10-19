@@ -1441,6 +1441,7 @@ mod tests {
             connected_at: 100,
             timed_kind_grants: Vec::new(),
             explicitly_remembered: None,
+            kinds_vetted: false,
         });
         cfg.auto_approve_kinds = vec![22242];
 

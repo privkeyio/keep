@@ -161,9 +161,9 @@ pub struct AppPermission {
     pub duration: PermissionDuration,
     /// Set true when the user makes an explicit remember-decision for this app
     /// (`grant_kind_forever` / `grant_kind_for`), false for a bare connection or
-    /// a client-supplied connect-time kind scope. Distinguishes a real user
-    /// remember from a client's `sign_event:<kind>` connect request so only the
-    /// former is persisted/restored across a bunker restart. Rebuilt from the
+    /// the kinds `connect_auto_approve_kinds` seeds at connect. Distinguishes a
+    /// real user remember from those connect-time kinds so only the former is
+    /// persisted/restored across a bunker restart. Rebuilt from the
     /// persisted row on restore.
     #[serde(default)]
     pub explicitly_remembered: bool,
@@ -213,7 +213,7 @@ impl AppPermission {
     ///
     /// This is the "still has something to remember" half of the persistence
     /// gate; combined with [`AppPermission::explicitly_remembered`] (the "user
-    /// actually chose to remember, vs a client-supplied connect scope" half), it
+    /// actually chose to remember, vs kinds seeded at connect" half), it
     /// decides whether the app is persisted/restored. A merely-connected client
     /// must re-present the connect secret via a fresh `connect` after a bunker
     /// restart instead of being silently re-authorized, matching NIP-46's
@@ -501,8 +501,8 @@ impl PermissionManager {
             // effect and the user would see their approval ignored.
             app.timed_kind_denials.remove(&kind);
             app.last_used = Timestamp::now();
-            // An explicit user remember-decision (vs a client-supplied connect
-            // kind scope); gates cross-restart persistence.
+            // An explicit user remember-decision (vs kinds seeded at connect);
+            // gates cross-restart persistence.
             app.explicitly_remembered = true;
             return true;
         }
@@ -623,6 +623,7 @@ impl PermissionManager {
                     })
                     .collect(),
                 explicitly_remembered: Some(app.explicitly_remembered),
+                kinds_vetted: true,
             })
             .collect()
     }
@@ -1434,11 +1435,10 @@ mod tests {
     }
 
     #[test]
-    fn stored_snapshot_omits_client_scoped_connect() {
-        // A client that requests a kind-scoped signing permission at connect
-        // (`sign_event:1` -> auto-approve kind 1) is silently approved for that
-        // kind this session, but must NOT self-qualify for cross-restart
-        // persistence: only an explicit user remember does.
+    fn stored_snapshot_omits_connect_seeded_kinds() {
+        // Kinds seeded at connect are approved for that kind this session, but
+        // must NOT self-qualify for cross-restart persistence: only an
+        // explicit user remember does.
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();
         pm.connect_with_permissions(
@@ -1449,11 +1449,11 @@ mod tests {
         );
         assert!(
             !pm.needs_approval(&pubkey, Kind::Custom(1)),
-            "client scope is live"
+            "connect-seeded kind is live"
         );
         assert!(
             pm.stored_snapshot().is_empty(),
-            "a client-supplied connect kind scope is not persisted"
+            "a connect-seeded kind is not persisted"
         );
         // Once the user explicitly remembers a kind, the app persists.
         assert!(pm.grant_kind_forever(&pubkey, Kind::Custom(2)));
@@ -1463,7 +1463,7 @@ mod tests {
     #[test]
     fn restore_persisted_drops_row_marked_not_remembered() {
         // A row authoritatively flagged not-remembered (`Some(false)`, e.g. a
-        // client connect scope persisted under an older path) is not restored,
+        // connect-seeded kind persisted under an older path) is not restored,
         // even though it carries a non-Reaction auto kind.
         let mut pm = PermissionManager::new();
         let pubkey = Keys::generate().public_key();

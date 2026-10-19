@@ -47,9 +47,9 @@ pub struct ServerConfig {
     pub auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
     /// Event kinds auto-approved per-app for each client that completes the
     /// connect handshake, scoped to that app's pubkey instead of the global
-    /// `auto_approve_kinds`. The mobile bunker grants NIP-98 (kind 27235) this
-    /// way so connected web clients sign without per-request prompts while
-    /// unconnected apps get no blanket grant.
+    /// `auto_approve_kinds`. The only source of connect-time kinds: the kinds a
+    /// client names in its own request are never auto-approved. NIP-98 (kind
+    /// 27235) is stripped from it.
     pub connect_auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind>,
     /// Enforces the relay's SPKI pin inside the TLS handshake of the sockets
     /// that carry remote-signing traffic, not only on a pre-flight probe. Left
@@ -101,10 +101,18 @@ impl PreGrantedApp {
             return None;
         };
         let permissions = Permission::from_bits_truncate(stored.permissions);
+        if !stored.kinds_vetted && !stored.auto_approve_kinds.is_empty() {
+            tracing::warn!(
+                pubkey_hex = %stored.pubkey_hex,
+                "PreGrantedApp::from_stored: dropping auto-approve kinds from a row \
+                 written before they were vetted; the client must be approved again"
+            );
+        }
         let auto_approve_kinds: std::collections::HashSet<nostr_sdk::Kind> = stored
             .auto_approve_kinds
             .iter()
             .copied()
+            .filter(|_| stored.kinds_vetted)
             .map(nostr_sdk::Kind::from)
             .collect();
         let timed_kind_grants: std::collections::HashMap<nostr_sdk::Kind, u64> = stored
@@ -1080,6 +1088,7 @@ mod tests {
             connected_at,
             timed_kind_grants: Vec::new(),
             explicitly_remembered: None,
+            kinds_vetted: true,
         }
     }
 
@@ -1136,6 +1145,37 @@ mod tests {
             app.timed_kind_grants.get(&nostr_sdk::Kind::Custom(1)),
             Some(&1_900_000_000)
         );
+    }
+
+    // A row from before kinds were vetted may hold kinds a client named in its
+    // own connect request, so it restores without auto-approve kinds. Timed
+    // grants only ever came from a prompt the user answered, so they stay.
+    #[tokio::test]
+    async fn an_unvetted_row_restores_without_its_auto_approve_kinds() {
+        let mut stored = sample_stored(
+            &good_pubkey_hex(),
+            keep_core::relay::StoredPermissionDuration::Forever,
+            0,
+        );
+        stored.kinds_vetted = false;
+        stored.explicitly_remembered = Some(true);
+        stored.timed_kind_grants = vec![keep_core::relay::StoredTimedKindGrant {
+            kind: 3,
+            expires_at: u64::MAX,
+        }];
+        let app = PreGrantedApp::from_stored(&stored).expect("valid stored row");
+        assert!(app.auto_approve_kinds.is_empty());
+
+        let pm = Arc::new(Mutex::new(PermissionManager::new()));
+        apply_pre_grants(&pm, &[app]).await;
+        let pm = pm.lock().await;
+        let pubkey = PublicKey::from_hex(&stored.pubkey_hex).unwrap();
+        assert!(pm.needs_approval(&pubkey, nostr_sdk::Kind::TextNote));
+        assert!(!pm.needs_approval(&pubkey, nostr_sdk::Kind::ContactList));
+        let snapshot = pm.stored_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].kinds_vetted);
+        assert!(!snapshot[0].auto_approve_kinds.contains(&1));
     }
 
     #[tokio::test]

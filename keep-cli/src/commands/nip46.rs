@@ -152,6 +152,7 @@ pub fn cmd_nip46_grant(
         timed_kind_grants: Vec::new(),
         // An operator running the grant command is an explicit remember decision.
         explicitly_remembered: Some(true),
+        kinds_vetted: true,
     };
     let replaced = match existing {
         Some(idx) => {
