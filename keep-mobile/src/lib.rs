@@ -1219,7 +1219,9 @@ impl KeepMobile {
     }
 
     pub fn delete_share(&self) -> Result<(), KeepMobileError> {
-        self.storage.delete_share()
+        let result = self.storage.delete_share();
+        self.invalidate_live_node();
+        result
     }
 
     pub fn export_share(&self, passphrase: String) -> Result<String, KeepMobileError> {
@@ -4213,7 +4215,7 @@ impl KeepMobile {
     /// replacement never loses the new session's requests. A first init has no
     /// prior tasks, so pending is left untouched. Mirrors invalidate_live_node
     /// minus nulling the node, which do_initialize overwrites immediately after.
-    async fn retire_prior_node_tasks(&self) {
+    async fn retire_prior_node_tasks(&self) -> bool {
         let replaced_prior_node = {
             let mut tasks = self
                 .node_tasks
@@ -4229,6 +4231,7 @@ impl KeepMobile {
         if replaced_prior_node {
             self.pending_requests.lock().await.clear();
         }
+        replaced_prior_node
     }
 
     /// Pin configuration for the live relay sockets.
@@ -4432,7 +4435,7 @@ impl KeepMobile {
             // requests are cleared up front. Clearing before the tasks below
             // spawn is what keeps the new session's requests: they can only be
             // enqueued once its listener/run tasks are live.
-            self.retire_prior_node_tasks().await;
+            let replaced_prior_node = self.retire_prior_node_tasks().await;
 
             let listener_handle = tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
@@ -4451,6 +4454,13 @@ impl KeepMobile {
                 .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
+            // A bunker running on the node just replaced holds it, or a copy
+            // of a share that may not be the one loaded now, so it stops as on
+            // any other teardown. After the write, as there.
+            if replaced_prior_node {
+                self.live_generation
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
             Ok(())
         })
     }
@@ -6315,6 +6325,17 @@ mod import_teardown_tests {
             matches!(&result, Err(KeepMobileError::InvalidInput { msg }) if msg.contains("UTF-8")),
             "expected an InvalidInput UTF-8 rejection, got {result:?}"
         );
+    }
+
+    // The legacy single-share delete tears the live node down like the keyed
+    // one, so a running bunker does not sign on with the deleted share.
+    #[test]
+    fn the_legacy_share_delete_tears_the_live_node_down() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let invalidated = mobile.live_generation.subscribe();
+        mobile.delete_share().unwrap();
+        assert!(invalidated.has_changed().unwrap());
     }
 }
 
