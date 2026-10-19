@@ -27,6 +27,15 @@ updates:
       # weekly cargo job fails on it. Tracked separately; unpin when that lands.
       - dependency-name: "nostr-sdk"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # nostr and nostr-relay-builder are the same release train: keep-approval
+      # uses nostr directly and the relay tests use nostr-relay-builder, against
+      # the nostr types nostr-sdk 0.44 re-exports. nostr 0.45 alone carries the
+      # same API removals (nip44::encrypt, the secp256k1 re-export) and fails to
+      # compile. They move with the nostr-sdk migration.
+      - dependency-name: "nostr"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "nostr-relay-builder"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
       # redb 4.2 and later require Rust 1.90; the toolchain is pinned to 1.89.0
       # (rust-toolchain.toml), so those releases fail every build job. redb is the
       # vault storage engine: move it together with the toolchain bump.
