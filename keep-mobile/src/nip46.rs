@@ -785,7 +785,8 @@ impl BunkerHandler {
 
         // Before the node is read, so a teardown after this point stops the
         // server even if the node it read is the one torn down.
-        let invalidated = self.mobile.live_generation.subscribe();
+        let mut invalidated = self.mobile.live_generation.subscribe();
+        let generation = *invalidated.borrow_and_update();
         let result = self.mobile.runtime.block_on(async {
             let verified_relays = self.mobile.verify_and_pin_relays(&relays, proxy).await?;
 
@@ -861,7 +862,7 @@ impl BunkerHandler {
 
             let server_callbacks = Some(Arc::new(CallbackBridge {
                 approval_timeout: APPROVAL_TIMEOUT,
-                generation: *invalidated.borrow(),
+                generation,
                 outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
@@ -935,7 +936,18 @@ async fn run_server(
     mut invalidated: tokio::sync::watch::Receiver<u64>,
     status: Arc<AtomicU8>,
 ) {
+    // Biased so a teardown is seen before more requests are drained, since
+    // those that need no prompt would otherwise sign with the old share.
     tokio::select! {
+        biased;
+        // The share was deleted, switched or reloaded, or the relay pins
+        // changed, so this server is signing with a share or trusting pins
+        // that are no longer current. It stays stopped until the app starts a
+        // new one.
+        _ = invalidated.changed() => {
+            server.stop().await;
+            status.store(STATUS_STOPPED, Ordering::Release);
+        }
         result = server.run() => {
             match result {
                 Ok(()) => status.store(STATUS_STOPPED, Ordering::Release),
@@ -943,14 +955,6 @@ async fn run_server(
             };
         }
         _ = shutdown_rx => {
-            server.stop().await;
-            status.store(STATUS_STOPPED, Ordering::Release);
-        }
-        // The share was deleted, switched or reloaded, or the relay pins
-        // changed, so this server is signing with a share or trusting pins
-        // that are no longer current. It stays stopped until the app starts a
-        // new one.
-        _ = invalidated.changed() => {
             server.stop().await;
             status.store(STATUS_STOPPED, Ordering::Release);
         }

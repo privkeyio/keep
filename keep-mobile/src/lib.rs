@@ -4215,7 +4215,7 @@ impl KeepMobile {
     /// replacement never loses the new session's requests. A first init has no
     /// prior tasks, so pending is left untouched. Mirrors invalidate_live_node
     /// minus nulling the node, which do_initialize overwrites immediately after.
-    async fn retire_prior_node_tasks(&self) -> bool {
+    async fn retire_prior_node_tasks(&self) {
         let replaced_prior_node = {
             let mut tasks = self
                 .node_tasks
@@ -4231,7 +4231,6 @@ impl KeepMobile {
         if replaced_prior_node {
             self.pending_requests.lock().await.clear();
         }
-        replaced_prior_node
     }
 
     /// Pin configuration for the live relay sockets.
@@ -4435,7 +4434,13 @@ impl KeepMobile {
             // requests are cleared up front. Clearing before the tasks below
             // spawn is what keeps the new session's requests: they can only be
             // enqueued once its listener/run tasks are live.
-            let replaced_prior_node = self.retire_prior_node_tasks().await;
+            let share_of = |node: &KfpNode| {
+                let metadata = &node.share_package().metadata;
+                (metadata.group_pubkey, metadata.identifier)
+            };
+            let prior_share = self.node.read().await.as_deref().map(share_of);
+            let loaded_share = share_of(&node);
+            self.retire_prior_node_tasks().await;
 
             let listener_handle = tokio::spawn(async move {
                 Self::event_listener(event_rx, request_rx, desc_ctx, state_ctx).await;
@@ -4454,10 +4459,11 @@ impl KeepMobile {
                 .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
-            // A bunker running on the node just replaced holds it, or a copy
-            // of a share that may not be the one loaded now, so it stops as on
-            // any other teardown. After the write, as there.
-            if replaced_prior_node {
+            // A bunker started on a different share holds a copy of it, or the
+            // node built from it, so it stops as on any other teardown, after
+            // the write as there. A re-init on the same share, which the app
+            // does on every network change, leaves it running.
+            if prior_share.is_some_and(|prior| prior != loaded_share) {
                 self.live_generation
                     .send_modify(|generation| *generation = generation.wrapping_add(1));
             }
