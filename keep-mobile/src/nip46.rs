@@ -28,12 +28,20 @@ use zeroize::{Zeroize, Zeroizing};
 /// implementation that waits forever stops every later request from every
 /// client, because the handler reads one at a time.
 ///
-/// Worth knowing when reading a denial: this and the platform's own 60 seconds
-/// are two timers started at nearly the same moment, so an answer that arrives
-/// within a hair of the deadline can be denied here after the operator
-/// approved it. Both orderings end in a denial when nobody answers, which is
-/// the direction that matters, and the window is a few milliseconds wide.
+/// The platform's own wait has to end before this one. Two timers of the same
+/// length started at nearly the same moment let an approval land on the
+/// platform side just after this side denied, and a platform that records the
+/// approval, such as trusting a client on connect, then holds state this side
+/// refused. [`nip46_approval_timeout_secs`] exports the value so a platform
+/// can derive its wait from it rather than copy it.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Seconds a bunker request waits for an answer before it is denied. A
+/// platform's [`BunkerCallbacks::request_approval`] has to give up sooner.
+#[uniffi::export]
+pub fn nip46_approval_timeout_secs() -> u64 {
+    APPROVAL_TIMEOUT.as_secs()
+}
 
 /// How many prompts may be waiting on the platform at once.
 ///
