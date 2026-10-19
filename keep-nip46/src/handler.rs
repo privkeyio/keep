@@ -467,6 +467,12 @@ impl SignerHandler {
         let mut requested_perms = permissions
             .as_deref()
             .map_or(self.connect_grant, parse_permission_string);
+        if authorization == ConnectAuthorization::SecretMatched {
+            // Nobody saw this connect, so the client gets at most what the
+            // operator lets a connect grant; what it asks for can only narrow
+            // that.
+            requested_perms &= self.connect_grant | Permission::GET_PUBLIC_KEY;
+        }
         let auto_kinds = self.connect_auto_approve_kinds.clone();
 
         if self.auto_approve {
@@ -1420,6 +1426,59 @@ mod tests {
                 "every requested kind must prompt"
             );
             handler.revoke_client(&app).await;
+        }
+    }
+
+    // A secret-matched connect gets at most the connect grant, whatever it asks
+    // for: signing it leaves out would let the Reaction default sign kind 7
+    // unprompted, and keep-web's grant leaves out decryption.
+    #[tokio::test]
+    async fn a_secret_matched_connect_is_capped_at_the_connect_grant() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, Arc::clone(&permissions), audit, None)
+            .with_expected_secret("s3cret".into());
+        let app = Keys::generate().public_key();
+        handler
+            .handle_connect(
+                app,
+                None,
+                Some("s3cret".into()),
+                Some("sign_event,nip44_encrypt".into()),
+            )
+            .await
+            .unwrap();
+        let pm = permissions.lock().await;
+        assert!(!pm.has_permission(&app, Permission::SIGN_EVENT));
+        assert!(!pm.has_permission(&app, Permission::NIP44_ENCRYPT));
+        assert!(pm.has_permission(&app, Permission::GET_PUBLIC_KEY));
+    }
+
+    // Kinds the operator configures are seeded on both connect paths.
+    #[tokio::test]
+    async fn configured_connect_kinds_are_seeded_on_both_paths() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, Arc::clone(&permissions), audit, None)
+            .with_expected_secret("s3cret".into())
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT)
+            .with_connect_auto_approve_kinds(HashSet::from([Kind::TextNote]));
+        let connected = Keys::generate().public_key();
+        handler
+            .handle_connect(connected, None, Some("s3cret".into()), None)
+            .await
+            .unwrap();
+        let registered = Keys::generate().public_key();
+        handler
+            .register_client(registered, "Client".into(), Some("sign_event"))
+            .await
+            .unwrap();
+        let pm = permissions.lock().await;
+        for app in [connected, registered] {
+            assert!(!pm.needs_approval(&app, Kind::TextNote));
+            assert!(pm.needs_approval(&app, Kind::LongFormTextNote));
         }
     }
 
