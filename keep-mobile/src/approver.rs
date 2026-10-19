@@ -468,6 +468,21 @@ fn signed_freeze(
     Ok(wire::to_text(&freeze))
 }
 
+/// The gateway's relays, held to the rules every other relay here is: `wss://`,
+/// and not an internal address, which the pinned transport would refuse anyway
+/// with an error that does not say why. Internal addresses pass only where the
+/// transport lets them through too, in test builds.
+fn checked_relays(relays: &[String]) -> Result<(), KeepMobileError> {
+    let validate = if keep_core::relay::ALLOW_INTERNAL_HOSTS {
+        keep_core::relay::validate_relay_url_allow_internal
+    } else {
+        keep_core::relay::validate_relay_url
+    };
+    relays
+        .iter()
+        .try_for_each(|r| validate(r).map_err(|msg| KeepMobileError::InvalidRelayUrl { msg }))
+}
+
 fn no_relay() -> KeepMobileError {
     KeepMobileError::NetworkError {
         msg: "no relay accepted the message".into(),
@@ -659,29 +674,48 @@ impl ApproverHandler {
         }
     }
 
-    /// Connect to `relays` and serve what arrives for the transport key.
-    /// Callers hold `lifecycle` and have halted what ran before.
+    /// Connect to `relays` and serve what arrives for the transport key, in
+    /// place of what ran before once the new socket is set up, so a failure
+    /// leaves the old one serving. Callers hold `lifecycle`.
     ///
     /// The socket goes through the configured proxy and the pinned transport,
     /// like every other relay socket here: it carries the pairing and every
-    /// approval. The relays come from the gateway's pairing code or its
-    /// `paired` answer, so they are probed and pinned before anything is sent.
-    /// Starting does not wait for a relay to connect, so an approver started
-    /// offline comes up when the network does; one whose relays never connect
-    /// is reported by the gateway-silence alert.
+    /// approval. The relays are probed first, which learns a pin on first use.
+    /// Unless pinning is strict that probe is best effort, since an approver
+    /// started offline has to come up when the network does: the handshake
+    /// still enforces every recorded pin, and a mismatch stops it here. Relays
+    /// that never connect are reported by the gateway-silence alert.
     fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
+        checked_relays(&relays)?;
         let transport = keys.public_key();
         let proxy = self.mobile.configured_proxy()?;
+        if proxy.is_some() && self.mobile.get_strict_cert_pinning()? {
+            // The pinned transport cannot pin a socket the proxy opens, and
+            // refuses every one under strict pinning: the approver would
+            // report running while carrying nothing.
+            return Err(KeepMobileError::InvalidInput {
+                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
+            });
+        }
         let (relays, pinning) = {
             let _cert = self
                 .mobile
                 .cert_pin_lock
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let relays = self
+            let relays = match self
                 .mobile
                 .runtime
-                .block_on(self.mobile.verify_and_pin_relays(&relays, proxy))?;
+                .block_on(self.mobile.verify_and_pin_relays(&relays, proxy))
+            {
+                Ok(verified) => verified,
+                Err(e @ KeepMobileError::CertificatePinMismatch { .. }) => return Err(e),
+                Err(e) if self.mobile.get_strict_cert_pinning()? => return Err(e),
+                Err(e) => {
+                    tracing::warn!(error = %e, "approver relays not probed; connecting to them anyway");
+                    relays
+                }
+            };
             (relays, self.mobile.live_pinning()?)
         };
         let client = keep_frost_net::build_client(&keys, proxy, Some(pinning))
@@ -807,15 +841,24 @@ impl ApproverHandler {
                 if this.generation.load(Ordering::SeqCst) != generation {
                     return;
                 }
-                this.halt();
-                let Some(relays) = reconnect else { return };
-                let keys = this.lock().session.as_ref().map(|s| s.keys.clone());
-                if let Some(keys) = keys {
-                    if let Err(e) = this.run(relays, keys) {
-                        tracing::warn!(error = %e, "the approver could not reconnect");
-                    }
+                match reconnect {
+                    Some(relays) => this.move_relays(relays),
+                    None => this.halt(),
                 }
             });
+        }
+    }
+
+    /// Serve `relays` in place of the relays running now. Not halted first: a
+    /// failure leaves the old socket serving, and with it the silence alert,
+    /// rather than an approver that stopped and told no one. Callers hold
+    /// `lifecycle`.
+    fn move_relays(self: &Arc<Self>, relays: Vec<String>) {
+        let keys = self.lock().session.as_ref().map(|s| s.keys.clone());
+        if let Some(keys) = keys {
+            if let Err(e) = self.run(relays, keys) {
+                tracing::warn!(error = %e, "the approver could not move to the gateway's new relays");
+            }
         }
     }
 
@@ -875,8 +918,16 @@ impl ApproverHandler {
                         Ok(paired) => {
                             stored.paired = true;
                             if !paired.relays.is_empty() && paired.relays != stored.relays {
-                                stored.relays = paired.relays.clone();
-                                fx.reconnect = Some(stored.relays.clone());
+                                match checked_relays(&paired.relays) {
+                                    Ok(()) => {
+                                        stored.relays = paired.relays.clone();
+                                        fx.reconnect = Some(stored.relays.clone());
+                                    }
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "keeping the approver's relays: the gateway named relays it cannot use"
+                                    ),
+                                }
                             }
                             stored
                                 .tracker
@@ -1221,6 +1272,7 @@ impl ApproverHandler {
             return Err(invalid("already paired: remove this pairing first"));
         }
         let uri = PairingUri::parse(&uri).map_err(|e| invalid(e.to_string()))?;
+        checked_relays(&uri.relays)?;
         keep_approval::change::check_label(&label, "label").map_err(|e| invalid(e.to_string()))?;
         let approver = Hex33(
             approver_key
