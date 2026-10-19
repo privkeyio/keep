@@ -156,16 +156,16 @@ fn assemble_signed_event(
     ))
 }
 
-fn parse_permission_string(perms: &str) -> (Permission, HashSet<Kind>) {
+/// The methods a client asks for. A `sign_event:<kind>` entry asks for
+/// signing and nothing more: the kinds a client names are never auto-approved,
+/// since a client holding the connect secret would otherwise grant itself
+/// silent signing without the user ever seeing a prompt.
+fn parse_permission_string(perms: &str) -> Permission {
     let mut result = Permission::empty();
-    let mut auto_kinds = HashSet::new();
     for part in perms.split(',') {
         let trimmed = part.trim();
-        if let Some(kind_str) = trimmed.strip_prefix("sign_event:") {
+        if trimmed.starts_with("sign_event:") {
             result |= Permission::SIGN_EVENT;
-            if let Ok(kind_num) = kind_str.parse::<u16>() {
-                auto_kinds.insert(Kind::from(kind_num));
-            }
         } else {
             match trimmed {
                 "get_public_key" => result |= Permission::GET_PUBLIC_KEY,
@@ -181,9 +181,9 @@ fn parse_permission_string(perms: &str) -> (Permission, HashSet<Kind>) {
         }
     }
     if result.is_empty() {
-        (Permission::DEFAULT, auto_kinds)
+        Permission::DEFAULT
     } else {
-        (result | Permission::GET_PUBLIC_KEY, auto_kinds)
+        result | Permission::GET_PUBLIC_KEY
     }
 }
 
@@ -464,11 +464,10 @@ impl SignerHandler {
             }
         }
 
-        let (mut requested_perms, mut auto_kinds) = permissions
+        let mut requested_perms = permissions
             .as_deref()
-            .map(parse_permission_string)
-            .unwrap_or((self.connect_grant, HashSet::new()));
-        auto_kinds.extend(self.connect_auto_approve_kinds.iter().copied());
+            .map_or(self.connect_grant, parse_permission_string);
+        let auto_kinds = self.connect_auto_approve_kinds.clone();
 
         if self.auto_approve {
             requested_perms = Permission::ALL;
@@ -919,10 +918,8 @@ impl SignerHandler {
     ) -> Result<()> {
         self.check_rate_limit(&app_pubkey).await?;
 
-        let (requested_perms, mut auto_kinds) = permissions_str
-            .map(parse_permission_string)
-            .unwrap_or((self.connect_grant, HashSet::new()));
-        auto_kinds.extend(self.connect_auto_approve_kinds.iter().copied());
+        let requested_perms = permissions_str.map_or(self.connect_grant, parse_permission_string);
+        let auto_kinds = self.connect_auto_approve_kinds.clone();
 
         let mut pm = self.permissions.lock().await;
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
@@ -1389,6 +1386,62 @@ mod tests {
         );
     }
 
+    // A client holding the connect secret names the kinds it wants signed, and
+    // those kinds must still prompt: the connect secret proves the client may
+    // ask, not that the user agreed to sign anything unseen. Reconnecting after
+    // a revoke must not bring a silent grant back either.
+    #[tokio::test]
+    async fn kinds_a_client_requests_on_connect_still_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let cb = Arc::new(RecordingCallbacks::new());
+        let handler = SignerHandler::new(keyring, permissions, audit, Some(cb.clone()))
+            .with_expected_secret("s3cret".into())
+            .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let app = Keys::generate().public_key();
+        let requested = "sign_event:0,sign_event:1,sign_event:3,sign_event:30023";
+
+        for _ in 0..2 {
+            handler
+                .handle_connect(app, None, Some("s3cret".into()), Some(requested.into()))
+                .await
+                .unwrap();
+            cb.methods.lock().unwrap().clear();
+            for kind in [0u16, 1, 3, 30023] {
+                let ev =
+                    UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::from(kind), vec![], "");
+                handler.handle_sign_event(app, ev).await.unwrap();
+            }
+            assert_eq!(
+                cb.methods.lock().unwrap().len(),
+                4,
+                "every requested kind must prompt"
+            );
+            handler.revoke_client(&app).await;
+        }
+    }
+
+    // The nostrconnect path registers a client from its own URI, so the kinds
+    // in that URI are as client-chosen as a bunker connect's.
+    #[tokio::test]
+    async fn kinds_in_a_registered_client_uri_still_prompt() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(keyring, Arc::clone(&permissions), audit, None);
+        let app = Keys::generate().public_key();
+        handler
+            .register_client(app, "Client".into(), Some("sign_event:1,sign_event:4"))
+            .await
+            .unwrap();
+        let pm = permissions.lock().await;
+        assert!(pm.has_permission(&app, Permission::SIGN_EVENT));
+        assert!(pm.needs_approval(&app, Kind::TextNote));
+        assert!(pm.needs_approval(&app, Kind::EncryptedDirectMessage));
+    }
+
     // Requirement 3: the signer must sign the event EXACTLY as received —
     // created_at is not rewritten and tags (including the NIP-98 `payload`
     // tag) are preserved verbatim and in order.
@@ -1698,12 +1751,11 @@ mod tests {
 
     #[test]
     fn test_parse_permission_string_v3() {
-        let (perms, kinds) = parse_permission_string("nip44v3_encrypt,nip44v3_decrypt");
+        let perms = parse_permission_string("nip44v3_encrypt,nip44v3_decrypt");
         assert!(perms.contains(Permission::NIP44_V3_ENCRYPT));
         assert!(perms.contains(Permission::NIP44_V3_DECRYPT));
         assert!(perms.contains(Permission::GET_PUBLIC_KEY));
         assert!(!perms.contains(Permission::NIP44_ENCRYPT));
-        assert!(kinds.is_empty());
     }
 
     #[tokio::test]
@@ -1724,29 +1776,24 @@ mod tests {
 
     #[test]
     fn test_parse_permission_string_with_kinds() {
-        let (perms, kinds) = parse_permission_string("sign_event:1,sign_event:7,nip44_encrypt");
+        let perms = parse_permission_string("sign_event:1,sign_event:7,nip44_encrypt");
         assert!(perms.contains(Permission::SIGN_EVENT));
         assert!(perms.contains(Permission::NIP44_ENCRYPT));
         assert!(perms.contains(Permission::GET_PUBLIC_KEY));
-        assert!(kinds.contains(&Kind::TextNote));
-        assert!(kinds.contains(&Kind::Reaction));
-        assert_eq!(kinds.len(), 2);
     }
 
     #[test]
     fn test_parse_permission_string_empty() {
-        let (perms, kinds) = parse_permission_string("");
+        let perms = parse_permission_string("");
         assert_eq!(perms, Permission::DEFAULT);
-        assert!(kinds.is_empty());
     }
 
     #[test]
     fn test_parse_permission_string_basic() {
-        let (perms, kinds) = parse_permission_string("get_public_key,sign_event");
+        let perms = parse_permission_string("get_public_key,sign_event");
         assert!(perms.contains(Permission::GET_PUBLIC_KEY));
         assert!(perms.contains(Permission::SIGN_EVENT));
         assert!(!perms.contains(Permission::NIP44_ENCRYPT));
-        assert!(kinds.is_empty());
     }
 
     #[tokio::test]
@@ -1766,7 +1813,7 @@ mod tests {
 
         let pm = handler.permissions.lock().await;
         assert!(pm.has_permission(&app_pubkey, Permission::SIGN_EVENT));
-        assert!(!pm.needs_approval(&app_pubkey, Kind::TextNote));
+        assert!(pm.needs_approval(&app_pubkey, Kind::TextNote));
         assert!(!pm.needs_approval(&app_pubkey, Kind::Reaction));
         assert!(pm.needs_approval(&app_pubkey, Kind::from(30023)));
     }

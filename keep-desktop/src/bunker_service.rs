@@ -797,7 +797,7 @@ impl App {
 
 /// Map the connected-client list to the vault's persisted bunker permissions,
 /// keeping only clients the user explicitly remembered. A bare connection or a
-/// client-supplied connect-time kind scope is not durable, so it must re-present
+/// kind seeded at connect is not durable, so it must re-present
 /// the connect secret via a fresh `connect` after a restart. Pure so the persist
 /// gate can be tested independently of `App`.
 pub(crate) fn remembered_clients_to_stored(
