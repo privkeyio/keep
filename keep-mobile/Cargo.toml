@@ -41,6 +41,9 @@ tracing-android = "0.2"
 [dev-dependencies]
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 nostr-relay-builder = "0.44"
+# The test relays listen on loopback, which the pinned transport otherwise
+# screens out.
+keep-core = { path = "../keep-core", features = ["allow-internal"] }
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }

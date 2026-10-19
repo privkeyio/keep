@@ -1335,3 +1335,71 @@ fn the_first_counter_after_a_load_skips_past_a_rollback() {
     assert!(phone.handler.freeze(None).is_err());
     assert!(saved(&phone) > last);
 }
+
+// The approver's relay socket enforces pins inside the handshake like every
+// other relay socket here: under strict pinning a relay it cannot pin carries
+// nothing, where the same decision over the same relay goes through when
+// pinning is lenient (`a_decision_is_decided_once_a_relay_takes_it_...`).
+#[test]
+fn under_strict_pinning_a_relay_that_cannot_be_pinned_carries_no_decision() {
+    let phone = paired();
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    let relay = phone.mobile.runtime.block_on(start_mock_relay());
+    let url = phone.mobile.runtime.block_on(relay.url()).to_string();
+    serve(&phone, url);
+    let request = phone.request(17, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let id = request.request_id.to_hex();
+    let digest = phone.handler.decision_digest(id.clone(), true).unwrap();
+    let err = phone
+        .handler
+        .send_decision(id, true, phone.sign(&digest, false))
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
+    assert_eq!(phone.handler.waiting_requests().len(), 1);
+    phone.handler.stop();
+}
+
+// With the proxy on, both the probe that learns a relay's pin and the live
+// socket that carries the pairing and approvals go through it, rather than
+// connecting from this phone's own address.
+#[test]
+fn the_approver_reaches_its_relays_through_the_proxy() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (greetings, seen) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut first = [0u8; 1];
+            if std::io::Read::read_exact(&mut stream, &mut first).is_ok()
+                && greetings.send(first[0]).is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let phone = paired();
+    phone
+        .mobile
+        .save_proxy_config(crate::ProxyConfigInfo {
+            enabled: true,
+            port,
+        })
+        .unwrap();
+    phone
+        .mobile
+        .stage_certificate_pin("relay.example".into(), "aa".repeat(32))
+        .unwrap();
+    phone.stored(|s| s.relays = vec!["wss://relay.example".into()]);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+
+    for which in ["the probe", "the live socket"] {
+        let first = seen
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("{which} did not go through the proxy"));
+        assert_eq!(first, 0x05, "{which} opens with a SOCKS5 greeting");
+    }
+    phone.handler.stop();
+}

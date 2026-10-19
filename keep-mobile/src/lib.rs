@@ -4233,6 +4233,17 @@ impl KeepMobile {
         }
     }
 
+    /// The loopback SOCKS proxy relay sockets go through, when one is enabled.
+    pub(crate) fn configured_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        let stored = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+        if stored.enabled {
+            Ok(Some(parse_loopback_proxy("127.0.0.1", stored.port)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Pin configuration for the live relay sockets.
     ///
     /// The stored pin set is handed to the transport, which only ever reads it:

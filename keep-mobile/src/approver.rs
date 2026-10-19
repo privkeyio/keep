@@ -661,12 +661,31 @@ impl ApproverHandler {
 
     /// Connect to `relays` and serve what arrives for the transport key.
     /// Callers hold `lifecycle` and have halted what ran before.
-    fn run(
-        self: &Arc<Self>,
-        relays: Vec<String>,
-        transport: PublicKey,
-    ) -> Result<(), KeepMobileError> {
-        let client = Client::default();
+    ///
+    /// The socket goes through the configured proxy and the pinned transport,
+    /// like every other relay socket here: it carries the pairing and every
+    /// approval. The relays come from the gateway's pairing code or its
+    /// `paired` answer, so they are probed and pinned before anything is sent.
+    /// Starting does not wait for a relay to connect, so an approver started
+    /// offline comes up when the network does; one whose relays never connect
+    /// is reported by the gateway-silence alert.
+    fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
+        let transport = keys.public_key();
+        let proxy = self.mobile.configured_proxy()?;
+        let (relays, pinning) = {
+            let _cert = self
+                .mobile
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let relays = self
+                .mobile
+                .runtime
+                .block_on(self.mobile.verify_and_pin_relays(&relays, proxy))?;
+            (relays, self.mobile.live_pinning()?)
+        };
+        let client = keep_frost_net::build_client(&keys, proxy, Some(pinning))
+            .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?;
         let weak = Arc::downgrade(self);
         // What these tasks deliver is dropped once a stop or start follows.
         let generation = self.generation.load(Ordering::SeqCst);
@@ -790,9 +809,9 @@ impl ApproverHandler {
                 }
                 this.halt();
                 let Some(relays) = reconnect else { return };
-                let transport = this.lock().session.as_ref().map(|s| s.keys.public_key());
-                if let Some(transport) = transport {
-                    if let Err(e) = this.run(relays, transport) {
+                let keys = this.lock().session.as_ref().map(|s| s.keys.clone());
+                if let Some(keys) = keys {
+                    if let Err(e) = this.run(relays, keys) {
                         tracing::warn!(error = %e, "the approver could not reconnect");
                     }
                 }
@@ -1284,7 +1303,7 @@ impl ApproverHandler {
         };
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(callbacks);
         self.halt();
-        let sent = self.run(relays, keys.public_key()).and_then(|()| {
+        let sent = self.run(relays, keys.clone()).and_then(|()| {
             let tag = TagKey::pairing_phone(&secret);
             let event = wrap::wrap(
                 &keys,
@@ -1308,14 +1327,14 @@ impl ApproverHandler {
     ) -> Result<(), KeepMobileError> {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.open_check()?;
-        let (relays, transport) = {
+        let (relays, keys) = {
             let inner = self.lock();
             let stored = inner.stored.as_ref().ok_or_else(|| invalid("not paired"))?;
-            (stored.relays.clone(), stored.keys()?.public_key())
+            (stored.relays.clone(), stored.keys()?)
         };
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = Some(callbacks);
         self.halt();
-        self.run(relays, transport)
+        self.run(relays, keys)
     }
 
     pub fn stop(&self) {
