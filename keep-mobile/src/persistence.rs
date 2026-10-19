@@ -489,7 +489,7 @@ pub(crate) struct DescriptorLoad {
 /// So what this function guarantees is that a corrupt index is never parsed as
 /// empty and that no read on this side writes. An index that stays unreadable
 /// refuses every save and delete until
-/// [`rebuild_unreadable_descriptor_index`] replaces it.
+/// [`repair_descriptor_index`] replaces it.
 fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>, KeepMobileError> {
     match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
         Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
@@ -560,28 +560,46 @@ pub(crate) fn load_listed_descriptors(
     DescriptorLoad { loaded, unreadable }
 }
 
-/// Replace a descriptor index that cannot be read with one listing each of
-/// `groups` whose descriptor record reads back, and return that list.
+/// Add to the descriptor index each of `held` whose descriptor record is not
+/// proven absent, keeping every entry it already lists, and return the result.
 ///
-/// Refused while the index reads, so a healthy index is never narrowed to what
-/// `groups` happens to cover. A descriptor for a group outside `groups` stays
-/// stored but unlisted until it is saved again, which is why this runs only on
-/// the user's say-so rather than on the next failed read.
-pub(crate) fn rebuild_unreadable_descriptor_index(
+/// An index that will not parse, or that still fails on a second read, is
+/// replaced, since every save and delete refuses while it stands; the entries
+/// it held for groups outside `held` are then unlisted until saved again, which
+/// is why this runs only on the user's say-so. Nothing is ever removed
+/// otherwise, and a record that fails to read keeps its entry like any other,
+/// so running this again once more shares read back recovers what an earlier
+/// run missed. Refused when `held` is empty, since a share list that came back
+/// empty is as likely a fault as a device with nothing to list.
+pub(crate) fn repair_descriptor_index(
     storage: &Arc<dyn SecureStorage>,
-    groups: impl IntoIterator<Item = String>,
+    held: impl IntoIterator<Item = String>,
 ) -> Result<Vec<String>, KeepMobileError> {
-    if load_descriptor_index(storage).is_ok() {
+    let held: std::collections::BTreeSet<String> = held.into_iter().collect();
+    if held.is_empty() {
         return Err(KeepMobileError::InvalidInput {
-            msg: "The descriptor index is readable; there is nothing to reset".into(),
+            msg: "No shares are listed to repair the descriptor index from".into(),
         });
     }
-    let groups: std::collections::BTreeSet<String> = groups.into_iter().collect();
-    let index: Vec<String> = groups
-        .into_iter()
-        .filter(|group| load_descriptor(storage, group).is_ok())
-        .collect();
-    persist_descriptor_index(storage, &index)?;
+    let current = load_descriptor_index(storage).or_else(|_| load_descriptor_index(storage));
+    let replaced = current.is_err();
+    let mut index = current.unwrap_or_else(|e| {
+        tracing::warn!("Replacing the descriptor index, which cannot be read: {e}");
+        Vec::new()
+    });
+    let listed = index.len();
+    for group in held {
+        if index.contains(&group) {
+            continue;
+        }
+        match storage.load_share_by_key(descriptor_key(&group)) {
+            Err(KeepMobileError::StorageNotFound) => {}
+            _ => index.push(group),
+        }
+    }
+    if replaced || index.len() != listed {
+        persist_descriptor_index(storage, &index)?;
+    }
     Ok(index)
 }
 
@@ -640,8 +658,8 @@ pub(crate) fn persist_descriptor(
     // that would have been safe, which costs the caller its work (a device
     // registration discards the HMAC it just obtained from the signer and has
     // to repeat the exchange). Accepted because the alternative is another
-    // metadata read to decide, carrying the same wipe-on-decrypt-failure
-    // hazard, to save a retry rather than any data.
+    // read to decide, which can fault the same way, to save a retry rather
+    // than any data.
     let mut index = load_descriptor_index(storage)?;
     if !index.contains(&info.group_pubkey) {
         index.push(info.group_pubkey.clone());
@@ -1311,41 +1329,63 @@ mod descriptor_index_tests {
         (faulty, storage)
     }
 
-    #[test]
-    fn a_readable_index_is_not_reset() {
-        let (faulty, storage) = storage_with(&[AA, BB]);
-        assert!(rebuild_unreadable_descriptor_index(&storage, [AA.to_string()]).is_err());
-        assert_eq!(faulty.index().len(), 2, "a healthy index is never narrowed");
+    fn unlist(faulty: &FaultyStorage, group: &str) {
+        let index: Vec<String> = faulty.index().into_iter().filter(|g| g != group).collect();
+        faulty.records.lock().unwrap().insert(
+            DESCRIPTOR_INDEX_KEY.into(),
+            serde_json::to_vec(&index).unwrap(),
+        );
     }
 
-    // The rebuild keeps each held group whose record reads, once, and nothing
-    // else; a stored but unlisted record comes back by being saved again.
+    // On a readable index the repair only adds: an entry for a group not held
+    // here stays, and a held group whose record is stored comes back.
     #[test]
-    fn an_unreadable_index_is_rebuilt_from_held_groups_whose_records_read() {
+    fn repairing_a_readable_index_only_adds() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        unlist(&faulty, BB);
+        let index = repair_descriptor_index(&storage, [BB.to_string()]).unwrap();
+        assert_eq!(index, vec![AA.to_string(), BB.to_string()]);
+        assert_eq!(faulty.index(), index);
+    }
+
+    // An index that fails on every read is replaced. A held group whose record
+    // will not read keeps an entry like any other, and only a record proven
+    // absent is left out.
+    #[test]
+    fn an_index_that_will_not_read_is_replaced_keeping_unreadable_records() {
         let (faulty, storage) = storage_with(&[AA, BB, CC]);
+        faulty.fault(&faulty.unreadable, DESCRIPTOR_INDEX_KEY);
+        faulty.fault(&faulty.unreadable, &descriptor_key(BB));
+        assert!(persist_descriptor(&storage, &descriptor(CC)).is_err());
+
+        let held = [BB, AA, AA, "dd"].map(String::from);
+        let index = repair_descriptor_index(&storage, held).unwrap();
+        assert_eq!(index, vec![AA.to_string(), BB.to_string()]);
+
+        faulty.clear_faults();
+        assert_eq!(faulty.index(), index);
+        persist_descriptor(&storage, &descriptor(CC)).unwrap();
+        assert_eq!(
+            faulty.index(),
+            vec![AA.to_string(), BB.to_string(), CC.to_string()]
+        );
+    }
+
+    // A share list that came back empty is as likely a fault as a device with
+    // nothing to list, so it replaces nothing.
+    #[test]
+    fn repairing_from_no_shares_is_refused() {
+        let (faulty, storage) = storage_with(&[AA]);
         faulty
             .records
             .lock()
             .unwrap()
             .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
-        faulty.fault(&faulty.unreadable, &descriptor_key(BB));
-        assert!(persist_descriptor(&storage, &descriptor(CC)).is_err());
-
-        let held = [BB, AA, AA, "dd"].map(String::from);
-        let index = rebuild_unreadable_descriptor_index(&storage, held).unwrap();
-        assert_eq!(index, vec![AA.to_string()]);
-        assert_eq!(faulty.index(), vec![AA.to_string()]);
-
-        faulty.clear_faults();
-        persist_descriptor(&storage, &descriptor(CC)).unwrap();
-        let mut listed: Vec<String> = load_descriptors(&storage)
-            .unwrap()
-            .loaded
-            .into_iter()
-            .map(|d| d.group_pubkey)
-            .collect();
-        listed.sort();
-        assert_eq!(listed, vec![AA.to_string(), CC.to_string()]);
+        assert!(repair_descriptor_index(&storage, Vec::new()).is_err());
+        assert_eq!(
+            faulty.raw(DESCRIPTOR_INDEX_KEY).unwrap(),
+            b"not json".to_vec()
+        );
     }
 
     // One prefs key that will not decrypt fails every descriptor in a single

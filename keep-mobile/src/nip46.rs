@@ -206,15 +206,15 @@ pub trait BunkerCallbacks: Send + Sync {
     /// Asks the operator to allow one request, blocking the caller until it is
     /// answered.
     ///
-    /// The implementation must bound that wait and reject when it expires
-    /// (keep-android waits 60 seconds). The NIP-46 handler reads one request at
-    /// a time, so a wait that never ends stops every later request from every
-    /// client, not just this one.
+    /// The implementation must bound that wait and reject when it expires,
+    /// sooner than [`nip46_approval_timeout_secs`]. The NIP-46 handler reads
+    /// one request at a time, so a wait that never ends stops every later
+    /// request from every client, not just this one.
     ///
-    /// That requirement is now backed rather than merely stated: an answer that
-    /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal. An
-    /// implementation that bounds its own wait, as keep-android does, decides
-    /// its own outcome; one that does not gets denied for it.
+    /// That requirement is backed rather than merely stated: an answer that
+    /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal, and
+    /// an approval the implementation records after that point is one this
+    /// side already refused.
     fn request_approval(&self, request: BunkerApprovalRequest) -> BunkerApprovalResult;
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
