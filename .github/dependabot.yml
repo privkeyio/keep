@@ -32,6 +32,19 @@ updates:
       # vault storage engine: move it together with the toolchain bump.
       - dependency-name: "redb"
         versions: [">= 4.2"]
+      # tray-icon 0.25 (and the muda 0.20 it pulls in) require Rust 1.90, so like
+      # redb it moves with the toolchain bump.
+      - dependency-name: "tray-icon"
+        versions: [">= 0.25"]
+      # keep-frost-net's pinned relay transport hands nostr-sdk a socket of the
+      # relay stack's own types, so both must stay at the versions nostr-sdk 0.44
+      # resolves (async-wsocket 0.13, tokio-tungstenite 0.26). Bumping either
+      # alone puts two copies of WebSocketStream in the tree and fails to
+      # compile. They move with the nostr-sdk migration.
+      - dependency-name: "async-wsocket"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "tokio-tungstenite"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
