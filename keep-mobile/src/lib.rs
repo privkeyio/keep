@@ -2532,9 +2532,11 @@ impl KeepMobile {
     /// run missed. Refused when no shares are listed. Returns how many
     /// descriptors the index lists afterwards.
     ///
-    /// An index that reads but will not parse is replaced. One whose read
-    /// fails is replaced only with `replace_unreadable`, since that read may
-    /// succeed later; otherwise its error is returned. Replacing leaves the
+    /// An index that cannot be read or parsed is replaced only with
+    /// `replace_unreadable`, since the share list can under-report and a
+    /// failed read may succeed later; otherwise its error is returned, which
+    /// for one that will not parse starts with "Descriptor index is
+    /// unreadable". Replacing leaves the
     /// descriptors it listed for groups not held here stored but unlisted
     /// until saved again, so the app passes `replace_unreadable` only after
     /// the user confirms, having retried first.
@@ -6738,7 +6740,8 @@ mod restore_backup_metadata_tests {
         );
         assert_eq!(decrypted.wallet_descriptors[0].group_pubkey, group);
 
-        assert_eq!(mobile.wallet_descriptor_repair_index(false).unwrap(), 1);
+        assert!(mobile.wallet_descriptor_repair_index(false).is_err());
+        assert_eq!(mobile.wallet_descriptor_repair_index(true).unwrap(), 1);
         assert_eq!(mobile.wallet_descriptor_list().len(), 1);
         mobile
             .wallet_descriptor_delete(hex::encode(group))
