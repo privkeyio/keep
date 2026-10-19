@@ -1082,10 +1082,10 @@ fn a_decision_no_relay_takes_is_not_decided() {
 }
 
 #[test]
-fn close_gives_the_slot_back_and_ends_the_handler() {
+fn shutdown_gives_the_slot_back_and_ends_the_handler() {
     let phone = paired();
     assert!(ApproverHandler::new(phone.mobile.clone()).is_err());
-    phone.handler.close();
+    phone.handler.shutdown();
     assert!(!phone.handler.status().paired);
     assert!(phone.handler.clone().start(Arc::new(Nobody)).is_err());
     assert!(phone.handler.forget().is_err());
@@ -1144,7 +1144,7 @@ fn a_pairing_a_relay_takes_waits_for_the_gateway() {
         .unwrap_err()
         .to_string()
         .contains("no pairing was begun"));
-    handler.close();
+    handler.shutdown();
 }
 
 #[test]

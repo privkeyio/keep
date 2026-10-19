@@ -267,6 +267,22 @@ jobs:
             --library "$RUNNER_TEMP/jniLibs/arm64-v8a/libkeep_mobile.so" \
             --language kotlin --no-format --out-dir "$RUNNER_TEMP/kotlin"
           test -f "$RUNNER_TEMP/kotlin/io/privkey/keep/uniffi/keep_mobile.kt"
+      # Generating is not compiling: an exported name can collide with one the
+      # Kotlin generator adds itself, such as the AutoCloseable `close()` on every
+      # object, and only kotlinc reports that.
+      - name: Compile Kotlin bindings
+        env:
+          KOTLIN_VERSION: "2.4.21"
+          KOTLIN_SHA256: 7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd
+          JNA_VERSION: "5.18.1"
+          JNA_SHA256: 260c4b1e22b1db9e110ee441c4f13ce115f841fa48c41d78750986214b395557
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o kotlinc.zip "https://github.com/JetBrains/kotlin/releases/download/v$KOTLIN_VERSION/kotlin-compiler-$KOTLIN_VERSION.zip"
+          curl -fsSL -o jna.jar "https://repo1.maven.org/maven2/net/java/dev/jna/jna/$JNA_VERSION/jna-$JNA_VERSION.jar"
+          printf '%s  kotlinc.zip\n%s  jna.jar\n' "$KOTLIN_SHA256" "$JNA_SHA256" | sha256sum -c -
+          unzip -q kotlinc.zip
+          ./kotlinc/bin/kotlinc kotlin/io/privkey/keep/uniffi/keep_mobile.kt -cp jna.jar -d kotlin-classes
 
   msrv:
     runs-on: ubuntu-latest
