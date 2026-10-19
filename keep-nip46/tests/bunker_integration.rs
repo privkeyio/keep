@@ -755,3 +755,275 @@ async fn test_dispatch_nip04_encrypt_decrypt_roundtrip() {
     cb.server_handle.abort();
     cb.client.disconnect().await;
 }
+
+/// Refuses every prompt and records which method asked, so a test can tell a
+/// request the user was asked about from one the bunker answered on its own.
+struct RecordingRefuser(std::sync::Mutex<Vec<String>>);
+impl ServerCallbacks for RecordingRefuser {
+    fn on_log(&self, _event: LogEvent) {}
+    fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        self.0.lock().unwrap().push(request.method);
+        ApprovalResult::rejected()
+    }
+}
+
+// A client holding the connect secret names the kinds it wants signed on
+// connect. Over the relay, each of those kinds must still reach the prompt,
+// and what the client asks for beyond the connect grant is refused outright.
+#[tokio::test]
+async fn test_e2e_kinds_named_on_connect_still_prompt() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = common::start_mock_relay().await;
+    let relay_url = mock_relay.url().await.to_string();
+    let (keyring, signer_pubkey) = setup_keyring();
+    let prompts = Arc::new(RecordingRefuser(std::sync::Mutex::new(Vec::new())));
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        None,
+        std::slice::from_ref(&relay_url),
+        Some(prompts.clone()),
+        ServerConfig {
+            connect_grant: keep_nip46::Permission::GET_PUBLIC_KEY
+                | keep_nip46::Permission::SIGN_EVENT,
+            expected_secret: Some("e2e-connect-secret".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("server creation");
+    let bunker_secret = extract_bunker_secret(&server.bunker_url()).expect("bunker secret");
+    let server_pubkey = server.pubkey();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let client_keys = Keys::generate();
+    let client = Client::new(client_keys.clone());
+    client.add_relay(relay_url).await.unwrap();
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .author(server_pubkey)
+                .pubkey(client_keys.public_key()),
+            None,
+        )
+        .await
+        .expect("subscribe to bunker responses");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut notifications = client.notifications();
+
+    let ask = |id: &str, method: &str, params: serde_json::Value| {
+        let request = serde_json::json!({ "id": id, "method": method, "params": params });
+        build_nip46_request(
+            &client_keys,
+            &server_pubkey,
+            &serde_json::to_string(&request).unwrap(),
+        )
+    };
+    let unsigned = |kind: u16| {
+        serde_json::to_string(&serde_json::json!({
+            "kind": kind,
+            "content": "e2e",
+            "tags": [],
+            "created_at": Timestamp::now().as_secs(),
+        }))
+        .unwrap()
+    };
+
+    let mut responses = Vec::new();
+    let mut requests = vec![(
+        "connect".to_string(),
+        ask(
+            "connect",
+            "connect",
+            serde_json::json!([
+                signer_pubkey.to_hex(),
+                bunker_secret,
+                "sign_event:0,sign_event:1,sign_event:3,nip44_decrypt"
+            ]),
+        ),
+    )];
+    for kind in [0u16, 1, 3, 7] {
+        let id = format!("sign-{kind}");
+        requests.push((
+            id.clone(),
+            ask(&id, "sign_event", serde_json::json!([unsigned(kind)])),
+        ));
+    }
+    requests.push((
+        "decrypt".to_string(),
+        ask(
+            "decrypt",
+            "nip44_decrypt",
+            serde_json::json!([Keys::generate().public_key().to_hex(), "AAAA"]),
+        ),
+    ));
+    for (id, event) in requests {
+        client.send_event(&event).await.unwrap();
+        let response = await_nip46_response(
+            &mut notifications,
+            &client_keys,
+            &server_pubkey,
+            &id,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap_or_else(|| panic!("{id} must respond"));
+        responses.push((id, response));
+    }
+
+    let result = |id: &str| {
+        responses
+            .iter()
+            .find(|(r, _)| r == id)
+            .and_then(|(_, response)| response.get("result").and_then(|v| v.as_str()))
+            .filter(|r| !r.is_empty())
+            .map(str::to_owned)
+    };
+    assert_eq!(result("connect").as_deref(), Some("ack"));
+    for kind in [0, 1, 3] {
+        assert!(
+            result(&format!("sign-{kind}")).is_none(),
+            "kind {kind} was named on connect and must not be signed unprompted"
+        );
+    }
+    let reaction = Event::from_json(result("sign-7").expect("kind 7 is signed by default"))
+        .expect("signed reaction");
+    reaction.verify().expect("the reaction verifies");
+    assert!(
+        result("decrypt").is_none(),
+        "decryption is outside the connect grant"
+    );
+    assert_eq!(
+        *prompts.0.lock().unwrap(),
+        vec!["sign_event"; 3],
+        "each named kind was prompted, and nothing else was"
+    );
+
+    server_handle.abort();
+    client.disconnect().await;
+}
+
+// A grant row saved before kinds were vetted may hold kinds a client chose
+// for itself. A known client needs no connect to sign, so over the relay a
+// bunker restored from such a row must not sign those kinds unprompted: with
+// them dropped the row holds no grant, so the client is not restored at all
+// and has to connect again. A row saved since keeps signing them.
+#[tokio::test]
+async fn test_e2e_unvetted_restored_kinds_are_not_signed_unprompted() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    for vetted in [false, true] {
+        let mock_relay = common::start_mock_relay().await;
+        let relay_url = mock_relay.url().await.to_string();
+        let (keyring, _) = setup_keyring();
+        let client_keys = Keys::generate();
+        let row = keep_core::relay::StoredBunkerPermission {
+            pubkey_hex: client_keys.public_key().to_hex(),
+            name: "restored".into(),
+            permissions: (keep_nip46::Permission::GET_PUBLIC_KEY
+                | keep_nip46::Permission::SIGN_EVENT)
+                .bits(),
+            auto_approve_kinds: vec![1],
+            duration: keep_core::relay::StoredPermissionDuration::Forever,
+            connected_at: 0,
+            timed_kind_grants: Vec::new(),
+            explicitly_remembered: Some(true),
+            kinds_vetted: vetted,
+        };
+        let prompts = Arc::new(RecordingRefuser(std::sync::Mutex::new(Vec::new())));
+        let mut server = Server::new_with_config(
+            keyring,
+            None,
+            None,
+            std::slice::from_ref(&relay_url),
+            Some(prompts.clone()),
+            ServerConfig {
+                pre_grants: keep_nip46::PreGrantedApp::from_stored(&row)
+                    .into_iter()
+                    .collect(),
+                expected_secret: Some("e2e-connect-secret".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("server creation");
+        let server_pubkey = server.pubkey();
+        let server_handle = tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let client = Client::new(client_keys.clone());
+        client.add_relay(relay_url).await.unwrap();
+        client.connect().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        client
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .author(server_pubkey)
+                    .pubkey(client_keys.public_key()),
+                None,
+            )
+            .await
+            .expect("subscribe to bunker responses");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut notifications = client.notifications();
+
+        let unsigned = serde_json::json!({
+            "kind": 1,
+            "content": "restored",
+            "tags": [],
+            "created_at": Timestamp::now().as_secs(),
+        });
+        let request = serde_json::json!({
+            "id": "sign",
+            "method": "sign_event",
+            "params": [serde_json::to_string(&unsigned).unwrap()],
+        });
+        client
+            .send_event(&build_nip46_request(
+                &client_keys,
+                &server_pubkey,
+                &serde_json::to_string(&request).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let response = await_nip46_response(
+            &mut notifications,
+            &client_keys,
+            &server_pubkey,
+            "sign",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("sign_event must respond");
+        let signed = response
+            .get("result")
+            .and_then(|v| v.as_str())
+            .filter(|r| !r.is_empty())
+            .is_some();
+        assert_eq!(signed, vetted, "vetted={vetted}: {response}");
+        if !vetted {
+            assert!(
+                response.get("error").and_then(|v| v.as_str()).is_some(),
+                "an unrestored client is refused: {response}"
+            );
+        }
+        assert!(prompts.0.lock().unwrap().is_empty());
+
+        server_handle.abort();
+        client.disconnect().await;
+    }
+}
