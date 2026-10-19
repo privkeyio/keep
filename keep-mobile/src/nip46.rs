@@ -259,9 +259,9 @@ struct CallbackBridge {
     /// Prompts handed to the platform that have not come back, including the
     /// ones this side has already stopped waiting for.
     outstanding: Arc<AtomicUsize>,
-    /// The bunker transport pubkey this server serves, which the grants it
-    /// persists are tagged with.
-    transport_hex: String,
+    /// The transport key and group this server serves under, which the grants
+    /// it persists are tagged with.
+    grant_scope: String,
     /// Cleared by `stop_bunker`, after which this server persists nothing.
     serving: Arc<AtomicBool>,
 }
@@ -425,7 +425,7 @@ impl ServerCallbacks for CallbackBridge {
         };
         if let Err(e) = self
             .mobile
-            .persist_bunker_permissions(grants, &self.transport_hex, serving)
+            .persist_bunker_permissions(grants, &self.grant_scope, serving)
         {
             tracing::warn!("failed to persist bunker permissions: {e}");
         }
@@ -446,6 +446,11 @@ pub struct BunkerHandler {
     /// The `serving` flag of the server last started, which `stop_bunker`
     /// clears.
     serving: std::sync::Mutex<Arc<AtomicBool>>,
+    /// Set by a `stop_bunker` that found a start still connecting, with no
+    /// server yet to signal. Read and set under the `shutdown_tx` lock, so the
+    /// start either sees it before publishing or has published a server the
+    /// stop then signals.
+    stop_requested: AtomicBool,
 }
 
 impl BunkerHandler {
@@ -466,9 +471,22 @@ impl BunkerHandler {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Make a started server's engine the one revokes reach, and its
-    /// `serving` flag the one `stop_bunker` clears.
-    fn publish_server(&self, handler: &Arc<SignerHandler>, serving: Arc<AtomicBool>) {
+    /// Publish a started server, making its engine the one revokes reach and
+    /// its `serving` flag the one `stop_bunker` clears, unless a stop came while
+    /// it was starting. Returns whether it was published; when it was not, the
+    /// caller stops the server.
+    fn publish_server(
+        &self,
+        url: String,
+        handler: &Arc<SignerHandler>,
+        serving: Arc<AtomicBool>,
+        tx: tokio::sync::oneshot::Sender<()>,
+    ) -> bool {
+        let mut shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stop_requested.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
         *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
         *self
             .mobile
@@ -476,6 +494,8 @@ impl BunkerHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
         *self.serving.lock().unwrap_or_else(|e| e.into_inner()) = serving;
+        *shutdown_tx = Some(tx);
+        true
     }
 
     fn live_handler(&self) -> Option<Arc<SignerHandler>> {
@@ -499,6 +519,7 @@ impl BunkerHandler {
             shutdown_tx: std::sync::Mutex::new(None),
             handler: std::sync::Mutex::new(None),
             serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+            stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -522,13 +543,17 @@ impl BunkerHandler {
     }
 
     pub fn stop_bunker(&self) {
-        let tx = self
-            .shutdown_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(tx) = tx {
-            let _ = tx.send(());
+        {
+            let mut shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+            match shutdown_tx.take() {
+                Some(tx) => {
+                    let _ = tx.send(());
+                }
+                None if self.load_status() == STATUS_STARTING => {
+                    self.stop_requested.store(true, Ordering::Release);
+                }
+                None => {}
+            }
         }
         self.serving
             .lock()
@@ -678,11 +703,18 @@ fn bunker_connect_auto_approve_kinds() -> std::collections::HashSet<Kind> {
     std::collections::HashSet::new()
 }
 
-/// The bunker pubkey a transport secret serves under, as hex.
-fn transport_pubkey_hex(secret: &[u8; 32]) -> Result<String, KeepMobileError> {
-    nostr_sdk::SecretKey::from_slice(secret)
+/// What the grants of a bunker serving with `transport_secret` for
+/// `group_pubkey` are tagged with: its bunker pubkey and the group, both hex.
+/// A grant is for the identity it was approved under, through the bunker key
+/// it was approved on.
+fn grant_scope(
+    transport_secret: &[u8; 32],
+    group_pubkey: &[u8; 32],
+) -> Result<String, KeepMobileError> {
+    let transport = nostr_sdk::SecretKey::from_slice(transport_secret)
         .map(|key| nostr_sdk::Keys::new(key).public_key().to_hex())
-        .map_err(|e| KeepMobileError::InitializationFailed { msg: e.to_string() })
+        .map_err(|e| KeepMobileError::InitializationFailed { msg: e.to_string() })?;
+    Ok(format!("{transport}:{}", hex::encode(group_pubkey)))
 }
 
 /// Decodes a persisted transport secret, returning `None` when the stored value
@@ -856,7 +888,7 @@ impl BunkerHandler {
             };
 
             let (transport_secret, connect_secret) = load_or_create_bunker_keys(&self.mobile)?;
-            let transport_hex = transport_pubkey_hex(&transport_secret)?;
+            let grant_scope = grant_scope(&transport_secret, &group_pubkey_bytes)?;
 
             // Restore persisted per-(app, kind) remember-grants so they survive a
             // bunker restart. The engine is the single source of truth for these
@@ -864,7 +896,7 @@ impl BunkerHandler {
             // grant/revoke via the `persist_permissions` callback below.
             let pre_grants: Vec<PreGrantedApp> = self
                 .mobile
-                .load_bunker_permissions(&transport_hex)
+                .load_bunker_permissions(&grant_scope)
                 .iter()
                 .filter_map(PreGrantedApp::from_stored)
                 .collect();
@@ -906,11 +938,11 @@ impl BunkerHandler {
                 outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
-                transport_hex,
+                grant_scope,
                 serving: Arc::clone(&serving),
             }) as Arc<dyn ServerCallbacks>);
 
-            let server = if local_complete {
+            let mut server = if local_complete {
                 // Wrap the node's in-memory share in a FrostSigner for local
                 // signing. The share is re-encrypted under an ephemeral data key
                 // purely to satisfy the FrostSigner API; it never leaves the
@@ -949,16 +981,25 @@ impl BunkerHandler {
                 .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })?
             };
 
-            *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
-            self.publish_server(&server.handler(), serving);
-
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-            *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
+            let published = self.publish_server(
+                server.bunker_url(),
+                &server.handler(),
+                Arc::clone(&serving),
+                shutdown_tx,
+            );
+            if !published {
+                server.stop().await;
+                return Err(KeepMobileError::InitializationFailed {
+                    msg: "The bunker was stopped while it was starting".into(),
+                });
+            }
 
             let status = Arc::clone(&self.status);
             tokio::spawn(async move {
                 status.store(STATUS_RUNNING, Ordering::Release);
                 run_server(server, shutdown_rx, invalidated, status).await;
+                serving.store(false, Ordering::Release);
             });
 
             Ok::<(), KeepMobileError>(())
@@ -966,6 +1007,8 @@ impl BunkerHandler {
 
         if result.is_err() {
             self.set_status(STATUS_STOPPED);
+            // A stop asked of a start that failed anyway must not stop the next.
+            self.stop_requested.store(false, Ordering::Release);
         }
         result
     }
@@ -1198,7 +1241,7 @@ mod tests {
             approval_timeout: Duration::from_millis(200),
             generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
-            transport_hex: String::new(),
+            grant_scope: String::new(),
             serving: Arc::new(AtomicBool::new(true)),
         };
 
@@ -1250,7 +1293,7 @@ mod tests {
             approval_timeout: Duration::from_millis(50),
             generation: 0,
             outstanding: Arc::clone(&outstanding),
-            transport_hex: String::new(),
+            grant_scope: String::new(),
             serving: Arc::new(AtomicBool::new(true)),
         };
 
@@ -1296,7 +1339,7 @@ mod tests {
             approval_timeout: Duration::from_secs(5),
             generation: 0,
             outstanding: Arc::clone(&outstanding),
-            transport_hex: String::new(),
+            grant_scope: String::new(),
             serving: Arc::new(AtomicBool::new(true)),
         };
 
@@ -1373,7 +1416,7 @@ mod tests {
             approval_timeout: APPROVAL_TIMEOUT,
             generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
-            transport_hex: String::new(),
+            grant_scope: String::new(),
             serving: Arc::new(AtomicBool::new(true)),
         };
         let ask = |bridge: &CallbackBridge| {
@@ -1458,6 +1501,8 @@ mod tests {
         assert_eq!(transport2.len(), 32);
     }
 
+    const GROUP: [u8; 32] = [7; 32];
+
     fn remembered(client: &PublicKey) -> keep_core::relay::StoredBunkerPermission {
         keep_core::relay::StoredBunkerPermission {
             pubkey_hex: client.to_hex(),
@@ -1474,7 +1519,7 @@ mod tests {
     fn restored_clients(mobile: &KeepMobile) -> Vec<String> {
         let (transport, _) = load_or_create_bunker_keys(mobile).unwrap();
         mobile
-            .load_bunker_permissions(&transport_pubkey_hex(&transport).unwrap())
+            .load_bunker_permissions(&grant_scope(&transport, &GROUP).unwrap())
             .into_iter()
             .map(|grant| grant.pubkey_hex)
             .collect()
@@ -1485,7 +1530,7 @@ mod tests {
         mobile
             .persist_bunker_permissions(
                 clients.iter().map(remembered).collect(),
-                &transport_pubkey_hex(&transport).unwrap(),
+                &grant_scope(&transport, &GROUP).unwrap(),
                 || true,
             )
             .unwrap();
@@ -1526,6 +1571,20 @@ mod tests {
             .rotate_bunker_credentials()
             .unwrap();
         assert!(restored_clients(&mobile).is_empty());
+    }
+
+    // A grant was approved for the identity the bunker signed as, so one made
+    // while another share was active is not restored.
+    #[test]
+    fn grants_for_another_share_are_not_restored() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        persist_remembered(&mobile, &[nostr_sdk::Keys::generate().public_key()]);
+        let (transport, _) = load_or_create_bunker_keys(&mobile).unwrap();
+        assert!(mobile
+            .load_bunker_permissions(&grant_scope(&transport, &[8; 32]).unwrap())
+            .is_empty());
+        assert_eq!(restored_clients(&mobile).len(), 1);
     }
 
     // Grants saved before they were tagged with a bunker key cannot be told
@@ -1570,8 +1629,12 @@ mod tests {
         let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
         let client = nostr_sdk::Keys::generate().public_key();
         let (engine, permissions) = engine_knowing(&client);
-        BunkerHandler::new(Arc::clone(&mobile))
-            .publish_server(&engine, Arc::new(AtomicBool::new(true)));
+        assert!(BunkerHandler::new(Arc::clone(&mobile)).publish_server(
+            String::new(),
+            &engine,
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::oneshot::channel().0,
+        ));
 
         BunkerHandler::new(Arc::clone(&mobile))
             .revoke_client(client.to_hex())
@@ -1592,9 +1655,57 @@ mod tests {
         let (engine, _) = engine_knowing(&nostr_sdk::Keys::generate().public_key());
         let serving = Arc::new(AtomicBool::new(true));
         let handler = BunkerHandler::new(Arc::clone(&mobile));
-        handler.publish_server(&engine, Arc::clone(&serving));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        assert!(handler.publish_server(String::new(), &engine, Arc::clone(&serving), tx));
         handler.stop_bunker();
         assert!(!serving.load(Ordering::Acquire));
+        assert!(rx.try_recv().is_ok(), "the server is signalled to stop");
+    }
+
+    // A stop while a start is still connecting finds no server to signal. The
+    // start must see it and not publish, or it leaves a server running that
+    // nothing can stop or revoke.
+    #[test]
+    fn a_stop_during_a_start_stops_that_start() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (engine, _) = engine_knowing(&nostr_sdk::Keys::generate().public_key());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+
+        handler.set_status(STATUS_STARTING);
+        handler.stop_bunker();
+        let published = handler.publish_server(
+            "bunker://".into(),
+            &engine,
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::oneshot::channel().0,
+        );
+        assert!(!published);
+        assert!(handler.live_handler().is_none());
+        assert!(handler.get_bunker_url().is_none());
+
+        assert!(
+            handler.publish_server(
+                "bunker://".into(),
+                &engine,
+                Arc::new(AtomicBool::new(true)),
+                tokio::sync::oneshot::channel().0,
+            ),
+            "the request stops one start, not the next"
+        );
+
+        handler.set_status(STATUS_STOPPED);
+        let idle = BunkerHandler::new(Arc::clone(&mobile));
+        idle.stop_bunker();
+        assert!(
+            idle.publish_server(
+                "bunker://".into(),
+                &engine,
+                Arc::new(AtomicBool::new(true)),
+                tokio::sync::oneshot::channel().0,
+            ),
+            "a stop with nothing starting leaves no request behind"
+        );
     }
 
     // A rotation stops a bunker started through any handler, so the old keys
@@ -1635,7 +1746,7 @@ mod tests {
             approval_timeout: Duration::from_secs(1),
             generation: *mobile.live_generation.borrow(),
             outstanding: Arc::new(AtomicUsize::new(0)),
-            transport_hex: transport_pubkey_hex(&transport).unwrap(),
+            grant_scope: grant_scope(&transport, &GROUP).unwrap(),
             serving: Arc::new(AtomicBool::new(true)),
         };
         let client = nostr_sdk::Keys::generate().public_key();
@@ -1885,7 +1996,7 @@ mod tests {
             approval_timeout: Duration::from_secs(5),
             generation: *mobile.live_generation.borrow(),
             outstanding: Arc::new(AtomicUsize::new(0)),
-            transport_hex: String::new(),
+            grant_scope: String::new(),
             serving: Arc::new(AtomicBool::new(true)),
         };
         let result = ServerCallbacks::request_approval(&bridge, an_approval());

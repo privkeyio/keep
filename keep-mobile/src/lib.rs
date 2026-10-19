@@ -3117,7 +3117,7 @@ impl KeepMobile {
             peer_policies: existing.peer_policies,
             kfp_v1_peer_policies: existing.kfp_v1_peer_policies,
             bunker_permissions: existing.bunker_permissions,
-            bunker_permissions_transport: existing.bunker_permissions_transport,
+            bunker_permissions_scope: existing.bunker_permissions_scope,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
@@ -3684,7 +3684,7 @@ impl KeepMobile {
                 peer_policies: rc.peer_policies.clone(),
                 kfp_v1_peer_policies: rc.kfp_v1_peer_policies.clone(),
                 bunker_permissions: rc.bunker_permissions.clone(),
-                bunker_permissions_transport: None,
+                bunker_permissions_scope: None,
             };
             prepared_relays.push((group_hex, stored_relay));
         }
@@ -4174,21 +4174,21 @@ impl KeepMobile {
     /// Load the persisted NIP-46 bunker permission grants from the global relay
     /// config, returning them ready to seed `ServerConfig::pre_grants` so
     /// remembered grants survive a bunker restart. Only grants made under
-    /// `transport_hex` are returned: a client remembered before a credential
-    /// rotation has to pair again.
+    /// `scope` are returned: a client remembered before a credential rotation,
+    /// or for another share, has to be approved again.
     pub(crate) fn load_bunker_permissions(
         &self,
-        transport_hex: &str,
+        scope: &str,
     ) -> Vec<keep_core::relay::StoredBunkerPermission> {
         let key = relay_config_key(None);
         match persistence::load_relay_config(&self.storage, &key) {
-            Ok(Some(c)) if c.bunker_permissions_transport.as_deref() == Some(transport_hex) => {
+            Ok(Some(c)) if c.bunker_permissions_scope.as_deref() == Some(scope) => {
                 c.bunker_permissions
             }
             Ok(Some(c)) => {
                 if !c.bunker_permissions.is_empty() {
                     tracing::info!(
-                        "not restoring bunker grants made under other bunker credentials"
+                        "not restoring bunker grants made under other bunker credentials or another share"
                     );
                 }
                 Vec::new()
@@ -4211,7 +4211,7 @@ impl KeepMobile {
     }
 
     /// Replace the persisted NIP-46 bunker permission grants with `grants`, made
-    /// under the bunker transport key `transport_hex`, preserving the relay
+    /// under `scope` (see `load_bunker_permissions`), preserving the relay
     /// lists. Called from the engine's `persist_permissions` callback after
     /// every grant write or revoke, so the durable store mirrors the in-memory
     /// engine (the single source of truth). Nothing is written unless `serving`
@@ -4220,7 +4220,7 @@ impl KeepMobile {
     pub(crate) fn persist_bunker_permissions(
         &self,
         grants: Vec<keep_core::relay::StoredBunkerPermission>,
-        transport_hex: &str,
+        scope: &str,
         serving: impl FnOnce() -> bool,
     ) -> Result<(), KeepMobileError> {
         let key = relay_config_key(None);
@@ -4242,7 +4242,7 @@ impl KeepMobile {
             }
         };
         stored.bunker_permissions = grants;
-        stored.bunker_permissions_transport = Some(transport_hex.to_owned());
+        stored.bunker_permissions_scope = Some(scope.to_owned());
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 

@@ -35,11 +35,12 @@ pub(crate) struct StoredRelayConfig {
     pub(crate) kfp_v1_peer_policies: Vec<keep_core::relay::KfpV1PeerPolicyEntry>,
     #[serde(default)]
     pub(crate) bunker_permissions: Vec<keep_core::relay::StoredBunkerPermission>,
-    /// The bunker transport pubkey `bunker_permissions` were granted under.
-    /// Rotating the credentials changes it, so grants made before a rotation
-    /// are not restored; untagged grants are not restored either.
+    /// The bunker transport pubkey and the group signed for that
+    /// `bunker_permissions` were granted under. Rotating the credentials or
+    /// switching the active share changes it, so a grant made before either is
+    /// not restored; untagged grants are not restored either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) bunker_permissions_transport: Option<String>,
+    pub(crate) bunker_permissions_scope: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
