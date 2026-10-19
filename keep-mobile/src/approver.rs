@@ -20,7 +20,7 @@
 //! after a restart the app reads them back with
 //! [`ApproverHandler::waiting_requests`] and [`ApproverHandler::status`].
 //! One handler holds a `KeepMobile`'s approver state at a time; the app
-//! calls [`ApproverHandler::close`] when done with it.
+//! calls [`ApproverHandler::shutdown`] when done with it.
 
 mod view;
 
@@ -537,7 +537,7 @@ pub struct ApproverHandler {
     mobile: Arc<KeepMobile>,
     inner: Mutex<Inner>,
     running: Mutex<Option<Running>>,
-    /// Serializes start, stop, close, forget and reconnects.
+    /// Serializes start, stop, shutdown, forget and reconnects.
     lifecycle: Mutex<()>,
     /// Counts stops, so a reconnect scheduled before one does not undo it.
     generation: AtomicU64,
@@ -1074,7 +1074,7 @@ fn anchor_event(tracker: &AnchorTracker) -> ApproverEvent {
 #[uniffi::export]
 impl ApproverHandler {
     /// The approver for `mobile`, with any pairing kept from an earlier
-    /// run. One at a time per `KeepMobile`: close the last one first.
+    /// run. One at a time per `KeepMobile`: shut the last one down first.
     #[uniffi::constructor]
     pub fn new(mobile: Arc<KeepMobile>) -> Result<Arc<Self>, KeepMobileError> {
         if mobile.approver_live.swap(true, Ordering::SeqCst) {
@@ -1326,7 +1326,7 @@ impl ApproverHandler {
     /// Stop serving, let go of the callbacks, and give the `KeepMobile`'s
     /// approver slot back, so a new handler can open. The pairing stays
     /// stored; this handler can do nothing more.
-    pub fn close(&self) {
+    pub fn shutdown(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.halt();
         *self.callbacks.lock().unwrap_or_else(|e| e.into_inner()) = None;
