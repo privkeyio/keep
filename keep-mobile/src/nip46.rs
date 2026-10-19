@@ -432,20 +432,38 @@ impl ServerCallbacks for CallbackBridge {
     }
 }
 
+/// How `stop_bunker` and a start meet, kept under one lock: a stop either
+/// signals a published server or, when a start is still in flight, leaves a
+/// request that start honors instead of publishing.
+#[derive(Default)]
+struct Lifecycle {
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// From claiming the status, before the start waits on the start lock, to
+    /// publishing or failing.
+    starting: bool,
+    stop_requested: bool,
+}
+
 #[derive(uniffi::Object)]
 pub struct BunkerHandler {
     mobile: Arc<KeepMobile>,
     status: Arc<AtomicU8>,
     bunker_url: std::sync::Mutex<Option<String>>,
-    shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    lifecycle: std::sync::Mutex<Lifecycle>,
     /// The `serving` flag of the server last started, which `stop_bunker`
     /// clears.
     serving: std::sync::Mutex<Arc<AtomicBool>>,
-    /// Set by a `stop_bunker` that found a start still connecting, with no
-    /// server yet to signal. Read and set under the `shutdown_tx` lock, so the
-    /// start either sees it before publishing or has published a server the
-    /// stop then signals.
-    stop_requested: AtomicBool,
+}
+
+impl Drop for BunkerHandler {
+    // Dropping the handler drops the shutdown sender, which stops its server,
+    // but an approval still open there could persist before it does.
+    fn drop(&mut self) {
+        self.serving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(false, Ordering::Release);
+    }
 }
 
 impl BunkerHandler {
@@ -455,6 +473,10 @@ impl BunkerHandler {
 
     fn load_status(&self) -> u8 {
         self.status.load(Ordering::Acquire)
+    }
+
+    fn lifecycle(&self) -> std::sync::MutexGuard<'_, Lifecycle> {
+        self.lifecycle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// See `KeepMobile::bunker_start_lock`. It guards no data, so a panic
@@ -477,8 +499,9 @@ impl BunkerHandler {
         serving: Arc<AtomicBool>,
         tx: tokio::sync::oneshot::Sender<()>,
     ) -> bool {
-        let mut shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
-        if self.stop_requested.swap(false, Ordering::AcqRel) {
+        let mut lifecycle = self.lifecycle();
+        lifecycle.starting = false;
+        if std::mem::take(&mut lifecycle.stop_requested) {
             return false;
         }
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
@@ -488,7 +511,7 @@ impl BunkerHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
         *self.serving.lock().unwrap_or_else(|e| e.into_inner()) = serving;
-        *shutdown_tx = Some(tx);
+        lifecycle.shutdown_tx = Some(tx);
         true
     }
 
@@ -510,9 +533,8 @@ impl BunkerHandler {
             mobile,
             status: Arc::new(AtomicU8::new(STATUS_STOPPED)),
             bunker_url: std::sync::Mutex::new(None),
-            shutdown_tx: std::sync::Mutex::new(None),
+            lifecycle: std::sync::Mutex::new(Lifecycle::default()),
             serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
-            stop_requested: AtomicBool::new(false),
         }
     }
 
@@ -537,15 +559,12 @@ impl BunkerHandler {
 
     pub fn stop_bunker(&self) {
         {
-            let mut shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
-            match shutdown_tx.take() {
-                Some(tx) => {
-                    let _ = tx.send(());
-                }
-                None if self.load_status() == STATUS_STARTING => {
-                    self.stop_requested.store(true, Ordering::Release);
-                }
-                None => {}
+            let mut lifecycle = self.lifecycle();
+            if let Some(tx) = lifecycle.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            if lifecycle.starting {
+                lifecycle.stop_requested = true;
             }
         }
         self.serving
@@ -595,13 +614,10 @@ impl BunkerHandler {
     /// On `Err`, rotation did NOT happen and the previous (possibly leaked)
     /// credential is still valid — callers must not report success.
     pub fn rotate_bunker_credentials(&self) -> Result<(), KeepMobileError> {
-        // Serialize against `do_start_bunker`: without this a start already past
-        // its status CAS (but not yet holding `shutdown_tx`) would escape the
-        // `stop_bunker` below and finish serving the old keys, silently defeating
-        // the rotation. Holding this for the whole rotate guarantees no start is
-        // mid-flight: any concurrent start either completed (so `shutdown_tx` is
-        // set and `stop_bunker` signals it) or is blocked here and will read the
-        // freshly-persisted secrets when it proceeds.
+        // Serialize against `do_start_bunker`, which holds this from before it
+        // reads the keys until it publishes: any start either published (and
+        // the stop below signals it) or is waiting here, and the stop below
+        // cancels one started through this handler.
         let _start_guard = self.start_guard();
 
         // Signal the running bunker to stop so its old keys/URL and grants tear
@@ -814,25 +830,32 @@ impl BunkerHandler {
             validate_relay_url(relay)?;
         }
 
-        // Held for the whole start so a concurrent `rotate_bunker_credentials`
-        // cannot slip between the status CAS and `shutdown_tx` being set and
-        // leave this start serving keys that rotation meant to revoke.
-        let _start_guard = self.start_guard();
-
-        if self
-            .status
-            .compare_exchange(
-                STATUS_STOPPED,
-                STATUS_STARTING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
+        // Claimed before waiting on the start lock, so a stop made while this
+        // start waits is recorded for it.
         {
-            return Err(KeepMobileError::InitializationFailed {
-                msg: "Bunker already running or starting".into(),
-            });
+            let mut lifecycle = self.lifecycle();
+            if self
+                .status
+                .compare_exchange(
+                    STATUS_STOPPED,
+                    STATUS_STARTING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return Err(KeepMobileError::InitializationFailed {
+                    msg: "Bunker already running or starting".into(),
+                });
+            }
+            lifecycle.starting = true;
+            lifecycle.stop_requested = false;
         }
+
+        // Held for the whole start, so a revoke or rotation cannot fall between
+        // reading the persisted grants and publishing the engine, and a
+        // rotation's new keys are read by any start that waited on it.
+        let _start_guard = self.start_guard();
 
         // Cert-pin the bunker relays before serving, matching do_initialize.
         // Held on the sync stack across the block_on (like do_initialize) so the
@@ -997,12 +1020,10 @@ impl BunkerHandler {
         });
 
         if result.is_err() {
-            // Under the lock `stop_bunker` reads the status under, so a stop
-            // cannot see this start as still starting and leave a request that
-            // stops the next one.
-            let _shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
+            let mut lifecycle = self.lifecycle();
+            lifecycle.starting = false;
+            lifecycle.stop_requested = false;
             self.set_status(STATUS_STOPPED);
-            self.stop_requested.store(false, Ordering::Release);
         }
         result
     }
@@ -1027,15 +1048,17 @@ async fn run_server(
             server.stop().await;
             status.store(STATUS_STOPPED, Ordering::Release);
         }
+        // Before `run` for the same reason: a stopped server must not sign one
+        // more queued request, which a revoke made since could not reach.
+        _ = shutdown_rx => {
+            server.stop().await;
+            status.store(STATUS_STOPPED, Ordering::Release);
+        }
         result = server.run() => {
             match result {
                 Ok(()) => status.store(STATUS_STOPPED, Ordering::Release),
                 Err(_) => status.store(STATUS_ERROR, Ordering::Release),
             };
-        }
-        _ = shutdown_rx => {
-            server.stop().await;
-            status.store(STATUS_STOPPED, Ordering::Release);
         }
     }
     // However it stopped, including a handler dropped without `stop_bunker`.
@@ -1669,7 +1692,7 @@ mod tests {
         let (engine, _) = engine_knowing(&nostr_sdk::Keys::generate().public_key());
         let handler = BunkerHandler::new(Arc::clone(&mobile));
 
-        handler.set_status(STATUS_STARTING);
+        handler.lifecycle().starting = true;
         handler.stop_bunker();
         let published = handler.publish_server(
             "bunker://".into(),
@@ -1691,7 +1714,20 @@ mod tests {
             "the request stops one start, not the next"
         );
 
-        handler.set_status(STATUS_STOPPED);
+        // A server that stopped by itself leaves its sender behind, and a stop
+        // that finds it must still reach the start in flight.
+        let restarted = BunkerHandler::new(Arc::clone(&mobile));
+        let (dead, _) = tokio::sync::oneshot::channel();
+        restarted.lifecycle().shutdown_tx = Some(dead);
+        restarted.lifecycle().starting = true;
+        restarted.stop_bunker();
+        assert!(!restarted.publish_server(
+            "bunker://".into(),
+            &engine,
+            Arc::new(AtomicBool::new(true)),
+            tokio::sync::oneshot::channel().0,
+        ));
+
         let idle = BunkerHandler::new(Arc::clone(&mobile));
         idle.stop_bunker();
         assert!(
