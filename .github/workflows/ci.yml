@@ -226,7 +226,7 @@ jobs:
           # aws-lc-sys (via rustls) compiles bundled C through the NDK's cmake
           # toolchain, which only reliably supports the Ninja generator.
           sudo apt-get install -y ninja-build
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
           java-version: "21"
@@ -244,7 +244,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: android
-      - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
           tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
       - name: Cross-compile keep-mobile for Android
