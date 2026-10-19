@@ -611,6 +611,9 @@ impl BunkerHandler {
     /// in-memory grants); the caller restarts it to obtain and publish the new
     /// URL, and existing clients must re-pair.
     ///
+    /// A start in flight on this handler is cancelled and fails with "The bunker
+    /// was stopped while it was starting"; the caller starts it again.
+    ///
     /// On `Err`, rotation did NOT happen and the previous (possibly leaked)
     /// credential is still valid — callers must not report success.
     pub fn rotate_bunker_credentials(&self) -> Result<(), KeepMobileError> {
