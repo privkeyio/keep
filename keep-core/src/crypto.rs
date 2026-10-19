@@ -246,7 +246,8 @@ pub struct SecretVec {
 #[allow(missing_docs)]
 impl SecretVec {
     pub fn new(mut data: Vec<u8>) -> Result<Self> {
-        let mut encrypted = EncryptedMem::new();
+        let mut encrypted = EncryptedMem::new()
+            .map_err(|_| CryptoError::encryption("prepare secret encryption in RAM"))?;
         encrypted
             .encrypt(&data)
             .map_err(|_| CryptoError::encryption("encrypt secret in RAM"))?;
@@ -318,7 +319,8 @@ pub struct SecretKey {
 #[allow(missing_docs)]
 impl SecretKey {
     pub fn new(mut bytes: [u8; KEY_SIZE]) -> Result<Self> {
-        let mut encrypted = EncryptedMem::new();
+        let mut encrypted = EncryptedMem::new()
+            .map_err(|_| CryptoError::encryption("prepare key encryption in RAM"))?;
         encrypted
             .encrypt(&bytes)
             .map_err(|_| CryptoError::encryption("encrypt key in RAM"))?;
