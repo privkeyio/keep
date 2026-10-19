@@ -215,14 +215,65 @@ pub(crate) fn persist_velocity(
     )
 }
 
-pub(crate) fn load_trusted_wardens(
+/// The trusted warden set and the epoch that orders changes to it.
+///
+/// Kept in one record so a change to the set and the advance of the epoch land
+/// in a single write. Two records would let a failure between them leave the
+/// set changed with the epoch unmoved, which is exactly the window a replayed
+/// authorization needs.
+///
+/// The device id lives here too, because it scopes the epoch: an authorization
+/// names both, so one signed for another device at the same epoch does not
+/// verify here.
+pub(crate) struct WardenSet {
+    pub(crate) wardens: HashSet<[u8; POLICY_PUBKEY_LEN]>,
+    pub(crate) epoch: u64,
+    pub(crate) device: Option<[u8; 32]>,
+    /// Set when the set was rebuilt from the stored policy's signer after its
+    /// record was lost, and cleared by the next authorized change.
+    pub(crate) restored: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredWardenSet {
+    epoch: u64,
+    wardens: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restored: bool,
+}
+
+pub(crate) fn load_warden_set(
     storage: &Arc<dyn SecureStorage>,
-) -> Result<HashSet<[u8; POLICY_PUBKEY_LEN]>, KeepMobileError> {
+) -> Result<WardenSet, KeepMobileError> {
     let data = storage.load_share_by_key(TRUSTED_WARDENS_KEY.into())?;
-    let hex_list: Vec<String> =
-        serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to deserialize trusted wardens: {e}"),
-        })?;
+    // The record was a bare list of keys before the epoch existed. It is read
+    // as epoch 0, which is what a device that never authorized a change holds.
+    let (epoch, hex_list, device_hex, restored) =
+        match serde_json::from_slice::<StoredWardenSet>(&data) {
+            Ok(stored) => (stored.epoch, stored.wardens, stored.device, stored.restored),
+            Err(_) => (
+                0,
+                serde_json::from_slice::<Vec<String>>(&data).map_err(|e| {
+                    KeepMobileError::StorageError {
+                        msg: format!("Failed to deserialize trusted wardens: {e}"),
+                    }
+                })?,
+                None,
+                false,
+            ),
+        };
+    let device = device_hex
+        .map(|hex_str| {
+            hex::decode(&hex_str)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .ok_or_else(|| KeepMobileError::StorageError {
+                    msg: format!("{TRUSTED_WARDENS_KEY}: malformed device id"),
+                })
+        })
+        .transpose()?;
 
     let mut wardens = HashSet::new();
     let mut malformed = Vec::new();
@@ -242,7 +293,12 @@ pub(crate) fn load_trusted_wardens(
         }
     }
     if malformed.is_empty() {
-        Ok(wardens)
+        Ok(WardenSet {
+            wardens,
+            epoch,
+            device,
+            restored,
+        })
     } else {
         Err(KeepMobileError::StorageError {
             msg: format!(
@@ -254,12 +310,23 @@ pub(crate) fn load_trusted_wardens(
     }
 }
 
-pub(crate) fn persist_trusted_wardens(
+pub(crate) fn load_trusted_wardens(
     storage: &Arc<dyn SecureStorage>,
-    wardens: &HashSet<[u8; POLICY_PUBKEY_LEN]>,
+) -> Result<HashSet<[u8; POLICY_PUBKEY_LEN]>, KeepMobileError> {
+    load_warden_set(storage).map(|set| set.wardens)
+}
+
+pub(crate) fn persist_warden_set(
+    storage: &Arc<dyn SecureStorage>,
+    set: &WardenSet,
 ) -> Result<(), KeepMobileError> {
-    let hex_list: Vec<String> = wardens.iter().map(hex::encode).collect();
-    let data = serde_json::to_vec(&hex_list).map_err(|e| KeepMobileError::StorageError {
+    let stored = StoredWardenSet {
+        epoch: set.epoch,
+        wardens: set.wardens.iter().map(hex::encode).collect(),
+        device: set.device.map(hex::encode),
+        restored: set.restored,
+    };
+    let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize trusted wardens: {e}"),
     })?;
     storage.store_share_by_key(
