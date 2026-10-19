@@ -438,11 +438,6 @@ pub struct BunkerHandler {
     status: Arc<AtomicU8>,
     bunker_url: std::sync::Mutex<Option<String>>,
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    /// Weak, so the running server holds the only strong reference: the
-    /// handler owns the signer and with it the share or the node, and a server
-    /// that stopped on its own, such as on a node teardown, must not leave
-    /// them resident until the next `stop_bunker`.
-    handler: std::sync::Mutex<Option<std::sync::Weak<SignerHandler>>>,
     /// The `serving` flag of the server last started, which `stop_bunker`
     /// clears.
     serving: std::sync::Mutex<Arc<AtomicBool>>,
@@ -487,7 +482,6 @@ impl BunkerHandler {
             return false;
         }
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(url);
-        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
         *self
             .mobile
             .live_bunker
@@ -517,7 +511,6 @@ impl BunkerHandler {
             status: Arc::new(AtomicU8::new(STATUS_STOPPED)),
             bunker_url: std::sync::Mutex::new(None),
             shutdown_tx: std::sync::Mutex::new(None),
-            handler: std::sync::Mutex::new(None),
             serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
             stop_requested: AtomicBool::new(false),
         }
@@ -560,7 +553,6 @@ impl BunkerHandler {
             .unwrap_or_else(|e| e.into_inner())
             .store(false, Ordering::Release);
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Revokes a single client: drops its grants in the running engine, so any
@@ -998,16 +990,18 @@ impl BunkerHandler {
             let status = Arc::clone(&self.status);
             tokio::spawn(async move {
                 status.store(STATUS_RUNNING, Ordering::Release);
-                run_server(server, shutdown_rx, invalidated, status).await;
-                serving.store(false, Ordering::Release);
+                run_server(server, shutdown_rx, invalidated, status, serving).await;
             });
 
             Ok::<(), KeepMobileError>(())
         });
 
         if result.is_err() {
+            // Under the lock `stop_bunker` reads the status under, so a stop
+            // cannot see this start as still starting and leave a request that
+            // stops the next one.
+            let _shutdown_tx = self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner());
             self.set_status(STATUS_STOPPED);
-            // A stop asked of a start that failed anyway must not stop the next.
             self.stop_requested.store(false, Ordering::Release);
         }
         result
@@ -1019,6 +1013,7 @@ async fn run_server(
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     mut invalidated: tokio::sync::watch::Receiver<u64>,
     status: Arc<AtomicU8>,
+    serving: Arc<AtomicBool>,
 ) {
     // Biased so a teardown is seen before more requests are drained, since
     // those that need no prompt would otherwise sign with the old share.
@@ -1043,6 +1038,8 @@ async fn run_server(
             status.store(STATUS_STOPPED, Ordering::Release);
         }
     }
+    // However it stopped, including a handler dropped without `stop_bunker`.
+    serving.store(false, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -1891,11 +1888,13 @@ mod tests {
         });
         let bunker = server.pubkey();
         let handler = Arc::downgrade(&server.handler());
+        let persisting = Arc::new(AtomicBool::new(true));
         let serving = mobile.runtime.spawn(run_server(
             server,
             shutdown_rx,
             invalidated,
             Arc::clone(&status),
+            Arc::clone(&persisting),
         ));
         assert!(
             mobile.runtime.block_on(pings_back(&url, bunker)),
@@ -1910,6 +1909,10 @@ mod tests {
         }
         assert!(serving.is_finished(), "the server stopped with the node");
         assert_eq!(status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert!(
+            !persisting.load(Ordering::Acquire),
+            "a stopped server persists nothing"
+        );
         assert!(
             handler.upgrade().is_none(),
             "the signer, and the share it holds, went with the server"
