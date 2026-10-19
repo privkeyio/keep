@@ -700,6 +700,15 @@ pub struct KeepMobile {
     /// rather than signing on with a share that was deleted or switched away
     /// from, or trusting a pin that was removed.
     pub(crate) live_generation: tokio::sync::watch::Sender<u64>,
+    /// Serializes every bunker start against revokes and credential
+    /// rotations, whichever `BunkerHandler` each is made through: a start reads
+    /// the persisted grants before it publishes its engine, and a revoke in
+    /// between would be lost.
+    pub(crate) bunker_start_lock: std::sync::Mutex<()>,
+    /// The engine of the bunker last started, through any `BunkerHandler`, so
+    /// a revoke reaches it whichever instance the revoke is made through. Weak,
+    /// so it dies with the server.
+    pub(crate) live_bunker: std::sync::Mutex<Option<std::sync::Weak<keep_nip46::SignerHandler>>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -965,6 +974,8 @@ impl KeepMobile {
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
             live_generation: tokio::sync::watch::Sender::new(0),
+            bunker_start_lock: std::sync::Mutex::new(()),
+            live_bunker: std::sync::Mutex::new(None),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),

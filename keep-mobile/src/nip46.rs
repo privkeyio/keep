@@ -443,10 +443,6 @@ pub struct BunkerHandler {
     /// that stopped on its own, such as on a node teardown, must not leave
     /// them resident until the next `stop_bunker`.
     handler: std::sync::Mutex<Option<std::sync::Weak<SignerHandler>>>,
-    /// Serializes `do_start_bunker` against `rotate_bunker_credentials` so a
-    /// credential rotation cannot interleave with an in-flight start (which
-    /// would otherwise finish serving the pre-rotation keys).
-    start_rotate_lock: std::sync::Mutex<()>,
     /// The `serving` flag of the server last started, which `stop_bunker`
     /// clears.
     serving: std::sync::Mutex<Arc<AtomicBool>>,
@@ -461,16 +457,30 @@ impl BunkerHandler {
         self.status.load(Ordering::Acquire)
     }
 
-    fn start_guard(&self) -> Result<std::sync::MutexGuard<'_, ()>, KeepMobileError> {
-        self.start_rotate_lock
+    /// See `KeepMobile::bunker_start_lock`. It guards no data, so a panic
+    /// while it was held leaves nothing to repair.
+    fn start_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.mobile
+            .bunker_start_lock
             .lock()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "bunker start/rotate lock poisoned".into(),
-            })
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make a started server's engine the one revokes reach, and its
+    /// `serving` flag the one `stop_bunker` clears.
+    fn publish_server(&self, handler: &Arc<SignerHandler>, serving: Arc<AtomicBool>) {
+        *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
+        *self
+            .mobile
+            .live_bunker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(handler));
+        *self.serving.lock().unwrap_or_else(|e| e.into_inner()) = serving;
     }
 
     fn live_handler(&self) -> Option<Arc<SignerHandler>> {
-        self.handler
+        self.mobile
+            .live_bunker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
@@ -488,7 +498,6 @@ impl BunkerHandler {
             bunker_url: std::sync::Mutex::new(None),
             shutdown_tx: std::sync::Mutex::new(None),
             handler: std::sync::Mutex::new(None),
-            start_rotate_lock: std::sync::Mutex::new(()),
             serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
@@ -539,7 +548,7 @@ impl BunkerHandler {
         })?;
         // A start between reading the persisted grants and publishing its
         // handler would restore what this removes, unseen by either step.
-        let _start_guard = self.start_guard()?;
+        let _start_guard = self.start_guard();
         if let Some(handler) = self.live_handler() {
             self.mobile
                 .runtime
@@ -550,7 +559,7 @@ impl BunkerHandler {
 
     /// Revokes every client, in the running engine and in the persisted grants.
     pub fn revoke_all_clients(&self) -> Result<(), KeepMobileError> {
-        let _start_guard = self.start_guard()?;
+        let _start_guard = self.start_guard();
         if let Some(handler) = self.live_handler() {
             self.mobile
                 .runtime
@@ -576,11 +585,16 @@ impl BunkerHandler {
         // mid-flight: any concurrent start either completed (so `shutdown_tx` is
         // set and `stop_bunker` signals it) or is blocked here and will read the
         // freshly-persisted secrets when it proceeds.
-        let _start_guard = self.start_guard()?;
+        let _start_guard = self.start_guard();
 
         // Signal the running bunker to stop so its old keys/URL and grants tear
         // down; server shutdown completes asynchronously in its own task.
+        // `stop_bunker` reaches only a bunker this handler started, so the
+        // generation moves too, which stops one started through any other.
         self.stop_bunker();
+        self.mobile
+            .live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
 
         let _guard =
             self.mobile
@@ -779,7 +793,7 @@ impl BunkerHandler {
         // Held for the whole start so a concurrent `rotate_bunker_credentials`
         // cannot slip between the status CAS and `shutdown_tx` being set and
         // leave this start serving keys that rotation meant to revoke.
-        let _start_guard = self.start_guard()?;
+        let _start_guard = self.start_guard();
 
         if self
             .status
@@ -799,8 +813,8 @@ impl BunkerHandler {
         // Cert-pin the bunker relays before serving, matching do_initialize.
         // Held on the sync stack across the block_on (like do_initialize) so the
         // trust-on-first-use pin persist cannot race a concurrent cert-pin FFI
-        // call. Lock order start_rotate_lock -> cert_pin_lock is acyclic: the
-        // cert-pin FFI methods and init never take start_rotate_lock.
+        // call. Lock order bunker_start_lock -> cert_pin_lock is acyclic: the
+        // cert-pin FFI methods and init never take bunker_start_lock.
         let _cert_pins = self
             .mobile
             .cert_pin_lock
@@ -936,9 +950,7 @@ impl BunkerHandler {
             };
 
             *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
-            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(Arc::downgrade(&server.handler()));
-            *self.serving.lock().unwrap_or_else(|e| e.into_inner()) = serving;
+            self.publish_server(&server.handler(), serving);
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
@@ -1531,6 +1543,73 @@ mod tests {
         assert!(restored_clients(&mobile).is_empty());
     }
 
+    fn engine_knowing(
+        client: &PublicKey,
+    ) -> (
+        Arc<SignerHandler>,
+        Arc<tokio::sync::Mutex<keep_nip46::PermissionManager>>,
+    ) {
+        let mut pm = keep_nip46::PermissionManager::new();
+        assert!(pm.connect(*client, "client".into()));
+        let permissions = Arc::new(tokio::sync::Mutex::new(pm));
+        let handler = Arc::new(SignerHandler::new(
+            Arc::new(tokio::sync::Mutex::new(keep_core::keyring::Keyring::new())),
+            Arc::clone(&permissions),
+            Arc::new(tokio::sync::Mutex::new(keep_nip46::AuditLog::new(10))),
+            None,
+        ));
+        (handler, permissions)
+    }
+
+    // The app makes a new handler for every start, so a revoke can arrive
+    // through one that did not start the running bunker, and must still reach
+    // its engine.
+    #[test]
+    fn a_revoke_reaches_a_bunker_started_through_another_handler() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let client = nostr_sdk::Keys::generate().public_key();
+        let (engine, permissions) = engine_knowing(&client);
+        BunkerHandler::new(Arc::clone(&mobile))
+            .publish_server(&engine, Arc::new(AtomicBool::new(true)));
+
+        BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_client(client.to_hex())
+            .unwrap();
+        assert!(mobile
+            .runtime
+            .block_on(permissions.lock())
+            .get_app(&client)
+            .is_none());
+    }
+
+    // `stop_bunker` must reach the flag of the server it stops, or that server
+    // keeps persisting while it winds down.
+    #[test]
+    fn stopping_a_bunker_clears_its_serving_flag() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (engine, _) = engine_knowing(&nostr_sdk::Keys::generate().public_key());
+        let serving = Arc::new(AtomicBool::new(true));
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        handler.publish_server(&engine, Arc::clone(&serving));
+        handler.stop_bunker();
+        assert!(!serving.load(Ordering::Acquire));
+    }
+
+    // A rotation stops a bunker started through any handler, so the old keys
+    // stop serving and its approvals and persists are refused.
+    #[test]
+    fn a_rotation_moves_the_live_generation() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let before = *mobile.live_generation.borrow();
+        BunkerHandler::new(Arc::clone(&mobile))
+            .rotate_bunker_credentials()
+            .unwrap();
+        assert_ne!(*mobile.live_generation.borrow(), before);
+    }
+
     // A server still winding down after a stop must not write back grants a
     // revoke cleared in the meantime.
     #[test]
@@ -1564,6 +1643,18 @@ mod tests {
         bridge.persist_permissions(vec![remembered(&client)]);
         assert!(restored_clients(&mobile).is_empty());
         bridge.serving.store(true, Ordering::Release);
+        mobile
+            .live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        bridge.persist_permissions(vec![remembered(&client)]);
+        assert!(
+            restored_clients(&mobile).is_empty(),
+            "a server from before a teardown persists nothing either"
+        );
+        let bridge = CallbackBridge {
+            generation: *mobile.live_generation.borrow(),
+            ..bridge
+        };
         bridge.persist_permissions(vec![remembered(&client)]);
         assert_eq!(restored_clients(&mobile), vec![client.to_hex()]);
     }
