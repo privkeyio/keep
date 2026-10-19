@@ -8,7 +8,7 @@ repository.workspace = true
 description = "Agent approvals over Nostr: the encodings, hashes, signatures and checks the gateway and the approver share"
 
 [dependencies]
-nostr = { version = "0.44", default-features = false, features = ["std", "nip44", "nip59"] }
+nostr = { version = "0.45", default-features = false, features = ["std", "nip44", "nip59"] }
 bitcoin = { workspace = true }
 sha2 = { version = "0.11", features = ["zeroize"] }
 hmac = { version = "0.13", features = ["zeroize"] }
