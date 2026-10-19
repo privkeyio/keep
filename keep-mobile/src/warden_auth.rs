@@ -24,10 +24,21 @@
 //! the set returns to what it was, and the original "add" would verify again
 //! and bring the compromised key back.
 //!
-//! The signed message is domain-separated from a policy bundle's, so neither
-//! can be passed off as the other.
+//! The signed message is a standard BIP340 signature over the 32 bytes
+//!
+//! ```text
+//! SHA256("keep/warden-authorization/v1" || version || action || warden_pubkey
+//!        || device_id || subject || epoch as u64 little-endian)
+//! ```
+//!
+//! so any BIP340 signer can produce one. The leading tag separates it from a
+//! policy bundle's signed data, so neither can be passed off as the other.
+//!
+//! An authorization stays valid until the epoch next advances. A warden that
+//! sent one and no longer wants it used spends it by making any other change,
+//! such as installing a renewal of the policy.
 
-use k256::schnorr::{signature::Verifier, Signature, VerifyingKey};
+use k256::schnorr::{signature::hazmat::PrehashVerifier, Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 
@@ -71,10 +82,11 @@ pub struct WardenGovernance {
     pub epoch: u64,
 }
 
-/// The subject a revocation names when a policy record is stored but cannot be
-/// produced, because it will not parse or will not decrypt, so it has no digest
-/// of its own. Only accepted while the record is in that state, and like every
-/// authorization it names the current epoch, so it is single-use.
+/// The subject a revocation names when the stored policy cannot be attributed
+/// to a trusted warden: it will not decrypt, will not parse, or fails its
+/// signature, hash or signer check, so no warden knows its digest. Only
+/// accepted while the record is in that state, and like every authorization it
+/// names this device and its current epoch.
 pub(crate) fn unreadable_policy_subject() -> [u8; 32] {
     Sha256::digest(b"keep/unreadable-policy").into()
 }
@@ -192,7 +204,7 @@ impl WardenAuthorization {
             self.epoch,
         );
         verifying_key
-            .verify(&message, &signature)
+            .verify_prehash(&message, &signature)
             .map_err(|_| KeepMobileError::PolicySignatureInvalid)
     }
 }
@@ -206,12 +218,12 @@ pub(crate) fn sign_authorization(
     device: &[u8; 32],
     epoch: u64,
 ) -> String {
-    use k256::schnorr::signature::Signer;
+    use k256::schnorr::signature::hazmat::PrehashSigner;
 
     let mut warden_pubkey = [0u8; POLICY_PUBKEY_LEN];
     warden_pubkey.copy_from_slice(&signing_key.verifying_key().to_bytes());
     let message = WardenAuthorization::message(action, &warden_pubkey, device, subject, epoch);
-    let signature = signing_key.sign(&message);
+    let signature = signing_key.sign_prehash(&message).expect("32-byte prehash");
 
     let mut out = Vec::with_capacity(WARDEN_AUTH_LEN);
     out.push(WARDEN_AUTH_VERSION);
@@ -331,7 +343,7 @@ mod tests {
     /// not verify.
     #[test]
     fn the_signed_message_is_tagged() {
-        use k256::schnorr::signature::Signer;
+        use k256::schnorr::signature::hazmat::PrehashSigner;
 
         let warden = key();
         let trusted: HashSet<_> = [pubkey(&warden)].into();
@@ -353,12 +365,51 @@ mod tests {
         ))
         .unwrap();
         let sig_at = bytes.len() - POLICY_SIGNATURE_LEN;
-        bytes[sig_at..].copy_from_slice(&warden.sign(&untagged).to_bytes());
+        bytes[sig_at..].copy_from_slice(&warden.sign_prehash(&untagged).unwrap().to_bytes());
         let auth = WardenAuthorization::from_hex(&hex::encode(bytes)).unwrap();
         assert!(matches!(
             auth.authorize(WardenAction::RevokePolicy, &subject, &DEVICE, 0, &trusted),
             Err(KeepMobileError::PolicySignatureInvalid)
         ));
+    }
+
+    /// An authorization assembled from the documented construction and
+    /// signed by an independent BIP340 implementation verifies, so a warden
+    /// needs nothing from this crate to produce one.
+    #[test]
+    fn a_standard_bip340_signer_produces_a_valid_authorization() {
+        use nostr_sdk::secp256k1::{Keypair, Message, Secp256k1};
+
+        let warden = key();
+        let trusted: HashSet<_> = [pubkey(&warden)].into();
+        let subject = [6u8; 32];
+        let epoch = 3u64;
+
+        let mut preimage = Vec::new();
+        preimage.extend_from_slice(b"keep/warden-authorization/v1");
+        preimage.push(1);
+        preimage.push(WardenAction::AddWarden as u8);
+        preimage.extend_from_slice(&pubkey(&warden));
+        preimage.extend_from_slice(&DEVICE);
+        preimage.extend_from_slice(&subject);
+        preimage.extend_from_slice(&epoch.to_le_bytes());
+        let digest: [u8; 32] = Sha256::digest(&preimage).into();
+
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &warden.to_bytes()).unwrap();
+        let signature = secp.sign_schnorr_no_aux_rand(&Message::from_digest(digest), &keypair);
+
+        let mut bytes = vec![1, WardenAction::AddWarden as u8];
+        bytes.extend_from_slice(&pubkey(&warden));
+        bytes.extend_from_slice(&DEVICE);
+        bytes.extend_from_slice(&subject);
+        bytes.extend_from_slice(&epoch.to_le_bytes());
+        bytes.extend_from_slice(signature.as_ref());
+
+        WardenAuthorization::from_hex(&hex::encode(bytes))
+            .unwrap()
+            .authorize(WardenAction::AddWarden, &subject, &DEVICE, epoch, &trusted)
+            .unwrap();
     }
 
     #[test]

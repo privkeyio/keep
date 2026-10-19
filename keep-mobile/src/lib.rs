@@ -2095,9 +2095,11 @@ impl KeepMobile {
     /// warden epoch. Without one, anyone holding the device could remove the
     /// policy and spend without limit.
     ///
-    /// The revocation names the stored policy by its digest, or, when the
-    /// record exists but will not parse, by the fixed subject for an
-    /// unreadable record. With no policy stored there is nothing to remove and
+    /// The revocation names the stored policy by its digest when that policy
+    /// verifies as a trusted warden's, or otherwise by the fixed subject for a
+    /// policy that cannot be attributed: one that will not decrypt, will not
+    /// parse, or parses and fails its signature, hash or signer check. With no
+    /// policy stored there is nothing to remove and
     /// no revocation is needed; the time floor is still reset, see below.
     ///
     /// If no trusted warden can sign one, because the warden keys were lost,
@@ -2116,25 +2118,37 @@ impl KeepMobile {
 
         // What is stored decides what the revocation has to name. Read fresh,
         // because memory can hold a faulted state with no bundle in it.
-        //
-        // Anything stored that cannot be produced, whether it will not parse or
-        // will not even decrypt, is named by the fixed subject for an unreadable
-        // policy. Refusing to remove one that will not decrypt left no way out:
-        // a record whose key alias was invalidated never reads again, and an
-        // install is refused over a fault with no baseline, so the device sat
-        // refusing every spend until it was wiped. The subject is safe to accept
-        // here because it still needs a trusted warden's signature at the
-        // current epoch on this device, and the epoch advances on every
-        // install as well as every change: it cannot be carried to another
-        // device, or held back and used on a policy installed after it.
-        let subject = match persistence::load_policy(&self.storage) {
-            Ok(bundle) => Some(bundle.digest()),
+        let stored = match persistence::load_policy(&self.storage) {
+            Ok(bundle) => Some(Some(bundle)),
             Err(KeepMobileError::StorageNotFound) => None,
-            Err(_) => Some(warden_auth::unreadable_policy_subject()),
+            Err(_) => Some(None),
         };
 
-        if let Some(subject) = subject {
+        if let Some(stored) = stored {
             let (set, device) = Self::governance_set(&self.storage)?;
+            // A policy is named by its digest only when it verifies as what a
+            // trusted warden signed, because only then does the warden know it.
+            // Anything else stored, whether it will not decrypt, will not parse,
+            // or parses with edited rules or under a signer no longer trusted,
+            // faults with no baseline, so an install is refused over it, and the
+            // digest of whatever bytes are there is known to nobody. Requiring
+            // that digest left those devices refusing every spend until they
+            // were wiped, so they are all named by the one fixed subject.
+            //
+            // That subject still needs a trusted warden's signature for this
+            // device at its current epoch, and the epoch advances on every
+            // install and every change, so it cannot be carried to another
+            // device or used on a policy installed after it was signed.
+            let subject = match stored {
+                Some(bundle)
+                    if bundle.verify_signature().is_ok()
+                        && bundle.verify_hash().is_ok()
+                        && bundle.verify_trusted_warden(&set.wardens).is_ok() =>
+                {
+                    bundle.digest()
+                }
+                _ => warden_auth::unreadable_policy_subject(),
+            };
             let revocation = revocation.ok_or_else(|| KeepMobileError::InvalidPolicy {
                 msg: "Removing the policy needs a revocation signed by a trusted warden".into(),
             })?;
@@ -2166,8 +2180,11 @@ impl KeepMobile {
                 Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
                 Err(e) => return Err(e),
             }
-            policy.clear_policy();
         }
+        // Also when nothing was stored: memory then holds a policy storage no
+        // longer has, such as one another instance revoked, and reporting
+        // success while still enforcing it would be false.
+        policy.clear_policy();
 
         // The time floor goes with it, and needs no revocation when no policy
         // is stored because then it guards nothing. A floor is seeded from the
@@ -2293,7 +2310,9 @@ impl KeepMobile {
         pubkey_hex: String,
         authorization: String,
     ) -> Result<(), KeepMobileError> {
-        let pubkey = network::parse_warden_pubkey(&pubkey_hex)?;
+        // Length only, not the curve check, so a key stored before keys were
+        // checked can still be removed.
+        let pubkey = network::parse_warden_pubkey_bytes(&pubkey_hex)?;
         self.mutate_trusted_wardens(pubkey, false, Some(authorization))
     }
 
@@ -3916,8 +3935,12 @@ impl KeepMobile {
             // Emptying the set under a stored policy leaves nothing able to
             // revoke it, so the only way out is a wipe that loses the share.
             // A rotation adds the new key first and never gets here; the way
-            // to disengage entirely is to revoke the policy first.
-            if wardens.is_empty()
+            // to disengage entirely is to revoke the policy first. Only keys
+            // that can sign count, since one stored before keys were checked
+            // as curve points keeps the set non-empty and revokes nothing.
+            if !wardens
+                .iter()
+                .any(|key| k256::schnorr::VerifyingKey::from_bytes(key).is_ok())
                 && !matches!(
                     persistence::load_policy(&self.storage),
                     Err(KeepMobileError::StorageNotFound)
@@ -3957,6 +3980,20 @@ impl KeepMobile {
     ) -> Result<(persistence::WardenSet, [u8; 32]), KeepMobileError> {
         let mut set = match persistence::load_warden_set(storage) {
             Ok(set) => set,
+            // A stored policy was installed against a trusted warden, so a
+            // wardens record reading as absent beside one is a misread, not a
+            // fresh device. Writing an empty set over it would leave the policy
+            // with nothing able to revoke it.
+            Err(KeepMobileError::StorageNotFound)
+                if !matches!(
+                    persistence::load_policy(storage),
+                    Err(KeepMobileError::StorageNotFound)
+                ) =>
+            {
+                return Err(KeepMobileError::StorageError {
+                    msg: "The trusted wardens record is missing beside a stored policy".into(),
+                });
+            }
             Err(KeepMobileError::StorageNotFound) => persistence::WardenSet {
                 wardens: std::collections::HashSet::new(),
                 epoch: 0,
@@ -9094,6 +9131,10 @@ mod velocity_fault_tests {
     fn a_policy_with_no_wardens_left_takes_no_new_one() {
         let storage = Arc::new(FaultingStorage::default());
         plant_signed_policy(&storage, &capped_rules(), false);
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&Vec::<String>::new()).unwrap(),
+        );
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
 
         let err = mobile
@@ -9199,9 +9240,10 @@ mod velocity_fault_tests {
             PolicyStatus::NotConfigured
         ));
 
-        // Not accepted against a policy that parses.
-        let (_w, bundle) = plant_signed_policy(&storage, &capped_rules(), false);
-        let _ = bundle;
+        // Not accepted against a policy that verifies.
+        let bundle =
+            create_test_bundle_with(&warden, &capped_rules(), Utc::now().timestamp() as u64);
+        storage.plant(POLICY_STORAGE_KEY, serde_json::to_vec(&bundle).unwrap());
         assert!(mobile
             .delete_policy(Some(revocation(
                 &mobile,
@@ -9411,5 +9453,192 @@ mod velocity_fault_tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&storage.raw(TRUSTED_WARDENS_KEY).unwrap()).unwrap();
         assert_eq!(raw["device"], first.device_id);
+    }
+
+    /// A record that parses but fails verification, here one whose rules were
+    /// edited, has a digest no warden knows, so it is named by the fixed
+    /// subject. Requiring its digest left a device holding one refusing every
+    /// spend until it was wiped, since an install is refused over it too.
+    #[test]
+    fn an_edited_policy_is_revoked_by_the_unattributable_subject() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (warden, bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        let text = String::from_utf8(storage.raw(POLICY_STORAGE_KEY).unwrap()).unwrap();
+        let edited = text.replace("100000", "900000");
+        assert_ne!(edited, text);
+        storage.plant(POLICY_STORAGE_KEY, edited.into_bytes());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+
+        assert!(mobile
+            .delete_policy(Some(revocation(&mobile, &warden, &bundle.digest())))
+            .is_err());
+        mobile
+            .delete_policy(Some(revocation(
+                &mobile,
+                &warden,
+                &unreadable_policy_subject(),
+            )))
+            .unwrap();
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::NotConfigured
+        ));
+    }
+
+    /// A policy whose signer was untrusted before it was replaced no longer
+    /// verifies, so the warden left is not expected to know its digest; it
+    /// revokes it by the fixed subject.
+    #[test]
+    fn a_policy_whose_signer_was_removed_is_revoked_by_the_remaining_warden() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (signer, _bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let other = new_warden();
+        let add = warden_change(
+            &mobile,
+            &signer,
+            WardenAction::AddWarden,
+            &pubkey_of(&other),
+        );
+        mobile
+            .add_trusted_warden(hex::encode(pubkey_of(&other)), Some(add))
+            .unwrap();
+        let remove = warden_change(
+            &mobile,
+            &other,
+            WardenAction::RemoveWarden,
+            &pubkey_of(&signer),
+        );
+        mobile
+            .remove_trusted_warden(hex::encode(pubkey_of(&signer)), remove)
+            .unwrap();
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unverified
+            }
+        ));
+
+        mobile
+            .delete_policy(Some(revocation(
+                &mobile,
+                &other,
+                &unreadable_policy_subject(),
+            )))
+            .unwrap();
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::NotConfigured
+        ));
+    }
+
+    /// The fixed subject is not accepted for a policy that verifies: that one
+    /// is named by its digest, which the warden who signed it knows.
+    #[test]
+    fn a_verified_policy_is_not_revoked_by_the_unattributable_subject() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (warden, _bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(mobile
+            .delete_policy(Some(revocation(
+                &mobile,
+                &warden,
+                &unreadable_policy_subject(),
+            )))
+            .is_err());
+        assert!(matches!(
+            mobile.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    /// A delete that fails leaves a faulted policy faulted, not cleared.
+    #[test]
+    fn a_delete_that_fails_leaves_a_faulted_policy_refusing() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (warden, _bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        storage.fault(POLICY_STORAGE_KEY);
+        storage.fault_delete(POLICY_STORAGE_KEY);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        let revoke = revocation(&mobile, &warden, &unreadable_policy_subject());
+        assert!(mobile.delete_policy(Some(revoke)).is_err());
+        assert!(
+            matches!(
+                mobile.policy_status(None).unwrap(),
+                PolicyStatus::Faulted { .. }
+            ),
+            "a failed delete must not leave memory reading as no policy"
+        );
+    }
+
+    /// With nothing stored, deleting clears a policy memory still holds, such
+    /// as one another instance on the same storage revoked, rather than
+    /// reporting success while still enforcing it.
+    #[test]
+    fn deleting_with_nothing_stored_clears_memory() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (warden, bundle) = plant_signed_policy(&storage, &capped_rules(), true);
+        let a = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let b = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        a.delete_policy(Some(revocation(&a, &warden, &bundle.digest())))
+            .unwrap();
+        b.delete_policy(None).unwrap();
+        assert!(matches!(
+            b.policy_status(None).unwrap(),
+            PolicyStatus::NotConfigured
+        ));
+    }
+
+    /// A wardens record reading as absent beside a stored policy is a misread,
+    /// since the policy was installed against a trusted warden. It must not be
+    /// replaced by an empty set, which would leave the policy unrevocable.
+    #[test]
+    fn a_wardens_record_misread_as_absent_is_not_overwritten() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (_warden, _bundle) = plant_signed_policy(&storage, &capped_rules(), false);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(mobile.warden_governance().is_err());
+        assert!(storage.raw(TRUSTED_WARDENS_KEY).is_none());
+    }
+
+    /// A key that is not a curve point, stored before keys were checked, can
+    /// still be removed, and does not count as a warden able to revoke the
+    /// policy when deciding whether the last one is being removed.
+    #[test]
+    fn a_stored_key_that_cannot_sign_is_removable_and_does_not_count() {
+        let storage = Arc::new(FaultingStorage::default());
+        let (warden, bundle) = plant_signed_policy(&storage, &capped_rules(), false);
+        let dead = [0u8; 32];
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden)), hex::encode(dead)]).unwrap(),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        let remove = warden_change(
+            &mobile,
+            &warden,
+            WardenAction::RemoveWarden,
+            &pubkey_of(&warden),
+        );
+        assert!(mobile
+            .remove_trusted_warden(hex::encode(pubkey_of(&warden)), remove)
+            .is_err());
+
+        let remove = warden_change(&mobile, &warden, WardenAction::RemoveWarden, &dead);
+        mobile
+            .remove_trusted_warden(hex::encode(dead), remove)
+            .unwrap();
+        assert_eq!(
+            mobile.list_trusted_wardens().unwrap(),
+            vec![hex::encode(bundle.warden_pubkey)]
+        );
     }
 }

@@ -60,22 +60,27 @@ pub(crate) fn parse_loopback_proxy(
     Ok(std::net::SocketAddr::new(ip, port))
 }
 
-pub(crate) fn parse_warden_pubkey(
+pub(crate) fn parse_warden_pubkey_bytes(
     pubkey_hex: &str,
 ) -> Result<[u8; crate::policy::POLICY_PUBKEY_LEN], KeepMobileError> {
     let pubkey_bytes = hex::decode(pubkey_hex).map_err(|e| KeepMobileError::InvalidPolicy {
         msg: format!("Invalid hex: {e}"),
     })?;
 
-    let pubkey: [u8; crate::policy::POLICY_PUBKEY_LEN] =
-        pubkey_bytes
-            .try_into()
-            .map_err(|_| KeepMobileError::InvalidPolicy {
-                msg: format!(
-                    "Warden pubkey must be {} bytes",
-                    crate::policy::POLICY_PUBKEY_LEN
-                ),
-            })?;
+    pubkey_bytes
+        .try_into()
+        .map_err(|_| KeepMobileError::InvalidPolicy {
+            msg: format!(
+                "Warden pubkey must be {} bytes",
+                crate::policy::POLICY_PUBKEY_LEN
+            ),
+        })
+}
+
+pub(crate) fn parse_warden_pubkey(
+    pubkey_hex: &str,
+) -> Result<[u8; crate::policy::POLICY_PUBKEY_LEN], KeepMobileError> {
+    let pubkey = parse_warden_pubkey_bytes(pubkey_hex)?;
     // A key that is not a curve point can never sign, so trusting one would
     // spend an epoch, or the first-warden slot, on a warden that cannot act.
     k256::schnorr::VerifyingKey::from_bytes(&pubkey).map_err(|_| {
