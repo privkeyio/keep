@@ -1503,7 +1503,7 @@ mod tests {
         let status = Arc::new(AtomicU8::new(STATUS_RUNNING));
         let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
-        let (_relay, server) = mobile.runtime.block_on(async {
+        let (_relay, server, url) = mobile.runtime.block_on(async {
             let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
             let url = relay.url().await.to_string();
             let mut keyring = keep_core::keyring::Keyring::new();
@@ -1526,8 +1526,9 @@ mod tests {
             )
             .await
             .unwrap();
-            (relay, server)
+            (relay, server, url)
         });
+        let bunker = server.pubkey();
         let handler = Arc::downgrade(&server.handler());
         let serving = mobile.runtime.spawn(run_server(
             server,
@@ -1535,8 +1536,10 @@ mod tests {
             invalidated,
             Arc::clone(&status),
         ));
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!serving.is_finished(), "the server is serving");
+        assert!(
+            mobile.runtime.block_on(pings_back(&url, bunker)),
+            "the server is serving before the teardown"
+        );
 
         mobile.clear_certificate_pins().unwrap();
 
@@ -1550,6 +1553,60 @@ mod tests {
             handler.upgrade().is_none(),
             "the signer, and the share it holds, went with the server"
         );
+    }
+
+    /// Whether the bunker at `bunker` answers a NIP-46 `ping` on `url`.
+    async fn pings_back(url: &str, bunker: PublicKey) -> bool {
+        use nostr_sdk::nips::nip44;
+        let keys = nostr_sdk::Keys::generate();
+        let client = nostr_sdk::Client::new(keys.clone());
+        client.add_relay(url).await.unwrap();
+        client.connect().await;
+        client
+            .subscribe(
+                nostr_sdk::Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .author(bunker)
+                    .pubkey(keys.public_key()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut notifications = client.notifications();
+        let request = serde_json::json!({ "id": "ping", "method": "ping", "params": [] });
+        let content = nip44::encrypt(
+            keys.secret_key(),
+            &bunker,
+            request.to_string(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = nostr_sdk::EventBuilder::new(Kind::NostrConnect, content)
+            .tag(nostr_sdk::Tag::public_key(bunker))
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Ok(nostr_sdk::RelayPoolNotification::Event { event, .. }) =
+                    notifications.recv().await
+                else {
+                    continue;
+                };
+                if event.pubkey != bunker {
+                    continue;
+                }
+                if let Ok(plain) =
+                    nip44::decrypt(keys.secret_key(), &bunker, event.content.as_str())
+                {
+                    return plain.contains("pong");
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        client.disconnect().await;
+        answered
     }
 
     // A prompt blocks the server's own task, so a teardown while it is open
