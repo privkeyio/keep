@@ -2529,12 +2529,19 @@ impl KeepMobile {
     /// refuses while it cannot be read. Each group this device holds a share
     /// of whose descriptor record is stored is added, and nothing is removed,
     /// so running it again once more shares read back recovers what an earlier
-    /// run missed. An index that cannot be read is replaced, and the
-    /// descriptors it listed for groups not held here stay stored but unlisted
-    /// until saved again, so the app runs this only after the user confirms.
-    /// Refused when no shares are listed. Returns how many descriptors the
-    /// index lists afterwards.
-    pub fn wallet_descriptor_repair_index(&self) -> Result<u32, KeepMobileError> {
+    /// run missed. Refused when no shares are listed. Returns how many
+    /// descriptors the index lists afterwards.
+    ///
+    /// An index that reads but will not parse is replaced. One whose read
+    /// fails is replaced only with `replace_unreadable`, since that read may
+    /// succeed later; otherwise its error is returned. Replacing leaves the
+    /// descriptors it listed for groups not held here stored but unlisted
+    /// until saved again, so the app passes `replace_unreadable` only after
+    /// the user confirms, having retried first.
+    pub fn wallet_descriptor_repair_index(
+        &self,
+        replace_unreadable: bool,
+    ) -> Result<u32, KeepMobileError> {
         let _guard =
             self.descriptor_write_lock
                 .lock()
@@ -2546,7 +2553,7 @@ impl KeepMobile {
             .list_all_shares()
             .into_iter()
             .map(|meta| hex::encode(meta.group_pubkey));
-        let index = persistence::repair_descriptor_index(&self.storage, held)?;
+        let index = persistence::repair_descriptor_index(&self.storage, held, replace_unreadable)?;
         Ok(u32::try_from(index.len()).unwrap_or(u32::MAX))
     }
 
@@ -6731,7 +6738,7 @@ mod restore_backup_metadata_tests {
         );
         assert_eq!(decrypted.wallet_descriptors[0].group_pubkey, group);
 
-        assert_eq!(mobile.wallet_descriptor_repair_index().unwrap(), 1);
+        assert_eq!(mobile.wallet_descriptor_repair_index(false).unwrap(), 1);
         assert_eq!(mobile.wallet_descriptor_list().len(), 1);
         mobile
             .wallet_descriptor_delete(hex::encode(group))

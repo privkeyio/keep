@@ -500,6 +500,18 @@ fn load_descriptor_index(storage: &Arc<dyn SecureStorage>) -> Result<Vec<String>
     }
 }
 
+/// Held across every read and rewrite of the descriptor index. The index is
+/// one record rewritten whole, so two writers that each read it and write back
+/// their own addition would drop the other's; a descriptor save can start from
+/// a peer's coordination round at any moment.
+static DESCRIPTOR_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn descriptor_index_lock() -> std::sync::MutexGuard<'static, ()> {
+    DESCRIPTOR_INDEX_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Prefix of the error a corrupt index blob produces. A corrupt index refuses
 /// every descriptor write, and recovering needs an explicit user-confirmed
 /// reset rather than an automatic rebuild from a list that can under-report,
@@ -563,17 +575,20 @@ pub(crate) fn load_listed_descriptors(
 /// Add to the descriptor index each of `held` whose descriptor record is not
 /// proven absent, keeping every entry it already lists, and return the result.
 ///
-/// An index that will not parse, or that still fails on a second read, is
-/// replaced, since every save and delete refuses while it stands; the entries
-/// it held for groups outside `held` are then unlisted until saved again, which
-/// is why this runs only on the user's say-so. Nothing is ever removed
-/// otherwise, and a record that fails to read keeps its entry like any other,
-/// so running this again once more shares read back recovers what an earlier
-/// run missed. Refused when `held` is empty, since a share list that came back
-/// empty is as likely a fault as a device with nothing to list.
+/// An index that reads but will not parse is replaced, since every save and
+/// delete refuses while it stands. One whose read fails is replaced only with
+/// `replace_unreadable`, because a read that fails now may succeed later, and
+/// the replacement cannot be undone: the entries the old index held for groups
+/// outside `held` are unlisted until saved again, and nothing enumerates keys
+/// to find them. Nothing is ever removed otherwise, and a record that fails to
+/// read keeps its entry like any other, so running this again once more shares
+/// read back recovers what an earlier run missed. Refused when `held` is empty,
+/// since a share list that came back empty is as likely a fault as a device
+/// with nothing to list.
 pub(crate) fn repair_descriptor_index(
     storage: &Arc<dyn SecureStorage>,
     held: impl IntoIterator<Item = String>,
+    replace_unreadable: bool,
 ) -> Result<Vec<String>, KeepMobileError> {
     let held: std::collections::BTreeSet<String> = held.into_iter().collect();
     if held.is_empty() {
@@ -581,12 +596,18 @@ pub(crate) fn repair_descriptor_index(
             msg: "No shares are listed to repair the descriptor index from".into(),
         });
     }
-    let current = load_descriptor_index(storage).or_else(|_| load_descriptor_index(storage));
-    let replaced = current.is_err();
-    let mut index = current.unwrap_or_else(|e| {
-        tracing::warn!("Replacing the descriptor index, which cannot be read: {e}");
-        Vec::new()
-    });
+    let _index_lock = descriptor_index_lock();
+    let current = match storage.load_share_by_key(DESCRIPTOR_INDEX_KEY.into()) {
+        Ok(data) => serde_json::from_slice::<Vec<String>>(&data).ok(),
+        Err(KeepMobileError::StorageNotFound) => Some(Vec::new()),
+        Err(_) if replace_unreadable => None,
+        Err(e) => return Err(e),
+    };
+    let replaced = current.is_none();
+    if replaced {
+        tracing::warn!("Replacing the descriptor index, which cannot be read");
+    }
+    let mut index = current.unwrap_or_default();
     let listed = index.len();
     for group in held {
         if index.contains(&group) {
@@ -660,10 +681,13 @@ pub(crate) fn persist_descriptor(
     // to repeat the exchange). Accepted because the alternative is another
     // read to decide, which can fault the same way, to save a retry rather
     // than any data.
-    let mut index = load_descriptor_index(storage)?;
-    if !index.contains(&info.group_pubkey) {
-        index.push(info.group_pubkey.clone());
-        persist_descriptor_index(storage, &index)?;
+    {
+        let _index_lock = descriptor_index_lock();
+        let mut index = load_descriptor_index(storage)?;
+        if !index.contains(&info.group_pubkey) {
+            index.push(info.group_pubkey.clone());
+            persist_descriptor_index(storage, &index)?;
+        }
     }
     storage.store_share_by_key(
         descriptor_key(&info.group_pubkey),
@@ -750,6 +774,7 @@ pub(crate) fn delete_descriptor(
 ) -> Result<(), KeepMobileError> {
     // Read the index before deleting the record, or a refusal here reports a
     // failure for a descriptor that is already gone and that no list can show.
+    let _index_lock = descriptor_index_lock();
     let mut index = load_descriptor_index(storage)?;
     storage.delete_share_by_key(descriptor_key(group_pubkey_hex))?;
 
@@ -1343,7 +1368,7 @@ mod descriptor_index_tests {
     fn repairing_a_readable_index_only_adds() {
         let (faulty, storage) = storage_with(&[AA, BB]);
         unlist(&faulty, BB);
-        let index = repair_descriptor_index(&storage, [BB.to_string()]).unwrap();
+        let index = repair_descriptor_index(&storage, [BB.to_string()], false).unwrap();
         assert_eq!(index, vec![AA.to_string(), BB.to_string()]);
         assert_eq!(faulty.index(), index);
     }
@@ -1358,8 +1383,12 @@ mod descriptor_index_tests {
         faulty.fault(&faulty.unreadable, &descriptor_key(BB));
         assert!(persist_descriptor(&storage, &descriptor(CC)).is_err());
 
-        let held = [BB, AA, AA, "dd"].map(String::from);
-        let index = repair_descriptor_index(&storage, held).unwrap();
+        let held = || [BB, AA, AA, "dd"].map(String::from);
+        assert!(
+            repair_descriptor_index(&storage, held(), false).is_err(),
+            "a read that fails may succeed later, so it is not replaced unasked"
+        );
+        let index = repair_descriptor_index(&storage, held(), true).unwrap();
         assert_eq!(index, vec![AA.to_string(), BB.to_string()]);
 
         faulty.clear_faults();
@@ -1369,6 +1398,21 @@ mod descriptor_index_tests {
             faulty.index(),
             vec![AA.to_string(), BB.to_string(), CC.to_string()]
         );
+    }
+
+    // An index that reads but will not parse cannot come right on a later
+    // read, so it is replaced without being asked to.
+    #[test]
+    fn an_index_that_will_not_parse_is_replaced() {
+        let (faulty, storage) = storage_with(&[AA, BB]);
+        faulty
+            .records
+            .lock()
+            .unwrap()
+            .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
+        let index = repair_descriptor_index(&storage, [AA.to_string()], false).unwrap();
+        assert_eq!(index, vec![AA.to_string()]);
+        assert_eq!(faulty.index(), index);
     }
 
     // A share list that came back empty is as likely a fault as a device with
@@ -1381,7 +1425,7 @@ mod descriptor_index_tests {
             .lock()
             .unwrap()
             .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
-        assert!(repair_descriptor_index(&storage, Vec::new()).is_err());
+        assert!(repair_descriptor_index(&storage, Vec::new(), true).is_err());
         assert_eq!(
             faulty.raw(DESCRIPTOR_INDEX_KEY).unwrap(),
             b"not json".to_vec()
