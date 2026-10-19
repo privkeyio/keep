@@ -855,8 +855,16 @@ impl ApproverHandler {
     /// `lifecycle`.
     fn move_relays(self: &Arc<Self>, relays: Vec<String>) {
         let keys = self.lock().session.as_ref().map(|s| s.keys.clone());
-        if let Some(keys) = keys {
-            if let Err(e) = self.run(relays, keys) {
+        let Some(keys) = keys else { return };
+        match self.run(relays.clone(), keys) {
+            Ok(()) => {
+                let mut inner = self.lock();
+                if let Some(stored) = inner.stored.as_mut() {
+                    stored.relays = relays;
+                    self.persist_or_log(stored);
+                }
+            }
+            Err(e) => {
                 tracing::warn!(error = %e, "the approver could not move to the gateway's new relays");
             }
         }
@@ -918,11 +926,11 @@ impl ApproverHandler {
                         Ok(paired) => {
                             stored.paired = true;
                             if !paired.relays.is_empty() && paired.relays != stored.relays {
+                                // Kept once the approver is serving them, by
+                                // `move_relays`, so a move that fails leaves
+                                // stored what still runs.
                                 match checked_relays(&paired.relays) {
-                                    Ok(()) => {
-                                        stored.relays = paired.relays.clone();
-                                        fx.reconnect = Some(stored.relays.clone());
-                                    }
+                                    Ok(()) => fx.reconnect = Some(paired.relays.clone()),
                                     Err(e) => tracing::warn!(
                                         error = %e,
                                         "keeping the approver's relays: the gateway named relays it cannot use"

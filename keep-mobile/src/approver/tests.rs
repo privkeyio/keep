@@ -1479,11 +1479,16 @@ fn a_failed_move_to_new_relays_keeps_the_old_ones_serving() {
     let phone = paired();
     let relay = phone.mobile.runtime.block_on(start_mock_relay());
     let url = phone.mobile.runtime.block_on(relay.url()).to_string();
-    serve(&phone, url);
+    serve(&phone, url.clone());
     phone
         .handler
-        .move_relays(vec!["https://relay.example".into()]);
+        .move_relays(vec!["wss://user@relay.example".into()]);
     assert!(phone.handler.status().running);
+    assert_eq!(
+        phone.stored(|s| s.relays.clone()),
+        vec![url],
+        "storage keeps the relays still serving"
+    );
     let request = phone.request(18, "x", 10);
     phone.take(kind::REQUEST, &wire::to_text(&request));
     let id = request.request_id.to_hex();
@@ -1493,4 +1498,66 @@ fn a_failed_move_to_new_relays_keeps_the_old_ones_serving() {
         .send_decision(id, true, phone.sign(&digest, false))
         .expect("the old relay still carries the decision");
     phone.handler.stop();
+}
+
+// A move that succeeds is kept, so the next start serves the new relays.
+#[test]
+fn a_move_to_new_relays_is_kept_once_they_serve() {
+    let phone = paired();
+    let first = phone.mobile.runtime.block_on(start_mock_relay());
+    let second = phone.mobile.runtime.block_on(start_mock_relay());
+    let first_url = phone.mobile.runtime.block_on(first.url()).to_string();
+    let second_url = phone.mobile.runtime.block_on(second.url()).to_string();
+    serve(&phone, first_url);
+    phone.handler.move_relays(vec![second_url.clone()]);
+    assert_eq!(phone.stored(|s| s.relays.clone()), vec![second_url.clone()]);
+    let kept = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
+    assert!(
+        String::from_utf8(kept).unwrap().contains(&second_url),
+        "written to storage, so the next start serves them"
+    );
+    phone.handler.stop();
+}
+
+// A `paired` answer naming other relays asks for a move, and the new relays
+// are stored only once the move has them serving: written here, a move that
+// failed would leave storage naming relays nothing serves.
+#[test]
+fn a_paired_answer_moving_relays_stores_them_only_after_the_move() {
+    let phone = paired();
+    let old = phone.stored(|s| {
+        s.paired = false;
+        s.relays.clone()
+    });
+    let (transport, approver) = phone.stored(|s| (sig::xonly(&s.keys().unwrap()), s.approver));
+    let answer = wire::to_text(&Pairing::Paired {
+        v: V1,
+        transport: Hex32(transport),
+        approver,
+        relays: vec!["wss://elsewhere.example".into()],
+        deadline_secs: 60,
+        anchor: anchor(1),
+        frozen: Frozen {
+            epoch: 0,
+            all: false,
+            credentials: vec![],
+            unfrozen: vec![],
+        },
+    });
+    let fx = {
+        let mut inner = phone.handler.lock();
+        phone
+            .handler
+            .handle(&mut inner, kind::PAIRING, &answer, now())
+    };
+    assert_eq!(
+        fx.reconnect,
+        Some(vec!["wss://elsewhere.example".to_string()])
+    );
+    assert!(phone.handler.status().paired);
+    assert_eq!(phone.stored(|s| s.relays.clone()), old);
+    let kept = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
+    assert!(!String::from_utf8(kept)
+        .unwrap()
+        .contains("elsewhere.example"));
 }
