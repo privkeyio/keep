@@ -1803,6 +1803,206 @@ mod tests {
         assert_eq!(restored_clients(&mobile), vec![client.to_hex()]);
     }
 
+    struct RefusesAndCounts(Arc<AtomicUsize>);
+    impl BunkerCallbacks for RefusesAndCounts {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            BunkerApprovalResult {
+                approved: false,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+    }
+
+    /// Sends a kind 1 `sign_event` from `client` to the bunker at `bunker` and
+    /// returns the signed event, or `None` when the bunker refused.
+    async fn sign_over_relay(
+        client: &nostr_sdk::Client,
+        keys: &nostr_sdk::Keys,
+        bunker: PublicKey,
+        id: &str,
+    ) -> Option<nostr_sdk::Event> {
+        use nostr_sdk::nips::nip44;
+        let mut notifications = client.notifications();
+        let unsigned = serde_json::json!({
+            "kind": 1,
+            "content": id,
+            "tags": [],
+            "created_at": nostr_sdk::Timestamp::now().as_secs(),
+        });
+        let request = serde_json::json!({
+            "id": id,
+            "method": "sign_event",
+            "params": [serde_json::to_string(&unsigned).unwrap()],
+        });
+        let content = nip44::encrypt(
+            keys.secret_key(),
+            &bunker,
+            serde_json::to_string(&request).unwrap(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = nostr_sdk::EventBuilder::new(Kind::NostrConnect, content)
+            .tag(nostr_sdk::Tag::public_key(bunker))
+            .sign_with_keys(keys)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .expect("the bunker answers");
+            let Ok(Ok(nostr_sdk::RelayPoolNotification::Event { event, .. })) =
+                tokio::time::timeout(remaining, notifications.recv()).await
+            else {
+                continue;
+            };
+            if event.kind != Kind::NostrConnect || event.pubkey != bunker {
+                continue;
+            }
+            let Ok(plain) = nip44::decrypt(keys.secret_key(), &bunker, event.content.as_str())
+            else {
+                continue;
+            };
+            let response: serde_json::Value = serde_json::from_str(&plain).unwrap();
+            if response.get("id").and_then(|v| v.as_str()) != Some(id) {
+                continue;
+            }
+            return response
+                .get("result")
+                .and_then(|v| v.as_str())
+                .filter(|r| !r.is_empty())
+                .map(|r| <nostr_sdk::Event as nostr_sdk::JsonUtil>::from_json(r).unwrap());
+        }
+    }
+
+    // End to end over a relay, with the production callback bridge and grants
+    // restored from storage: a remembered client signs its kind unprompted, a
+    // revoke made through another handler stops that at once and leaves
+    // nothing to restore, and a rotation through a third stops the server.
+    #[test]
+    fn a_remembered_client_loses_its_grant_on_revoke_end_to_end() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, _) = load_or_create_bunker_keys(&mobile).unwrap();
+        let scope = grant_scope(&transport, &GROUP).unwrap();
+        let keys = nostr_sdk::Keys::generate();
+        persist_remembered(&mobile, &[keys.public_key()]);
+        let pre_grants: Vec<PreGrantedApp> = mobile
+            .load_bunker_permissions(&scope)
+            .iter()
+            .filter_map(PreGrantedApp::from_stored)
+            .collect();
+        assert_eq!(pre_grants.len(), 1);
+
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let serving = Arc::new(AtomicBool::new(true));
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(RefusesAndCounts(Arc::clone(&prompts))),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: scope.clone(),
+            serving: Arc::clone(&serving),
+        };
+        let invalidated = mobile.live_generation.subscribe();
+        let (_relay, server, url) = mobile.runtime.block_on(async {
+            let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+            let url = relay.url().await.to_string();
+            let mut keyring = keep_core::keyring::Keyring::new();
+            let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+            keyring
+                .load_key(
+                    *keypair.public_bytes(),
+                    *keypair.secret_bytes(),
+                    keep_core::keys::KeyType::Nostr,
+                    "test".into(),
+                )
+                .unwrap();
+            let server = Server::new_with_config(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                None,
+                None,
+                std::slice::from_ref(&url),
+                Some(Arc::new(bridge) as Arc<dyn ServerCallbacks>),
+                ServerConfig {
+                    pre_grants,
+                    expected_secret: Some("e2e".into()),
+                    ..ServerConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            (relay, server, url)
+        });
+        let bunker = server.pubkey();
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(starter.publish_server(String::new(), &server.handler(), Arc::clone(&serving), tx));
+        starter.set_status(STATUS_RUNNING);
+        let running = mobile.runtime.spawn(run_server(
+            server,
+            rx,
+            invalidated,
+            Arc::clone(&starter.status),
+            Arc::clone(&serving),
+        ));
+
+        let client = mobile.runtime.block_on(async {
+            let client = nostr_sdk::Client::new(keys.clone());
+            client.add_relay(url).await.unwrap();
+            client.connect().await;
+            client
+                .subscribe(
+                    nostr_sdk::Filter::new()
+                        .kind(Kind::NostrConnect)
+                        .author(bunker)
+                        .pubkey(keys.public_key()),
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client
+        });
+
+        let signed = mobile
+            .runtime
+            .block_on(sign_over_relay(&client, &keys, bunker, "remembered"))
+            .expect("a remembered kind is signed");
+        signed.verify().unwrap();
+        assert_eq!(prompts.load(Ordering::Acquire), 0);
+
+        BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_client(keys.public_key().to_hex())
+            .unwrap();
+        assert!(mobile
+            .runtime
+            .block_on(sign_over_relay(&client, &keys, bunker, "revoked"))
+            .is_none());
+        assert_eq!(
+            prompts.load(Ordering::Acquire),
+            0,
+            "an unknown client is refused"
+        );
+        assert!(restored_clients(&mobile).is_empty());
+
+        BunkerHandler::new(Arc::clone(&mobile))
+            .rotate_bunker_credentials()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !running.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.is_finished(), "a rotation stops the server");
+        assert_eq!(starter.load_status(), STATUS_STOPPED);
+        assert!(!serving.load(Ordering::Acquire));
+        mobile.runtime.block_on(client.disconnect());
+    }
+
     // A persisted transport secret that is valid 32-byte hex but not a valid
     // secp256k1 scalar (here all-zero) must be rejected and regenerated, so a
     // corrupt key cannot brick the bunker permanently.
