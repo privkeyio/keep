@@ -694,6 +694,12 @@ pub struct KeepMobile {
     pre_approved_hashes: PreApprovedHashes,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
+    /// Advanced each time the live node is torn down, after it is gone. A
+    /// running bunker holds its own copy of the share, or a handle to the old
+    /// node, and the relay pins it started with, so it stops when this moves
+    /// rather than signing on with a share that was deleted or switched away
+    /// from, or trusting a pin that was removed.
+    pub(crate) live_generation: tokio::sync::watch::Sender<u64>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -958,6 +964,7 @@ impl KeepMobile {
             pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
+            live_generation: tokio::sync::watch::Sender::new(0),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1212,7 +1219,9 @@ impl KeepMobile {
     }
 
     pub fn delete_share(&self) -> Result<(), KeepMobileError> {
-        self.storage.delete_share()
+        let result = self.storage.delete_share();
+        self.invalidate_live_node();
+        result
     }
 
     pub fn export_share(&self, passphrase: String) -> Result<String, KeepMobileError> {
@@ -1324,6 +1333,10 @@ impl KeepMobile {
             self.pending_requests.lock().await.clear();
             *self.node.write().await = None;
         });
+        // After the node is gone, so a bunker start that read the old node
+        // subscribed before this and sees it.
+        self.live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
@@ -4421,6 +4434,12 @@ impl KeepMobile {
             // requests are cleared up front. Clearing before the tasks below
             // spawn is what keeps the new session's requests: they can only be
             // enqueued once its listener/run tasks are live.
+            let share_of = |node: &KfpNode| {
+                let metadata = &node.share_package().metadata;
+                (metadata.group_pubkey, metadata.identifier)
+            };
+            let prior_share = self.node.read().await.as_deref().map(share_of);
+            let loaded_share = share_of(&node);
             self.retire_prior_node_tasks().await;
 
             let listener_handle = tokio::spawn(async move {
@@ -4440,6 +4459,14 @@ impl KeepMobile {
                 .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
+            // A bunker started on a different share holds a copy of it, or the
+            // node built from it, so it stops as on any other teardown, after
+            // the write as there. A re-init on the same share, which the app
+            // does on every network change, leaves it running.
+            if prior_share.is_some_and(|prior| prior != loaded_share) {
+                self.live_generation
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
             Ok(())
         })
     }
@@ -6304,6 +6331,17 @@ mod import_teardown_tests {
             matches!(&result, Err(KeepMobileError::InvalidInput { msg }) if msg.contains("UTF-8")),
             "expected an InvalidInput UTF-8 rejection, got {result:?}"
         );
+    }
+
+    // The legacy single-share delete tears the live node down like the keyed
+    // one, so a running bunker does not sign on with the deleted share.
+    #[test]
+    fn the_legacy_share_delete_tears_the_live_node_down() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let invalidated = mobile.live_generation.subscribe();
+        mobile.delete_share().unwrap();
+        assert!(invalidated.has_changed().unwrap());
     }
 }
 

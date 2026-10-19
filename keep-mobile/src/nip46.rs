@@ -250,6 +250,12 @@ struct CallbackBridge {
     /// constant directly so a test can reach the timeout without taking a
     /// minute to do it.
     approval_timeout: Duration,
+    /// The live generation this server started under. An approval that comes
+    /// back after the node was torn down is refused, since the server would
+    /// otherwise sign it with the share that was deleted or switched away
+    /// from: the prompt blocks the server's own task, so the teardown cannot
+    /// stop it until the prompt returns.
+    generation: u64,
     /// Prompts handed to the platform that have not come back, including the
     /// ones this side has already stopped waiting for.
     outstanding: Arc<AtomicUsize>,
@@ -371,6 +377,12 @@ impl ServerCallbacks for CallbackBridge {
         };
 
         match answered {
+            Ok(_) if *self.mobile.live_generation.borrow() != self.generation => {
+                tracing::warn!(
+                    "Refusing {asked_for} from {asked_by}: the share changed while it was asked"
+                );
+                Self::refused()
+            }
             Ok(result) => result.into(),
             // Denied, not retried. The operator did not answer, and the
             // request's own rate limiting decides whether the client gets
@@ -414,7 +426,11 @@ pub struct BunkerHandler {
     status: Arc<AtomicU8>,
     bunker_url: std::sync::Mutex<Option<String>>,
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-    handler: std::sync::Mutex<Option<Arc<SignerHandler>>>,
+    /// Weak, so the running server holds the only strong reference: the
+    /// handler owns the signer and with it the share or the node, and a server
+    /// that stopped on its own, such as on a node teardown, must not leave
+    /// them resident until the next `stop_bunker`.
+    handler: std::sync::Mutex<Option<std::sync::Weak<SignerHandler>>>,
     /// Serializes `do_start_bunker` against `rotate_bunker_credentials` so a
     /// credential rotation cannot interleave with an in-flight start (which
     /// would otherwise finish serving the pre-rotation keys).
@@ -486,7 +502,8 @@ impl BunkerHandler {
             .handler
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
         let Some(handler) = handler else {
             return Ok(());
         };
@@ -506,7 +523,8 @@ impl BunkerHandler {
             .handler
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
         if let Some(handler) = handler {
             self.mobile
                 .runtime
@@ -765,6 +783,10 @@ impl BunkerHandler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // Before the node is read, so a teardown after this point stops the
+        // server even if the node it read is the one torn down.
+        let mut invalidated = self.mobile.live_generation.subscribe();
+        let generation = *invalidated.borrow_and_update();
         let result = self.mobile.runtime.block_on(async {
             let verified_relays = self.mobile.verify_and_pin_relays(&relays, proxy).await?;
 
@@ -840,6 +862,7 @@ impl BunkerHandler {
 
             let server_callbacks = Some(Arc::new(CallbackBridge {
                 approval_timeout: APPROVAL_TIMEOUT,
+                generation,
                 outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
@@ -885,7 +908,8 @@ impl BunkerHandler {
             };
 
             *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.bunker_url());
-            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(server.handler());
+            *self.handler.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Arc::downgrade(&server.handler()));
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
             *self.shutdown_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(shutdown_tx);
@@ -893,7 +917,7 @@ impl BunkerHandler {
             let status = Arc::clone(&self.status);
             tokio::spawn(async move {
                 status.store(STATUS_RUNNING, Ordering::Release);
-                run_server(server, shutdown_rx, status).await;
+                run_server(server, shutdown_rx, invalidated, status).await;
             });
 
             Ok::<(), KeepMobileError>(())
@@ -909,9 +933,21 @@ impl BunkerHandler {
 async fn run_server(
     mut server: Server,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    mut invalidated: tokio::sync::watch::Receiver<u64>,
     status: Arc<AtomicU8>,
 ) {
+    // Biased so a teardown is seen before more requests are drained, since
+    // those that need no prompt would otherwise sign with the old share.
     tokio::select! {
+        biased;
+        // The share was deleted, switched or reloaded, or the relay pins
+        // changed, so this server is signing with a share or trusting pins
+        // that are no longer current. It stays stopped until the app starts a
+        // new one.
+        _ = invalidated.changed() => {
+            server.stop().await;
+            status.store(STATUS_STOPPED, Ordering::Release);
+        }
         result = server.run() => {
             match result {
                 Ok(()) => status.store(STATUS_STOPPED, Ordering::Release),
@@ -1119,6 +1155,7 @@ mod tests {
             callbacks: Arc::new(NeverAnswers(Mutex::new(rx))),
             mobile: Arc::clone(&mobile),
             approval_timeout: Duration::from_millis(200),
+            generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
         };
 
@@ -1168,6 +1205,7 @@ mod tests {
             callbacks: Arc::new(NeverAnswers(Mutex::new(rx))),
             mobile: Arc::clone(&mobile),
             approval_timeout: Duration::from_millis(50),
+            generation: 0,
             outstanding: Arc::clone(&outstanding),
         };
 
@@ -1211,6 +1249,7 @@ mod tests {
             callbacks: Arc::new(Panics),
             mobile: Arc::clone(&mobile),
             approval_timeout: Duration::from_secs(5),
+            generation: 0,
             outstanding: Arc::clone(&outstanding),
         };
 
@@ -1285,6 +1324,7 @@ mod tests {
             callbacks: Arc::new(Waiter(Mutex::new(Some(rx)))),
             mobile: Arc::clone(&mobile),
             approval_timeout: APPROVAL_TIMEOUT,
+            generation: 0,
             outstanding: Arc::new(AtomicUsize::new(0)),
         };
         let ask = |bridge: &CallbackBridge| {
@@ -1449,5 +1489,154 @@ mod tests {
         let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*transport1, *transport2);
         assert_eq!(*secret1, *secret2);
+    }
+
+    // A running bunker holds its own copy of the share, or a handle to the old
+    // node, and the relay pins it started with. Tearing the live node down, as
+    // deleting or switching the share or editing the pins does, has to stop it
+    // too, or it signs on with a share that is gone.
+    #[test]
+    fn a_running_bunker_stops_when_the_live_node_is_torn_down() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let invalidated = mobile.live_generation.subscribe();
+        let status = Arc::new(AtomicU8::new(STATUS_RUNNING));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let (_relay, server, url) = mobile.runtime.block_on(async {
+            let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+            let url = relay.url().await.to_string();
+            let mut keyring = keep_core::keyring::Keyring::new();
+            let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+            keyring
+                .load_key(
+                    *keypair.public_bytes(),
+                    *keypair.secret_bytes(),
+                    keep_core::keys::KeyType::Nostr,
+                    "test".into(),
+                )
+                .unwrap();
+            let server = Server::new_with_config(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                None,
+                None,
+                std::slice::from_ref(&url),
+                None,
+                ServerConfig::default(),
+            )
+            .await
+            .unwrap();
+            (relay, server, url)
+        });
+        let bunker = server.pubkey();
+        let handler = Arc::downgrade(&server.handler());
+        let serving = mobile.runtime.spawn(run_server(
+            server,
+            shutdown_rx,
+            invalidated,
+            Arc::clone(&status),
+        ));
+        assert!(
+            mobile.runtime.block_on(pings_back(&url, bunker)),
+            "the server is serving before the teardown"
+        );
+
+        mobile.clear_certificate_pins().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !serving.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(serving.is_finished(), "the server stopped with the node");
+        assert_eq!(status.load(Ordering::Acquire), STATUS_STOPPED);
+        assert!(
+            handler.upgrade().is_none(),
+            "the signer, and the share it holds, went with the server"
+        );
+    }
+
+    /// Whether the bunker at `bunker` answers a NIP-46 `ping` on `url`.
+    async fn pings_back(url: &str, bunker: PublicKey) -> bool {
+        use nostr_sdk::nips::nip44;
+        let keys = nostr_sdk::Keys::generate();
+        let client = nostr_sdk::Client::new(keys.clone());
+        client.add_relay(url).await.unwrap();
+        client.connect().await;
+        client
+            .subscribe(
+                nostr_sdk::Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .author(bunker)
+                    .pubkey(keys.public_key()),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut notifications = client.notifications();
+        let request = serde_json::json!({ "id": "ping", "method": "ping", "params": [] });
+        let content = nip44::encrypt(
+            keys.secret_key(),
+            &bunker,
+            request.to_string(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = nostr_sdk::EventBuilder::new(Kind::NostrConnect, content)
+            .tag(nostr_sdk::Tag::public_key(bunker))
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+        let answered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let Ok(nostr_sdk::RelayPoolNotification::Event { event, .. }) =
+                    notifications.recv().await
+                else {
+                    continue;
+                };
+                if event.pubkey != bunker {
+                    continue;
+                }
+                if let Ok(plain) =
+                    nip44::decrypt(keys.secret_key(), &bunker, event.content.as_str())
+                {
+                    return plain.contains("pong");
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        client.disconnect().await;
+        answered
+    }
+
+    // A prompt blocks the server's own task, so a teardown while it is open
+    // cannot stop the server until it returns. An approval that comes back
+    // after the share changed must not be signed with the old one.
+    #[test]
+    fn an_approval_that_returns_after_a_teardown_is_refused() {
+        struct ApprovesAfterTeardown(Arc<KeepMobile>);
+        impl BunkerCallbacks for ApprovesAfterTeardown {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                self.0.invalidate_live_node();
+                BunkerApprovalResult {
+                    approved: true,
+                    remember: BunkerRememberDuration::Forever,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(ApprovesAfterTeardown(Arc::clone(&mobile))),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+        };
+        let result = ServerCallbacks::request_approval(&bridge, an_approval());
+        assert!(!result.approved, "the share changed while it was asked");
     }
 }
