@@ -80,6 +80,11 @@ pub struct WardenGovernance {
     pub device_id: String,
     /// The epoch the next authorization has to name.
     pub epoch: u64,
+    /// True when the warden set was lost and rebuilt from the stored policy's
+    /// signer under a new device id: every other warden was dropped and no
+    /// authorization signed before then applies. Cleared by the next
+    /// authorized change.
+    pub restored: bool,
 }
 
 /// The subject a revocation names when the stored policy cannot be attributed

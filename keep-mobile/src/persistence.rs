@@ -229,6 +229,9 @@ pub(crate) struct WardenSet {
     pub(crate) wardens: HashSet<[u8; POLICY_PUBKEY_LEN]>,
     pub(crate) epoch: u64,
     pub(crate) device: Option<[u8; 32]>,
+    /// Set when the set was rebuilt from the stored policy's signer after its
+    /// record was lost, and cleared by the next authorized change.
+    pub(crate) restored: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -237,6 +240,8 @@ struct StoredWardenSet {
     wardens: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     device: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    restored: bool,
 }
 
 pub(crate) fn load_warden_set(
@@ -245,18 +250,20 @@ pub(crate) fn load_warden_set(
     let data = storage.load_share_by_key(TRUSTED_WARDENS_KEY.into())?;
     // The record was a bare list of keys before the epoch existed. It is read
     // as epoch 0, which is what a device that never authorized a change holds.
-    let (epoch, hex_list, device_hex) = match serde_json::from_slice::<StoredWardenSet>(&data) {
-        Ok(stored) => (stored.epoch, stored.wardens, stored.device),
-        Err(_) => (
-            0,
-            serde_json::from_slice::<Vec<String>>(&data).map_err(|e| {
-                KeepMobileError::StorageError {
-                    msg: format!("Failed to deserialize trusted wardens: {e}"),
-                }
-            })?,
-            None,
-        ),
-    };
+    let (epoch, hex_list, device_hex, restored) =
+        match serde_json::from_slice::<StoredWardenSet>(&data) {
+            Ok(stored) => (stored.epoch, stored.wardens, stored.device, stored.restored),
+            Err(_) => (
+                0,
+                serde_json::from_slice::<Vec<String>>(&data).map_err(|e| {
+                    KeepMobileError::StorageError {
+                        msg: format!("Failed to deserialize trusted wardens: {e}"),
+                    }
+                })?,
+                None,
+                false,
+            ),
+        };
     let device = device_hex
         .map(|hex_str| {
             hex::decode(&hex_str)
@@ -290,6 +297,7 @@ pub(crate) fn load_warden_set(
             wardens,
             epoch,
             device,
+            restored,
         })
     } else {
         Err(KeepMobileError::StorageError {
@@ -316,6 +324,7 @@ pub(crate) fn persist_warden_set(
         epoch: set.epoch,
         wardens: set.wardens.iter().map(hex::encode).collect(),
         device: set.device.map(hex::encode),
+        restored: set.restored,
     };
     let data = serde_json::to_vec(&stored).map_err(|e| KeepMobileError::StorageError {
         msg: format!("Failed to serialize trusted wardens: {e}"),

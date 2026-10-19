@@ -2002,6 +2002,9 @@ impl KeepMobile {
                 epoch: Self::next_epoch(set.epoch)?,
                 wardens: set.wardens,
                 device: Some(device),
+                // A bundle can be installed from one signed before the
+                // restore, so it is not the warden acting on it.
+                restored: set.restored,
             },
         )?;
         persistence::persist_policy(&self.storage, &bundle)?;
@@ -2180,6 +2183,7 @@ impl KeepMobile {
                     wardens: set.wardens,
                     epoch: Self::next_epoch(set.epoch)?,
                     device: Some(device),
+                    restored: false,
                 },
             )?;
 
@@ -2339,6 +2343,7 @@ impl KeepMobile {
         Ok(WardenGovernance {
             device_id: hex::encode(device),
             epoch: set.epoch,
+            restored: set.restored,
         })
     }
 
@@ -3993,6 +3998,7 @@ impl KeepMobile {
             wardens,
             epoch: Self::next_epoch(set.epoch)?,
             device: Some(device),
+            restored: false,
         };
         persistence::persist_warden_set(&self.storage, &next)?;
         policy.set_trusted_wardens(next.wardens);
@@ -4017,6 +4023,7 @@ impl KeepMobile {
                 wardens: std::collections::HashSet::new(),
                 epoch: 0,
                 device: None,
+                restored: false,
             });
         let device = match set.device {
             Some(device) => device,
@@ -4073,6 +4080,7 @@ impl KeepMobile {
             wardens: std::collections::HashSet::from([signer]),
             epoch: 0,
             device: Some(keep_core::crypto::try_random_bytes::<32>()?),
+            restored: true,
         };
         persistence::persist_warden_set(storage, &set)?;
         tracing::warn!("Trusted wardens record was lost; restored from the stored policy's signer");
@@ -7998,6 +8006,7 @@ mod velocity_fault_tests {
         let before = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
         let (device_before, _) = governance(&before);
         let held = revocation(&before, &warden, &bundle.digest());
+        assert!(!before.warden_governance().unwrap().restored);
         storage.records.lock().unwrap().remove(TRUSTED_WARDENS_KEY);
 
         let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
@@ -8012,10 +8021,16 @@ mod velocity_fault_tests {
         let (device, epoch) = governance(&mobile);
         assert_ne!(device, device_before);
         assert_eq!(epoch, 0);
+        assert!(mobile.warden_governance().unwrap().restored);
+
+        let relaunched = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert_eq!(governance(&relaunched), (device, 0));
+        assert!(relaunched.warden_governance().unwrap().restored);
 
         assert!(mobile.delete_policy(Some(held)).is_err());
         let fresh = revocation(&mobile, &warden, &bundle.digest());
         mobile.delete_policy(Some(fresh)).unwrap();
+        assert!(!mobile.warden_governance().unwrap().restored);
     }
 
     /// A policy that does not verify names no signer, so a lost wardens record
