@@ -694,6 +694,12 @@ pub struct KeepMobile {
     pre_approved_hashes: PreApprovedHashes,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
+    /// Advanced each time the live node is torn down, after it is gone. A
+    /// running bunker holds its own copy of the share, or a handle to the old
+    /// node, and the relay pins it started with, so it stops when this moves
+    /// rather than signing on with a share that was deleted or switched away
+    /// from, or trusting a pin that was removed.
+    pub(crate) live_generation: tokio::sync::watch::Sender<u64>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -958,6 +964,7 @@ impl KeepMobile {
             pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
+            live_generation: tokio::sync::watch::Sender::new(0),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1324,6 +1331,10 @@ impl KeepMobile {
             self.pending_requests.lock().await.clear();
             *self.node.write().await = None;
         });
+        // After the node is gone, so a bunker start that read the old node
+        // subscribed before this and sees it.
+        self.live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {

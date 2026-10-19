@@ -765,6 +765,9 @@ impl BunkerHandler {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // Before the node is read, so a teardown after this point stops the
+        // server even if the node it read is the one torn down.
+        let invalidated = self.mobile.live_generation.subscribe();
         let result = self.mobile.runtime.block_on(async {
             let verified_relays = self.mobile.verify_and_pin_relays(&relays, proxy).await?;
 
@@ -893,7 +896,7 @@ impl BunkerHandler {
             let status = Arc::clone(&self.status);
             tokio::spawn(async move {
                 status.store(STATUS_RUNNING, Ordering::Release);
-                run_server(server, shutdown_rx, status).await;
+                run_server(server, shutdown_rx, invalidated, status).await;
             });
 
             Ok::<(), KeepMobileError>(())
@@ -909,6 +912,7 @@ impl BunkerHandler {
 async fn run_server(
     mut server: Server,
     shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    mut invalidated: tokio::sync::watch::Receiver<u64>,
     status: Arc<AtomicU8>,
 ) {
     tokio::select! {
@@ -919,6 +923,13 @@ async fn run_server(
             };
         }
         _ = shutdown_rx => {
+            server.stop().await;
+            status.store(STATUS_STOPPED, Ordering::Release);
+        }
+        // The share was deleted or switched, or the relay pins changed, so
+        // this server is signing with a share or trusting pins that are no
+        // longer current. The app starts a new one.
+        _ = invalidated.changed() => {
             server.stop().await;
             status.store(STATUS_STOPPED, Ordering::Release);
         }
@@ -1449,5 +1460,61 @@ mod tests {
         let (transport2, secret2) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*transport1, *transport2);
         assert_eq!(*secret1, *secret2);
+    }
+
+    // A running bunker holds its own copy of the share, or a handle to the old
+    // node, and the relay pins it started with. Tearing the live node down, as
+    // deleting or switching the share or editing the pins does, has to stop it
+    // too, or it signs on with a share that is gone.
+    #[test]
+    fn a_running_bunker_stops_when_the_live_node_is_torn_down() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let invalidated = mobile.live_generation.subscribe();
+        let status = Arc::new(AtomicU8::new(STATUS_RUNNING));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+        let (_relay, server) = mobile.runtime.block_on(async {
+            let relay = nostr_relay_builder::MockRelay::run().await.unwrap();
+            let url = relay.url().await.to_string();
+            let mut keyring = keep_core::keyring::Keyring::new();
+            let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+            keyring
+                .load_key(
+                    *keypair.public_bytes(),
+                    *keypair.secret_bytes(),
+                    keep_core::keys::KeyType::Nostr,
+                    "test".into(),
+                )
+                .unwrap();
+            let server = Server::new_with_config(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                None,
+                None,
+                std::slice::from_ref(&url),
+                None,
+                ServerConfig::default(),
+            )
+            .await
+            .unwrap();
+            (relay, server)
+        });
+        let serving = mobile.runtime.spawn(run_server(
+            server,
+            shutdown_rx,
+            invalidated,
+            Arc::clone(&status),
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!serving.is_finished(), "the server is serving");
+
+        mobile.clear_certificate_pins().unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !serving.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(serving.is_finished(), "the server stopped with the node");
+        assert_eq!(status.load(Ordering::Acquire), STATUS_STOPPED);
     }
 }
