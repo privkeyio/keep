@@ -44,6 +44,7 @@ deny = [
     { crate = "openssl" },
     { crate = "openssl-sys" },
     { crate = "webpki-roots:>=1,<1.0.10", reason = "RUSTSEC-2026-0381 is ignored for the 0.26 shim; the roots it re-exports must stay patched" },
+    { crate = "webpki-roots:<0.26.11", reason = "these bundle their own roots, including the one RUSTSEC-2026-0381 removes, and that advisory is ignored by ID" },
 ]
 
 [sources]
