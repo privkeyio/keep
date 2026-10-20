@@ -479,8 +479,6 @@ impl BunkerHandler {
         self.lifecycle.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// See `KeepMobile::bunker_start_lock`. It guards no data, so a panic
-    /// while it was held leaves nothing to repair.
     /// Stop any running bunker, whichever handler started it: `stop_bunker`
     /// reaches only one this handler started, so the generation moves too.
     fn stop_serving(&self) {
@@ -539,6 +537,8 @@ impl BunkerHandler {
         result
     }
 
+    /// See `KeepMobile::bunker_start_lock`. It guards no data, so a panic
+    /// while it was held leaves nothing to repair.
     fn start_guard(&self) -> std::sync::MutexGuard<'_, ()> {
         self.mobile
             .bunker_start_lock
@@ -639,11 +639,16 @@ impl BunkerHandler {
     /// x-only public key.
     ///
     /// The client still holds the connect secret, which would let it connect
-    /// again under this key or a fresh one, so the secret is replaced and the
-    /// running bunker stopped: the caller starts it again, and publishes the
+    /// again under this key or a fresh one, so the running bunker is stopped
+    /// and the secret replaced: the caller starts it again, and publishes the
     /// new URL. The transport key stays, so other clients' remembered grants
-    /// stay and they sign without pairing again; a client that was only
-    /// connected needs the new URL, as after any restart.
+    /// stay, and those that sign without sending `connect` again carry on. A
+    /// client that was only connected loses its session at the stop, and one
+    /// that sends `connect` again needs the new URL.
+    ///
+    /// On `Err` the revoke did not complete and the old secret may still be
+    /// valid for the next start: callers must not report success. The bunker
+    /// is left stopped either way.
     pub fn revoke_client(&self, pubkey: String) -> Result<(), KeepMobileError> {
         let pubkey = PublicKey::from_hex(&pubkey).map_err(|_| KeepMobileError::InvalidInput {
             msg: "Invalid client pubkey hex".into(),
@@ -651,13 +656,14 @@ impl BunkerHandler {
         // A start between reading the persisted grants and publishing its
         // handler would restore what this removes, unseen by either step.
         let _start_guard = self.start_guard();
+        // Stopped first, so no error below leaves the old secret serving.
+        self.stop_serving();
         if let Some(handler) = self.live_handler() {
             self.mobile
                 .runtime
                 .block_on(async { handler.revoke_client(&pubkey).await });
         }
         self.mobile.forget_bunker_permissions(Some(&pubkey))?;
-        self.stop_serving();
         self.rewrite_bunker_config(false, |clients| {
             clients.retain(|c| PublicKey::parse(c).ok() != Some(pubkey))
         })
@@ -668,13 +674,13 @@ impl BunkerHandler {
     /// `revoke_client` does for one.
     pub fn revoke_all_clients(&self) -> Result<(), KeepMobileError> {
         let _start_guard = self.start_guard();
+        self.stop_serving();
         if let Some(handler) = self.live_handler() {
             self.mobile
                 .runtime
                 .block_on(async { handler.revoke_all_clients().await });
         }
         self.mobile.forget_bunker_permissions(None)?;
-        self.stop_serving();
         self.rewrite_bunker_config(false, Vec::clear)
     }
 
@@ -2032,20 +2038,56 @@ mod tests {
         assert_ne!(again.as_str(), rotated.as_str());
     }
 
+    /// A client on `url` listening for the bunker at `bunker`'s answers.
+    fn listening(
+        mobile: &KeepMobile,
+        url: &str,
+        keys: &nostr_sdk::Keys,
+        bunker: PublicKey,
+    ) -> nostr_sdk::Client {
+        mobile.runtime.block_on(async {
+            let client = nostr_sdk::Client::new(keys.clone());
+            client.add_relay(url).await.unwrap();
+            client.connect().await;
+            client
+                .subscribe(
+                    nostr_sdk::Filter::new()
+                        .kind(Kind::NostrConnect)
+                        .author(bunker)
+                        .pubkey(keys.public_key()),
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            client
+        })
+    }
+
+    fn error_of(answer: Option<serde_json::Value>) -> Option<String> {
+        answer
+            .expect("the bunker answers")
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    }
+
     // End to end over a relay, with the production callback bridge and grants
-    // restored from storage: a remembered client signs its kind unprompted. A
-    // revoke made through another handler stops the bunker and leaves nothing
-    // to restore, and replaces the connect secret but not the transport key,
-    // so the bunker started again refuses the revoked client both its old
-    // secret and its signing request.
+    // restored from storage. A revoke made through another handler stops the
+    // bunker and leaves nothing to restore, and replaces the connect secret but
+    // not the transport key. The bunker started again refuses the revoked
+    // client its signing request and its old secret, and the old secret to any
+    // key; the new secret works, and a client still remembered signs without
+    // pairing again.
     #[test]
     fn a_revoked_client_cannot_sign_or_connect_again_end_to_end() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
         let (transport, old_secret) = load_or_create_bunker_keys(&mobile).unwrap();
         let scope = grant_scope(&transport, &GROUP).unwrap();
-        let keys = nostr_sdk::Keys::generate();
-        persist_remembered(&mobile, &[keys.public_key()]);
+        let revoked = nostr_sdk::Keys::generate();
+        let kept = nostr_sdk::Keys::generate();
+        persist_remembered(&mobile, &[revoked.public_key(), kept.public_key()]);
         let prompts = Arc::new(AtomicUsize::new(0));
         let relay = mobile
             .runtime
@@ -2075,31 +2117,15 @@ mod tests {
             &scope,
             &prompts,
         );
-        let client = mobile.runtime.block_on(async {
-            let client = nostr_sdk::Client::new(keys.clone());
-            client.add_relay(url.clone()).await.unwrap();
-            client.connect().await;
-            client
-                .subscribe(
-                    nostr_sdk::Filter::new()
-                        .kind(Kind::NostrConnect)
-                        .author(bunker)
-                        .pubkey(keys.public_key()),
-                    None,
-                )
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            client
-        });
+        let client = listening(&mobile, &url, &revoked, bunker);
         let signed = mobile
             .runtime
-            .block_on(sign_over_relay(&client, &keys, bunker, "remembered"))
+            .block_on(sign_over_relay(&client, &revoked, bunker, "remembered"))
             .expect("a remembered kind is signed");
         signed.verify().unwrap();
 
         BunkerHandler::new(Arc::clone(&mobile))
-            .revoke_client(keys.public_key().to_hex())
+            .revoke_client(revoked.public_key().to_hex())
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !running.is_finished() && std::time::Instant::now() < deadline {
@@ -2107,7 +2133,7 @@ mod tests {
         }
         assert!(running.is_finished(), "the revoke stops the bunker");
         assert!(!serving.load(Ordering::Acquire));
-        assert!(restored_clients(&mobile).is_empty());
+        assert_eq!(restored_clients(&mobile), vec![kept.public_key().to_hex()]);
         let (kept_transport, new_secret) = load_or_create_bunker_keys(&mobile).unwrap();
         assert_eq!(*kept_transport, *transport, "the transport key stays");
         assert_ne!(new_secret.as_str(), old_secret.as_str());
@@ -2115,28 +2141,93 @@ mod tests {
         let restarter = BunkerHandler::new(Arc::clone(&mobile));
         let (again, _, _) = serve_stored(&mobile, &restarter, &url, keyring, &scope, &prompts);
         assert_eq!(again, bunker);
-        let refused = mobile
-            .runtime
-            .block_on(ask_over_relay(
-                &client,
-                &keys,
-                bunker,
-                "reconnect",
-                "connect",
-                serde_json::json!([bunker.to_hex(), old_secret.as_str()]),
-            ))
-            .expect("the bunker answers");
-        assert!(
-            refused.get("error").and_then(|v| v.as_str()).is_some(),
-            "{refused}"
+        let connect = |secret: &str| serde_json::json!([bunker.to_hex(), secret]);
+        let ask = |client: &nostr_sdk::Client, keys, id, method, params| {
+            mobile
+                .runtime
+                .block_on(ask_over_relay(client, keys, bunker, id, method, params))
+        };
+
+        let unsigned = serde_json::json!({
+            "kind": 1, "content": "x", "tags": [],
+            "created_at": nostr_sdk::Timestamp::now().as_secs(),
+        });
+        let sign = serde_json::json!([unsigned.to_string()]);
+        assert_eq!(
+            error_of(ask(&client, &revoked, "revoked-sign", "sign_event", sign)).as_deref(),
+            Some("Permission denied"),
+            "the revoked client cannot sign"
         );
-        assert!(mobile
-            .runtime
-            .block_on(sign_over_relay(&client, &keys, bunker, "revoked"))
-            .is_none());
-        assert_eq!(prompts.load(Ordering::Acquire), 0, "refused without asking");
+        assert_eq!(
+            error_of(ask(
+                &client,
+                &revoked,
+                "revoked-connect",
+                "connect",
+                connect(old_secret.as_str())
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "nor connect with the old secret"
+        );
+        let fresh = nostr_sdk::Keys::generate();
+        let fresh_client = listening(&mobile, &url, &fresh, bunker);
+        assert_eq!(
+            error_of(ask(
+                &fresh_client,
+                &fresh,
+                "fresh-old",
+                "connect",
+                connect(old_secret.as_str())
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "the old secret is refused to any key"
+        );
+        assert_eq!(
+            error_of(ask(
+                &fresh_client,
+                &fresh,
+                "fresh-new",
+                "connect",
+                connect(new_secret.as_str())
+            )),
+            None,
+            "the new secret is accepted"
+        );
+        let kept_client = listening(&mobile, &url, &kept, bunker);
+        assert!(
+            mobile
+                .runtime
+                .block_on(sign_over_relay(&kept_client, &kept, bunker, "still-kept"))
+                .is_some(),
+            "a client still remembered signs without pairing again"
+        );
+        assert_eq!(prompts.load(Ordering::Acquire), 0, "nothing asked the user");
         restarter.stop_bunker();
-        mobile.runtime.block_on(client.disconnect());
+        for c in [client, fresh_client, kept_client] {
+            mobile.runtime.block_on(c.disconnect());
+        }
+    }
+
+    // A revoke that cannot complete leaves the bunker stopped, so the old
+    // secret does not keep serving, and reports the failure.
+    #[test]
+    fn a_revoke_that_fails_leaves_the_bunker_stopped() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        storage
+            .store_share_by_key(
+                crate::relay_config_key(None),
+                b"not json".to_vec(),
+                crate::persistence::storage_metadata("relay_config"),
+            )
+            .unwrap();
+        let before = *mobile.live_generation.borrow();
+        assert!(BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_client(nostr_sdk::Keys::generate().public_key().to_hex())
+            .is_err());
+        assert_ne!(*mobile.live_generation.borrow(), before, "stopped");
     }
 
     // A persisted transport secret that is valid 32-byte hex but not a valid
