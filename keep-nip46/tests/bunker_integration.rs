@@ -502,7 +502,7 @@ struct ConnectedBunker {
     _mock_relay: MockRelay,
 }
 
-async fn bunker_with_connected_client() -> ConnectedBunker {
+async fn bunker_with_connected_client(transport: Option<[u8; 32]>) -> ConnectedBunker {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -514,7 +514,7 @@ async fn bunker_with_connected_client() -> ConnectedBunker {
     let mut server = Server::new_with_config(
         keyring,
         None,
-        None,
+        transport,
         std::slice::from_ref(&relay_url),
         None,
         ServerConfig {
@@ -556,7 +556,7 @@ async fn bunker_with_connected_client() -> ConnectedBunker {
     let connect_req = serde_json::json!({
         "id": "req-connect",
         "method": "connect",
-        "params": [signer_pubkey.to_hex(), bunker_secret],
+        "params": [server_pubkey.to_hex(), bunker_secret],
     });
     client
         .send_event(&build_nip46_request(
@@ -620,7 +620,7 @@ async fn send_and_await(
 
 #[tokio::test]
 async fn test_dispatch_get_public_key_returns_signer_pubkey() {
-    let mut cb = bunker_with_connected_client().await;
+    let mut cb = bunker_with_connected_client(None).await;
 
     let resp = send_and_await(&mut cb, "req-gpk", "get_public_key", serde_json::json!([])).await;
     let result = resp
@@ -640,7 +640,7 @@ async fn test_dispatch_get_public_key_returns_signer_pubkey() {
 
 #[tokio::test]
 async fn test_dispatch_ping_returns_pong() {
-    let mut cb = bunker_with_connected_client().await;
+    let mut cb = bunker_with_connected_client(None).await;
 
     let resp = send_and_await(&mut cb, "req-ping", "ping", serde_json::json!([])).await;
     let result = resp
@@ -658,7 +658,7 @@ async fn test_dispatch_ping_returns_pong() {
 
 #[tokio::test]
 async fn test_dispatch_nip44_encrypt_decrypt_roundtrip() {
-    let mut cb = bunker_with_connected_client().await;
+    let mut cb = bunker_with_connected_client(None).await;
 
     let third_party = Keys::generate();
     let plaintext = "secret message for #553 nip44 coverage";
@@ -709,7 +709,7 @@ async fn test_dispatch_nip44_encrypt_decrypt_roundtrip() {
 
 #[tokio::test]
 async fn test_dispatch_nip04_encrypt_decrypt_roundtrip() {
-    let mut cb = bunker_with_connected_client().await;
+    let mut cb = bunker_with_connected_client(None).await;
 
     let third_party = Keys::generate();
     let plaintext = "legacy nip04 coverage for #553";
@@ -1026,4 +1026,41 @@ async fn test_e2e_unvetted_restored_kinds_are_not_signed_unprompted() {
         server_handle.abort();
         client.disconnect().await;
     }
+}
+
+// A single-key bunker with its own transport secret serves under a bunker
+// pubkey that is not its signing key. The event it returns must be signed for
+// the signing key, and verify.
+#[tokio::test]
+async fn test_e2e_keyring_bunker_with_transport_key_signs_valid_events() {
+    let transport = Keys::generate();
+    let mut cb = bunker_with_connected_client(Some(transport.secret_key().secret_bytes())).await;
+    assert_eq!(cb.server_pubkey, transport.public_key());
+    assert_ne!(cb.server_pubkey, cb.signer_pubkey);
+
+    let unsigned = serde_json::json!({
+        "kind": 1,
+        "content": "signed for the signing key",
+        "tags": [],
+        "created_at": Timestamp::now().as_secs(),
+    });
+    let resp = send_and_await(
+        &mut cb,
+        "req-sign",
+        "sign_event",
+        serde_json::json!([serde_json::to_string(&unsigned).unwrap()]),
+    )
+    .await;
+    let signed = Event::from_json(
+        resp.get("result")
+            .and_then(|v| v.as_str())
+            .expect("sign_event returns the event"),
+    )
+    .expect("a signed event");
+    signed.verify().expect("the returned event verifies");
+    assert_eq!(signed.pubkey, cb.signer_pubkey);
+    assert_eq!(signed.content, "signed for the signing key");
+
+    cb.server_handle.abort();
+    cb.client.disconnect().await;
 }
