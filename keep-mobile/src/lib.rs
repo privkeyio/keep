@@ -2024,7 +2024,14 @@ impl KeepMobile {
         // until the mark is raised, so a load by another instance cannot read
         // between them.
         let _mark = Self::high_water_lock();
-        let unconfigured = !policy.is_configured();
+        // From storage, not memory: another instance may have stored a policy
+        // this one has not loaded, and replacing the mark over it would let an
+        // older bundle in on a transient read fault.
+        let unconfigured = !policy.is_configured()
+            && matches!(
+                persistence::load_policy(&self.storage),
+                Err(KeepMobileError::StorageNotFound)
+            );
         Self::high_water_admits(&self.storage, &bundle, unconfigured).map_err(|fault| {
             KeepMobileError::InvalidPolicy {
                 msg: match fault {
@@ -8571,6 +8578,31 @@ mod velocity_fault_tests {
         let kept: crate::persistence::PolicyHighWater =
             serde_json::from_slice(&storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).unwrap()).unwrap();
         assert_eq!(kept, crate::persistence::PolicyHighWater::of(&bundle));
+    }
+
+    // An instance that has not loaded a policy another one stored does not take
+    // its own empty memory for "nothing depends on the mark": an unreadable
+    // mark still refuses, so an older bundle cannot replace the stored one.
+    #[test]
+    fn an_unreadable_mark_is_not_replaced_over_a_policy_another_instance_stored() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden))]).expect("serialize wardens"),
+        );
+        let stale = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        let newer = create_test_bundle_with(&warden, &capped_rules(), now - 60);
+        plant_bundle(&storage, &newer);
+        storage.fault(POLICY_HIGH_WATER_STORAGE_KEY);
+        let older = create_test_bundle_with(&warden, &PolicyRules::default(), now - 120);
+        assert!(stale.import_policy(hex::encode(older.to_bytes())).is_err());
+        assert_eq!(
+            storage.raw(POLICY_STORAGE_KEY).unwrap(),
+            serde_json::to_vec(&newer).unwrap(),
+            "the stored policy stays"
+        );
     }
 
     // A policy stored before the mark existed loads as before and sets it.
