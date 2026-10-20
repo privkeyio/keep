@@ -52,7 +52,7 @@ pub use signing_policy::{
     assess_signing_risk, evaluate_sign_policy, evaluate_sign_policy_selection, is_sensitive_kind,
     sensitive_kind_warning, AutoSignDecision, PolicyMode, SignPolicyEvaluation,
     SignPolicySelection, SigningAuthLevel, SigningRateLimiter, SigningRequestContext,
-    SigningRiskAssessment, SigningRiskFactor, UsageStats,
+    SigningRiskAssessment, SigningRiskFactor, StorageRead, UsageStats,
 };
 pub use storage::{PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
@@ -1376,10 +1376,20 @@ impl KeepMobile {
             .active_share_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let is_active = self
-            .storage
-            .get_active_share_key()
-            .is_some_and(|k| constant_time_eq(k.as_bytes(), group_pubkey.as_bytes()));
+        let is_active = match self.storage.read_active_share_key() {
+            signing_policy::StorageRead::Found { value } => {
+                constant_time_eq(value.as_bytes(), group_pubkey.as_bytes())
+            }
+            signing_policy::StorageRead::Absent => false,
+            // Whether this is the active share decides whether the pointer is
+            // cleared with it, so a pointer that cannot be read refuses the
+            // delete rather than leave it naming a share that is gone.
+            signing_policy::StorageRead::Unavailable => {
+                return Err(KeepMobileError::StorageError {
+                    msg: "The active share could not be read; try the delete again".into(),
+                })
+            }
+        };
 
         if is_active {
             self.storage.set_active_share_key(None)?;
@@ -3744,9 +3754,18 @@ impl KeepMobile {
             decrypted.config.kill_switch,
         )?;
 
-        if self.storage.get_active_share_key().is_none() {
-            if let Some(group_hex) = first_group_hex {
-                let _ = self.storage.set_active_share_key(Some(group_hex));
+        // Only a pointer known to be unset is set: one that could not be read
+        // may name another account, and repointing it here would skip the
+        // cleanup an account switch needs.
+        match self.storage.read_active_share_key() {
+            signing_policy::StorageRead::Absent => {
+                if let Some(group_hex) = first_group_hex {
+                    let _ = self.storage.set_active_share_key(Some(group_hex));
+                }
+            }
+            signing_policy::StorageRead::Found { .. } => {}
+            signing_policy::StorageRead::Unavailable => {
+                tracing::warn!("active share unreadable; restore leaves it as it is");
             }
         }
 
@@ -5717,6 +5736,12 @@ mod import_teardown_tests {
         fn get_active_share_key(&self) -> Option<String> {
             self.active.lock().unwrap().clone()
         }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
+        }
         fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
             *self.active.lock().unwrap() = key;
             Ok(())
@@ -5874,6 +5899,12 @@ mod import_teardown_tests {
             fn get_active_share_key(&self) -> Option<String> {
                 self.inner.get_active_share_key()
             }
+            fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+                match self.get_active_share_key() {
+                    Some(value) => crate::signing_policy::StorageRead::Found { value },
+                    None => crate::signing_policy::StorageRead::Absent,
+                }
+            }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.inner.set_active_share_key(k)
             }
@@ -6004,6 +6035,12 @@ mod import_teardown_tests {
             }
             fn get_active_share_key(&self) -> Option<String> {
                 self.0.get_active_share_key()
+            }
+            fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+                match self.get_active_share_key() {
+                    Some(value) => crate::signing_policy::StorageRead::Found { value },
+                    None => crate::signing_policy::StorageRead::Absent,
+                }
             }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.0.set_active_share_key(k)
@@ -6473,6 +6510,12 @@ mod cert_pin_ffi_tests {
         fn get_active_share_key(&self) -> Option<String> {
             None
         }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
+        }
         fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -6605,6 +6648,9 @@ mod restore_backup_metadata_tests {
         data: StdMutex<HashMap<String, Vec<u8>>>,
         metas: StdMutex<Vec<ShareMetadataInfo>>,
         active: StdMutex<Option<String>>,
+        /// The active-share pointer fails to read: its getter answers `None`,
+        /// as Android's does on a fault.
+        pointer_unreadable: std::sync::atomic::AtomicBool,
     }
 
     impl SecureStorage for RecordingStorage {
@@ -6657,7 +6703,25 @@ mod restore_backup_metadata_tests {
             Ok(())
         }
         fn get_active_share_key(&self) -> Option<String> {
+            if self
+                .pointer_unreadable
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return None;
+            }
             self.active.lock().unwrap().clone()
+        }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            if self
+                .pointer_unreadable
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return crate::signing_policy::StorageRead::Unavailable;
+            }
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
         }
         fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
             *self.active.lock().unwrap() = key;
@@ -6736,6 +6800,12 @@ mod restore_backup_metadata_tests {
             }
             fn get_active_share_key(&self) -> Option<String> {
                 self.inner.get_active_share_key()
+            }
+            fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+                match self.get_active_share_key() {
+                    Some(value) => crate::signing_policy::StorageRead::Found { value },
+                    None => crate::signing_policy::StorageRead::Absent,
+                }
             }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.inner.set_active_share_key(k)
@@ -6858,6 +6928,57 @@ mod restore_backup_metadata_tests {
             .wallet_descriptor_delete(hex::encode(group))
             .expect("writes go through once the index is reset");
         assert!(mobile.wallet_descriptor_list().is_empty());
+    }
+
+    // A restore while the active-share pointer cannot be read leaves it as it
+    // is: it may name another account, and repointing it would switch accounts
+    // without the cleanup a switch needs.
+    #[test]
+    fn a_restore_leaves_an_unreadable_active_share_alone() {
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(true)],
+            vec![],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build");
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let other = hex::encode([9u8; 32]);
+        *storage.active.lock().unwrap() = Some(other.clone());
+        storage
+            .pointer_unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert_eq!(*storage.active.lock().unwrap(), Some(other));
+    }
+
+    // Whether the share being deleted is the active one decides whether the
+    // pointer goes with it, so a pointer that cannot be read refuses the delete.
+    #[test]
+    fn a_delete_with_an_unreadable_active_share_is_refused() {
+        let (storage, _) = restore_one(true);
+        let key = hex::encode([7u8; 32]);
+        assert_eq!(*storage.active.lock().unwrap(), Some(key.clone()));
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        storage
+            .pointer_unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(mobile.delete_share_by_key(key.clone()).is_err());
+        assert!(
+            storage.load_share_by_key(key.clone()).is_ok(),
+            "nothing deleted"
+        );
+        assert_eq!(*storage.active.lock().unwrap(), Some(key));
     }
 
     fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {
@@ -7123,6 +7244,12 @@ mod baseline_presign_policy_tests {
         fn get_active_share_key(&self) -> Option<String> {
             None
         }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
+        }
         fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -7349,6 +7476,12 @@ mod dkg_pending_share_tests {
         }
         fn get_active_share_key(&self) -> Option<String> {
             self.active.lock().unwrap().clone()
+        }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
         }
         fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
             *self.active.lock().unwrap() = key;
@@ -7914,6 +8047,12 @@ mod velocity_fault_tests {
         }
         fn get_active_share_key(&self) -> Option<String> {
             None
+        }
+        fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            match self.get_active_share_key() {
+                Some(value) => crate::signing_policy::StorageRead::Found { value },
+                None => crate::signing_policy::StorageRead::Absent,
+            }
         }
         fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
             Ok(())
