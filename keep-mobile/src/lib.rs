@@ -700,6 +700,15 @@ pub struct KeepMobile {
     /// rather than signing on with a share that was deleted or switched away
     /// from, or trusting a pin that was removed.
     pub(crate) live_generation: tokio::sync::watch::Sender<u64>,
+    /// Serializes every bunker start against revokes and credential
+    /// rotations, whichever `BunkerHandler` each is made through: a start reads
+    /// the persisted grants before it publishes its engine, and a revoke in
+    /// between would be lost.
+    pub(crate) bunker_start_lock: std::sync::Mutex<()>,
+    /// The engine of the bunker last started, through any `BunkerHandler`, so
+    /// a revoke reaches it whichever instance the revoke is made through. Weak,
+    /// so it dies with the server.
+    pub(crate) live_bunker: std::sync::Mutex<Option<std::sync::Weak<keep_nip46::SignerHandler>>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -965,6 +974,8 @@ impl KeepMobile {
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
             live_generation: tokio::sync::watch::Sender::new(0),
+            bunker_start_lock: std::sync::Mutex::new(()),
+            live_bunker: std::sync::Mutex::new(None),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
@@ -3106,6 +3117,7 @@ impl KeepMobile {
             peer_policies: existing.peer_policies,
             kfp_v1_peer_policies: existing.kfp_v1_peer_policies,
             bunker_permissions: existing.bunker_permissions,
+            bunker_permissions_scope: existing.bunker_permissions_scope,
         };
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
@@ -3672,6 +3684,7 @@ impl KeepMobile {
                 peer_policies: rc.peer_policies.clone(),
                 kfp_v1_peer_policies: rc.kfp_v1_peer_policies.clone(),
                 bunker_permissions: rc.bunker_permissions.clone(),
+                bunker_permissions_scope: None,
             };
             prepared_relays.push((group_hex, stored_relay));
         }
@@ -4160,11 +4173,26 @@ impl KeepMobile {
 
     /// Load the persisted NIP-46 bunker permission grants from the global relay
     /// config, returning them ready to seed `ServerConfig::pre_grants` so
-    /// remembered grants survive a bunker restart.
-    pub(crate) fn load_bunker_permissions(&self) -> Vec<keep_core::relay::StoredBunkerPermission> {
+    /// remembered grants survive a bunker restart. Only grants made under
+    /// `scope` are returned: a client remembered before a credential rotation,
+    /// or for another share, has to be approved again.
+    pub(crate) fn load_bunker_permissions(
+        &self,
+        scope: &str,
+    ) -> Vec<keep_core::relay::StoredBunkerPermission> {
         let key = relay_config_key(None);
         match persistence::load_relay_config(&self.storage, &key) {
-            Ok(Some(c)) => c.bunker_permissions,
+            Ok(Some(c)) if c.bunker_permissions_scope.as_deref() == Some(scope) => {
+                c.bunker_permissions
+            }
+            Ok(Some(c)) => {
+                if !c.bunker_permissions.is_empty() {
+                    tracing::info!(
+                        "not restoring bunker grants made under other bunker credentials or another share"
+                    );
+                }
+                Vec::new()
+            }
             Ok(None) => Vec::new(),
             // A real load error (decrypt/deserialize failure, corruption, or
             // tampering) is NOT the same as "no config yet". Seeding empty
@@ -4182,19 +4210,28 @@ impl KeepMobile {
         }
     }
 
-    /// Replace the persisted NIP-46 bunker permission grants with `grants`,
-    /// preserving the relay lists. Called from the engine's `persist_permissions`
-    /// callback after every grant write or revoke, so the durable store mirrors
-    /// the in-memory engine (the single source of truth).
+    /// Replace the persisted NIP-46 bunker permission grants with `grants`, made
+    /// under `scope` (see `load_bunker_permissions`), preserving the relay
+    /// lists. Called from the engine's `persist_permissions` callback after
+    /// every grant write or revoke, so the durable store mirrors the in-memory
+    /// engine (the single source of truth). Nothing is written unless `serving`
+    /// holds once the lock is taken: a server still winding down after a stop
+    /// would otherwise write back grants a revoke cleared in the meantime.
     pub(crate) fn persist_bunker_permissions(
         &self,
         grants: Vec<keep_core::relay::StoredBunkerPermission>,
+        scope: &str,
+        serving: impl FnOnce() -> bool,
     ) -> Result<(), KeepMobileError> {
         let key = relay_config_key(None);
         let _guard = self
             .relay_config_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if !serving() {
+            tracing::debug!("not persisting bunker grants from a stopped server");
+            return Ok(());
+        }
         let mut stored = match persistence::load_relay_config(&self.storage, &key) {
             Ok(Some(c)) => c,
             Ok(None) => persistence::StoredRelayConfig::default(),
@@ -4205,6 +4242,43 @@ impl KeepMobile {
             }
         };
         stored.bunker_permissions = grants;
+        stored.bunker_permissions_scope = Some(scope.to_owned());
+        persistence::persist_relay_config(&self.storage, &key, &stored)
+    }
+
+    /// Drop the persisted NIP-46 grants of `client`, or of every client when
+    /// `None`, so a revoke holds when no bunker is running to persist it.
+    pub(crate) fn forget_bunker_permissions(
+        &self,
+        client: Option<&nostr_sdk::PublicKey>,
+    ) -> Result<(), KeepMobileError> {
+        let key = relay_config_key(None);
+        let _guard = self
+            .relay_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored = match persistence::load_relay_config(&self.storage, &key) {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(KeepMobileError::StorageError {
+                    msg: format!("failed to load existing relay config: {e}"),
+                });
+            }
+        };
+        let before = stored.bunker_permissions.len();
+        match client {
+            Some(client) => stored.bunker_permissions.retain(|grant| {
+                nostr_sdk::PublicKey::from_hex(&grant.pubkey_hex)
+                    .ok()
+                    .as_ref()
+                    != Some(client)
+            }),
+            None => stored.bunker_permissions.clear(),
+        }
+        if stored.bunker_permissions.len() == before {
+            return Ok(());
+        }
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
