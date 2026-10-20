@@ -8,6 +8,7 @@ ignore = [
     { id = "RUSTSEC-2024-0415", reason = "gtk3 bindings unmaintained; no migration path for tray-icon ecosystem" },
     { id = "RUSTSEC-2026-0194", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
+    { id = "RUSTSEC-2026-0381", reason = "only webpki-roots 0.26.11 remains flagged: a semver shim whose sole item re-exports TLS_SERVER_ROOTS from webpki-roots 1.x, locked at the patched 1.0.10; tokio-tungstenite 0.26 (via async-wsocket) pins the shim. [bans] denies webpki-roots 1.x below 1.0.10 so this ignore cannot hide a downgrade" },
     { id = "RUSTSEC-2026-0237", reason = "nostr-relay-builder unmaintained; dev-dependency only (test relay for keep-cli, keep-frost-net, keep-nip46 integration tests), never in a shipped artifact; unmaintained advisory with no fixed version to move to" },
 ]
 unmaintained = "workspace"
@@ -42,6 +43,7 @@ highlight = "all"
 deny = [
     { crate = "openssl" },
     { crate = "openssl-sys" },
+    { crate = "webpki-roots:>=1,<1.0.10", reason = "RUSTSEC-2026-0381 is ignored for the 0.26 shim; the roots it re-exports must stay patched" },
 ]
 
 [sources]
