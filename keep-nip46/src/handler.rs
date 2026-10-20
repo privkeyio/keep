@@ -119,7 +119,11 @@ fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
     }
 }
 
-fn prepare_frost_event(
+/// The request's event rebuilt for the key that signs it. The request carries
+/// the bunker's transport pubkey, which differs from the signing key whenever
+/// a transport secret is set or the signer is a FROST group, and an event
+/// signed as-is would not verify.
+fn event_for_signer(
     pubkey: PublicKey,
     unsigned: &UnsignedEvent,
 ) -> Result<(UnsignedEvent, EventId)> {
@@ -668,7 +672,7 @@ impl SignerHandler {
         let signed_event = if let Some(ref net_frost) = self.network_frost_signer {
             let pubkey = PublicKey::from_slice(net_frost.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
-            let (frost_event, event_id) = prepare_frost_event(pubkey, &unsigned_event)?;
+            let (frost_event, event_id) = event_for_signer(pubkey, &unsigned_event)?;
             // #529: pass the full unsigned event as a structured payload so
             // co-signers can recompute the id and reject a cross-domain
             // label spoof (e.g. a Bitcoin sighash relabeled as nostr-event).
@@ -680,7 +684,7 @@ impl SignerHandler {
             let signer = frost.lock().await;
             let pubkey = PublicKey::from_slice(signer.group_pubkey())
                 .map_err(|e| CryptoError::invalid_key(format!("pubkey: {e}")))?;
-            let (frost_event, event_id) = prepare_frost_event(pubkey, &unsigned_event)?;
+            let (frost_event, event_id) = event_for_signer(pubkey, &unsigned_event)?;
             let sig_bytes = signer.sign(event_id.as_bytes())?;
             assemble_signed_event(event_id, pubkey, frost_event, &sig_bytes)?
         } else {
@@ -694,7 +698,8 @@ impl SignerHandler {
                 .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?;
             let keys = Keys::new(secret);
 
-            unsigned_event
+            let (event, _) = event_for_signer(keys.public_key(), &unsigned_event)?;
+            event
                 .sign(&keys)
                 .await
                 .map_err(|e| CryptoError::invalid_signature(format!("signing: {e}")))?
@@ -1668,6 +1673,24 @@ mod tests {
             tags,
             "tags must be preserved verbatim and in order"
         );
+    }
+
+    // A request's event carries the bunker's transport pubkey, which is not the
+    // keyring key once a transport secret is set. The returned event is the
+    // keyring key's, and verifies.
+    #[tokio::test]
+    async fn a_keyring_signs_an_event_built_for_another_key_as_its_own() {
+        let handler = setup_handler();
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+
+        let transport = Keys::generate().public_key();
+        let unsigned = UnsignedEvent::new(transport, Timestamp::now(), Kind::TextNote, vec![], "x");
+        let signed = handler.handle_sign_event(app, unsigned).await.unwrap();
+        assert_eq!(signed.pubkey, signer_pk);
+        assert!(signed.verify().is_ok());
+        assert_eq!(signed.content, "x");
     }
 
     #[tokio::test]
