@@ -1386,7 +1386,8 @@ impl KeepMobile {
             // delete rather than leave it naming a share that is gone.
             signing_policy::StorageRead::Unavailable => {
                 return Err(KeepMobileError::StorageError {
-                    msg: "The active share could not be read; try the delete again".into(),
+                    msg: "The active account could not be read; select an account, then delete"
+                        .into(),
                 })
             }
         };
@@ -3516,6 +3517,9 @@ impl KeepMobile {
         let file_size = data.len();
         let decrypted = decrypt_backup_data(&data, &passphrase)?;
         let info = backup_info(&decrypted, file_size);
+        // A device with one share runs on it with no pointer written, so an
+        // absent pointer alone does not mean no account is in use.
+        let had_shares = self.storage.has_share() || !self.storage.list_all_shares().is_empty();
 
         let mut first_group_hex: Option<String> = None;
 
@@ -3754,19 +3758,23 @@ impl KeepMobile {
             decrypted.config.kill_switch,
         )?;
 
-        // Only a pointer known to be unset is set: one that could not be read
-        // may name another account, and repointing it here would skip the
-        // cleanup an account switch needs.
+        // The pointer is set only on a device that held no share: setting it
+        // anywhere else switches accounts without the cleanup a switch needs,
+        // whether it names another account or could not be read.
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         match self.storage.read_active_share_key() {
-            signing_policy::StorageRead::Absent => {
+            signing_policy::StorageRead::Absent if !had_shares => {
                 if let Some(group_hex) = first_group_hex {
                     let _ = self.storage.set_active_share_key(Some(group_hex));
                 }
             }
-            signing_policy::StorageRead::Found { .. } => {}
             signing_policy::StorageRead::Unavailable => {
                 tracing::warn!("active share unreadable; restore leaves it as it is");
             }
+            _ => {}
         }
 
         Ok(info)
@@ -5515,7 +5523,17 @@ impl KeepMobile {
     fn load_share_package(&self) -> Result<SharePackage, KeepMobileError> {
         let key = match self.storage.get_active_share_key() {
             Some(k) => k,
-            None => self.resolve_active_share()?,
+            // A pointer that could not be read may name another account than
+            // the one share that happens to list, so the node is not built on
+            // a guess.
+            None => match self.storage.read_active_share_key() {
+                signing_policy::StorageRead::Unavailable => {
+                    return Err(KeepMobileError::StorageError {
+                        msg: "The active account could not be read".into(),
+                    })
+                }
+                _ => self.resolve_active_share()?,
+            },
         };
         let data = self.storage.load_share_by_key(key.clone())?;
         let stored: StoredShareData = serde_json::from_slice(&data)
@@ -5900,10 +5918,7 @@ mod import_teardown_tests {
                 self.inner.get_active_share_key()
             }
             fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
-                match self.get_active_share_key() {
-                    Some(value) => crate::signing_policy::StorageRead::Found { value },
-                    None => crate::signing_policy::StorageRead::Absent,
-                }
+                self.inner.read_active_share_key()
             }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.inner.set_active_share_key(k)
@@ -6037,10 +6052,7 @@ mod import_teardown_tests {
                 self.0.get_active_share_key()
             }
             fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
-                match self.get_active_share_key() {
-                    Some(value) => crate::signing_policy::StorageRead::Found { value },
-                    None => crate::signing_policy::StorageRead::Absent,
-                }
+                self.0.read_active_share_key()
             }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.0.set_active_share_key(k)
@@ -6802,10 +6814,7 @@ mod restore_backup_metadata_tests {
                 self.inner.get_active_share_key()
             }
             fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
-                match self.get_active_share_key() {
-                    Some(value) => crate::signing_policy::StorageRead::Found { value },
-                    None => crate::signing_policy::StorageRead::Absent,
-                }
+                self.inner.read_active_share_key()
             }
             fn set_active_share_key(&self, k: Option<String>) -> Result<(), KeepMobileError> {
                 self.inner.set_active_share_key(k)
@@ -6979,6 +6988,63 @@ mod restore_backup_metadata_tests {
             "nothing deleted"
         );
         assert_eq!(*storage.active.lock().unwrap(), Some(key));
+    }
+
+    // A device with one share runs on it with no pointer stored. A restore that
+    // brings another share must not point at it: that switches accounts without
+    // the cleanup a switch needs.
+    #[test]
+    fn a_restore_onto_a_device_using_one_share_points_at_nothing_new() {
+        let (storage, _) = restore_one(true);
+        *storage.active.lock().unwrap() = None;
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let mut other = backup_share(true);
+        other.group_pubkey = hex::encode([8u8; 32]);
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![other],
+            vec![],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build");
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert_eq!(*storage.active.lock().unwrap(), None);
+    }
+
+    // A pointer that cannot be read does not leave the node to be built on the
+    // one share that happens to list, which may be another account's.
+    #[test]
+    fn an_unreadable_active_share_builds_nothing_on_the_share_listed() {
+        let (storage, _) = restore_one(true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        // The fixture's key package is a placeholder, so an export that reaches
+        // the share fails on it: that failure shows the share was loaded.
+        let reached = mobile
+            .export_share("a long export passphrase".into())
+            .unwrap_err();
+        assert!(
+            matches!(reached, KeepMobileError::InvalidShare { .. }),
+            "{reached}"
+        );
+        storage
+            .pointer_unreadable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = mobile
+            .export_share("a long export passphrase".into())
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("could not be read")),
+            "{err:?}"
+        );
     }
 
     fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {
