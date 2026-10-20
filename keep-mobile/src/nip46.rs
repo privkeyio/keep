@@ -2177,38 +2177,47 @@ mod tests {
             .await
             .unwrap();
         let mut notifications = client.notifications();
-        let request = serde_json::json!({ "id": "ping", "method": "ping", "params": [] });
-        let content = nip44::encrypt(
-            keys.secret_key(),
-            &bunker,
-            request.to_string(),
-            nip44::Version::V2,
-        )
-        .unwrap();
-        let event = nostr_sdk::EventBuilder::new(Kind::NostrConnect, content)
-            .tag(nostr_sdk::Tag::public_key(bunker))
-            .sign_with_keys(&keys)
+        // Sent again each second: a ping that reaches the relay before the
+        // server has subscribed is not kept for it, since NIP-46 events are
+        // ephemeral.
+        let mut answered = false;
+        for _ in 0..10 {
+            let request = serde_json::json!({ "id": "ping", "method": "ping", "params": [] });
+            let content = nip44::encrypt(
+                keys.secret_key(),
+                &bunker,
+                request.to_string(),
+                nip44::Version::V2,
+            )
             .unwrap();
-        client.send_event(&event).await.unwrap();
-        let answered = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let Ok(nostr_sdk::RelayPoolNotification::Event { event, .. }) =
-                    notifications.recv().await
-                else {
-                    continue;
-                };
-                if event.pubkey != bunker {
-                    continue;
+            let event = nostr_sdk::EventBuilder::new(Kind::NostrConnect, content)
+                .tag(nostr_sdk::Tag::public_key(bunker))
+                .sign_with_keys(&keys)
+                .unwrap();
+            client.send_event(&event).await.unwrap();
+            answered = tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let Ok(nostr_sdk::RelayPoolNotification::Event { event, .. }) =
+                        notifications.recv().await
+                    else {
+                        continue;
+                    };
+                    if event.pubkey != bunker {
+                        continue;
+                    }
+                    if let Ok(plain) =
+                        nip44::decrypt(keys.secret_key(), &bunker, event.content.as_str())
+                    {
+                        return plain.contains("pong");
+                    }
                 }
-                if let Ok(plain) =
-                    nip44::decrypt(keys.secret_key(), &bunker, event.content.as_str())
-                {
-                    return plain.contains("pong");
-                }
+            })
+            .await
+            .unwrap_or(false);
+            if answered {
+                break;
             }
-        })
-        .await
-        .unwrap_or(false);
+        }
         client.disconnect().await;
         answered
     }
