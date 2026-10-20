@@ -244,7 +244,8 @@ pub enum PolicyFault {
     /// stored record was rolled back to an older warden-signed bundle, which
     /// would otherwise load with its older rules. Not retried. Still a rollback
     /// baseline, since its signature and signer held, so the current policy can
-    /// be installed over it.
+    /// be installed over it, unless the record of the newest policy is the one
+    /// that is corrupt: only a revocation clears that.
     Superseded,
 }
 
@@ -263,7 +264,8 @@ impl std::fmt::Display for PolicyFault {
             Self::Superseded => {
                 write!(
                     f,
-                    "the stored policy is older than one this device already accepted"
+                    "the stored policy is older than one this device already accepted, \
+                     or the record of that one is corrupt"
                 )
             }
             Self::NotYetValid => {
