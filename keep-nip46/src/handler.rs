@@ -604,6 +604,12 @@ impl SignerHandler {
                 return Err(KeepError::UserRejected);
             }
 
+            // The prompt can stay open for a minute, and the app revoked
+            // meanwhile: an approval given to an app since removed signs
+            // nothing and grants nothing.
+            self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
+                .await?;
+
             // #575: when the user approves with a remember-duration, persist
             // a per-app, per-kind grant so subsequent requests within the
             // window skip the prompt. `JustThisTime` is the one-shot default
@@ -723,7 +729,14 @@ impl SignerHandler {
             .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?)
     }
 
-    async fn require_approval(&self, app_pubkey: PublicKey, method: &str) -> Result<()> {
+    /// Ask the user to approve `method`, then check again that the app still
+    /// holds `perm`: it may have been revoked while the prompt was open.
+    async fn require_approval(
+        &self,
+        app_pubkey: PublicKey,
+        method: &str,
+        perm: Permission,
+    ) -> Result<()> {
         let request = ApprovalRequest {
             app_pubkey,
             app_name: self.get_app_name(&app_pubkey).await,
@@ -734,7 +747,7 @@ impl SignerHandler {
             http_auth: None,
         };
         if self.request_approval(request).await.approved {
-            Ok(())
+            self.require_permission(&app_pubkey, perm).await
         } else {
             self.audit
                 .lock()
@@ -754,7 +767,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_ENCRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip44_encrypt").await?;
+        self.require_approval(app_pubkey, "nip44_encrypt", Permission::NIP44_ENCRYPT)
+            .await?;
         self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip44::encrypt(&secret, &recipient, plaintext, nip44::Version::V2)
@@ -777,7 +791,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_DECRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip44_decrypt").await?;
+        self.require_approval(app_pubkey, "nip44_decrypt", Permission::NIP44_DECRYPT)
+            .await?;
         self.check_kill_switch()?;
 
         let secret = self.primary_secret_key().await?;
@@ -804,7 +819,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_V3_ENCRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip44v3_encrypt").await?;
+        self.require_approval(app_pubkey, "nip44v3_encrypt", Permission::NIP44_V3_ENCRYPT)
+            .await?;
         self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ss = keep_core::crypto::nip44::shared_secret(
@@ -833,7 +849,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP44_V3_DECRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip44v3_decrypt").await?;
+        self.require_approval(app_pubkey, "nip44v3_decrypt", Permission::NIP44_V3_DECRYPT)
+            .await?;
         self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ss =
@@ -863,7 +880,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_ENCRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip04_encrypt").await?;
+        self.require_approval(app_pubkey, "nip04_encrypt", Permission::NIP04_ENCRYPT)
+            .await?;
         self.check_kill_switch()?;
         let secret = self.primary_secret_key().await?;
         let ciphertext = nip04::encrypt(&secret, &recipient, plaintext)
@@ -886,7 +904,8 @@ impl SignerHandler {
         self.check_rate_limit(&app_pubkey).await?;
         self.require_permission(&app_pubkey, Permission::NIP04_DECRYPT)
             .await?;
-        self.require_approval(app_pubkey, "nip04_decrypt").await?;
+        self.require_approval(app_pubkey, "nip04_decrypt", Permission::NIP04_DECRYPT)
+            .await?;
         self.check_kill_switch()?;
 
         let secret = self.primary_secret_key().await?;
@@ -1126,6 +1145,51 @@ mod tests {
             ApprovalResult::approved_once()
         }
         fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    }
+
+    /// Approves every prompt, but revokes the asking app first, as a user
+    /// revoking it while its prompt was open would.
+    struct RevokesThenApproves(Arc<Mutex<PermissionManager>>);
+    impl crate::types::ServerCallbacks for RevokesThenApproves {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            let permissions = Arc::clone(&self.0);
+            std::thread::spawn(move || permissions.blocking_lock().revoke(&request.app_pubkey))
+                .join()
+                .unwrap();
+            ApprovalResult {
+                approved: true,
+                remember: RememberDuration::Forever,
+            }
+        }
+    }
+
+    // An approval that comes back for an app revoked while its prompt was
+    // open signs nothing, decrypts nothing and grants nothing.
+    #[tokio::test]
+    async fn an_approval_for_an_app_revoked_meanwhile_does_nothing() {
+        let keyring = setup_keyring();
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let audit = Arc::new(Mutex::new(AuditLog::new(100)));
+        let handler = SignerHandler::new(
+            keyring,
+            Arc::clone(&permissions),
+            audit,
+            Some(Arc::new(RevokesThenApproves(Arc::clone(&permissions)))),
+        );
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let app = Keys::generate().public_key();
+        let connect =
+            || handler.register_client(app, "app".into(), Some("sign_event,nip44_encrypt"));
+
+        connect().await.unwrap();
+        let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
+        assert!(handler.handle_sign_event(app, ev).await.is_err());
+        assert!(permissions.lock().await.get_app(&app).is_none());
+
+        connect().await.unwrap();
+        let peer = Keys::generate().public_key();
+        assert!(handler.handle_nip44_encrypt(app, peer, "x").await.is_err());
     }
 
     #[tokio::test]
