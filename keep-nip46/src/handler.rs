@@ -604,11 +604,12 @@ impl SignerHandler {
                 return Err(KeepError::UserRejected);
             }
 
-            // The prompt can stay open for a minute, and the app revoked
-            // meanwhile: an approval given to an app since removed signs
+            // The prompt can stay open for a minute, in which the app may be
+            // revoked or the kill switch thrown. Either way the approval signs
             // nothing and grants nothing.
             self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
                 .await?;
+            self.check_kill_switch()?;
 
             // #575: when the user approves with a remember-duration, persist
             // a per-app, per-kind grant so subsequent requests within the
@@ -729,8 +730,8 @@ impl SignerHandler {
             .map_err(|e| CryptoError::invalid_key(format!("secret key: {e}")))?)
     }
 
-    /// Ask the user to approve `method`, then check again that the app still
-    /// holds `perm`: it may have been revoked while the prompt was open.
+    // Asks the user to approve `method`, then checks again that the app still
+    // holds `perm`: it may have been revoked while the prompt was open.
     async fn require_approval(
         &self,
         app_pubkey: PublicKey,
@@ -1147,16 +1148,21 @@ mod tests {
         fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
     }
 
-    /// Approves every prompt, but revokes the asking app first, as a user
-    /// revoking it while its prompt was open would.
+    /// Approves every prompt to remember forever, but first leaves the asking
+    /// app with only `GET_PUBLIC_KEY`, as a user taking a permission away
+    /// while its prompt was open would.
     struct RevokesThenApproves(Arc<Mutex<PermissionManager>>);
     impl crate::types::ServerCallbacks for RevokesThenApproves {
         fn on_log(&self, _event: crate::types::LogEvent) {}
         fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
             let permissions = Arc::clone(&self.0);
-            std::thread::spawn(move || permissions.blocking_lock().revoke(&request.app_pubkey))
-                .join()
-                .unwrap();
+            std::thread::spawn(move || {
+                permissions
+                    .blocking_lock()
+                    .set_permissions(&request.app_pubkey, Permission::GET_PUBLIC_KEY)
+            })
+            .join()
+            .unwrap();
             ApprovalResult {
                 approved: true,
                 remember: RememberDuration::Forever,
@@ -1184,12 +1190,68 @@ mod tests {
 
         connect().await.unwrap();
         let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
-        assert!(handler.handle_sign_event(app, ev).await.is_err());
-        assert!(permissions.lock().await.get_app(&app).is_none());
+        let err = handler.handle_sign_event(app, ev).await.unwrap_err();
+        assert!(matches!(err, KeepError::PermissionDenied(_)), "{err}");
+        assert!(
+            !permissions
+                .lock()
+                .await
+                .get_app(&app)
+                .unwrap()
+                .auto_approve_kinds
+                .contains(&Kind::TextNote),
+            "the remember-forever was not kept"
+        );
 
+        handler.revoke_client(&app).await;
         connect().await.unwrap();
         let peer = Keys::generate().public_key();
-        assert!(handler.handle_nip44_encrypt(app, peer, "x").await.is_err());
+        let err = handler
+            .handle_nip44_encrypt(app, peer, "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, KeepError::PermissionDenied(_)), "{err}");
+    }
+
+    // A kill switch thrown while a sign prompt was open: the approval, though
+    // it asked to remember, signs nothing and grants nothing.
+    #[tokio::test]
+    async fn an_approval_after_the_kill_switch_was_thrown_does_nothing() {
+        struct ThrowsThenApproves(Arc<AtomicBool>);
+        impl crate::types::ServerCallbacks for ThrowsThenApproves {
+            fn on_log(&self, _event: crate::types::LogEvent) {}
+            fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                ApprovalResult {
+                    approved: true,
+                    remember: RememberDuration::Forever,
+                }
+            }
+        }
+        let kill = Arc::new(AtomicBool::new(false));
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::clone(&permissions),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(Arc::new(ThrowsThenApproves(Arc::clone(&kill)))),
+        )
+        .with_kill_switch(Arc::clone(&kill));
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let app = Keys::generate().public_key();
+        handler
+            .register_client(app, "app".into(), Some("sign_event"))
+            .await
+            .unwrap();
+        let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
+        assert!(handler.handle_sign_event(app, ev).await.is_err());
+        assert!(!permissions
+            .lock()
+            .await
+            .get_app(&app)
+            .unwrap()
+            .auto_approve_kinds
+            .contains(&Kind::TextNote));
     }
 
     #[tokio::test]
