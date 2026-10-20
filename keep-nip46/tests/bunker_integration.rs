@@ -1064,3 +1064,152 @@ async fn test_e2e_keyring_bunker_with_transport_key_signs_valid_events() {
     cb.server_handle.abort();
     cb.client.disconnect().await;
 }
+
+/// A server on `relay_url` serving under `transport`, returning its pubkey,
+/// handler and the task running it.
+async fn serve_on(
+    relay_url: &str,
+    transport: [u8; 32],
+) -> (
+    PublicKey,
+    Arc<keep_nip46::SignerHandler>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (keyring, _) = setup_keyring();
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        Some(transport),
+        &[relay_url.to_string()],
+        None,
+        ServerConfig {
+            expected_secret: Some("replay-secret".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("server creation");
+    let pubkey = server.pubkey();
+    let handler = server.handler();
+    let task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    (pubkey, handler, task)
+}
+
+/// A NIP-46 request from `client_keys` to `server_pubkey`, dated `created_at`.
+fn dated_request(
+    client_keys: &Keys,
+    server_pubkey: &PublicKey,
+    request: &serde_json::Value,
+    created_at: Timestamp,
+) -> Event {
+    let encrypted = nip44::encrypt(
+        client_keys.secret_key(),
+        server_pubkey,
+        request.to_string(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    EventBuilder::new(Kind::NostrConnect, &encrypted)
+        .tag(Tag::public_key(*server_pubkey))
+        .custom_created_at(created_at)
+        .sign_with_keys(client_keys)
+        .unwrap()
+}
+
+// A relay that keeps NIP-46 events replays them to every new subscription, so
+// a bunker that restarts is handed requests from before it started, among them
+// connects carrying a secret that was valid then. One dated before the start
+// is not handled, nor is one dated far ahead, which would otherwise come back
+// on every restart until its date; one from a client whose clock runs a little
+// behind is.
+#[tokio::test]
+async fn test_e2e_requests_dated_outside_the_run_are_not_handled() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = common::start_mock_relay().await;
+    let relay_url = mock_relay.url().await.to_string();
+    let (server_pubkey, handler, task) =
+        serve_on(&relay_url, Keys::generate().secret_key().secret_bytes()).await;
+
+    let client_keys = Keys::generate();
+    let client = Client::new(client_keys.clone());
+    client.add_relay(relay_url).await.unwrap();
+    client.connect().await;
+    client
+        .subscribe(
+            Filter::new()
+                .kind(Kind::NostrConnect)
+                .author(server_pubkey)
+                .pubkey(client_keys.public_key()),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut notifications = client.notifications();
+
+    // Requests are handled in the order they arrive, so a pong after a request
+    // proves that request was processed.
+    let mut ping = async |id: &str, created_at: Timestamp| {
+        let request = serde_json::json!({ "id": id, "method": "ping", "params": [] });
+        client
+            .send_event(&dated_request(
+                &client_keys,
+                &server_pubkey,
+                &request,
+                created_at,
+            ))
+            .await
+            .unwrap();
+        await_nip46_response(
+            &mut notifications,
+            &client_keys,
+            &server_pubkey,
+            id,
+            Duration::from_secs(10),
+        )
+        .await
+    };
+    assert!(
+        ping("before", Timestamp::now()).await.is_some(),
+        "the bunker serves"
+    );
+
+    let replayed = serde_json::json!({
+        "id": "replayed",
+        "method": "connect",
+        "params": [server_pubkey.to_hex(), "replay-secret"],
+    });
+    for created_at in [
+        Timestamp::now() - Duration::from_secs(600),
+        Timestamp::now() + Duration::from_secs(600),
+    ] {
+        client
+            .send_event(&dated_request(
+                &client_keys,
+                &server_pubkey,
+                &replayed,
+                created_at,
+            ))
+            .await
+            .unwrap();
+    }
+    assert!(
+        ping("after", Timestamp::now() - Duration::from_secs(10))
+            .await
+            .is_some(),
+        "a client whose clock runs a little behind is answered"
+    );
+    assert!(
+        handler.list_clients().await.is_empty(),
+        "a connect dated outside the bunker's run does not register the client"
+    );
+
+    task.abort();
+    client.disconnect().await;
+}

@@ -168,6 +168,33 @@ pub struct Server {
     callbacks: Option<Arc<dyn ServerCallbacks>>,
     config: ServerConfig,
     bunker_secret: Option<Zeroizing<String>>,
+    /// When the last `start` began serving, less `REQUEST_CLOCK_SKEW_SECS`.
+    /// Requests created before it are not handled: a relay that keeps NIP-46
+    /// events replays them to every new subscription, and nothing here
+    /// remembers what a previous run handled.
+    serving_since: Timestamp,
+}
+
+/// How far behind the bunker's clock a client's may run before its requests
+/// made just after a start are taken for replays from before it. After a
+/// restart, a request answered within this long before it can be answered
+/// again, to the same client.
+const REQUEST_CLOCK_SKEW_SECS: u64 = 30;
+
+/// How far ahead of the bunker's clock a client's may run. A request dated
+/// later would pass every later start's `since` until that date, and so be
+/// replayed on each restart; one within this is replayed only by a restart
+/// this soon after it.
+const REQUEST_FUTURE_SKEW_SECS: u64 = 120;
+
+/// Whether a request is dated before a bunker that started serving at `since`
+/// began, or too far ahead of `now`.
+fn is_out_of_window(event: &Event, since: Timestamp, now: Timestamp) -> bool {
+    event.created_at < since || is_too_far_ahead(event, now)
+}
+
+fn is_too_far_ahead(event: &Event, now: Timestamp) -> bool {
+    event.created_at > now + std::time::Duration::from_secs(REQUEST_FUTURE_SKEW_SECS)
 }
 
 async fn add_relays(
@@ -320,6 +347,7 @@ impl Server {
             callbacks,
             config,
             bunker_secret,
+            serving_since: Timestamp::now(),
         }
     }
 
@@ -613,9 +641,12 @@ impl Server {
                 .map_err(|e| NetworkError::connection(e.to_string()))?;
         }
 
+        self.serving_since =
+            Timestamp::now() - std::time::Duration::from_secs(REQUEST_CLOCK_SKEW_SECS);
         let filter = Filter::new()
             .kind(Kind::NostrConnect)
-            .pubkey(self.keys.public_key());
+            .pubkey(self.keys.public_key())
+            .since(self.serving_since);
 
         self.client
             .subscribe(filter, None)
@@ -639,6 +670,7 @@ impl Server {
         let client = self.client.clone();
         let callbacks = self.callbacks.clone();
         let max_event_json_size = self.config.max_event_json_size;
+        let since = self.serving_since;
 
         let ended = drive_notifications(self.client.notifications(), |notification| {
             let handler = handler.clone();
@@ -648,7 +680,22 @@ impl Server {
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::NostrConnect {
+                    // `since` is checked here as well as in the filter: the pool
+                    // does not hold a relay to it.
+                    let now = Timestamp::now();
+                    if event.kind == Kind::NostrConnect && is_out_of_window(&event, since, now) {
+                        let app_id = &event.pubkey.to_hex()[..8];
+                        if is_too_far_ahead(&event, now) {
+                            // Most likely a client whose clock is set ahead,
+                            // which otherwise just sees every request hang.
+                            warn!(app_id, "ignoring a NIP-46 request dated too far ahead");
+                        } else {
+                            debug!(
+                                app_id,
+                                "ignoring a NIP-46 request from before this bunker started"
+                            );
+                        }
+                    } else if event.kind == Kind::NostrConnect {
                         if let Err(e) = Self::handle_nip46_event(
                             &handler,
                             &keys,
@@ -979,6 +1026,28 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+
+    // A request created at either edge of the window is handled, and one a
+    // second beyond it is not. Checked here without a relay, since the
+    // filter's `since` would hide a regression in the check from any test that
+    // goes through one.
+    #[test]
+    fn a_request_outside_the_window_is_recognized() {
+        let keys = Keys::generate();
+        let since = Timestamp::from_secs(1_800_000_000);
+        let now = Timestamp::from_secs(1_800_001_000);
+        let at = |secs: u64| {
+            EventBuilder::new(Kind::NostrConnect, "")
+                .custom_created_at(Timestamp::from_secs(secs))
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let skew = REQUEST_FUTURE_SKEW_SECS;
+        assert!(!is_out_of_window(&at(1_800_000_000), since, now));
+        assert!(is_out_of_window(&at(1_799_999_999), since, now));
+        assert!(!is_out_of_window(&at(1_800_001_000 + skew), since, now));
+        assert!(is_out_of_window(&at(1_800_001_001 + skew), since, now));
+    }
     use super::*;
 
     // `pool().add_relay` takes the relay options verbatim, so the proxy has to
