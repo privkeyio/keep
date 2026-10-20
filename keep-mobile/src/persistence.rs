@@ -170,6 +170,76 @@ pub(crate) fn persist_clock_floor(
     )
 }
 
+/// The newest policy this device has accepted. Kept in its own record so that
+/// rolling the policy record back to an older warden-signed bundle, which loads
+/// on its own terms, is still measured against something it cannot carry with
+/// it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PolicyHighWater {
+    pub(crate) created_at: u64,
+    /// Hex of the bundle's `policy_hash`, which tells apart two bundles signed
+    /// in the same second.
+    pub(crate) policy_hash: String,
+}
+
+impl PolicyHighWater {
+    pub(crate) fn of(bundle: &crate::policy::PolicyBundle) -> Self {
+        Self {
+            created_at: bundle.created_at,
+            policy_hash: hex::encode(bundle.policy_hash),
+        }
+    }
+
+    /// Whether `bundle` predates this mark: older, or of the same second with
+    /// other contents.
+    pub(crate) fn supersedes(&self, bundle: &crate::policy::PolicyBundle) -> bool {
+        bundle.created_at < self.created_at
+            || (bundle.created_at == self.created_at
+                && !self
+                    .policy_hash
+                    .eq_ignore_ascii_case(&hex::encode(bundle.policy_hash)))
+    }
+}
+
+pub(crate) enum PolicyHighWaterRead {
+    Found(PolicyHighWater),
+    Absent,
+    Corrupt,
+}
+
+/// Two short fields, so anything this long is not this record.
+const POLICY_HIGH_WATER_RECORD_MAX_LEN: usize = 256;
+
+/// Reads the policy high-water mark. `Err` is a read that did not complete.
+pub(crate) fn load_policy_high_water(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<PolicyHighWaterRead, KeepMobileError> {
+    match storage.load_share_by_key(crate::POLICY_HIGH_WATER_STORAGE_KEY.into()) {
+        Ok(data) if data.len() > POLICY_HIGH_WATER_RECORD_MAX_LEN => {
+            Ok(PolicyHighWaterRead::Corrupt)
+        }
+        Ok(data) => Ok(serde_json::from_slice(&data)
+            .map(PolicyHighWaterRead::Found)
+            .unwrap_or(PolicyHighWaterRead::Corrupt)),
+        Err(KeepMobileError::StorageNotFound) => Ok(PolicyHighWaterRead::Absent),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn persist_policy_high_water(
+    storage: &Arc<dyn SecureStorage>,
+    mark: &PolicyHighWater,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(mark).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize the policy high-water mark: {e}"),
+    })?;
+    storage.store_share_by_key(
+        crate::POLICY_HIGH_WATER_STORAGE_KEY.into(),
+        data,
+        storage_metadata("policy_high_water"),
+    )
+}
+
 pub(crate) fn load_velocity(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<VelocityTracker, KeepMobileError> {

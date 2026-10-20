@@ -353,6 +353,12 @@ const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
 const CLOCK_FLOOR_STORAGE_KEY: &str = "__keep_clock_floor_v1";
+pub(crate) const POLICY_HIGH_WATER_STORAGE_KEY: &str = "__keep_policy_high_water_v1";
+
+/// Serializes the policy high-water mark's read-modify-write across the
+/// process, as `FLOOR_LOCK` does the time floor's. Innermost: taken under the
+/// policy lock, and nothing is taken while it is held.
+static HIGH_WATER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The fault a time-floor error stands for. A corrupt record will not clear, so
 /// it is the fault that is not retried and that says deleting the policy is the
@@ -1995,9 +2001,13 @@ impl KeepMobile {
         // so an attacker who can roll the stored bytes back to an older
         // warden-signed bundle gets no comparison at all: that bundle loads as
         // `Active` on its own terms and this check never runs. It also takes no
-        // FFI call, so authenticating `delete_policy` would not close it.
-        // Closing it needs a high-water mark kept outside the record and
-        // refused below, which is follow-up work.
+        // FFI call, so authenticating `delete_policy` would not close it. The
+        // high-water mark kept outside the record closes it against someone who
+        // can put an older copy of the record back, at load and below. Not
+        // against someone who can also delete the mark or put an older one
+        // back: the older bundle then loads and becomes the mark. That needs
+        // state outside what storage can roll back or delete, such as hardware
+        // rollback resistance.
         if policy.fault().is_some() && policy.rollback_baseline().is_none() {
             return Err(KeepMobileError::InvalidPolicy {
                 msg: "Refusing to replace a policy that cannot be checked against. \
@@ -2010,6 +2020,31 @@ impl KeepMobile {
         let (set, device) = Self::governance_set(&self.storage)?;
         bundle.verify_trusted_warden(&set.wardens)?;
         bundle.verify_version_upgrade(policy.rollback_baseline())?;
+        // Measured against the newest policy accepted here too, which the
+        // stored record cannot vouch for once it has been rolled back. Held
+        // until the mark is raised, so a load by another instance cannot read
+        // between them.
+        let _mark = Self::high_water_lock();
+        // From storage, not memory: another instance may have stored a policy
+        // this one has not loaded, and replacing the mark over it would let an
+        // older bundle in on a transient read fault.
+        let unconfigured = !policy.is_configured()
+            && matches!(
+                persistence::load_policy(&self.storage),
+                Err(KeepMobileError::StorageNotFound)
+            );
+        Self::high_water_admits(&self.storage, &bundle, unconfigured).map_err(|fault| {
+            KeepMobileError::InvalidPolicy {
+                msg: match fault {
+                    PolicyFault::Superseded => {
+                        "Refusing a policy older than one this device already accepted, or the \
+                         record of that one is corrupt. Revoking the policy clears that record."
+                            .into()
+                    }
+                    _ => "The record of the newest policy accepted could not be read".into(),
+                },
+            }
+        })?;
 
         let info = bundle.to_policy_info();
         // The record goes first, for the same reason it does in
@@ -2036,6 +2071,12 @@ impl KeepMobile {
                 restored: set.restored,
             },
         )?;
+        // The mark rises before the record is written. A failed write of the
+        // record then leaves the mark ahead of the policy stored, which
+        // refuses until this import is retried; the other order would leave
+        // the bundle installed with the mark behind it, admitting a rollback
+        // to the one it replaced until the next load.
+        Self::raise_high_water(&self.storage, &bundle, unconfigured)?;
         persistence::persist_policy(&self.storage, &bundle)?;
         policy.set_policy(bundle.clone());
 
@@ -2243,6 +2284,20 @@ impl KeepMobile {
             Err(_) => tracing::warn!(
                 "The time floor could not be reset; call delete_policy again, which needs no \
                  revocation once no policy is stored"
+            ),
+        }
+        // The high-water mark too: with no policy, any bundle is stricter than
+        // what is enforced, so the mark protects nothing, and one pushed ahead
+        // by a bundle dated in the future would refuse every correctly dated
+        // install until real time caught up.
+        let _mark = Self::high_water_lock();
+        match self
+            .storage
+            .delete_share_by_key(POLICY_HIGH_WATER_STORAGE_KEY.into())
+        {
+            Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
+            Err(_) => tracing::warn!(
+                "The policy high-water mark could not be reset; call delete_policy again"
             ),
         }
         Ok(())
@@ -4862,6 +4917,67 @@ impl KeepMobile {
         Ok(observed.clock_at(now_secs))
     }
 
+    /// Whether `bundle`, already attributed, may be held as the policy given
+    /// the newest one this device has accepted. A mark that is corrupt or will
+    /// not read says nothing about age, so it refuses, unless
+    /// `replace_unusable`, which is sound only when no stored policy depends on
+    /// it: a mark that never reads again would otherwise refuse every install
+    /// for good. Callers hold `HIGH_WATER_LOCK`.
+    fn high_water_admits(
+        storage: &Arc<dyn SecureStorage>,
+        bundle: &PolicyBundle,
+        replace_unusable: bool,
+    ) -> Result<(), PolicyFault> {
+        match persistence::load_policy_high_water(storage) {
+            Ok(persistence::PolicyHighWaterRead::Found(mark)) if mark.supersedes(bundle) => {
+                Err(PolicyFault::Superseded)
+            }
+            Ok(persistence::PolicyHighWaterRead::Found(_))
+            | Ok(persistence::PolicyHighWaterRead::Absent) => Ok(()),
+            _ if replace_unusable => Ok(()),
+            Ok(persistence::PolicyHighWaterRead::Corrupt) => Err(PolicyFault::Superseded),
+            Err(_) => Err(PolicyFault::Unreadable),
+        }
+    }
+
+    /// Records `bundle` as the newest policy accepted when it is newer than the
+    /// mark, or the mark is absent, or unusable and `replace_unusable`. Only
+    /// for a bundle `high_water_admits` passed. A mark that cannot be read or
+    /// written is an error, never a silent skip. Callers hold
+    /// `HIGH_WATER_LOCK`.
+    fn raise_high_water(
+        storage: &Arc<dyn SecureStorage>,
+        bundle: &PolicyBundle,
+        replace_unusable: bool,
+    ) -> Result<(), KeepMobileError> {
+        let raise = match persistence::load_policy_high_water(storage) {
+            Ok(persistence::PolicyHighWaterRead::Found(mark)) => {
+                mark.created_at < bundle.created_at
+            }
+            Ok(persistence::PolicyHighWaterRead::Absent) => true,
+            _ if replace_unusable => true,
+            Ok(persistence::PolicyHighWaterRead::Corrupt) => {
+                return Err(KeepMobileError::StorageError {
+                    msg: "The record of the newest policy accepted is corrupt".into(),
+                })
+            }
+            Err(e) => return Err(e),
+        };
+        if raise {
+            persistence::persist_policy_high_water(
+                storage,
+                &persistence::PolicyHighWater::of(bundle),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn high_water_lock() -> std::sync::MutexGuard<'static, ()> {
+        HIGH_WATER_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Loads the stored wardens and policy into `evaluator`, deciding which of
     /// the three states the records put it in.
     ///
@@ -4888,6 +5004,10 @@ impl KeepMobile {
         evaluator: &mut PolicyEvaluator,
         clock: clock_floor::PolicyClock,
     ) {
+        // Held across the policy read and the mark, so an import by another
+        // instance cannot raise the mark between them and fault the policy
+        // just read as superseded by its own replacement.
+        let _mark = Self::high_water_lock();
         match persistence::load_trusted_wardens(storage) {
             Ok(wardens) => evaluator.set_trusted_wardens(wardens),
             Err(KeepMobileError::StorageNotFound) => {
@@ -4955,6 +5075,29 @@ impl KeepMobile {
             return;
         }
 
+        // Before the clock: a record rolled back to an older warden-signed
+        // bundle is authentic and may well be in date, which is exactly what
+        // would let it load with its older rules.
+        if let Err(fault) = Self::high_water_admits(storage, &bundle, false) {
+            tracing::error!(
+                "Stored policy is not admitted by the newest one accepted ({fault}), \
+                 every rule will refuse"
+            );
+            let baseline = (fault == PolicyFault::Superseded).then_some(bundle);
+            evaluator.set_policy_faulted(fault, baseline);
+            return;
+        }
+
+        // The mark rises only to a bundle whose `created_at` is evidence of
+        // age. One dated ahead of the clock is not, and raising the mark to it
+        // would refuse every correctly dated replacement as older.
+        if bundle.timestamp_fault_at(clock) != Some(PolicyFault::NotYetValid) {
+            // The bundle is held either way, so a failed raise does not refuse
+            // it; the next load raises the mark again.
+            if let Err(e) = Self::raise_high_water(storage, &bundle, false) {
+                tracing::warn!(error = %e, "Policy high-water mark not raised");
+            }
+        }
         match bundle.timestamp_fault_at(clock) {
             None => evaluator.set_policy(bundle),
             Some(fault) => {
@@ -8317,6 +8460,307 @@ mod velocity_fault_tests {
             destinations: vec![],
             has_unknown_destination: false,
         }
+    }
+
+    fn plant_bundle(storage: &FaultingStorage, bundle: &crate::policy::PolicyBundle) {
+        storage.plant(
+            POLICY_STORAGE_KEY,
+            serde_json::to_vec(bundle).expect("serialize policy"),
+        );
+    }
+
+    fn status_of(storage: &Arc<FaultingStorage>) -> PolicyStatus {
+        KeepMobile::new(Arc::clone(storage) as Arc<dyn SecureStorage>)
+            .unwrap()
+            .policy_status(None)
+            .unwrap()
+    }
+
+    /// Two policies from one warden, the older first installed and the newer
+    /// imported over it, on a device that now holds the newer.
+    fn older_then_newer() -> (
+        Arc<FaultingStorage>,
+        KeepMobile,
+        k256::schnorr::SigningKey,
+        crate::policy::PolicyBundle,
+        crate::policy::PolicyBundle,
+    ) {
+        let now = Utc::now().timestamp() as u64;
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        let older = create_test_bundle_with(&warden, &PolicyRules::default(), now - 120);
+        plant_bundle(&storage, &older);
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(older.warden_pubkey)]).expect("serialize wardens"),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let newer = create_test_bundle_with(&warden, &capped_rules(), now - 60);
+        mobile.import_policy(hex::encode(newer.to_bytes())).unwrap();
+        (storage, mobile, warden, older, newer)
+    }
+
+    // A record rolled back to an older warden-signed bundle verifies and is in
+    // date, so it would load with its older rules; the mark kept outside it is
+    // what refuses it. The current policy then installs over it again.
+    #[test]
+    fn a_policy_rolled_back_to_an_older_signed_bundle_is_refused() {
+        let (storage, _, _, older, newer) = older_then_newer();
+        plant_bundle(&storage, &older);
+        let reopened = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Superseded
+            }
+        ));
+        assert!(matches!(
+            reopened.evaluate_policy(a_spend(), None).unwrap(),
+            PolicyDecision::Deny { .. }
+        ));
+        reopened
+            .import_policy(hex::encode(newer.to_bytes()))
+            .expect("the current policy installs over the rolled-back record");
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    // A bundle of the same second with other contents is not the one accepted.
+    #[test]
+    fn a_policy_of_the_same_second_with_other_rules_is_refused() {
+        let (storage, _, warden, _, newer) = older_then_newer();
+        let twin = create_test_bundle_with(&warden, &PolicyRules::default(), newer.created_at);
+        assert_ne!(twin.policy_hash, newer.policy_hash);
+        plant_bundle(&storage, &twin);
+        assert!(matches!(
+            status_of(&storage),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Superseded
+            }
+        ));
+    }
+
+    // With the policy revoked nothing is enforced, so any bundle is stricter
+    // than that and the mark protects nothing: it is cleared with the policy,
+    // so one pushed ahead cannot refuse correctly dated installs.
+    #[test]
+    fn revoking_the_policy_clears_the_mark() {
+        let (storage, mobile, warden, older, newer) = older_then_newer();
+        assert!(storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).is_some());
+        mobile
+            .delete_policy(Some(revocation(&mobile, &warden, &newer.digest())))
+            .unwrap();
+        assert!(storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).is_none());
+        mobile
+            .import_policy(hex::encode(older.to_bytes()))
+            .expect("with no policy, an older bundle is still stricter than none");
+    }
+
+    // A mark that will not read cannot say how old the stored policy is, so
+    // the policy refuses, and is read again in case the fault clears.
+    #[test]
+    fn an_unreadable_mark_refuses_the_stored_policy() {
+        let (storage, _, _, _, _) = older_then_newer();
+        storage.fault(POLICY_HIGH_WATER_STORAGE_KEY);
+        let reopened = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Unreadable
+            }
+        ));
+        storage.heal();
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    // A mark that cannot be written refuses the import, rather than installing
+    // the bundle with the mark left behind it.
+    #[test]
+    fn a_mark_that_cannot_be_raised_refuses_the_import() {
+        let (storage, mobile, warden, _, newer) = older_then_newer();
+        storage.fault_write(POLICY_HIGH_WATER_STORAGE_KEY);
+        let newest =
+            create_test_bundle_with(&warden, &capped_rules(), Utc::now().timestamp() as u64);
+        assert!(mobile
+            .import_policy(hex::encode(newest.to_bytes()))
+            .is_err());
+        storage.heal();
+        assert_eq!(
+            storage.raw(POLICY_STORAGE_KEY).unwrap(),
+            serde_json::to_vec(&newer).unwrap(),
+            "the stored policy stays"
+        );
+        let kept: crate::persistence::PolicyHighWater =
+            serde_json::from_slice(&storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).unwrap()).unwrap();
+        assert_eq!(kept, crate::persistence::PolicyHighWater::of(&newer));
+    }
+
+    // The mark rises before the record is written, so a failed write leaves
+    // the older policy stored behind the mark: it refuses, and the import
+    // succeeds when retried.
+    #[test]
+    fn a_policy_that_failed_to_store_refuses_until_imported_again() {
+        let (storage, mobile, warden, _, _) = older_then_newer();
+        storage.fault_write(POLICY_STORAGE_KEY);
+        let newest =
+            create_test_bundle_with(&warden, &capped_rules(), Utc::now().timestamp() as u64);
+        assert!(mobile
+            .import_policy(hex::encode(newest.to_bytes()))
+            .is_err());
+        storage.heal();
+        let reopened = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Superseded
+            }
+        ));
+        reopened
+            .import_policy(hex::encode(newest.to_bytes()))
+            .expect("the retried import installs");
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
+    }
+
+    // A revocation whose mark delete failed leaves the mark ahead of any older
+    // bundle; revoking again with no policy stored clears it.
+    #[test]
+    fn a_mark_left_by_a_failed_revoke_is_cleared_by_revoking_again() {
+        let (storage, mobile, warden, older, newer) = older_then_newer();
+        storage.fault_delete(POLICY_HIGH_WATER_STORAGE_KEY);
+        mobile
+            .delete_policy(Some(revocation(&mobile, &warden, &newer.digest())))
+            .unwrap();
+        let err = mobile
+            .import_policy(hex::encode(older.to_bytes()))
+            .expect_err("the mark left behind still refuses an older bundle");
+        let KeepMobileError::InvalidPolicy { msg } = err else {
+            panic!("expected the mark refusal, got {err:?}");
+        };
+        assert!(msg.contains("Revoking the policy clears"), "{msg}");
+        storage.heal_delete();
+        mobile.delete_policy(None).unwrap();
+        mobile
+            .import_policy(hex::encode(older.to_bytes()))
+            .expect("with the mark cleared, an older bundle installs");
+    }
+
+    // A bundle dated ahead of the clock is no evidence of age, so loading it
+    // does not raise the mark, which would refuse every correctly dated
+    // replacement.
+    #[test]
+    fn a_future_dated_policy_does_not_raise_the_mark() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        let ahead = create_test_bundle_with(
+            &warden,
+            &capped_rules(),
+            Utc::now().timestamp() as u64 + MAX_POLICY_FUTURE_SECS + 3600,
+        );
+        plant_bundle(&storage, &ahead);
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(ahead.warden_pubkey)]).expect("serialize wardens"),
+        );
+        assert!(matches!(
+            status_of(&storage),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::NotYetValid
+            }
+        ));
+        assert!(storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).is_none());
+    }
+
+    // With no policy depending on it, a mark that will not read is replaced by
+    // an import, rather than refusing every install for good.
+    #[test]
+    fn an_unreadable_mark_is_replaced_when_no_policy_depends_on_it() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden))]).expect("serialize wardens"),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        storage.fault(POLICY_HIGH_WATER_STORAGE_KEY);
+        let bundle =
+            create_test_bundle_with(&warden, &capped_rules(), Utc::now().timestamp() as u64);
+        mobile
+            .import_policy(hex::encode(bundle.to_bytes()))
+            .expect("the unreadable mark is replaced");
+        storage.heal();
+        let kept: crate::persistence::PolicyHighWater =
+            serde_json::from_slice(&storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).unwrap()).unwrap();
+        assert_eq!(kept, crate::persistence::PolicyHighWater::of(&bundle));
+    }
+
+    // An instance that has not loaded a policy another one stored does not take
+    // its own empty memory for "nothing depends on the mark": an unreadable
+    // mark still refuses, so an older bundle cannot replace the stored one.
+    #[test]
+    fn an_unreadable_mark_is_not_replaced_over_a_policy_another_instance_stored() {
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden))]).expect("serialize wardens"),
+        );
+        let stale = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        let newer = create_test_bundle_with(&warden, &capped_rules(), now - 60);
+        plant_bundle(&storage, &newer);
+        storage.fault(POLICY_HIGH_WATER_STORAGE_KEY);
+        let older = create_test_bundle_with(&warden, &PolicyRules::default(), now - 120);
+        assert!(stale.import_policy(hex::encode(older.to_bytes())).is_err());
+        assert_eq!(
+            storage.raw(POLICY_STORAGE_KEY).unwrap(),
+            serde_json::to_vec(&newer).unwrap(),
+            "the stored policy stays"
+        );
+    }
+
+    // A policy stored before the mark existed loads as before and sets it.
+    #[test]
+    fn a_policy_stored_before_the_mark_loads_and_sets_it() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        assert!(storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).is_none());
+        assert!(matches!(status_of(&storage), PolicyStatus::Active { .. }));
+        assert!(storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).is_some());
+    }
+
+    // A corrupt mark says nothing about age, so a stored policy refuses on it;
+    // with the policy revoked nothing depends on it and an import replaces it.
+    #[test]
+    fn a_corrupt_mark_refuses_until_no_policy_depends_on_it() {
+        let (storage, _, warden, _, newer) = older_then_newer();
+        storage.plant(POLICY_HIGH_WATER_STORAGE_KEY, b"not json".to_vec());
+        let reopened = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Faulted {
+                fault: PolicyFault::Superseded
+            }
+        ));
+        reopened
+            .delete_policy(Some(revocation(&reopened, &warden, &newer.digest())))
+            .unwrap();
+        let later =
+            create_test_bundle_with(&warden, &capped_rules(), Utc::now().timestamp() as u64);
+        reopened
+            .import_policy(hex::encode(later.to_bytes()))
+            .expect("with no policy depending on it, the mark is replaced");
+        assert!(matches!(
+            reopened.policy_status(None).unwrap(),
+            PolicyStatus::Active { .. }
+        ));
     }
 
     fn capped_rules() -> PolicyRules {

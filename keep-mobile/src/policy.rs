@@ -239,6 +239,14 @@ pub enum PolicyFault {
     /// wait for a fault that never clears. A trusted warden revoking the policy
     /// is the way out: with no policy the floor guards nothing and is replaced.
     ClockUntrusted,
+    /// Attributed, but older than a policy this device has already accepted,
+    /// or the record of that policy is corrupt so its age cannot be judged: the
+    /// stored record was rolled back to an older warden-signed bundle, which
+    /// would otherwise load with its older rules. Not retried. Still a rollback
+    /// baseline, since its signature and signer held, so the current policy can
+    /// be installed over it, unless the record of the newest policy is the one
+    /// that is corrupt: only a revocation clears that.
+    Superseded,
 }
 
 impl PolicyFault {
@@ -253,6 +261,13 @@ impl std::fmt::Display for PolicyFault {
         match self {
             Self::Unreadable => write!(f, "the stored policy could not be read"),
             Self::Unverified => write!(f, "the stored policy did not verify"),
+            Self::Superseded => {
+                write!(
+                    f,
+                    "the stored policy is older than one this device already accepted, \
+                     or the record of that one is corrupt"
+                )
+            }
             Self::NotYetValid => {
                 write!(f, "the stored policy is dated ahead of this device's clock")
             }
@@ -645,8 +660,11 @@ impl PolicyEvaluator {
             // be installed until the record is deleted outright. Dropping the
             // baseline here sends that case to `import_policy`'s own refusal,
             // which says what to do about it.
+            //
+            // A superseded bundle is attributed and dated in the past, so its
+            // `created_at` is a real age, and the current policy is newer.
             PolicyState::Faulted {
-                fault: PolicyFault::Expired,
+                fault: PolicyFault::Expired | PolicyFault::Superseded,
                 attributed,
             } => attributed.as_deref(),
             PolicyState::Faulted { .. } | PolicyState::NotConfigured => None,
