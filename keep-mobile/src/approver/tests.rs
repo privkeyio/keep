@@ -540,7 +540,7 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     let uri = PairingUri {
         gateway: sig::xonly(&channel),
         secret: Zeroizing::new([3u8; 32]),
-        relays: vec!["wss://relay.example".into()],
+        relays: vec!["ws://127.0.0.1:1".into()],
     }
     .to_uri()
     .unwrap();
@@ -1334,4 +1334,230 @@ fn the_first_counter_after_a_load_skips_past_a_rollback() {
     let phone = phone.reopen();
     assert!(phone.handler.freeze(None).is_err());
     assert!(saved(&phone) > last);
+}
+
+// The approver's relay socket enforces pins inside the handshake like every
+// other relay socket here: under strict pinning a relay it cannot pin carries
+// nothing, where the same decision over the same relay goes through when
+// pinning is lenient (`a_decision_is_decided_once_a_relay_takes_it_...`).
+#[test]
+fn under_strict_pinning_a_relay_that_cannot_be_pinned_carries_no_decision() {
+    let phone = paired();
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    let relay = phone.mobile.runtime.block_on(start_mock_relay());
+    let url = phone.mobile.runtime.block_on(relay.url()).to_string();
+    serve(&phone, url);
+    let request = phone.request(17, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let id = request.request_id.to_hex();
+    let digest = phone.handler.decision_digest(id.clone(), true).unwrap();
+    let err = phone
+        .handler
+        .send_decision(id, true, phone.sign(&digest, false))
+        .unwrap_err();
+    assert!(matches!(err, KeepMobileError::NetworkError { .. }), "{err}");
+    assert_eq!(phone.handler.waiting_requests().len(), 1);
+    phone.handler.stop();
+}
+
+// With the proxy on, both the probe that learns a relay's pin and the live
+// socket that carries the pairing and approvals go through it, rather than
+// connecting from this phone's own address. The live socket retries only every
+// ten seconds, so two greetings well inside that are the probe's and its own.
+#[test]
+fn the_approver_reaches_its_relays_through_the_proxy() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (greetings, seen) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut first = [0u8; 1];
+            if std::io::Read::read_exact(&mut stream, &mut first).is_ok()
+                && greetings.send(first[0]).is_err()
+            {
+                return;
+            }
+        }
+    });
+
+    let phone = paired();
+    phone
+        .mobile
+        .save_proxy_config(crate::ProxyConfigInfo {
+            enabled: true,
+            port,
+        })
+        .unwrap();
+    let started = std::time::Instant::now();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+
+    for which in ["the probe", "the live socket"] {
+        let left = Duration::from_secs(6).saturating_sub(started.elapsed());
+        let first = seen
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("{which} did not go through the proxy"));
+        assert_eq!(first, 0x05, "{which} opens with a SOCKS5 greeting");
+    }
+    phone.handler.stop();
+}
+
+// Strict pinning cannot pin a socket the proxy opens, so the approver refuses
+// the pair outright rather than report running and carry nothing.
+#[test]
+fn strict_pinning_with_the_proxy_is_refused() {
+    let phone = paired();
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    phone
+        .mobile
+        .save_proxy_config(crate::ProxyConfigInfo {
+            enabled: true,
+            port: 9050,
+        })
+        .unwrap();
+    let err = phone.handler.clone().start(Arc::new(Nobody)).unwrap_err();
+    assert!(
+        err.to_string().contains("Strict certificate pinning"),
+        "{err}"
+    );
+    assert!(!phone.handler.status().running);
+}
+
+// The pairing's relays were never probed by an approver before, so they have no
+// pin: one started offline still comes up, and connects when the network does.
+// Under strict pinning the same start is refused.
+#[test]
+fn an_approver_started_offline_comes_up_unless_pinning_is_strict() {
+    let phone = paired();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running);
+    phone.handler.stop();
+
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    assert!(phone.handler.clone().start(Arc::new(Nobody)).is_err());
+    assert!(!phone.handler.status().running);
+}
+
+// The gateway's relays are held to the rules every other relay here is, with
+// an error that says so, whether they come from a pairing code or were kept
+// from an earlier run.
+#[test]
+fn relays_another_socket_would_refuse_are_refused() {
+    let phone = paired();
+    let uri = PairingUri {
+        gateway: sig::xonly(&Keys::generate()),
+        secret: Zeroizing::new([3u8; 32]),
+        relays: vec!["wss://user@relay.example".into()],
+    }
+    .to_uri();
+    if let Ok(uri) = uri {
+        let fresh = ApproverHandler::new(Arc::new(
+            KeepMobile::new(Arc::new(Memory::default())).unwrap(),
+        ))
+        .unwrap();
+        let err = fresh
+            .begin_pairing(uri.to_string(), vec![2; 33], "phone".into())
+            .unwrap_err();
+        assert!(
+            matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
+            "{err}"
+        );
+    }
+    phone.stored(|s| s.relays = vec!["wss://user@relay.example".into()]);
+    let err = phone.handler.clone().start(Arc::new(Nobody)).unwrap_err();
+    assert!(
+        matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
+        "{err}"
+    );
+}
+
+// A move to relays the approver cannot use leaves it serving the old ones, so
+// approvals still go and the silence alert still runs, rather than stopping
+// with no word to anyone.
+#[test]
+fn a_failed_move_to_new_relays_keeps_the_old_ones_serving() {
+    let phone = paired();
+    let relay = phone.mobile.runtime.block_on(start_mock_relay());
+    let url = phone.mobile.runtime.block_on(relay.url()).to_string();
+    serve(&phone, url.clone());
+    phone
+        .handler
+        .move_relays(vec!["wss://user@relay.example".into()]);
+    assert!(phone.handler.status().running);
+    assert_eq!(
+        phone.stored(|s| s.relays.clone()),
+        vec![url],
+        "storage keeps the relays still serving"
+    );
+    let request = phone.request(18, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    let id = request.request_id.to_hex();
+    let digest = phone.handler.decision_digest(id.clone(), true).unwrap();
+    phone
+        .handler
+        .send_decision(id, true, phone.sign(&digest, false))
+        .expect("the old relay still carries the decision");
+    phone.handler.stop();
+}
+
+// A move that succeeds is kept, so the next start serves the new relays.
+#[test]
+fn a_move_to_new_relays_is_kept_once_they_serve() {
+    let phone = paired();
+    let first = phone.mobile.runtime.block_on(start_mock_relay());
+    let second = phone.mobile.runtime.block_on(start_mock_relay());
+    let first_url = phone.mobile.runtime.block_on(first.url()).to_string();
+    let second_url = phone.mobile.runtime.block_on(second.url()).to_string();
+    serve(&phone, first_url);
+    phone.handler.move_relays(vec![second_url.clone()]);
+    assert_eq!(phone.stored(|s| s.relays.clone()), vec![second_url.clone()]);
+    let kept = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
+    assert!(
+        String::from_utf8(kept).unwrap().contains(&second_url),
+        "written to storage, so the next start serves them"
+    );
+    phone.handler.stop();
+}
+
+// A `paired` answer naming other relays asks for a move, and the new relays
+// are stored only once the move has them serving: written here, a move that
+// failed would leave storage naming relays nothing serves.
+#[test]
+fn a_paired_answer_moving_relays_stores_them_only_after_the_move() {
+    let phone = paired();
+    let old = phone.stored(|s| {
+        s.paired = false;
+        s.relays.clone()
+    });
+    let (transport, approver) = phone.stored(|s| (sig::xonly(&s.keys().unwrap()), s.approver));
+    let answer = wire::to_text(&Pairing::Paired {
+        v: V1,
+        transport: Hex32(transport),
+        approver,
+        relays: vec!["wss://elsewhere.example".into()],
+        deadline_secs: 60,
+        anchor: anchor(1),
+        frozen: Frozen {
+            epoch: 0,
+            all: false,
+            credentials: vec![],
+            unfrozen: vec![],
+        },
+    });
+    let fx = {
+        let mut inner = phone.handler.lock();
+        phone
+            .handler
+            .handle(&mut inner, kind::PAIRING, &answer, now())
+    };
+    assert_eq!(
+        fx.reconnect,
+        Some(vec!["wss://elsewhere.example".to_string()])
+    );
+    assert!(phone.handler.status().paired);
+    assert_eq!(phone.stored(|s| s.relays.clone()), old);
+    let kept = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
+    assert!(!String::from_utf8(kept)
+        .unwrap()
+        .contains("elsewhere.example"));
 }

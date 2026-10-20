@@ -1717,13 +1717,7 @@ impl KeepMobile {
         // Route through the configured loopback SOCKS proxy when enabled (§7),
         // mirroring the signing path's proxy. Resolved before the probe below,
         // which dials through the same proxy.
-        let stored_proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
-            .unwrap_or_default();
-        let proxy = if stored_proxy.enabled {
-            Some(parse_loopback_proxy("127.0.0.1", stored_proxy.port)?)
-        } else {
-            None
-        };
+        let proxy = self.configured_proxy()?;
 
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
@@ -2628,13 +2622,7 @@ impl KeepMobile {
         // The relay list comes from the device URI, so it is attacker-
         // influenceable: pin it before anything is sent. Resolved here, off the
         // async block, so the probe and the live socket get the same proxy.
-        let stored_proxy = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
-            .unwrap_or_default();
-        let proxy = if stored_proxy.enabled {
-            Some(parse_loopback_proxy("127.0.0.1", stored_proxy.port)?)
-        } else {
-            None
-        };
+        let proxy = self.configured_proxy()?;
         let (device_signer, uri_relays, uri_secret) = keep_nip46::parse_bunker_url(&device_uri)
             .map_err(|e| KeepMobileError::InvalidInput {
                 msg: format!("invalid device URI: {e}"),
@@ -4304,6 +4292,17 @@ impl KeepMobile {
 
         if replaced_prior_node {
             self.pending_requests.lock().await.clear();
+        }
+    }
+
+    /// The loopback SOCKS proxy relay sockets go through, when one is enabled.
+    pub(crate) fn configured_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        let stored = persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+        if stored.enabled {
+            Ok(Some(parse_loopback_proxy("127.0.0.1", stored.port)?))
+        } else {
+            Ok(None)
         }
     }
 

@@ -41,6 +41,10 @@ tracing-android = "0.2"
 [dev-dependencies]
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 nostr-relay-builder = "0.44"
+# The test relays, and the gateway e2e's (which builds the mobile_approver
+# example), are ws:// on loopback, which relay checks and the pinned transport
+# otherwise refuse.
+keep-core = { path = "../keep-core", features = ["allow-ws", "allow-internal"] }
 
 [build-dependencies]
 uniffi = { version = "0.32", features = ["build"] }
