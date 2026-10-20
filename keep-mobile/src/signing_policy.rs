@@ -186,6 +186,8 @@ impl WindowRead {
 /// key legitimately means "no usage recorded yet", so the window starts fresh. A
 /// read that failed means nothing is known, and starting fresh there would reset
 /// the count on every request and make the hourly and daily ceilings unreachable.
+/// Other stores use it the same way, such as the active-share pointer, where an
+/// unreadable value must never be taken for an unset one.
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum StorageRead {
     /// The key holds this value.

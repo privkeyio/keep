@@ -84,6 +84,12 @@ impl SecureStorage for Memory {
     fn get_active_share_key(&self) -> Option<String> {
         None
     }
+    fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+        match self.get_active_share_key() {
+            Some(value) => crate::signing_policy::StorageRead::Found { value },
+            None => crate::signing_policy::StorageRead::Absent,
+        }
+    }
     fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
         Ok(())
     }

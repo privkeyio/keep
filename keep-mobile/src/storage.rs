@@ -99,5 +99,16 @@ pub trait SecureStorage: Send + Sync {
     /// error path too.
     fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError>;
     fn get_active_share_key(&self) -> Option<String>;
+    /// Read the stored active-share pointer as it is: `Found` with the key it
+    /// holds (even one naming a share since deleted), `Absent` when no pointer
+    /// is stored, `Unavailable` when it is present but cannot be read or the
+    /// lookup cannot complete. No fallback, no inference from the shares
+    /// listed, and no side effect: unlike `get_active_share_key`, which may
+    /// resolve and store a fallback, this must not write.
+    ///
+    /// Callers that decide whether to set or clear the pointer rely on the
+    /// difference: taking a failed read for an unset pointer switches the
+    /// active account without the cleanup a switch needs.
+    fn read_active_share_key(&self) -> crate::signing_policy::StorageRead;
     fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError>;
 }

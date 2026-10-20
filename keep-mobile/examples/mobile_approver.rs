@@ -81,6 +81,12 @@ impl SecureStorage for Memory {
     fn get_active_share_key(&self) -> Option<String> {
         None
     }
+    fn read_active_share_key(&self) -> keep_mobile::StorageRead {
+        match self.get_active_share_key() {
+            Some(value) => keep_mobile::StorageRead::Found { value },
+            None => keep_mobile::StorageRead::Absent,
+        }
+    }
     fn set_active_share_key(&self, _: Option<String>) -> Result<(), KeepMobileError> {
         Ok(())
     }
