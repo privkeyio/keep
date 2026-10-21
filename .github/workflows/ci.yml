@@ -23,6 +23,18 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      # The agent bindings are excluded from the workspace and keep their own
+      # lockfiles, which the step above never reads. Dependabot updates only the
+      # root lockfile: when one of these fails, reseed the binding's lockfile
+      # from the root Cargo.lock so the crates they share stay in step.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: keep-agent-py/Cargo.toml
+          arguments: --all-features --locked --config deny.toml
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          manifest-path: keep-agent-ts/Cargo.toml
+          arguments: --all-features --locked --config deny.toml
 
   lint:
     runs-on: ubuntu-latest
@@ -52,10 +64,12 @@ jobs:
       # keep-agent-py and keep-agent-ts are excluded from the workspace (cdylib
       # bindings with their own lockfiles), so --workspace never sees them. Check
       # them explicitly to catch dependency drift that only surfaces on compile.
+      # --locked fails when a change to a shared manifest leaves their lockfiles
+      # behind, so what is linted is what the lockfiles, and the deny job, pin.
       - run: cargo fmt --manifest-path keep-agent-py/Cargo.toml -- --check
-      - run: cargo clippy --manifest-path keep-agent-py/Cargo.toml -- -D warnings
+      - run: cargo clippy --locked --manifest-path keep-agent-py/Cargo.toml -- -D warnings
       - run: cargo fmt --manifest-path keep-agent-ts/Cargo.toml -- --check
-      - run: cargo clippy --manifest-path keep-agent-ts/Cargo.toml -- -D warnings
+      - run: cargo clippy --locked --manifest-path keep-agent-ts/Cargo.toml -- -D warnings
 
   build:
     runs-on: ${{ matrix.os }}
