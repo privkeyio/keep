@@ -185,10 +185,9 @@ impl PyAgentSession {
         secret_key: Option<String>,
     ) -> PyResult<Self> {
         let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(sk) = secret_key {
-            let decoded =
-                Zeroizing::new(hex::decode(&sk).map_err(|e| {
-                    PyValueError::new_err(format!("Invalid secret key hex: {}", e))
-                })?);
+            let decoded = Zeroizing::new(
+                hex::decode(&sk).map_err(|_| PyValueError::new_err("Invalid secret key hex"))?,
+            );
             if decoded.len() != 32 {
                 return Err(PyValueError::new_err(format!(
                     "Secret key must be 32 bytes, got {}",

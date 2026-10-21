@@ -86,8 +86,7 @@ impl KeepAgentSession {
     ) -> Result<Self> {
         let secret_bytes: Option<Zeroizing<[u8; 32]>> = if let Some(ref sk) = secret_key {
             let decoded = Zeroizing::new(
-                hex::decode(sk)
-                    .map_err(|e| Error::from_reason(format!("Invalid secret key hex: {}", e)))?,
+                hex::decode(sk).map_err(|_| Error::from_reason("Invalid secret key hex"))?,
             );
             if decoded.len() != 32 {
                 return Err(Error::from_reason(format!(
