@@ -3,7 +3,8 @@
 use crate::error::{EnclaveError, Result};
 use crate::kms::{EncryptedWallet, EnclaveKms};
 use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine, SigningContext};
-use crate::signer::{EnclaveSigner, PsbtAnalysis};
+use crate::psbt::PsbtAnalysis;
+use crate::signer::EnclaveSigner;
 use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -431,12 +432,7 @@ impl VsockServer {
             }
         };
 
-        let total_spend: u64 = analysis
-            .destinations
-            .iter()
-            .filter(|d| !d.is_change)
-            .map(|d| d.amount_sats)
-            .sum();
+        let total_spend = analysis.leaving_wallet_sats();
 
         let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_secs(),
@@ -455,7 +451,7 @@ impl VsockServer {
         }
 
         match self.signer.sign_psbt(&req.key_id, &req.psbt, network) {
-            Ok((signed_psbt, signed_inputs, _)) => {
+            Ok((signed_psbt, signed_inputs)) => {
                 self.policy_engine.record_operation(&req.key_id);
                 EnclaveResponse::SignedPsbt {
                     psbt: signed_psbt,
@@ -469,9 +465,12 @@ impl VsockServer {
         }
     }
 
-    /// Evaluate the policy engine against each non-change destination. Returns the
-    /// error response to send back if any destination is denied or requires
-    /// approval, or `None` when every destination is allowed.
+    /// Evaluate the policy engine against each non-change destination, or once
+    /// with no destination when nothing but the fee leaves the wallet, so the
+    /// amount, rate and time rules always apply. An output with no address is
+    /// named `script:<hex>`, so an allowlist refuses it unless that name is
+    /// listed. Returns the error response
+    /// to send back if any evaluation is denied or requires approval.
     fn enforce_destination_policies(
         &mut self,
         analysis: &PsbtAnalysis,
@@ -479,11 +478,21 @@ impl VsockServer {
         total_spend: u64,
         timestamp: u64,
     ) -> Option<EnclaveResponse> {
-        for dest in &analysis.destinations {
-            if dest.is_change {
-                continue;
-            }
-            let addr = dest.address.as_deref();
+        let named: Vec<String> = analysis
+            .destinations
+            .iter()
+            .filter(|d| !d.is_change)
+            .map(|d| match &d.address {
+                Some(address) => address.clone(),
+                None => format!("script:{}", d.script_hex),
+            })
+            .collect();
+        let destinations: Vec<Option<&str>> = if named.is_empty() {
+            vec![None]
+        } else {
+            named.iter().map(|s| Some(s.as_str())).collect()
+        };
+        for addr in destinations {
             let ctx = SigningContext {
                 key_id,
                 amount_sats: Some(total_spend),
@@ -615,5 +624,105 @@ impl VsockServer {
                 message: e.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{Policy, PolicyAction, PolicyRule};
+    use crate::psbt::fixtures::*;
+    use bitcoin::psbt::Psbt;
+    use bitcoin::{Address, ScriptBuf};
+
+    fn server(rules: Vec<PolicyRule>) -> VsockServer {
+        let signer = EnclaveSigner::with_ephemeral_secret([42u8; 32]);
+        let kms = signer.create_kms();
+        let mut server = VsockServer {
+            signer,
+            policy_engine: PolicyEngine::new(),
+            kms,
+            used_nonces: std::collections::HashMap::new(),
+            policy_initialized: false,
+        };
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![Policy {
+                name: "limits".into(),
+                rules,
+                action: PolicyAction::Deny,
+            }],
+        });
+        server.signer.import_key("k", &SECRET).unwrap();
+        server
+    }
+
+    fn sign(server: &mut VsockServer, psbt: &Psbt) -> EnclaveResponse {
+        server.handle_sign_psbt(PsbtSigningRequest {
+            key_id: "k".into(),
+            psbt: psbt.serialize(),
+            network: NetworkParam::Bitcoin,
+            nonce: None,
+            timestamp: None,
+        })
+    }
+
+    fn denied(response: &EnclaveResponse) -> bool {
+        matches!(
+            response,
+            EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                ..
+            }
+        )
+    }
+
+    fn address(spk: &ScriptBuf) -> String {
+        Address::from_script(spk, Network::Bitcoin).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_spend_within_policy_is_signed() {
+        let to = p2tr(other_key());
+        let mut server = server(vec![
+            PolicyRule::MaxAmountSats(50_000),
+            PolicyRule::AddressAllowlist(vec![address(&to)]),
+        ]);
+        let psbt = psbt(&[(p2tr(x_only(&SECRET)), 45_000)], &[(to, 44_000)]);
+        match sign(&mut server, &psbt) {
+            EnclaveResponse::SignedPsbt { signed_inputs, .. } => assert_eq!(signed_inputs, 1),
+            other => panic!("expected a signed PSBT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_fee_counts_toward_the_amount_limit() {
+        let mut server = server(vec![PolicyRule::MaxAmountSats(50_000)]);
+        let psbt = psbt(
+            &[(p2tr(x_only(&SECRET)), 100_000)],
+            &[(p2tr(other_key()), 40_000)],
+        );
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn an_output_without_an_address_fails_the_allowlist() {
+        let to = p2tr(other_key());
+        let mut server = server(vec![PolicyRule::AddressAllowlist(vec![address(&to)])]);
+        let psbt = psbt(
+            &[(p2tr(x_only(&SECRET)), 50_000)],
+            &[(to, 40_000), (ScriptBuf::new_op_return([1u8, 2, 3]), 0)],
+        );
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn the_policy_applies_when_only_the_fee_leaves() {
+        let (change, fp, path) = child(&SECRET, Network::Bitcoin, "m/86'/0'/0'/1/0");
+        let mut server = server(vec![PolicyRule::MaxAmountSats(500)]);
+        let mut psbt = psbt(&[(p2tr(x_only(&SECRET)), 100_000)], &[(p2tr(change), 99_000)]);
+        psbt.outputs[0]
+            .tap_key_origins
+            .insert(change, (vec![], (fp, path)));
+        assert!(denied(&sign(&mut server, &psbt)));
     }
 }
