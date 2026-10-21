@@ -11,7 +11,7 @@ use std::collections::HashSet;
 const BLOCKS_PER_DAY: u32 = 144;
 const BLOCKS_PER_MONTH: u32 = BLOCKS_PER_DAY * 30;
 const MAX_KEYS_PER_TIER: usize = 20;
-const MAX_RECOVERY_TIERS: usize = 10;
+pub(crate) const MAX_RECOVERY_TIERS: usize = 10;
 /// Maximum block-based relative timelock (`older(n)`) for a recovery tier. BIP-68
 /// encodes a block-height relative timelock in the low 16 bits of `nSequence`, so
 /// 0xFFFF (65535 blocks ≈ 455 days ≈ ~15 months at 10 min/block) is the protocol
