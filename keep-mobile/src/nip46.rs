@@ -573,6 +573,26 @@ impl BunkerHandler {
         true
     }
 
+    /// Run a published server. RUNNING is stored before its task is spawned,
+    /// so it is what a caller reads once `start_bunker` returns, and the task
+    /// can only replace it with the state the server ends in.
+    fn serve(
+        &self,
+        server: Server,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        invalidated: tokio::sync::watch::Receiver<u64>,
+        serving: Arc<AtomicBool>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.set_status(STATUS_RUNNING);
+        self.mobile.runtime.spawn(run_server(
+            server,
+            shutdown_rx,
+            invalidated,
+            Arc::clone(&self.status),
+            serving,
+        ))
+    }
+
     fn live_handler(&self) -> Option<Arc<SignerHandler>> {
         self.mobile
             .live_bunker
@@ -1052,11 +1072,7 @@ impl BunkerHandler {
                 });
             }
 
-            let status = Arc::clone(&self.status);
-            tokio::spawn(async move {
-                status.store(STATUS_RUNNING, Ordering::Release);
-                run_server(server, shutdown_rx, invalidated, status, serving).await;
-            });
+            self.serve(server, shutdown_rx, invalidated, serving);
 
             Ok::<(), KeepMobileError>(())
         });
@@ -1984,16 +2000,55 @@ mod tests {
         let bunker = server.pubkey();
         let (tx, rx) = tokio::sync::oneshot::channel();
         assert!(starter.publish_server(String::new(), &server.handler(), Arc::clone(&serving), tx));
-        starter.set_status(STATUS_RUNNING);
-        let running = mobile.runtime.spawn(run_server(
-            server,
-            rx,
-            invalidated,
-            Arc::clone(&starter.status),
-            Arc::clone(&serving),
-        ));
+        let running = starter.serve(server, rx, invalidated, Arc::clone(&serving));
         std::thread::sleep(Duration::from_millis(500));
         (bunker, serving, running)
+    }
+
+    // A start reads RUNNING as soon as it returns, not once its task is
+    // scheduled, and a stop after that still ends at STOPPED.
+    #[test]
+    fn a_served_bunker_reads_running_before_its_task_runs() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(storage).unwrap());
+        let relay = mobile
+            .runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let url = mobile.runtime.block_on(relay.url()).to_string();
+        let mut keyring = keep_core::keyring::Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let server = mobile
+            .runtime
+            .block_on(Server::new_with_config(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                None,
+                None,
+                &[url],
+                None,
+                ServerConfig::default(),
+            ))
+            .unwrap();
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        handler.set_status(STATUS_STARTING);
+        let serving = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(handler.publish_server(String::new(), &server.handler(), Arc::clone(&serving), tx));
+        let running = handler.serve(server, rx, mobile.live_generation.subscribe(), serving);
+        assert_eq!(handler.load_status(), STATUS_RUNNING);
+
+        handler.stop_bunker();
+        mobile.runtime.block_on(running).unwrap();
+        assert_eq!(handler.load_status(), STATUS_STOPPED);
     }
 
     // A revoke takes the client out of the app's list however it was written
