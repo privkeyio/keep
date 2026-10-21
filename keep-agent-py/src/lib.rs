@@ -694,7 +694,7 @@ impl PyPendingSession {
     }
 }
 
-#[pymodule]
+#[pymodule(gil_used = true)]
 fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionScope>()?;
     m.add_class::<PyRateLimit>()?;
