@@ -874,36 +874,52 @@ mod tests {
 
     #[test]
     fn test_frost_wallet_descriptor_round_trips_for_every_tier_count() {
-        use crate::recovery::{RecoveryTier, SpendingTier};
+        use crate::recovery::{RecoveryTier, SpendingTier, MAX_RECOVERY_TIERS};
         let group_pk = test_group_pubkey();
         let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
-        for count in 1..=10u8 {
-            let config = RecoveryConfig {
-                primary: SpendingTier {
-                    keys: vec![test_keypair(1)],
-                    threshold: 1,
-                },
-                recovery_tiers: (0..count)
-                    .map(|i| RecoveryTier {
-                        keys: vec![test_keypair(i + 2)],
-                        threshold: 1,
-                        timelock_months: u32::from(i) + 1,
-                    })
-                    .collect(),
-                network: Network::Testnet,
-            };
-            let export =
-                DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Testnet)
-                    .unwrap();
-            let (reparsed, _) = canonicalize_descriptor(&export.descriptor)
-                .unwrap_or_else(|e| panic!("{count} tiers: {e}"));
-            assert_eq!(reparsed, export.descriptor, "{count} tiers");
-            let built = config.build_with_internal_key(&xonly).unwrap().descriptor;
-            assert_eq!(
-                export.descriptor.split('#').next().unwrap(),
-                built,
-                "{count} tiers"
-            );
+        let primaries = [
+            SpendingTier {
+                keys: vec![test_keypair(1)],
+                threshold: 1,
+            },
+            SpendingTier {
+                keys: vec![test_keypair(12), test_keypair(13)],
+                threshold: 2,
+            },
+        ];
+        for primary in primaries {
+            let multisig = primary.keys.len() > 1;
+            for count in 1..=MAX_RECOVERY_TIERS as u8 {
+                let label = format!("{count} tiers, multisig primary {multisig}");
+                let config = RecoveryConfig {
+                    primary: primary.clone(),
+                    recovery_tiers: (0..count)
+                        .map(|i| RecoveryTier {
+                            keys: vec![test_keypair(i + 2)],
+                            threshold: 1,
+                            timelock_months: u32::from(i) + 1,
+                        })
+                        .collect(),
+                    network: Network::Testnet,
+                };
+                let export =
+                    DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Testnet)
+                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+                let (reparsed, _) = canonicalize_descriptor(&export.descriptor)
+                    .unwrap_or_else(|e| panic!("{label}: {e}"));
+                assert_eq!(reparsed, export.descriptor, "{label}");
+                let built = config.build_with_internal_key(&xonly).unwrap();
+                assert_eq!(
+                    export.descriptor.split('#').next().unwrap(),
+                    built.descriptor,
+                    "{label}"
+                );
+                assert_eq!(
+                    descriptor_script_pubkey(&export.descriptor).unwrap(),
+                    built.address.script_pubkey(),
+                    "{label}"
+                );
+            }
         }
     }
 }
