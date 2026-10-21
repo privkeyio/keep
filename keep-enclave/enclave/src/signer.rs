@@ -6,34 +6,16 @@
 use crate::audit::SigningAuditLog;
 use crate::error::{EnclaveError, Result};
 use crate::mlock::{MlockedBox, MlockedVec};
+use crate::psbt::{PsbtAnalysis, PsbtKeys};
 use bitcoin::psbt::Psbt;
-use bitcoin::secp256k1::{Keypair, Message, Secp256k1};
-use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
-use bitcoin::taproot::Signature as TaprootSignature;
-use bitcoin::{Address, Network, TxOut, XOnlyPublicKey};
+use bitcoin::Network;
 use frost_secp256k1_tr as frost;
 use k256::schnorr::SigningKey;
 use rand_core::OsRng;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::Signer;
 use std::collections::{BTreeMap, HashMap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PsbtAnalysis {
-    pub total_input_sats: u64,
-    pub total_output_sats: u64,
-    pub fee_sats: u64,
-    pub destinations: Vec<PsbtDestination>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PsbtDestination {
-    pub address: Option<String>,
-    pub amount_sats: u64,
-    pub is_change: bool,
-}
 
 #[derive(ZeroizeOnDrop)]
 pub struct EnclaveSigner {
@@ -209,140 +191,18 @@ impl EnclaveSigner {
             .keys
             .get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
-
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &*entry.secret)
-            .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
-        let (x_only_pubkey, _) = keypair.x_only_public_key();
-
         let mut psbt = Psbt::deserialize(psbt_bytes)
             .map_err(|e| EnclaveError::Signing(format!("Invalid PSBT: {}", e)))?;
-
-        let analysis = self.analyze_psbt(&psbt, &x_only_pubkey, network)?;
-
-        let prevouts: Vec<TxOut> = psbt
-            .inputs
-            .iter()
-            .enumerate()
-            .map(|(idx, input)| {
-                input
-                    .witness_utxo
-                    .clone()
-                    .ok_or_else(|| {
-                        EnclaveError::Signing(format!("Missing witness UTXO for input {}", idx))
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let prevouts_ref = Prevouts::All(&prevouts);
-        let mut signed_count = 0;
-
-        for i in 0..psbt.inputs.len() {
-            if !self.should_sign_input(&psbt, i, &x_only_pubkey, &secp, network)? {
-                continue;
-            }
-
-            let mut sighash_cache = SighashCache::new(&psbt.unsigned_tx);
-            let sighash = sighash_cache
-                .taproot_key_spend_signature_hash(i, &prevouts_ref, TapSighashType::Default)
-                .map_err(|e| EnclaveError::Signing(format!("Sighash failed: {}", e)))?;
-
-            let msg = Message::from_digest_slice(sighash.as_ref())
-                .map_err(|e| EnclaveError::Signing(format!("Message failed: {}", e)))?;
-
-            // Nitro Enclaves have /dev/urandom, but other enclave environments
-            // (e.g., SGX, SEV) may not provide reliable auxiliary randomness.
-            // Using deterministic signing avoids side-channel variance across
-            // heterogeneous enclave deployments at the cost of slightly weaker
-            // protection against differential power analysis.
-            let sig = secp.sign_schnorr_no_aux_rand(&msg, &keypair);
-
-            psbt.inputs[i].tap_key_sig = Some(TaprootSignature {
-                signature: sig,
-                sighash_type: TapSighashType::Default,
-            });
-            signed_count += 1;
-        }
-
+        let (analysis, signed_count) = {
+            let keys = PsbtKeys::new(&entry.secret, network)?;
+            let analysis = keys.analyze(&psbt)?;
+            (analysis, keys.sign(&mut psbt)?)
+        };
         let signed_bytes = psbt.serialize();
 
         self.audit_log.log_psbt_sign(key_id, psbt_bytes, signed_count);
 
         Ok((signed_bytes, signed_count, analysis))
-    }
-
-    fn analyze_psbt(
-        &self,
-        psbt: &Psbt,
-        our_pubkey: &XOnlyPublicKey,
-        network: Network,
-    ) -> Result<PsbtAnalysis> {
-        let secp = Secp256k1::new();
-        let mut total_input_sats = 0u64;
-
-        for input in &psbt.inputs {
-            if let Some(utxo) = &input.witness_utxo {
-                total_input_sats += utxo.value.to_sat();
-            }
-        }
-
-        let mut destinations = Vec::new();
-        let mut total_output_sats = 0u64;
-
-        for (i, output) in psbt.unsigned_tx.output.iter().enumerate() {
-            total_output_sats += output.value.to_sat();
-
-            let address = Address::from_script(&output.script_pubkey, network)
-                .ok()
-                .map(|a| a.to_string());
-
-            let is_change = self.is_change_output(psbt, i, our_pubkey, &secp, network);
-
-            destinations.push(PsbtDestination {
-                address,
-                amount_sats: output.value.to_sat(),
-                is_change,
-            });
-        }
-
-        Ok(PsbtAnalysis {
-            total_input_sats,
-            total_output_sats,
-            fee_sats: total_input_sats.saturating_sub(total_output_sats),
-            destinations,
-        })
-    }
-
-    fn should_sign_input(
-        &self,
-        psbt: &Psbt,
-        index: usize,
-        our_pubkey: &XOnlyPublicKey,
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        network: Network,
-    ) -> Result<bool> {
-        let input = &psbt.inputs[index];
-
-        if let Some(tap_internal_key) = &input.tap_internal_key {
-            if tap_internal_key == our_pubkey {
-                return Ok(true);
-            }
-        }
-
-        for (pubkey, _) in &input.tap_key_origins {
-            if pubkey == our_pubkey {
-                return Ok(true);
-            }
-        }
-
-        if let Some(utxo) = &input.witness_utxo {
-            let our_address = Address::p2tr(secp, *our_pubkey, None, network);
-            if utxo.script_pubkey == our_address.script_pubkey() {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
     }
 
     pub fn analyze_psbt_for_key(
@@ -355,47 +215,9 @@ impl EnclaveSigner {
             .keys
             .get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
-
-        let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &*entry.secret)
-            .map_err(|e| EnclaveError::Signing(format!("Invalid key: {}", e)))?;
-        let (x_only_pubkey, _) = keypair.x_only_public_key();
-
         let psbt = Psbt::deserialize(psbt_bytes)
             .map_err(|e| EnclaveError::Signing(format!("Invalid PSBT: {}", e)))?;
-
-        self.analyze_psbt(&psbt, &x_only_pubkey, network)
-    }
-
-    fn is_change_output(
-        &self,
-        psbt: &Psbt,
-        index: usize,
-        our_pubkey: &XOnlyPublicKey,
-        secp: &Secp256k1<bitcoin::secp256k1::All>,
-        network: Network,
-    ) -> bool {
-        if let Some(output) = psbt.outputs.get(index) {
-            for (pubkey, _) in &output.tap_key_origins {
-                if pubkey == our_pubkey {
-                    return true;
-                }
-            }
-            if let Some(internal_key) = &output.tap_internal_key {
-                if internal_key == our_pubkey {
-                    return true;
-                }
-            }
-        }
-
-        if let Some(tx_output) = psbt.unsigned_tx.output.get(index) {
-            let our_address = Address::p2tr(secp, *our_pubkey, None, network);
-            if tx_output.script_pubkey == our_address.script_pubkey() {
-                return true;
-            }
-        }
-
-        false
+        PsbtKeys::new(&entry.secret, network)?.analyze(&psbt)
     }
 
     pub fn import_frost_key(

@@ -18,6 +18,7 @@ mod kms;
 mod kmstool;
 mod mlock;
 mod policy;
+mod psbt;
 mod rate_limit;
 mod signer;
 mod vsock_server;
