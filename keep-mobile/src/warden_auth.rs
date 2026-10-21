@@ -89,7 +89,8 @@ pub struct WardenGovernance {
 
 /// The subject a revocation names when the stored policy cannot be attributed
 /// to a trusted warden: it will not decrypt, will not parse, or fails its
-/// signature, hash or signer check, so no warden knows its digest. Only
+/// signature, hash or signer check, so no warden knows its digest; or it is
+/// missing while the device still records accepting one. Only
 /// accepted while the record is in that state, and like every authorization it
 /// names this device and its current epoch.
 pub(crate) fn unreadable_policy_subject() -> [u8; 32] {

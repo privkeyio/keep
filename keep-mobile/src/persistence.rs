@@ -210,6 +210,29 @@ pub(crate) enum PolicyHighWaterRead {
 /// Two short fields, so anything this long is not this record.
 const POLICY_HIGH_WATER_RECORD_MAX_LEN: usize = 256;
 
+/// [`load_policy`] for a caller deciding whether a policy is held. A missing
+/// record is `StorageNotFound` only while the high-water mark is absent too.
+/// A mark that is present or corrupt says a policy was accepted here and its
+/// record removed some way other than a revocation, which removes both, so
+/// that is `InvalidPolicy`: a policy is held and names no signer. A mark that
+/// will not read is that read's error.
+pub(crate) fn load_policy_unless_missing(
+    storage: &Arc<dyn SecureStorage>,
+) -> Result<PolicyBundle, KeepMobileError> {
+    match load_policy(storage) {
+        Err(KeepMobileError::StorageNotFound) => match load_policy_high_water(storage)? {
+            PolicyHighWaterRead::Absent => Err(KeepMobileError::StorageNotFound),
+            PolicyHighWaterRead::Found(_) | PolicyHighWaterRead::Corrupt => {
+                Err(KeepMobileError::InvalidPolicy {
+                    msg: "The policy record is missing, though this device has accepted a policy"
+                        .into(),
+                })
+            }
+        },
+        other => other,
+    }
+}
+
 /// Reads the policy high-water mark. `Err` is a read that did not complete.
 pub(crate) fn load_policy_high_water(
     storage: &Arc<dyn SecureStorage>,

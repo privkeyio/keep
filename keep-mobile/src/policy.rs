@@ -247,6 +247,13 @@ pub enum PolicyFault {
     /// be installed over it, unless the record of the newest policy is the one
     /// that is corrupt: only a revocation clears that.
     Superseded,
+    /// No policy record is stored, though this device holds the record of a
+    /// policy it accepted: the policy record was removed some way other than
+    /// a revocation, which removes both. Refusing is what keeps deleting the
+    /// record from lifting the policy. Not retried. A bundle the record of the
+    /// newest policy admits can be installed over it; otherwise a trusted
+    /// warden revoking the policy is the way out.
+    Missing,
 }
 
 impl PolicyFault {
@@ -261,6 +268,10 @@ impl std::fmt::Display for PolicyFault {
         match self {
             Self::Unreadable => write!(f, "the stored policy could not be read"),
             Self::Unverified => write!(f, "the stored policy did not verify"),
+            Self::Missing => write!(
+                f,
+                "the stored policy is missing, though this device has accepted one"
+            ),
             Self::Superseded => {
                 write!(
                     f,
