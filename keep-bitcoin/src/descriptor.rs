@@ -871,4 +871,39 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1], export.checksum);
     }
+
+    #[test]
+    fn test_frost_wallet_descriptor_round_trips_for_every_tier_count() {
+        use crate::recovery::{RecoveryTier, SpendingTier};
+        let group_pk = test_group_pubkey();
+        let xonly = XOnlyPublicKey::from_slice(&group_pk).unwrap();
+        for count in 1..=10u8 {
+            let config = RecoveryConfig {
+                primary: SpendingTier {
+                    keys: vec![test_keypair(1)],
+                    threshold: 1,
+                },
+                recovery_tiers: (0..count)
+                    .map(|i| RecoveryTier {
+                        keys: vec![test_keypair(i + 2)],
+                        threshold: 1,
+                        timelock_months: u32::from(i) + 1,
+                    })
+                    .collect(),
+                network: Network::Testnet,
+            };
+            let export =
+                DescriptorExport::from_frost_wallet(&group_pk, Some(&config), Network::Testnet)
+                    .unwrap();
+            let (reparsed, _) = canonicalize_descriptor(&export.descriptor)
+                .unwrap_or_else(|e| panic!("{count} tiers: {e}"));
+            assert_eq!(reparsed, export.descriptor, "{count} tiers");
+            let built = config.build_with_internal_key(&xonly).unwrap().descriptor;
+            assert_eq!(
+                export.descriptor.split('#').next().unwrap(),
+                built,
+                "{count} tiers"
+            );
+        }
+    }
 }
