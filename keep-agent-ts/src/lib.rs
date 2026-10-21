@@ -76,7 +76,7 @@ pub struct KeepAgentSession {
 
 #[napi]
 impl KeepAgentSession {
-    #[napi(constructor)]
+    #[napi(constructor, strict)]
     pub fn new(
         scope_config: Option<SessionScopeConfig>,
         rate_limit: Option<RateLimitOptions>,
@@ -225,7 +225,7 @@ impl KeepAgentSession {
         })
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn check_operation(&self, operation: String) -> Result<bool> {
         let token = self.token.lock().await;
         let session = self
@@ -246,7 +246,7 @@ impl KeepAgentSession {
         Ok(session.check_operation(&op).is_ok())
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn check_event_kind(&self, kind: u32) -> Result<bool> {
         if kind > u16::MAX as u32 {
             return Err(Error::from_reason(format!(
@@ -264,7 +264,7 @@ impl KeepAgentSession {
         Ok(session.check_event_kind(kind as u16).is_ok())
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn check_amount(&self, sats: i64) -> Result<bool> {
         if sats < 0 {
             return Err(Error::from_reason("sats must be non-negative".to_string()));
@@ -278,7 +278,7 @@ impl KeepAgentSession {
         Ok(session.check_amount(sats as u64).is_ok())
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn check_address(&self, address: String) -> Result<bool> {
         let token = self.token.lock().await;
         let session = self
@@ -303,7 +303,7 @@ impl KeepAgentSession {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn sign_event(
         &self,
         kind: u32,
@@ -380,7 +380,7 @@ impl KeepAgentSession {
         })
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn sign_psbt(&self, psbt_base64: String, network: Option<String>) -> Result<String> {
         let token = self.token.lock().await;
         let session = self
@@ -445,7 +445,7 @@ impl KeepAgentSession {
         Ok(keep_core::keys::bytes_to_npub(pubkey))
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn get_bitcoin_address(&self, network: Option<String>) -> Result<String> {
         let token = self.token.lock().await;
         let session = self
@@ -484,7 +484,7 @@ pub struct RemoteSession {
 
 #[napi]
 impl RemoteSession {
-    #[napi(factory)]
+    #[napi(factory, strict)]
     pub async fn connect(
         bunker_url: String,
         timeout_seconds: Option<u32>,
@@ -503,7 +503,7 @@ impl RemoteSession {
         })
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn sign_event(&self, event_json: String) -> Result<String> {
         let client = self.client.lock().await;
         client
@@ -521,7 +521,7 @@ impl RemoteSession {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn nip44_encrypt(&self, pubkey: String, plaintext: String) -> Result<String> {
         let client = self.client.lock().await;
         client
@@ -530,7 +530,7 @@ impl RemoteSession {
             .map_err(|e| Error::from_reason(e.to_string()))
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn nip44_decrypt(&self, pubkey: String, ciphertext: String) -> Result<String> {
         let client = self.client.lock().await;
         client
@@ -574,7 +574,7 @@ pub struct PendingSession {
 
 #[napi]
 impl PendingSession {
-    #[napi(factory)]
+    #[napi(factory, strict)]
     pub async fn create(
         bunker_url: String,
         timeout_seconds: Option<u32>,
@@ -608,7 +608,7 @@ impl PendingSession {
         self.approval_url.clone()
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn poll(&self, timeout_seconds: Option<u32>) -> Result<String> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(5) as u64);
         let inner = self.inner.lock().await;
@@ -625,7 +625,7 @@ impl PendingSession {
         })
     }
 
-    #[napi]
+    #[napi(strict)]
     pub async fn wait_for_approval(&self, timeout_seconds: Option<u32>) -> Result<RemoteSession> {
         let timeout = std::time::Duration::from_secs(timeout_seconds.unwrap_or(300) as u64);
         let inner = self.inner.lock().await;
