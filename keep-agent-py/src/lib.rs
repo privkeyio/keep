@@ -36,7 +36,7 @@ fn create_runtime() -> PyResult<tokio::runtime::Runtime> {
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PySessionScope {
     inner: SessionScope,
@@ -113,7 +113,7 @@ impl PySessionScope {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct PyRateLimit {
     inner: RateLimitConfig,
@@ -694,7 +694,7 @@ impl PyPendingSession {
     }
 }
 
-#[pymodule]
+#[pymodule(gil_used = true)]
 fn _bindings(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySessionScope>()?;
     m.add_class::<PyRateLimit>()?;
