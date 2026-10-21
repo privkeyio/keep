@@ -186,23 +186,19 @@ impl EnclaveSigner {
         key_id: &str,
         psbt_bytes: &[u8],
         network: Network,
-    ) -> Result<(Vec<u8>, usize, PsbtAnalysis)> {
+    ) -> Result<(Vec<u8>, usize)> {
         let entry = self
             .keys
             .get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
         let mut psbt = Psbt::deserialize(psbt_bytes)
             .map_err(|e| EnclaveError::Signing(format!("Invalid PSBT: {}", e)))?;
-        let (analysis, signed_count) = {
-            let keys = PsbtKeys::new(&entry.secret, network)?;
-            let analysis = keys.analyze(&psbt)?;
-            (analysis, keys.sign(&mut psbt)?)
-        };
+        let signed_count = PsbtKeys::new(&entry.secret, network)?.sign(&mut psbt)?;
         let signed_bytes = psbt.serialize();
 
         self.audit_log.log_psbt_sign(key_id, psbt_bytes, signed_count);
 
-        Ok((signed_bytes, signed_count, analysis))
+        Ok((signed_bytes, signed_count))
     }
 
     pub fn analyze_psbt_for_key(

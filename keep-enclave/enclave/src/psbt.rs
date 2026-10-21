@@ -12,6 +12,11 @@
 //! vault holds its wallet's funds. PSBT key origins only name which child to try:
 //! a key signs an input, or counts an output as change, only when the key,
 //! tweaked, is the output key in that scriptPubKey.
+//!
+//! Unlike keep-bitcoin, the single-key output counts as change on mainnet: the
+//! enclave exports no descriptors, and a key generated here has no other
+//! address. Funds paid there stay spendable by this key, though for a key
+//! imported from a keep vault the vault's watch-only wallet does not show them.
 
 use crate::error::{EnclaveError, Result};
 use bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint, KeySource, Xpriv};
@@ -208,9 +213,8 @@ impl<'a> PsbtKeys<'a> {
         };
         let mut keypair = self.derive_keypair(path)?;
         let derived_key = keypair.x_only_public_key().0;
-        let tweaked = keypair.tap_tweak(&self.secp, None);
+        let mut tweaked = keypair.tap_tweak(&self.secp, None).to_keypair();
         keypair.non_secure_erase();
-        let mut tweaked = tweaked.to_keypair();
         if derived_key != expected || tweaked.x_only_public_key().0 != output_key {
             tweaked.non_secure_erase();
             return Ok(None);
@@ -266,7 +270,7 @@ impl<'a> PsbtKeys<'a> {
         else {
             return false;
         };
-        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, false, |p| {
+        match self.key_path_signer(&txout.script_pubkey, &output.tap_key_origins, true, |p| {
             self.is_change_path(p)
         }) {
             Ok(Some(mut keypair)) => {
@@ -524,6 +528,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use bitcoin::hashes::Hash;
     use bitcoin::psbt::PsbtSighashType;
 
     /// Check input `index`'s key-path signature the way consensus does: against
@@ -570,12 +575,98 @@ mod tests {
     }
 
     #[test]
+    fn the_single_key_output_is_change_on_mainnet() {
+        let me = x_only(&SECRET);
+        let psbt = psbt(
+            &[(p2tr(me), 100_000)],
+            &[(p2tr(other_key()), 30_000), (p2tr(me), 60_000)],
+        );
+        let analysis = PsbtKeys::new(&SECRET, Network::Bitcoin)
+            .unwrap()
+            .analyze(&psbt)
+            .unwrap();
+        assert!(!analysis.destinations[0].is_change);
+        assert!(analysis.destinations[1].is_change);
+        assert_eq!(analysis.leaving_wallet_sats(), 40_000);
+    }
+
+    #[test]
+    fn a_mainnet_child_is_not_signed_under_a_test_network() {
+        let (child, fp, path) = child(&SECRET, Network::Bitcoin, "m/86'/0'/0'/0/0");
+        let mut psbt = psbt(&[(p2tr(child), 50_000)], &[(p2tr(other_key()), 40_000)]);
+        name(&mut psbt.inputs[0].tap_key_origins, child, fp, path);
+        let keys = PsbtKeys::new(&SECRET, Network::Testnet).unwrap();
+        assert_eq!(keys.sign(&mut psbt).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_input_with_a_script_tree_is_not_signed() {
+        let me = x_only(&SECRET);
+        let mut psbt = psbt(&[(p2tr(me), 50_000)], &[(p2tr(other_key()), 40_000)]);
+        psbt.inputs[0].tap_merkle_root =
+            Some(bitcoin::taproot::TapNodeHash::from_byte_array([3u8; 32]));
+        let keys = PsbtKeys::new(&SECRET, Network::Bitcoin).unwrap();
+        assert_eq!(keys.sign(&mut psbt).unwrap(), 0);
+    }
+
+    #[test]
+    fn change_is_account_zero_below_index_1000() {
+        let other_account = child(&SECRET, Network::Testnet, "m/86'/1'/1'/1/0");
+        let too_far = child(&SECRET, Network::Testnet, "m/86'/1'/0'/1/1000");
+        let mut psbt = psbt(
+            &[(p2tr(other_account.0), 100_000)],
+            &[(p2tr(other_account.0), 40_000), (p2tr(too_far.0), 50_000)],
+        );
+        name(
+            &mut psbt.inputs[0].tap_key_origins,
+            other_account.0,
+            other_account.1,
+            other_account.2.clone(),
+        );
+        name(
+            &mut psbt.outputs[0].tap_key_origins,
+            other_account.0,
+            other_account.1,
+            other_account.2,
+        );
+        name(
+            &mut psbt.outputs[1].tap_key_origins,
+            too_far.0,
+            too_far.1,
+            too_far.2,
+        );
+        let keys = PsbtKeys::new(&SECRET, Network::Testnet).unwrap();
+        let analysis = keys.analyze(&psbt).unwrap();
+        assert!(
+            !analysis.destinations[0].is_change,
+            "another account is a spend"
+        );
+        assert!(
+            !analysis.destinations[1].is_change,
+            "index 1000 is past the change window"
+        );
+        assert_eq!(
+            keys.sign(&mut psbt).unwrap(),
+            1,
+            "another account's input is still signed"
+        );
+    }
+
+    #[test]
     fn the_single_key_output_is_not_signed_off_mainnet() {
         let me = x_only(&SECRET);
         let mut psbt = psbt(&[(p2tr(me), 50_000)], &[(p2tr(other_key()), 40_000)]);
         let keys = PsbtKeys::new(&SECRET, Network::Testnet).unwrap();
         assert_eq!(keys.sign(&mut psbt).unwrap(), 0);
         assert!(psbt.inputs[0].tap_key_sig.is_none());
+        let change = PsbtKeys::new(&SECRET, Network::Testnet)
+            .unwrap()
+            .analyze(&super::fixtures::psbt(
+                &[(p2tr(other_key()), 50_000)],
+                &[(p2tr(me), 40_000)],
+            ))
+            .unwrap();
+        assert!(!change.destinations[0].is_change);
     }
 
     #[test]

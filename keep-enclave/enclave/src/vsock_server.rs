@@ -451,7 +451,7 @@ impl VsockServer {
         }
 
         match self.signer.sign_psbt(&req.key_id, &req.psbt, network) {
-            Ok((signed_psbt, signed_inputs, _)) => {
+            Ok((signed_psbt, signed_inputs)) => {
                 self.policy_engine.record_operation(&req.key_id);
                 EnclaveResponse::SignedPsbt {
                     psbt: signed_psbt,
@@ -468,7 +468,8 @@ impl VsockServer {
     /// Evaluate the policy engine against each non-change destination, or once
     /// with no destination when nothing but the fee leaves the wallet, so the
     /// amount, rate and time rules always apply. An output with no address is
-    /// named by its script, which no allowlist holds. Returns the error response
+    /// named `script:<hex>`, so an allowlist refuses it unless that name is
+    /// listed. Returns the error response
     /// to send back if any evaluation is denied or requires approval.
     fn enforce_destination_policies(
         &mut self,
