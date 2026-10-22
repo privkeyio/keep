@@ -62,7 +62,7 @@ use keep_core::relay::{is_internal_ip, ALLOW_INTERNAL_HOSTS};
 
 use crate::cert_pin::CertificatePinSet;
 use crate::error::{FrostNetError, Result};
-use crate::pinning::PinningServerCertVerifier;
+use crate::pinning::{PinFailureHook, PinningServerCertVerifier};
 
 /// How the pin set and the strict-mode flag are handed to the transport.
 ///
@@ -76,6 +76,7 @@ use crate::pinning::PinningServerCertVerifier;
 pub struct TlsPinning {
     pins: Arc<Mutex<CertificatePinSet>>,
     require_pinned: bool,
+    on_failure: Option<PinFailureHook>,
 }
 
 impl fmt::Debug for TlsPinning {
@@ -94,7 +95,18 @@ impl TlsPinning {
         Self {
             pins,
             require_pinned,
+            on_failure: None,
         }
+    }
+
+    /// Report a pin rejection on the handshake that carries relay data.
+    ///
+    /// The hook runs on the handshake thread. It must not block or call back
+    /// into this transport. A reconnect reports a host once, until a later
+    /// handshake for that host succeeds.
+    pub fn on_pin_failure(mut self, hook: PinFailureHook) -> Self {
+        self.on_failure = Some(hook);
+        self
     }
 
     /// Whether a host with no pin on record is refused.
@@ -211,7 +223,7 @@ impl PinnedWebSocketTransport {
             .cloned()
             .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 
-        let verifier = PinningServerCertVerifier::new_with_provider(
+        let mut verifier = PinningServerCertVerifier::new_with_provider(
             Arc::new(roots),
             pinning.pins,
             require_pinned,
@@ -220,6 +232,9 @@ impl PinnedWebSocketTransport {
         .map_err(|e| {
             FrostNetError::Transport(format!("Failed to build pinning certificate verifier: {e}"))
         })?;
+        if let Some(hook) = pinning.on_failure {
+            verifier = verifier.with_on_pin_failure(hook);
+        }
 
         let config = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()

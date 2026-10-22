@@ -5497,6 +5497,14 @@ impl KeepMobile {
                                 keep_frost_net::KFP_VERSION
                             );
                         }
+                        Ok(KfpNodeEvent::RelayPinRejected { relay_host, reason }) => {
+                            tracing::error!(
+                                relay_host,
+                                reason = reason.as_str(),
+                                "relay TLS certificate pin rejected; this relay stays disconnected: {}",
+                                reason.explanation()
+                            );
+                        }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             state.push(&connection_status).await;

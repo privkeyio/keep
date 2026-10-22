@@ -5,6 +5,7 @@ mod ecdh;
 mod enroll;
 mod learning;
 mod oprf;
+mod pin_report;
 mod psbt;
 mod signing;
 mod transport;
@@ -49,6 +50,7 @@ use crate::nonce_store::{FileNonceStore, NonceStore};
 use crate::oprf_session::{OprfEvalRateLimiter, OprfUnlockSessionManager};
 use crate::peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
 use crate::pinned_transport::TlsPinning;
+use crate::pinning::PinRejection;
 use crate::protocol::*;
 use crate::psbt_session::PsbtSessionManager;
 use crate::session::{NetworkSession, SessionManager};
@@ -917,6 +919,13 @@ pub enum KfpNodeEvent {
     DuressFrozen {
         beacon_pubkey: PublicKey,
     },
+    /// A relay's live TLS handshake rejected the SPKI pin. The pool stays up
+    /// on any other relay that connected, so this is the only signal that one
+    /// relay is down because its certificate did not match.
+    RelayPinRejected {
+        relay_host: String,
+        reason: PinRejection,
+    },
     /// The OS RNG health check failed: three raw samples came back constant,
     /// repeated, or too close together. Signing is refused from here on. Not
     /// cleared at runtime, because the condition means the source this node
@@ -1152,6 +1161,11 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .debug_struct("DuressFrozen")
                 .field("beacon_pubkey", beacon_pubkey)
                 .finish(),
+            Self::RelayPinRejected { relay_host, reason } => f
+                .debug_struct("RelayPinRejected")
+                .field("relay_host", relay_host)
+                .field("reason", &reason.as_str())
+                .finish(),
             Self::EntropyDegraded => f.write_str("EntropyDegraded"),
         }
     }
@@ -1239,6 +1253,7 @@ pub struct KfpNode {
     shutdown_rx: TokioMutex<Option<mpsc::Receiver<()>>>,
     pub(crate) replay_window_secs: u64,
     pub(crate) audit_log: Arc<SigningAuditLog>,
+    pin_reports: Arc<pin_report::PinReports>,
     expected_pcrs: Option<ExpectedPcrs>,
     /// Pinned policy for verifying peer TPM-quote attestation evidence. The
     /// parallel to `expected_pcrs` for the Nitro path; `None` means TPM quotes
@@ -1445,12 +1460,26 @@ impl KfpNode {
 
         require_learnable_verifying_shares(&share)?;
         let keys = derive_keys_from_share(&share)?;
+        // The hook has to be installed before connect: that is when a mismatch
+        // on one relay happens, and this wait still succeeds if another relay
+        // connects. The reports buffer holds the event until someone subscribes.
+        let pin_reports = Arc::new(pin_report::PinReports::new());
+        let pinning = pinning.map(|p| p.on_pin_failure(pin_reports.hook()));
         let transport = Arc::new(
             NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts(), pinning)
                 .await?,
         ) as Arc<dyn CosignTransport>;
 
-        Self::assemble(share, keys, transport, nonce_store, session_timeout)
+        let node = Self::assemble(
+            share,
+            keys,
+            transport,
+            nonce_store,
+            session_timeout,
+            Arc::clone(&pin_reports),
+        )?;
+        pin_reports.attach(node.event_tx.clone(), Arc::clone(&node.audit_log));
+        Ok(node)
     }
 
     /// Synchronous assembly of a [`KfpNode`] from an already-connected
@@ -1463,6 +1492,7 @@ impl KfpNode {
         transport: Arc<dyn CosignTransport>,
         nonce_store: Option<Arc<dyn NonceStore>>,
         session_timeout: Option<Duration>,
+        pin_reports: Arc<pin_report::PinReports>,
     ) -> Result<Self> {
         let descriptor_manager = match session_timeout {
             Some(t) => DescriptorSessionManager::with_timeout(t)?,
@@ -1543,6 +1573,7 @@ impl KfpNode {
             shutdown_rx: TokioMutex::new(Some(shutdown_rx)),
             replay_window_secs: DEFAULT_REPLAY_WINDOW_SECS,
             audit_log,
+            pin_reports,
             expected_pcrs: None,
             tpm_attestation_policy: None,
             duress_beacon_pins: None,
@@ -1574,7 +1605,14 @@ impl KfpNode {
     ) -> Result<Self> {
         require_learnable_verifying_shares(&share)?;
         let keys = derive_keys_from_share(&share)?;
-        Self::assemble(share, keys, transport, nonce_store, session_timeout)
+        Self::assemble(
+            share,
+            keys,
+            transport,
+            nonce_store,
+            session_timeout,
+            Arc::new(pin_report::PinReports::new()),
+        )
     }
 
     pub fn with_descriptor_lookup(mut self, lookup: Arc<dyn PersistedDescriptorLookup>) -> Self {
@@ -2061,7 +2099,9 @@ impl KfpNode {
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<KfpNodeEvent> {
-        self.event_tx.subscribe()
+        let rx = self.event_tx.subscribe();
+        self.pin_reports.flush();
+        rx
     }
 
     pub fn audit_log(&self) -> &SigningAuditLog {

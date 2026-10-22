@@ -20,6 +20,7 @@
     type BunkerInfo,
     type Share,
     type SigningEntry,
+    type PinRejectionEntry,
     type LogEvent,
     type ApprovalEvent,
     type PeerInfo,
@@ -70,6 +71,7 @@
   let signerRetired = $state(false)
   let signingLoadError = $state<string | null>(null)
   let signingLog = $state<SigningEntry[]>([])
+  let pinRejections = $state<PinRejectionEntry[]>([])
   let signingVerified = $state(true)
   let wsConnected = $state(false)
 
@@ -330,6 +332,7 @@
     getSigningLog()
       .then((r) => {
         signingLog = r.entries
+        pinRejections = r.pin_rejections ?? []
         signingVerified = r.verified
       })
       .catch(() => {})
@@ -337,7 +340,12 @@
 
   function exportSigningLog() {
     const data = JSON.stringify(
-      { verified: signingVerified, exported_at: new Date().toISOString(), entries: signingLog },
+      {
+        verified: signingVerified,
+        exported_at: new Date().toISOString(),
+        entries: signingLog,
+        pin_rejections: pinRejections,
+      },
       null,
       2,
     )
@@ -1022,7 +1030,7 @@
 
   <h2>
     Signing Log
-    {#if signingLog.length}
+    {#if signingLog.length || pinRejections.length}
       <span class="verify {signingVerified ? 'ok' : 'fail'}">
         {signingVerified ? '✓ chain verified' : '✗ chain INVALID'}
       </span>
@@ -1030,6 +1038,13 @@
     {/if}
   </h2>
   <div class="panel">
+    {#each pinRejections as p (`${p.timestamp_ms}-${p.relay_host}`)}
+      <div class="event">
+        <strong>frost</strong>: relay pin rejected
+        <span class="fail">✗</span>
+        <span class="muted"> · {p.relay_host}: {p.detail}</span>
+      </div>
+    {/each}
     {#each signingSessions as s (s.session)}
       <div
         class="event session-row"

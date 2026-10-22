@@ -742,6 +742,14 @@ pub fn cmd_frost_network_serve(
                             }
                         }
                     }
+                    Ok(keep_frost_net::KfpNodeEvent::RelayPinRejected { relay_host, reason }) => {
+                        tracing::error!(
+                            relay_host,
+                            reason = reason.as_str(),
+                            "relay TLS certificate pin rejected; this relay stays disconnected: {}",
+                            reason.explanation()
+                        );
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "node events dropped while busy");
                     }
