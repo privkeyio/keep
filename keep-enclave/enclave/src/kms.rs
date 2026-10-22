@@ -3,17 +3,30 @@
 use crate::error::{EnclaveError, Result};
 use crate::mlock::MlockedBox;
 use aes_gcm::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Nonce,
 };
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroize;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
+
+const POLICY_BINDING_DOMAIN: &[u8] = b"keep-enclave-policy-v1";
+const MAX_SEALED_KEY_LEN: usize = 4096;
+
+pub fn policy_binding_hash(policy_bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(POLICY_BINDING_DOMAIN);
+    hasher.update(policy_bytes);
+    hasher.finalize().into()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedWallet {
     pub encrypted_data_key: Vec<u8>,
     pub encrypted_wallet_key: Vec<u8>,
     pub nonce: [u8; 12],
+    pub policy_hash: [u8; 32],
 }
 
 pub struct EnclaveKms {
@@ -36,20 +49,14 @@ impl EnclaveKms {
         Ok(pubkey)
     }
 
-    pub fn decrypt_wallet_key(&self, encrypted: &EncryptedWallet) -> Result<Vec<u8>> {
+    pub fn decrypt_wallet_key(
+        &self,
+        encrypted: &EncryptedWallet,
+    ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
         let mut data_key = self.decrypt_data_key(&encrypted.encrypted_data_key)?;
-
-        let cipher = Aes256Gcm::new_from_slice(&data_key)
-            .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
-
-        let nonce = &Nonce::from(encrypted.nonce);
-        let wallet_key = cipher
-            .decrypt(nonce, encrypted.encrypted_wallet_key.as_ref())
-            .map_err(|e| EnclaveError::Kms(format!("Decryption failed: {}", e)))?;
-
+        let opened = open_sealed_wallet(&data_key, encrypted);
         data_key.zeroize();
-
-        Ok(wallet_key)
+        opened
     }
 
     #[cfg(target_os = "linux")]
@@ -118,25 +125,138 @@ impl EnclaveKms {
     }
 }
 
+fn sealed_body(wallet_key: &[u8], policy_bytes: &[u8]) -> Result<Vec<u8>> {
+    if wallet_key.is_empty() || wallet_key.len() > MAX_SEALED_KEY_LEN || policy_bytes.is_empty() {
+        return Err(EnclaveError::Kms("Invalid sealed wallet".into()));
+    }
+    let len = u32::try_from(wallet_key.len())
+        .map_err(|_| EnclaveError::Kms("Invalid sealed wallet".into()))?;
+    let mut body = Vec::with_capacity(4 + wallet_key.len() + policy_bytes.len());
+    body.extend_from_slice(&len.to_le_bytes());
+    body.extend_from_slice(wallet_key);
+    body.extend_from_slice(policy_bytes);
+    Ok(body)
+}
+
+fn open_sealed_wallet(
+    data_key: &[u8],
+    encrypted: &EncryptedWallet,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+    let cipher = Aes256Gcm::new_from_slice(data_key)
+        .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
+    let nonce = &Nonce::from(encrypted.nonce);
+    let plain = cipher
+        .decrypt(
+            nonce,
+            Payload {
+                msg: encrypted.encrypted_wallet_key.as_ref(),
+                aad: &encrypted.policy_hash,
+            },
+        )
+        .map_err(|_| EnclaveError::Kms("Decryption failed".into()))?;
+    let plain = Zeroizing::new(plain);
+    if plain.len() < 4 {
+        return Err(EnclaveError::Kms("Decryption failed".into()));
+    }
+    let len = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]) as usize;
+    if len == 0 || len > MAX_SEALED_KEY_LEN || plain.len() < 4 + len {
+        return Err(EnclaveError::Kms("Decryption failed".into()));
+    }
+    let policy = plain[4 + len..].to_vec();
+    if policy.is_empty() {
+        return Err(EnclaveError::Kms("Decryption failed".into()));
+    }
+    let computed = policy_binding_hash(&policy);
+    if !bool::from(computed.ct_eq(&encrypted.policy_hash)) {
+        return Err(EnclaveError::Kms("Decryption failed".into()));
+    }
+    Ok((Zeroizing::new(plain[4..4 + len].to_vec()), policy))
+}
+
+pub(crate) fn seal_wallet(
+    data_key: &[u8],
+    wallet_key: &[u8],
+    policy_bytes: &[u8],
+    nonce: [u8; 12],
+) -> Result<EncryptedWallet> {
+    let policy_hash = policy_binding_hash(policy_bytes);
+    let body = Zeroizing::new(sealed_body(wallet_key, policy_bytes)?);
+    let cipher = Aes256Gcm::new_from_slice(data_key)
+        .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
+    let encrypted_wallet_key = cipher
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: body.as_ref(),
+                aad: &policy_hash,
+            },
+        )
+        .map_err(|_| EnclaveError::Kms("Encryption failed".into()))?;
+    Ok(EncryptedWallet {
+        encrypted_data_key: Vec::new(),
+        encrypted_wallet_key,
+        nonce,
+        policy_hash,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn seal_for_test(
+    ephemeral: &[u8; 32],
+    wallet_key: &[u8],
+    policy_bytes: &[u8],
+) -> EncryptedWallet {
+    let data_key = [99u8; 32];
+    let nonce_bytes: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+    let cipher = Aes256Gcm::new_from_slice(ephemeral).expect("ephemeral key");
+    let mut encrypted_data_key = cipher
+        .encrypt(&Nonce::from(nonce_bytes), data_key.as_slice())
+        .expect("data key seal");
+    let mut prefixed = nonce_bytes.to_vec();
+    prefixed.append(&mut encrypted_data_key);
+    let mut sealed = seal_wallet(data_key.as_slice(), wallet_key, policy_bytes, [11u8; 12])
+        .expect("wallet seal");
+    sealed.encrypted_data_key = prefixed;
+    sealed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::KeyInit;
 
-    fn encrypt_data_key(master_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
-        let nonce_bytes: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        let cipher = Aes256Gcm::new_from_slice(master_key).unwrap();
-        let nonce = &Nonce::from(nonce_bytes);
-        let mut ciphertext = cipher.encrypt(nonce, plaintext).unwrap();
-        let mut result = nonce_bytes.to_vec();
-        result.append(&mut ciphertext);
-        result
+    #[test]
+    fn the_policy_binding_hash_is_stable() {
+        let hash = policy_binding_hash(b"keep-enclave-policy-vector");
+        assert_eq!(
+            hex::encode(hash),
+            "a334882cee0e99d085bf384f3ab99165cb0e7a211f09a2c559f5f9986b84a538"
+        );
     }
 
-    fn encrypt_wallet_key(data_key: &[u8], wallet_key: &[u8], nonce: &[u8; 12]) -> Vec<u8> {
-        let cipher = Aes256Gcm::new_from_slice(data_key).unwrap();
-        let n = &Nonce::from(*nonce);
-        cipher.encrypt(n, wallet_key).unwrap()
+    #[test]
+    fn a_known_ciphertext_opens() {
+        let policy_hash: [u8; 32] =
+            hex::decode("bc70690ba73998f7d68b22cab7142c66cb66a17d49e04931efebc1b54160cdde")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let encrypted = EncryptedWallet {
+            encrypted_data_key: Vec::new(),
+            encrypted_wallet_key: hex::decode("cddb7aa5af39d9deefcec117ccb67b3b65e5ad28a89c")
+                .unwrap(),
+            nonce: [11u8; 12],
+            policy_hash,
+        };
+        let (key, policy) = open_sealed_wallet(&[99u8; 32], &encrypted).unwrap();
+        assert_eq!(key.as_slice(), b"k");
+        assert_eq!(policy, b"p");
+        assert_eq!(policy_hash, policy_binding_hash(b"p"));
+    }
+
+    #[test]
+    fn the_sealed_body_is_the_key_then_the_policy() {
+        let body = sealed_body(b"k", b"p").unwrap();
+        assert_eq!(body, [1, 0, 0, 0, b'k', b'p']);
     }
 
     #[test]
@@ -144,22 +264,26 @@ mod tests {
         let mut ephemeral_secret = [42u8; 32];
         let ephemeral_secret_copy = ephemeral_secret;
         let kms = EnclaveKms::new(&mut ephemeral_secret);
-
-        let data_key = [99u8; 32];
         let wallet_key = b"my_secret_wallet_key_32_bytes!!!";
-        let nonce: [u8; 12] = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22];
+        let encrypted = seal_for_test(&ephemeral_secret_copy, wallet_key, b"policy");
 
-        let encrypted_data_key = encrypt_data_key(&ephemeral_secret_copy, &data_key);
-        let encrypted_wallet_key = encrypt_wallet_key(&data_key, wallet_key, &nonce);
+        let (decrypted, policy) = kms.decrypt_wallet_key(&encrypted).unwrap();
+        assert_eq!(decrypted.as_slice(), wallet_key);
+        assert_eq!(policy, b"policy");
+    }
 
-        let encrypted = EncryptedWallet {
-            encrypted_data_key,
-            encrypted_wallet_key,
-            nonce,
-        };
-
-        let decrypted = kms.decrypt_wallet_key(&encrypted).unwrap();
-        assert_eq!(decrypted, wallet_key);
+    #[test]
+    fn a_tampered_policy_hash_does_not_open() {
+        let mut ephemeral_secret = [42u8; 32];
+        let ephemeral_secret_copy = ephemeral_secret;
+        let kms = EnclaveKms::new(&mut ephemeral_secret);
+        let mut encrypted = seal_for_test(
+            &ephemeral_secret_copy,
+            b"secret-key-material-32-bytes!!",
+            b"policy",
+        );
+        encrypted.policy_hash[0] ^= 0xff;
+        assert!(kms.decrypt_wallet_key(&encrypted).is_err());
     }
 
     #[test]
@@ -167,21 +291,7 @@ mod tests {
         let ephemeral_secret = [42u8; 32];
         let mut wrong_secret = [99u8; 32];
         let kms = EnclaveKms::new(&mut wrong_secret);
-
-        let data_key = [88u8; 32];
-        let wallet_key = b"secret";
-        let nonce: [u8; 12] = [1; 12];
-
-        let encrypted_data_key = encrypt_data_key(&ephemeral_secret, &data_key);
-        let encrypted_wallet_key = encrypt_wallet_key(&data_key, wallet_key, &nonce);
-
-        let encrypted = EncryptedWallet {
-            encrypted_data_key,
-            encrypted_wallet_key,
-            nonce,
-        };
-
-        let result = kms.decrypt_wallet_key(&encrypted);
-        assert!(result.is_err());
+        let encrypted = seal_for_test(&ephemeral_secret, b"secret", b"policy");
+        assert!(kms.decrypt_wallet_key(&encrypted).is_err());
     }
 }

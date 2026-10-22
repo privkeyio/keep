@@ -8,6 +8,7 @@ use crate::signer::EnclaveSigner;
 use bitcoin::Network;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 const VSOCK_PORT: u32 = 5000;
 const MAX_REQUEST_SIZE: usize = 1024 * 1024;
@@ -99,6 +100,8 @@ pub struct VsockServer {
     kms: EnclaveKms,
     used_nonces: std::collections::HashMap<[u8; 32], u64>,
     policy_initialized: bool,
+    policy_sealed: bool,
+    sealed_policy_hash: [u8; 32],
 }
 
 impl VsockServer {
@@ -111,6 +114,18 @@ impl VsockServer {
             kms,
             used_nonces: std::collections::HashMap::new(),
             policy_initialized: false,
+            policy_sealed: false,
+            sealed_policy_hash: [0u8; 32],
+        })
+    }
+
+    fn policy_required(&self) -> Option<EnclaveResponse> {
+        if self.policy_initialized {
+            return None;
+        }
+        Some(EnclaveResponse::Error {
+            code: ErrorCode::PolicyDenied,
+            message: "no policy loaded".into(),
         })
     }
 
@@ -336,8 +351,8 @@ impl VsockServer {
         name: &str,
         encrypted: &EncryptedWallet,
     ) -> EnclaveResponse {
-        let secret = match self.kms.decrypt_wallet_key(encrypted) {
-            Ok(s) => s,
+        let (secret, policy_bytes) = match self.kms.decrypt_wallet_key(encrypted) {
+            Ok(opened) => opened,
             Err(e) => {
                 return EnclaveResponse::Error {
                     code: ErrorCode::InvalidRequest,
@@ -345,12 +360,42 @@ impl VsockServer {
                 };
             }
         };
+        let policy = match postcard::from_bytes::<PolicyConfig>(&policy_bytes) {
+            Ok(policy) => policy,
+            Err(_) => {
+                return EnclaveResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "KMS decryption failed: invalid sealed wallet".into(),
+                };
+            }
+        };
+        if policy.policies.is_empty() || secret.len() != 32 {
+            return EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                message: "policy denies request".into(),
+            };
+        }
+        if self.policy_sealed && !bool::from(encrypted.policy_hash.ct_eq(&self.sealed_policy_hash))
+        {
+            return EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                message: "Policy is sealed to the key".into(),
+            };
+        }
 
         match self.signer.import_key(name, &secret) {
-            Ok(pubkey) => EnclaveResponse::PublicKey {
-                pubkey: pubkey.to_vec(),
-                name: name.to_string(),
-            },
+            Ok(pubkey) => {
+                if !self.policy_sealed {
+                    self.policy_engine.set_policies(policy);
+                    self.policy_initialized = true;
+                    self.policy_sealed = true;
+                    self.sealed_policy_hash = encrypted.policy_hash;
+                }
+                EnclaveResponse::PublicKey {
+                    pubkey: pubkey.to_vec(),
+                    name: name.to_string(),
+                }
+            }
             Err(e) => EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
                 message: e.to_string(),
@@ -359,6 +404,9 @@ impl VsockServer {
     }
 
     fn handle_sign(&mut self, req: SigningRequest) -> EnclaveResponse {
+        if let Some(denied) = self.policy_required() {
+            return denied;
+        }
         if let Err(e) = self.validate_replay_protection(req.nonce, req.timestamp) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
@@ -413,6 +461,9 @@ impl VsockServer {
     }
 
     fn handle_sign_psbt(&mut self, req: PsbtSigningRequest) -> EnclaveResponse {
+        if let Some(denied) = self.policy_required() {
+            return denied;
+        }
         if let Err(e) = self.validate_replay_protection(req.nonce, req.timestamp) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
@@ -521,6 +572,18 @@ impl VsockServer {
     }
 
     fn handle_set_policy(&mut self, config: PolicyConfig) -> EnclaveResponse {
+        if self.policy_sealed {
+            return EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                message: "Policy is sealed to the key".into(),
+            };
+        }
+        if config.policies.is_empty() {
+            return EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                message: "policy denies request".into(),
+            };
+        }
         if self.policy_initialized {
             return EnclaveResponse::Error {
                 code: ErrorCode::PolicyDenied,
@@ -570,6 +633,9 @@ impl VsockServer {
         nonce: Option<[u8; 32]>,
         timestamp: Option<u64>,
     ) -> EnclaveResponse {
+        if let Some(denied) = self.policy_required() {
+            return denied;
+        }
         if let Err(e) = self.validate_replay_protection(nonce, timestamp) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
@@ -610,6 +676,9 @@ impl VsockServer {
         nonce: Option<[u8; 32]>,
         timestamp: Option<u64>,
     ) -> EnclaveResponse {
+        if let Some(denied) = self.policy_required() {
+            return denied;
+        }
         if let Err(e) = self.validate_replay_protection(nonce, timestamp) {
             return EnclaveResponse::Error {
                 code: ErrorCode::InvalidRequest,
@@ -644,6 +713,8 @@ mod tests {
             kms,
             used_nonces: std::collections::HashMap::new(),
             policy_initialized: false,
+            policy_sealed: false,
+            sealed_policy_hash: [0u8; 32],
         };
         server.handle_set_policy(PolicyConfig {
             policies: vec![Policy {
@@ -724,5 +795,203 @@ mod tests {
             .tap_key_origins
             .insert(change, (vec![], (fp, path)));
         assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    fn bare() -> VsockServer {
+        let signer = EnclaveSigner::with_ephemeral_secret([42u8; 32]);
+        let kms = signer.create_kms();
+        VsockServer {
+            signer,
+            policy_engine: PolicyEngine::new(),
+            kms,
+            used_nonces: std::collections::HashMap::new(),
+            policy_initialized: false,
+            policy_sealed: false,
+            sealed_policy_hash: [0u8; 32],
+        }
+    }
+
+    fn rate_bytes(max: u32) -> Vec<u8> {
+        postcard::to_allocvec(&PolicyConfig {
+            policies: vec![Policy {
+                name: "rate".into(),
+                rules: vec![PolicyRule::MaxPerMinute(max)],
+                action: PolicyAction::Deny,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn limit_bytes(max: u64) -> Vec<u8> {
+        postcard::to_allocvec(&PolicyConfig {
+            policies: vec![Policy {
+                name: "limit".into(),
+                rules: vec![PolicyRule::MaxAmountSats(max)],
+                action: PolicyAction::Deny,
+            }],
+        })
+        .unwrap()
+    }
+
+    fn sign_amount(server: &mut VsockServer, amount: u64) -> EnclaveResponse {
+        server.handle_sign(SigningRequest {
+            key_id: "k".into(),
+            message: vec![1u8; 32],
+            event_kind: None,
+            amount_sats: Some(amount),
+            destination: None,
+            nonce: None,
+            timestamp: None,
+        })
+    }
+
+    #[test]
+    fn signing_is_refused_until_a_policy_is_loaded() {
+        let mut server = bare();
+        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&server.handle_frost_round1("k", &[1u8; 32], None, None)));
+        assert!(denied(&server.handle_frost_round2([0u8; 32], None, None)));
+        assert!(denied(&server.handle_set_policy(PolicyConfig { policies: vec![] })));
+        assert!(denied(&sign_amount(&mut server, 1)));
+    }
+
+    #[test]
+    fn a_sealed_policy_replaces_a_looser_host_policy() {
+        let mut server = bare();
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![Policy {
+                name: "loose".into(),
+                rules: vec![PolicyRule::MaxAmountSats(1_000_000)],
+                action: PolicyAction::Deny,
+            }],
+        });
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000));
+        match server.handle_import_encrypted_key("k", &blob) {
+            EnclaveResponse::PublicKey { .. } => {}
+            other => panic!("expected the key to import, got {other:?}"),
+        }
+        assert!(matches!(
+            sign_amount(&mut server, 500),
+            EnclaveResponse::Signature { .. }
+        ));
+        assert!(denied(&sign_amount(&mut server, 2_000)));
+        assert!(denied(&server.handle_set_policy(PolicyConfig {
+            policies: vec![Policy {
+                name: "looser".into(),
+                rules: vec![PolicyRule::MaxAmountSats(1_000_000)],
+                action: PolicyAction::Deny,
+            }],
+        })));
+    }
+
+    #[test]
+    fn a_sealed_rate_limit_replaces_a_seeded_bucket() {
+        let mut server = bare();
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![Policy {
+                name: "loose".into(),
+                rules: vec![PolicyRule::MaxPerMinute(1_000_000)],
+                action: PolicyAction::Deny,
+            }],
+        });
+        let _ = sign_amount(&mut server, 1);
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &rate_bytes(1));
+        match server.handle_import_encrypted_key("k", &blob) {
+            EnclaveResponse::PublicKey { .. } => {}
+            other => panic!("expected the key to import, got {other:?}"),
+        }
+        assert!(matches!(
+            sign_amount(&mut server, 1),
+            EnclaveResponse::Signature { .. }
+        ));
+        assert!(denied(&sign_amount(&mut server, 1)));
+    }
+
+    #[test]
+    fn a_restart_loads_the_sealed_policy() {
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000));
+        let mut restarted = bare();
+        match restarted.handle_import_encrypted_key("k", &blob) {
+            EnclaveResponse::PublicKey { .. } => {}
+            other => panic!("expected the key to import, got {other:?}"),
+        }
+        assert!(matches!(
+            sign_amount(&mut restarted, 500),
+            EnclaveResponse::Signature { .. }
+        ));
+        assert!(denied(&sign_amount(&mut restarted, 2_000)));
+    }
+
+    #[test]
+    fn a_tampered_policy_hash_does_not_import() {
+        let mut blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000));
+        blob.policy_hash[0] ^= 0xff;
+        let mut server = bare();
+        assert!(matches!(
+            server.handle_import_encrypted_key("k", &blob),
+            EnclaveResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(matches!(
+            server.handle_get_public_key("k"),
+            EnclaveResponse::Error {
+                code: ErrorCode::KeyNotFound,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_second_sealed_policy_is_refused() {
+        let mut server = bare();
+        let first = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000));
+        assert!(matches!(
+            server.handle_import_encrypted_key("k", &first),
+            EnclaveResponse::PublicKey { .. }
+        ));
+        let second = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000_000));
+        assert!(denied(&server.handle_import_encrypted_key("other", &second)));
+        assert!(denied(&sign_amount(&mut server, 2_000)));
+    }
+
+    #[test]
+    fn a_rejected_key_does_not_seal_the_policy() {
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &[0u8; 32], &limit_bytes(1_000_000));
+        let mut server = bare();
+        assert!(matches!(
+            server.handle_import_encrypted_key("k", &blob),
+            EnclaveResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(matches!(
+            server.handle_set_policy(PolicyConfig {
+                policies: vec![Policy {
+                    name: "limit".into(),
+                    rules: vec![PolicyRule::MaxAmountSats(1_000)],
+                    action: PolicyAction::Deny,
+                }],
+            }),
+            EnclaveResponse::PolicySet
+        ));
+    }
+
+    #[test]
+    fn an_empty_sealed_policy_does_not_load_the_key() {
+        let empty = postcard::to_allocvec(&PolicyConfig { policies: vec![] }).unwrap();
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &empty);
+        let mut server = bare();
+        assert!(denied(&server.handle_import_encrypted_key("k", &blob)));
+        assert!(matches!(
+            server.handle_get_public_key("k"),
+            EnclaveResponse::Error {
+                code: ErrorCode::KeyNotFound,
+                ..
+            }
+        ));
+        assert!(denied(&sign_amount(&mut server, 1)));
     }
 }
