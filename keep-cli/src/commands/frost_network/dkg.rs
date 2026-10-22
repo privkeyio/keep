@@ -203,12 +203,8 @@ fn cmd_frost_network_dkg_hardware(
 
     rt.block_on(async {
         let keys = subkey.clone();
-        let client = Client::new(keys.clone());
-        client
-            .add_relay(relay)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
-        client.connect().await;
+        let client =
+            crate::pinning::connect_client(vault_path, &[relay.to_string()], keys.clone()).await?;
 
         out.info("Connected to relay");
         out.field(
@@ -623,12 +619,8 @@ fn cmd_frost_network_dkg_software(
 
     let outcome = rt.block_on(async {
         let keys = subkey.clone();
-        let client = Client::new(keys.clone());
-        client
-            .add_relay(relay)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
-        client.connect().await;
+        let client =
+            crate::pinning::connect_client(vault_path, &[relay.to_string()], keys.clone()).await?;
 
         out.info("Connected to relay");
         out.field(
@@ -874,8 +866,10 @@ fn write_dkg_recovery_stash(path: &std::path::Path, export_json: &str) -> Result
 /// invite), and nothing is written to a relay. `--publish` opts into the CLI's
 /// relay-discovery path, which each participant's `dkg` then fetches.
 #[tracing::instrument(skip(out))]
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_group_create(
     out: &Output,
+    path: &std::path::Path,
     name: &str,
     threshold: u8,
     participants: u8,
@@ -954,15 +948,7 @@ pub fn cmd_frost_network_group_create(
 
     rt.block_on(async {
         let keys = Keys::generate();
-        let client = Client::new(keys.clone());
-
-        for relay in relays {
-            client
-                .add_relay(relay)
-                .await
-                .map_err(|e| KeepError::NetworkErr(NetworkError::relay(format!("{relay}: {e}"))))?;
-        }
-        client.connect().await;
+        let client = crate::pinning::connect_client(path, relays, keys.clone()).await?;
 
         out.info("Connected to relays");
         out.field(

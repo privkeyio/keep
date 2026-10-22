@@ -232,6 +232,7 @@ pub fn cmd_frost_network_serve(
                 .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
             return rt.block_on(duress::run_duress_serve(
                 out,
+                path,
                 &beacon,
                 &group_pubkey,
                 &recipients,
@@ -308,9 +309,7 @@ pub fn cmd_frost_network_serve(
     let unlock_result = rt.block_on(async move {
         out.info("Starting FROST coordination node...");
 
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         let mut node =
             node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         if let Some(policy) = tpm_policy {
@@ -804,9 +803,7 @@ pub fn cmd_frost_network_peers(
         let spinner = out.spinner("Connecting and discovering peers...");
 
         let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
+            crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?,
         );
 
         node.announce()
@@ -973,6 +970,7 @@ pub fn cmd_frost_network_sign(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     let signature = rt.block_on(frost_network_sign_round(
         out,
+        path,
         share,
         relay,
         message_bytes,
@@ -1017,15 +1015,14 @@ fn build_unsigned_frost_event(
 /// requests an aggregated signature, and returns the 64-byte schnorr sig.
 async fn frost_network_sign_round(
     out: &Output,
+    vault: &Path,
     share: keep_core::frost::SharePackage,
     relay: &str,
     message_bytes: Vec<u8>,
     message_type: &str,
     structured_payload: Option<Vec<u8>>,
 ) -> Result<[u8; 64]> {
-    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-        .await
-        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    let mut node = crate::pinning::connect_node(vault, share, vec![relay.to_string()]).await?;
 
     out.info("Starting FROST coordination node...");
     let pk = node.pubkey();
@@ -1114,15 +1111,14 @@ async fn wait_for_peers(
 /// signature is obtained before any is returned.
 pub(crate) async fn key_path_spend_round(
     out: &Output,
+    vault: &Path,
     share: keep_core::frost::SharePackage,
     relay: &str,
     timeout: std::time::Duration,
     spends: Vec<NetworkKeyPathSpend>,
 ) -> Result<Vec<[u8; 64]>> {
     let needed = usize::from(share.metadata.threshold.saturating_sub(1));
-    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-        .await
-        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    let mut node = crate::pinning::connect_node(vault, share, vec![relay.to_string()]).await?;
     let shutdown_tx = node.take_shutdown_handle();
     let node = std::sync::Arc::new(node);
     let node_clone = node.clone();
@@ -1277,6 +1273,7 @@ pub fn cmd_frost_network_sign_event(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     let sig_bytes = rt.block_on(frost_network_sign_round(
         out,
+        path,
         share,
         relay,
         event_id.as_bytes().to_vec(),
@@ -1360,9 +1357,7 @@ pub fn cmd_frost_network_health_check(
 
     rt.block_on(async {
         let node = std::sync::Arc::new(
-            keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?,
+            crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?,
         );
 
         node.announce()
@@ -1656,6 +1651,7 @@ pub(crate) fn load_oprf_key_share(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_oprf_request(
     out: &Output,
+    vault: &Path,
     share: keep_core::frost::SharePackage,
     relay: &str,
     mut oprf_share: keep_core::oprf::threshold::KeyShare,
@@ -1664,9 +1660,7 @@ pub(crate) async fn run_oprf_request(
     volume_id: &str,
     epoch: u32,
 ) -> Result<zeroize::Zeroizing<[u8; 32]>> {
-    let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-        .await
-        .map_err(|e| KeepError::Frost(e.to_string()))?;
+    let mut node = crate::pinning::connect_node(vault, share, vec![relay.to_string()]).await?;
     // Install the OPRF key share BEFORE running so this box can answer its own
     // quorum's evaluate requests. `set_oprf_key_share` takes a `Copy`, so wipe our
     // transient parameter copy immediately after; the caller wipes its own.
@@ -1717,6 +1711,7 @@ pub(crate) async fn run_oprf_request(
 /// `--share-file`; errors clearly if either is missing.
 pub(crate) fn derive_secret_seal_key(
     out: &Output,
+    vault: &Path,
     keep: &Keep,
     oprf: &crate::cli::OprfSecretArgs,
     default_relay: &str,
@@ -1743,6 +1738,7 @@ pub(crate) fn derive_secret_seal_key(
     let mut oprf_share = load_oprf_key_share(share_file)?;
     let result = rt.block_on(run_oprf_request(
         out,
+        vault,
         share,
         relay,
         oprf_share,
@@ -1829,6 +1825,7 @@ pub fn cmd_frost_network_oprf_unlock(
 
     let result = rt.block_on(run_oprf_request(
         out,
+        path,
         share,
         relay,
         oprf_share,
@@ -1971,9 +1968,7 @@ pub fn cmd_frost_network_oprf_provision(
     }
 
     let dist = rt.block_on(async move {
-        let mut node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let mut node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         attestation::set_optional_announce_attestor(out, &mut node, attestor);
 
         out.info("Starting FROST coordination node...");

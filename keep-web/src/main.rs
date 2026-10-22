@@ -392,6 +392,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bunker_secret: state::load_or_create_bunker_secret(&vault_path)?,
                         transport_key: state::load_or_create_transport_key(&vault_path)?,
                         learned_verifying_shares: learned_tx,
+                        pin_dir: vault_path.clone(),
+                        require_pinned: keep_frost_net::env_requests_strict_pinning(),
                     },
                     events.clone(),
                     approvals.clone(),
@@ -420,6 +422,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             bunker_secret,
             events.clone(),
             approvals.clone(),
+            vault_path.clone(),
+            keep_frost_net::env_requests_strict_pinning(),
         )
         .map_err(|e| format!("failed to start bunker: {e}"))?
     } else {

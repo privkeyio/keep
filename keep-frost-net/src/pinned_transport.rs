@@ -275,8 +275,10 @@ impl PinnedWebSocketTransport {
             // Screen the addresses we are about to dial, matching the probe's
             // guard. DNS resolution happens here, after any URL-level check, so
             // this is what actually stops a rebind onto a loopback or
-            // link-local address.
-            let addrs: Vec<SocketAddr> = if ALLOW_INTERNAL_HOSTS {
+            // link-local address. A cleartext relay has no certificate to pin,
+            // and strict mode already refused it above; screening it too would
+            // reject the local relays a `ws://` client dialed before pinning.
+            let addrs: Vec<SocketAddr> = if ALLOW_INTERNAL_HOSTS || url.scheme() != "wss" {
                 addrs
             } else {
                 addrs

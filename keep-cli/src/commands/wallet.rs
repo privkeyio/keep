@@ -168,6 +168,7 @@ pub fn cmd_wallet_sign(
             .map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
         rt.block_on(crate::commands::frost_network::key_path_spend_round(
             out,
+            path,
             share,
             relay,
             Duration::from_secs(timeout_secs),
@@ -463,7 +464,7 @@ pub fn cmd_wallet_register(
 
     let register_outcome = rt.block_on(async {
         let spinner = out.spinner("Connecting to signer...");
-        let client = keep_nip46::Nip46Client::connect_to(device_uri, None, None)
+        let client = crate::pinning::connect_signer(path, device_uri)
             .await
             .map_err(|e| KeepError::Runtime(format!("connect: {e}")))?;
         spinner.finish();
@@ -1138,9 +1139,7 @@ pub fn cmd_wallet_propose(
     let keep = Arc::new(Mutex::new(keep));
 
     rt.block_on(async {
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         let node = node.with_descriptor_lookup(Arc::new(descriptor_lookup_for(keep.clone())));
         let node = std::sync::Arc::new(node);
 
@@ -1495,9 +1494,7 @@ pub fn cmd_wallet_announce_keys(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         let node =
             node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new({
                 let snapshot = descriptor_snapshot.clone();
@@ -1714,9 +1711,7 @@ pub fn cmd_wallet_spend(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     rt.block_on(async {
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         let node = node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new(
             {
                 let snapshot = descriptor_snapshot.clone();
@@ -1922,6 +1917,7 @@ fn parse_session_id(s: &str) -> Result<[u8; 32]> {
 #[allow(clippy::too_many_arguments)]
 async fn approve_psbt_session(
     out: &Output,
+    vault: &Path,
     descriptors: Arc<Vec<WalletDescriptor>>,
     node: Arc<keep_frost_net::KfpNode>,
     session_id: [u8; 32],
@@ -2076,7 +2072,7 @@ async fn approve_psbt_session(
         local_fp
     ));
 
-    let client = keep_nip46::Nip46Client::connect_to(&bunker_uri, None, None)
+    let client = crate::pinning::connect_signer(vault, &bunker_uri)
         .await
         .map_err(|e| KeepError::Frost(format!("NIP-46 connect: {e}")))?;
     let signed_outcome = async {
@@ -2223,9 +2219,7 @@ pub fn cmd_wallet_approve_psbt(
             registry.insert(fp, format!("signer-{fp}"), uri.clone());
         }
 
-        let node = keep_frost_net::KfpNode::new(share, vec![relay.to_string()])
-            .await
-            .map_err(|e| KeepError::Frost(e.to_string()))?;
+        let node = crate::pinning::connect_node(path, share, vec![relay.to_string()]).await?;
         let node = node.with_descriptor_lookup(Arc::new(keep_frost_net::KeepDescriptorLookup::new(
             {
                 let snapshot = descriptor_snapshot.clone();
@@ -2293,6 +2287,7 @@ pub fn cmd_wallet_approve_psbt(
                     let bunker = registry_entries[idx].1.clone();
                     approve_psbt_session(
                         out,
+                        path,
                         descriptor_snapshot.clone(),
                         node.clone(),
                         session_id,

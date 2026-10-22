@@ -11,6 +11,7 @@ mod output;
 mod panic;
 #[cfg(windows)]
 mod panic_windows;
+mod pinning;
 mod signer;
 mod tui;
 #[cfg(feature = "warden")]
@@ -529,6 +530,7 @@ fn dispatch_frost_network(
             let relay = relay.as_deref().unwrap_or(default_relay);
             commands::frost_network::cmd_frost_network_attestation_provision(
                 out,
+                path,
                 &group,
                 relay,
                 &out_path,
@@ -631,6 +633,7 @@ fn dispatch_frost_network(
             };
             commands::frost_network::cmd_frost_network_group_create(
                 out,
+                path,
                 &name,
                 threshold,
                 participants,
