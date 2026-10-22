@@ -264,6 +264,26 @@ mod tests {
     }
 
     #[test]
+    fn a_known_ciphertext_opens() {
+        let policy_hash: [u8; 32] =
+            hex::decode("bc70690ba73998f7d68b22cab7142c66cb66a17d49e04931efebc1b54160cdde")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let encrypted = EncryptedWallet {
+            encrypted_data_key: Vec::new(),
+            encrypted_wallet_key: hex::decode("cddb7aa5af39d9deefcec117ccb67b3b65e5ad28a89c")
+                .unwrap(),
+            nonce: [11u8; 12],
+            policy_hash,
+        };
+        let (key, policy) = open_sealed_wallet(&[99u8; 32], &encrypted).unwrap();
+        assert_eq!(key.as_slice(), b"k");
+        assert_eq!(policy, b"p");
+        assert_eq!(policy_hash, policy_binding_hash(b"p"));
+    }
+
+    #[test]
     fn the_sealed_body_is_the_key_then_the_policy() {
         let body = sealed_body(b"k", b"p").unwrap();
         assert_eq!(body, [1, 0, 0, 0, b'k', b'p']);

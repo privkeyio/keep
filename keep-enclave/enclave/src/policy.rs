@@ -96,6 +96,9 @@ impl PolicyEngine {
 
     pub fn set_policies(&mut self, config: PolicyConfig) {
         self.policies = config.policies;
+        // A bucket keeps the capacity from its first use, so a loose host
+        // policy would otherwise survive the sealed rules.
+        self.rate_limiter.clear();
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {

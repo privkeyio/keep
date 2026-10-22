@@ -811,6 +811,17 @@ mod tests {
         }
     }
 
+    fn rate_bytes(max: u32) -> Vec<u8> {
+        postcard::to_allocvec(&PolicyConfig {
+            policies: vec![Policy {
+                name: "rate".into(),
+                rules: vec![PolicyRule::MaxPerMinute(max)],
+                action: PolicyAction::Deny,
+            }],
+        })
+        .unwrap()
+    }
+
     fn limit_bytes(max: u64) -> Vec<u8> {
         postcard::to_allocvec(&PolicyConfig {
             policies: vec![Policy {
@@ -871,6 +882,29 @@ mod tests {
                 action: PolicyAction::Deny,
             }],
         })));
+    }
+
+    #[test]
+    fn a_sealed_rate_limit_replaces_a_seeded_bucket() {
+        let mut server = bare();
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![Policy {
+                name: "loose".into(),
+                rules: vec![PolicyRule::MaxPerMinute(1_000_000)],
+                action: PolicyAction::Deny,
+            }],
+        });
+        let _ = sign_amount(&mut server, 1);
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &rate_bytes(1));
+        match server.handle_import_encrypted_key("k", &blob) {
+            EnclaveResponse::PublicKey { .. } => {}
+            other => panic!("expected the key to import, got {other:?}"),
+        }
+        assert!(matches!(
+            sign_amount(&mut server, 1),
+            EnclaveResponse::Signature { .. }
+        ));
+        assert!(denied(&sign_amount(&mut server, 1)));
     }
 
     #[test]
