@@ -819,6 +819,56 @@ mod tests {
     }
 
     #[test]
+    fn an_allow_amount_cap_does_not_bound_the_fee() {
+        let to = p2tr(other_key());
+        let mut server = bare();
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![
+                Policy {
+                    name: "cap".into(),
+                    rules: vec![PolicyRule::MaxAmountSats(1_000)],
+                    action: PolicyAction::Allow,
+                },
+                Policy {
+                    name: "dest".into(),
+                    rules: vec![PolicyRule::AddressAllowlist(vec![address(&to)])],
+                    action: PolicyAction::Deny,
+                },
+            ],
+        });
+        server.signer.import_key("k", &SECRET).unwrap();
+        let psbt = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to, 1)]);
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn a_fee_cap_after_a_skippable_rule_does_not_bound_the_fee() {
+        let to = p2tr(other_key());
+        let other = p2tr(x_only(&[9u8; 32]));
+        let mut server = bare();
+        server.handle_set_policy(PolicyConfig {
+            policies: vec![
+                Policy {
+                    name: "cap".into(),
+                    rules: vec![
+                        PolicyRule::AddressAllowlist(vec![address(&other)]),
+                        PolicyRule::MaxFeeSats(1_000),
+                    ],
+                    action: PolicyAction::Allow,
+                },
+                Policy {
+                    name: "dest".into(),
+                    rules: vec![PolicyRule::AddressAllowlist(vec![address(&to)])],
+                    action: PolicyAction::Deny,
+                },
+            ],
+        });
+        server.signer.import_key("k", &SECRET).unwrap();
+        let psbt = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to, 1)]);
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
     fn an_or_with_an_allowlist_does_not_bound_the_fee() {
         let to = p2tr(other_key());
         let mut server = server(vec![PolicyRule::Or(vec![

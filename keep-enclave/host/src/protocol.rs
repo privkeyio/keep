@@ -141,6 +141,7 @@ pub enum PolicyRule {
     AllowedEventKinds(Vec<u32>),
     And(Vec<PolicyRule>),
     Or(Vec<PolicyRule>),
+    MaxFeeSats(u64),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,3 +160,16 @@ pub enum PolicyDecision {
 
 pub const VSOCK_PORT: u32 = 5000;
 pub const ENCLAVE_CID: u32 = 16;
+
+#[cfg(test)]
+mod tests {
+    use super::PolicyRule;
+
+    #[test]
+    fn max_fee_keeps_the_previous_rule_indexes() {
+        let allow = postcard::to_allocvec(&PolicyRule::AddressAllowlist(vec!["a".into()])).unwrap();
+        assert_eq!(allow[0], 4);
+        let fee = postcard::to_allocvec(&PolicyRule::MaxFeeSats(9)).unwrap();
+        assert_eq!(fee[0], 11);
+    }
+}

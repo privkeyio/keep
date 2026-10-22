@@ -23,7 +23,6 @@ pub enum PolicyRule {
     MaxPerMinute(u32),
     MaxPerHour(u32),
     MaxPerDay(u32),
-    MaxFeeSats(u64),
     AddressAllowlist(Vec<String>),
     AddressBlocklist(Vec<String>),
     AllowedHours { start: u8, end: u8 },
@@ -31,6 +30,7 @@ pub enum PolicyRule {
     AllowedEventKinds(Vec<u32>),
     And(Vec<PolicyRule>),
     Or(Vec<PolicyRule>),
+    MaxFeeSats(u64),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -105,10 +105,11 @@ impl PolicyEngine {
         self.rate_limiter.clear();
     }
 
-    /// A fee is bounded only by a rule the policy cannot skip. An `Or` bounds
-    /// it when every branch does, because one open branch would authorize any fee.
+    /// A fee is bounded when no rule sequence can allow it. An amount cap counts
+    /// only under Deny or RequireApproval. Under Allow, a failed rule is skipped
+    /// and a later policy can still sign.
     pub fn bounds_fee(&self) -> bool {
-        self.policies.iter().any(|policy| policy.rules.iter().any(rule_bounds_fee))
+        self.policies.iter().any(|policy| !policy_allows_unbounded_fee(policy))
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {
@@ -235,13 +236,77 @@ impl PolicyEngine {
     }
 }
 
-fn rule_bounds_fee(rule: &PolicyRule) -> bool {
-    match rule {
-        PolicyRule::MaxFeeSats(_) | PolicyRule::MaxAmountSats(_) => true,
-        PolicyRule::And(rules) => rules.iter().any(rule_bounds_fee),
-        PolicyRule::Or(rules) => !rules.is_empty() && rules.iter().all(rule_bounds_fee),
-        _ => false,
+struct FeeEffect {
+    pass: bool,
+    fail: bool,
+}
+
+fn policy_allows_unbounded_fee(policy: &Policy) -> bool {
+    for rule in &policy.rules {
+        let effect = rule_fee_effect(rule);
+        if effect.fail && matches!(policy.action, PolicyAction::Allow) {
+            return true;
+        }
+        if !effect.pass {
+            return false;
+        }
     }
+    true
+}
+
+fn rule_fee_effect(rule: &PolicyRule) -> FeeEffect {
+    match rule {
+        PolicyRule::MaxFeeSats(_) => FeeEffect {
+            pass: false,
+            fail: false,
+        },
+        PolicyRule::MaxAmountSats(_) => FeeEffect {
+            pass: false,
+            fail: true,
+        },
+        PolicyRule::And(rules) => and_fee_effect(rules),
+        PolicyRule::Or(rules) => or_fee_effect(rules),
+        _ => FeeEffect {
+            pass: true,
+            fail: true,
+        },
+    }
+}
+
+fn and_fee_effect(rules: &[PolicyRule]) -> FeeEffect {
+    let mut effect = FeeEffect {
+        pass: true,
+        fail: false,
+    };
+    for rule in rules {
+        if !effect.pass {
+            break;
+        }
+        let child = rule_fee_effect(rule);
+        effect.fail |= child.fail;
+        effect.pass = child.pass;
+    }
+    effect
+}
+
+fn or_fee_effect(rules: &[PolicyRule]) -> FeeEffect {
+    let mut effect = FeeEffect {
+        pass: false,
+        fail: false,
+    };
+    let mut open = true;
+    for rule in rules {
+        if !open {
+            break;
+        }
+        let child = rule_fee_effect(rule);
+        effect.pass |= child.pass;
+        open = child.fail;
+    }
+    if open {
+        effect.fail = true;
+    }
+    effect
 }
 
 impl Default for PolicyEngine {
@@ -345,5 +410,57 @@ mod tests {
             engine.evaluate(&ctx_fail),
             PolicyDecision::Deny(_)
         ));
+    }
+
+    fn policy(action: PolicyAction, rules: Vec<PolicyRule>) -> Policy {
+        Policy {
+            name: "p".into(),
+            rules,
+            action,
+        }
+    }
+
+    fn engine(policies: Vec<Policy>) -> PolicyEngine {
+        let mut engine = PolicyEngine::new();
+        engine.set_policies(PolicyConfig { policies });
+        engine
+    }
+
+    #[test]
+    fn an_amount_cap_bounds_the_fee_only_when_breaking_it_stops_the_spend() {
+        let cap = PolicyRule::MaxAmountSats(1_000);
+        assert!(!engine(vec![policy(PolicyAction::Allow, vec![cap.clone()])]).bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::Deny, vec![cap.clone()])]).bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::RequireApproval, vec![cap])]).bounds_fee());
+    }
+
+    #[test]
+    fn a_fee_cap_bounds_the_fee_only_when_evaluation_reaches_it() {
+        let fee = PolicyRule::MaxFeeSats(1_000);
+        let listed = PolicyRule::AddressAllowlist(vec!["bc1".into()]);
+        assert!(engine(vec![policy(PolicyAction::Allow, vec![fee.clone()])]).bounds_fee());
+        assert!(!engine(vec![policy(
+            PolicyAction::Allow,
+            vec![listed.clone(), fee.clone()],
+        )])
+        .bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::Allow, vec![fee, listed.clone()])]).bounds_fee());
+        assert!(!engine(vec![
+            policy(PolicyAction::Allow, vec![PolicyRule::MaxAmountSats(1_000)]),
+            policy(PolicyAction::Deny, vec![listed]),
+        ])
+        .bounds_fee());
+    }
+
+    #[test]
+    fn max_fee_keeps_the_previous_rule_indexes() {
+        let allow = postcard::to_allocvec(&PolicyRule::AddressAllowlist(vec!["a".into()])).unwrap();
+        assert_eq!(allow[0], 4);
+        match postcard::from_bytes::<PolicyRule>(&[4, 1, 1, b'a']).unwrap() {
+            PolicyRule::AddressAllowlist(list) => assert_eq!(list, ["a"]),
+            other => panic!("expected an allowlist, got {other:?}"),
+        }
+        let fee = postcard::to_allocvec(&PolicyRule::MaxFeeSats(9)).unwrap();
+        assert_eq!(fee[0], 11);
     }
 }
