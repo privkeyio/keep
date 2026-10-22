@@ -99,6 +99,9 @@ impl PolicyEngine {
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {
+        if self.policies.is_empty() {
+            return PolicyDecision::Deny(PolicyDenyReason::ExplicitDeny);
+        }
         for i in 0..self.policies.len() {
             let policy = self.policies[i].clone();
             let decision = self.check_policy(&policy, ctx);
@@ -226,6 +229,22 @@ mod tests {
 
     fn now() -> u64 {
         1703001600
+    }
+
+    #[test]
+    fn an_empty_policy_denies() {
+        let mut engine = PolicyEngine::new();
+        let ctx = SigningContext {
+            key_id: "test",
+            amount_sats: Some(1),
+            destination: None,
+            event_kind: None,
+            timestamp: now(),
+        };
+        assert_eq!(
+            engine.evaluate(&ctx),
+            PolicyDecision::Deny(PolicyDenyReason::ExplicitDeny)
+        );
     }
 
     #[test]
