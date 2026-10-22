@@ -23,6 +23,7 @@ pub enum PolicyRule {
     MaxPerMinute(u32),
     MaxPerHour(u32),
     MaxPerDay(u32),
+    MaxFeeSats(u64),
     AddressAllowlist(Vec<String>),
     AddressBlocklist(Vec<String>),
     AllowedHours { start: u8, end: u8 },
@@ -49,6 +50,7 @@ pub enum PolicyDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDenyReason {
     AmountExceeded,
+    FeeExceeded,
     RateLimitExceeded,
     AddressNotAllowed,
     AddressBlocked,
@@ -62,6 +64,7 @@ impl std::fmt::Display for PolicyDenyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AmountExceeded => write!(f, "amount exceeds limit"),
+            Self::FeeExceeded => write!(f, "fee exceeds limit"),
             Self::RateLimitExceeded => write!(f, "rate limit exceeded"),
             Self::AddressNotAllowed => write!(f, "address not in allowlist"),
             Self::AddressBlocked => write!(f, "address is blocked"),
@@ -76,6 +79,7 @@ impl std::fmt::Display for PolicyDenyReason {
 pub struct SigningContext<'a> {
     pub key_id: &'a str,
     pub amount_sats: Option<u64>,
+    pub fee_sats: Option<u64>,
     pub destination: Option<&'a str>,
     pub event_kind: Option<u32>,
     pub timestamp: u64,
@@ -99,6 +103,12 @@ impl PolicyEngine {
         // A bucket keeps the capacity from its first use, so a loose host
         // policy would otherwise survive the sealed rules.
         self.rate_limiter.clear();
+    }
+
+    /// A fee is bounded only by a rule the policy cannot skip. An `Or` bounds
+    /// it when every branch does, because one open branch would authorize any fee.
+    pub fn bounds_fee(&self) -> bool {
+        self.policies.iter().any(|policy| policy.rules.iter().any(rule_bounds_fee))
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {
@@ -146,6 +156,11 @@ impl PolicyEngine {
             PolicyRule::MaxAmountSats(max) => {
                 ctx.amount_sats.map(|a| a <= *max).unwrap_or(true)
             }
+
+            PolicyRule::MaxFeeSats(max) => match ctx.fee_sats {
+                Some(fee) if fee > *max => return Err(PolicyDenyReason::FeeExceeded),
+                _ => true,
+            },
 
             PolicyRule::MaxPerMinute(max) => {
                 self.rate_limiter.check_minute(ctx.key_id, *max)
@@ -220,6 +235,15 @@ impl PolicyEngine {
     }
 }
 
+fn rule_bounds_fee(rule: &PolicyRule) -> bool {
+    match rule {
+        PolicyRule::MaxFeeSats(_) | PolicyRule::MaxAmountSats(_) => true,
+        PolicyRule::And(rules) => rules.iter().any(rule_bounds_fee),
+        PolicyRule::Or(rules) => !rules.is_empty() && rules.iter().all(rule_bounds_fee),
+        _ => false,
+    }
+}
+
 impl Default for PolicyEngine {
     fn default() -> Self {
         Self::new()
@@ -240,6 +264,7 @@ mod tests {
         let ctx = SigningContext {
             key_id: "test",
             amount_sats: Some(1),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -264,6 +289,7 @@ mod tests {
         let ctx_ok = SigningContext {
             key_id: "test",
             amount_sats: Some(500),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -273,6 +299,7 @@ mod tests {
         let ctx_fail = SigningContext {
             key_id: "test",
             amount_sats: Some(2000),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -299,6 +326,7 @@ mod tests {
         let ctx_ok = SigningContext {
             key_id: "test",
             amount_sats: None,
+            fee_sats: None,
             destination: Some("bc1allowed"),
             event_kind: None,
             timestamp: now(),
@@ -308,6 +336,7 @@ mod tests {
         let ctx_fail = SigningContext {
             key_id: "test",
             amount_sats: None,
+            fee_sats: None,
             destination: Some("bc1blocked"),
             event_kind: None,
             timestamp: now(),

@@ -427,6 +427,7 @@ impl VsockServer {
         let ctx = SigningContext {
             key_id: &req.key_id,
             amount_sats: req.amount_sats,
+            fee_sats: None,
             destination: req.destination.as_deref(),
             event_kind: req.event_kind,
             timestamp,
@@ -529,6 +530,12 @@ impl VsockServer {
         total_spend: u64,
         timestamp: u64,
     ) -> Option<EnclaveResponse> {
+        if analysis.fee_sats > 0 && !self.policy_engine.bounds_fee() {
+            return Some(EnclaveResponse::Error {
+                code: ErrorCode::PolicyDenied,
+                message: "fee is not bounded".into(),
+            });
+        }
         let named: Vec<String> = analysis
             .destinations
             .iter()
@@ -547,6 +554,7 @@ impl VsockServer {
             let ctx = SigningContext {
                 key_id,
                 amount_sats: Some(total_spend),
+                fee_sats: Some(analysis.fee_sats),
                 destination: addr,
                 event_kind: None,
                 timestamp,
@@ -783,6 +791,41 @@ mod tests {
             &[(p2tr(x_only(&SECRET)), 50_000)],
             &[(to, 40_000), (ScriptBuf::new_op_return([1u8, 2, 3]), 0)],
         );
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn an_allowlist_alone_does_not_authorize_a_fee() {
+        let to = p2tr(other_key());
+        let mut server = server(vec![PolicyRule::AddressAllowlist(vec![address(&to)])]);
+        let psbt = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to, 40_000)]);
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn a_fee_cap_allows_a_small_fee_and_refuses_a_large_one() {
+        let to = p2tr(other_key());
+        let mut server = server(vec![
+            PolicyRule::AddressAllowlist(vec![address(&to)]),
+            PolicyRule::MaxFeeSats(1_000),
+        ]);
+        let small = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to.clone(), 49_000)]);
+        match sign(&mut server, &small) {
+            EnclaveResponse::SignedPsbt { signed_inputs, .. } => assert_eq!(signed_inputs, 1),
+            other => panic!("expected a signed PSBT, got {other:?}"),
+        }
+        let large = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to, 40_000)]);
+        assert!(denied(&sign(&mut server, &large)));
+    }
+
+    #[test]
+    fn an_or_with_an_allowlist_does_not_bound_the_fee() {
+        let to = p2tr(other_key());
+        let mut server = server(vec![PolicyRule::Or(vec![
+            PolicyRule::AddressAllowlist(vec![address(&to)]),
+            PolicyRule::MaxAmountSats(1_000_000),
+        ])]);
+        let psbt = psbt(&[(p2tr(x_only(&SECRET)), 50_000)], &[(to, 40_000)]);
         assert!(denied(&sign(&mut server, &psbt)));
     }
 
