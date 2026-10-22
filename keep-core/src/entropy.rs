@@ -6,6 +6,13 @@ use blake2::{Blake2b512, Digest};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+use crate::frost::{frozen_positions, pair_looks_random, MAX_FROZEN_POSITIONS};
+
+#[cfg(test)]
+use crate::frost::{hamming_distance, MIN_HAMMING};
+
+pub use crate::frost::EntropyHealthError;
+
 const POOL_SIZE: usize = 128;
 
 static PROCESS_CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -272,121 +279,14 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     try_random_bytes().expect("RNG health check failed: constant or zero output detected")
 }
 
-/// Why a draw could not be trusted.
-///
-/// The two arms are kept apart because they call for different responses. A
-/// source that answered with constant output is a property of the machine and
-/// will not improve on its own, so a co-signer should stop and stay stopped.
-/// A call that failed to complete is a different statement, closer to "no file
-/// descriptors" than to "the kernel is broken", and treating it as permanent
-/// turns a transient fault into an outage that needs an operator to clear.
-/// They also read differently in a log, which matters when someone is trying to
-/// work out what happened.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntropyHealthError {
-    /// The source answered, and what it returned failed the health criteria.
-    Degraded,
-    /// The source could not be read at all.
-    Unavailable,
-}
-
-impl std::fmt::Display for EntropyHealthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Degraded => write!(
-                f,
-                "RNG health check failed: constant or zero output detected"
-            ),
-            Self::Unavailable => write!(f, "RNG unavailable: the OS refused to provide entropy"),
-        }
-    }
-}
-
-impl std::error::Error for EntropyHealthError {}
-
-fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
-    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
-}
-
-const MIN_HAMMING: u32 = 64;
-
-/// The most byte positions that may hold the same value in every sample before
-/// the samples are refused. Only meaningful across three or more samples.
-pub(crate) const MAX_FROZEN_POSITIONS: usize = 3;
-
-/// How many of the 32 byte positions hold the same value, whatever it is, in
-/// every one of `samples`.
-///
-/// This replaces a test that refused any position holding `0x00` or `0xff` in
-/// every sample, which got both its rate and its coverage wrong.
-///
-/// Its rate: that happens to healthy randomness about once in 260,000
-/// three-sample calls, measured at 12 in 3,000,000 checked draws against the
-/// analytic 11.4. Every failure latches a co-signing node, and the periodic
-/// check runs every 30 seconds, so a healthy always-on node took itself out of
-/// service about once a month.
-///
-/// Its coverage: it caught a frozen extreme byte, and any number of them, but
-/// never a frozen byte of any other value. A source that fills part of a buffer
-/// and leaves the rest as it was is the case that matters, because several
-/// draws turn bytes straight into a scalar with no hash between: the dealer's
-/// key, every polynomial coefficient, refresh and repair deltas, and the DKG
-/// proof-of-knowledge nonce. Twelve frozen bytes there leave 160 bits in known
-/// positions, about 2^80 work to recover, and the Hamming floor does not catch
-/// it until roughly half the bytes are frozen.
-///
-/// Counting positions frozen at any value, and refusing above
-/// [`MAX_FROZEN_POSITIONS`], fixes both. A position matches across three
-/// independent samples with probability 1 in 65,536, so four or more of 32
-/// doing so is a binomial tail of about 2e-15, the same order as the Hamming
-/// floor, and no healthy node latches on it. What it still lets through, one to
-/// three frozen positions, leaves at least 232 bits.
-///
-/// Three samples is the floor. Across two, a position matches with probability
-/// 1 in 256, and four of 32 matching becomes about 8e-6 per call, which is the
-/// rate this exists to get away from.
-pub(crate) fn frozen_positions(samples: &[[u8; 32]]) -> usize {
-    debug_assert!(
-        samples.len() >= 3,
-        "frozen_positions needs three samples; below that healthy input trips it"
-    );
-    let Some((first, rest)) = samples.split_first() else {
-        return 0;
-    };
-    (0..32)
-        .filter(|&pos| rest.iter().all(|s| s[pos] == first[pos]))
-        .count()
-}
-
-/// Applies the health criteria to three samples: none all-zero, all distinct,
-/// no more than [`MAX_FROZEN_POSITIONS`] byte positions holding the same value
-/// across all three, and every pair at least [`MIN_HAMMING`] bits apart.
+/// Applies the health criteria to three samples: every pair passes
+/// [`pair_looks_random`], and no more than [`MAX_FROZEN_POSITIONS`] byte
+/// positions hold the same value across all three.
 fn samples_look_random(samples: &[[u8; 32]; 3]) -> bool {
-    let all_nonzero = samples.iter().all(|s| s.iter().any(|&b| b != 0));
-    let all_unique =
-        samples[0] != samples[1] && samples[1] != samples[2] && samples[0] != samples[2];
-
-    if !all_nonzero || !all_unique || frozen_positions(samples) > MAX_FROZEN_POSITIONS {
-        return false;
-    }
-
     [(0, 1), (1, 2), (0, 2)]
         .iter()
-        .all(|&(i, j)| hamming_distance(&samples[i], &samples[j]) >= MIN_HAMMING)
-}
-
-/// The health criteria for a pair of draws, for a caller judging the bytes it
-/// was handed rather than a sample drawn beside them: neither draw all-zero,
-/// the two distinct, and at least [`MIN_HAMMING`] bits apart, which a source
-/// repeating itself with a handful of bits flipped still fails.
-///
-/// These are the same criteria [`check_entropy_health`] applies to each of its
-/// pairs. The frozen-position count is not among them, because across two
-/// samples healthy randomness trips it often enough to latch a node; it needs
-/// three, see [`frozen_positions`].
-pub(crate) fn pair_looks_random(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let nonzero = |s: &[u8; 32]| s.iter().any(|&b| b != 0);
-    nonzero(a) && nonzero(b) && a != b && hamming_distance(a, b) >= MIN_HAMMING
+        .all(|&(i, j)| pair_looks_random(&samples[i], &samples[j]))
+        && frozen_positions(samples) <= MAX_FROZEN_POSITIONS
 }
 
 /// Draws three samples straight from the OS RNG, with nothing mixed in.

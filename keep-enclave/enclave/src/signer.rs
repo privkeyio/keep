@@ -11,11 +11,13 @@ use bitcoin::psbt::Psbt;
 use bitcoin::Network;
 use frost_secp256k1_tr as frost;
 use k256::schnorr::SigningKey;
-use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use signature::Signer;
 use std::collections::{BTreeMap, HashMap};
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+#[path = "../../../keep-core/src/frost/checked_rng.rs"]
+mod checked_rng;
 
 #[derive(ZeroizeOnDrop)]
 pub struct EnclaveSigner {
@@ -196,7 +198,8 @@ impl EnclaveSigner {
         let signed_count = PsbtKeys::new(&entry.secret, network)?.sign(&mut psbt)?;
         let signed_bytes = psbt.serialize();
 
-        self.audit_log.log_psbt_sign(key_id, psbt_bytes, signed_count);
+        self.audit_log
+            .log_psbt_sign(key_id, psbt_bytes, signed_count);
 
         Ok((signed_bytes, signed_count))
     }
@@ -225,7 +228,9 @@ impl EnclaveSigner {
         let key_package = frost::keys::KeyPackage::deserialize(&key_package_bytes)
             .map_err(|e| EnclaveError::InvalidKey(format!("Invalid FROST key package: {}", e)))?;
 
-        let pubkey = key_package.verifying_key().serialize()
+        let pubkey = key_package
+            .verifying_key()
+            .serialize()
             .map_err(|e| EnclaveError::InvalidKey(format!("Failed to serialize pubkey: {}", e)))?;
         let mut pubkey_arr = [0u8; 32];
         pubkey_arr.copy_from_slice(&pubkey[1..33]);
@@ -241,35 +246,57 @@ impl EnclaveSigner {
         Ok(pubkey_arr)
     }
 
-    pub fn frost_round1(
-        &mut self,
-        key_id: &str,
-        message: &[u8],
-    ) -> Result<(Vec<u8>, [u8; 32])> {
-        let entry = self.frost_keys.get(key_id)
+    pub fn frost_round1(&mut self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
+        let entry = self
+            .frost_keys
+            .get(key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))?;
 
         let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
-        let mut rng = OsRng;
-        let (nonces, our_commitment) = frost::round1::commit(key_package.signing_share(), &mut rng);
+        let identifier = *key_package.identifier();
+        // commit_checked certifies the OsRng frost-core reads. The NSM-backed
+        // getrandom below only names the session.
+        let drawn = checked_rng::commit_checked(key_package.signing_share())
+            .map_err(|e| EnclaveError::Signing(e.to_string()));
+        self.store_round1(key_id, message, identifier, drawn)
+    }
 
-        let commitment_bytes = our_commitment.serialize()
+    fn store_round1(
+        &mut self,
+        key_id: &str,
+        message: &[u8],
+        identifier: frost::Identifier,
+        drawn: std::result::Result<
+            (
+                frost::round1::SigningNonces,
+                frost::round1::SigningCommitments,
+            ),
+            EnclaveError,
+        >,
+    ) -> Result<(Vec<u8>, [u8; 32])> {
+        let (nonces, our_commitment) = drawn?;
+
+        let commitment_bytes = our_commitment
+            .serialize()
             .map_err(|e| EnclaveError::Signing(format!("Failed to serialize commitment: {}", e)))?;
 
         let mut session_id = [0u8; 32];
         getrandom(&mut session_id)?;
 
         let mut commitments = BTreeMap::new();
-        commitments.insert(*key_package.identifier(), our_commitment);
+        commitments.insert(identifier, our_commitment);
 
-        self.frost_sessions.insert(session_id, FrostSession {
-            nonces,
-            commitments,
-            message: message.to_vec(),
-            key_id: key_id.to_string(),
-        });
+        self.frost_sessions.insert(
+            session_id,
+            FrostSession {
+                nonces,
+                commitments,
+                message: message.to_vec(),
+                key_id: key_id.to_string(),
+            },
+        );
 
         self.audit_log.log_frost_round1(key_id, message, session_id);
 
@@ -282,7 +309,9 @@ impl EnclaveSigner {
         identifier_bytes: &[u8],
         commitment_bytes: &[u8],
     ) -> Result<()> {
-        let session = self.frost_sessions.get_mut(&session_id)
+        let session = self
+            .frost_sessions
+            .get_mut(&session_id)
             .ok_or_else(|| EnclaveError::Signing("Session not found".into()))?;
 
         let identifier = frost::Identifier::deserialize(identifier_bytes)
@@ -294,29 +323,32 @@ impl EnclaveSigner {
         Ok(())
     }
 
-    pub fn frost_round2(
-        &mut self,
-        session_id: [u8; 32],
-    ) -> Result<Vec<u8>> {
-        let session = self.frost_sessions.remove(&session_id)
+    pub fn frost_round2(&mut self, session_id: [u8; 32]) -> Result<Vec<u8>> {
+        let session = self
+            .frost_sessions
+            .remove(&session_id)
             .ok_or_else(|| EnclaveError::Signing("Session not found".into()))?;
 
         let key_id = session.key_id.clone();
 
-        let entry = self.frost_keys.get(&key_id)
+        let entry = self
+            .frost_keys
+            .get(&key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.clone()))?;
 
         let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
-        let signing_package = frost::SigningPackage::new(session.commitments.clone(), &session.message);
+        let signing_package =
+            frost::SigningPackage::new(session.commitments.clone(), &session.message);
 
         let signature_share = frost::round2::sign(&signing_package, &session.nonces, &key_package)
             .map_err(|e| EnclaveError::Signing(format!("FROST signing failed: {}", e)))?;
 
         let share_bytes = signature_share.serialize();
 
-        self.audit_log.log_frost_round2(&key_id, session_id, &share_bytes);
+        self.audit_log
+            .log_frost_round2(&key_id, session_id, &share_bytes);
 
         Ok(share_bytes)
     }
@@ -452,5 +484,111 @@ mod tests {
         let mut signer = test_signer();
         let result = signer.sign("nonexistent", b"test");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn two_round1_draws_do_not_repeat_a_commitment() {
+        let mut signer = signer_with_share();
+        let (first, _) = signer.frost_round1("group", b"one").unwrap();
+        let (second, _) = signer.frost_round1("group", b"two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(signer.frost_sessions.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_draw_stores_no_session() {
+        let mut signer = test_signer();
+        let err = signer
+            .store_round1(
+                "group",
+                b"msg",
+                frost::Identifier::try_from(1u16).unwrap(),
+                Err(EnclaveError::Signing(
+                    "RNG health check failed: constant or zero output detected".into(),
+                )),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("RNG health check failed"), "{err}");
+        assert!(signer.frost_sessions.is_empty());
+    }
+
+    #[test]
+    fn a_checked_round1_completes_a_verifying_signature() {
+        let (shares, pubkey_package) = frost::keys::generate_with_dealer(
+            2,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut rand_core::OsRng,
+        )
+        .unwrap();
+        let mut packages = shares
+            .into_iter()
+            .map(|(_, secret)| frost::keys::KeyPackage::try_from(secret).unwrap());
+        let our_key = packages.next().unwrap();
+        let their_key = packages.next().unwrap();
+
+        let mut signer = test_signer();
+        signer
+            .import_frost_key(
+                "group",
+                our_key.serialize().unwrap(),
+                pubkey_package.serialize().unwrap(),
+            )
+            .unwrap();
+
+        let message = b"pay the allowed destination";
+        let (our_commitment_bytes, session_id) = signer.frost_round1("group", message).unwrap();
+        let our_commitment =
+            frost::round1::SigningCommitments::deserialize(&our_commitment_bytes).unwrap();
+        let (their_nonces, their_commitment) =
+            checked_rng::commit_checked(their_key.signing_share()).unwrap();
+        signer
+            .frost_add_commitment(
+                session_id,
+                &their_key.identifier().serialize(),
+                &their_commitment.serialize().unwrap(),
+            )
+            .unwrap();
+
+        let mut commitments = BTreeMap::new();
+        commitments.insert(*our_key.identifier(), our_commitment);
+        commitments.insert(*their_key.identifier(), their_commitment);
+        let signing_package = frost::SigningPackage::new(commitments, message);
+
+        let our_share_bytes = signer.frost_round2(session_id).unwrap();
+        let our_share = frost::round2::SignatureShare::deserialize(&our_share_bytes).unwrap();
+        let their_share = frost::round2::sign(&signing_package, &their_nonces, &their_key).unwrap();
+
+        let mut signature_shares = BTreeMap::new();
+        signature_shares.insert(*our_key.identifier(), our_share);
+        signature_shares.insert(*their_key.identifier(), their_share);
+        let signature =
+            frost::aggregate(&signing_package, &signature_shares, &pubkey_package).unwrap();
+        pubkey_package
+            .verifying_key()
+            .verify(message, &signature)
+            .unwrap();
+        assert!(signer.frost_sessions.is_empty());
+    }
+
+    fn signer_with_share() -> EnclaveSigner {
+        let (shares, pubkey_package) = frost::keys::generate_with_dealer(
+            2,
+            2,
+            frost::keys::IdentifierList::Default,
+            &mut rand_core::OsRng,
+        )
+        .unwrap();
+        let (_, secret) = shares.into_iter().next().unwrap();
+        let key = frost::keys::KeyPackage::try_from(secret).unwrap();
+        let mut signer = test_signer();
+        signer
+            .import_frost_key(
+                "group",
+                key.serialize().unwrap(),
+                pubkey_package.serialize().unwrap(),
+            )
+            .unwrap();
+        signer
     }
 }

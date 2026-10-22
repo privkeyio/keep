@@ -22,7 +22,12 @@ mod verifying_set;
 #[cfg(feature = "ed25519")]
 pub mod ed25519;
 
+#[doc(hidden)]
+pub use checked_rng::EntropyHealthError;
 pub use checked_rng::{checked_draw, commit_checked, CheckedRng};
+pub(crate) use checked_rng::{frozen_positions, pair_looks_random, MAX_FROZEN_POSITIONS};
+#[cfg(test)]
+pub(crate) use checked_rng::{hamming_distance, MIN_HAMMING};
 pub use coordinator::Coordinator;
 pub use dealer::{ThresholdConfig, TrustedDealer};
 pub use recover::recover_nsec;
