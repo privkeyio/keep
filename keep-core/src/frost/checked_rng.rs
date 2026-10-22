@@ -3,7 +3,7 @@
 
 //! Secret generation that checks the draw the secret is built from.
 //!
-//! [`check_entropy_health`] certifies the source by drawing samples of its own.
+//! The periodic entropy probe certifies the source by drawing samples of its own.
 //! A secret drawn afterwards comes from a different call, so a source that
 //! fails between the probe and the draw yields key material no check ever
 //! looked at. The window is narrow and periodic probing closes most of it, but
@@ -44,15 +44,115 @@
 //! do better. At a site that makes a single draw the only comparison is against
 //! bytes drawn after the secret, which catches a source that is still degraded
 //! when probed but not one that emits a single chosen value and then recovers.
-//!
-//! [`check_entropy_health`]: crate::entropy::check_entropy_health
+
+// The Ed25519 half is gated on keep-core's `ed25519` feature. This file is also
+// compiled into the enclave, which does not declare that feature.
+#![allow(unexpected_cfgs)]
 
 use frost_secp256k1_tr::rand_core::{impls, CryptoRng, Error as RngError, OsRng, RngCore};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::entropy::{
-    frozen_positions, pair_looks_random, EntropyHealthError, MAX_FROZEN_POSITIONS,
-};
+/// Why a draw could not be trusted.
+///
+/// The two arms are kept apart because they call for different responses. A
+/// source that answered with constant output is a property of the machine and
+/// will not improve on its own, so a co-signer should stop and stay stopped.
+/// A call that failed to complete is a different statement, closer to "no file
+/// descriptors" than to "the kernel is broken", and treating it as permanent
+/// turns a transient fault into an outage that needs an operator to clear.
+/// They also read differently in a log, which matters when someone is trying to
+/// work out what happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntropyHealthError {
+    /// The source answered, and what it returned failed the health criteria.
+    Degraded,
+    /// The source could not be read at all.
+    Unavailable,
+}
+
+impl std::fmt::Display for EntropyHealthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Degraded => write!(
+                f,
+                "RNG health check failed: constant or zero output detected"
+            ),
+            Self::Unavailable => write!(f, "RNG unavailable: the OS refused to provide entropy"),
+        }
+    }
+}
+
+impl std::error::Error for EntropyHealthError {}
+
+/// How many bits differ between two 32-byte draws.
+pub(crate) fn hamming_distance(a: &[u8; 32], b: &[u8; 32]) -> u32 {
+    a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum()
+}
+
+/// Bits two draws must differ by before they count as independent.
+pub(crate) const MIN_HAMMING: u32 = 64;
+
+/// The most byte positions that may hold the same value in every sample before
+/// the samples are refused. Only meaningful across three or more samples.
+pub(crate) const MAX_FROZEN_POSITIONS: usize = 3;
+
+/// How many of the 32 byte positions hold the same value, whatever it is, in
+/// every one of `samples`.
+///
+/// This replaces a test that refused any position holding `0x00` or `0xff` in
+/// every sample, which got both its rate and its coverage wrong.
+///
+/// Its rate: that happens to healthy randomness about once in 260,000
+/// three-sample calls, measured at 12 in 3,000,000 checked draws against the
+/// analytic 11.4. Every failure latches a co-signing node, and the periodic
+/// check runs every 30 seconds, so a healthy always-on node took itself out of
+/// service about once a month.
+///
+/// Its coverage: it caught a frozen extreme byte, and any number of them, but
+/// never a frozen byte of any other value. A source that fills part of a buffer
+/// and leaves the rest as it was is the case that matters, because several
+/// draws turn bytes straight into a scalar with no hash between: the dealer's
+/// key, every polynomial coefficient, refresh and repair deltas, and the DKG
+/// proof-of-knowledge nonce. Twelve frozen bytes there leave 160 bits in known
+/// positions, about 2^80 work to recover, and the Hamming floor does not catch
+/// it until roughly half the bytes are frozen.
+///
+/// Counting positions frozen at any value, and refusing above
+/// [`MAX_FROZEN_POSITIONS`], fixes both. A position matches across three
+/// independent samples with probability 1 in 65,536, so four or more of 32
+/// doing so is a binomial tail of about 2e-15, the same order as the Hamming
+/// floor, and no healthy node latches on it. What it still lets through, one to
+/// three frozen positions, leaves at least 232 bits.
+///
+/// Three samples is the floor. Across two, a position matches with probability
+/// 1 in 256, and four of 32 matching becomes about 8e-6 per call, which is the
+/// rate this exists to get away from.
+pub(crate) fn frozen_positions(samples: &[[u8; 32]]) -> usize {
+    debug_assert!(
+        samples.len() >= 3,
+        "frozen_positions needs three samples; below that healthy input trips it"
+    );
+    let Some((first, rest)) = samples.split_first() else {
+        return 0;
+    };
+    (0..32)
+        .filter(|&pos| rest.iter().all(|s| s[pos] == first[pos]))
+        .count()
+}
+
+/// The health criteria for a pair of draws, for a caller judging the bytes it
+/// was handed rather than a sample drawn beside them: neither draw all-zero,
+/// the two distinct, and at least [`MIN_HAMMING`] bits apart, which a source
+/// repeating itself with a handful of bits flipped still fails.
+///
+/// These are the same criteria the periodic entropy probe applies to each of
+/// its pairs. The frozen-position count is not among them, because across two
+/// samples healthy randomness trips it often enough to latch a node; it needs
+/// three, see [`frozen_positions`].
+pub(crate) fn pair_looks_random(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let nonzero = |s: &[u8; 32]| s.iter().any(|&b| b != 0);
+    nonzero(a) && nonzero(b) && a != b && hamming_distance(a, b) >= MIN_HAMMING
+}
 
 /// An RNG that holds every fill it hands out to the health criteria.
 ///
