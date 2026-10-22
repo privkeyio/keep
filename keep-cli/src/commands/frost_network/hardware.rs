@@ -100,12 +100,8 @@ pub fn cmd_frost_network_sign_hardware(
 
     rt.block_on(async {
         let keys = Keys::generate();
-        let client = Client::new(keys.clone());
-        client
-            .add_relay(relay)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
-        client.connect().await;
+        let client =
+            crate::pinning::connect_client(path, &[relay.to_string()], keys.clone()).await?;
 
         out.info("Connected to relay");
         out.field(
@@ -424,13 +420,8 @@ pub fn cmd_frost_network_nonce_precommit(
 
     rt.block_on(async {
         let keys = Keys::generate();
-        let client = Client::new(keys.clone());
-
-        client
-            .add_relay(relay)
-            .await
-            .map_err(|e| KeepError::NetworkErr(NetworkError::relay(e.to_string())))?;
-        client.connect().await;
+        let client =
+            crate::pinning::connect_client(path, &[relay.to_string()], keys.clone()).await?;
 
         out.info("Connected to relay");
         out.field(

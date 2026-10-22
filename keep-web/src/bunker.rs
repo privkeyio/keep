@@ -245,12 +245,38 @@ pub struct NetworkConfig {
     /// the share was stored without it, so the caller can store it in the vault.
     pub learned_verifying_shares:
         tokio::sync::mpsc::UnboundedSender<(u16, std::collections::BTreeMap<u16, [u8; 33]>)>,
+    /// Vault directory that holds `cert-pins.json`.
+    pub pin_dir: std::path::PathBuf,
+    /// Refuse a relay that has no recorded pin, and refuse a non-`wss` relay.
+    pub require_pinned: bool,
 }
 
 /// What `spawn_network_frost` reports back once the co-signer is up.
 pub struct NetworkHandle {
     pub info: BunkerInfo,
     pub node: Arc<KfpNode>,
+}
+
+/// Probe every relay, record a first-use pin, and return the handle the live
+/// handshake enforces. A corrupt pin file, or a cleartext relay while strict
+/// pinning is on, refuses to connect.
+async fn relay_pinning(
+    pin_dir: &std::path::Path,
+    require_pinned: bool,
+    frost_relays: &[String],
+    bunker_relays: &[String],
+) -> Result<keep_frost_net::TlsPinning, String> {
+    let store = keep_frost_net::RelayPinStore::open(pin_dir, require_pinned)
+        .map_err(|e| format!("certificate pins: {e}"))?;
+    store
+        .probe(frost_relays, None)
+        .await
+        .map_err(|e| format!("certificate pins: {e}"))?;
+    store
+        .probe(bunker_relays, None)
+        .await
+        .map_err(|e| format!("certificate pins: {e}"))?;
+    Ok(store.pinning())
 }
 
 /// Spawns the always-on network-FROST co-signer: a long-lived `KfpNode` that
@@ -276,7 +302,28 @@ pub fn spawn_network_frost(
             let threshold = cfg.share.metadata.threshold;
             let total = cfg.share.metadata.total_shares;
 
-            let node = match KfpNode::new(cfg.share, cfg.frost_relays.clone()).await {
+            let pinning = match relay_pinning(
+                &cfg.pin_dir,
+                cfg.require_pinned,
+                &cfg.frost_relays,
+                &cfg.bunker_relays,
+            )
+            .await
+            {
+                Ok(pinning) => pinning,
+                Err(e) => {
+                    let _ = info_tx.send(Err(e));
+                    return;
+                }
+            };
+            let node = match KfpNode::new_pinned(
+                cfg.share,
+                cfg.frost_relays.clone(),
+                None,
+                pinning.clone(),
+            )
+            .await
+            {
                 Ok(n) => Arc::new(n),
                 Err(e) => {
                     let _ = info_tx.send(Err(format!("frost node: {e}")));
@@ -343,6 +390,7 @@ pub fn spawn_network_frost(
                 &cfg.bunker_relays,
                 Some(callbacks),
                 ServerConfig {
+                    tls_pinning: Some(pinning),
                     // Least privilege for the co-signer: connect handshake +
                     // signing only, not NIP-04/44 encrypt/decrypt.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
@@ -396,6 +444,8 @@ pub fn spawn_single_key(
     bunker_secret: String,
     events: broadcast::Sender<Event>,
     approvals: Arc<StdMutex<HashMap<u64, Sender<bool>>>>,
+    pin_dir: std::path::PathBuf,
+    require_pinned: bool,
 ) -> Result<BunkerInfo, String> {
     let (info_tx, info_rx) = channel::<Result<BunkerInfo, String>>();
 
@@ -413,6 +463,13 @@ pub fn spawn_single_key(
                 approvals,
                 signing_enabled: None,
             });
+            let pinning = match relay_pinning(&pin_dir, require_pinned, &[], &relays).await {
+                Ok(pinning) => pinning,
+                Err(e) => {
+                    let _ = info_tx.send(Err(e));
+                    return;
+                }
+            };
             let mut server = match Server::new_with_config(
                 keyring,
                 None,
@@ -420,6 +477,7 @@ pub fn spawn_single_key(
                 &relays,
                 Some(callbacks),
                 ServerConfig {
+                    tls_pinning: Some(pinning),
                     // Least privilege for the single-key fallback: connect +
                     // signing only.
                     connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,

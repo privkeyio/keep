@@ -151,7 +151,8 @@ pub fn cmd_secret_add(
         // any other id would seal a value no quorum could reopen.
         let record = SecretRecord::new(name.to_string(), kind_core, value.to_vec())?;
         let oprf_id = hex::encode(record.id);
-        let oprf_key = derive_secret_seal_key(out, &keep, oprf, default_relay, &oprf_id, epoch)?;
+        let oprf_key =
+            derive_secret_seal_key(out, path, &keep, oprf, default_relay, &oprf_id, epoch)?;
         keep.store_sealed_secret(record, &oprf_key, epoch)?;
         out.success(&format!(
             "Stored threshold-sealed secret '{name}' ({kind_core:?}); id {oprf_id}. \
@@ -243,8 +244,15 @@ pub fn cmd_secret_get(
     // leaves no misleading "revealed" entry.
     let revealed: Zeroizing<Vec<u8>> = match seal {
         Some(seal) => {
-            let oprf_key =
-                derive_secret_seal_key(out, &keep, oprf, default_relay, &seal.oprf_id, seal.epoch)?;
+            let oprf_key = derive_secret_seal_key(
+                out,
+                path,
+                &keep,
+                oprf,
+                default_relay,
+                &seal.oprf_id,
+                seal.epoch,
+            )?;
             keep.reveal_sealed_secret(&id, &oprf_key)?
         }
         None => keep.reveal_secret(&id)?,

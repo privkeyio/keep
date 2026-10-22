@@ -112,9 +112,8 @@ pub fn cmd_serve(
 
         return rt.block_on(async {
             out.info("Connecting to FROST network...");
-            let node = keep_frost_net::KfpNode::new(share, vec![frost_relay.to_string()])
-                .await
-                .map_err(|e| KeepError::Frost(e.to_string()))?;
+            let node =
+                crate::pinning::connect_node(path, share, vec![frost_relay.to_string()]).await?;
 
             node.announce()
                 .await
@@ -137,15 +136,21 @@ pub fn cmd_serve(
 
             let transport_key: [u8; 32] = keep_core::crypto::try_random_bytes()?;
 
+            let bunker = crate::pinning::pin_bunker(
+                path,
+                &[relay.to_string()],
+                ServerConfig {
+                    auto_approve: true,
+                    ..ServerConfig::default()
+                },
+            )
+            .await?;
             let mut server = Server::new_network_frost_with_config(
                 net_signer,
                 transport_key,
                 &[relay.to_string()],
                 None,
-                ServerConfig {
-                    auto_approve: true,
-                    ..ServerConfig::default()
-                },
+                bunker,
             )
             .await?;
             let bunker_url = server.bunker_url();
@@ -234,6 +239,8 @@ pub fn cmd_serve(
             ..Default::default()
         };
         rt.block_on(async {
+            let headless_config =
+                crate::pinning::pin_bunker(path, &[relay.to_string()], headless_config).await?;
             // Serve a local inspect socket so read-only commands (`keep list`)
             // can query this daemon instead of failing on the exclusive writer
             // lock (#533). Owner-only; metadata only. Shares the same keyring.
@@ -282,8 +289,18 @@ pub fn cmd_serve(
     let (bunker_url, npub, keyring_for_tui, transport_key_for_tui) = rt.block_on(async {
         if let Some(ref frost) = frost_signer {
             let transport_key: [u8; 32] = keep_core::crypto::try_random_bytes()?;
-            let server =
-                Server::new_frost(frost.clone(), transport_key, &[relay.to_string()], None).await?;
+            let config =
+                crate::pinning::pin_bunker(path, &[relay.to_string()], ServerConfig::default())
+                    .await?;
+            let server = Server::new_with_config(
+                Arc::new(Mutex::new(Keyring::new())),
+                Some(frost.clone()),
+                Some(transport_key),
+                &[relay.to_string()],
+                None,
+                config,
+            )
+            .await?;
             Ok::<_, KeepError>((
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
@@ -291,7 +308,18 @@ pub fn cmd_serve(
                 Some(transport_key),
             ))
         } else {
-            let server = Server::new(keyring.clone(), &[relay.to_string()], None).await?;
+            let config =
+                crate::pinning::pin_bunker(path, &[relay.to_string()], ServerConfig::default())
+                    .await?;
+            let server = Server::new_with_config(
+                keyring.clone(),
+                None,
+                None,
+                &[relay.to_string()],
+                None,
+                config,
+            )
+            .await?;
             Ok::<_, KeepError>((
                 server.bunker_url(),
                 server.pubkey().to_bech32().unwrap_or_default(),
@@ -306,6 +334,7 @@ pub fn cmd_serve(
     let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
+    let vault = path.to_path_buf();
 
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
@@ -329,6 +358,21 @@ pub fn cmd_serve(
             if !global_auto_approve.is_empty() {
                 tui_config.auto_approve_kinds = global_auto_approve;
             }
+            let tui_config = match crate::pinning::pin_bunker(
+                &vault,
+                std::slice::from_ref(&relay_clone),
+                tui_config,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(TuiEvent::Log(
+                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
             let mut server =
                 if let (Some(frost), Some(transport_key)) = (frost_signer, transport_key_for_tui) {
                     match Server::new_with_config(
@@ -386,12 +430,14 @@ pub fn cmd_serve(
 }
 
 fn spawn_tui_server(
+    vault: &Path,
     keyring: Arc<Mutex<Keyring>>,
     relay: &str,
     bunker_url: String,
     npub: String,
     global_auto_approve: std::collections::HashSet<nostr_sdk::Kind>,
 ) -> Result<()> {
+    let vault = vault.to_path_buf();
     let (mut tui, tui_tx) = crate::tui::Tui::new(bunker_url, npub, relay.to_string());
     let tui_tx_clone = tui_tx.clone();
     let relay_clone = relay.to_string();
@@ -418,6 +464,21 @@ fn spawn_tui_server(
             if !global_auto_approve.is_empty() {
                 tui_config.auto_approve_kinds = global_auto_approve;
             }
+            let tui_config = match crate::pinning::pin_bunker(
+                &vault,
+                std::slice::from_ref(&relay_clone),
+                tui_config,
+            )
+            .await
+            {
+                Ok(config) => config,
+                Err(e) => {
+                    let _ = tui_tx_clone.send(TuiEvent::Log(
+                        LogEntry::new("system", "server error", false).with_detail(&e.to_string()),
+                    ));
+                    return;
+                }
+            };
 
             let mut server = match Server::new_with_config(
                 keyring,
@@ -453,6 +514,7 @@ fn spawn_tui_server(
 
 fn run_headless(
     out: &Output,
+    vault: &Path,
     keyring: Arc<Mutex<Keyring>>,
     relay: &str,
     pre_grants: Vec<keep_nip46::PreGrantedApp>,
@@ -475,6 +537,7 @@ fn run_headless(
         config.auto_approve_kinds = global_auto_approve;
     }
     rt.block_on(async {
+        let config = crate::pinning::pin_bunker(vault, &[relay.to_string()], config).await?;
         let mut server =
             Server::new_with_config(keyring, None, None, &[relay.to_string()], None, config)
                 .await?;
@@ -488,11 +551,20 @@ fn run_headless(
     Ok(())
 }
 
-fn get_bunker_info(keyring: Arc<Mutex<Keyring>>, relay: &str) -> Result<(String, String)> {
+fn get_bunker_info(
+    vault: &Path,
+    keyring: Arc<Mutex<Keyring>>,
+    relay: &str,
+) -> Result<(String, String)> {
     let rt =
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
     rt.block_on(async {
-        let server = Server::new(keyring, &[relay.to_string()], None).await?;
+        let config =
+            crate::pinning::pin_bunker(vault, &[relay.to_string()], ServerConfig::default())
+                .await?;
+        let server =
+            Server::new_with_config(keyring, None, None, &[relay.to_string()], None, config)
+                .await?;
         Ok((
             server.bunker_url(),
             server.pubkey().to_bech32().unwrap_or_default(),
@@ -541,12 +613,12 @@ fn cmd_serve_outer(out: &Output, path: &Path, relay: &str, headless: bool) -> Re
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
+        return run_headless(out, path, keyring, relay, pre_grants, global_auto_approve);
     }
 
-    let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
+    let (bunker_url, npub) = get_bunker_info(path, keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI");
-    spawn_tui_server(keyring, relay, bunker_url, npub, global_auto_approve)
+    spawn_tui_server(path, keyring, relay, bunker_url, npub, global_auto_approve)
 }
 
 fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> Result<()> {
@@ -577,12 +649,12 @@ fn cmd_serve_hidden(out: &Output, path: &Path, relay: &str, headless: bool) -> R
     let keyring = Arc::new(Mutex::new(keyring));
 
     if headless {
-        return run_headless(out, keyring, relay, pre_grants, global_auto_approve);
+        return run_headless(out, path, keyring, relay, pre_grants, global_auto_approve);
     }
 
-    let (bunker_url, npub) = get_bunker_info(keyring.clone(), relay)?;
+    let (bunker_url, npub) = get_bunker_info(path, keyring.clone(), relay)?;
     info!(relay, npub = %npub, "starting TUI for hidden volume");
-    spawn_tui_server(keyring, relay, bunker_url, npub, global_auto_approve)
+    spawn_tui_server(path, keyring, relay, bunker_url, npub, global_auto_approve)
 }
 
 /// Translate an already-loaded global `RelayConfig` into the runtime serve

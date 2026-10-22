@@ -559,6 +559,7 @@ fn write_policy_toml(path: &Path, config: &AttestationConfig) -> Result<()> {
 /// (trust-on-first-use), and write an `--attestation-config` TOML file.
 pub fn cmd_frost_network_attestation_provision(
     out: &Output,
+    path: &Path,
     group_npub: &str,
     relay: &str,
     out_path: &Path,
@@ -597,12 +598,9 @@ pub fn cmd_frost_network_attestation_provision(
         tokio::runtime::Runtime::new().map_err(|e| KeepError::Runtime(format!("tokio: {e}")))?;
 
     let config = rt.block_on(async {
-        let client = Client::new(Keys::generate());
-        client
-            .add_relay(relay)
+        let client = crate::pinning::connect_client(path, &[relay.to_string()], Keys::generate())
             .await
-            .map_err(|e| err(format!("add relay {relay}: {e}")))?;
-        client.connect().await;
+            .map_err(|e| err(e.to_string()))?;
 
         // Announces are ephemeral (KFP_EVENT_KIND is in the NIP-16 ephemeral range), so relays
         // do not store them: a point-in-time fetch (which returns on EOSE) only catches one if a

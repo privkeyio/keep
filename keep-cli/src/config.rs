@@ -106,6 +106,10 @@ pub struct Config {
     pub relays: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_timeout")]
     pub timeout: Option<u64>,
+    /// Reject a `wss://` relay that has no pin in `cert-pins.json` instead of
+    /// trusting it on first use. Also enabled by `KEEP_STRICT_CERT_PINNING`.
+    #[serde(default)]
+    pub strict_cert_pinning: bool,
 }
 
 impl Config {
@@ -198,6 +202,17 @@ timeout = 60
         assert_eq!(config.log_level, LogLevel::Debug);
         assert_eq!(config.relays.len(), 2);
         assert_eq!(config.timeout, Some(60));
+        assert!(!config.strict_cert_pinning);
+    }
+
+    #[test]
+    fn strict_cert_pinning_parses_and_defaults_off() {
+        assert!(!Config::parse("").unwrap().strict_cert_pinning);
+        assert!(
+            Config::parse("strict_cert_pinning = true")
+                .unwrap()
+                .strict_cert_pinning
+        );
     }
 
     #[test]

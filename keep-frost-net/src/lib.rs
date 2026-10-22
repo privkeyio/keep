@@ -74,6 +74,7 @@ mod nonce_pool;
 mod nonce_store;
 mod oprf_session;
 mod peer;
+mod pin_store;
 mod pinned_transport;
 mod pinning;
 pub mod proof;
@@ -135,6 +136,7 @@ pub use oprf_session::{
     OprfUnlockSessionState, MAX_OPRF_EVALS_PER_WINDOW, OPRF_EVAL_WINDOW,
 };
 pub use peer::{AttestationStatus, Peer, PeerManager, PeerStatus};
+pub use pin_store::{env_requests_strict_pinning, RelayPinStore};
 pub use pinned_transport::{
     build_client, wait_for_any_relay, with_proxy, PinnedWebSocketTransport, TlsPinning,
 };

@@ -635,6 +635,7 @@ pub(crate) fn record_recipients(
 /// password was entered.
 pub(crate) async fn run_duress_serve(
     out: &Output,
+    vault: &Path,
     beacon: &Keys,
     group_pubkey: &[u8; 32],
     recipients: &[PublicKey],
@@ -659,59 +660,58 @@ pub(crate) async fn run_duress_serve(
     // then correlate or silently drop the duress broadcast by that pubkey). The
     // wraps authenticate via their own seal, not the client key, so a throwaway
     // AUTH identity loses nothing.
-    let client = Client::new(Keys::generate());
-    if client.add_relay(relay).await.is_ok() {
-        client.connect().await;
-        // Broadcast the beacon (one NIP-59 gift wrap per recorded recipient) and
-        // re-broadcast on an interval with a fresh nonce, not once: a one-shot
-        // alert would miss any holder briefly offline, reconnecting, or slow to
-        // subscribe. Holders freeze on the first wrap they verify and short-circuit
-        // the rest, so repeats are idempotent. The loop keeps the process resident
-        // (fail-closed: never unlocks, never answers evals).
-        //
-        // Delivery is `Output`-driven: connect() returns immediately and a send can
-        // race the relay's NIP-42 auth (which completes shortly after connect but
-        // isn't exposed as a status), so we RETRY FAST until a broadcast is actually
-        // ACCEPTED (the relay appears in `output.success`) , covering the auth race
-        // and any connection settling , then relax to the re-broadcast cadence. A
-        // one-shot give-up would leave a coerced holder on a slow box silent.
-        // RELEASE GATE: the re-broadcast cadence is a relay-observable duress
-        // signature; traffic-shape indistinguishability is part of the gate.
-        let mut delivered = false;
-        loop {
-            let connected = client
-                .relays()
-                .await
-                .values()
-                .any(|r| matches!(r.status(), RelayStatus::Connected));
-            if !connected {
+    let keys = Keys::generate();
+    let client = loop {
+        match crate::pinning::connect_client(vault, &[relay.to_string()], keys.clone()).await {
+            Ok(client) => break client,
+            Err(e) => {
+                debug!(error = %e, "relay");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                continue;
             }
-            let broadcast_ok =
-                match broadcast_beacon(&client, beacon, group_pubkey, recipients).await {
-                    Ok(ok) => ok,
-                    Err(e) => {
-                        debug!(error = %e, "beacon broadcast build failed");
-                        false
-                    }
-                };
-            if broadcast_ok {
-                delivered = true;
-            }
-            let interval = if delivered {
-                BEACON_REPUBLISH_INTERVAL_SECS
-            } else {
-                BEACON_INITIAL_RETRY_SECS
-            };
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         }
-    }
-
-    // Reached only when the relay could not be added/connected: stay resident so
-    // the holder appears online but answers no evaluation requests (fail-closed).
+    };
+    // Broadcast the beacon (one NIP-59 gift wrap per recorded recipient) and
+    // re-broadcast on an interval with a fresh nonce, not once: a one-shot
+    // alert would miss any holder briefly offline, reconnecting, or slow to
+    // subscribe. Holders freeze on the first wrap they verify and short-circuit
+    // the rest, so repeats are idempotent. The loop keeps the process resident
+    // (fail-closed: never unlocks, never answers evals).
+    //
+    // Delivery is `Output`-driven: connect() returns immediately and a send can
+    // race the relay's NIP-42 auth (which completes shortly after connect but
+    // isn't exposed as a status), so we RETRY FAST until a broadcast is actually
+    // ACCEPTED (the relay appears in `output.success`) , covering the auth race
+    // and any connection settling , then relax to the re-broadcast cadence. A
+    // one-shot give-up would leave a coerced holder on a slow box silent.
+    // RELEASE GATE: the re-broadcast cadence is a relay-observable duress
+    // signature; traffic-shape indistinguishability is part of the gate.
+    let mut delivered = false;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        let connected = client
+            .relays()
+            .await
+            .values()
+            .any(|r| matches!(r.status(), RelayStatus::Connected));
+        if !connected {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            continue;
+        }
+        let broadcast_ok = match broadcast_beacon(&client, beacon, group_pubkey, recipients).await {
+            Ok(ok) => ok,
+            Err(e) => {
+                debug!(error = %e, "beacon broadcast build failed");
+                false
+            }
+        };
+        if broadcast_ok {
+            delivered = true;
+        }
+        let interval = if delivered {
+            BEACON_REPUBLISH_INTERVAL_SECS
+        } else {
+            BEACON_INITIAL_RETRY_SECS
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
     }
 }
 
