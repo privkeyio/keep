@@ -30,6 +30,7 @@ pub enum PolicyRule {
     AllowedEventKinds(Vec<u32>),
     And(Vec<PolicyRule>),
     Or(Vec<PolicyRule>),
+    MaxFeeSats(u64),
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -49,6 +50,7 @@ pub enum PolicyDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyDenyReason {
     AmountExceeded,
+    FeeExceeded,
     RateLimitExceeded,
     AddressNotAllowed,
     AddressBlocked,
@@ -62,6 +64,7 @@ impl std::fmt::Display for PolicyDenyReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AmountExceeded => write!(f, "amount exceeds limit"),
+            Self::FeeExceeded => write!(f, "fee exceeds limit"),
             Self::RateLimitExceeded => write!(f, "rate limit exceeded"),
             Self::AddressNotAllowed => write!(f, "address not in allowlist"),
             Self::AddressBlocked => write!(f, "address is blocked"),
@@ -76,6 +79,7 @@ impl std::fmt::Display for PolicyDenyReason {
 pub struct SigningContext<'a> {
     pub key_id: &'a str,
     pub amount_sats: Option<u64>,
+    pub fee_sats: Option<u64>,
     pub destination: Option<&'a str>,
     pub event_kind: Option<u32>,
     pub timestamp: u64,
@@ -99,6 +103,13 @@ impl PolicyEngine {
         // A bucket keeps the capacity from its first use, so a loose host
         // policy would otherwise survive the sealed rules.
         self.rate_limiter.clear();
+    }
+
+    /// A fee is bounded when no rule sequence can allow it. An amount cap counts
+    /// only under Deny or RequireApproval. Under Allow, a failed rule is skipped
+    /// and a later policy can still sign.
+    pub fn bounds_fee(&self) -> bool {
+        self.policies.iter().any(|policy| !policy_allows_unbounded_fee(policy))
     }
 
     pub fn evaluate(&mut self, ctx: &SigningContext<'_>) -> PolicyDecision {
@@ -146,6 +157,11 @@ impl PolicyEngine {
             PolicyRule::MaxAmountSats(max) => {
                 ctx.amount_sats.map(|a| a <= *max).unwrap_or(true)
             }
+
+            PolicyRule::MaxFeeSats(max) => match ctx.fee_sats {
+                Some(fee) if fee > *max => return Err(PolicyDenyReason::FeeExceeded),
+                _ => true,
+            },
 
             PolicyRule::MaxPerMinute(max) => {
                 self.rate_limiter.check_minute(ctx.key_id, *max)
@@ -220,6 +236,79 @@ impl PolicyEngine {
     }
 }
 
+struct FeeEffect {
+    pass: bool,
+    fail: bool,
+}
+
+fn policy_allows_unbounded_fee(policy: &Policy) -> bool {
+    for rule in &policy.rules {
+        let effect = rule_fee_effect(rule);
+        if effect.fail && matches!(policy.action, PolicyAction::Allow) {
+            return true;
+        }
+        if !effect.pass {
+            return false;
+        }
+    }
+    true
+}
+
+fn rule_fee_effect(rule: &PolicyRule) -> FeeEffect {
+    match rule {
+        PolicyRule::MaxFeeSats(_) => FeeEffect {
+            pass: false,
+            fail: false,
+        },
+        PolicyRule::MaxAmountSats(_) => FeeEffect {
+            pass: false,
+            fail: true,
+        },
+        PolicyRule::And(rules) => and_fee_effect(rules),
+        PolicyRule::Or(rules) => or_fee_effect(rules),
+        _ => FeeEffect {
+            pass: true,
+            fail: true,
+        },
+    }
+}
+
+fn and_fee_effect(rules: &[PolicyRule]) -> FeeEffect {
+    let mut effect = FeeEffect {
+        pass: true,
+        fail: false,
+    };
+    for rule in rules {
+        if !effect.pass {
+            break;
+        }
+        let child = rule_fee_effect(rule);
+        effect.fail |= child.fail;
+        effect.pass = child.pass;
+    }
+    effect
+}
+
+fn or_fee_effect(rules: &[PolicyRule]) -> FeeEffect {
+    let mut effect = FeeEffect {
+        pass: false,
+        fail: false,
+    };
+    let mut open = true;
+    for rule in rules {
+        if !open {
+            break;
+        }
+        let child = rule_fee_effect(rule);
+        effect.pass |= child.pass;
+        open = child.fail;
+    }
+    if open {
+        effect.fail = true;
+    }
+    effect
+}
+
 impl Default for PolicyEngine {
     fn default() -> Self {
         Self::new()
@@ -240,6 +329,7 @@ mod tests {
         let ctx = SigningContext {
             key_id: "test",
             amount_sats: Some(1),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -264,6 +354,7 @@ mod tests {
         let ctx_ok = SigningContext {
             key_id: "test",
             amount_sats: Some(500),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -273,6 +364,7 @@ mod tests {
         let ctx_fail = SigningContext {
             key_id: "test",
             amount_sats: Some(2000),
+            fee_sats: None,
             destination: None,
             event_kind: None,
             timestamp: now(),
@@ -299,6 +391,7 @@ mod tests {
         let ctx_ok = SigningContext {
             key_id: "test",
             amount_sats: None,
+            fee_sats: None,
             destination: Some("bc1allowed"),
             event_kind: None,
             timestamp: now(),
@@ -308,6 +401,7 @@ mod tests {
         let ctx_fail = SigningContext {
             key_id: "test",
             amount_sats: None,
+            fee_sats: None,
             destination: Some("bc1blocked"),
             event_kind: None,
             timestamp: now(),
@@ -316,5 +410,57 @@ mod tests {
             engine.evaluate(&ctx_fail),
             PolicyDecision::Deny(_)
         ));
+    }
+
+    fn policy(action: PolicyAction, rules: Vec<PolicyRule>) -> Policy {
+        Policy {
+            name: "p".into(),
+            rules,
+            action,
+        }
+    }
+
+    fn engine(policies: Vec<Policy>) -> PolicyEngine {
+        let mut engine = PolicyEngine::new();
+        engine.set_policies(PolicyConfig { policies });
+        engine
+    }
+
+    #[test]
+    fn an_amount_cap_bounds_the_fee_only_when_breaking_it_stops_the_spend() {
+        let cap = PolicyRule::MaxAmountSats(1_000);
+        assert!(!engine(vec![policy(PolicyAction::Allow, vec![cap.clone()])]).bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::Deny, vec![cap.clone()])]).bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::RequireApproval, vec![cap])]).bounds_fee());
+    }
+
+    #[test]
+    fn a_fee_cap_bounds_the_fee_only_when_evaluation_reaches_it() {
+        let fee = PolicyRule::MaxFeeSats(1_000);
+        let listed = PolicyRule::AddressAllowlist(vec!["bc1".into()]);
+        assert!(engine(vec![policy(PolicyAction::Allow, vec![fee.clone()])]).bounds_fee());
+        assert!(!engine(vec![policy(
+            PolicyAction::Allow,
+            vec![listed.clone(), fee.clone()],
+        )])
+        .bounds_fee());
+        assert!(engine(vec![policy(PolicyAction::Allow, vec![fee, listed.clone()])]).bounds_fee());
+        assert!(!engine(vec![
+            policy(PolicyAction::Allow, vec![PolicyRule::MaxAmountSats(1_000)]),
+            policy(PolicyAction::Deny, vec![listed]),
+        ])
+        .bounds_fee());
+    }
+
+    #[test]
+    fn max_fee_keeps_the_previous_rule_indexes() {
+        let allow = postcard::to_allocvec(&PolicyRule::AddressAllowlist(vec!["a".into()])).unwrap();
+        assert_eq!(allow[0], 4);
+        match postcard::from_bytes::<PolicyRule>(&[4, 1, 1, b'a']).unwrap() {
+            PolicyRule::AddressAllowlist(list) => assert_eq!(list, ["a"]),
+            other => panic!("expected an allowlist, got {other:?}"),
+        }
+        let fee = postcard::to_allocvec(&PolicyRule::MaxFeeSats(9)).unwrap();
+        assert_eq!(fee[0], 11);
     }
 }
