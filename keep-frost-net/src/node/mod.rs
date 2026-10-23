@@ -1465,10 +1465,20 @@ impl KfpNode {
         // connects. The reports buffer holds the event until someone subscribes.
         let pin_reports = Arc::new(pin_report::PinReports::new());
         let pinning = pinning.map(|p| p.on_pin_failure(pin_reports.hook()));
-        let transport = Arc::new(
-            NostrTransport::connect(keys.clone(), &relays, proxy, default_relay_opts(), pinning)
-                .await?,
-        ) as Arc<dyn CosignTransport>;
+        let transport = match NostrTransport::connect(
+            keys.clone(),
+            &relays,
+            proxy,
+            default_relay_opts(),
+            pinning,
+        )
+        .await
+        {
+            Ok(transport) => Arc::new(transport) as Arc<dyn CosignTransport>,
+            // Every relay was refused. Dropping `pin_reports` here used to
+            // turn a pin mismatch into an undifferentiated timeout.
+            Err(e) => return Err(pin_reports.annotate(e)),
+        };
 
         let node = Self::assemble(
             share,

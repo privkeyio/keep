@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 use crate::audit::SigningAuditLog;
+use crate::error::FrostNetError;
 use crate::pinning::{acceptable_relay_host, PinFailureHook, PinRejection};
 
 use super::KfpNodeEvent;
@@ -81,6 +82,27 @@ impl PinReports {
         }
         guard.audit = Some(audit);
         guard.tx = Some(tx);
+    }
+
+    /// Rejections still held, for a connect attempt that is about to return
+    /// before [`Self::attach`]. A node that never starts has no audit log, so
+    /// the caller's error is the only place the refusal can be read.
+    pub(crate) fn annotate(&self, err: FrostNetError) -> FrostNetError {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.pending.is_empty() {
+            return err;
+        }
+        let detail = guard
+            .pending
+            .iter()
+            .map(|queued| format!("{} refused: {}", queued.host, queued.reason.explanation()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let msg = match &err {
+            FrostNetError::Transport(msg) => format!("{msg} ({detail})"),
+            other => format!("{other} ({detail})"),
+        };
+        FrostNetError::Transport(msg)
     }
 
     /// Deliver anything still held. A later call does not send those events again.
@@ -166,5 +188,26 @@ mod tests {
         assert_eq!(audit.relay_pin_rejections().len(), 1);
         reports.flush();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_failed_connect_names_the_rejected_relay() {
+        let reports = PinReports::new();
+        let timeout = FrostNetError::Transport("Timed out waiting for relay connection".into());
+        assert_eq!(
+            reports.annotate(timeout).to_string(),
+            "Transport error: Timed out waiting for relay connection"
+        );
+
+        reports.report("relay.example.com", PinRejection::Mismatch);
+        reports.report("not a host", PinRejection::Mismatch);
+        let err = reports.annotate(FrostNetError::Transport(
+            "Timed out waiting for relay connection".into(),
+        ));
+        let text = err.to_string();
+        assert!(text.contains("Timed out waiting for relay connection"));
+        assert!(text
+            .contains("relay.example.com refused: its certificate does not match the pinned key"));
+        assert!(!text.contains("not a host"));
     }
 }

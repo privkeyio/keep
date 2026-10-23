@@ -202,21 +202,24 @@ impl PinningServerCertVerifier {
             }
             Err(e) => {
                 // The pool records a failed connection and stays up on its
-                // other relays. The warning is the log line; the hook is how a
-                // node turns the same transition into an event and an audit
-                // entry. Once per host until a later handshake succeeds, so a
-                // reconnect loop does not repeat it.
-                tracing::warn!(
-                    relay_host = %hostname,
-                    "TLS certificate pin check FAILED on the live relay connection; refusing it: {e}"
-                );
+                // other relays. Logged once per host, at error: the CLI's
+                // default filter hides warnings, and the pool retries for the
+                // life of the process. The hook turns the same transition into
+                // an event and an audit entry.
                 let reason = match &e {
                     FrostNetError::CertificatePinMismatch { .. } => Some(PinRejection::Mismatch),
                     FrostNetError::CertificatePinMissing { .. } => Some(PinRejection::Missing),
                     _ => None,
                 };
-                if let Some(reason) = reason {
-                    self.report_failure(hostname, reason);
+                let first = match reason {
+                    Some(reason) => self.report_failure(hostname, reason),
+                    None => true,
+                };
+                if first {
+                    tracing::error!(
+                        relay_host = %hostname,
+                        "TLS certificate pin check FAILED on the live relay connection; refusing it: {e}"
+                    );
                 }
                 Err(Error::InvalidCertificate(
                     CertificateError::ApplicationVerificationFailure,
@@ -225,16 +228,19 @@ impl PinningServerCertVerifier {
         }
     }
 
-    fn report_failure(&self, hostname: &str, reason: PinRejection) {
+    /// Returns whether this is a new refusal. Repeat handshakes for a host
+    /// already refused are the reconnect loop, not a new event.
+    fn report_failure(&self, hostname: &str, reason: PinRejection) -> bool {
         {
             let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
             if !failed.insert((hostname.to_string(), reason)) {
-                return;
+                return false;
             }
         }
         if let Some(hook) = &self.on_failure {
             hook(hostname, reason);
         }
+        true
     }
 
     fn clear_failure(&self, hostname: &str) {
