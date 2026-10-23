@@ -21,12 +21,61 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
+use crate::error::FrostNetError;
+
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use rustls::{CertificateError, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
 use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
 
 use crate::cert_pin::{self, CertificatePinSet, SpkiHash};
+
+/// Why a live handshake refused a relay on pin policy.
+///
+/// The discriminant is covered by the pin-rejection audit HMAC, so it is
+/// append-only: renumber one and every entry already written fails verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PinRejection {
+    /// The certificate's key does not match a pin on record.
+    Mismatch = 1,
+    /// Strict mode, and this host has no pin on record.
+    Missing = 2,
+}
+
+impl PinRejection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mismatch => "mismatch",
+            Self::Missing => "missing",
+        }
+    }
+
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::Mismatch => "its certificate does not match the pinned key",
+            Self::Missing => "strict pinning has no pin on record for it",
+        }
+    }
+
+    pub(crate) fn discriminant(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Called on the handshake thread when a pin check starts refusing a host.
+///
+/// Must not block, panic, or call back into the verifier. Invoked once per
+/// host and reason until a later handshake for that host succeeds.
+pub type PinFailureHook = Arc<dyn Fn(&str, PinRejection) + Send + Sync>;
+
+/// A hostname, or a bracketed IP literal, short enough to store.
+pub(crate) fn acceptable_relay_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
 
 /// A `rustls` server-certificate verifier that adds SPKI pinning on top of
 /// standard WebPKI validation. See the module docs for the layering guarantee.
@@ -48,6 +97,10 @@ pub struct PinningServerCertVerifier {
     /// Hosts already logged as accepted-with-no-pin, so the relay pool's
     /// reconnect loop does not repeat the same warning for the whole session.
     warned_unpinned: Arc<Mutex<HashSet<String>>>,
+    /// Hosts currently refused, so a reconnect reports the transition once.
+    /// Cleared when a later handshake for that host succeeds.
+    failed: Arc<Mutex<HashSet<(String, PinRejection)>>>,
+    on_failure: Option<PinFailureHook>,
 }
 
 impl fmt::Debug for PinningServerCertVerifier {
@@ -102,7 +155,14 @@ impl PinningServerCertVerifier {
             pins,
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
+            failed: Arc::new(Mutex::new(HashSet::new())),
+            on_failure: None,
         }
+    }
+
+    pub(crate) fn with_on_pin_failure(mut self, hook: PinFailureHook) -> Self {
+        self.on_failure = Some(hook);
+        self
     }
 
     /// Enforce the SPKI pin for `hostname` against the observed `spki_hash`,
@@ -132,24 +192,60 @@ impl PinningServerCertVerifier {
             // the probe, so reaching this arm means the probe did not cover
             // this host, which is worth saying out loud.
             Ok((_, Some(_))) => {
+                self.clear_failure(hostname);
                 self.warn_once_unpinned(hostname);
                 Ok(())
             }
-            Ok((_, None)) => Ok(()),
+            Ok((_, None)) => {
+                self.clear_failure(hostname);
+                Ok(())
+            }
             Err(e) => {
-                // The only signal a selective man-in-the-middle produces: the
-                // pool just records a failed connection and the node carries on
-                // over its other relays, so without this line the attempt is
-                // invisible.
-                tracing::warn!(
-                    relay_host = %hostname,
-                    "TLS certificate pin check FAILED on the live relay connection; refusing it: {e}"
-                );
+                // The pool records a failed connection and stays up on its
+                // other relays. Logged once per host, at error: the CLI's
+                // default filter hides warnings, and the pool retries for the
+                // life of the process. The hook turns the same transition into
+                // an event and an audit entry.
+                let reason = match &e {
+                    FrostNetError::CertificatePinMismatch { .. } => Some(PinRejection::Mismatch),
+                    FrostNetError::CertificatePinMissing { .. } => Some(PinRejection::Missing),
+                    _ => None,
+                };
+                let first = match reason {
+                    Some(reason) => self.report_failure(hostname, reason),
+                    None => true,
+                };
+                if first {
+                    tracing::error!(
+                        relay_host = %hostname,
+                        "TLS certificate pin check FAILED on the live relay connection; refusing it: {e}"
+                    );
+                }
                 Err(Error::InvalidCertificate(
                     CertificateError::ApplicationVerificationFailure,
                 ))
             }
         }
+    }
+
+    /// Returns whether this is a new refusal. Repeat handshakes for a host
+    /// already refused are the reconnect loop, not a new event.
+    fn report_failure(&self, hostname: &str, reason: PinRejection) -> bool {
+        {
+            let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+            if !failed.insert((hostname.to_string(), reason)) {
+                return false;
+            }
+        }
+        if let Some(hook) = &self.on_failure {
+            hook(hostname, reason);
+        }
+        true
+    }
+
+    fn clear_failure(&self, hostname: &str) {
+        let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
+        failed.retain(|(host, _)| host != hostname);
     }
 
     /// Warn the first time a host is accepted with no pin on record. The relay
@@ -318,6 +414,8 @@ mod tests {
             pins: Arc::new(Mutex::new(pins)),
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
+            failed: Arc::new(Mutex::new(HashSet::new())),
+            on_failure: None,
         }
     }
 
@@ -443,5 +541,84 @@ mod tests {
         pins.add_pin("127.0.0.1".into(), cert_spki_hash());
         let v = verifier(true, pins, true);
         assert!(run(&v, "127.0.0.1").is_ok());
+    }
+
+    fn hooked(
+        accept: bool,
+        pins: Arc<Mutex<CertificatePinSet>>,
+        require_pinned: bool,
+        hits: Arc<Mutex<Vec<(String, PinRejection)>>>,
+    ) -> PinningServerCertVerifier {
+        PinningServerCertVerifier {
+            inner: Arc::new(StubInner { accept }),
+            pins,
+            require_pinned,
+            warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
+            failed: Arc::new(Mutex::new(HashSet::new())),
+            on_failure: Some(Arc::new(move |host, reason| {
+                hits.lock().unwrap().push((host.to_string(), reason));
+            })),
+        }
+    }
+
+    #[test]
+    fn a_pin_mismatch_is_reported_once_until_a_later_handshake_succeeds() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let pins = Arc::new(Mutex::new(CertificatePinSet::new()));
+        pins.lock()
+            .unwrap()
+            .add_pin("relay.example.com".into(), [0xAAu8; 32]);
+        let v = hooked(true, Arc::clone(&pins), false, Arc::clone(&hits));
+
+        assert!(run(&v, "relay.example.com").is_err());
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            [("relay.example.com".into(), PinRejection::Mismatch)]
+        );
+
+        pins.lock().unwrap().remove_pin("relay.example.com");
+        pins.lock()
+            .unwrap()
+            .add_pin("relay.example.com".into(), cert_spki_hash());
+        assert!(run(&v, "relay.example.com").is_ok());
+        assert!(
+            hits.lock().unwrap().len() == 1,
+            "a match is not a rejection"
+        );
+
+        pins.lock().unwrap().remove_pin("relay.example.com");
+        pins.lock()
+            .unwrap()
+            .add_pin("relay.example.com".into(), [0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(hits.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_strict_missing_pin_is_reported_once() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let v = hooked(
+            true,
+            Arc::new(Mutex::new(CertificatePinSet::new())),
+            true,
+            Arc::clone(&hits),
+        );
+        assert!(run(&v, "relay.example.com").is_err());
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            [("relay.example.com".into(), PinRejection::Missing)]
+        );
+    }
+
+    #[test]
+    fn a_chain_the_standard_validator_rejects_is_not_a_pin_failure() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("relay.example.com".into(), [0xAAu8; 32]);
+        let v = hooked(false, Arc::new(Mutex::new(pins)), false, Arc::clone(&hits));
+        assert!(run(&v, "relay.example.com").is_err());
+        assert!(hits.lock().unwrap().is_empty());
     }
 }

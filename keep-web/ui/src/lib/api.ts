@@ -29,6 +29,13 @@ export interface SigningEntry {
   our_index: number
 }
 
+export interface PinRejectionEntry {
+  timestamp_ms: number
+  relay_host: string
+  reason: string
+  detail: string
+}
+
 export interface LogEvent {
   type: 'log'
   app: string
@@ -154,6 +161,7 @@ export async function setActiveGroup(group: string): Promise<{ restarting: boole
 export async function getSigningLog(): Promise<{
   verified: boolean
   entries: SigningEntry[]
+  pin_rejections: PinRejectionEntry[]
 }> {
   const r = await api('/api/signing-log')
   if (!r.ok) throw new Error(`signing log: ${r.status}`)

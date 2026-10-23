@@ -98,7 +98,7 @@ pub use attestation::{
     derive_announce_attestation_nonce, derive_attestation_nonce, verify_peer_attestation,
     ExpectedPcrs,
 };
-pub use audit::{SigningAuditEntry, SigningAuditLog, SigningOperation};
+pub use audit::{RelayPinAuditEntry, SigningAuditEntry, SigningAuditLog, SigningOperation};
 pub use cert_pin::{normalize_pin_hostname, verify_relay_certificate, CertificatePinSet, SpkiHash};
 pub use descriptor_session::{
     derive_descriptor_session_id, derive_policy_hash, find_local_external_xpub_in_tier,
@@ -140,7 +140,7 @@ pub use pin_store::{env_requests_strict_pinning, RelayPinStore};
 pub use pinned_transport::{
     build_client, wait_for_any_relay, with_proxy, PinnedWebSocketTransport, TlsPinning,
 };
-pub use pinning::PinningServerCertVerifier;
+pub use pinning::{PinFailureHook, PinRejection, PinningServerCertVerifier};
 pub use protocol::{
     AnnouncePayload, AnnouncedXpub, CommitmentPayload, DescriptorAckPayload,
     DescriptorContributePayload, DescriptorFinalizePayload, DescriptorNackPayload,
