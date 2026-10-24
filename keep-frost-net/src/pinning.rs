@@ -404,6 +404,17 @@ mod tests {
     #[derive(Debug)]
     struct StubInner {
         accept: bool,
+        signs: bool,
+    }
+
+    impl StubInner {
+        fn signature(&self) -> Result<HandshakeSignatureValid, Error> {
+            if self.signs {
+                Ok(HandshakeSignatureValid::assertion())
+            } else {
+                Err(Error::InvalidCertificate(CertificateError::BadSignature))
+            }
+        }
     }
 
     impl ServerCertVerifier for StubInner {
@@ -427,7 +438,7 @@ mod tests {
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            self.signature()
         }
         fn verify_tls13_signature(
             &self,
@@ -435,7 +446,7 @@ mod tests {
             _cert: &CertificateDer<'_>,
             _dss: &DigitallySignedStruct,
         ) -> Result<HandshakeSignatureValid, Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            self.signature()
         }
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
             vec![SignatureScheme::ECDSA_NISTP256_SHA256]
@@ -448,13 +459,29 @@ mod tests {
         require_pinned: bool,
     ) -> PinningServerCertVerifier {
         PinningServerCertVerifier {
-            inner: Arc::new(StubInner { accept }),
+            inner: Arc::new(StubInner {
+                accept,
+                signs: true,
+            }),
             pins: Arc::new(Mutex::new(pins)),
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
             on_failure: None,
         }
+    }
+
+    fn dss() -> DigitallySignedStruct {
+        use rustls::internal::msgs::codec::Codec;
+        DigitallySignedStruct::read_bytes(&[0x04, 0x03, 0x00, 0x01, 0x00]).unwrap()
+    }
+
+    fn sign12(v: &PinningServerCertVerifier) -> Result<HandshakeSignatureValid, Error> {
+        v.verify_tls12_signature(b"m", &CertificateDer::from(cert_der()), &dss())
+    }
+
+    fn sign13(v: &PinningServerCertVerifier) -> Result<HandshakeSignatureValid, Error> {
+        v.verify_tls13_signature(b"m", &CertificateDer::from(cert_der()), &dss())
     }
 
     fn run(v: &PinningServerCertVerifier, host: &str) -> Result<ServerCertVerified, Error> {
@@ -588,7 +615,10 @@ mod tests {
         hits: Arc<Mutex<Vec<(String, PinRejection)>>>,
     ) -> PinningServerCertVerifier {
         PinningServerCertVerifier {
-            inner: Arc::new(StubInner { accept }),
+            inner: Arc::new(StubInner {
+                accept,
+                signs: true,
+            }),
             pins,
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
@@ -620,7 +650,7 @@ mod tests {
             .unwrap()
             .add_pin("relay.example.com".into(), cert_spki_hash());
         assert!(run(&v, "relay.example.com").is_ok());
-        v.proven(&CertificateDer::from(cert_der()));
+        assert!(sign13(&v).is_ok());
         assert!(
             hits.lock().unwrap().len() == 1,
             "a match is not a rejection"
@@ -659,7 +689,7 @@ mod tests {
         assert!(run(&v, "relay.example.com").is_ok());
         swap_pin([0xAAu8; 32]);
         assert!(run(&v, "relay.example.com").is_err());
-        v.proven(&CertificateDer::from(cert_der()));
+        assert!(sign13(&v).is_ok());
         assert_eq!(
             hits.lock().unwrap().len(),
             1,
@@ -668,7 +698,48 @@ mod tests {
 
         swap_pin(cert_spki_hash());
         assert!(run(&v, "relay.example.com").is_ok());
-        v.proven(&CertificateDer::from(cert_der()));
+        assert!(sign13(&v).is_ok());
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(hits.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_a_verified_handshake_signature_rearms_the_report() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let pins = Arc::new(Mutex::new(CertificatePinSet::new()));
+        let swap_pin = |hash: SpkiHash| {
+            let mut pins = pins.lock().unwrap();
+            pins.remove_pin("relay.example.com");
+            pins.add_pin("relay.example.com".into(), hash);
+        };
+        let v = hooked(true, Arc::clone(&pins), false, Arc::clone(&hits));
+        let forger = PinningServerCertVerifier {
+            inner: Arc::new(StubInner {
+                accept: true,
+                signs: false,
+            }),
+            ..hooked(true, Arc::clone(&pins), false, Arc::clone(&hits))
+        };
+        let forger = PinningServerCertVerifier {
+            failed: Arc::clone(&v.failed),
+            ..forger
+        };
+
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        swap_pin(cert_spki_hash());
+        assert!(run(&forger, "relay.example.com").is_ok());
+        assert!(sign13(&forger).is_err());
+        assert!(run(&forger, "relay.example.com").is_ok());
+        assert!(sign12(&forger).is_err());
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(hits.lock().unwrap().len(), 1);
+
+        swap_pin(cert_spki_hash());
+        assert!(run(&v, "relay.example.com").is_ok());
+        assert!(sign12(&v).is_ok());
         swap_pin([0xAAu8; 32]);
         assert!(run(&v, "relay.example.com").is_err());
         assert_eq!(hits.lock().unwrap().len(), 2);
@@ -693,7 +764,7 @@ mod tests {
         swap_pin(cert_spki_hash());
         assert!(run(&v, "relay.example.com").is_ok());
         assert!(run(&v, "other.example.com").is_ok());
-        v.proven(&CertificateDer::from(cert_der()));
+        assert!(sign13(&v).is_ok());
         swap_pin([0xAAu8; 32]);
         assert!(run(&v, "relay.example.com").is_err());
         assert_eq!(hits.lock().unwrap().len(), 1);
