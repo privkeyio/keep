@@ -742,14 +742,6 @@ pub fn cmd_frost_network_serve(
                             }
                         }
                     }
-                    Ok(keep_frost_net::KfpNodeEvent::RelayPinRejected { relay_host, reason }) => {
-                        tracing::error!(
-                            relay_host,
-                            reason = reason.as_str(),
-                            "relay TLS certificate pin rejected; this relay stays disconnected: {}",
-                            reason.explanation()
-                        );
-                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "node events dropped while busy");
                     }
@@ -1599,17 +1591,6 @@ pub(crate) fn store_learned_verifying_shares(
     tokio::spawn(async move {
         loop {
             match events.recv().await {
-                Ok(keep_frost_net::KfpNodeEvent::RelayPinRejected { relay_host, reason }) => {
-                    // `keep serve` has no other subscriber. The handshake
-                    // already logged the transition; this one is for a process
-                    // that stayed up and is watching the bus.
-                    tracing::error!(
-                        relay_host,
-                        reason = reason.as_str(),
-                        "relay TLS certificate pin rejected; this relay stays disconnected: {}",
-                        reason.explanation()
-                    );
-                }
                 Ok(keep_frost_net::KfpNodeEvent::VerifyingSharesLearned {
                     share_index,
                     verifying_shares,

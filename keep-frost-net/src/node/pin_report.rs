@@ -16,6 +16,10 @@ use crate::pinning::{acceptable_relay_host, PinFailureHook, PinRejection};
 
 use super::KfpNodeEvent;
 
+/// A successful handshake re-arms a host's report, so a relay that flaps while
+/// nobody is subscribed would otherwise queue one entry per failure forever.
+const MAX_PENDING: usize = 64;
+
 struct Queued {
     host: String,
     reason: PinRejection,
@@ -65,6 +69,17 @@ impl PinReports {
             if tx.receiver_count() > 0 && tx.send(event).is_ok() {
                 return;
             }
+        }
+        if let Some(held) = guard
+            .pending
+            .iter_mut()
+            .find(|queued| queued.host == host && queued.reason == reason)
+        {
+            held.audited |= audited;
+            return;
+        }
+        if guard.pending.len() >= MAX_PENDING {
+            guard.pending.remove(0);
         }
         guard.pending.push(Queued {
             host: host.to_string(),
@@ -188,6 +203,41 @@ mod tests {
         assert_eq!(audit.relay_pin_rejections().len(), 1);
         reports.flush();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rejections_held_for_a_missing_subscriber_stay_bounded() {
+        let reports = Arc::new(PinReports::new());
+        let (tx, _) = broadcast::channel(2 * MAX_PENDING);
+        let audit = Arc::new(SigningAuditLog::new([3u8; 32]));
+        reports.attach(tx.clone(), Arc::clone(&audit));
+        for _ in 0..500 {
+            reports.report("flap.example.com", PinRejection::Mismatch);
+        }
+        let audited = audit.relay_pin_rejections();
+        assert!(audited.len() > 1, "each refusal is still audited");
+        assert!(audited.iter().all(|e| e.relay_host == "flap.example.com"));
+        let held = reports
+            .annotate(FrostNetError::Transport("t".into()))
+            .to_string();
+        assert_eq!(held.matches("flap.example.com").count(), 1);
+        for i in 0..(MAX_PENDING + 10) {
+            reports.report(&format!("r{i}.example.com"), PinRejection::Missing);
+        }
+
+        let mut rx = tx.subscribe();
+        reports.flush();
+        let mut hosts = Vec::new();
+        while let Ok(KfpNodeEvent::RelayPinRejected { relay_host, .. }) = rx.try_recv() {
+            hosts.push(relay_host);
+        }
+        assert_eq!(hosts.len(), MAX_PENDING);
+        assert!(!hosts.iter().any(|h| h == "flap.example.com"));
+        assert_eq!(hosts.first().unwrap(), "r10.example.com");
+        assert_eq!(
+            hosts.last().unwrap(),
+            &format!("r{}.example.com", MAX_PENDING + 9)
+        );
     }
 
     #[test]
