@@ -2068,7 +2068,6 @@ checksum = "0dc92fb57ca44df6db8059111ab3af99a63d5d0f8375d9972e319a379c6bab76"
 dependencies = [
  "generic-array 0.14.7",
  "rand_core 0.6.4",
- "serdect 0.2.0",
  "subtle",
  "zeroize",
 ]
@@ -2170,9 +2169,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -3234,7 +3233,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2e55f16dcf0e9c00efbe2e655ffe45fc98e7066b52bc92f8a79e64060a79351"
 dependencies = [
  "rustversion",
- "serde_core",
  "typenum",
 ]
 
@@ -3862,7 +3860,6 @@ version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9155a582abd142abc056962c29e3ce5ff2ad5469f4246b537ed42c5deba857da"
 dependencies = [
- "serde",
  "typenum",
 ]
 
@@ -5986,7 +5983,6 @@ dependencies = [
  "num-integer",
  "num-traits",
  "rand 0.8.6",
- "serde",
 ]
 
 [[package]]
@@ -5997,7 +5993,6 @@ checksum = "73f88a1307638156682bada9d7604135552957b7818057dcef22705b4d509495"
 dependencies = [
  "num-traits",
  "rand 0.8.6",
- "serde",
 ]
 
 [[package]]
@@ -6046,7 +6041,6 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "serde",
 ]
 
 [[package]]
@@ -10133,7 +10127,6 @@ version = "5.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ec751bdcc8bda099e269b24cc6b4ad14f9ce8b0490c1599174070e792ecd70c"
 dependencies = [
- "crypto-bigint 0.5.5",
  "crypto-bigint 0.6.1",
  "elliptic-curve",
  "elliptic-curve-tools",
