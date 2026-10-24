@@ -17,7 +17,8 @@
 //! is configured, matching a typical TLS client; any OCSP staple the peer sends
 //! is still passed through to the standard validator.)
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -98,13 +99,10 @@ pub struct PinningServerCertVerifier {
     /// reconnect loop does not repeat the same warning for the whole session.
     warned_unpinned: Arc<Mutex<HashSet<String>>>,
     /// Hosts currently refused, so a reconnect reports the transition once.
-    /// Cleared when a later handshake for that host succeeds.
+    /// Cleared once a later handshake for that host passes the pin and its
+    /// signature verifies. An on-path relay to the genuine server can still
+    /// produce that signature, so this bounds repeats rather than ruling them out.
     failed: Arc<Mutex<HashSet<(String, PinRejection)>>>,
-    /// Hosts whose certificate passed the pin, keyed to its SPKI, until the
-    /// handshake signature proves the peer holds that key. rustls checks the
-    /// certificate before the signature, so clearing a refusal on the
-    /// certificate alone would let a replayed genuine certificate re-arm it.
-    awaiting_proof: Arc<Mutex<HashMap<String, SpkiHash>>>,
     on_failure: Option<PinFailureHook>,
 }
 
@@ -161,7 +159,6 @@ impl PinningServerCertVerifier {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
-            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: None,
         }
     }
@@ -217,10 +214,6 @@ impl PinningServerCertVerifier {
                     FrostNetError::CertificatePinMissing { .. } => Some(PinRejection::Missing),
                     _ => None,
                 };
-                self.awaiting_proof
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(hostname);
                 let first = match reason {
                     Some(reason) => self.report_failure(hostname, reason),
                     None => true,
@@ -254,37 +247,30 @@ impl PinningServerCertVerifier {
     }
 
     fn await_proof(&self, hostname: &str, spki_hash: SpkiHash) {
-        self.awaiting_proof
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(hostname.to_string(), spki_hash);
+        AWAITING_PROOF.with(|cell| {
+            *cell.borrow_mut() = Some((self.id(), hostname.to_string(), spki_hash));
+        });
     }
 
-    /// The peer signed the handshake with the key of `cert`, so every host
-    /// that accepted this key is reachable again.
+    /// The peer signed this handshake with the key of `cert`. Only the host
+    /// whose certificate this same handshake accepted is cleared.
     fn proven(&self, cert: &CertificateDer<'_>) {
+        let Some((id, host, expected)) = AWAITING_PROOF.with(|cell| cell.borrow_mut().take())
+        else {
+            return;
+        };
         let Some(spki) = cert_pin::extract_spki_from_der(cert.as_ref()) else {
             return;
         };
-        let spki_hash = cert_pin::hash_spki(&spki);
-        let hosts: Vec<String> = {
-            let mut awaiting = self
-                .awaiting_proof
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let hosts = awaiting
-                .iter()
-                .filter(|(_, hash)| **hash == spki_hash)
-                .map(|(host, _)| host.clone())
-                .collect();
-            awaiting.retain(|_, hash| *hash != spki_hash);
-            hosts
-        };
-        if hosts.is_empty() {
+        if id != self.id() || cert_pin::hash_spki(&spki) != expected {
             return;
         }
         let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
-        failed.retain(|(host, _)| !hosts.contains(host));
+        failed.retain(|(h, _)| *h != host);
+    }
+
+    fn id(&self) -> usize {
+        Arc::as_ptr(&self.failed) as *const () as usize
     }
 
     /// Warn the first time a host is accepted with no pin on record. The relay
@@ -305,6 +291,14 @@ impl PinningServerCertVerifier {
     }
 }
 
+thread_local! {
+    // rustls 0.23 runs verify_server_cert and then the handshake signature
+    // check inside one synchronous `handle` call, for TLS 1.2 and 1.3 alike,
+    // so this slot belongs to exactly one handshake. Clearing a refusal on the
+    // certificate alone would let a replayed genuine certificate re-arm it.
+    static AWAITING_PROOF: RefCell<Option<(usize, String, SpkiHash)>> = const { RefCell::new(None) };
+}
+
 impl ServerCertVerifier for PinningServerCertVerifier {
     fn verify_server_cert(
         &self,
@@ -314,6 +308,7 @@ impl ServerCertVerifier for PinningServerCertVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
+        AWAITING_PROOF.with(|cell| cell.borrow_mut().take());
         // 1. Standard validation FIRST: trust-anchor chain, validity window,
         //    hostname match. Never bypassed.
         self.inner.verify_server_cert(
@@ -458,7 +453,6 @@ mod tests {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
-            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: None,
         }
     }
@@ -599,7 +593,6 @@ mod tests {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
-            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Some(Arc::new(move |host, reason| {
                 hits.lock().unwrap().push((host.to_string(), reason));
             })),
@@ -679,6 +672,31 @@ mod tests {
         swap_pin([0xAAu8; 32]);
         assert!(run(&v, "relay.example.com").is_err());
         assert_eq!(hits.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_proof_for_one_host_does_not_clear_another_sharing_its_key() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let pins = Arc::new(Mutex::new(CertificatePinSet::new()));
+        pins.lock()
+            .unwrap()
+            .add_pin("other.example.com".into(), cert_spki_hash());
+        let v = hooked(true, Arc::clone(&pins), false, Arc::clone(&hits));
+        let swap_pin = |hash: SpkiHash| {
+            let mut pins = pins.lock().unwrap();
+            pins.remove_pin("relay.example.com");
+            pins.add_pin("relay.example.com".into(), hash);
+        };
+
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        swap_pin(cert_spki_hash());
+        assert!(run(&v, "relay.example.com").is_ok());
+        assert!(run(&v, "other.example.com").is_ok());
+        v.proven(&CertificateDer::from(cert_der()));
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(hits.lock().unwrap().len(), 1);
     }
 
     #[test]
