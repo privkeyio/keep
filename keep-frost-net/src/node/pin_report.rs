@@ -6,7 +6,7 @@
 //! [`KfpNode::subscribe`](super::KfpNode::subscribe), and send later ones
 //! straight onto the bus.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use tokio::sync::broadcast;
 
@@ -28,8 +28,10 @@ struct Queued {
 
 struct Inner {
     pending: Vec<Queued>,
-    tx: Option<broadcast::Sender<KfpNodeEvent>>,
-    audit: Option<Arc<SigningAuditLog>>,
+    // Weak, so the verifier inside the relay transport never keeps the node's
+    // bus open or its HMAC key alive after the node drops.
+    tx: Option<broadcast::WeakSender<KfpNodeEvent>>,
+    audit: Option<Weak<SigningAuditLog>>,
 }
 
 pub(crate) struct PinReports {
@@ -60,12 +62,13 @@ impl PinReports {
         let audited = guard
             .audit
             .as_ref()
+            .and_then(Weak::upgrade)
             .is_some_and(|audit| audit.log_relay_pin_rejection(host, reason));
         let event = KfpNodeEvent::RelayPinRejected {
             relay_host: host.to_string(),
             reason,
         };
-        if let Some(tx) = guard.tx.clone() {
+        if let Some(tx) = guard.tx.as_ref().and_then(|tx| tx.upgrade()) {
             if tx.receiver_count() > 0 && tx.send(event).is_ok() {
                 return;
             }
@@ -95,8 +98,8 @@ impl PinReports {
                 queued.audited = audit.log_relay_pin_rejection(&queued.host, queued.reason);
             }
         }
-        guard.audit = Some(audit);
-        guard.tx = Some(tx);
+        guard.audit = Some(Arc::downgrade(&audit));
+        guard.tx = Some(tx.downgrade());
     }
 
     /// Rejections still held, for a connect attempt that is about to return
@@ -123,7 +126,7 @@ impl PinReports {
     /// Deliver anything still held. A later call does not send those events again.
     pub(crate) fn flush(&self) {
         let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(tx) = guard.tx.clone() else {
+        let Some(tx) = guard.tx.as_ref().and_then(|tx| tx.upgrade()) else {
             return;
         };
         if tx.receiver_count() == 0 {
@@ -238,6 +241,21 @@ mod tests {
             hosts.last().unwrap(),
             &format!("r{}.example.com", MAX_PENDING + 9)
         );
+    }
+
+    #[test]
+    fn reports_do_not_keep_the_bus_or_audit_log_alive() {
+        let (reports, tx, audit) = attached();
+        let mut rx = tx.subscribe();
+        assert_eq!(Arc::strong_count(&audit), 1);
+        drop(tx);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+        drop(audit);
+        reports.report("relay.example.com", PinRejection::Mismatch);
+        reports.flush();
     }
 
     #[test]

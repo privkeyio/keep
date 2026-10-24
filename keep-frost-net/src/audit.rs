@@ -208,6 +208,7 @@ impl RelayPinAuditEntry {
         reason: PinRejection,
     ) -> [u8; 32] {
         let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
+        mac.update(b"keep/relay-pin/v1\0");
         mac.update(&timestamp_ms.to_le_bytes());
         let host = relay_host.as_bytes();
         mac.update(&(host.len() as u16).to_le_bytes());

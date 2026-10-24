@@ -17,7 +17,7 @@
 //! is configured, matching a typical TLS client; any OCSP staple the peer sends
 //! is still passed through to the standard validator.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +100,11 @@ pub struct PinningServerCertVerifier {
     /// Hosts currently refused, so a reconnect reports the transition once.
     /// Cleared when a later handshake for that host succeeds.
     failed: Arc<Mutex<HashSet<(String, PinRejection)>>>,
+    /// Hosts whose certificate passed the pin, keyed to its SPKI, until the
+    /// handshake signature proves the peer holds that key. rustls checks the
+    /// certificate before the signature, so clearing a refusal on the
+    /// certificate alone would let a replayed genuine certificate re-arm it.
+    awaiting_proof: Arc<Mutex<HashMap<String, SpkiHash>>>,
     on_failure: Option<PinFailureHook>,
 }
 
@@ -156,6 +161,7 @@ impl PinningServerCertVerifier {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
+            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: None,
         }
     }
@@ -192,12 +198,12 @@ impl PinningServerCertVerifier {
             // the probe, so reaching this arm means the probe did not cover
             // this host, which is worth saying out loud.
             Ok((_, Some(_))) => {
-                self.clear_failure(hostname);
+                self.await_proof(hostname, spki_hash);
                 self.warn_once_unpinned(hostname);
                 Ok(())
             }
             Ok((_, None)) => {
-                self.clear_failure(hostname);
+                self.await_proof(hostname, spki_hash);
                 Ok(())
             }
             Err(e) => {
@@ -211,6 +217,10 @@ impl PinningServerCertVerifier {
                     FrostNetError::CertificatePinMissing { .. } => Some(PinRejection::Missing),
                     _ => None,
                 };
+                self.awaiting_proof
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(hostname);
                 let first = match reason {
                     Some(reason) => self.report_failure(hostname, reason),
                     None => true,
@@ -243,9 +253,38 @@ impl PinningServerCertVerifier {
         true
     }
 
-    fn clear_failure(&self, hostname: &str) {
+    fn await_proof(&self, hostname: &str, spki_hash: SpkiHash) {
+        self.awaiting_proof
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(hostname.to_string(), spki_hash);
+    }
+
+    /// The peer signed the handshake with the key of `cert`, so every host
+    /// that accepted this key is reachable again.
+    fn proven(&self, cert: &CertificateDer<'_>) {
+        let Some(spki) = cert_pin::extract_spki_from_der(cert.as_ref()) else {
+            return;
+        };
+        let spki_hash = cert_pin::hash_spki(&spki);
+        let hosts: Vec<String> = {
+            let mut awaiting = self
+                .awaiting_proof
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let hosts = awaiting
+                .iter()
+                .filter(|(_, hash)| **hash == spki_hash)
+                .map(|(host, _)| host.clone())
+                .collect();
+            awaiting.retain(|_, hash| *hash != spki_hash);
+            hosts
+        };
+        if hosts.is_empty() {
+            return;
+        }
         let mut failed = self.failed.lock().unwrap_or_else(|p| p.into_inner());
-        failed.retain(|(host, _)| host != hostname);
+        failed.retain(|(host, _)| !hosts.contains(host));
     }
 
     /// Warn the first time a host is accepted with no pin on record. The relay
@@ -321,7 +360,9 @@ impl ServerCertVerifier for PinningServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        let valid = self.inner.verify_tls12_signature(message, cert, dss)?;
+        self.proven(cert);
+        Ok(valid)
     }
 
     fn verify_tls13_signature(
@@ -330,7 +371,9 @@ impl ServerCertVerifier for PinningServerCertVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        let valid = self.inner.verify_tls13_signature(message, cert, dss)?;
+        self.proven(cert);
+        Ok(valid)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -415,6 +458,7 @@ mod tests {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
+            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: None,
         }
     }
@@ -555,6 +599,7 @@ mod tests {
             require_pinned,
             warned_unpinned: Arc::new(Mutex::new(HashSet::new())),
             failed: Arc::new(Mutex::new(HashSet::new())),
+            awaiting_proof: Arc::new(Mutex::new(HashMap::new())),
             on_failure: Some(Arc::new(move |host, reason| {
                 hits.lock().unwrap().push((host.to_string(), reason));
             })),
@@ -582,6 +627,7 @@ mod tests {
             .unwrap()
             .add_pin("relay.example.com".into(), cert_spki_hash());
         assert!(run(&v, "relay.example.com").is_ok());
+        v.proven(&CertificateDer::from(cert_der()));
         assert!(
             hits.lock().unwrap().len() == 1,
             "a match is not a rejection"
@@ -591,6 +637,46 @@ mod tests {
         pins.lock()
             .unwrap()
             .add_pin("relay.example.com".into(), [0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert_eq!(hits.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_replayed_certificate_without_its_key_does_not_rearm_the_report() {
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let pins = Arc::new(Mutex::new(CertificatePinSet::new()));
+        let v = hooked(true, Arc::clone(&pins), false, Arc::clone(&hits));
+        let swap_pin = |hash: SpkiHash| {
+            let mut pins = pins.lock().unwrap();
+            pins.remove_pin("relay.example.com");
+            pins.add_pin("relay.example.com".into(), hash);
+        };
+
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        for _ in 0..3 {
+            swap_pin(cert_spki_hash());
+            assert!(run(&v, "relay.example.com").is_ok());
+            swap_pin([0xAAu8; 32]);
+            assert!(run(&v, "relay.example.com").is_err());
+        }
+        assert_eq!(hits.lock().unwrap().len(), 1);
+
+        swap_pin(cert_spki_hash());
+        assert!(run(&v, "relay.example.com").is_ok());
+        swap_pin([0xAAu8; 32]);
+        assert!(run(&v, "relay.example.com").is_err());
+        v.proven(&CertificateDer::from(cert_der()));
+        assert_eq!(
+            hits.lock().unwrap().len(),
+            1,
+            "a refusal in between drops the pending proof"
+        );
+
+        swap_pin(cert_spki_hash());
+        assert!(run(&v, "relay.example.com").is_ok());
+        v.proven(&CertificateDer::from(cert_der()));
+        swap_pin([0xAAu8; 32]);
         assert!(run(&v, "relay.example.com").is_err());
         assert_eq!(hits.lock().unwrap().len(), 2);
     }
