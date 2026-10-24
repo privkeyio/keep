@@ -9,6 +9,7 @@ ignore = [
     { id = "RUSTSEC-2026-0194", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml XML DoS; only reached via wayland-scanner (build-time protocol XML) and tauri-winrt-notification (self-generated Windows toast XML), never untrusted input; fix requires 0.41.0, unavailable at the pinned transitive minors" },
     { id = "RUSTSEC-2026-0381", reason = "only webpki-roots 0.26.11 remains flagged: a semver shim whose sole item re-exports TLS_SERVER_ROOTS from webpki-roots 1.x, locked at the patched 1.0.10; tokio-tungstenite 0.26 (via async-wsocket) pins the shim. [bans] denies webpki-roots 1.x below 1.0.10 so this ignore cannot hide a downgrade" },
+    { id = "RUSTSEC-2026-0387", reason = "only crypto-bigint 0.5.5 remains, via elliptic-curve/k256 0.13, which frost-secp256k1-tr 3.0.0 and voprf pin with no 0.14-based release. 0.5.5 has none of the advisory's UintRef, BoxedMontyForm or ctutils code; k256 0.13 calls it on secrets only for mask-based add_mod/sub_mod/neg_mod/sbb/ct_* and keeps scalar mul, invert and field arithmetic in its own code. [bans] denies the 0.6 and 0.7 lines below 0.7.6. The lockfile still lists 0.6.1 through vsss-rs weak features, but it is never built. Revisit by 2027-01-31 or when frost-secp256k1-tr moves to k256 0.14" },
     { id = "RUSTSEC-2026-0237", reason = "nostr-relay-builder unmaintained; dev-dependency only (test relay for keep-cli, keep-frost-net, keep-nip46 integration tests), never in a shipped artifact; unmaintained advisory with no fixed version to move to" },
 ]
 unmaintained = "workspace"
@@ -45,6 +46,8 @@ deny = [
     { crate = "openssl-sys" },
     { crate = "webpki-roots:>=1,<1.0.10", reason = "RUSTSEC-2026-0381 is ignored for the 0.26 shim; the roots it re-exports must stay patched" },
     { crate = "webpki-roots:<0.26.11", reason = "these bundle their own roots, including the one RUSTSEC-2026-0381 removes, and that advisory is ignored by ID" },
+    { crate = "crypto-bigint:>=0.6.0-0,<0.7.0-0", reason = "RUSTSEC-2026-0387 is ignored by ID for the 0.5 line only; pre-releases included" },
+    { crate = "crypto-bigint:>=0.7.0-0,<0.7.6", reason = "RUSTSEC-2026-0387 is ignored by ID for the 0.5 line only; pre-releases included" },
 ]
 
 [sources]
