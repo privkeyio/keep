@@ -385,12 +385,6 @@ impl SigningAuditLog {
             reason,
             hmac,
         };
-        info!(
-            relay_host,
-            reason = reason.as_str(),
-            hmac = %hex::encode(hmac),
-            "Relay pin rejection audit entry"
-        );
         let mut ring = self.pin_rejections.write();
         if ring.len() >= self.max_pin_rejections {
             ring.pop_front();
