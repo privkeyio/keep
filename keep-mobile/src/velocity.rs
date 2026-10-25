@@ -39,15 +39,29 @@ impl VelocityTracker {
         }
     }
 
+    #[cfg(test)]
     pub fn record(&mut self, amount_sats: u64) {
+        self.record_at(amount_sats, Utc::now());
+    }
+
+    /// Record a spend as made at `at`. The policy path passes the floored
+    /// time, not the device clock: a spend stamped by a clock set back is dated
+    /// early, so it leaves the daily and weekly windows early once the clock
+    /// is put right, and the limit can be spent again.
+    pub fn record_at(&mut self, amount_sats: u64, at: chrono::DateTime<Utc>) {
         if self.transactions.len() >= MAX_TRACKED_TRANSACTIONS {
             self.transactions.pop_front();
         }
 
         self.transactions.push_back(TrackedTransaction {
-            timestamp: Utc::now(),
+            timestamp: at,
             amount_sats,
         });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_timestamp(&self) -> Option<chrono::DateTime<Utc>> {
+        self.transactions.back().map(|tx| tx.timestamp)
     }
 
     pub fn daily_total(&self) -> u64 {

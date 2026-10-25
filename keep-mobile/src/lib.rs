@@ -2361,7 +2361,31 @@ impl KeepMobile {
     /// the caller has to refuse it.
     pub fn record_policy_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
         self.reload_velocity_if_unknown()?;
-        self.policy_read_lock()?.record_transaction(amount_sats)?;
+        // Dated no earlier than the stored floor, so a spend made with the
+        // clock set back behind it does not leave the limit windows early. Read
+        // without a monotonic reading, which leaves the floor where it is, and
+        // before the policy lock, as everywhere.
+        //
+        // A floor that cannot be used refuses while a policy depends on it, as
+        // every other policy path does: this runs before the spend completes,
+        // and dating it by the device clock instead would bring back the early
+        // dating this exists to stop. With no policy there are no limits to
+        // date anything against, so the device clock is fine.
+        let floored = self
+            .policy_now(None)
+            .ok()
+            .and_then(|clock| chrono::DateTime::from_timestamp(clock.effective_secs, 0));
+        let stamp = match floored {
+            Some(stamp) => stamp,
+            None if self.policy_configured()? => {
+                return Err(KeepMobileError::InvalidPolicy {
+                    msg: "The time floor is unusable, so the spend cannot be dated".into(),
+                })
+            }
+            None => chrono::Utc::now(),
+        };
+        self.policy_read_lock()?
+            .record_transaction_at(amount_sats, stamp)?;
         let velocity = self.velocity_lock()?;
         let tracker = velocity
             .as_ref()
@@ -10204,6 +10228,49 @@ mod velocity_fault_tests {
             mobile.get_policy_info(None).is_none(),
             "a bundle out of its window is not the policy in force"
         );
+    }
+
+    /// A spend made with the clock set back behind the floor is dated at the
+    /// floor. Dated by the clock, it would leave the daily window early once
+    /// the clock was put right, and the limit could be spent again.
+    #[test]
+    fn a_spend_made_with_the_clock_set_back_is_dated_at_the_floor() {
+        let now = Utc::now().timestamp() as u64;
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        let floor_secs = now + 20 * 3600;
+        storage.plant(
+            CLOCK_FLOOR_STORAGE_KEY,
+            serde_json::to_vec(&crate::clock_floor::ClockFloor {
+                floor_secs,
+                anchor_elapsed_ms: Some(9_000_000),
+            })
+            .unwrap(),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+
+        mobile.record_policy_transaction(1_000).unwrap();
+
+        let velocity = mobile.velocity_lock().unwrap();
+        let dated = velocity.as_ref().unwrap().last_timestamp().unwrap();
+        assert!(
+            dated.timestamp() as u64 >= floor_secs,
+            "dated {dated}, floor {floor_secs}"
+        );
+    }
+
+    /// A floor that cannot be used refuses the spend while a policy depends on
+    /// it, rather than dating it by a clock that may have been set back.
+    #[test]
+    fn a_spend_is_refused_when_the_floor_is_unusable_under_a_policy() {
+        let storage = Arc::new(FaultingStorage::default());
+        plant_policy(&storage, &capped_rules(), true);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        storage.plant(CLOCK_FLOOR_STORAGE_KEY, b"not a floor".to_vec());
+
+        assert!(mobile.record_policy_transaction(1_000).is_err());
+        let velocity = mobile.velocity_lock().unwrap();
+        assert_eq!(velocity.as_ref().unwrap().last_timestamp(), None);
     }
 
     /// With no policy configured the floor guards nothing, so a record that
