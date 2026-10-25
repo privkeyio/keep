@@ -4,7 +4,7 @@
 use crate::clock_floor::PolicyClock;
 use crate::error::KeepMobileError;
 use crate::velocity::VelocityTracker;
-use chrono::{Datelike, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use k256::schnorr::{signature::Verifier, Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -105,12 +105,37 @@ pub struct PolicyRules {
     pub max_amount: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_fee: Option<u64>,
+    /// Spending over the last 24 hours, measured on the device clock. A spend
+    /// is never dated earlier than the stored time floor. The floor can lag
+    /// real time, by however long the device was off and by up to a minute,
+    /// so a spend made with the clock set back within that lag is still dated
+    /// early by up to it. Setting the clock forward moves past spends out of
+    /// the window, so against whoever holds the device this and
+    /// [`Self::weekly_limit`] are worth what [`Self::allowed_hours`] is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daily_limit: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weekly_limit: Option<u64>,
+    /// UTC hours a spend may happen in, judged at the device's time.
+    ///
+    /// What this and [`Self::allowed_days`] are worth: a convenience against
+    /// mistakes, not a control against whoever holds the device. Both are read
+    /// off the device clock, which the holder can set. They are also judged at
+    /// the stored time floor, so a clock set back behind that floor (the
+    /// latest time the app has proven has passed, which needs the platform's
+    /// monotonic reading) is refused. That is all the floor catches: it never
+    /// rises past the clock, so a clock set back while the window is still
+    /// open keeps the floor inside it, and it does not follow real time across
+    /// a reboot. Setting the clock forward to the next opening is not caught at
+    /// all. Making these a control needs a time source the holder cannot set.
+    ///
+    /// An honest clock corrected backward looks the same as one set back, so
+    /// after such a correction the window can close early by up to the size of
+    /// the correction, for about that long.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_hours: Option<HourRange>,
+    /// Days of the week a spend may happen on, in UTC, as three-letter
+    /// abbreviations. Worth the same as [`Self::allowed_hours`]; see there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed_days: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -810,30 +835,44 @@ impl PolicyEvaluator {
             }
         }
 
-        if let Some(hour_range) = &rules.allowed_hours {
-            let now = Utc::now();
-            let hour = now.hour() as u8;
-            let allowed = if hour_range.start <= hour_range.end {
-                hour >= hour_range.start && hour < hour_range.end
-            } else {
-                hour >= hour_range.start || hour < hour_range.end
+        if rules.allowed_hours.is_some() || rules.allowed_days.is_some() {
+            // Judged at both readings, and both have to fall inside. They
+            // differ only when the device clock is behind the stored floor,
+            // which a clock set back looks like (as does an honest backward
+            // correction), and the floor cannot be lowered. Read from the
+            // clock the caller established rather than from `Utc::now`, so the
+            // window rules see the same time the expiry check did.
+            // Defensive: `evaluate`'s expiry check refuses every clock that
+            // could get here out of range, so this is not expected to fire.
+            let Some(instants) = window_instants(clock) else {
+                return Ok(PolicyDecision::Deny {
+                    reason: "Cannot evaluate the spending policy: the clock is out of range".into(),
+                });
             };
-            if !allowed {
-                return Ok(PolicyDecision::Deny {
-                    reason: "Transaction outside allowed hours".into(),
-                });
-            }
-        }
 
-        if let Some(allowed_days) = &rules.allowed_days {
-            let day_name = weekday_abbrev(Utc::now().weekday());
-            if !allowed_days
-                .iter()
-                .any(|d| d.eq_ignore_ascii_case(day_name))
-            {
-                return Ok(PolicyDecision::Deny {
-                    reason: "Transaction not allowed on this day".into(),
-                });
+            if let Some(hour_range) = &rules.allowed_hours {
+                if !instants
+                    .iter()
+                    .all(|t| hour_in_range(t.hour() as u8, hour_range))
+                {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Transaction outside allowed hours".into(),
+                    });
+                }
+            }
+
+            if let Some(allowed_days) = &rules.allowed_days {
+                let day_allowed = |t: &DateTime<Utc>| {
+                    let day_name = weekday_abbrev(t.weekday());
+                    allowed_days
+                        .iter()
+                        .any(|d| d.eq_ignore_ascii_case(day_name))
+                };
+                if !instants.iter().all(day_allowed) {
+                    return Ok(PolicyDecision::Deny {
+                        reason: "Transaction not allowed on this day".into(),
+                    });
+                }
             }
         }
 
@@ -865,7 +904,18 @@ impl PolicyEvaluator {
         Ok(PolicyDecision::Allow)
     }
 
+    #[cfg(test)]
     pub fn record_transaction(&self, amount_sats: u64) -> Result<(), KeepMobileError> {
+        self.record_transaction_at(amount_sats, Utc::now())
+    }
+
+    /// Record a spend dated `at`; see [`VelocityTracker::record_at`] for why
+    /// the policy path dates it at the floored time.
+    pub(crate) fn record_transaction_at(
+        &self,
+        amount_sats: u64,
+        at: DateTime<Utc>,
+    ) -> Result<(), KeepMobileError> {
         let mut velocity = self
             .velocity
             .lock()
@@ -877,7 +927,7 @@ impl PolicyEvaluator {
             .ok_or_else(|| KeepMobileError::StorageError {
                 msg: "Spending history unreadable, cannot record transaction".into(),
             })?;
-        velocity.record(amount_sats);
+        velocity.record_at(amount_sats, at);
         Ok(())
     }
 }
@@ -901,6 +951,26 @@ impl TransactionContext {
             destinations,
             has_unknown_destination,
         }
+    }
+}
+
+/// The instants a time-window rule is judged at: what the device clock says,
+/// and the time floored at the stored floor. `None` when either is outside
+/// what a date can represent, which refuses.
+fn window_instants(clock: PolicyClock) -> Option<[DateTime<Utc>; 2]> {
+    Some([
+        DateTime::from_timestamp(clock.clock_secs, 0)?,
+        DateTime::from_timestamp(clock.effective_secs, 0)?,
+    ])
+}
+
+/// Whether `hour` falls in `range`, which wraps past midnight when its start
+/// is after its end.
+fn hour_in_range(hour: u8, range: &HourRange) -> bool {
+    if range.start <= range.end {
+        hour >= range.start && hour < range.end
+    } else {
+        hour >= range.start || hour < range.end
     }
 }
 
@@ -1626,5 +1696,139 @@ mod tests {
             panic!("expected a fault");
         };
         assert_eq!(fault, PolicyFault::Unverified);
+    }
+
+    /// 2026-10-21, a Wednesday, at `hour`:00 UTC.
+    fn wednesday_at(hour: u32) -> i64 {
+        use chrono::TimeZone;
+        Utc.with_ymd_and_hms(2026, 10, 21, hour, 0, 0)
+            .unwrap()
+            .timestamp()
+    }
+
+    fn time_window_evaluator(rules: &PolicyRules) -> PolicyEvaluator {
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
+        let mut evaluator = PolicyEvaluator::new(velocity);
+        evaluator.set_policy(create_test_bundle_at(
+            rules,
+            (wednesday_at(0) - 24 * 3600) as u64,
+        ));
+        evaluator
+    }
+
+    fn allows(evaluator: &PolicyEvaluator, clock: PolicyClock) -> bool {
+        let ctx = TransactionContext {
+            amount_sats: 1_000,
+            fee_sats: 10,
+            destinations: vec![],
+            has_unknown_destination: false,
+        };
+        matches!(
+            evaluator.evaluate(&ctx, clock).unwrap(),
+            PolicyDecision::Allow
+        )
+    }
+
+    /// The hour window is judged at the clock the caller established, at an
+    /// exact instant, and at its edges: the start is inside and the end is not.
+    #[test]
+    fn the_hour_window_is_judged_at_the_given_clock() {
+        let evaluator = time_window_evaluator(&PolicyRules {
+            allowed_hours: Some(HourRange { start: 9, end: 17 }),
+            ..Default::default()
+        });
+        assert!(allows(&evaluator, at(wednesday_at(9))));
+        assert!(allows(&evaluator, at(wednesday_at(16))));
+        assert!(!allows(&evaluator, at(wednesday_at(17))));
+        assert!(!allows(&evaluator, at(wednesday_at(3))));
+    }
+
+    /// A range whose start is after its end wraps past midnight.
+    #[test]
+    fn an_hour_window_can_wrap_past_midnight() {
+        let evaluator = time_window_evaluator(&PolicyRules {
+            allowed_hours: Some(HourRange { start: 22, end: 6 }),
+            ..Default::default()
+        });
+        assert!(allows(&evaluator, at(wednesday_at(23))));
+        assert!(allows(&evaluator, at(wednesday_at(2))));
+        assert!(!allows(&evaluator, at(wednesday_at(12))));
+    }
+
+    /// The case this closes: the window has shut for the day, the app has
+    /// since seen the later time, and the holder sets the device clock back
+    /// into the window. The floor still reads the later time, so the spend is
+    /// refused. Before this the rule read `Utc::now` alone and allowed it.
+    #[test]
+    fn a_clock_wound_back_into_the_hour_window_is_refused() {
+        let evaluator = time_window_evaluator(&PolicyRules {
+            allowed_hours: Some(HourRange { start: 9, end: 17 }),
+            ..Default::default()
+        });
+        let wound_back = PolicyClock {
+            clock_secs: wednesday_at(10),
+            effective_secs: wednesday_at(20),
+        };
+        assert!(!allows(&evaluator, wound_back));
+    }
+
+    /// The same for the day rule: Thursday is not allowed, and setting the
+    /// clock back to Wednesday leaves the floor on Thursday.
+    #[test]
+    fn a_clock_wound_back_into_an_allowed_day_is_refused() {
+        let evaluator = time_window_evaluator(&PolicyRules {
+            allowed_days: Some(vec!["wed".into()]),
+            ..Default::default()
+        });
+        assert!(allows(&evaluator, at(wednesday_at(12))));
+        assert!(!allows(&evaluator, at(wednesday_at(12) + 24 * 3600)));
+        let wound_back = PolicyClock {
+            clock_secs: wednesday_at(12),
+            effective_secs: wednesday_at(12) + 24 * 3600,
+        };
+        assert!(!allows(&evaluator, wound_back));
+    }
+
+    /// Each reading is judged on its own, so a rule reading only one of them
+    /// fails one of these. The floor inside with the clock outside refuses,
+    /// as does the reverse, and both inside allows even when they differ.
+    #[test]
+    fn both_readings_have_to_fall_inside_the_window() {
+        let evaluator = time_window_evaluator(&PolicyRules {
+            allowed_hours: Some(HourRange { start: 9, end: 17 }),
+            ..Default::default()
+        });
+        let clock_before_opening = PolicyClock {
+            clock_secs: wednesday_at(9) - 300,
+            effective_secs: wednesday_at(9) + 300,
+        };
+        assert!(!allows(&evaluator, clock_before_opening));
+        let both_inside = PolicyClock {
+            clock_secs: wednesday_at(10),
+            effective_secs: wednesday_at(10) + 300,
+        };
+        assert!(allows(&evaluator, both_inside));
+
+        let overnight = time_window_evaluator(&PolicyRules {
+            allowed_hours: Some(HourRange { start: 22, end: 6 }),
+            ..Default::default()
+        });
+        let floor_past_closing = PolicyClock {
+            clock_secs: wednesday_at(5),
+            effective_secs: wednesday_at(7),
+        };
+        assert!(!allows(&overnight, floor_past_closing));
+    }
+
+    /// A spend is dated where the caller says, so the policy path can date it
+    /// at the floored time rather than at a clock set back.
+    #[test]
+    fn a_spend_is_dated_at_the_time_it_is_recorded_at() {
+        let velocity = Arc::new(Mutex::new(Some(VelocityTracker::new())));
+        let evaluator = PolicyEvaluator::new(Arc::clone(&velocity));
+        let floored = DateTime::from_timestamp(wednesday_at(12), 0).unwrap();
+        evaluator.record_transaction_at(1_000, floored).unwrap();
+        let guard = velocity.lock().unwrap();
+        assert_eq!(guard.as_ref().unwrap().last_timestamp(), Some(floored));
     }
 }
