@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "keep-agent"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -1580,7 +1580,7 @@ dependencies = [
 
 [[package]]
 name = "keep-approval"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "bitcoin",
  "hex",
@@ -1597,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "keep-bitcoin"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "bitcoin",
  "getrandom 0.4.3",
@@ -1613,7 +1613,7 @@ dependencies = [
 
 [[package]]
 name = "keep-core"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "aes 0.9.3",
  "argon2",
