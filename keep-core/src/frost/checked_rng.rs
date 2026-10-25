@@ -33,23 +33,37 @@
 //! that no whole block could be formed from are refused outright instead of
 //! being certified by those extra draws.
 //!
+//! What the criteria cannot catch, because the judge is built per call: a
+//! source that replays the same sequence from one call to the next. Every
+//! comparison inside each call passes, and without more the same nonce pair
+//! would come back in every session, which is the case that recovers the
+//! share. Comparing across calls would mean keeping drawn bytes for the life of
+//! the process, so that case is closed differently: every fill is hashed,
+//! after it has been judged, together with a process-wide fill counter, the
+//! process id and the clock (see [`separate`]). What a secret is built from is
+//! then never the same twice in one process, whatever the source does, and the
+//! criteria still see the source's own bytes rather than the hash, which would
+//! pass them all.
+//!
 //! What it does not catch, stated here so the check is not trusted past its
-//! reach. The judge is built per call, so a source that replays the same
-//! sequence across calls emits the same nonce pair in every session and passes
-//! every comparison made here. That is the case that recovers the share, and it
-//! is the gap tracked as follow-up work; within one call, hiding and binding
-//! matching does not by itself recover anything. It also cannot see a source
-//! that is compromised rather than broken: bytes an attacker chose but that
-//! look statistically healthy pass every criterion, and no test at the draw can
-//! do better. At a site that makes a single draw the only comparison is against
-//! bytes drawn after the secret, which catches a source that is still degraded
-//! when probed but not one that emits a single chosen value and then recovers.
+//! reach. Two copies of one process restored from a snapshot share the counter
+//! and the pid, and if the source replays across them too, only the clock
+//! tells their fills apart, which separates them in practice and guarantees
+//! nothing. It also cannot see a source that is compromised rather than broken:
+//! bytes an attacker chose but that look statistically healthy pass every
+//! criterion, and no test at the draw can do better. At a site that makes a
+//! single draw the only comparison is against bytes drawn after the secret,
+//! which catches a source that is still degraded when probed but not one that
+//! emits a single chosen value and then recovers.
 
 // The Ed25519 half is gated on keep-core's `ed25519` feature. This file is also
 // compiled into the enclave, which does not declare that feature.
 #![allow(unexpected_cfgs)]
 
 use frost_secp256k1_tr::rand_core::{impls, CryptoRng, Error as RngError, OsRng, RngCore};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Why a draw could not be trusted.
@@ -110,12 +124,14 @@ pub(crate) const MAX_FROZEN_POSITIONS: usize = 3;
 ///
 /// Its coverage: it caught a frozen extreme byte, and any number of them, but
 /// never a frozen byte of any other value. A source that fills part of a buffer
-/// and leaves the rest as it was is the case that matters, because several
-/// draws turn bytes straight into a scalar with no hash between: the dealer's
-/// key, every polynomial coefficient, refresh and repair deltas, and the DKG
-/// proof-of-knowledge nonce. Twelve frozen bytes there leave 160 bits in known
-/// positions, about 2^80 work to recover, and the Hamming floor does not catch
-/// it until roughly half the bytes are frozen.
+/// and leaves the rest as it was is the case that matters, because what it
+/// hands out carries fewer unpredictable bits than its width claims, and that
+/// shortfall reaches every secret built from it: the dealer's key, every
+/// polynomial coefficient, refresh and repair deltas, and the DKG
+/// proof-of-knowledge nonce. Hashing each fill before it is used (see
+/// [`separate`]) mixes the frozen bytes in but cannot replace them, and the
+/// Hamming floor does not catch such a source until roughly half the bytes are
+/// frozen.
 ///
 /// Counting positions frozen at any value, and refusing above
 /// [`MAX_FROZEN_POSITIONS`], fixes both. A position matches across three
@@ -308,8 +324,8 @@ impl<R: RngCore> CheckedRng<R> {
         // A source that fills only part of what it is asked for leaves the rest
         // as it was, so the same byte positions hold the same value in every
         // block. The pairwise checks miss that until about half the bytes are
-        // frozen, and several draws here take bytes straight into a scalar,
-        // so it is counted across every block judged. The threshold and why it
+        // frozen, and every secret built here inherits the shortfall, so it is
+        // counted across every block judged. The threshold and why it
         // does not latch a healthy node are on `frozen_positions`.
         if self.fault.is_none() && self.judged.len() >= MIN_JUDGED {
             let blocks = Zeroizing::new(self.judged.iter().map(|b| **b).collect::<Vec<_>>());
@@ -317,6 +333,67 @@ impl<R: RngCore> CheckedRng<R> {
                 self.fault = Some(EntropyHealthError::Degraded);
             }
         }
+    }
+}
+
+/// Fills handed out by every [`CheckedRng`] in this process, so no two are
+/// ever separated with the same count. Holds a count and nothing drawn.
+static FILLS_HANDED_OUT: AtomicU64 = AtomicU64::new(0);
+
+/// Replace a judged fill with a hash of it that no other fill in this process
+/// can share.
+///
+/// Each 32-byte block of the output is SHA-256 over a domain tag, the fill's
+/// number in this process, the process id, the clock, the block's index and
+/// the whole fill as drawn. The count makes the input unique within a process
+/// for as long as it runs, so a source replaying a sequence from one call to
+/// the next can no longer hand frost-core the same bytes twice: frost-core
+/// derives a nonce as `H3(random_bytes || signing_share)` (frost-core 3.0.0,
+/// `round1.rs:77-90`), and a repeat there is what recovers the share. The pid
+/// does the same for a forked child, which inherits the count.
+///
+/// That guarantee holds within one process and nowhere else. A new process
+/// starts the count again, so every run of a one-shot command, a restarted
+/// daemon and a copy restored from a snapshot are told apart from each other
+/// only by the pid and the clock. A pid is often the same on every start in a
+/// container or an enclave, which leaves the clock, and that separates them in
+/// practice without guaranteeing anything.
+///
+/// The output is no more predictable than the fill: with SHA-256 treated as a
+/// random function, a healthy fill comes out indistinguishable from uniform,
+/// and the count, pid and clock add no entropy worth counting. That is why it
+/// runs after the fill is judged and never before, since the hash of a stuck
+/// source looks healthy to every criterion.
+fn separate(dest: &mut [u8]) {
+    if dest.is_empty() {
+        return;
+    }
+    let fill = FILLS_HANDED_OUT.fetch_add(1, Ordering::Relaxed);
+    // A clock set before 1970 is still a clock, so it is hashed by distance
+    // and side rather than collapsed to one constant.
+    let clock = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(after) => (1u8, after.as_nanos()),
+        Err(before) => (0u8, before.duration().as_nanos()),
+    };
+    let drawn = Zeroizing::new(dest.to_vec());
+    for (index, block) in dest.chunks_mut(32).enumerate() {
+        let mut hasher = Sha256::new();
+        hasher.update(b"keep/checked-rng/separate/v1\0");
+        hasher.update(fill.to_le_bytes());
+        hasher.update(std::process::id().to_le_bytes());
+        hasher.update([clock.0]);
+        hasher.update(clock.1.to_le_bytes());
+        hasher.update((index as u64).to_le_bytes());
+        hasher.update((drawn.len() as u64).to_le_bytes());
+        hasher.update(&drawn[..]);
+        let mut digest = hasher.finalize();
+        block.copy_from_slice(&digest[..block.len()]);
+        // Hygiene to the same standard as `judged`: frost-core keeps its own
+        // copy of these bytes unscrubbed. keep-core's SHA-256 also clears its
+        // buffer on drop; the enclave's sha2 0.10 cannot, so the raw fill may
+        // stay in that hasher's freed buffer there.
+        let digest: &mut [u8] = &mut digest;
+        digest.zeroize();
     }
 }
 
@@ -339,6 +416,7 @@ impl<R: RngCore> RngCore for CheckedRng<R> {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         self.inner.fill_bytes(dest);
         self.judge(dest);
+        separate(dest);
     }
 
     /// Nothing on the nonce path reaches this: frost-core fills through
@@ -348,6 +426,7 @@ impl<R: RngCore> RngCore for CheckedRng<R> {
     fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), RngError> {
         self.inner.try_fill_bytes(dest)?;
         self.judge(dest);
+        separate(dest);
         Ok(())
     }
 }
@@ -556,6 +635,22 @@ mod tests {
     impl_rng!(CountingRng, |s, dest| {
         s.0 += dest.len();
         OsRng.fill_bytes(dest);
+    });
+
+    /// Healthy-looking from block to block, and the same sequence from the
+    /// start every time one is made. Built fresh per call, it is a source that
+    /// replays itself across calls, which no comparison inside a call can see.
+    struct ReplayingRng(u64);
+
+    impl_rng!(ReplayingRng, |s, dest| {
+        for block in dest.chunks_mut(32) {
+            let digest = Sha256::new()
+                .chain_update(b"replaying source")
+                .chain_update(s.0.to_le_bytes())
+                .finalize();
+            block.copy_from_slice(&digest[..block.len()]);
+            s.0 += 1;
+        }
     });
 
     impl_rng!(CreepingRng, |s, dest| {
@@ -936,5 +1031,104 @@ mod tests {
             verdict_of(ExactlyFrozenRng(4, 0)),
             Some(EntropyHealthError::Degraded)
         );
+    }
+    /// The share-recovering case the per-call criteria cannot see: a source
+    /// that hands every call the same sequence. Each call passes, because
+    /// nothing inside it repeats, and before fills were separated both calls
+    /// committed to the same nonce pair, so two signatures over different
+    /// messages gave up the share.
+    #[test]
+    fn a_source_replaying_its_sequence_across_calls_never_repeats_a_nonce() {
+        let mut first_raw = [0u8; 64];
+        let mut second_raw = [0u8; 64];
+        ReplayingRng(0).fill_bytes(&mut first_raw);
+        ReplayingRng(0).fill_bytes(&mut second_raw);
+        assert_eq!(first_raw, second_raw, "the source must really replay");
+
+        let share = test_share(9);
+        let commit = || {
+            checked_draw_from(ReplayingRng(0), |rng| {
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
+                frost_secp256k1_tr::round1::commit(&share, rng)
+            })
+            .expect("each call on its own looks healthy, so it passes")
+        };
+        let (first, _) = commit();
+        let (second, _) = commit();
+        assert_ne!(first.hiding().serialize(), second.hiding().serialize());
+        assert_ne!(first.binding().serialize(), second.binding().serialize());
+    }
+
+    /// The same for Ed25519, whose nonces come from the same kind of fill.
+    #[cfg(feature = "ed25519")]
+    #[test]
+    fn an_ed25519_source_replaying_across_calls_never_repeats_a_nonce() {
+        let (shares, _) = checked_draw(|rng| {
+            #[expect(clippy::disallowed_methods)] // drawn through the checked source
+            frost_ed25519::keys::generate_with_dealer(
+                3,
+                2,
+                frost_ed25519::keys::IdentifierList::Default,
+                rng,
+            )
+        })
+        .expect("the OS source must pass")
+        .expect("dealer generation must succeed");
+        let secret = shares.values().next().expect("three shares");
+        let commit = || {
+            checked_draw_from(ReplayingRng(0), |rng| {
+                #[expect(clippy::disallowed_methods)] // drawn through the checked source
+                frost_ed25519::round1::commit(secret.signing_share(), rng)
+            })
+            .expect("each call on its own looks healthy, so it passes")
+        };
+        let (first, _) = commit();
+        let (second, _) = commit();
+        assert_ne!(first.hiding().serialize(), second.hiding().serialize());
+        assert_ne!(first.binding().serialize(), second.binding().serialize());
+    }
+
+    /// Two identical fills never come out the same, at any width, including
+    /// one with a ragged tail shorter than a block.
+    #[test]
+    fn identical_fills_are_separated_at_every_width() {
+        // Nothing narrower than 16: a one-byte output matches by chance once in
+        // 256, which would make this fail on its own about one run in a hundred.
+        for width in [16usize, 32, 48, 64] {
+            let mut first = vec![0x42u8; width];
+            let mut second = first.clone();
+            separate(&mut first);
+            separate(&mut second);
+            assert_ne!(first, second, "width {width}");
+            assert_ne!(first, vec![0x42u8; width], "width {width}");
+        }
+    }
+
+    /// Every way out of the judged source is separated, not only the
+    /// `fill_bytes` that frost-core happens to use today.
+    #[test]
+    fn every_path_out_of_a_replaying_source_is_separated() {
+        // Whole blocks' worth, since narrower draws are refused as unjudged.
+        let via_u64 = || {
+            checked_draw_from(ReplayingRng(0), |rng| [(); 4].map(|()| rng.next_u64()))
+                .expect("a block of u64s is judged and passes")
+        };
+        assert_ne!(via_u64(), via_u64());
+
+        let via_u32 = || {
+            checked_draw_from(ReplayingRng(0), |rng| [(); 8].map(|()| rng.next_u32()))
+                .expect("a block of u32s is judged and passes")
+        };
+        assert_ne!(via_u32(), via_u32());
+
+        let via_try = || {
+            checked_draw_from(ReplayingRng(0), |rng| {
+                let mut block = [0u8; 32];
+                rng.try_fill_bytes(&mut block).map(|()| block)
+            })
+            .expect("a full block is judged and passes")
+            .expect("the source never refuses")
+        };
+        assert_ne!(via_try(), via_try());
     }
 }

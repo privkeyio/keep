@@ -231,10 +231,9 @@ impl KfpNode {
         let key_package = self.share.key_package()?;
         let mut fresh = Vec::with_capacity(deficit);
         for _ in 0..deficit {
-            // Drawn through the entropy module rather than the crypto wrapper
-            // so the health failure keeps its own type. The wrapper flattens it
-            // into a stringly-typed encryption error, and deciding to stop
-            // signing on a string match is exactly the guess this refuses to make.
+            // Drawn through the entropy module so the health failure reaches
+            // `entropy_refusal` as its own type, which is what the decision to
+            // stop signing branches on.
             let nonce_id: NonceId = keep_core::entropy::try_random_bytes::<32>()
                 .map_err(|e| self.entropy_refusal("nonce id", e))?;
             let (nonces, commitment) = self.commit_nonces(key_package.signing_share())?;

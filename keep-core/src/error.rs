@@ -513,6 +513,12 @@ pub enum KeepError {
     AuditWriteFailed(String),
     #[error("Encryption error: {0}")]
     Encryption(String),
+    /// The RNG behind a secret failed its health check, and what was built
+    /// from the draw was dropped rather than returned. Its own variant rather
+    /// than `Encryption`, so a caller can tell a bad source from a bad
+    /// ciphertext, and one that holds signing state can stop on `Degraded`.
+    #[error(transparent)]
+    Entropy(#[from] crate::entropy::EntropyHealthError),
     #[error("Database error: {0}")]
     Database(String),
     /// The vault's redb file is already opened (exclusive lock) by another
@@ -556,12 +562,6 @@ pub enum KeepError {
     CapacityExceeded(String),
     #[error("{0}")]
     Other(String),
-}
-
-impl From<crate::entropy::EntropyHealthError> for KeepError {
-    fn from(e: crate::entropy::EntropyHealthError) -> Self {
-        KeepError::Encryption(e.to_string())
-    }
 }
 
 #[allow(missing_docs)]

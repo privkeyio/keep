@@ -1318,15 +1318,20 @@ mod tests {
     }
 
     #[test]
-    fn entropy_health_error_maps_to_keep_encryption_error() {
+    fn entropy_health_error_keeps_its_identity_as_a_keep_error() {
         // The RNG-failure path returns a recoverable error rather than panicking
-        // (#685); it surfaces as a crypto/encryption-class KeepError.
+        // (#685), and keeps which failure it was, so a caller can stop signing
+        // on a degraded source without matching on a message.
         for e in [
             crate::entropy::EntropyHealthError::Degraded,
             crate::entropy::EntropyHealthError::Unavailable,
         ] {
             let err = crate::error::KeepError::from(e);
-            assert!(matches!(err, crate::error::KeepError::Encryption(_)));
+            assert!(
+                matches!(err, crate::error::KeepError::Entropy(kind) if kind == e),
+                "{err:?}"
+            );
+            assert_eq!(err.to_string(), e.to_string());
         }
     }
 
