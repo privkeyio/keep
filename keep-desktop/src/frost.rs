@@ -824,6 +824,14 @@ fn handle_node_event(
                 "RNG HEALTH CHECK FAILED: co-signing refused on this node".to_string(),
             );
         }
+        KfpNodeEvent::RelayPinRejected { relay_host, reason } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::Error,
+                format!("Relay {relay_host} refused: {}", reason.explanation()),
+            );
+        }
         // Threshold-OPRF unlock events are not surfaced in the
         // desktop UI yet (KeepNode appliance flow).
         KfpNodeEvent::OprfEvalRequested { .. }

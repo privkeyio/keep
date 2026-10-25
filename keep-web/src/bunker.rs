@@ -223,6 +223,15 @@ fn node_event_to_log(ev: &KfpNodeEvent) -> Option<Event> {
                 keep_frost_net::KFP_VERSION
             )),
         }),
+        KfpNodeEvent::RelayPinRejected { relay_host, reason } => Some(Event::Log {
+            app: "frost".into(),
+            action: "relay pin rejected".into(),
+            success: false,
+            detail: Some(format!(
+                "Relay {relay_host} refused: {}",
+                reason.explanation()
+            )),
+        }),
         _ => None,
     }
 }
@@ -518,6 +527,31 @@ pub fn spawn_single_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_relay_pin_rejection_is_an_activity_failure() {
+        let event = super::node_event_to_log(&KfpNodeEvent::RelayPinRejected {
+            relay_host: "relay.example.com".into(),
+            reason: keep_frost_net::PinRejection::Mismatch,
+        })
+        .expect("a pin rejection is surfaced");
+        match event {
+            Event::Log {
+                app,
+                action,
+                success,
+                detail,
+            } => {
+                assert_eq!(app, "frost");
+                assert_eq!(action, "relay pin rejected");
+                assert!(!success);
+                let detail = detail.expect("the relay is named");
+                assert!(detail.contains("relay.example.com"));
+                assert!(detail.contains("does not match"));
+            }
+            _ => panic!("expected a log event"),
+        }
+    }
 
     #[test]
     fn approval_id_is_js_safe() {

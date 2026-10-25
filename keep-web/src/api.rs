@@ -303,9 +303,18 @@ pub struct SigningEntryDto {
 }
 
 #[derive(Serialize)]
+pub struct PinRejectionDto {
+    timestamp_ms: u64,
+    relay_host: String,
+    reason: String,
+    detail: String,
+}
+
+#[derive(Serialize)]
 pub struct SigningLogResponse {
     verified: bool,
     entries: Vec<SigningEntryDto>,
+    pin_rejections: Vec<PinRejectionDto>,
 }
 
 /// Returns the FROST node's tamper-evident signing audit log (network mode).
@@ -314,6 +323,7 @@ pub async fn signing_log(State(state): State<AppState>) -> impl IntoResponse {
         return Json(SigningLogResponse {
             verified: true,
             entries: Vec::new(),
+            pin_rejections: Vec::new(),
         })
         .into_response();
     };
@@ -331,7 +341,23 @@ pub async fn signing_log(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
     entries.reverse();
-    Json(SigningLogResponse { verified, entries }).into_response()
+    let pin_rejections = log
+        .relay_pin_rejections()
+        .into_iter()
+        .rev()
+        .map(|e| PinRejectionDto {
+            timestamp_ms: e.timestamp_ms,
+            relay_host: e.relay_host,
+            reason: e.reason.as_str().to_string(),
+            detail: e.reason.explanation().to_string(),
+        })
+        .collect();
+    Json(SigningLogResponse {
+        verified,
+        entries,
+        pin_rejections,
+    })
+    .into_response()
 }
 
 #[derive(Serialize)]

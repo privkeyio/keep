@@ -15,6 +15,8 @@ use subtle::ConstantTimeEq;
 use tracing::info;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+use crate::pinning::{acceptable_relay_host, PinRejection};
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,6 +182,49 @@ pub struct SigningAuditLog {
     max_entries: usize,
     #[zeroize(skip)]
     max_refusals: usize,
+    /// Pin rejections are not signing operations, and a reconnect loop must
+    /// not be able to walk the signing history out of its ring.
+    #[zeroize(skip)]
+    pin_rejections: Arc<RwLock<VecDeque<RelayPinAuditEntry>>>,
+    #[zeroize(skip)]
+    max_pin_rejections: usize,
+}
+
+/// One live-handshake pin rejection. HMAC'd with the same key as the signing
+/// log so a later edit of the host or the reason fails verification.
+#[derive(Clone, Debug)]
+pub struct RelayPinAuditEntry {
+    pub timestamp_ms: u64,
+    pub relay_host: String,
+    pub reason: PinRejection,
+    pub hmac: [u8; 32],
+}
+
+impl RelayPinAuditEntry {
+    fn compute_hmac(
+        hmac_key: &[u8],
+        timestamp_ms: u64,
+        relay_host: &str,
+        reason: PinRejection,
+    ) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(hmac_key).expect("HMAC accepts any key length");
+        mac.update(b"keep/relay-pin/v1\0");
+        mac.update(&timestamp_ms.to_le_bytes());
+        let host = relay_host.as_bytes();
+        mac.update(&(host.len() as u16).to_le_bytes());
+        mac.update(host);
+        mac.update(&[reason.discriminant()]);
+        let result = mac.finalize();
+        let mut hmac_out = [0u8; 32];
+        hmac_out.copy_from_slice(&result.into_bytes());
+        hmac_out
+    }
+
+    pub fn verify(&self, hmac_key: &[u8]) -> bool {
+        let expected =
+            Self::compute_hmac(hmac_key, self.timestamp_ms, &self.relay_host, self.reason);
+        bool::from(self.hmac.ct_eq(&expected))
+    }
 }
 
 impl SigningAuditLog {
@@ -193,6 +238,10 @@ impl SigningAuditLog {
             // enough that the refusal stream is a bounded annex rather than a
             // second full-sized log.
             max_refusals: 1000,
+            pin_rejections: Arc::new(RwLock::new(VecDeque::new())),
+            // One relay flaps between match and mismatch. Bounded so that
+            // cannot grow the log without limit.
+            max_pin_rejections: 32,
         }
     }
 
@@ -304,11 +353,48 @@ impl SigningAuditLog {
     }
 
     pub fn verify_all(&self) -> bool {
-        self.entries
+        let signing = self
+            .entries
             .read()
             .iter()
             .chain(self.refusals.read().iter())
-            .all(|e| e.verify(&self.hmac_key))
+            .all(|e| e.verify(&self.hmac_key));
+        let pins = self
+            .pin_rejections
+            .read()
+            .iter()
+            .all(|e| e.verify(&self.hmac_key));
+        signing && pins
+    }
+
+    /// Record a pin rejection. Refuses a host that is not a hostname-shaped
+    /// label, so the log cannot be made to store an arbitrary string.
+    pub fn log_relay_pin_rejection(&self, relay_host: &str, reason: PinRejection) -> bool {
+        if !acceptable_relay_host(relay_host) {
+            return false;
+        }
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let hmac =
+            RelayPinAuditEntry::compute_hmac(&self.hmac_key, timestamp_ms, relay_host, reason);
+        let entry = RelayPinAuditEntry {
+            timestamp_ms,
+            relay_host: relay_host.to_string(),
+            reason,
+            hmac,
+        };
+        let mut ring = self.pin_rejections.write();
+        if ring.len() >= self.max_pin_rejections {
+            ring.pop_front();
+        }
+        ring.push_back(entry);
+        true
+    }
+
+    pub fn relay_pin_rejections(&self) -> Vec<RelayPinAuditEntry> {
+        self.pin_rejections.read().iter().cloned().collect()
     }
 
     pub fn get_entries_for_session(&self, session_id: &[u8; 32]) -> Vec<SigningAuditEntry> {
@@ -334,6 +420,7 @@ fn hash_bytes(data: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pinning::PinRejection;
 
     /// A flood of refusals must not walk accepted-path history out of the log.
     ///
@@ -585,5 +672,38 @@ mod tests {
             "two different records must not produce the same authentication tag"
         );
         assert!(log.verify_all());
+    }
+
+    #[test]
+    fn a_pin_rejection_is_authenticated_and_does_not_evict_signing_history() {
+        let log = SigningAuditLog::new([9u8; 32]);
+        log.log_signing_operation(
+            [1u8; 32],
+            b"m",
+            None,
+            vec![1],
+            1,
+            SigningOperation::SignRequestInitiated,
+            None,
+        );
+        assert!(log.log_relay_pin_rejection("relay.example.com", PinRejection::Mismatch));
+        assert!(!log.log_relay_pin_rejection("relay\nexample.com", PinRejection::Mismatch));
+        assert!(!log.log_relay_pin_rejection("", PinRejection::Missing));
+
+        let pins = log.relay_pin_rejections();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].relay_host, "relay.example.com");
+        assert_eq!(pins[0].reason, PinRejection::Mismatch);
+        assert!(pins[0].verify(&[9u8; 32]));
+        assert!(log.verify_all());
+        assert_eq!(
+            log.entries().len(),
+            1,
+            "a pin rejection is not a signing entry"
+        );
+
+        let mut tampered = pins[0].clone();
+        tampered.relay_host = "other.example.com".into();
+        assert!(!tampered.verify(&[9u8; 32]));
     }
 }
