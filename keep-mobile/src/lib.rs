@@ -3899,6 +3899,7 @@ fn nip46_to_mobile_error(e: keep_core::error::KeepError) -> KeepMobileError {
         KeepError::StorageErr(e) => KeepMobileError::StorageError { msg: e.to_string() },
         KeepError::CryptoErr(e) => KeepMobileError::FrostError { msg: e.to_string() },
         KeepError::Encryption(msg) => KeepMobileError::EncryptionError { msg },
+        KeepError::Entropy(e) => KeepMobileError::EncryptionError { msg: e.to_string() },
         KeepError::Runtime(msg) => KeepMobileError::NotSupported { msg },
         other => KeepMobileError::NetworkError {
             msg: other.to_string(),

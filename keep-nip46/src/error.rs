@@ -16,7 +16,9 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::Locked => "Signer locked",
         KeepError::AlreadyExists(_) | KeepError::NotFound(_) => "Resource error",
         KeepError::InvalidNetwork(_) => "Invalid network",
-        KeepError::Encryption(_) | KeepError::CryptoErr(_) => "Cryptographic operation failed",
+        KeepError::Encryption(_) | KeepError::Entropy(_) | KeepError::CryptoErr(_) => {
+            "Cryptographic operation failed"
+        }
         KeepError::Database(_)
         | KeepError::VaultAlreadyOpen(_)
         | KeepError::Migration(_)
