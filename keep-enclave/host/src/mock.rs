@@ -63,6 +63,9 @@ impl MockEnclaveClient {
             EnclaveRequest::ImportEncryptedKey { name, encrypted } => {
                 self.mock_import_encrypted_key(&name, &encrypted)
             }
+            EnclaveRequest::ImportEncryptedFrostKey {
+                name, encrypted, ..
+            } => self.mock_import_encrypted_key(&name, &encrypted),
             EnclaveRequest::ImportFrostKey {
                 name,
                 key_package,

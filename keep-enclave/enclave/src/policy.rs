@@ -21,15 +21,14 @@ pub struct Policy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PolicyRule {
     MaxAmountSats(u64),
-    /// Sign or SignPsbt requests signed by the key, this many a minute on
-    /// average with bursts of up to this many, a PSBT counting once however
-    /// many inputs it signs. A full burst followed by the minute's refill
-    /// can come to nearly twice this within one minute. Every such request
-    /// counts, including one a policy let through without reaching this
-    /// rule. The enclave keeps no count across restarts, so it starts with
-    /// none left when a policy is loaded and refills from there: the first
-    /// signature waits a minute divided by the maximum. The hour and day
-    /// rules work the same way.
+    /// Sign or SignPsbt requests signed and FROST shares made by the key, this
+    /// many a minute on average with bursts of up to this many, a PSBT counting
+    /// once however many inputs it signs. A full burst followed by the minute's
+    /// refill can come to nearly twice this within one minute. Every such request
+    /// counts, including one a policy let through without reaching this rule. The
+    /// enclave keeps no count across restarts, so it starts with none left when a
+    /// policy is loaded and refills from there: the first signature waits a
+    /// minute divided by the maximum. The hour and day rules work the same way.
     MaxPerMinute(u32),
     MaxPerHour(u32),
     MaxPerDay(u32),

@@ -45,6 +45,8 @@ struct FrostKeyEntry {
     key_package_bytes: MlockedVec,
     #[zeroize(skip)]
     pubkey_package_bytes: Vec<u8>,
+    #[zeroize(skip)]
+    group_pubkey: [u8; 32],
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -55,6 +57,8 @@ struct FrostSession {
     message: Vec<u8>,
     #[zeroize(skip)]
     key_id: String,
+    #[zeroize(skip)]
+    group_pubkey: [u8; 32],
 }
 
 impl EnclaveSigner {
@@ -225,7 +229,10 @@ impl EnclaveSigner {
         key_package_bytes: Vec<u8>,
         pubkey_package_bytes: Vec<u8>,
     ) -> Result<[u8; 32]> {
-        let key_package = frost::keys::KeyPackage::deserialize(&key_package_bytes)
+        // Locked before parsing, so bytes that fail to parse (a wallet secret
+        // sent as a share, say) are wiped on the way out too.
+        let key_package_bytes = MlockedVec::new(key_package_bytes);
+        let key_package = frost::keys::KeyPackage::deserialize(key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::InvalidKey(format!("Invalid FROST key package: {}", e)))?;
 
         let pubkey = key_package
@@ -238,12 +245,35 @@ impl EnclaveSigner {
         self.frost_keys.insert(
             name.to_string(),
             FrostKeyEntry {
-                key_package_bytes: MlockedVec::new(key_package_bytes),
+                key_package_bytes,
                 pubkey_package_bytes,
+                group_pubkey: pubkey_arr,
             },
         );
 
         Ok(pubkey_arr)
+    }
+
+    /// The x-only group public key of the FROST share named `key_id`.
+    pub fn frost_public_key(&self, key_id: &str) -> Result<[u8; 32]> {
+        self.frost_keys
+            .get(key_id)
+            .map(|entry| entry.group_pubkey)
+            .ok_or_else(|| EnclaveError::KeyNotFound(key_id.into()))
+    }
+
+    /// The group public key of the share an open FROST session was opened
+    /// with.
+    pub fn frost_session_pubkey(&self, session_id: &[u8; 32]) -> Result<[u8; 32]> {
+        self.frost_sessions
+            .get(session_id)
+            .map(|session| session.group_pubkey)
+            .ok_or_else(|| EnclaveError::Signing("Session not found".into()))
+    }
+
+    /// Close a FROST session without signing, destroying its nonces.
+    pub fn drop_frost_session(&mut self, session_id: &[u8; 32]) {
+        self.frost_sessions.remove(session_id);
     }
 
     pub fn frost_round1(&mut self, key_id: &str, message: &[u8]) -> Result<(Vec<u8>, [u8; 32])> {
@@ -256,16 +286,18 @@ impl EnclaveSigner {
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
 
         let identifier = *key_package.identifier();
+        let group_pubkey = entry.group_pubkey;
         // commit_checked certifies the OsRng frost-core reads. The NSM-backed
         // getrandom below only names the session.
         let drawn = checked_rng::commit_checked(key_package.signing_share())
             .map_err(|e| EnclaveError::Signing(e.to_string()));
-        self.store_round1(key_id, message, identifier, drawn)
+        self.store_round1(key_id, group_pubkey, message, identifier, drawn)
     }
 
     fn store_round1(
         &mut self,
         key_id: &str,
+        group_pubkey: [u8; 32],
         message: &[u8],
         identifier: frost::Identifier,
         drawn: std::result::Result<
@@ -295,6 +327,7 @@ impl EnclaveSigner {
                 commitments,
                 message: message.to_vec(),
                 key_id: key_id.to_string(),
+                group_pubkey,
             },
         );
 
@@ -335,6 +368,12 @@ impl EnclaveSigner {
             .frost_keys
             .get(&key_id)
             .ok_or_else(|| EnclaveError::KeyNotFound(key_id.clone()))?;
+
+        // A share imported under the same name since round 1 is not the one
+        // the session's policy check and commitments were made for.
+        if entry.group_pubkey != session.group_pubkey {
+            return Err(EnclaveError::Signing("Share changed since round 1".into()));
+        }
 
         let key_package = frost::keys::KeyPackage::deserialize(entry.key_package_bytes.as_slice())
             .map_err(|e| EnclaveError::Signing(format!("Invalid key package: {}", e)))?;
@@ -501,6 +540,7 @@ mod tests {
         let err = signer
             .store_round1(
                 "group",
+                [0u8; 32],
                 b"msg",
                 frost::Identifier::try_from(1u16).unwrap(),
                 Err(EnclaveError::Signing(
