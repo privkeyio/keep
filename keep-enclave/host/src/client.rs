@@ -156,6 +156,33 @@ impl EnclaveClient {
         }
     }
 
+    /// Import a FROST key package sealed with its policy by
+    /// `EnvelopeEncryption::encrypt_for_enclave`, with its public key
+    /// package. Returns the group's x-only public key.
+    pub fn import_encrypted_frost_key(
+        &self,
+        name: &str,
+        encrypted: crate::kms::EncryptedWallet,
+        pubkey_package: &[u8],
+    ) -> Result<Vec<u8>> {
+        debug!(name, "Importing encrypted FROST key to enclave");
+        let request = EnclaveRequest::ImportEncryptedFrostKey {
+            name: name.to_string(),
+            encrypted,
+            pubkey_package: pubkey_package.to_vec(),
+        };
+        let response = self.send_request(&request)?;
+
+        match response {
+            EnclaveResponse::PublicKey { pubkey, .. } => Ok(pubkey),
+            EnclaveResponse::Error { code, message } => {
+                warn!(?code, message, "Encrypted FROST key import failed");
+                Err(EnclaveError::InvalidKey(message))
+            }
+            _ => Err(EnclaveError::InvalidKey("Unexpected response".into())),
+        }
+    }
+
     pub fn sign(&self, request: SigningRequest) -> Result<[u8; 64]> {
         debug!(key_id = %request.key_id, "Signing in enclave");
         let response = self.send_request(&EnclaveRequest::Sign(request))?;
