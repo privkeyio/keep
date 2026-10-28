@@ -169,9 +169,6 @@ mod tests {
         let request = SigningRequest {
             key_id: "test".to_string(),
             message: b"hello".to_vec(),
-            event_kind: None,
-            amount_sats: None,
-            destination: None,
             nonce: None,
             timestamp: None,
         };

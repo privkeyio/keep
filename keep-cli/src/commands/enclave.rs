@@ -294,9 +294,6 @@ pub fn cmd_enclave_sign(
             keep_enclave_host::EnclaveRequest::Sign(keep_enclave_host::SigningRequest {
                 key_id: key.to_string(),
                 message: message_bytes,
-                event_kind: None,
-                amount_sats: None,
-                destination: None,
                 nonce: None,
                 timestamp: None,
             });
@@ -324,9 +321,6 @@ pub fn cmd_enclave_sign(
         let request = keep_enclave_host::SigningRequest {
             key_id: key.to_string(),
             message: message_bytes,
-            event_kind: None,
-            amount_sats: None,
-            destination: None,
             nonce: None,
             timestamp: None,
         };

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 use crate::error::{EnclaveError, Result};
 use crate::kms::{EncryptedWallet, EnclaveKms};
-use crate::policy::{PolicyConfig, PolicyDecision, PolicyEngine, SigningContext};
+use crate::policy::{Contents, PolicyConfig, PolicyDecision, PolicyEngine, SigningContext};
 use crate::psbt::PsbtAnalysis;
 use crate::signer::EnclaveSigner;
 use bitcoin::Network;
@@ -37,13 +37,13 @@ pub enum EnclaveRequest {
     },
 }
 
+/// A message to sign as it is. The enclave cannot read what it spends or which
+/// event it is, so it fails every policy rule on either, and a `MaxFeeSats`
+/// anywhere in the policy refuses it outright.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningRequest {
     pub key_id: String,
     pub message: Vec<u8>,
-    pub event_kind: Option<u32>,
-    pub amount_sats: Option<u64>,
-    pub destination: Option<String>,
     pub nonce: Option<[u8; 32]>,
     pub timestamp: Option<u64>,
 }
@@ -499,10 +499,7 @@ impl VsockServer {
 
         let ctx = SigningContext {
             pubkey,
-            amount_sats: req.amount_sats,
-            fee_sats: None,
-            destination: req.destination.as_deref(),
-            event_kind: req.event_kind,
+            contents: Contents::Unread,
             timestamp,
         };
 
@@ -631,10 +628,11 @@ impl VsockServer {
         for addr in destinations {
             let ctx = SigningContext {
                 pubkey,
-                amount_sats: Some(total_spend),
-                fee_sats: Some(analysis.fee_sats),
-                destination: addr,
-                event_kind: None,
+                contents: Contents::Spend {
+                    amount_sats: total_spend,
+                    fee_sats: analysis.fee_sats,
+                    destination: addr,
+                },
                 timestamp,
             };
 
@@ -735,8 +733,8 @@ impl VsockServer {
     }
 
     /// Hold a FROST request for the share's group key to the policy. A FROST
-    /// message is opaque to the enclave, so it is judged with no amount,
-    /// destination or event kind, like a `Sign` request that names none.
+    /// message is opaque to the enclave, so it is judged like a `Sign` request,
+    /// failing every rule on what it spends or which event it signs.
     fn frost_policy(&mut self, pubkey: [u8; 32]) -> Option<EnclaveResponse> {
         let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_secs(),
@@ -749,10 +747,7 @@ impl VsockServer {
         };
         let ctx = SigningContext {
             pubkey,
-            amount_sats: None,
-            fee_sats: None,
-            destination: None,
-            event_kind: None,
+            contents: Contents::Unread,
             timestamp,
         };
         match self.policy_engine.evaluate(&ctx) {
@@ -881,7 +876,7 @@ mod tests {
     use bitcoin::{Address, ScriptBuf};
     use std::time::Duration;
 
-    const WIRE_DIGEST: &str = "e07732b1b0bb25bccb7c26b722dcd96cfd47044aa74e6a3565007ec3f42d78b5";
+    const WIRE_DIGEST: &str = "d136a7183840ba3dc5d39f640534e85a74e17d786691da1516f8ef6104e0b9b5";
 
     /// One of every request, response and policy rule, encoded as they go
     /// over vsock. The host and the enclave each define these types, and
@@ -941,9 +936,6 @@ mod tests {
             EnclaveRequest::Sign(SigningRequest {
                 key_id: "s".into(),
                 message: vec![15],
-                event_kind: Some(u32::MAX),
-                amount_sats: Some(u64::MAX),
-                destination: Some("d".into()),
                 nonce: Some([18u8; 32]),
                 timestamp: Some(u64::MAX - 19),
             }),
@@ -1251,26 +1243,31 @@ mod tests {
         .unwrap()
     }
 
-    fn sign_amount(server: &mut VsockServer, amount: u64) -> EnclaveResponse {
-        server.handle_sign(SigningRequest {
-            key_id: "k".into(),
-            message: vec![1u8; 32],
-            event_kind: None,
-            amount_sats: Some(amount),
-            destination: None,
-            nonce: None,
-            timestamp: None,
-        })
+    fn sign_raw(server: &mut VsockServer) -> EnclaveResponse {
+        sign_as(server, "k")
+    }
+
+    /// Sign a PSBT paying `sats` away and 100 in fees.
+    fn pay(server: &mut VsockServer, sats: u64) -> EnclaveResponse {
+        let psbt = psbt(
+            &[(p2tr(x_only(&SECRET)), sats + 100)],
+            &[(p2tr(other_key()), sats)],
+        );
+        sign(server, &psbt)
+    }
+
+    fn paid(response: &EnclaveResponse) -> bool {
+        matches!(response, EnclaveResponse::SignedPsbt { .. })
     }
 
     #[test]
     fn signing_is_refused_until_a_policy_is_loaded() {
         let mut server = bare();
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_raw(&mut server)));
         assert!(denied(&server.handle_frost_round1("k", &[1u8; 32], None, None)));
         assert!(denied(&server.handle_frost_round2([0u8; 32], None, None)));
         assert!(denied(&server.handle_set_policy(PolicyConfig { policies: vec![] })));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     #[test]
@@ -1288,11 +1285,8 @@ mod tests {
             EnclaveResponse::PublicKey { .. } => {}
             other => panic!("expected the key to import, got {other:?}"),
         }
-        assert!(matches!(
-            sign_amount(&mut server, 500),
-            EnclaveResponse::Signature { .. }
-        ));
-        assert!(denied(&sign_amount(&mut server, 2_000)));
+        assert!(paid(&pay(&mut server, 400)));
+        assert!(denied(&pay(&mut server, 1_900)));
         assert!(denied(&server.handle_set_policy(PolicyConfig {
             policies: vec![Policy {
                 name: "looser".into(),
@@ -1314,13 +1308,13 @@ mod tests {
         });
         server.signer.import_key("k", &SECRET).unwrap();
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_raw(&mut server)));
         let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &rate_bytes(1));
         imported(server.handle_import_encrypted_key("k", &blob));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_raw(&mut server)));
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(signed(&sign_amount(&mut server, 1)));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_raw(&mut server)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     fn signed(response: &EnclaveResponse) -> bool {
@@ -1334,13 +1328,10 @@ mod tests {
         }
     }
 
-    fn sign_as(server: &mut VsockServer, key_id: &str, amount: u64) -> EnclaveResponse {
+    fn sign_as(server: &mut VsockServer, key_id: &str) -> EnclaveResponse {
         server.handle_sign(SigningRequest {
             key_id: key_id.into(),
             message: vec![1u8; 32],
-            event_kind: None,
-            amount_sats: Some(amount),
-            destination: None,
             nonce: None,
             timestamp: None,
         })
@@ -1364,10 +1355,10 @@ mod tests {
     #[test]
     fn a_restarted_enclave_starts_its_rate_limits_empty() {
         let mut server = sealed_rules(vec![PolicyRule::MaxPerMinute(2)]);
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_raw(&mut server)));
         server.policy_engine.advance_clock(Duration::from_secs(30));
-        assert!(signed(&sign_amount(&mut server, 1)));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_raw(&mut server)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     #[test]
@@ -1377,8 +1368,8 @@ mod tests {
         imported(server.handle_import_encrypted_key("k", &blob));
         imported(server.handle_import_encrypted_key("again", &blob));
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(signed(&sign_as(&mut server, "k", 1)));
-        assert!(denied(&sign_as(&mut server, "again", 1)));
+        assert!(signed(&sign_as(&mut server, "k")));
+        assert!(denied(&sign_as(&mut server, "again")));
     }
 
     #[test]
@@ -1388,21 +1379,24 @@ mod tests {
             PolicyRule::MaxPerMinute(2),
         ]);
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(signed(&sign_amount(&mut server, 1)));
-        assert!(signed(&sign_amount(&mut server, 1)));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_raw(&mut server)));
+        assert!(signed(&sign_raw(&mut server)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     #[test]
     fn a_signature_counts_against_a_rate_rule_its_branch_skipped() {
-        let mut server = sealed_rules(vec![PolicyRule::Or(vec![
-            PolicyRule::MaxAmountSats(10),
-            PolicyRule::MaxPerMinute(2),
-        ])]);
+        let mut server = server(vec![
+            PolicyRule::MaxFeeSats(1_000),
+            PolicyRule::Or(vec![
+                PolicyRule::MaxAmountSats(1_000),
+                PolicyRule::MaxPerMinute(2),
+            ]),
+        ]);
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(signed(&sign_amount(&mut server, 5)));
-        assert!(signed(&sign_amount(&mut server, 5)));
-        assert!(denied(&sign_amount(&mut server, 100)));
+        assert!(paid(&pay(&mut server, 500)));
+        assert!(paid(&pay(&mut server, 500)));
+        assert!(denied(&pay(&mut server, 5_000)));
     }
 
     #[test]
@@ -1430,14 +1424,14 @@ mod tests {
 
     #[test]
     fn a_refused_request_spends_no_rate_limit() {
-        let mut server = sealed_rules(vec![
+        let mut server = server(vec![
             PolicyRule::MaxPerMinute(1),
-            PolicyRule::MaxAmountSats(10),
+            PolicyRule::MaxAmountSats(1_000),
         ]);
         server.policy_engine.advance_clock(Duration::from_secs(60));
-        assert!(denied(&sign_amount(&mut server, 100)));
-        assert!(signed(&sign_amount(&mut server, 5)));
-        assert!(denied(&sign_amount(&mut server, 5)));
+        assert!(denied(&pay(&mut server, 5_000)));
+        assert!(paid(&pay(&mut server, 500)));
+        assert!(denied(&pay(&mut server, 500)));
     }
 
     #[test]
@@ -1468,13 +1462,43 @@ mod tests {
         let mut server = sealed_rules(vec![PolicyRule::MaxPerMinute(1)]);
         server.policy_engine.advance_clock(Duration::from_secs(60));
         assert!(matches!(
-            sign_as(&mut server, "missing", 1),
+            sign_as(&mut server, "missing"),
             EnclaveResponse::Error {
                 code: ErrorCode::KeyNotFound,
                 ..
             }
         ));
-        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_raw(&mut server)));
+    }
+
+    /// A rule on what a request spends or which event it signs, for each kind.
+    fn reading_rules() -> Vec<PolicyRule> {
+        vec![
+            PolicyRule::MaxAmountSats(u64::MAX),
+            PolicyRule::MaxFeeSats(u64::MAX),
+            PolicyRule::AddressAllowlist(vec![address(&p2tr(other_key()))]),
+            PolicyRule::AddressBlocklist(vec![address(&p2tr(other_key()))]),
+            PolicyRule::AllowedEventKinds(vec![1]),
+        ]
+    }
+
+    #[test]
+    fn a_raw_message_fails_the_rules_on_what_it_spends_or_signs() {
+        for rule in reading_rules() {
+            let mut server = sealed_rules(vec![rule.clone()]);
+            assert!(denied(&sign_raw(&mut server)), "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn a_raw_message_is_signed_under_the_rules_it_can_be_held_to() {
+        let mut server = sealed_rules(vec![PolicyRule::Or(vec![
+            PolicyRule::MaxAmountSats(u64::MAX),
+            PolicyRule::MaxPerMinute(1),
+        ])]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_raw(&mut server)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     #[test]
@@ -1485,11 +1509,8 @@ mod tests {
             EnclaveResponse::PublicKey { .. } => {}
             other => panic!("expected the key to import, got {other:?}"),
         }
-        assert!(matches!(
-            sign_amount(&mut restarted, 500),
-            EnclaveResponse::Signature { .. }
-        ));
-        assert!(denied(&sign_amount(&mut restarted, 2_000)));
+        assert!(paid(&pay(&mut restarted, 400)));
+        assert!(denied(&pay(&mut restarted, 1_900)));
     }
 
     #[test]
@@ -1523,7 +1544,8 @@ mod tests {
         ));
         let second = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &limit_bytes(1_000_000));
         assert!(denied(&server.handle_import_encrypted_key("other", &second)));
-        assert!(denied(&sign_amount(&mut server, 2_000)));
+        assert!(paid(&pay(&mut server, 400)));
+        assert!(denied(&pay(&mut server, 1_900)));
     }
 
     #[test]
@@ -1562,7 +1584,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(denied(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_raw(&mut server)));
     }
 
     type FrostKeys = (
@@ -1713,6 +1735,27 @@ mod tests {
             end: (hour + 3) % 24,
         }]);
         assert!(denied(&open(&mut server, b"msg").unwrap_err()));
+    }
+
+    #[test]
+    fn a_frost_round_fails_the_rules_on_what_it_spends_or_signs() {
+        for rule in reading_rules() {
+            let (mut server, _) = sealed_frost(vec![rule.clone()]);
+            assert!(denied(&open(&mut server, b"msg").unwrap_err()), "{rule:?}");
+        }
+    }
+
+    #[test]
+    fn a_frost_share_is_refused_in_round_two_by_the_rules_on_what_it_spends() {
+        let (mut server, theirs) = sealed_frost(vec![PolicyRule::Or(vec![
+            PolicyRule::MaxPerMinute(1),
+            PolicyRule::MaxAmountSats(u64::MAX),
+        ])]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        let first = open(&mut server, b"first").unwrap();
+        let second = open(&mut server, b"second").unwrap();
+        assert!(shared(&finish(&mut server, first, &theirs)));
+        assert!(denied(&finish(&mut server, second, &theirs)));
     }
 
     #[test]

@@ -54,13 +54,14 @@ pub enum EnclaveRequest {
     },
 }
 
+/// A message to sign as it is. The enclave cannot read what it spends or which
+/// event it is, so it fails every policy rule on either, and a `MaxFeeSats`
+/// anywhere in the policy refuses it outright; sign a spend with `SignPsbt`
+/// instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigningRequest {
     pub key_id: String,
     pub message: Vec<u8>,
-    pub event_kind: Option<u32>,
-    pub amount_sats: Option<u64>,
-    pub destination: Option<String>,
     pub nonce: Option<[u8; 32]>,
     pub timestamp: Option<u64>,
 }
@@ -136,13 +137,21 @@ pub struct Policy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PolicyRule {
+    /// What a PSBT takes out of the wallet, fee included, at most this. A raw
+    /// `Sign` message or a FROST share fails it, since the enclave cannot read
+    /// what they spend, and the address rules fail them the same way. A
+    /// `MaxFeeSats` anywhere in the policy refuses them outright, and
+    /// `AllowedEventKinds` fails every request.
     MaxAmountSats(u64),
     MaxPerMinute(u32),
     MaxPerHour(u32),
     MaxPerDay(u32),
     AddressAllowlist(Vec<String>),
     AddressBlocklist(Vec<String>),
-    AllowedHours { start: u8, end: u8 },
+    AllowedHours {
+        start: u8,
+        end: u8,
+    },
     BlockWeekends,
     AllowedEventKinds(Vec<u32>),
     And(Vec<PolicyRule>),
@@ -172,7 +181,7 @@ mod tests {
     use super::*;
     use sha2::Digest;
 
-    const WIRE_DIGEST: &str = "e07732b1b0bb25bccb7c26b722dcd96cfd47044aa74e6a3565007ec3f42d78b5";
+    const WIRE_DIGEST: &str = "d136a7183840ba3dc5d39f640534e85a74e17d786691da1516f8ef6104e0b9b5";
 
     /// One of every request, response and policy rule, encoded as they go
     /// over vsock. The host and the enclave each define these types, and
@@ -232,9 +241,6 @@ mod tests {
             EnclaveRequest::Sign(SigningRequest {
                 key_id: "s".into(),
                 message: vec![15],
-                event_kind: Some(u32::MAX),
-                amount_sats: Some(u64::MAX),
-                destination: Some("d".into()),
                 nonce: Some([18u8; 32]),
                 timestamp: Some(u64::MAX - 19),
             }),

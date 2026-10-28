@@ -43,9 +43,6 @@ fn test_backend_sign() {
     let request = SigningRequest {
         key_id: "signer".to_string(),
         message: b"test message".to_vec(),
-        event_kind: Some(1),
-        amount_sats: None,
-        destination: None,
         nonce: None,
         timestamp: None,
     };
@@ -90,9 +87,6 @@ fn test_backend_sign_nonexistent_key() {
     let request = SigningRequest {
         key_id: "nonexistent".to_string(),
         message: b"test".to_vec(),
-        event_kind: None,
-        amount_sats: None,
-        destination: None,
         nonce: None,
         timestamp: None,
     };
