@@ -214,6 +214,8 @@ PolicyRule::MaxAmountSats(1_000_000)  // 0.01 BTC limit
 PolicyRule::MaxPerHour(10)            // Rate limit
 ```
 
+Rate limits count each Sign or SignPsbt request a key signs (a PSBT counts once, however many inputs it signs), against the key's public key rather than the name it was imported under. The enclave keeps no count across restarts, so it cannot know what a key signed before it last started; it treats every rate limit as used up when a policy is loaded, which every launch needs before it can sign, and refills from there. A restart therefore buys nothing beyond the normal refill, at the cost of a wait after every launch: `MaxPerHour(10)` allows its first signature six minutes after the policy is loaded and its full ten an hour after. Each running enclave keeps its own count, so the limits bound one enclave, not every enclave that can unseal the key.
+
 ## Local Development
 
 Mock mode (no security, dev only):

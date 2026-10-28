@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
-use crate::rate_limit::RateLimiter;
+use crate::rate_limit::{RateLimiter, Window};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 const MAX_POLICY_DEPTH: usize = 16;
 
@@ -20,6 +21,15 @@ pub struct Policy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PolicyRule {
     MaxAmountSats(u64),
+    /// Sign or SignPsbt requests signed by the key, this many a minute on
+    /// average with bursts of up to this many, a PSBT counting once however
+    /// many inputs it signs. A full burst followed by the minute's refill
+    /// can come to nearly twice this within one minute. Every such request
+    /// counts, including one a policy let through without reaching this
+    /// rule. The enclave keeps no count across restarts, so it starts with
+    /// none left when a policy is loaded and refills from there: the first
+    /// signature waits a minute divided by the maximum. The hour and day
+    /// rules work the same way.
     MaxPerMinute(u32),
     MaxPerHour(u32),
     MaxPerDay(u32),
@@ -77,7 +87,9 @@ impl std::fmt::Display for PolicyDenyReason {
 }
 
 pub struct SigningContext<'a> {
-    pub key_id: &'a str,
+    /// The signing key's public key, which rate limits count against, so a
+    /// secret imported under several names shares its limits.
+    pub pubkey: [u8; 32],
     pub amount_sats: Option<u64>,
     pub fee_sats: Option<u64>,
     pub destination: Option<&'a str>,
@@ -100,9 +112,9 @@ impl PolicyEngine {
 
     pub fn set_policies(&mut self, config: PolicyConfig) {
         self.policies = config.policies;
-        // A bucket keeps the capacity from its first use, so a loose host
-        // policy would otherwise survive the sealed rules.
-        self.rate_limiter.clear();
+        // What was signed under a looser policy the host loaded first is not
+        // carried over, so the new rules start with nothing left, as at launch.
+        self.rate_limiter.drain();
     }
 
     /// A fee is bounded when no rule sequence can allow it. An amount cap counts
@@ -164,15 +176,15 @@ impl PolicyEngine {
             },
 
             PolicyRule::MaxPerMinute(max) => {
-                self.rate_limiter.check_minute(ctx.key_id, *max)
+                self.rate_limiter.allows(Window::Minute, &ctx.pubkey, *max)
             }
 
             PolicyRule::MaxPerHour(max) => {
-                self.rate_limiter.check_hour(ctx.key_id, *max)
+                self.rate_limiter.allows(Window::Hour, &ctx.pubkey, *max)
             }
 
             PolicyRule::MaxPerDay(max) => {
-                self.rate_limiter.check_day(ctx.key_id, *max)
+                self.rate_limiter.allows(Window::Day, &ctx.pubkey, *max)
             }
 
             PolicyRule::AddressAllowlist(allowed) => {
@@ -231,8 +243,50 @@ impl PolicyEngine {
         Ok(result)
     }
 
-    pub fn record_operation(&mut self, key_id: &str) {
-        self.rate_limiter.record(key_id);
+    /// Count a signature made by `pubkey` against every rate rule in every
+    /// policy, nested ones included as deep as evaluation goes.
+    pub fn record_operation(&mut self, pubkey: &[u8; 32]) {
+        let mut limits = BTreeSet::new();
+        for policy in &self.policies {
+            for rule in &policy.rules {
+                collect_rate_limits(rule, MAX_POLICY_DEPTH, &mut limits);
+            }
+        }
+        self.rate_limiter.record(pubkey, limits);
+    }
+
+    #[cfg(test)]
+    pub fn advance_clock(&mut self, by: std::time::Duration) {
+        self.rate_limiter.advance(by);
+    }
+}
+
+fn collect_rate_limits(rule: &PolicyRule, depth: usize, limits: &mut BTreeSet<(Window, u32)>) {
+    if depth == 0 {
+        return;
+    }
+    match rule {
+        PolicyRule::MaxPerMinute(max) => {
+            limits.insert((Window::Minute, *max));
+        }
+        PolicyRule::MaxPerHour(max) => {
+            limits.insert((Window::Hour, *max));
+        }
+        PolicyRule::MaxPerDay(max) => {
+            limits.insert((Window::Day, *max));
+        }
+        PolicyRule::And(rules) | PolicyRule::Or(rules) => {
+            for rule in rules {
+                collect_rate_limits(rule, depth - 1, limits);
+            }
+        }
+        PolicyRule::MaxAmountSats(_)
+        | PolicyRule::MaxFeeSats(_)
+        | PolicyRule::AddressAllowlist(_)
+        | PolicyRule::AddressBlocklist(_)
+        | PolicyRule::AllowedHours { .. }
+        | PolicyRule::BlockWeekends
+        | PolicyRule::AllowedEventKinds(_) => {}
     }
 }
 
@@ -327,7 +381,7 @@ mod tests {
     fn an_empty_policy_denies() {
         let mut engine = PolicyEngine::new();
         let ctx = SigningContext {
-            key_id: "test",
+            pubkey: [7u8; 32],
             amount_sats: Some(1),
             fee_sats: None,
             destination: None,
@@ -352,7 +406,7 @@ mod tests {
         });
 
         let ctx_ok = SigningContext {
-            key_id: "test",
+            pubkey: [7u8; 32],
             amount_sats: Some(500),
             fee_sats: None,
             destination: None,
@@ -362,7 +416,7 @@ mod tests {
         assert_eq!(engine.evaluate(&ctx_ok), PolicyDecision::Allow);
 
         let ctx_fail = SigningContext {
-            key_id: "test",
+            pubkey: [7u8; 32],
             amount_sats: Some(2000),
             fee_sats: None,
             destination: None,
@@ -389,7 +443,7 @@ mod tests {
         });
 
         let ctx_ok = SigningContext {
-            key_id: "test",
+            pubkey: [7u8; 32],
             amount_sats: None,
             fee_sats: None,
             destination: Some("bc1allowed"),
@@ -399,7 +453,7 @@ mod tests {
         assert_eq!(engine.evaluate(&ctx_ok), PolicyDecision::Allow);
 
         let ctx_fail = SigningContext {
-            key_id: "test",
+            pubkey: [7u8; 32],
             amount_sats: None,
             fee_sats: None,
             destination: Some("bc1blocked"),
