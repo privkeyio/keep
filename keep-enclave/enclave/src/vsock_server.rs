@@ -35,6 +35,13 @@ pub enum EnclaveRequest {
         encrypted: EncryptedWallet,
         pubkey_package: Vec<u8>,
     },
+    /// Seal a key again to a new policy its warden signed, answered with
+    /// `SealedKey`. `policy` is the postcard `PolicyConfig` to seal.
+    UpdateSealedPolicy {
+        encrypted: EncryptedWallet,
+        policy: Vec<u8>,
+        signature: Vec<u8>,
+    },
 }
 
 /// A message to sign as it is. The enclave cannot read what it spends or which
@@ -86,6 +93,10 @@ pub enum EnclaveResponse {
     FrostCommitment { commitment: Vec<u8>, nonces_id: Vec<u8> },
     FrostShare { share: Vec<u8> },
     Error { code: ErrorCode, message: String },
+    /// A key sealed again by `UpdateSealedPolicy`.
+    SealedKey {
+        encrypted: EncryptedWallet,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -267,6 +278,11 @@ impl VsockServer {
                 encrypted,
                 pubkey_package,
             } => self.handle_import_encrypted_frost_key(&name, &encrypted, pubkey_package),
+            EnclaveRequest::UpdateSealedPolicy {
+                encrypted,
+                policy,
+                signature,
+            } => self.handle_update_sealed_policy(&encrypted, &policy, &signature),
         }
     }
 
@@ -420,13 +436,57 @@ impl VsockServer {
         }
     }
 
+    /// Seal the key in `encrypted` to `policy` at its warden's next epoch, if
+    /// the warden signed that move, and hand the new blob back. The running
+    /// policy does not change: blobs sealed to the same warden, epoch and
+    /// policy share a hash whatever key they hold, so switching on one would
+    /// move every key loaded beside it. The new policy applies once the host
+    /// restarts the enclave and imports the new blob. The old blob still opens
+    /// to its old policy: nothing here can revoke it.
+    fn handle_update_sealed_policy(
+        &self,
+        encrypted: &EncryptedWallet,
+        policy: &[u8],
+        signature: &[u8],
+    ) -> EnclaveResponse {
+        match postcard::from_bytes::<PolicyConfig>(policy) {
+            Ok(config) if !config.policies.is_empty() => {}
+            _ => {
+                return EnclaveResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: "Invalid policy".into(),
+                };
+            }
+        };
+        let sealed = match self.kms.update_policy(encrypted, policy, signature) {
+            Ok(sealed) => sealed,
+            Err(EnclaveError::PolicyDenied(message)) => {
+                return EnclaveResponse::Error {
+                    code: ErrorCode::PolicyDenied,
+                    message,
+                };
+            }
+            Err(e) => {
+                return EnclaveResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("KMS decryption failed: {}", e),
+                };
+            }
+        };
+        EnclaveResponse::SealedKey { encrypted: sealed }
+    }
+
     /// Decrypt a sealed key and its policy, refusing an empty policy and,
     /// once a policy is sealed, any other policy.
     fn open_sealed(
         &self,
         encrypted: &EncryptedWallet,
     ) -> std::result::Result<(zeroize::Zeroizing<Vec<u8>>, PolicyConfig), EnclaveResponse> {
-        let (secret, policy_bytes) = match self.kms.decrypt_wallet_key(encrypted) {
+        let crate::kms::Opened {
+            key: secret,
+            policy: policy_bytes,
+            ..
+        } = match self.kms.decrypt_wallet_key(encrypted) {
             Ok(opened) => opened,
             Err(e) => {
                 return Err(EnclaveResponse::Error {
@@ -876,7 +936,7 @@ mod tests {
     use bitcoin::{Address, ScriptBuf};
     use std::time::Duration;
 
-    const WIRE_DIGEST: &str = "d136a7183840ba3dc5d39f640534e85a74e17d786691da1516f8ef6104e0b9b5";
+    const WIRE_DIGEST: &str = "835f1ffbcaa847312dde3fc10c5c2c797d839a0ae59271bc771fc7bfc6fd2082";
 
     /// One of every request, response and policy rule, encoded as they go
     /// over vsock. The host and the enclave each define these types, and
@@ -966,8 +1026,13 @@ mod tests {
             },
             EnclaveRequest::ImportEncryptedFrostKey {
                 name: "x".into(),
-                encrypted: wallet,
+                encrypted: wallet.clone(),
                 pubkey_package: vec![29],
+            },
+            EnclaveRequest::UpdateSealedPolicy {
+                encrypted: wallet.clone(),
+                policy: vec![38],
+                signature: vec![39],
             },
         ];
         let responses = vec![
@@ -1005,7 +1070,8 @@ mod tests {
                 code,
                 message: "m".into(),
             }),
-        );
+        )
+        .chain([EnclaveResponse::SealedKey { encrypted: wallet }]);
         let networks = [
             NetworkParam::Bitcoin,
             NetworkParam::Testnet,
@@ -1499,6 +1565,174 @@ mod tests {
         server.policy_engine.advance_clock(Duration::from_secs(60));
         assert!(signed(&sign_raw(&mut server)));
         assert!(denied(&sign_raw(&mut server)));
+    }
+
+    const WARDEN: [u8; 32] = [5u8; 32];
+
+    fn warden_pubkey(secret: &[u8; 32]) -> [u8; 32] {
+        k256::schnorr::SigningKey::from_bytes(secret)
+            .unwrap()
+            .verifying_key()
+            .to_bytes()
+            .into()
+    }
+
+    fn warden_blob(key: &[u8], rules: Vec<PolicyRule>) -> EncryptedWallet {
+        let warden = crate::kms::Warden {
+            pubkey: warden_pubkey(&WARDEN),
+            epoch: 0,
+        };
+        crate::kms::seal_for_test_with(&[42u8; 32], key, Some(&warden), &policy_bytes(rules))
+    }
+
+    /// The signature `signer` makes to move `old` to `policy` at `epoch`.
+    fn approve(signer: &[u8; 32], old: &EncryptedWallet, epoch: u64, policy: &[u8]) -> Vec<u8> {
+        let warden = crate::kms::Warden {
+            pubkey: warden_pubkey(&WARDEN),
+            epoch,
+        };
+        let hash = crate::kms::sealed_policy_hash(Some(&warden), policy);
+        let message = crate::kms::policy_update_message(old, &hash);
+        k256::schnorr::SigningKey::from_bytes(signer)
+            .unwrap()
+            .sign_raw(&message, &[0u8; 32])
+            .unwrap()
+            .to_bytes()
+            .to_vec()
+    }
+
+    fn resealed(response: EnclaveResponse) -> EncryptedWallet {
+        match response {
+            EnclaveResponse::SealedKey { encrypted } => encrypted,
+            other => panic!("expected a sealed key, got {other:?}"),
+        }
+    }
+
+    fn cap(sats: u64) -> Vec<PolicyRule> {
+        vec![PolicyRule::MaxAmountSats(sats)]
+    }
+
+    #[test]
+    fn a_policy_the_warden_signs_reseals_the_key_for_the_next_launch() {
+        let old = warden_blob(&SECRET, cap(1_000));
+        let mut server = bare();
+        imported(server.handle_import_encrypted_key("k", &old));
+        assert!(denied(&pay(&mut server, 1_900)));
+        let looser = policy_bytes(cap(1_000_000));
+        let signature = approve(&WARDEN, &old, 1, &looser);
+        let new = resealed(server.handle_update_sealed_policy(&old, &looser, &signature));
+        assert!(denied(&pay(&mut server, 1_900)));
+        let again = resealed(server.handle_update_sealed_policy(&old, &looser, &signature));
+        assert_eq!(again.encrypted_wallet_key, new.encrypted_wallet_key);
+        assert_eq!(again.nonce, new.nonce);
+        let opened = server.kms.decrypt_wallet_key(&new).unwrap();
+        assert_eq!(opened.warden.map(|w| w.epoch), Some(1));
+        assert_eq!(*opened.key, SECRET);
+
+        let mut restarted = bare();
+        imported(restarted.handle_import_encrypted_key("k", &new));
+        assert!(paid(&pay(&mut restarted, 1_900)));
+        let tighter = policy_bytes(cap(10));
+        let signature = approve(&WARDEN, &new, 2, &tighter);
+        let tight = resealed(restarted.handle_update_sealed_policy(&new, &tighter, &signature));
+        let mut again = bare();
+        imported(again.handle_import_encrypted_key("k", &tight));
+        assert!(denied(&pay(&mut again, 400)));
+    }
+
+    #[test]
+    fn the_old_blob_still_opens_to_its_old_policy() {
+        let old = warden_blob(&SECRET, cap(1_000));
+        let looser = policy_bytes(cap(1_000_000));
+        let signature = approve(&WARDEN, &old, 1, &looser);
+        resealed(bare().handle_update_sealed_policy(&old, &looser, &signature));
+        let mut restarted = bare();
+        imported(restarted.handle_import_encrypted_key("k", &old));
+        assert!(denied(&pay(&mut restarted, 1_900)));
+    }
+
+    #[test]
+    fn an_update_the_warden_did_not_sign_is_refused() {
+        let old = warden_blob(&SECRET, cap(1_000));
+        let mut server = bare();
+        imported(server.handle_import_encrypted_key("k", &old));
+        let looser = policy_bytes(cap(1_000_000));
+        let forged = approve(&[6u8; 32], &old, 1, &looser);
+        assert!(denied(
+            &server.handle_update_sealed_policy(&old, &looser, &forged)
+        ));
+        let mut truncated = approve(&WARDEN, &old, 1, &looser);
+        truncated.pop();
+        assert!(denied(
+            &server.handle_update_sealed_policy(&old, &looser, &truncated)
+        ));
+        assert!(denied(&pay(&mut server, 1_900)));
+    }
+
+    #[test]
+    fn an_update_signed_for_another_epoch_is_refused() {
+        let old = warden_blob(&SECRET, cap(1_000));
+        let looser = policy_bytes(cap(1_000_000));
+        for epoch in [0, 2] {
+            let signature = approve(&WARDEN, &old, epoch, &looser);
+            assert!(denied(
+                &bare().handle_update_sealed_policy(&old, &looser, &signature)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_signature_moves_only_the_blob_it_names() {
+        let first = warden_blob(&SECRET, cap(1_000));
+        let second = warden_blob(&[8u8; 32], cap(1_000));
+        let looser = policy_bytes(cap(1_000_000));
+        let signature = approve(&WARDEN, &first, 1, &looser);
+        assert!(denied(
+            &bare().handle_update_sealed_policy(&second, &looser, &signature)
+        ));
+        let other_policy = policy_bytes(cap(2_000_000));
+        assert!(denied(&bare().handle_update_sealed_policy(
+            &first,
+            &other_policy,
+            &signature
+        )));
+    }
+
+    #[test]
+    fn a_key_sealed_without_a_warden_keeps_its_policy() {
+        let old = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &policy_bytes(cap(1_000)));
+        let looser = policy_bytes(cap(1_000_000));
+        let signature = approve(&WARDEN, &old, 1, &looser);
+        assert!(denied(
+            &bare().handle_update_sealed_policy(&old, &looser, &signature)
+        ));
+    }
+
+    #[test]
+    fn an_update_for_a_blob_sealed_alike_leaves_a_loaded_key_alone() {
+        let loaded = warden_blob(&SECRET, cap(1_000));
+        let mut server = bare();
+        imported(server.handle_import_encrypted_key("k", &loaded));
+        let old = warden_blob(&[8u8; 32], cap(1_000));
+        assert_eq!(old.policy_hash, loaded.policy_hash);
+        let looser = policy_bytes(cap(1_000_000));
+        let signature = approve(&WARDEN, &old, 1, &looser);
+        resealed(server.handle_update_sealed_policy(&old, &looser, &signature));
+        assert!(denied(&pay(&mut server, 1_900)));
+    }
+
+    #[test]
+    fn an_empty_policy_is_not_sealed() {
+        let old = warden_blob(&SECRET, cap(1_000));
+        let empty = postcard::to_allocvec(&PolicyConfig { policies: vec![] }).unwrap();
+        let signature = approve(&WARDEN, &old, 1, &empty);
+        assert!(matches!(
+            bare().handle_update_sealed_policy(&old, &empty, &signature),
+            EnclaveResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                ..
+            }
+        ));
     }
 
     #[test]

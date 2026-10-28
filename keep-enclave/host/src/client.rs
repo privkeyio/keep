@@ -183,6 +183,37 @@ impl EnclaveClient {
         }
     }
 
+    /// Have the enclave seal the key in `encrypted` again to `policy` (postcard
+    /// `PolicyConfig` bytes) at its warden's next epoch. `signature` is the
+    /// warden's BIP340 signature over
+    /// `policy_update_message(&encrypted, &sealed_policy_hash(..))`
+    /// for the next epoch. The running enclave keeps its policy; the new blob
+    /// applies once imported after a restart. The old blob keeps opening to its
+    /// old policy.
+    pub fn update_sealed_policy(
+        &self,
+        encrypted: crate::kms::EncryptedWallet,
+        policy: &[u8],
+        signature: &[u8],
+    ) -> Result<crate::kms::EncryptedWallet> {
+        let request = EnclaveRequest::UpdateSealedPolicy {
+            encrypted,
+            policy: policy.to_vec(),
+            signature: signature.to_vec(),
+        };
+        match self.send_request(&request)? {
+            EnclaveResponse::SealedKey { encrypted } => Ok(encrypted),
+            EnclaveResponse::Error { code, message } => {
+                warn!(?code, message, "Sealed policy update failed");
+                match code {
+                    ErrorCode::PolicyDenied => Err(EnclaveError::PolicyDenied(message)),
+                    _ => Err(EnclaveError::InvalidKey(message)),
+                }
+            }
+            _ => Err(EnclaveError::InvalidKey("Unexpected response".into())),
+        }
+    }
+
     pub fn sign(&self, request: SigningRequest) -> Result<[u8; 64]> {
         debug!(key_id = %request.key_id, "Signing in enclave");
         let response = self.send_request(&EnclaveRequest::Sign(request))?;

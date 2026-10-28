@@ -52,6 +52,13 @@ pub enum EnclaveRequest {
         encrypted: EncryptedWallet,
         pubkey_package: Vec<u8>,
     },
+    /// Seal a key again to a new policy its warden signed, answered with
+    /// `SealedKey`. `policy` is the postcard `PolicyConfig` to seal.
+    UpdateSealedPolicy {
+        encrypted: EncryptedWallet,
+        policy: Vec<u8>,
+        signature: Vec<u8>,
+    },
 }
 
 /// A message to sign as it is. The enclave cannot read what it spends or which
@@ -110,6 +117,10 @@ pub enum EnclaveResponse {
     Error {
         code: ErrorCode,
         message: String,
+    },
+    /// A key sealed again by `UpdateSealedPolicy`.
+    SealedKey {
+        encrypted: EncryptedWallet,
     },
 }
 
@@ -181,7 +192,7 @@ mod tests {
     use super::*;
     use sha2::Digest;
 
-    const WIRE_DIGEST: &str = "d136a7183840ba3dc5d39f640534e85a74e17d786691da1516f8ef6104e0b9b5";
+    const WIRE_DIGEST: &str = "835f1ffbcaa847312dde3fc10c5c2c797d839a0ae59271bc771fc7bfc6fd2082";
 
     /// One of every request, response and policy rule, encoded as they go
     /// over vsock. The host and the enclave each define these types, and
@@ -271,8 +282,13 @@ mod tests {
             },
             EnclaveRequest::ImportEncryptedFrostKey {
                 name: "x".into(),
-                encrypted: wallet,
+                encrypted: wallet.clone(),
                 pubkey_package: vec![29],
+            },
+            EnclaveRequest::UpdateSealedPolicy {
+                encrypted: wallet.clone(),
+                policy: vec![38],
+                signature: vec![39],
             },
         ];
         let responses = vec![
@@ -310,7 +326,8 @@ mod tests {
                 code,
                 message: "m".into(),
             }),
-        );
+        )
+        .chain([EnclaveResponse::SealedKey { encrypted: wallet }]);
         let networks = [
             NetworkParam::Bitcoin,
             NetworkParam::Testnet,
