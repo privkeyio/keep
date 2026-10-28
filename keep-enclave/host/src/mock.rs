@@ -66,6 +66,10 @@ impl MockEnclaveClient {
             EnclaveRequest::ImportEncryptedFrostKey {
                 name, encrypted, ..
             } => self.mock_import_encrypted_key(&name, &encrypted),
+            EnclaveRequest::UpdateSealedPolicy { .. } => EnclaveResponse::Error {
+                code: ErrorCode::InternalError,
+                message: "Sealed policy updates require a real enclave".into(),
+            },
             EnclaveRequest::ImportFrostKey {
                 name,
                 key_package,

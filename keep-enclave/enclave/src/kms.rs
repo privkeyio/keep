@@ -12,7 +12,58 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 const POLICY_BINDING_DOMAIN: &[u8] = b"keep-enclave-policy-v1";
+const WARDEN_BINDING_DOMAIN: &[u8] = b"keep-enclave-policy-v2";
+const POLICY_UPDATE_DOMAIN: &[u8] = b"keep-enclave-policy-update-v1";
 const MAX_SEALED_KEY_LEN: usize = 4096;
+const WARDEN_LEN: usize = 32 + 8;
+
+/// The key allowed to sign a new policy for a sealed key, and how many times it
+/// has. A key sealed without one keeps its policy for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Warden {
+    pub pubkey: [u8; 32],
+    pub epoch: u64,
+}
+
+/// What a sealed blob holds once opened.
+pub struct Opened {
+    pub key: Zeroizing<Vec<u8>>,
+    pub policy: Vec<u8>,
+    pub warden: Option<Warden>,
+}
+
+/// The hash a sealed blob is bound to: the policy alone, or with a warden the
+/// warden's key, its epoch and the policy, under another domain so neither
+/// can pass for the other.
+pub fn sealed_policy_hash(warden: Option<&Warden>, policy_bytes: &[u8]) -> [u8; 32] {
+    match warden {
+        None => policy_binding_hash(policy_bytes),
+        Some(warden) => {
+            let mut hasher = Sha256::new();
+            hasher.update(WARDEN_BINDING_DOMAIN);
+            hasher.update(warden.pubkey);
+            hasher.update(warden.epoch.to_le_bytes());
+            hasher.update(policy_bytes);
+            hasher.finalize().into()
+        }
+    }
+}
+
+/// What the warden signs to move the blob `old` to `new_policy_hash`: the hash
+/// of the whole blob names that one blob, so the signature moves no other.
+pub fn policy_update_message(old: &EncryptedWallet, new_policy_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(POLICY_UPDATE_DOMAIN);
+    let mut blob = Sha256::new();
+    blob.update((old.encrypted_data_key.len() as u64).to_le_bytes());
+    blob.update(&old.encrypted_data_key);
+    blob.update(old.nonce);
+    blob.update(old.policy_hash);
+    blob.update(&old.encrypted_wallet_key);
+    hasher.update(blob.finalize());
+    hasher.update(new_policy_hash);
+    hasher.finalize().into()
+}
 
 pub fn policy_binding_hash(policy_bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -49,14 +100,47 @@ impl EnclaveKms {
         Ok(pubkey)
     }
 
-    pub fn decrypt_wallet_key(
-        &self,
-        encrypted: &EncryptedWallet,
-    ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+    pub fn decrypt_wallet_key(&self, encrypted: &EncryptedWallet) -> Result<Opened> {
         let mut data_key = self.decrypt_data_key(&encrypted.encrypted_data_key)?;
         let opened = open_sealed_wallet(&data_key, encrypted);
         data_key.zeroize();
         opened
+    }
+
+    /// Seal the key in `old` to `new_policy` at the warden's next epoch, if the
+    /// warden signed that move. The new blob reuses the old blob's data key,
+    /// under a nonce drawn from that key and the new body, so sealing the same
+    /// move again gives the same blob and the data key encrypts no more bodies
+    /// than the warden has signed.
+    pub fn update_policy(
+        &self,
+        old: &EncryptedWallet,
+        new_policy: &[u8],
+        signature: &[u8],
+    ) -> Result<EncryptedWallet> {
+        let mut data_key = Zeroizing::new(self.decrypt_data_key(&old.encrypted_data_key)?);
+        let opened = open_sealed_wallet(&data_key, old)?;
+        let warden = opened.warden.ok_or_else(|| {
+            EnclaveError::PolicyDenied("Policy is sealed without a warden".into())
+        })?;
+        let next = Warden {
+            pubkey: warden.pubkey,
+            epoch: warden
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| EnclaveError::PolicyDenied("Warden epoch exhausted".into()))?,
+        };
+        let new_hash = sealed_policy_hash(Some(&next), new_policy);
+        verify_warden(
+            &warden.pubkey,
+            &policy_update_message(old, &new_hash),
+            signature,
+        )?;
+        let nonce = reseal_nonce(&data_key, &opened.key, &next, new_policy)?;
+        let mut sealed = seal_wallet(&data_key, &opened.key, Some(&next), new_policy, nonce)?;
+        data_key.zeroize();
+        sealed.encrypted_data_key = old.encrypted_data_key.clone();
+        Ok(sealed)
     }
 
     #[cfg(target_os = "linux")]
@@ -125,23 +209,43 @@ impl EnclaveKms {
     }
 }
 
-fn sealed_body(wallet_key: &[u8], policy_bytes: &[u8]) -> Result<Vec<u8>> {
+fn reseal_nonce(data_key: &[u8], key: &[u8], warden: &Warden, policy: &[u8]) -> Result<[u8; 12]> {
+    use hmac::{Hmac, Mac};
+    let body = Zeroizing::new(sealed_body(key, Some(warden), policy)?);
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(data_key)
+        .map_err(|_| EnclaveError::Kms("Invalid data key".into()))?;
+    mac.update(b"keep-enclave-reseal-nonce-v1");
+    mac.update(&body);
+    let tag = mac.finalize().into_bytes();
+    Ok(tag[..12].try_into().expect("12 bytes"))
+}
+
+fn verify_warden(pubkey: &[u8; 32], message: &[u8; 32], signature: &[u8]) -> Result<()> {
+    use k256::schnorr::{Signature, VerifyingKey};
+    let denied = || EnclaveError::PolicyDenied("Policy update not signed by the warden".into());
+    let key = VerifyingKey::from_bytes(pubkey).map_err(|_| denied())?;
+    let signature = Signature::try_from(signature).map_err(|_| denied())?;
+    key.verify_raw(message, &signature).map_err(|_| denied())
+}
+
+fn sealed_body(wallet_key: &[u8], warden: Option<&Warden>, policy_bytes: &[u8]) -> Result<Vec<u8>> {
     if wallet_key.is_empty() || wallet_key.len() > MAX_SEALED_KEY_LEN || policy_bytes.is_empty() {
         return Err(EnclaveError::Kms("Invalid sealed wallet".into()));
     }
     let len = u32::try_from(wallet_key.len())
         .map_err(|_| EnclaveError::Kms("Invalid sealed wallet".into()))?;
-    let mut body = Vec::with_capacity(4 + wallet_key.len() + policy_bytes.len());
+    let mut body = Vec::with_capacity(4 + wallet_key.len() + WARDEN_LEN + policy_bytes.len());
     body.extend_from_slice(&len.to_le_bytes());
     body.extend_from_slice(wallet_key);
+    if let Some(warden) = warden {
+        body.extend_from_slice(&warden.pubkey);
+        body.extend_from_slice(&warden.epoch.to_le_bytes());
+    }
     body.extend_from_slice(policy_bytes);
     Ok(body)
 }
 
-fn open_sealed_wallet(
-    data_key: &[u8],
-    encrypted: &EncryptedWallet,
-) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+fn open_sealed_wallet(data_key: &[u8], encrypted: &EncryptedWallet) -> Result<Opened> {
     let cipher = Aes256Gcm::new_from_slice(data_key)
         .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
     let nonce = &Nonce::from(encrypted.nonce);
@@ -162,25 +266,42 @@ fn open_sealed_wallet(
     if len == 0 || len > MAX_SEALED_KEY_LEN || plain.len() < 4 + len {
         return Err(EnclaveError::Kms("Decryption failed".into()));
     }
-    let policy = plain[4 + len..].to_vec();
-    if policy.is_empty() {
+    let rest = &plain[4 + len..];
+    let bound = |warden: Option<&Warden>, policy: &[u8]| {
+        !policy.is_empty()
+            && bool::from(sealed_policy_hash(warden, policy).ct_eq(&encrypted.policy_hash))
+    };
+    let (warden, policy) = if bound(None, rest) {
+        (None, rest)
+    } else if rest.len() > WARDEN_LEN {
+        let (head, policy) = rest.split_at(WARDEN_LEN);
+        let warden = Warden {
+            pubkey: head[..32].try_into().expect("32 bytes"),
+            epoch: u64::from_le_bytes(head[32..].try_into().expect("8 bytes")),
+        };
+        if !bound(Some(&warden), policy) {
+            return Err(EnclaveError::Kms("Decryption failed".into()));
+        }
+        (Some(warden), policy)
+    } else {
         return Err(EnclaveError::Kms("Decryption failed".into()));
-    }
-    let computed = policy_binding_hash(&policy);
-    if !bool::from(computed.ct_eq(&encrypted.policy_hash)) {
-        return Err(EnclaveError::Kms("Decryption failed".into()));
-    }
-    Ok((Zeroizing::new(plain[4..4 + len].to_vec()), policy))
+    };
+    Ok(Opened {
+        key: Zeroizing::new(plain[4..4 + len].to_vec()),
+        policy: policy.to_vec(),
+        warden,
+    })
 }
 
 pub(crate) fn seal_wallet(
     data_key: &[u8],
     wallet_key: &[u8],
+    warden: Option<&Warden>,
     policy_bytes: &[u8],
     nonce: [u8; 12],
 ) -> Result<EncryptedWallet> {
-    let policy_hash = policy_binding_hash(policy_bytes);
-    let body = Zeroizing::new(sealed_body(wallet_key, policy_bytes)?);
+    let policy_hash = sealed_policy_hash(warden, policy_bytes);
+    let body = Zeroizing::new(sealed_body(wallet_key, warden, policy_bytes)?);
     let cipher = Aes256Gcm::new_from_slice(data_key)
         .map_err(|e| EnclaveError::Kms(format!("Invalid data key: {}", e)))?;
     let encrypted_wallet_key = cipher
@@ -206,6 +327,16 @@ pub(crate) fn seal_for_test(
     wallet_key: &[u8],
     policy_bytes: &[u8],
 ) -> EncryptedWallet {
+    seal_for_test_with(ephemeral, wallet_key, None, policy_bytes)
+}
+
+#[cfg(test)]
+pub(crate) fn seal_for_test_with(
+    ephemeral: &[u8; 32],
+    wallet_key: &[u8],
+    warden: Option<&Warden>,
+    policy_bytes: &[u8],
+) -> EncryptedWallet {
     let data_key = [99u8; 32];
     let nonce_bytes: [u8; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
     let cipher = Aes256Gcm::new_from_slice(ephemeral).expect("ephemeral key");
@@ -214,8 +345,14 @@ pub(crate) fn seal_for_test(
         .expect("data key seal");
     let mut prefixed = nonce_bytes.to_vec();
     prefixed.append(&mut encrypted_data_key);
-    let mut sealed = seal_wallet(data_key.as_slice(), wallet_key, policy_bytes, [11u8; 12])
-        .expect("wallet seal");
+    let mut sealed = seal_wallet(
+        data_key.as_slice(),
+        wallet_key,
+        warden,
+        policy_bytes,
+        [11u8; 12],
+    )
+    .expect("wallet seal");
     sealed.encrypted_data_key = prefixed;
     sealed
 }
@@ -223,6 +360,26 @@ pub(crate) fn seal_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_warden_hashes_match_the_other_side() {
+        let warden = Warden {
+            pubkey: [1u8; 32],
+            epoch: u64::MAX - 7,
+        };
+        let hash = sealed_policy_hash(Some(&warden), b"policy");
+        let old = EncryptedWallet {
+            encrypted_data_key: vec![2],
+            encrypted_wallet_key: vec![3, 4],
+            nonce: [5u8; 12],
+            policy_hash: [6u8; 32],
+        };
+        let message = policy_update_message(&old, &hash);
+        assert_eq!(
+            format!("{}{}", hex::encode(hash), hex::encode(message)),
+            "6d7bb60fecc9191f94832db9a65e05dfed71ab157b08c744d427d898fd1307790333fbbe2fba890ed303a51f568b2939fb23e9c457ab4b2e7702a9ed4e48b0c1"
+        );
+    }
 
     #[test]
     fn the_policy_binding_hash_is_stable() {
@@ -247,7 +404,7 @@ mod tests {
             nonce: [11u8; 12],
             policy_hash,
         };
-        let (key, policy) = open_sealed_wallet(&[99u8; 32], &encrypted).unwrap();
+        let Opened { key, policy, .. } = open_sealed_wallet(&[99u8; 32], &encrypted).unwrap();
         assert_eq!(key.as_slice(), b"k");
         assert_eq!(policy, b"p");
         assert_eq!(policy_hash, policy_binding_hash(b"p"));
@@ -255,7 +412,7 @@ mod tests {
 
     #[test]
     fn the_sealed_body_is_the_key_then_the_policy() {
-        let body = sealed_body(b"k", b"p").unwrap();
+        let body = sealed_body(b"k", None, b"p").unwrap();
         assert_eq!(body, [1, 0, 0, 0, b'k', b'p']);
     }
 
@@ -267,7 +424,11 @@ mod tests {
         let wallet_key = b"my_secret_wallet_key_32_bytes!!!";
         let encrypted = seal_for_test(&ephemeral_secret_copy, wallet_key, b"policy");
 
-        let (decrypted, policy) = kms.decrypt_wallet_key(&encrypted).unwrap();
+        let Opened {
+            key: decrypted,
+            policy,
+            ..
+        } = kms.decrypt_wallet_key(&encrypted).unwrap();
         assert_eq!(decrypted.as_slice(), wallet_key);
         assert_eq!(policy, b"policy");
     }
