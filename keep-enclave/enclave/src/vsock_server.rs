@@ -424,8 +424,13 @@ impl VsockServer {
             }
         };
 
+        let pubkey = match self.pubkey_for(&req.key_id) {
+            Ok(pubkey) => pubkey,
+            Err(response) => return response,
+        };
+
         let ctx = SigningContext {
-            key_id: &req.key_id,
+            pubkey,
             amount_sats: req.amount_sats,
             fee_sats: None,
             destination: req.destination.as_deref(),
@@ -451,7 +456,7 @@ impl VsockServer {
 
         match self.signer.sign(&req.key_id, &req.message) {
             Ok(signature) => {
-                self.policy_engine.record_operation(&req.key_id);
+                self.policy_engine.record_operation(&pubkey);
                 EnclaveResponse::Signature { signature: signature.to_vec() }
             }
             Err(e) => EnclaveResponse::Error {
@@ -471,6 +476,11 @@ impl VsockServer {
                 message: e.into(),
             };
         }
+
+        let pubkey = match self.pubkey_for(&req.key_id) {
+            Ok(pubkey) => pubkey,
+            Err(response) => return response,
+        };
 
         let network: Network = req.network.into();
 
@@ -497,14 +507,14 @@ impl VsockServer {
         };
 
         if let Some(denied) =
-            self.enforce_destination_policies(&analysis, &req.key_id, total_spend, timestamp)
+            self.enforce_destination_policies(&analysis, pubkey, total_spend, timestamp)
         {
             return denied;
         }
 
         match self.signer.sign_psbt(&req.key_id, &req.psbt, network) {
             Ok((signed_psbt, signed_inputs)) => {
-                self.policy_engine.record_operation(&req.key_id);
+                self.policy_engine.record_operation(&pubkey);
                 EnclaveResponse::SignedPsbt {
                     psbt: signed_psbt,
                     signed_inputs,
@@ -526,7 +536,7 @@ impl VsockServer {
     fn enforce_destination_policies(
         &mut self,
         analysis: &PsbtAnalysis,
-        key_id: &str,
+        pubkey: [u8; 32],
         total_spend: u64,
         timestamp: u64,
     ) -> Option<EnclaveResponse> {
@@ -552,7 +562,7 @@ impl VsockServer {
         };
         for addr in destinations {
             let ctx = SigningContext {
-                key_id,
+                pubkey,
                 amount_sats: Some(total_spend),
                 fee_sats: Some(analysis.fee_sats),
                 destination: addr,
@@ -604,16 +614,24 @@ impl VsockServer {
     }
 
     fn handle_get_public_key(&self, key_id: &str) -> EnclaveResponse {
-        match self.signer.get_public_key(key_id) {
+        match self.pubkey_for(key_id) {
             Ok(pubkey) => EnclaveResponse::PublicKey {
                 pubkey: pubkey.to_vec(),
                 name: key_id.to_string(),
             },
-            Err(e) => EnclaveResponse::Error {
+            Err(response) => response,
+        }
+    }
+
+    /// The public key of the signing key named `key_id`, which its rate
+    /// limits count against, or the response refusing an unknown name.
+    fn pubkey_for(&self, key_id: &str) -> std::result::Result<[u8; 32], EnclaveResponse> {
+        self.signer
+            .get_public_key(key_id)
+            .map_err(|e| EnclaveResponse::Error {
                 code: ErrorCode::KeyNotFound,
                 message: e.to_string(),
-            },
-        }
+            })
     }
 
     fn handle_import_frost_key(
@@ -711,6 +729,7 @@ mod tests {
     use crate::psbt::fixtures::*;
     use bitcoin::psbt::Psbt;
     use bitcoin::{Address, ScriptBuf};
+    use std::time::Duration;
 
     fn server(rules: Vec<PolicyRule>) -> VsockServer {
         let signer = EnclaveSigner::with_ephemeral_secret([42u8; 32]);
@@ -987,17 +1006,169 @@ mod tests {
                 action: PolicyAction::Deny,
             }],
         });
-        let _ = sign_amount(&mut server, 1);
+        server.signer.import_key("k", &SECRET).unwrap();
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_amount(&mut server, 1)));
         let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &rate_bytes(1));
-        match server.handle_import_encrypted_key("k", &blob) {
+        imported(server.handle_import_encrypted_key("k", &blob));
+        assert!(denied(&sign_amount(&mut server, 1)));
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_amount(&mut server, 1)));
+    }
+
+    fn signed(response: &EnclaveResponse) -> bool {
+        matches!(response, EnclaveResponse::Signature { .. })
+    }
+
+    fn imported(response: EnclaveResponse) {
+        match response {
             EnclaveResponse::PublicKey { .. } => {}
             other => panic!("expected the key to import, got {other:?}"),
         }
-        assert!(matches!(
-            sign_amount(&mut server, 1),
-            EnclaveResponse::Signature { .. }
-        ));
+    }
+
+    fn sign_as(server: &mut VsockServer, key_id: &str, amount: u64) -> EnclaveResponse {
+        server.handle_sign(SigningRequest {
+            key_id: key_id.into(),
+            message: vec![1u8; 32],
+            event_kind: None,
+            amount_sats: Some(amount),
+            destination: None,
+            nonce: None,
+            timestamp: None,
+        })
+    }
+
+    fn sealed_rules(rules: Vec<PolicyRule>) -> VsockServer {
+        let bytes = postcard::to_allocvec(&PolicyConfig {
+            policies: vec![Policy {
+                name: "sealed".into(),
+                rules,
+                action: PolicyAction::Deny,
+            }],
+        })
+        .unwrap();
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &bytes);
+        let mut server = bare();
+        imported(server.handle_import_encrypted_key("k", &blob));
+        server
+    }
+
+    #[test]
+    fn a_restarted_enclave_starts_its_rate_limits_empty() {
+        let mut server = sealed_rules(vec![PolicyRule::MaxPerMinute(2)]);
         assert!(denied(&sign_amount(&mut server, 1)));
+        server.policy_engine.advance_clock(Duration::from_secs(30));
+        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_amount(&mut server, 1)));
+    }
+
+    #[test]
+    fn one_secret_under_two_names_shares_its_rate_limit() {
+        let blob = crate::kms::seal_for_test(&[42u8; 32], &SECRET, &rate_bytes(1));
+        let mut server = bare();
+        imported(server.handle_import_encrypted_key("k", &blob));
+        imported(server.handle_import_encrypted_key("again", &blob));
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_as(&mut server, "k", 1)));
+        assert!(denied(&sign_as(&mut server, "again", 1)));
+    }
+
+    #[test]
+    fn a_second_rate_rule_on_a_key_is_held_to_its_own_maximum() {
+        let mut server = sealed_rules(vec![
+            PolicyRule::MaxPerMinute(100),
+            PolicyRule::MaxPerMinute(2),
+        ]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(signed(&sign_amount(&mut server, 1)));
+        assert!(denied(&sign_amount(&mut server, 1)));
+    }
+
+    #[test]
+    fn a_signature_counts_against_a_rate_rule_its_branch_skipped() {
+        let mut server = sealed_rules(vec![PolicyRule::Or(vec![
+            PolicyRule::MaxAmountSats(10),
+            PolicyRule::MaxPerMinute(2),
+        ])]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(signed(&sign_amount(&mut server, 5)));
+        assert!(signed(&sign_amount(&mut server, 5)));
+        assert!(denied(&sign_amount(&mut server, 100)));
+    }
+
+    #[test]
+    fn a_psbt_counts_once_however_many_destinations_it_pays() {
+        let mut server = server(vec![
+            PolicyRule::MaxFeeSats(5_000),
+            PolicyRule::MaxPerMinute(2),
+        ]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        let psbt = psbt(
+            &[(p2tr(x_only(&SECRET)), 100_000)],
+            &[
+                (p2tr(other_key()), 49_000),
+                (p2tr(x_only(&[8u8; 32])), 49_000),
+            ],
+        );
+        for _ in 0..2 {
+            match sign(&mut server, &psbt) {
+                EnclaveResponse::SignedPsbt { .. } => {}
+                other => panic!("expected a signed PSBT, got {other:?}"),
+            }
+        }
+        assert!(denied(&sign(&mut server, &psbt)));
+    }
+
+    #[test]
+    fn a_refused_request_spends_no_rate_limit() {
+        let mut server = sealed_rules(vec![
+            PolicyRule::MaxPerMinute(1),
+            PolicyRule::MaxAmountSats(10),
+        ]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(denied(&sign_amount(&mut server, 100)));
+        assert!(signed(&sign_amount(&mut server, 5)));
+        assert!(denied(&sign_amount(&mut server, 5)));
+    }
+
+    #[test]
+    fn a_psbt_with_an_unknown_key_is_refused_as_not_found() {
+        let mut server = server(vec![PolicyRule::MaxAmountSats(1_000_000)]);
+        let psbt = psbt(
+            &[(p2tr(x_only(&SECRET)), 50_000)],
+            &[(p2tr(other_key()), 49_000)],
+        );
+        let response = server.handle_sign_psbt(PsbtSigningRequest {
+            key_id: "missing".into(),
+            psbt: psbt.serialize(),
+            network: NetworkParam::Bitcoin,
+            nonce: None,
+            timestamp: None,
+        });
+        assert!(matches!(
+            response,
+            EnclaveResponse::Error {
+                code: ErrorCode::KeyNotFound,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn signing_with_an_unknown_key_is_refused_before_the_policy() {
+        let mut server = sealed_rules(vec![PolicyRule::MaxPerMinute(1)]);
+        server.policy_engine.advance_clock(Duration::from_secs(60));
+        assert!(matches!(
+            sign_as(&mut server, "missing", 1),
+            EnclaveResponse::Error {
+                code: ErrorCode::KeyNotFound,
+                ..
+            }
+        ));
+        assert!(signed(&sign_amount(&mut server, 1)));
     }
 
     #[test]
