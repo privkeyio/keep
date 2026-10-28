@@ -575,9 +575,6 @@ mod tests {
         let sign_req = SigningRequest {
             key_id: "testkey".to_string(),
             message: message.to_vec(),
-            event_kind: None,
-            amount_sats: None,
-            destination: None,
             nonce: None,
             timestamp: None,
         };
