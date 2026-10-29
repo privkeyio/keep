@@ -8,7 +8,7 @@ use keep_approval::approver::{CLEARED_GRACE_SECS, FREEZE_SHOWN_SECS, SILENCE_SEC
 use keep_approval::binding::{
     Nip44DecryptPayload, NostrPayload, Payload, RequestDraft, UnsignedEventFields,
 };
-use keep_approval::change::Decimal;
+use keep_approval::change::{ChangeGrant, ChangeLimits, Decimal};
 use keep_approval::messages::{AnchorState, CredentialRef, Frozen, Reason};
 use p256::ecdsa::signature::Signer;
 
@@ -1000,34 +1000,78 @@ fn a_freeze_is_resent_only_once_its_counter_is_saved() {
 /// since an issue request names one the vault does not hold yet.
 #[test]
 fn a_management_request_gives_no_credential_id_to_freeze() {
-    let phone = paired();
-    phone.take(kind::ANCHOR, &anchor_text(now(), 100, 3, false));
-    let (request, _) = RequestDraft {
-        request_id: [14; 32],
-        created_at: now(),
-        deadline_secs: 120,
-        credential: Some(CredentialRef {
-            id: Hex16([0x22; 16]),
-            name: "writer".into(),
-            uid: 1001,
-        }),
-        key: None,
-        network: None,
-        reason: Reason::Management,
-        payload: Payload::Management(Change::Unfreeze {
-            scope: Scope::Credential(Hex16([0x22; 16])),
-            epoch: Decimal(3),
-        }),
-        budget: None,
-        anchor: anchor(100),
+    let id = Hex16([0x22; 16]);
+    let issue = Change::IssueCredential {
+        id,
+        name: "writer".into(),
+        uid: Decimal(1001),
+        created_at: Decimal(now()),
+        expires_at: Decimal(now() + 86_400),
+        grant: ChangeGrant {
+            keys: vec![Hex32([0x11; 32])],
+            operations: vec!["sign_nostr_event".into()],
+            event_kinds: vec![Decimal(1)],
+            nip44_peers: vec![],
+            bitcoin: None,
+            limits: ChangeLimits {
+                per_minute: Decimal(10),
+                per_hour: Decimal(100),
+                per_day: Decimal(1000),
+            },
+            secrets: vec![],
+        },
+    };
+    let unfreeze = Change::Unfreeze {
+        scope: Scope::Credential(id),
+        epoch: Decimal(3),
+    };
+    for (n, change) in [issue, unfreeze].into_iter().enumerate() {
+        let phone = paired();
+        phone.take(kind::ANCHOR, &anchor_text(now(), 100, 3, false));
+        let (request, _) = RequestDraft {
+            request_id: [14 + n as u8; 32],
+            created_at: now(),
+            deadline_secs: 120,
+            credential: Some(CredentialRef {
+                id,
+                name: "writer".into(),
+                uid: 1001,
+            }),
+            key: None,
+            network: None,
+            reason: Reason::Management,
+            payload: Payload::Management(change),
+            budget: None,
+            anchor: anchor(100),
+        }
+        .finish(&phone.channel())
+        .unwrap();
+        let events = phone.take(kind::REQUEST, &wire::to_text(&request));
+        let shown = shown_request(&events).expect("shown");
+        assert_eq!(shown.op, "management");
+        assert_eq!(shown.credential.as_deref(), Some("writer"));
+        assert_eq!(shown.credential_id, None, "{n}");
     }
-    .finish(&phone.channel())
-    .unwrap();
-    let events = phone.take(kind::REQUEST, &wire::to_text(&request));
-    let shown = shown_request(&events).expect("shown");
-    assert_eq!(shown.op, "management");
-    assert_eq!(shown.credential.as_deref(), Some("writer"));
-    assert_eq!(shown.credential_id, None);
+}
+
+#[test]
+fn a_freeze_by_credential_id_names_that_credential() {
+    let phone = paired();
+    let t = now();
+    phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    let shown =
+        shown_request(&phone.take(kind::REQUEST, &wire::to_text(&phone.request(1, "hi", 10))))
+            .expect("shown")
+            .clone();
+    // Not running: not sent now, but kept to resend.
+    assert!(phone.handler.freeze(shown.credential_id).is_err());
+    let fx = phone.handler.tick_at(t + 15);
+    assert_eq!(fx.send.len(), 1);
+    let (k, content) = &fx.send[0];
+    assert_eq!(*k, kind::FREEZE);
+    let freeze: Freeze = wire::parse(content).unwrap();
+    assert_eq!(freeze.action, FreezeAction::Freeze);
+    assert_eq!(freeze.scope, Scope::Credential(Hex16([0x22; 16])));
 }
 
 /// An approved unfreeze request this phone decided explains the freeze it
