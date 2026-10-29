@@ -852,7 +852,7 @@ The gateway itself has no network. A relay helper, `keep gateway relay`, runs as
    - made by the Keep app with its release signing key
    - on a phone with a locked bootloader that boots its maker's verified OS or GrapheneOS
 
-   An emulator, a rooted or unlocked phone, or another app cannot pair. Since the gateway has no network, the command checks the chain's certificates against Google's status list of revoked ones, which it fetches before showing the code. On a host that cannot reach Google, save https://android.googleapis.com/attestation/status on another machine and pass it with `--attestation-status FILE`.
+   An emulator, a rooted or unlocked phone, or another app cannot pair. Since the gateway has no network, the command checks the chain's certificates against Google's status list of revoked ones, which it fetches before showing the code. On a host that cannot reach Google, save https://android.googleapis.com/attestation/status on another machine and pass it with `--attestation-status FILE`. A saved list older than seven days is refused, since newly revoked keys would pass it.
 
 Once a phone is paired, the gateway refuses to start without the same channel key, since the phone trusts no other. A lost channel key is handled like a lost phone, below.
 

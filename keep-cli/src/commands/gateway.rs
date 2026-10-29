@@ -436,12 +436,31 @@ fn pair(out: &Output, label: &str, status: Option<&Path>, target: &AdminTarget) 
 
 /// The serial numbers Google's attestation status list marks revoked or
 /// suspended, from `file` or fetched.
+/// How old a saved status list may be. Google revokes leaked factory keys
+/// in it, and an old copy would still pass them.
+const MAX_STATUS_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 86400);
+
 fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<String>> {
     use keep_agent::gateway::daemon::attestation::{fetch_status, unusable_serials, STATUS_URL};
     let list = match file {
-        Some(path) => std::fs::read(path).map_err(|e| {
-            KeepError::InvalidInput(format!("reading {}: {e}", path.display()))
-        })?,
+        Some(path) => {
+            let read = |e: std::io::Error| {
+                KeepError::InvalidInput(format!("reading {}: {e}", path.display()))
+            };
+            let age = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map_err(read)?
+                .elapsed()
+                .unwrap_or_default();
+            if age > MAX_STATUS_AGE {
+                return Err(KeepError::InvalidInput(format!(
+                    "{} is {} days old, save a fresh copy of {STATUS_URL}",
+                    path.display(),
+                    age.as_secs() / 86400
+                )));
+            }
+            std::fs::read(path).map_err(read)?
+        }
         None => fetch_status().map_err(|e| {
             KeepError::Runtime(format!(
                 "{e}; on a host that cannot reach Google, save {STATUS_URL} elsewhere and pass it with --attestation-status"
@@ -1015,6 +1034,23 @@ mod tests {
         for bad in [Value::Null, attested(json!([])), attested(json!([3]))] {
             assert!(check_attestation(&bad, &unusable).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_saved_status_list_must_be_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, br#"{"entries": {"2c8c": {"status": "REVOKED"}}}"#).unwrap();
+        assert!(attestation_status(Some(&path)).unwrap().contains("2c8c"));
+        let old = std::time::SystemTime::now() - MAX_STATUS_AGE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let err = attestation_status(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("7 days old"), "{err}");
     }
 
     /// Answers that arrive in one read are each taken in turn.

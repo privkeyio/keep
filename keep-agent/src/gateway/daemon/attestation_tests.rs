@@ -600,12 +600,18 @@ fn a_status_list_names_what_is_revoked_or_suspended() {
     let list = br#"{"entries": {
         "2c8cdddfd5e03bfc": {"status": "REVOKED", "expires": "2020-11-13", "reason": "KEY_COMPROMISE"},
         "00C8966FCB2FBE32": {"status": "SUSPENDED", "reason": "SOFTWARE_FLAW"},
+        "6681152659205225093": {"status": "REVOKED", "reason": "KEY_COMPROMISE"},
+        "9999999999999999999999999999999999999999999999999": {"status": "REVOKED"},
         "a": {"status": "SOMETHING_NEW"}
     }}"#;
     let unusable = unusable_serials(list).unwrap();
-    assert_eq!(unusable.len(), 2);
+    assert_eq!(unusable.len(), 6);
     assert!(unusable.contains("2c8cdddfd5e03bfc"));
     assert!(unusable.contains("c8966fcb2fbe32"));
+    // Google writes some serials in decimal.
+    assert!(unusable.contains("5cb838f1fe157a85"));
+    assert!(unusable.contains("6681152659205225093"));
+    assert!(unusable.contains("6d79f82328ea3da61e066ebb2f889ffffffffffff"));
     for bad in [
         &b"{}"[..],
         b"[]",

@@ -13,8 +13,9 @@ use keep_approval::messages::{
     self as wire, Anchor, Freeze, FreezeAction, Outcome, OutcomeKind, Pairing, Request, SignerKey,
     Verdict, V1,
 };
-use keep_approval::pairing::PairingUri;
+use keep_approval::pairing::{CertChain, PairingUri};
 use keep_approval::sig::{self, ApproverSigningKey};
+use keep_approval::test_attestation;
 use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey};
 use keep_approval::{kind, Hex16, Hex32, Hex33, Hex64};
 use keep_core::audit::AuditEventType;
@@ -794,6 +795,38 @@ fn pairing_needs_both_proofs_and_two_keys() {
         phone.pairing_wrap(secret, &message, now)
     });
     assert_eq!(shown["ok"], json!(false));
+    // No attestation, one made for another session, and one made for the
+    // secret and channel the wrong way round.
+    type MakeChain = dyn Fn(&Phone, &[u8; 32]) -> CertChain;
+    let chains: [&MakeChain; 3] = [
+        &|_, _| CertChain(vec![vec![0x30, 0x00]]),
+        &|phone, _| phone.attestation(&[7; 32]),
+        &|phone, secret| {
+            test_attestation::chain(
+                &phone.a(),
+                &sig::pair_attestation_challenge(&phone.channel, secret),
+            )
+        },
+    ];
+    for chain in chains {
+        let shown = try_pair(&mut ap, &|phone, secret, now| {
+            let message = sig::pair(
+                &phone.t(),
+                &phone.approver,
+                &phone.channel,
+                secret,
+                "x",
+                chain(phone, secret),
+            );
+            phone.pairing_wrap(secret, &message, now)
+        });
+        assert_eq!(shown["ok"], json!(false), "{shown}");
+        assert!(
+            shown["error"].as_str().unwrap().contains("attestation"),
+            "{shown}"
+        );
+    }
+    assert!(ap.store().devices.is_empty());
     // An approver key of another type is not even opened as a `pair`: the
     // session goes on waiting.
     let conn = ap.conn();

@@ -78,7 +78,8 @@ pub fn fetch_status() -> Result<Vec<u8>, String> {
 
 /// The serial numbers a status list marks revoked or suspended, lowercase
 /// hex as [`Attested::serials`] writes them. A suspended certificate is
-/// refused too: pairing is a one-time decision.
+/// refused too: pairing is a one-time decision. The list writes some
+/// serials in decimal, so an all-digit entry counts in both readings.
 pub fn unusable_serials(list: &[u8]) -> Result<std::collections::HashSet<String>, String> {
     #[derive(serde::Deserialize)]
     struct List {
@@ -97,16 +98,39 @@ pub fn unusable_serials(list: &[u8]) -> Result<std::collections::HashSet<String>
         .entries
         .into_iter()
         .filter(|(_, e)| matches!(e.status.as_str(), "REVOKED" | "SUSPENDED"))
-        .map(|(serial, _)| {
+        .flat_map(|(serial, _)| {
+            // A certificate serial is at most 20 bytes, 49 decimal digits.
+            let decimal = (serial.len() <= 49 && serial.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| decimal_to_hex(&serial));
             let serial = serial.to_ascii_lowercase();
             let trimmed = serial.trim_start_matches('0');
-            if trimmed.is_empty() {
+            let hex = if trimmed.is_empty() {
                 "0".into()
             } else {
                 trimmed.to_string()
-            }
+            };
+            std::iter::once(hex).chain(decimal)
         })
         .collect())
+}
+
+/// `digits` read as a decimal number, written as unpadded lowercase hex.
+fn decimal_to_hex(digits: &str) -> String {
+    let mut value = vec![0u8];
+    for d in digits.bytes() {
+        let mut carry = u32::from(d - b'0');
+        for byte in value.iter_mut().rev() {
+            let next = u32::from(*byte) * 10 + carry;
+            *byte = next as u8;
+            carry = next >> 8;
+        }
+        if carry > 0 {
+            value.insert(0, carry as u8);
+        }
+    }
+    let hex = hex::encode(value);
+    let trimmed = hex.trim_start_matches('0');
+    if trimmed.is_empty() { "0" } else { trimmed }.to_string()
 }
 
 /// SHA-256 of the public key of each Google attestation root, as
