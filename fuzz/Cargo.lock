@@ -1426,6 +1426,7 @@ dependencies = [
  "hkdf 0.13.0",
  "hmac 0.13.0",
  "k256",
+ "libc",
  "memsec 0.7.0",
  "memsecurity",
  "rand 0.10.1",
