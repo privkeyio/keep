@@ -441,17 +441,23 @@ fn pair(out: &Output, label: &str, status: Option<&Path>, target: &AdminTarget) 
 const MAX_STATUS_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 86400);
 
 fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<String>> {
-    use keep_agent::gateway::daemon::attestation::{fetch_status, unusable_serials, STATUS_URL};
+    use keep_agent::gateway::daemon::attestation::{
+        fetch_status, unusable_serials, MAX_STATUS_BYTES, STATUS_URL,
+    };
+    use std::io::Read;
     let list = match file {
         Some(path) => {
             let read = |e: std::io::Error| {
                 KeepError::InvalidInput(format!("reading {}: {e}", path.display()))
             };
-            let age = std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .map_err(read)?
-                .elapsed()
-                .unwrap_or_default();
+            let meta = std::fs::metadata(path).map_err(read)?;
+            if !meta.is_file() {
+                return Err(KeepError::InvalidInput(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )));
+            }
+            let age = meta.modified().map_err(read)?.elapsed().unwrap_or_default();
             if age > MAX_STATUS_AGE {
                 return Err(KeepError::InvalidInput(format!(
                     "{} is {} days old, save a fresh copy of {STATUS_URL}",
@@ -459,7 +465,11 @@ fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<S
                     age.as_secs() / 86400
                 )));
             }
-            std::fs::read(path).map_err(read)?
+            let mut list = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|f| f.take(MAX_STATUS_BYTES as u64 + 1).read_to_end(&mut list))
+                .map_err(read)?;
+            list
         }
         None => fetch_status().map_err(|e| {
             KeepError::Runtime(format!(
@@ -1051,6 +1061,17 @@ mod tests {
             .unwrap();
         let err = attestation_status(Some(&path)).unwrap_err().to_string();
         assert!(err.contains("7 days old"), "{err}");
+        let big = dir.path().join("big.json");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let err = attestation_status(Some(&big)).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+        let err = attestation_status(Some(Path::new("/dev/zero")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
     }
 
     /// Answers that arrive in one read are each taken in turn.

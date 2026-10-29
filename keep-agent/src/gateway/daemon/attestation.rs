@@ -40,7 +40,7 @@ use x509_cert::Certificate;
 pub const STATUS_URL: &str = "https://android.googleapis.com/attestation/status";
 
 /// The largest status list read, well above the size Google serves.
-const MAX_STATUS_BYTES: usize = 8 << 20;
+pub const MAX_STATUS_BYTES: usize = 8 << 20;
 
 /// Fetch Google's attestation status list, over TLS checked against the
 /// bundled web roots only.
