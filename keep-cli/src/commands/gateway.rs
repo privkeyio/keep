@@ -457,7 +457,18 @@ fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<S
                     path.display()
                 )));
             }
-            let age = meta.modified().map_err(read)?.elapsed().unwrap_or_default();
+            let age = match meta.modified().map_err(read)?.elapsed() {
+                Ok(age) => age,
+                // A little clock skew between the machine that saved it
+                // and this one, but no list dated well ahead.
+                Err(ahead) if ahead.duration() <= Duration::from_secs(3600) => Duration::ZERO,
+                Err(_) => {
+                    return Err(KeepError::InvalidInput(format!(
+                        "{} is dated in the future, save a fresh copy of {STATUS_URL}",
+                        path.display()
+                    )))
+                }
+            };
             if age > MAX_STATUS_AGE {
                 return Err(KeepError::InvalidInput(format!(
                     "{} is {} days old, save a fresh copy of {STATUS_URL}",
@@ -1061,6 +1072,14 @@ mod tests {
             .unwrap();
         let err = attestation_status(Some(&path)).unwrap_err().to_string();
         assert!(err.contains("7 days old"), "{err}");
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(600))
+            .unwrap();
+        assert!(attestation_status(Some(&path)).is_ok());
+        file.set_modified(std::time::SystemTime::now() + MAX_STATUS_AGE)
+            .unwrap();
+        let err = attestation_status(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("dated in the future"), "{err}");
         let big = dir.path().join("big.json");
         std::fs::File::create(&big)
             .unwrap()
