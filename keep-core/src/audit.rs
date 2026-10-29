@@ -1951,14 +1951,18 @@ fn sync_parent(path: &Path) {
     let _ = path;
 }
 
-/// Cut `path` back to `len` bytes, durably; never grows it. A separate write
-/// handle, since an append-only handle cannot truncate on every platform.
+/// Cut `path` back to `len` bytes, durably; never grows it, and a missing
+/// file has nothing to cut. A separate write handle, since an append-only
+/// handle cannot truncate on every platform.
 fn truncate(path: &Path, len: u64) -> std::io::Result<()> {
     #[cfg(test)]
     if test_support::FAIL_TRUNCATE.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("truncate refused for the test"));
     }
-    let file = open_regular_with(OpenOptions::new().write(true), path)?;
+    let file = match open_regular_with(OpenOptions::new().write(true), path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        file => file?,
+    };
     if file.metadata()?.len() > len {
         file.set_len(len)?;
         file.sync_all()?;
@@ -2802,6 +2806,31 @@ mod tests {
             assert_eq!(names, [Some("app 1".into()), Some("app 3".into())]);
             assert_eq!(log.verify_chain(&key).unwrap(), (true, 2));
         }
+    }
+
+    /// A cut left pending against a signing log that is then removed does
+    /// not block every later append.
+    #[test]
+    fn a_pending_signing_cut_on_a_removed_log_is_dropped() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let path = dir.path().join("signing_audit.log");
+        let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        log.log(signing_entry(1), &key).unwrap();
+        let failed = with_faults(true, true, || log.log(signing_entry(2), &key));
+        assert!(failed.is_err());
+        assert!(log.torn.is_some());
+        std::fs::remove_file(&path).unwrap();
+
+        log.log(signing_entry(3), &key).unwrap();
+        assert_eq!(log.torn, None);
+        let names: Vec<_> = log
+            .read_all(&key)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.caller_name)
+            .collect();
+        assert_eq!(names, [Some("app 3".into())]);
     }
 
     /// A partial line a failed append could not cut is cut before key
