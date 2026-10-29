@@ -9,8 +9,8 @@ use zeroize::Zeroizing;
 use keep_core::error::{CryptoError, FrostError, KeepError, NetworkError, Result};
 use keep_core::Keep;
 use keep_frost_net::dkg::{
-    fetch_group_roster, frost_group_id, parse_pubkey, require_roster_matches, run_software_dkg,
-    ClientTransport, DkgPhase, DkgProgress, DKG_KIND_ANNOUNCE, MAX_DKG_EVENTS_SEEN,
+    fetch_group_roster, require_roster_matches, roster_from_subkeys, run_software_dkg,
+    ClientTransport, DkgPhase, DkgProgress, DkgRoster, DKG_KIND_ANNOUNCE, MAX_DKG_EVENTS_SEEN,
 };
 
 use crate::output::Output;
@@ -64,6 +64,35 @@ fn load_group_subkey(keep: &Keep, group: &str) -> Result<(Keys, Zeroizing<[u8; 3
     Ok((Keys::new(sk.into()), secret))
 }
 
+/// Quote `s` for a POSIX shell so a printed command can be pasted as is.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Build the roster from the subkeys the coordinator handed over out of band
+/// (§3 C2) and require it to hash to the group id we were given. The id is the
+/// `d` tag every DKG event carries and is folded into the transcript, so a
+/// participant handed a different list than the others lands on a channel of
+/// its own and never completes a ceremony with them.
+fn local_group_roster(
+    name: &str,
+    threshold: u8,
+    participants: u8,
+    participant_subkeys: &[String],
+    group_id_hex: &str,
+) -> Result<DkgRoster> {
+    let roster = roster_from_subkeys(name, threshold, participants, participant_subkeys)?;
+    if hex::encode(roster.group_id) != group_id_hex {
+        return Err(KeepError::InvalidInput(format!(
+            "the roster (group name {name:?}, {threshold}-of-{participants}, the \
+             --participant-subkey list in order) does not hash to --group-id; check each \
+             against what `group-create` printed, and pass --name if the coordinator's \
+             group name differs from --group"
+        )));
+    }
+    Ok(roster)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(skip(out))]
 pub fn cmd_frost_network_dkg(
@@ -73,6 +102,8 @@ pub fn cmd_frost_network_dkg(
     threshold: u8,
     participants: u8,
     our_index: u8,
+    roster_name: Option<&str>,
+    participant_subkeys: &[String],
     relay: &str,
     hardware: Option<&str>,
     vault_path: Option<&std::path::Path>,
@@ -108,6 +139,8 @@ pub fn cmd_frost_network_dkg(
             threshold,
             participants,
             our_index,
+            roster_name,
+            participant_subkeys,
             relay,
             vault_path,
         ),
@@ -528,6 +561,8 @@ fn cmd_frost_network_dkg_software(
     threshold: u8,
     participants: u8,
     our_index: u8,
+    roster_name: Option<&str>,
+    participant_subkeys: &[String],
     relay: &str,
     vault_path: &std::path::Path,
 ) -> Result<()> {
@@ -576,6 +611,19 @@ fn cmd_frost_network_dkg_software(
                     .into(),
             )
         })?;
+    // §3 C2: a roster the coordinator handed over out of band is checked here,
+    // before the vault opens, so a typo surfaces without a password prompt.
+    let local_roster = if participant_subkeys.is_empty() {
+        None
+    } else {
+        Some(local_group_roster(
+            roster_name.unwrap_or(group),
+            threshold,
+            participants,
+            participant_subkeys,
+            &group_id_hex,
+        )?)
+    };
 
     // §8: the pre-store stash is a single per-group slot. A fresh run derives a
     // fresh subkey, so completing one while an earlier share is still pending
@@ -629,15 +677,22 @@ fn cmd_frost_network_dkg_software(
         );
         out.newline();
 
-        // #674: fetch the signed roster and require it to match our CLI args +
-        // subkey before we emit any DKG material. Fail closed so a wrong
-        // --index or a stale --threshold surfaces before co-signers see us.
-        let spinner = out.spinner("Fetching signed group roster...");
-        let roster = fetch_group_roster(&client, &group_id_hex).await?;
-        spinner.finish();
+        // #674: take the roster handed over out of band, or fetch the published
+        // one, and require it to match our CLI args + subkey before we emit any
+        // DKG material. Fail closed so a wrong --index or a stale --threshold
+        // surfaces before co-signers see us.
+        let roster = match local_roster {
+            Some(roster) => roster,
+            None => {
+                let spinner = out.spinner("Fetching signed group roster...");
+                let roster = fetch_group_roster(&client, &group_id_hex).await?;
+                spinner.finish();
+                roster
+            }
+        };
         require_roster_matches(&roster, &keys, threshold, participants, our_index)?;
         out.success(&format!(
-            "Roster verified ({} participants pinned by signed announcement)",
+            "Roster verified ({} participants pinned by the group id)",
             roster.participants,
         ));
         out.newline();
@@ -861,10 +916,11 @@ fn write_dkg_recovery_stash(path: &std::path::Path, export_json: &str) -> Result
 /// subkeys.
 ///
 /// C2: relay publication is **opt-in** (`publish`). By default the roster is a
-/// local artifact — the group id and pubkey list are printed for the coordinator
-/// to hand to participants out of band (the same shape mobile carries in its
-/// invite), and nothing is written to a relay. `--publish` opts into the CLI's
-/// relay-discovery path, which each participant's `dkg` then fetches.
+/// local artifact: the coordinator gets a `dkg` command carrying the group id and
+/// every subkey to hand to participants out of band (the same shape mobile
+/// carries in its invite), and nothing is written to a relay. `--publish` opts
+/// into the CLI's relay-discovery path, which each participant's `dkg` then
+/// fetches.
 #[tracing::instrument(skip(out))]
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_frost_network_group_create(
@@ -883,47 +939,46 @@ pub fn cmd_frost_network_group_create(
     out.field("Threshold", &format!("{threshold}-of-{participants}"));
     out.newline();
 
-    if threshold < 2 || threshold > participants {
-        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-            "must be 2 <= threshold ({threshold}) <= participants ({participants})"
-        ))));
+    // The name and relay land in a command participants paste into a shell, so
+    // both are checked here and quoted when printed. The name is also the group
+    // label every participant sees, so it stays plain.
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with('-')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+    {
+        return Err(KeepError::InvalidInput(
+            "group name must be 1 to 64 characters of letters, digits, space, '.', '_' or '-', \
+             not starting with '-'"
+                .into(),
+        ));
     }
-
-    if participant_subkeys.len() != participants as usize {
-        return Err(KeepError::InvalidInput(format!(
-            "expected {} participant subkeys, got {}",
-            participants,
-            participant_subkeys.len()
-        )));
-    }
-
-    // Normalize before hashing. The raw CLI strings may be hex or bech32 and may
-    // differ in case, so two coordinators typing the same roster differently
-    // would derive different group ids and silently fail to find each other.
-    // Parsing also rejects a malformed key here rather than at round 1, and the
-    // duplicate check closes a real attack: repeating one participant's subkey
-    // gives that holder two of the n shares, so a 2-of-3 becomes single-party
-    // spendable by them.
-    let mut normalized: Vec<String> = Vec::with_capacity(participant_subkeys.len());
-    let mut seen: HashSet<PublicKey> = HashSet::new();
-    for (i, raw) in participant_subkeys.iter().enumerate() {
-        let pk = parse_pubkey(raw).map_err(|e| {
-            KeepError::InvalidInput(format!("participant {} subkey is invalid: {e}", i + 1))
+    let relay = relays
+        .first()
+        .ok_or_else(|| KeepError::InvalidInput("group-create needs at least one --relay".into()))?;
+    for url in relays {
+        RelayUrl::parse(url).map_err(|e| {
+            KeepError::InvalidInput(format!("relay {url:?} is not a relay URL: {e}"))
         })?;
-        if !seen.insert(pk) {
-            return Err(KeepError::InvalidInput(format!(
-                "participant {} repeats a subkey already used by an earlier participant; \
-                 every participant must hold a distinct key",
-                i + 1
-            )));
-        }
-        normalized.push(pk.to_bech32().map_err(|e| {
-            KeepError::InvalidInput(format!("participant {} subkey is unencodable: {e}", i + 1))
-        })?);
     }
-    let participant_subkeys: &[String] = &normalized;
 
-    let group_id = frost_group_id(name, threshold, participants, participant_subkeys);
+    // One gate for every roster: the threshold shape, one distinct key per
+    // index (a repeated subkey would hand its holder two of the n shares), and
+    // the group id. The subkeys are printed and published as bech32 so two
+    // coordinators who typed one roster differently show the same list.
+    let roster = roster_from_subkeys(name, threshold, participants, participant_subkeys)?;
+    let normalized = roster
+        .by_index
+        .values()
+        .map(|pk| {
+            pk.to_bech32()
+                .map_err(|e| KeepError::InvalidInput(format!("subkey is unencodable: {e}")))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    let participant_subkeys: &[String] = &normalized;
+    let group_id = roster.group_id;
 
     // C2: default is a local roster artifact — print the group id and the subkey
     // list for out-of-band distribution and skip the relay entirely, so a group
@@ -936,9 +991,21 @@ pub fn cmd_frost_network_group_create(
             out.info(&format!("Participant {}: {}", i + 1, subkey));
         }
         out.newline();
+        let subkey_args: String = participant_subkeys
+            .iter()
+            .map(|subkey| format!(" --participant-subkey {subkey}"))
+            .collect();
+        out.info(&format!(
+            "Send this command to every participant out of band; each puts in its own \
+             group-subkey name and index: keep frost network dkg --group GROUP_SUBKEY_NAME \
+             --name {} --group-id {} --threshold {threshold} --participants {participants} \
+             --index INDEX --relay {}{subkey_args}",
+            shell_quote(name),
+            hex::encode(group_id),
+            shell_quote(relay)
+        ));
         out.info(
-            "Distribute the group id + subkeys to participants out of band, or re-run with \
-             --publish to announce on the relay for the CLI discovery path.",
+            "Re-run with --publish only if participants should fetch the roster from the relay.",
         );
         return Ok(());
     }
@@ -1023,11 +1090,11 @@ pub fn cmd_frost_network_group_create(
         }
         out.newline();
         out.info(&format!(
-            "Each participant now runs: keep frost network dkg --group <their group-subkey name> \
-             --group-id {} --threshold {threshold} --participants {participants} --index <n> \
-             --relay {}",
+            "Each participant now runs, with its own group-subkey name and index: keep frost \
+             network dkg --group GROUP_SUBKEY_NAME --group-id {} --threshold {threshold} \
+             --participants {participants} --index INDEX --relay {}",
             hex::encode(group_id),
-            relays.first().map(String::as_str).unwrap_or("<relay>")
+            shell_quote(relay)
         ));
 
         Ok::<_, KeepError>(())
@@ -1124,5 +1191,59 @@ mod recovery_stash_tests {
         write_dkg_recovery_stash(&path, "export").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[cfg(test)]
+mod local_roster_tests {
+    use super::{local_group_roster, shell_quote};
+    use keep_frost_net::dkg::frost_group_id;
+    use nostr_sdk::prelude::*;
+
+    fn subkeys() -> Vec<String> {
+        (1..=3u8)
+            .map(|seed| {
+                let sk = SecretKey::from_slice(&[seed; 32]).unwrap();
+                Keys::new(sk).public_key().to_hex()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_roster_that_hashes_to_the_group_id_is_taken() {
+        let keys = subkeys();
+        let id = hex::encode(frost_group_id("team", 2, 3, &keys));
+        let roster = local_group_roster("team", 2, 3, &keys, &id).unwrap();
+        assert_eq!(hex::encode(roster.group_id), id);
+        assert_eq!(roster.by_index.len(), 3);
+        assert_eq!(roster.by_index[&2].to_hex(), keys[1]);
+    }
+
+    #[test]
+    fn a_roster_that_differs_from_the_group_id_is_refused() {
+        let keys = subkeys();
+        let id = hex::encode(frost_group_id("team", 2, 3, &keys));
+        let refused = |name: &str, t: u8, keys: &[String]| {
+            local_group_roster(name, t, 3, keys, &id)
+                .unwrap_err()
+                .to_string()
+        };
+
+        let mut swapped = keys.clone();
+        swapped.swap(0, 1);
+        assert!(refused("team", 2, &swapped).contains("does not hash to --group-id"));
+        assert!(refused("other", 2, &keys).contains("pass --name"));
+        assert!(refused("team", 3, &keys).contains("does not hash to --group-id"));
+        let mut outsider = keys.clone();
+        outsider[2] = Keys::generate().public_key().to_hex();
+        assert!(refused("team", 2, &outsider).contains("does not hash to --group-id"));
+        assert!(refused("team", 2, &keys[..2]).contains("claims 3 participants"));
+    }
+
+    #[test]
+    fn a_name_is_quoted_for_the_shell() {
+        assert_eq!(shell_quote("team"), "'team'");
+        assert_eq!(shell_quote("a b $x"), "'a b $x'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 }

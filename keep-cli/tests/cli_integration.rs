@@ -2369,12 +2369,88 @@ async fn test_list_coexists_with_running_daemon() {
 /// `dkg` with its own group name and the coordinator's group id.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_software_dkg_ceremony_creates_one_group() {
-    let bin = match keep_binary() {
-        Some(b) => b,
-        None => {
-            eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
-            return;
-        }
+    let Some(announcements) = run_software_dkg_ceremony(true).await else {
+        return;
+    };
+    assert_eq!(announcements, 1, "--publish must announce the roster");
+}
+
+/// By default the roster never reaches the relay: the coordinator prints the
+/// `dkg` command with the subkeys in it, and the participants run that command
+/// as printed, so nothing on the relay says who holds the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_software_dkg_ceremony_runs_on_an_unpublished_roster() {
+    let Some(announcements) = run_software_dkg_ceremony(false).await else {
+        return;
+    };
+    assert_eq!(announcements, 0, "the roster reached the relay unasked");
+}
+
+/// `group-create` prints a command participants paste into a shell, so a
+/// group name or relay that a shell would read as more than one word or as a
+/// second command is refused before anything is printed.
+#[test]
+fn test_group_create_refuses_a_name_or_relay_unsafe_to_print() {
+    let bin = require_binary!();
+    let dir = TempDir::new().unwrap();
+    let vault = dir.path().join("coordinator");
+    assert_success(&KeepCmd::new(&bin).path(&vault).args(["init"]).run());
+    let subkeys: Vec<String> = (1..=2u8)
+        .map(|seed| {
+            let sk = nostr_sdk::SecretKey::from_slice(&[seed; 32]).unwrap();
+            nostr_sdk::Keys::new(sk).public_key().to_hex()
+        })
+        .collect();
+    let create = |name: &str, relay: &str| {
+        let name_arg = format!("--name={name}");
+        KeepCmd::new(&bin)
+            .path(&vault)
+            .args([
+                "frost",
+                "network",
+                "group-create",
+                &name_arg,
+                "--threshold",
+                "2",
+                "--participants",
+                "2",
+                "--relay",
+                relay,
+                "--participant-subkey",
+                &subkeys[0],
+                "--participant-subkey",
+                &subkeys[1],
+            ])
+            .run()
+    };
+
+    assert_success(&create("team one", "wss://relay.example"));
+    for name in ["team; rm -rf ~", "$(id)", "it's", "-x", "", &"x".repeat(65)] {
+        let out = create(name, "wss://relay.example");
+        assert!(!out.status.success(), "name {name:?} was accepted");
+        assert!(output_contains(&out, "group name must be"), "name {name:?}");
+    }
+    let out = create("team", "not a relay");
+    assert!(!out.status.success(), "a non-URL relay was accepted");
+    assert!(output_contains(&out, "is not a relay URL"));
+}
+
+const COORDINATOR_NAME: &str = "shared roster";
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Runs a 2-of-3 ceremony over a mock relay, the roster published or handed
+/// over in the command `group-create` prints. Asserts all three participants
+/// derive one group key and returns how many group announcements the relay
+/// holds afterwards, or `None` when the binary is not built.
+async fn run_software_dkg_ceremony(publish: bool) -> Option<usize> {
+    use nostr_sdk::{Client, Filter, Keys, Kind};
+
+    let Some(bin) = keep_binary() else {
+        eprintln!("SKIPPED: keep binary not found (build with: cargo build -p keep-cli)");
+        return None;
     };
     rustls::crypto::ring::default_provider()
         .install_default()
@@ -2383,7 +2459,9 @@ async fn test_software_dkg_ceremony_creates_one_group() {
     let mock = common::start_mock_relay().await;
     let relay = mock.url().await.to_string();
     let dir = TempDir::new().unwrap();
-    let names = ["alice-group", "bob-group", "carol-group"];
+    // The first participant enrolls under the coordinator's group name; the
+    // others under names of their own, which `--name` maps to the group.
+    let names = [COORDINATOR_NAME, "bob-group", "carol-group"];
     let vaults: Vec<PathBuf> = (1..=3).map(|i| dir.path().join(format!("v{i}"))).collect();
 
     let mut subkeys = Vec::new();
@@ -2410,15 +2488,17 @@ async fn test_software_dkg_ceremony_creates_one_group() {
         "network",
         "group-create",
         "--name",
-        "shared-roster",
+        COORDINATOR_NAME,
         "--threshold",
         "2",
         "--participants",
         "3",
         "--relay",
         &relay,
-        "--publish",
     ];
+    if publish {
+        create.push("--publish");
+    }
     for subkey in &subkeys {
         create.push("--participant-subkey");
         create.push(subkey);
@@ -2433,34 +2513,70 @@ async fn test_software_dkg_ceremony_creates_one_group() {
         .and_then(|l| l.split_whitespace().last())
         .expect("group id printed")
         .to_string();
+    // The unpublished roster travels in the printed command, which the
+    // participants run through a shell exactly as printed.
+    let printed = text
+        .lines()
+        .filter(|l| l.contains("--participant-subkey"))
+        .find_map(|l| {
+            l.split_once("keep frost network dkg ")
+                .map(|(_, rest)| rest)
+        })
+        .map(str::to_string);
+    assert_eq!(printed.is_some(), !publish, "unexpected output:\n{text}");
 
     let runs: Vec<_> = vaults
         .iter()
         .zip(names)
         .enumerate()
         .map(|(i, (vault, name))| {
-            let mut cmd = Command::new(&bin);
+            let index = (i + 1).to_string();
+            let mut cmd = match &printed {
+                Some(args) => {
+                    let args = args
+                        .replace("GROUP_SUBKEY_NAME", &shell_quote(name))
+                        .replace("INDEX", &index);
+                    // The coordinator's name is the default, so a participant
+                    // who enrolled under it can leave --name out.
+                    let args = if name == COORDINATOR_NAME {
+                        let without =
+                            args.replace(&format!(" --name {}", shell_quote(COORDINATOR_NAME)), "");
+                        assert!(!without.contains("--name"), "--name not dropped: {without}");
+                        without
+                    } else {
+                        args
+                    };
+                    let mut cmd = Command::new("sh");
+                    cmd.arg("-c").arg(format!(
+                        "exec \"$0\" --path \"$1\" frost network dkg {args}"
+                    ));
+                    cmd.arg(&bin).arg(vault);
+                    cmd
+                }
+                None => {
+                    let mut cmd = Command::new(&bin);
+                    cmd.arg("--path").arg(vault).args([
+                        "frost",
+                        "network",
+                        "dkg",
+                        "--group",
+                        name,
+                        "--group-id",
+                        &group_id,
+                        "--threshold",
+                        "2",
+                        "--participants",
+                        "3",
+                        "--index",
+                        &index,
+                        "--relay",
+                        &relay,
+                    ]);
+                    cmd
+                }
+            };
             cmd.env("KEEP_PASSWORD", TEST_PASSWORD)
                 .env("KEEP_YES", "1")
-                .arg("--path")
-                .arg(vault)
-                .args([
-                    "frost",
-                    "network",
-                    "dkg",
-                    "--group",
-                    name,
-                    "--group-id",
-                    &group_id,
-                    "--threshold",
-                    "2",
-                    "--participants",
-                    "3",
-                    "--index",
-                    &(i + 1).to_string(),
-                    "--relay",
-                    &relay,
-                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -2490,6 +2606,20 @@ async fn test_software_dkg_ceremony_creates_one_group() {
     }
     assert_eq!(group_keys[0], group_keys[1]);
     assert_eq!(group_keys[1], group_keys[2]);
+
+    let client = Client::new(Keys::generate());
+    client.add_relay(&relay).await.unwrap();
+    client.connect().await;
+    let announcements = client
+        .fetch_events(
+            Filter::new().kind(Kind::Custom(31101)),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("query the relay")
+        .len();
+    client.disconnect().await;
+    Some(announcements)
 }
 
 /// A piped secret value larger than a record can hold is refused, and nothing

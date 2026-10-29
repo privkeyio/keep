@@ -258,6 +258,56 @@ pub fn frost_group_id(
     hasher.finalize().into()
 }
 
+/// Build the roster for a group from its name, `(threshold, participants)` and
+/// each participant's per-group subkey in index order, the same fields
+/// `frost_group_id` hashes. Every roster passes through here: one the
+/// coordinator handed over out of band because it was never published (§3 C2),
+/// one parsed from a kind-31101 announcement, and one `group-create` assembles.
+///
+/// The list is attacker-supplied, so this refuses a threshold below 2 or above
+/// `participants`, a count that differs from `participants`, a key that does not
+/// parse, and one key listed at two indices (which would hand its holder two of
+/// the n shares). It does not check the result against a group id; the caller
+/// compares `group_id` with the one it was given.
+pub fn roster_from_subkeys(
+    name: &str,
+    threshold: u8,
+    participants: u8,
+    ordered_subkeys: &[String],
+) -> Result<DkgRoster> {
+    if threshold < 2 || threshold > participants {
+        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+            "roster claims threshold {threshold} of {participants}; \
+             must satisfy 2 <= threshold <= participants"
+        ))));
+    }
+    if ordered_subkeys.len() != participants as usize {
+        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+            "roster lists {} subkeys but claims {participants} participants",
+            ordered_subkeys.len()
+        ))));
+    }
+    let mut by_index: BTreeMap<u16, PublicKey> = BTreeMap::new();
+    let mut distinct: HashSet<PublicKey> = HashSet::new();
+    for (i, subkey) in ordered_subkeys.iter().enumerate() {
+        let index = i as u16 + 1;
+        let pk = parse_pubkey(subkey)?;
+        if !distinct.insert(pk) {
+            return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
+                "roster repeats one pubkey at index {index}; every participant \
+                 must hold a distinct key"
+            ))));
+        }
+        by_index.insert(index, pk);
+    }
+    Ok(DkgRoster {
+        threshold,
+        participants,
+        by_index,
+        group_id: frost_group_id(name, threshold, participants, ordered_subkeys),
+    })
+}
+
 /// Fetch the kind-31101 group announcement(s) for `group_id_hex` and return
 /// the first one that authenticates into a valid roster.
 ///
@@ -351,23 +401,6 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
         }
     }
 
-    // Distinct indices are not enough: the announcement is attacker-supplied, so
-    // nothing stops one key being listed at two indices. That roster hash-binds
-    // correctly and authenticates fine, but it hands the holder of the repeated
-    // key two of the n shares, which makes a published "2-of-3" spendable by
-    // that party alone. Validating this only where we *create* a group would
-    // leave the check on the wrong side of the trust boundary, since an attacker
-    // publishes the announcement directly rather than running our CLI.
-    let mut distinct: HashSet<PublicKey> = HashSet::new();
-    for (idx, (pk, _)) in by_index.iter() {
-        if !distinct.insert(*pk) {
-            return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-                "group announcement repeats one pubkey at index {idx}; every \
-                 participant must hold a distinct key"
-            ))));
-        }
-    }
-
     let threshold = threshold.ok_or_else(|| {
         KeepError::FrostErr(FrostError::invalid_config(
             "group announcement is missing a `threshold` tag".to_string(),
@@ -378,18 +411,6 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
             "group announcement is missing a `participants` tag".to_string(),
         ))
     })?;
-    // Enforce the threshold shape here rather than trusting callers. This is a
-    // `pub` function fed an attacker-supplied announcement, and a roster
-    // claiming threshold 1 (single-party spendable) or threshold > participants
-    // (unsatisfiable) has no legitimate use. Both callers happen to pre-validate
-    // today; that is exactly the argument for not leaving the invariant on the
-    // far side of the trust boundary.
-    if threshold < 2 || threshold > participants {
-        return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
-            "group announcement claims threshold {threshold} of {participants}; \
-             must satisfy 2 <= threshold <= participants"
-        ))));
-    }
     if by_index.len() != participants as usize {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
             "group announcement carries {} p-tags but claims {} participants",
@@ -400,15 +421,13 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
     // Reject rosters with holes: indexes must be exactly 1..=participants.
     // This also imposes index order on the npubs fed to the group_id hash.
     let mut ordered_npubs: Vec<String> = Vec::with_capacity(participants as usize);
-    let mut roster: BTreeMap<u16, PublicKey> = BTreeMap::new();
     for idx in 1..=participants as u16 {
-        let (pk, npub) = by_index.get(&idx).ok_or_else(|| {
+        let (_, npub) = by_index.get(&idx).ok_or_else(|| {
             KeepError::FrostErr(FrostError::invalid_config(format!(
                 "group announcement is missing a p-tag for participant index {idx}"
             )))
         })?;
         ordered_npubs.push(npub.clone());
-        roster.insert(idx, *pk);
     }
 
     // #674: recompute the group_id hash from the announcement's own fields and
@@ -431,21 +450,19 @@ pub fn parse_roster_from_event(ev: &Event, group_id_hex: &str) -> Result<DkgRost
             ))));
         }
     };
-    let group_id = frost_group_id(&name, threshold, participants, &ordered_npubs);
-    let recomputed = hex::encode(group_id);
+    // The announcement is attacker-supplied, so the shape checks (a threshold
+    // of 2..=participants, one distinct key per index) run here on the verifying
+    // side through the same gate an out-of-band roster passes, not only where
+    // our CLI mints a group.
+    let roster = roster_from_subkeys(&name, threshold, participants, &ordered_npubs)?;
+    let recomputed = hex::encode(roster.group_id);
     if recomputed != group_id_hex {
         return Err(KeepError::FrostErr(FrostError::invalid_config(format!(
             "group announcement id {recomputed} does not match the queried d-tag {group_id_hex}; \
              refusing a roster that does not bind to the requested group"
         ))));
     }
-
-    Ok(DkgRoster {
-        threshold,
-        participants,
-        by_index: roster,
-        group_id,
-    })
+    Ok(roster)
 }
 
 /// Verify (threshold, participants) from the signed announcement match the
@@ -1860,6 +1877,58 @@ mod tests {
         }
         let ev = builder.sign_with_keys(&make_identity_keys(0x42)).unwrap();
         assert!(parse_roster_from_event(&ev, "deadbeef").is_err());
+    }
+
+    /// A roster handed over out of band pins the same keys and the same group id
+    /// as the announcement of that roster would, so a published and an
+    /// unpublished run of one group meet on one channel.
+    #[test]
+    fn a_roster_from_subkeys_matches_the_announced_one() {
+        let (n1, pk1) = make_pubkey(1);
+        let (n2, pk2) = make_pubkey(2);
+        let (n3, pk3) = make_pubkey(3);
+        let subkeys = vec![n1, n2, n3];
+        let group_id = hex::encode(frost_group_id("g", 2, 3, &subkeys));
+        let announced =
+            parse_roster_from_event(&build_announcement("g", 2, 3, &subkeys, None), &group_id)
+                .unwrap();
+
+        let roster = roster_from_subkeys("g", 2, 3, &subkeys).unwrap();
+        assert_eq!(hex::encode(roster.group_id), group_id);
+        assert_eq!(roster.group_id, announced.group_id);
+        assert_eq!(roster.by_index, announced.by_index);
+        assert_eq!((roster.threshold, roster.participants), (2, 3));
+        assert_eq!(
+            roster.by_index.into_iter().collect::<Vec<_>>(),
+            vec![(1, pk1), (2, pk2), (3, pk3)]
+        );
+    }
+
+    /// The out-of-band list comes from the coordinator, so the checks the
+    /// announcement parser makes apply to it too.
+    #[test]
+    fn a_roster_from_subkeys_refuses_what_an_announcement_would() {
+        let (n1, _) = make_pubkey(1);
+        let (n2, _) = make_pubkey(2);
+        let (n3, _) = make_pubkey(3);
+        let two = vec![n1.clone(), n2.clone()];
+        let three = vec![n1.clone(), n2, n3];
+        let refused = |t: u8, n: u8, keys: &[String]| roster_from_subkeys("g", t, n, keys).is_err();
+
+        assert!(!refused(2, 2, &two));
+        assert!(
+            refused(1, 2, &two),
+            "a threshold of 1 is spendable by one party"
+        );
+        assert!(refused(3, 2, &two), "a threshold above n can never sign");
+        assert!(refused(2, 3, &two), "a short list leaves an index unpinned");
+        assert!(refused(2, 2, &three), "a long list pins an index past n");
+        assert!(refused(2, 2, &[n1.clone(), "not a key".to_string()]));
+        let err = roster_from_subkeys("g", 2, 2, &[n1.clone(), n1]).unwrap_err();
+        assert!(
+            err.to_string().contains("distinct key"),
+            "unexpected error: {err}"
+        );
     }
 
     /// DkgRoster::expected_pubkey refuses out-of-range indexes cleanly.
