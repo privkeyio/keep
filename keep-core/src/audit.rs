@@ -560,7 +560,7 @@ impl AuditLog {
             migrated: None,
         };
         log.recover_interrupted_rewrite(data_key)?;
-        if log.path.exists() {
+        if present(&log.path) {
             let tail = scan_tail(&log.path)?;
             let last = tail
                 .last
@@ -635,7 +635,7 @@ impl AuditLog {
         if self.seq == 0 {
             return Ok(0);
         }
-        let file = match File::open(&self.path) {
+        let file = match open_regular(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => return Err(e.into()),
@@ -699,7 +699,7 @@ impl AuditLog {
         if seq == 0 || seq > self.seq {
             return None;
         }
-        let mut reader = BufReader::new(File::open(&self.path).ok()?);
+        let mut reader = BufReader::new(open_regular(&self.path).ok()?);
         let mut line = Vec::new();
         let mut next = |reader: &mut BufReader<File>| -> Option<Vec<u8>> {
             loop {
@@ -734,7 +734,7 @@ impl AuditLog {
         note: &str,
         data_key: &SecretKey,
     ) -> bool {
-        let Ok(file) = File::open(&self.path) else {
+        let Ok(file) = open_regular(&self.path) else {
             return false;
         };
         let Ok(batch) = crypto::BatchDecryptor::new(data_key) else {
@@ -815,13 +815,10 @@ impl AuditLog {
         // Appending to a file someone else cut, replaced or removed would
         // carry this log's place onto it, hiding what was there.
         self.check_on_disk()?;
-        let mut file = opts.open(&self.path)?;
+        let mut file = open_regular_with(&mut opts, &self.path)?;
         let len = file.metadata()?.len();
         // A partial line left by a failed write would make the log unreadable.
-        if let Err(e) = file
-            .write_all(line.as_bytes())
-            .and_then(|()| file.sync_all())
-        {
+        if let Err(e) = write_line(&mut file, line.as_bytes()).and_then(|()| file.sync_all()) {
             self.torn = truncate(&self.path, len).err().map(|_| len);
             return Err(e.into());
         }
@@ -862,7 +859,7 @@ impl AuditLog {
             None => true,
             Some((end, line)) => {
                 let mut found = vec![0u8; line.len()];
-                File::open(&self.path)
+                open_regular(&self.path)
                     .and_then(|mut f| {
                         std::io::Seek::seek(
                             &mut f,
@@ -892,7 +889,7 @@ impl AuditLog {
     /// broken.
     pub fn check_chain(&self, data_key: &SecretKey) -> Result<ChainCheck> {
         let mut chain = ChainVerifier::default();
-        let file = match File::open(&self.path) {
+        let file = match open_regular(&self.path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(chain.finish()),
             Err(e) => return Err(e.into()),
@@ -1066,7 +1063,7 @@ impl AuditLog {
     }
 
     fn read_entries(path: &Path, data_key: &SecretKey, cap: usize) -> Result<Vec<AuditEntry>> {
-        let file = File::open(path)?;
+        let file = open_regular(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
         let batch = crypto::BatchDecryptor::new(data_key)?;
@@ -1101,7 +1098,7 @@ impl AuditLog {
         path: &Path,
         data_key: &SecretKey,
     ) -> Result<(Vec<AuditEntry>, Option<usize>, usize)> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let mut reader = BufReader::new(open_regular(path)?);
         let (mut entries, mut before_gap, mut decrypted) = (Vec::new(), None, 0);
         let mut line = Vec::new();
         loop {
@@ -1314,7 +1311,7 @@ impl AuditLog {
         }
         let mut name = String::new();
         std::io::Read::read_to_string(
-            &mut std::io::Read::take(File::open(&marker).ok()?, 255),
+            &mut std::io::Read::take(open_regular(&marker).ok()?, 255),
             &mut name,
         )
         .ok()?;
@@ -1700,7 +1697,7 @@ impl Tail {
 /// Scan `path` for its last complete line that is not blank, without
 /// changing it.
 fn scan_tail(path: &Path) -> std::io::Result<Tail> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = BufReader::new(open_regular(path)?);
     let (mut line, mut last) = (Vec::new(), Vec::new());
     let (mut count, mut at, mut last_end) = (0, 0u64, 0u64);
     let complete = loop {
@@ -1740,6 +1737,58 @@ fn file_len(path: &Path) -> std::io::Result<u64> {
 /// Whether `path` is a regular file, without following a symlink.
 fn is_regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+}
+
+/// Whether anything is at `path`, a dangling symlink included.
+fn present(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Open the audit file at `path` for reading, only if it is a regular file.
+fn open_regular(path: &Path) -> std::io::Result<File> {
+    open_regular_with(OpenOptions::new().read(true), path)
+}
+
+/// Open `path` with `opts` only if it is a regular file: never through a
+/// symlink, and without blocking on a FIFO. A log replaced by a symlink to
+/// `/dev/zero` or by a FIFO would otherwise fill memory or hang every unlock,
+/// and a symlink would carry a cut or an append to the file it names.
+fn open_regular_with(opts: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
+    let not_regular = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} is not a regular file (a symlink, a FIFO or a device); keep reads and writes only a regular file there, so move it out of the vault directory",
+                path.display()
+            ),
+        )
+    };
+    let file = opts.open(path).map_err(|e| {
+        if e.kind() != std::io::ErrorKind::NotFound
+            && std::fs::symlink_metadata(path).is_ok_and(|m| !m.is_file())
+        {
+            not_regular()
+        } else {
+            e
+        }
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(not_regular());
+    }
+    Ok(file)
+}
+
+/// Write one log line. In tests, `PARTIAL_WRITE` stops it halfway with an
+/// error, as a full disk would.
+fn write_line(file: &mut File, line: &[u8]) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_support::PARTIAL_WRITE.with(std::cell::Cell::get) {
+        file.write_all(&line[..line.len() / 2])?;
+        return Err(std::io::Error::other("write cut short for the test"));
+    }
+    file.write_all(line)
 }
 
 /// A new file at `path` with mode 0600, after removing anything left there,
@@ -1792,7 +1841,7 @@ fn keep_copy(from: &Path, dir: &Path, base: &str) -> Result<PathBuf> {
     let temp = dir.join(format!("{base}.tmp"));
     let copied = (|| -> std::io::Result<PathBuf> {
         let mut out = create_fresh(&temp)?;
-        std::io::copy(&mut File::open(from)?, &mut out)?;
+        std::io::copy(&mut open_regular(from)?, &mut out)?;
         out.sync_all()?;
         let mut n = 1u32;
         loop {
@@ -1810,7 +1859,7 @@ fn keep_copy(from: &Path, dir: &Path, base: &str) -> Result<PathBuf> {
             opts.mode(0o600);
             match opts.open(name(n)) {
                 Ok(mut out) => {
-                    let copied = File::open(&temp)
+                    let copied = open_regular(&temp)
                         .and_then(|mut from| std::io::copy(&mut from, &mut out))
                         .and_then(|_| out.sync_all());
                     #[cfg(test)]
@@ -1847,7 +1896,7 @@ fn hard_link(from: &Path, to: &Path) -> std::io::Result<()> {
 /// the same plaintext, without checking or re-chaining anything. A line that
 /// does not decrypt under `old_key` is kept as it is.
 fn reencrypt_as_is(path: &Path, old_key: &SecretKey, new_key: &SecretKey) -> Result<()> {
-    let mut reader = BufReader::new(File::open(path)?);
+    let mut reader = BufReader::new(open_regular(path)?);
     let temp = temp_beside(path);
     let written = (|| -> Result<()> {
         let mut out = create_fresh(&temp)?;
@@ -1902,10 +1951,18 @@ fn sync_parent(path: &Path) {
     let _ = path;
 }
 
-/// Cut `path` back to `len` bytes, durably; never grows it. A separate write
-/// handle, since an append-only handle cannot truncate on every platform.
+/// Cut `path` back to `len` bytes, durably; never grows it, and a missing
+/// file has nothing to cut. A separate write handle, since an append-only
+/// handle cannot truncate on every platform.
 fn truncate(path: &Path, len: u64) -> std::io::Result<()> {
-    let file = OpenOptions::new().write(true).open(path)?;
+    #[cfg(test)]
+    if test_support::FAIL_TRUNCATE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other("truncate refused for the test"));
+    }
+    let file = match open_regular_with(OpenOptions::new().write(true), path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        file => file?,
+    };
     if file.metadata()?.len() > len {
         file.set_len(len)?;
         file.sync_all()?;
@@ -2086,6 +2143,9 @@ pub struct SigningAuditLog {
     retention: RetentionPolicy,
     /// The name this open kept an unreadable log under, if it did.
     set_aside: Option<String>,
+    /// The length to cut the log back to before the next append, when a
+    /// failed append left part of a line that could not be cut off then.
+    torn: Option<u64>,
 }
 
 impl SigningAuditLog {
@@ -2099,7 +2159,7 @@ impl SigningAuditLog {
     pub fn open(path: &Path, data_key: &SecretKey) -> Result<Self> {
         let audit_path = path.join("signing_audit.log");
         let mut set_aside = None;
-        let last_hash = if audit_path.exists() {
+        let last_hash = if present(&audit_path) {
             let tail = scan_tail(&audit_path)?;
             let last = tail.last.as_ref().map_or(Ok([0u8; 32]), |line| {
                 std::str::from_utf8(line_text(line))
@@ -2140,6 +2200,7 @@ impl SigningAuditLog {
             last_hash,
             retention: RetentionPolicy::default(),
             set_aside,
+            torn: None,
         })
     }
 
@@ -2164,8 +2225,19 @@ impl SigningAuditLog {
         self.retention = policy;
     }
 
+    /// Cut off the partial line a failed append left, if one is pending, so
+    /// the log reads back whole.
+    fn cut_torn(&mut self) -> Result<()> {
+        if let Some(len) = self.torn {
+            truncate(&self.path, len)?;
+            self.torn = None;
+        }
+        Ok(())
+    }
+
     /// Apply the retention policy, returning the number of entries removed.
     pub fn apply_retention(&mut self, data_key: &SecretKey) -> Result<usize> {
+        self.cut_torn()?;
         let entries = self.read_all(data_key)?;
         let original_count = entries.len();
         let now = chrono::Utc::now().timestamp();
@@ -2205,9 +2277,15 @@ impl SigningAuditLog {
         opts.create(true).append(true);
         #[cfg(unix)]
         opts.mode(0o600);
-        let mut file = opts.open(&self.path)?;
-        file.write_all(line.as_bytes())?;
-        file.sync_all()?;
+        self.cut_torn()?;
+        let mut file = open_regular_with(&mut opts, &self.path)?;
+        let len = file.metadata()?.len();
+        // A partial line left by a failed write would join the next entry
+        // into one line that cannot be read.
+        if let Err(e) = write_line(&mut file, line.as_bytes()).and_then(|()| file.sync_all()) {
+            self.torn = truncate(&self.path, len).err().map(|_| len);
+            return Err(e.into());
+        }
 
         self.last_hash = entry.hash;
         Ok(())
@@ -2314,6 +2392,7 @@ impl SigningAuditLog {
         if !self.path.exists() {
             return Ok(());
         }
+        self.cut_torn()?;
         let entries = Self::read_entries(&self.path, old_key)?;
         if entries.is_empty() {
             return Ok(());
@@ -2349,7 +2428,7 @@ impl SigningAuditLog {
     fn read_entries(path: &Path, data_key: &SecretKey) -> Result<Vec<SigningAuditEntry>> {
         const MAX_ENTRIES: usize = 100_000;
 
-        let file = File::open(path)?;
+        let file = open_regular(path)?;
         let reader = BufReader::new(file);
         let mut entries = Vec::new();
 
@@ -2418,6 +2497,7 @@ impl SigningAuditLog {
 
         let _ = std::fs::remove_file(&backup_path);
         self.last_hash = final_hash;
+        self.torn = None;
         Ok(())
     }
 
@@ -2427,11 +2507,7 @@ impl SigningAuditLog {
         entries: &[SigningAuditEntry],
         data_key: &SecretKey,
     ) -> Result<[u8; 32]> {
-        let mut opts = OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut file = opts.open(temp_path)?;
+        let mut file = create_fresh(temp_path)?;
 
         let mut prev_hash = [0u8; 32];
         for entry in entries {
@@ -2463,6 +2539,10 @@ pub(crate) mod test_support {
         pub(crate) static NO_HARD_LINKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         /// Makes this thread's copies into a kept log's name fail.
         pub(crate) static FAIL_COPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes this thread's log appends write half a line and fail.
+        pub(crate) static PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes this thread's cuts of a log back to a length fail.
+        pub(crate) static FAIL_TRUNCATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// Append `count` entries to the log in `dir`, chained from its last
@@ -2673,6 +2753,373 @@ mod tests {
             .unwrap();
         assert_eq!(log.read_all(&key).unwrap().len(), 3);
         assert!(log.verify_chain(&key).unwrap());
+    }
+
+    /// Run `f` with the test write and cut faults set as given, clearing
+    /// them after.
+    fn with_faults<T>(partial_write: bool, fail_truncate: bool, f: impl FnOnce() -> T) -> T {
+        use super::test_support::{FAIL_TRUNCATE, PARTIAL_WRITE};
+        PARTIAL_WRITE.with(|c| c.set(partial_write));
+        FAIL_TRUNCATE.with(|c| c.set(fail_truncate));
+        let out = f();
+        PARTIAL_WRITE.with(|c| c.set(false));
+        FAIL_TRUNCATE.with(|c| c.set(false));
+        out
+    }
+
+    fn signing_entry(n: u8) -> SigningAuditEntry {
+        SigningAuditEntry::new(
+            SigningRequestType::SignEvent,
+            SigningDecision::Approved,
+            false,
+            "caller".into(),
+            [0; 32],
+        )
+        .with_caller_name(format!("app {n}"))
+    }
+
+    /// A signing append that fails partway leaves no partial line: it is
+    /// cut off at once, or before the next append when the cut fails too,
+    /// so the next entry starts its own line and the log reads back whole.
+    #[test]
+    fn a_failed_signing_append_leaves_no_partial_line() {
+        for fail_truncate in [false, true] {
+            let dir = tempdir().unwrap();
+            let key = test_key();
+            let path = dir.path().join("signing_audit.log");
+            let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+            log.log(signing_entry(1), &key).unwrap();
+            let before = std::fs::read(&path).unwrap();
+
+            let failed = with_faults(true, fail_truncate, || log.log(signing_entry(2), &key));
+            assert!(failed.is_err());
+            let after = std::fs::read(&path).unwrap();
+            assert_eq!(
+                after == before,
+                !fail_truncate,
+                "fail_truncate {fail_truncate}"
+            );
+
+            log.log(signing_entry(3), &key).unwrap();
+            let entries = log.read_all(&key).unwrap();
+            let names: Vec<_> = entries.iter().map(|e| e.caller_name.clone()).collect();
+            assert_eq!(names, [Some("app 1".into()), Some("app 3".into())]);
+            assert_eq!(log.verify_chain(&key).unwrap(), (true, 2));
+        }
+    }
+
+    /// A cut left pending against a signing log that is then removed does
+    /// not block every later append.
+    #[test]
+    fn a_pending_signing_cut_on_a_removed_log_is_dropped() {
+        let dir = tempdir().unwrap();
+        let key = test_key();
+        let path = dir.path().join("signing_audit.log");
+        let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        log.log(signing_entry(1), &key).unwrap();
+        let failed = with_faults(true, true, || log.log(signing_entry(2), &key));
+        assert!(failed.is_err());
+        assert!(log.torn.is_some());
+        std::fs::remove_file(&path).unwrap();
+
+        log.log(signing_entry(3), &key).unwrap();
+        assert_eq!(log.torn, None);
+        let names: Vec<_> = log
+            .read_all(&key)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.caller_name)
+            .collect();
+        assert_eq!(names, [Some("app 3".into())]);
+    }
+
+    /// A partial line a failed append could not cut is cut before key
+    /// rotation or retention reads the signing log, so neither finds it
+    /// unreadable and the entries before it survive.
+    #[test]
+    fn a_left_over_signing_cut_is_made_before_rotation_and_retention() {
+        for rotate in [true, false] {
+            let dir = tempdir().unwrap();
+            let key = test_key();
+            let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+            log.log(signing_entry(1), &key).unwrap();
+            log.log(signing_entry(2), &key).unwrap();
+            let failed = with_faults(true, true, || log.log(signing_entry(3), &key));
+            assert!(failed.is_err());
+            let read_key = if rotate {
+                let new_key = SecretKey::generate().unwrap();
+                log.reencrypt(&key, &new_key).unwrap();
+                new_key
+            } else {
+                log.set_retention(RetentionPolicy {
+                    max_entries: Some(1),
+                    max_age_days: None,
+                });
+                assert_eq!(log.apply_retention(&key).unwrap(), 1);
+                key
+            };
+            let names: Vec<_> = log
+                .read_all(&read_key)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.caller_name)
+                .collect();
+            let expected: Vec<Option<String>> = if rotate {
+                vec![Some("app 1".into()), Some("app 2".into())]
+            } else {
+                vec![Some("app 2".into())]
+            };
+            assert_eq!(names, expected, "rotate {rotate}");
+        }
+    }
+
+    /// The same holds for the audit log.
+    #[test]
+    fn a_failed_audit_append_leaves_no_partial_line() {
+        for fail_truncate in [false, true] {
+            let dir = tempdir().unwrap();
+            let key = test_key();
+            let mut log = AuditLog::open(dir.path(), &key).unwrap();
+            log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+                .unwrap();
+            let failed = with_faults(true, fail_truncate, || {
+                log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key)
+            });
+            assert!(failed.is_err());
+            log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+                .unwrap();
+            assert_eq!(log.read_all(&key).unwrap().len(), 2);
+            assert!(log.verify_chain(&key).unwrap());
+        }
+    }
+
+    /// A symlink in a log's place is refused with an error naming it, and
+    /// the file it points at is neither cut nor written, though a torn end
+    /// would be cut from a log and an entry appended to it.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_a_logs_place_is_refused_and_not_followed() {
+        let key = test_key();
+        let dir = tempdir().unwrap();
+        let source = tempdir().unwrap();
+        let mut log = AuditLog::open(source.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let mut signing = SigningAuditLog::open(source.path(), &key).unwrap();
+        signing.log(signing_entry(1), &key).unwrap();
+
+        for name in ["audit.log", "signing_audit.log"] {
+            let mut torn = std::fs::read(source.path().join(name)).unwrap();
+            torn.extend_from_slice(b"half a line");
+            let target = dir.path().join(format!("{name}.elsewhere"));
+            std::fs::write(&target, &torn).unwrap();
+            std::os::unix::fs::symlink(&target, dir.path().join(name)).unwrap();
+        }
+        let err = AuditLog::open(dir.path(), &key).err().unwrap().to_string();
+        assert!(err.contains("audit.log is not a regular file"), "{err}");
+        std::fs::remove_file(dir.path().join("audit.log")).unwrap();
+        let err = SigningAuditLog::open(dir.path(), &key)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            err.contains("signing_audit.log is not a regular file"),
+            "{err}"
+        );
+
+        for name in ["audit.log", "signing_audit.log"] {
+            let mut torn = std::fs::read(source.path().join(name)).unwrap();
+            torn.extend_from_slice(b"half a line");
+            let target = dir.path().join(format!("{name}.elsewhere"));
+            assert_eq!(std::fs::read(&target).unwrap(), torn, "{name}");
+        }
+    }
+
+    /// A symlink left where no log is yet is refused, not taken for no log.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_in_a_logs_place_is_refused() {
+        let key = test_key();
+        for name in ["audit.log", "signing_audit.log"] {
+            let dir = tempdir().unwrap();
+            let target = dir.path().join("nowhere");
+            std::os::unix::fs::symlink(&target, dir.path().join(name)).unwrap();
+            let opened = match name {
+                "audit.log" => AuditLog::open(dir.path(), &key).map(drop),
+                _ => SigningAuditLog::open(dir.path(), &key).map(drop),
+            };
+            assert!(opened.is_err(), "{name}");
+            assert!(!target.exists(), "{name}");
+        }
+    }
+
+    /// A log swapped for a symlink to a copy of itself while the vault is
+    /// open is refused at the next append, and the copy is left as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_log_swapped_for_a_symlink_while_open_is_not_appended_through() {
+        let key = test_key();
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+            .unwrap();
+        let copy = dir.path().join("copy");
+        std::fs::copy(&path, &copy).unwrap();
+        let before = std::fs::read(&copy).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&copy, &path).unwrap();
+
+        let appended = log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key);
+        assert!(appended.is_err());
+        assert_eq!(std::fs::read(&copy).unwrap(), before);
+    }
+
+    /// Replace the file at `path` with a symlink to a copy of it, returning
+    /// the copy's path and contents.
+    #[cfg(unix)]
+    fn swap_for_symlink_to_copy(path: &Path) -> (PathBuf, Vec<u8>) {
+        let copy = path.with_extension("copy");
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::remove_file(path).unwrap();
+        std::os::unix::fs::symlink(&copy, path).unwrap();
+        let before = std::fs::read(&copy).unwrap();
+        (copy, before)
+    }
+
+    /// A log swapped for a symlink while the vault is open is not read
+    /// through by any read, so a symlink to `/dev/zero` cannot fill memory.
+    #[cfg(unix)]
+    #[test]
+    fn no_read_follows_a_log_swapped_for_a_symlink() {
+        let key = test_key();
+        let dir = tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        log.log(
+            AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]).with_reason("noted"),
+            &key,
+        )
+        .unwrap();
+        let mut signing = SigningAuditLog::open(dir.path(), &key).unwrap();
+        signing.log(signing_entry(1), &key).unwrap();
+        swap_for_symlink_to_copy(&dir.path().join("audit.log"));
+        swap_for_symlink_to_copy(&dir.path().join("signing_audit.log"));
+
+        assert!(log.read_all(&key).is_err());
+        assert!(log.check_chain(&key).is_err());
+        assert!(log.last_own_timestamp(&key).is_err());
+        assert_eq!(log.entry_hash_at(1, &key), None);
+        assert!(!log.any_entry_noting(&[AuditEventType::VaultUnlock], "noted", &key));
+        assert!(signing.read_all(&key).is_err());
+    }
+
+    /// The cut a failed append left for the next one is not made through a
+    /// symlink put in the log's place, nor is the append, for either log.
+    #[cfg(unix)]
+    #[test]
+    fn a_left_over_cut_is_not_made_through_a_symlink() {
+        let key = test_key();
+        for torn in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut log = AuditLog::open(dir.path(), &key).unwrap();
+            log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key)
+                .unwrap();
+            let mut signing = SigningAuditLog::open(dir.path(), &key).unwrap();
+            signing.log(signing_entry(1), &key).unwrap();
+            if torn {
+                let failed = with_faults(true, true, || {
+                    log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key)
+                });
+                assert!(failed.is_err());
+                let failed = with_faults(true, true, || signing.log(signing_entry(2), &key));
+                assert!(failed.is_err());
+            }
+            let (copy, before) = swap_for_symlink_to_copy(&dir.path().join("audit.log"));
+            let (signing_copy, signing_before) =
+                swap_for_symlink_to_copy(&dir.path().join("signing_audit.log"));
+
+            let appended = log.log(AuditEntry::new(AuditEventType::VaultLock, [0; 32]), &key);
+            assert!(appended.is_err(), "torn {torn}");
+            assert_eq!(std::fs::read(&copy).unwrap(), before, "torn {torn}");
+            assert!(signing.log(signing_entry(3), &key).is_err(), "torn {torn}");
+            assert_eq!(
+                std::fs::read(&signing_copy).unwrap(),
+                signing_before,
+                "torn {torn}"
+            );
+        }
+    }
+
+    /// The first append to a log that has no entries yet, which has no last
+    /// line to check, does not write through a symlink put in its place.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_append_is_not_made_through_a_symlink() {
+        let key = test_key();
+        let dir = tempdir().unwrap();
+        let mut log = AuditLog::open(dir.path(), &key).unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("audit.log")).unwrap();
+        let appended = log.log(AuditEntry::new(AuditEventType::VaultUnlock, [0; 32]), &key);
+        assert!(appended.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"");
+    }
+
+    /// Retention rewrites the signing log through a fresh temporary file, so
+    /// a symlink left at the temporary name is replaced, and the file it
+    /// points at is neither cut nor written.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_at_the_signing_logs_temporary_name_is_not_written_through() {
+        let key = test_key();
+        let dir = tempdir().unwrap();
+        let mut log = SigningAuditLog::open(dir.path(), &key).unwrap();
+        for n in 0..3 {
+            log.log(signing_entry(n), &key).unwrap();
+        }
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"not keep's").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("signing_audit.log.tmp")).unwrap();
+        log.set_retention(RetentionPolicy {
+            max_entries: Some(1),
+            max_age_days: None,
+        });
+        assert_eq!(log.apply_retention(&key).unwrap(), 2);
+        assert_eq!(std::fs::read(&target).unwrap(), b"not keep's");
+        assert_eq!(log.read_all(&key).unwrap().len(), 1);
+    }
+
+    /// A FIFO in a log's place is refused at once rather than hanging the
+    /// open waiting for a writer.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_a_logs_place_is_refused_without_blocking() {
+        for name in ["audit.log", "signing_audit.log"] {
+            let dir = tempdir().unwrap();
+            let fifo = dir.path().join(name);
+            let made = std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap();
+            assert!(made.success());
+            let (tx, rx) = std::sync::mpsc::channel();
+            let at = dir.path().to_path_buf();
+            let owned = name.to_string();
+            std::thread::spawn(move || {
+                let key = test_key();
+                let opened = match owned.as_str() {
+                    "audit.log" => AuditLog::open(&at, &key).map(drop),
+                    _ => SigningAuditLog::open(&at, &key).map(drop),
+                };
+                let _ = tx.send(opened.err().map(|e| e.to_string()));
+            });
+            let err = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("opening a FIFO at {name} hung"))
+                .unwrap_or_else(|| panic!("a FIFO at {name} was taken for a log"));
+            assert!(err.contains("is not a regular file"), "{err}");
+        }
     }
 
     #[test]
