@@ -453,6 +453,9 @@ pub enum Pairing {
         approver: Hex33,
         proof: Hex32,
         approver_sig: Hex64,
+        /// The approver key's Android Key Attestation chain, made with the
+        /// challenge [`crate::sig::pair_attestation_challenge`].
+        attestation: crate::pairing::CertChain,
     },
     /// From the gateway, once the device is registered.
     Paired {
@@ -541,6 +544,7 @@ mod tests {
             approver: Hex33([4; 33]),
             proof: Hex32([5; 32]),
             approver_sig: Hex64([6; 64]),
+            attestation: crate::pairing::CertChain(vec![vec![0x30, 0x00]]),
         };
         let text = to_text(&pair);
         assert!(text.contains("\"type\":\"pair\""));

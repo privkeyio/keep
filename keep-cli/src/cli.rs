@@ -353,6 +353,11 @@ pub(crate) enum ApproverCommands {
         /// The device's label
         #[arg(long)]
         label: String,
+        /// A copy of Google's attestation status list
+        /// (https://android.googleapis.com/attestation/status), read instead
+        /// of fetching it, for a host that cannot reach Google
+        #[arg(long, value_name = "FILE")]
+        attestation_status: Option<std::path::PathBuf>,
         #[command(flatten)]
         target: AdminTarget,
     },

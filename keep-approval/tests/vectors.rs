@@ -26,6 +26,7 @@ use keep_approval::messages::{
     AnchorState, Budget, CredentialRef, FreezeAction, LogPoint, Reason, Request, SignerKey,
     Verdict, WalletAnchor, WalletName,
 };
+use keep_approval::pairing::CertChain;
 use keep_approval::psbt::PsbtPayload;
 use keep_approval::sig::{self, xonly, ApproverSigningKey};
 use keep_approval::wrap::TagKey;
@@ -557,10 +558,21 @@ fn vectors() -> Value {
     }
     let secret = [0x07u8; 32];
     let pair_digest = sig::pair_approver_digest(&c, &t, &a);
-    let pair = sig::pair(&t, &approver, &c, &secret, "My phone");
+    let challenge = sig::pair_attestation_challenge(&secret, &c);
+    let pair = sig::pair(
+        &t,
+        &approver,
+        &c,
+        &secret,
+        "My phone",
+        // A stand-in: a real chain comes from a device's Keystore, and only
+        // the gateway judges it.
+        CertChain(vec![vec![0x30, 0x00]]),
+    );
     let pairing = json!({
         "secret": hex::encode(secret),
         "proof": sig::pair_proof(&secret, &c, &t, &a),
+        "attestation_challenge": hex::encode(challenge),
         "fingerprint": sig::fingerprint(&t, &a),
         "approver_digest": hex::encode(pair_digest),
         "approver_sig": sig::sign_p256(&approver, &pair_digest),
@@ -678,6 +690,13 @@ fn vectors_match() {
     }
     let p = &stored["pairing"];
     let a = hex33(&stored["keys"]["approver"]);
+    assert_eq!(
+        hex::encode(sig::pair_attestation_challenge(
+            &hex32(&p["secret"]),
+            &hex32(&stored["keys"]["channel"]),
+        )),
+        p["attestation_challenge"].as_str().unwrap()
+    );
     sig::verify_p256(
         &a,
         &hex32(&p["approver_digest"]),

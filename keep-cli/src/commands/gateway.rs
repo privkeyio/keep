@@ -363,15 +363,23 @@ fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> 
             out.success(&format!("Removed {removed} approver device(s)"));
             Ok(())
         }
-        ApproverCommands::Pair { label, target } => pair(out, &label, &target),
+        ApproverCommands::Pair {
+            label,
+            attestation_status,
+            target,
+        } => pair(out, &label, attestation_status.as_deref(), &target),
     }
 }
 
 /// Pair a phone over one admin connection: show the code, wait for the
 /// phone, show its fingerprint, ask the operator, and wait for the outcome.
-fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
+/// The gateway checks the phone's attestation but cannot reach Google, so
+/// the certificates it names are checked here against Google's status list,
+/// read before the session opens.
+fn pair(out: &Output, label: &str, status: Option<&Path>, target: &AdminTarget) -> Result<()> {
     // Checked before the gateway opens a session nobody could confirm.
     need_terminal()?;
+    let unusable = attestation_status(status)?;
     let mut session = AdminSession::open(target, PAIR_WAIT)?;
     session
         .write(&json!({ "op": "approver_pair", "label": label }))
@@ -383,6 +391,26 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
     let shown = session.next()?;
     let fingerprint = shown.result["fingerprint"].as_str().unwrap_or_default();
     let phone_label = shown.result["phone_label"].as_str().unwrap_or_default();
+    if let Err(why) = check_attestation(&shown.result["attestation"], &unusable) {
+        session.ask(&json!({ "op": "approver_reject" }))?;
+        return Err(KeepError::InvalidInput(format!(
+            "the phone was refused: {why}"
+        )));
+    }
+    let attestation = &shown.result["attestation"];
+    out.info(&format!(
+        "The phone's approver key is attested: {}, {}.",
+        if attestation["strongbox"] == true {
+            "kept in StrongBox"
+        } else {
+            "kept in the TEE"
+        },
+        if attestation["grapheneos"] == true {
+            "on GrapheneOS"
+        } else {
+            "on its maker's verified OS"
+        }
+    ));
     println!(
         "Phone \"{}\" shows fingerprint:  {fingerprint}",
         phone_label.escape_debug()
@@ -404,6 +432,86 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
         ));
     }
     print(&answer.result)
+}
+
+/// The serial numbers Google's attestation status list marks revoked or
+/// suspended, from `file` or fetched.
+/// How old a saved status list may be. Google revokes leaked factory keys
+/// in it, and an old copy would still pass them.
+const MAX_STATUS_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 86400);
+
+fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<String>> {
+    use keep_agent::gateway::daemon::attestation::{
+        fetch_status, unusable_serials, MAX_STATUS_BYTES, STATUS_URL,
+    };
+    use std::io::Read;
+    let list = match file {
+        Some(path) => {
+            let read = |e: std::io::Error| {
+                KeepError::InvalidInput(format!("reading {}: {e}", path.display()))
+            };
+            let meta = std::fs::metadata(path).map_err(read)?;
+            if !meta.is_file() {
+                return Err(KeepError::InvalidInput(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )));
+            }
+            let age = match meta.modified().map_err(read)?.elapsed() {
+                Ok(age) => age,
+                // A little clock skew between the machine that saved it
+                // and this one, but no list dated well ahead.
+                Err(ahead) if ahead.duration() <= Duration::from_secs(3600) => Duration::ZERO,
+                Err(_) => {
+                    return Err(KeepError::InvalidInput(format!(
+                        "{} is dated in the future, save a fresh copy of {STATUS_URL}",
+                        path.display()
+                    )))
+                }
+            };
+            if age > MAX_STATUS_AGE {
+                return Err(KeepError::InvalidInput(format!(
+                    "{} is {} days old, save a fresh copy of {STATUS_URL}",
+                    path.display(),
+                    age.as_secs() / 86400
+                )));
+            }
+            let mut list = Vec::new();
+            std::fs::File::open(path)
+                .and_then(|f| f.take(MAX_STATUS_BYTES as u64 + 1).read_to_end(&mut list))
+                .map_err(read)?;
+            list
+        }
+        None => fetch_status().map_err(|e| {
+            KeepError::Runtime(format!(
+                "{e}; on a host that cannot reach Google, save {STATUS_URL} elsewhere and pass it with --attestation-status"
+            ))
+        })?,
+    };
+    unusable_serials(&list).map_err(KeepError::InvalidInput)
+}
+
+/// Refuse a phone whose attestation names a revoked or suspended
+/// certificate, or that the gateway reported no attestation for.
+fn check_attestation(
+    attestation: &Value,
+    unusable: &std::collections::HashSet<String>,
+) -> std::result::Result<(), String> {
+    let serials = attestation["serials"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or("the gateway reported no attestation for it")?;
+    for serial in serials {
+        let serial = serial
+            .as_str()
+            .ok_or("the gateway reported a malformed attestation")?;
+        if unusable.contains(serial) {
+            return Err(format!(
+                "its attestation certificate {serial} is revoked or suspended by Google"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How long `approver pair` waits on the phone and the operator: the
@@ -936,6 +1044,54 @@ fn build_grant(args: GrantArgs) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_is_refused_for_a_revoked_or_missing_attestation() {
+        let unusable = ["2c8c".to_string()].into_iter().collect();
+        let attested = |serials: Value| json!({ "serials": serials, "strongbox": false });
+        assert!(check_attestation(&attested(json!(["3", "11"])), &unusable).is_ok());
+        let err = check_attestation(&attested(json!(["3", "2c8c"])), &unusable).unwrap_err();
+        assert!(err.contains("2c8c is revoked"), "{err}");
+        for bad in [Value::Null, attested(json!([])), attested(json!([3]))] {
+            assert!(check_attestation(&bad, &unusable).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_saved_status_list_must_be_recent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, br#"{"entries": {"2c8c": {"status": "REVOKED"}}}"#).unwrap();
+        assert!(attestation_status(Some(&path)).unwrap().contains("2c8c"));
+        let old = std::time::SystemTime::now() - MAX_STATUS_AGE - Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let err = attestation_status(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("7 days old"), "{err}");
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() + Duration::from_secs(600))
+            .unwrap();
+        assert!(attestation_status(Some(&path)).is_ok());
+        file.set_modified(std::time::SystemTime::now() + MAX_STATUS_AGE)
+            .unwrap();
+        let err = attestation_status(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("dated in the future"), "{err}");
+        let big = dir.path().join("big.json");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(64 << 20)
+            .unwrap();
+        let err = attestation_status(Some(&big)).unwrap_err().to_string();
+        assert!(err.contains("too large"), "{err}");
+        let err = attestation_status(Some(Path::new("/dev/zero")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+    }
 
     /// Answers that arrive in one read are each taken in turn.
     #[test]

@@ -12,6 +12,7 @@
 //! gateway holds it.
 
 pub mod approvals;
+pub mod attestation;
 pub mod clock;
 pub mod helper;
 mod inject;

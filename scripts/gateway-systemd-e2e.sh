@@ -553,7 +553,12 @@ systemctl daemon-reload
 systemctl restart "$UNIT" || fail "restart without injection"
 
 if [[ -n $PEER_SRC ]]; then
-    # Approvals under the shipped units, set up as documented.
+    # Approvals under the shipped units, set up as documented. The stand-in
+    # phone's attestation is minted under the test root only the e2e build
+    # trusts, so that build serves the gateway while a phone pairs.
+    [[ -n $E2E_SRC ]] || fail "approvals need the e2e build as the third argument"
+    install -m 0755 "$E2E_SRC" "$E2E_BIN"
+    printf '{"entries":{}}' >"$WORK/attestation-status.json"
     useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin $RELAY_USER
     CREATED_USERS+=($RELAY_USER)
     CREATED_GROUPS+=($RELAY_USER)
@@ -575,7 +580,7 @@ if [[ -n $PEER_SRC ]]; then
     cat >"$DROPIN/admin.conf" <<EOF
 [Service]
 ExecStart=
-ExecStart=$BIN --path $VAULT gateway serve --admin-uid $(uid "$ADMIN") --approval-relay ws://127.0.0.1:$PORT
+ExecStart=$E2E_BIN --path $VAULT gateway serve --admin-uid $(uid "$ADMIN") --approval-relay ws://127.0.0.1:$PORT
 EOF
     systemctl daemon-reload
     VERIFY=$(systemd-analyze verify "$RELAY_UNIT_FILE" 2>&1) || fail "systemd-analyze verify: $VERIFY"
@@ -609,8 +614,8 @@ EOF
 
     # Pair a phone on a terminal, as root does the first time.
     write_pair_driver "$WORK/pair.py"
-    python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$WORK/pair.answer" "$BIN" gateway approver pair \
-        --label Phone >"$WORK/pair.out" 2>&1 &
+    python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$WORK/pair.answer" "$E2E_BIN" gateway approver pair \
+        --label Phone --attestation-status "$WORK/attestation-status.json" >"$WORK/pair.out" 2>&1 &
     PAIR_PID=$!
     for _ in $(seq 300); do [[ -s $WORK/uri ]] && break; sleep 0.1; done
     [[ -s $WORK/uri ]] || fail "no pairing code: $(cat "$WORK/pair.out")"

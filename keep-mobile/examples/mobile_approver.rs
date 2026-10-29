@@ -181,6 +181,15 @@ fn main() {
         flip: Mutex::new(false),
     };
     let requests = Arc::new(Mutex::new(VecDeque::new()));
+    // A Keystore attests the key it makes; here the attestation is minted
+    // under the test root an e2e build of the gateway trusts.
+    let challenge = approver
+        .pairing_attestation_challenge(uri.clone())
+        .expect("a challenge");
+    let attestation = keep_approval::test_attestation::chain(
+        &keystore.public().try_into().expect("a compressed key"),
+        &challenge.try_into().expect("32 bytes"),
+    );
     let start = approver
         .begin_pairing(uri.clone(), keystore.public(), "e2e phone".into())
         .expect("a pairing");
@@ -189,6 +198,7 @@ fn main() {
         .clone()
         .finish_pairing(
             keystore.sign(&start.digest),
+            attestation.0,
             Arc::new(Printer {
                 requests: requests.clone(),
             }),

@@ -32,6 +32,8 @@ pub mod messages;
 pub mod pairing;
 pub mod psbt;
 pub mod sig;
+#[cfg(feature = "test-attestation")]
+pub mod test_attestation;
 pub mod wrap;
 
 pub use codec::{Hex16, Hex32, Hex33, Hex64};

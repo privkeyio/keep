@@ -8,12 +8,19 @@
 # and a stand-in phone (keep-agent's approval_peer example) pairs through
 # `keep gateway approver pair` and decides over a local relay.
 #
+# The stand-in phone's attestation is minted under a test root that only an
+# e2e build of keep trusts, so the keep given is that build (see
+# scripts/lib/inject-e2e-pki.sh for the inject test root it also needs).
+#
 # Creates and removes system users and groups, so it runs only as root and
 # only when KEEP_GATEWAY_E2E=1:
 #
-#   cargo build --release -p keep-cli -p keep-agent --example approval_peer
+#   scripts/lib/inject-e2e-pki.sh /tmp/pki
+#   KEEP_E2E_CA_DER=/tmp/pki/ca.der RUSTFLAGS='--cfg keep_e2e_roots' \
+#     cargo build --release -p keep-cli --target-dir target/e2e-roots
+#   cargo build --release -p keep-agent --features mcp --example approval_peer
 #   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-approvals-e2e.sh \
-#     target/release/keep target/release/examples/approval_peer [old-keep]
+#     target/e2e-roots/release/keep target/release/examples/approval_peer [old-keep]
 #
 # With KEEP_E2E_PHONE naming keep-mobile's mobile_approver example, that is
 # the phone instead: the app's own approver code, against the real gateway.
@@ -93,6 +100,12 @@ chmod 0755 "$WORK"
 install -m 0755 "$BIN_SRC" "$WORK/keep"
 install -m 0755 "$PEER_SRC" "$WORK/approval_peer"
 KEEP=$WORK/keep
+grep -q keep-e2e-roots-build "$KEEP" || fail "$BIN_SRC is not an e2e build, so it cannot take the stand-in phone's attestation"
+# Google's attestation status list, as the pair command reads it: nothing
+# revoked, and one that revokes the stand-in's intermediate.
+printf '{"entries":{}}' >"$WORK/attestation-status.json"
+printf '{"entries":{"2c8c":{"status":"REVOKED","reason":"KEY_COMPROMISE"}}}' >"$WORK/attestation-revoked.json"
+chmod 0644 "$WORK/attestation-status.json" "$WORK/attestation-revoked.json"
 PEER=$WORK/approval_peer
 PHONE=$PEER
 if [[ -n ${KEEP_E2E_PHONE:-} ]]; then
@@ -317,7 +330,7 @@ pass "a request that needs approval is refused while no phone is paired"
 # Pairing needs a terminal to confirm the fingerprint on, checked before
 # the gateway is asked.
 if msg=$("$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" \
-    --gateway-user "$GW" </dev/null 2>&1); then
+    --gateway-user "$GW" --attestation-status "$WORK/attestation-status.json" </dev/null 2>&1); then
     fail "pairing went ahead without a terminal"
 fi
 grep -q "confirmed on a terminal" <<<"$msg" || fail "pairing without a terminal: $msg"
@@ -328,7 +341,7 @@ pass "pairing without a terminal is refused before the gateway is asked"
 if msg=$(as "$ADMIN" timeout 20 python3 -c 'import os, pty, sys
 sys.exit(os.waitstatus_to_exitcode(pty.spawn(sys.argv[1:])))' \
     "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" \
-    --gateway-user "$GW" </dev/null 2>&1); then
+    --gateway-user "$GW" --attestation-status "$WORK/attestation-status.json" </dev/null 2>&1); then
     fail "the admin uid paired the first phone"
 fi
 grep -q "only root may pair the first" <<<"$msg" || fail "admin pairing first: $msg"
@@ -339,9 +352,32 @@ pass "only root pairs the first phone"
 # question with whether the phone shows the same.
 write_pair_driver "$WORK/pair.py"
 
+# A phone whose attestation chain holds a certificate Google revoked is
+# refused before its fingerprint is shown, and the session is used up.
+python3 "$WORK/pair.py" "$WORK/uri-revoked" "$WORK/phone-revoked.fp" "$WORK/pair-revoked.answer" \
+    "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" \
+    --attestation-status "$WORK/attestation-revoked.json" >"$WORK/pair-revoked.out" 2>&1 &
+PAIR_PID=$!
+for _ in $(seq 300); do [[ -f $WORK/uri-revoked ]] && break; sleep 0.1; done
+[[ -f $WORK/uri-revoked ]] || fail "no pairing code: $(cat "$WORK/pair-revoked.out")"
+"$PHONE" phone "$(cat "$WORK/uri-revoked")" </dev/null >"$WORK/phone-revoked.log" 2>&1 &
+PHONE_PID=$!
+if wait "$PAIR_PID"; then
+    fail "a phone with a revoked attestation certificate paired: $(cat "$WORK/pair-revoked.out")"
+fi
+PAIR_PID=
+grep -q "certificate 2c8c is revoked or suspended" "$WORK/pair-revoked.out" \
+    || fail "the revoked attestation was not named: $(cat "$WORK/pair-revoked.out")"
+grep -qE "shows fingerprint: +[0-9a-f]{4} " "$WORK/pair-revoked.out" && fail "the fingerprint was shown for a revoked attestation"
+for _ in $(seq 300); do grep -q '^refused' "$WORK/phone-revoked.log" && break; sleep 0.1; done
+grep -q '^refused' "$WORK/phone-revoked.log" || fail "the phone was not refused: $(cat "$WORK/phone-revoked.log")"
+stop_pid "$PHONE_PID"
+PHONE_PID=
+pass "a phone whose attestation names a revoked certificate is refused"
+
 python3 "$WORK/pair.py" "$WORK/uri" "$WORK/phone.fp" "$WORK/pair.answer" \
     "$KEEP" gateway approver pair --label Phone --admin-socket "$ADMIN_SOCK" --gateway-user "$GW" \
-    >"$WORK/pair.out" 2>&1 &
+    --attestation-status "$WORK/attestation-status.json" >"$WORK/pair.out" 2>&1 &
 PAIR_PID=$!
 for _ in $(seq 300); do [[ -f $WORK/uri ]] && break; sleep 0.1; done
 [[ -f $WORK/uri ]] || fail "no pairing code: $(cat "$WORK/pair.out")"

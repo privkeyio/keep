@@ -4592,6 +4592,7 @@ dependencies = [
  "p256",
  "rand 0.10.3",
  "reqwest",
+ "ring",
  "rustix 1.1.5",
  "rustls",
  "serde",
@@ -4606,6 +4607,7 @@ dependencies = [
  "urlencoding",
  "uuid",
  "webpki-roots 1.0.10",
+ "x509-cert",
  "zeroize",
 ]
 

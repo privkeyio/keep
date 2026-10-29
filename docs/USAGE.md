@@ -845,6 +845,15 @@ The gateway itself has no network. A relay helper, `keep gateway relay`, runs as
 
    It shows a pairing code, as a QR code and as text, valid for ten minutes and for one phone. Scan it with the approver app; the command then shows the fingerprint the phone shows. Answer `y` only if the two match. From then on the requests above wait for the phone. `keep gateway status` shows whether approvals are on and how many phones are paired; `keep gateway approver list` lists them.
 
+   The phone proves where its approver key lives with Android Key Attestation, and the gateway takes only a key that is:
+
+   - attested by a chain that ends in one of Google's attestation roots
+   - kept in the phone's TEE or StrongBox, generated there for this pairing, and usable only with a biometric, every time
+   - made by the Keep app with its release signing key
+   - on a phone with a locked bootloader that boots its maker's verified OS or GrapheneOS
+
+   An emulator, a rooted or unlocked phone, or another app cannot pair. Since the gateway has no network, the command checks the chain's certificates against Google's status list of revoked ones, which it fetches before showing the code. On a host that cannot reach Google, save https://android.googleapis.com/attestation/status on another machine and pass it with `--attestation-status FILE`. A saved list older than seven days is refused, since newly revoked keys would pass it.
+
 Once a phone is paired, the gateway refuses to start without the same channel key, since the phone trusts no other. A lost channel key is handled like a lost phone, below.
 
 Managing phones, as root or the admin uid:

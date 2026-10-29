@@ -527,6 +527,7 @@ mod tests {
             &p.gateway.public_key().to_bytes(),
             secret,
             "phone",
+            crate::sig::tests::test_chain(),
         ))
     }
 
@@ -1042,6 +1043,41 @@ mod tests {
 
     /// A pairing session, whose sender is not known yet, opens only a
     /// `pair` message: not another kind, nor a `paired` or `refused`.
+    #[test]
+    fn the_largest_attestation_chain_fits_a_pair() {
+        let p = pair();
+        let secret = [5u8; 32];
+        let chain = crate::pairing::CertChain(vec![
+            vec![0xff; crate::pairing::MAX_CERT_BYTES];
+            crate::pairing::MAX_CHAIN_CERTS
+        ]);
+        let text = crate::messages::to_text(&crate::sig::pair(
+            &p.device.public_key().to_bytes(),
+            &crate::sig::tests::approver_signing_key(9),
+            &p.gateway.public_key().to_bytes(),
+            &secret,
+            &"\u{1F600}".repeat(16),
+            chain,
+        ));
+        let event = wrap(
+            &p.device,
+            &p.gateway.public_key().to_bytes(),
+            &TagKey::pairing_phone(&secret),
+            kind::PAIRING,
+            &text,
+            NOW,
+        )
+        .unwrap();
+        let opened = open(
+            &p.gateway,
+            &event,
+            &pairing_candidates(&secret),
+            &mut SeenWraps::default(),
+            NOW,
+        );
+        assert!(opened.is_ok());
+    }
+
     #[test]
     fn a_pairing_session_opens_only_pair() {
         let p = pair();

@@ -40,6 +40,7 @@ use crate::gateway::daemon::approvals::{
     lock, Carries, Inbox, Outbox, RelayLink, Source, Store, StoredDevice, ANCHOR_EVERY_SECS,
     FREEZES_PER_MINUTE, MANAGEMENT_RESERVED, MAX_PARKED, PAIRING_SECS,
 };
+use crate::gateway::daemon::attestation;
 use crate::gateway::GrantedCredential;
 use crate::policy::{evaluate_approved, ApprovalReason, Budgets, Decision, Grant, Ledger};
 
@@ -1721,6 +1722,7 @@ impl State {
         // refused.
         let channel = a.channel_pub;
         let secret = session.secret.clone();
+        let calendar = self.clock.calendar();
         let checked = match wire::parse::<Pairing>(content) {
             Ok(Pairing::Pair {
                 label,
@@ -1728,6 +1730,7 @@ impl State {
                 approver,
                 proof,
                 approver_sig,
+                attestation,
                 ..
             }) => sig::check_pair(
                 &channel,
@@ -1739,17 +1742,19 @@ impl State {
             )
             .map_err(|e| e.to_string())
             .and_then(|device| {
-                keep_approval::change::check_label(&label, "label")
-                    .map(|()| (device, alg, label))
-                    .map_err(|e| e.to_string())
+                keep_approval::change::check_label(&label, "label").map_err(|e| e.to_string())?;
+                let challenge = sig::pair_attestation_challenge(&secret, &channel);
+                let attested =
+                    attestation::verify(&attestation.0, &challenge, &approver.0, calendar)?;
+                Ok((device, alg, label, attested))
             }),
             Ok(_) => Err("not a pair message".to_string()),
             Err(e) => Err(e.to_string()),
         };
         drop(secret);
-        let checked = checked.and_then(|(device, alg, label)| {
+        let checked = checked.and_then(|(device, alg, label, attested)| {
             self.registrable(&device)
-                .map(|()| (device, alg, label))
+                .map(|()| (device, alg, label, attested))
                 .map_err(str::to_string)
         });
         let Some(session) = self.approvals.as_mut().and_then(|a| a.pairing.as_mut()) else {
@@ -1757,7 +1762,7 @@ impl State {
         };
         let reply = session.reply.take();
         match checked {
-            Ok((device, alg, phone_label)) => {
+            Ok((device, alg, phone_label, attested)) => {
                 let fingerprint = sig::fingerprint(&device.transport, &device.approver);
                 session.state = PairState::Confirming { device, alg };
                 if let Some(reply) = reply {
@@ -1768,6 +1773,11 @@ impl State {
                             "phone_label": phone_label,
                             "transport": hex(device.transport),
                             "approver": hex(device.approver),
+                            "attestation": {
+                                "serials": attested.serials,
+                                "strongbox": attested.strongbox,
+                                "grapheneos": attested.grapheneos,
+                            },
                         }
                     })));
                 }
