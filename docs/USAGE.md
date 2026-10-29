@@ -440,20 +440,29 @@ The trusted dealer approach (`keep frost generate`) generates the full private k
 #    and send the printed hex pubkey to the coordinator.
 keep frost network group-subkey --group mygroup
 
-# 2. Coordinator: publish the signed roster, listing the subkeys in index order.
-#    Send the printed Group ID to every participant.
+# 2. Coordinator: assemble the roster, listing the subkeys in index order.
+#    Nothing is sent to a relay. It prints the Group ID and the dkg command
+#    for step 3, with every subkey in it.
 keep frost network group-create --name mygroup --threshold 2 --participants 3 \
   --participant-subkey <hex of participant 1> \
   --participant-subkey <hex of participant 2> \
   --participant-subkey <hex of participant 3> \
-  --relay wss://relay.example --publish
+  --relay wss://relay.example
 
-# 3. Every participant, at the same time, with its own index:
-keep frost network dkg --group mygroup --group-id <Group ID> \
-  --threshold 2 --participants 3 --index 1 --relay wss://relay.example
+# 3. Every participant, at the same time, runs the printed command with its own
+#    group-subkey name and index:
+keep frost network dkg --group mygroup --name 'mygroup' --group-id <Group ID> \
+  --threshold 2 --participants 3 --index 1 --relay wss://relay.example \
+  --participant-subkey <hex of participant 1> \
+  --participant-subkey <hex of participant 2> \
+  --participant-subkey <hex of participant 3>
 ```
 
-`--group` is the name the participant used with `group-subkey`; `--group-id` pins the coordinator's roster: it is a hash over the group name, threshold and every participant's subkey, so a roster with any other contents is refused. Use a relay that stores kind 31101 events. Hardware DKG over relays is not supported yet.
+`--group` is the name the participant used with `group-subkey`; `--name` is the coordinator's group name and can be left out when the two match. `--group-id` pins the roster: it is a hash over the group name, threshold, participant count and every subkey in order, so a roster with any other contents is refused. A list passed with `--participant-subkey` is checked before the vault opens, so a typo shows up without a password prompt. A participant handed a different list than the others gets a different group id and cannot join their ceremony.
+
+A matching group id shows the participants agree, not that the roster is right: whoever can change the command on its way to everyone can add a subkey of their own or raise the participant count, and every group id still matches. Before running it, each participant should confirm the threshold, the participant count and each peer's subkey with that peer directly. The command holds the roster in plain text, so it stays in your shell history unless you leave it out (in bash, start the line with a space when `HISTCONTROL` includes `ignorespace`).
+
+The roster stays off the relay by default because a published one is a lasting public record of the group name, the threshold, the participant count and every subkey. With `group-create --publish` the coordinator announces it as a kind 31101 event instead, and participants leave out `--participant-subkey` and `--name` so `dkg` fetches it; use a relay that stores kind 31101 events. Either way the DKG rounds pass through the relay as ephemeral events signed by the per-group subkeys, never by an identity key. Whoever watches the relay during the ceremony still sees the subkeys, the threshold, the participant count, the group public key and each participant's network address, so use a relay you trust if that link matters. Hardware DKG over relays is not supported yet.
 
 All participants must run the command within 5 minutes. On completion, each device stores its share and outputs the group public key.
 

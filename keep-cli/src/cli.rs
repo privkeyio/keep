@@ -1266,6 +1266,22 @@ pub(crate) enum FrostNetworkCommands {
         participants: u8,
         #[arg(short = 'i', long, help = "Our participant index (1-indexed)")]
         index: u8,
+        #[arg(
+            long,
+            help = "Participant per-group subkeys in index order, as printed by \
+                    `group-create`. Repeat once per participant. With these the roster \
+                    is checked against --group-id here and never read from the relay; \
+                    without them it is fetched from a roster published with \
+                    `group-create --publish`."
+        )]
+        participant_subkey: Vec<String>,
+        #[arg(
+            long,
+            requires = "participant_subkey",
+            help = "Group name the coordinator passed to `group-create --name`, if it \
+                    differs from --group. Only used with --participant-subkey."
+        )]
+        name: Option<String>,
         #[arg(short, long)]
         relay: Option<String>,
         #[arg(
@@ -1362,7 +1378,7 @@ pub(crate) enum FrostNetworkCommands {
         #[arg(
             long,
             help = "Publish the roster to the relay for the CLI discovery path (§3 C2). \
-                    Off by default: the roster is a local artifact distributed out of band."
+                    Off by default: the roster stays local and travels in the printed `dkg` command."
         )]
         publish: bool,
     },
