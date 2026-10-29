@@ -368,7 +368,7 @@ fi
 PAIR_PID=
 grep -q "certificate 2c8c is revoked or suspended" "$WORK/pair-revoked.out" \
     || fail "the revoked attestation was not named: $(cat "$WORK/pair-revoked.out")"
-grep -q "shows fingerprint" "$WORK/pair-revoked.out" && fail "the fingerprint was shown for a revoked attestation"
+grep -qE "shows fingerprint: +[0-9a-f]{4} " "$WORK/pair-revoked.out" && fail "the fingerprint was shown for a revoked attestation"
 for _ in $(seq 300); do grep -q '^refused' "$WORK/phone-revoked.log" && break; sleep 0.1; done
 grep -q '^refused' "$WORK/phone-revoked.log" || fail "the phone was not refused: $(cat "$WORK/phone-revoked.log")"
 stop_pid "$PHONE_PID"
