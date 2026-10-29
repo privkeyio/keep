@@ -252,6 +252,14 @@ fn a_checked_request_is_shown_once_with_the_agents_words_apart() {
     let shown = shown_request(&events).expect("shown");
     assert_eq!(shown.op, "sign_nostr_event");
     assert_eq!(shown.credential.as_deref(), Some("writer"));
+    assert_eq!(
+        shown.credential_id.as_deref(),
+        Some("22".repeat(16).as_str())
+    );
+    assert_eq!(
+        scope_arg(shown.credential_id.clone()).unwrap(),
+        Scope::Credential(Hex16([0x22; 16]))
+    );
     assert!(shown.reason.contains("kind 0"));
     let content = shown.fields.iter().find(|f| f.label == "content").unwrap();
     assert!(content.by_agent);
@@ -986,6 +994,40 @@ fn a_freeze_is_resent_only_once_its_counter_is_saved() {
     let freeze: Freeze = wire::parse(&fx.send[0].1).unwrap();
     let phone = phone.reopen();
     assert_eq!(phone.stored(|s| s.counter), freeze.counter);
+}
+
+/// A management request names its credential but gives no id to freeze by,
+/// since an issue request names one the vault does not hold yet.
+#[test]
+fn a_management_request_gives_no_credential_id_to_freeze() {
+    let phone = paired();
+    phone.take(kind::ANCHOR, &anchor_text(now(), 100, 3, false));
+    let (request, _) = RequestDraft {
+        request_id: [14; 32],
+        created_at: now(),
+        deadline_secs: 120,
+        credential: Some(CredentialRef {
+            id: Hex16([0x22; 16]),
+            name: "writer".into(),
+            uid: 1001,
+        }),
+        key: None,
+        network: None,
+        reason: Reason::Management,
+        payload: Payload::Management(Change::Unfreeze {
+            scope: Scope::Credential(Hex16([0x22; 16])),
+            epoch: Decimal(3),
+        }),
+        budget: None,
+        anchor: anchor(100),
+    }
+    .finish(&phone.channel())
+    .unwrap();
+    let events = phone.take(kind::REQUEST, &wire::to_text(&request));
+    let shown = shown_request(&events).expect("shown");
+    assert_eq!(shown.op, "management");
+    assert_eq!(shown.credential.as_deref(), Some("writer"));
+    assert_eq!(shown.credential_id, None);
 }
 
 /// An approved unfreeze request this phone decided explains the freeze it

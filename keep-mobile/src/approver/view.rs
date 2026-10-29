@@ -36,6 +36,10 @@ pub struct ApprovalRequest {
     pub reason: String,
     /// The credential asking, by name, when an agent asks.
     pub credential: Option<String>,
+    /// That credential's id, which freeze and unfreeze take, only when an
+    /// agent asks: a management request can name a credential not yet
+    /// issued.
+    pub credential_id: Option<String>,
     /// Seconds left to decide, by this phone's clock.
     pub seconds_left: u64,
     pub fields: Vec<ApprovalField>,
@@ -225,6 +229,11 @@ pub fn view(
             .credential
             .as_ref()
             .map(|c| shown(&c.name, GATEWAY_TEXT_CHARS).text),
+        credential_id: request
+            .credential
+            .as_ref()
+            .filter(|_| !matches!(checked.payload, Payload::Management(_)))
+            .map(|c| c.id.to_hex()),
         seconds_left,
         fields,
         warnings,
