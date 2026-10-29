@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "Agent approvals over Nostr: the encodings, hashes, signatures and checks the gateway and the approver share"
 
+[features]
+# Attestation chains under a fixed test root, for tests and stand-in phones.
+test-attestation = []
+
 [dependencies]
 nostr = { version = "0.44", default-features = false, features = ["std", "nip44", "nip59"] }
 bitcoin = { workspace = true }

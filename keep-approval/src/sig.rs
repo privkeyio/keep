@@ -14,6 +14,8 @@
 //!     || u8 action || u8 scope || [16 credential_id]))
 //! pair_approver_sig = P256_sign(approver_key, tagged("keep/approval/pair-approver/v1",
 //!     32 channel_pubkey || 32 transport_pubkey || 33 approver_pubkey))
+//! pair_attestation_challenge = HMAC-SHA256(secret, "keep/approval/pair-attest/v1"
+//!     || 32 channel_pubkey)
 //! ```
 //!
 //! The channel and transport keys are 32-byte x-only secp256k1 keys. The
@@ -45,6 +47,8 @@ pub const FREEZE_TAG: &str = "keep/approval/freeze/v1";
 pub const PAIR_APPROVER_TAG: &str = "keep/approval/pair-approver/v1";
 /// The prefix the pairing proof's HMAC covers.
 pub const PAIR_PROOF_PREFIX: &[u8] = b"keep/approval/pair/v1";
+/// The prefix the approver key's attestation challenge covers.
+pub const PAIR_ATTEST_PREFIX: &[u8] = b"keep/approval/pair-attest/v1";
 
 /// The most a freeze or unfreeze counter may move past the last one
 /// accepted from its device. A device that could jump to `u64::MAX` would
@@ -211,6 +215,20 @@ pub fn pair_proof(
     let mut proof = [0u8; 32];
     proof.copy_from_slice(out.as_bytes());
     Hex32(proof)
+}
+
+/// The challenge the phone puts in the approver key's attestation, made
+/// before the key exists: `HMAC-SHA256(secret, "keep/approval/pair-attest/v1"
+/// || channel_pubkey)`. It ties the attestation to this pairing session,
+/// which is used once and lasts ten minutes.
+pub fn pair_attestation_challenge(secret: &[u8; 32], channel: &[u8; 32]) -> [u8; 32] {
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(secret).expect("HMAC takes any key length");
+    mac.update(PAIR_ATTEST_PREFIX);
+    mac.update(channel);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(mac.finalize().as_bytes());
+    out
 }
 
 /// Check a pairing proof in constant time.
@@ -422,13 +440,14 @@ fn signed_freeze(
 }
 
 /// A phone's `pair` message for the session with `secret`: the proof over
-/// both keys and the approver key's signature over them.
+/// both keys, the approver key's signature over them, and its attestation.
 pub fn pair(
     transport: &[u8; 32],
     approver: &ApproverSigningKey,
     channel: &[u8; 32],
     secret: &[u8; 32],
     label: &str,
+    attestation: crate::pairing::CertChain,
 ) -> Pairing {
     let a = approver_key(approver);
     Pairing::Pair {
@@ -438,6 +457,7 @@ pub fn pair(
         approver: Hex33(a),
         proof: pair_proof(secret, channel, transport, &a),
         approver_sig: sign_p256(approver, &pair_approver_digest(channel, transport, &a)),
+        attestation,
     }
 }
 
@@ -445,6 +465,11 @@ pub fn pair(
 pub(crate) mod tests {
     use super::*;
     use crate::Hex16;
+
+    /// A chain that parses; only the gateway judges what it holds.
+    pub(crate) fn test_chain() -> crate::pairing::CertChain {
+        crate::pairing::CertChain(vec![vec![0x30, 0x00]])
+    }
 
     #[test]
     fn a_keystore_der_signature_verifies_once_its_s_is_made_low() {
@@ -614,7 +639,14 @@ pub(crate) mod tests {
             proof,
             approver_sig,
             ..
-        } = pair(&dev.transport, &approver, &channel, &secret, "x")
+        } = pair(
+            &dev.transport,
+            &approver,
+            &channel,
+            &secret,
+            "x",
+            test_chain(),
+        )
         else {
             unreachable!()
         };
@@ -651,7 +683,7 @@ pub(crate) mod tests {
             proof,
             approver_sig,
             ..
-        } = pair(&channel, &approver, &channel, &secret, "x")
+        } = pair(&channel, &approver, &channel, &secret, "x", test_chain())
         else {
             unreachable!()
         };

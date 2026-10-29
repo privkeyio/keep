@@ -261,6 +261,10 @@ async fn phone(uri: &str) {
         &phone.channel,
         &uri.secret,
         "e2e phone",
+        keep_approval::test_attestation::chain(
+            &a,
+            &sig::pair_attestation_challenge(&uri.secret, &phone.channel),
+        ),
     );
     let tag = TagKey::pairing_phone(&uri.secret);
     let event = wrap::wrap(

@@ -363,15 +363,23 @@ fn approver(out: &Output, path: &Path, command: ApproverCommands) -> Result<()> 
             out.success(&format!("Removed {removed} approver device(s)"));
             Ok(())
         }
-        ApproverCommands::Pair { label, target } => pair(out, &label, &target),
+        ApproverCommands::Pair {
+            label,
+            attestation_status,
+            target,
+        } => pair(out, &label, attestation_status.as_deref(), &target),
     }
 }
 
 /// Pair a phone over one admin connection: show the code, wait for the
 /// phone, show its fingerprint, ask the operator, and wait for the outcome.
-fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
+/// The gateway checks the phone's attestation but cannot reach Google, so
+/// the certificates it names are checked here against Google's status list,
+/// read before the session opens.
+fn pair(out: &Output, label: &str, status: Option<&Path>, target: &AdminTarget) -> Result<()> {
     // Checked before the gateway opens a session nobody could confirm.
     need_terminal()?;
+    let unusable = attestation_status(status)?;
     let mut session = AdminSession::open(target, PAIR_WAIT)?;
     session
         .write(&json!({ "op": "approver_pair", "label": label }))
@@ -383,6 +391,26 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
     let shown = session.next()?;
     let fingerprint = shown.result["fingerprint"].as_str().unwrap_or_default();
     let phone_label = shown.result["phone_label"].as_str().unwrap_or_default();
+    if let Err(why) = check_attestation(&shown.result["attestation"], &unusable) {
+        session.ask(&json!({ "op": "approver_reject" }))?;
+        return Err(KeepError::InvalidInput(format!(
+            "the phone was refused: {why}"
+        )));
+    }
+    let attestation = &shown.result["attestation"];
+    out.info(&format!(
+        "The phone's approver key is attested: {}, {}.",
+        if attestation["strongbox"] == true {
+            "kept in StrongBox"
+        } else {
+            "kept in the TEE"
+        },
+        if attestation["grapheneos"] == true {
+            "on GrapheneOS"
+        } else {
+            "on its maker's verified OS"
+        }
+    ));
     println!(
         "Phone \"{}\" shows fingerprint:  {fingerprint}",
         phone_label.escape_debug()
@@ -404,6 +432,46 @@ fn pair(out: &Output, label: &str, target: &AdminTarget) -> Result<()> {
         ));
     }
     print(&answer.result)
+}
+
+/// The serial numbers Google's attestation status list marks revoked or
+/// suspended, from `file` or fetched.
+fn attestation_status(file: Option<&Path>) -> Result<std::collections::HashSet<String>> {
+    use keep_agent::gateway::daemon::attestation::{fetch_status, unusable_serials, STATUS_URL};
+    let list = match file {
+        Some(path) => std::fs::read(path).map_err(|e| {
+            KeepError::InvalidInput(format!("reading {}: {e}", path.display()))
+        })?,
+        None => fetch_status().map_err(|e| {
+            KeepError::Runtime(format!(
+                "{e}; on a host that cannot reach Google, save {STATUS_URL} elsewhere and pass it with --attestation-status"
+            ))
+        })?,
+    };
+    unusable_serials(&list).map_err(KeepError::InvalidInput)
+}
+
+/// Refuse a phone whose attestation names a revoked or suspended
+/// certificate, or that the gateway reported no attestation for.
+fn check_attestation(
+    attestation: &Value,
+    unusable: &std::collections::HashSet<String>,
+) -> std::result::Result<(), String> {
+    let serials = attestation["serials"]
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or("the gateway reported no attestation for it")?;
+    for serial in serials {
+        let serial = serial
+            .as_str()
+            .ok_or("the gateway reported a malformed attestation")?;
+        if unusable.contains(serial) {
+            return Err(format!(
+                "its attestation certificate {serial} is revoked or suspended by Google"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// How long `approver pair` waits on the phone and the operator: the
@@ -936,6 +1004,18 @@ fn build_grant(args: GrantArgs) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_is_refused_for_a_revoked_or_missing_attestation() {
+        let unusable = ["2c8c".to_string()].into_iter().collect();
+        let attested = |serials: Value| json!({ "serials": serials, "strongbox": false });
+        assert!(check_attestation(&attested(json!(["3", "11"])), &unusable).is_ok());
+        let err = check_attestation(&attested(json!(["3", "2c8c"])), &unusable).unwrap_err();
+        assert!(err.contains("2c8c is revoked"), "{err}");
+        for bad in [Value::Null, attested(json!([])), attested(json!([3]))] {
+            assert!(check_attestation(&bad, &unusable).is_err(), "{bad}");
+        }
+    }
 
     /// Answers that arrive in one read are each taken in turn.
     #[test]

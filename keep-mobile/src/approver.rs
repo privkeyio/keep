@@ -40,7 +40,7 @@ use keep_approval::messages::{
     self as wire, Anchor, Decision, Freeze, FreezeAction, Outcome, OutcomeKind, Pairing, Request,
     SignerKey, Verdict, V1,
 };
-use keep_approval::pairing::{check_paired, PairingUri};
+use keep_approval::pairing::{check_paired, CertChain, PairingUri};
 use keep_approval::sig::{self, Alg};
 use keep_approval::wrap::{self, Candidate, SeenWraps, TagKey, TWEAK_SECS, WINDOW_PAST_SECS};
 use keep_approval::{kind, Hex16, Hex32, Hex33, Hex64};
@@ -1263,6 +1263,13 @@ impl ApproverHandler {
             .collect()
     }
 
+    /// The attestation challenge for the pairing code `uri`, to make the
+    /// approver key with (`setAttestationChallenge`) before pairing begins.
+    pub fn pairing_attestation_challenge(&self, uri: String) -> Result<Vec<u8>, KeepMobileError> {
+        let uri = PairingUri::parse(&uri).map_err(|e| invalid(e.to_string()))?;
+        Ok(sig::pair_attestation_challenge(&uri.secret, &uri.gateway).to_vec())
+    }
+
     /// Begin pairing with the gateway whose pairing code is `uri`, with the
     /// Keystore's approver key `approver_key` (33 bytes, compressed P-256)
     /// and the phone's `label`. The owner compares the fingerprint with the
@@ -1322,15 +1329,19 @@ impl ApproverHandler {
     }
 
     /// Send the pairing, signed by the approver key (`signature`, DER, as
-    /// the Keystore returns it), and wait for the gateway's answer. If it
-    /// cannot be sent, the pairing begun stays, to finish again.
+    /// the Keystore returns it) and with its attestation (`attestation`,
+    /// the certificates `getCertificateChain` returns, DER, leaf first), and
+    /// wait for the gateway's answer. If it cannot be sent, the pairing
+    /// begun stays, to finish again.
     pub fn finish_pairing(
         self: Arc<Self>,
         signature: Vec<u8>,
+        attestation: Vec<Vec<u8>>,
         callbacks: Arc<dyn ApproverCallbacks>,
     ) -> Result<(), KeepMobileError> {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         self.open_check()?;
+        let attestation = CertChain::new(attestation).map_err(|e| invalid(e.to_string()))?;
         let (pair, relays, keys, channel, secret, digest) = {
             let mut inner = self.lock();
             if inner.stored.as_ref().is_some_and(|s| s.paired) {
@@ -1352,6 +1363,7 @@ impl ApproverHandler {
                 approver: begun.stored.approver,
                 proof: sig::pair_proof(&begun.secret, &channel, &transport, &a),
                 approver_sig: sig,
+                attestation,
             };
             let stored = begun.stored.clone();
             let secret = begun.secret.clone();

@@ -8,7 +8,7 @@ description = "Agent SDK for Keep - secure signing for AI agents"
 
 [features]
 default = []
-mcp = ["dep:rustix", "dep:reqwest", "dep:rustls", "dep:webpki-roots"]
+mcp = ["dep:rustix", "dep:reqwest", "dep:rustls", "dep:webpki-roots", "dep:ring", "dep:x509-cert"]
 enclave = ["dep:aws-nitro-enclaves-nsm-api"]
 
 [dependencies]
@@ -32,7 +32,7 @@ url = { workspace = true }
 memchr = "2"
 base64 = "0.23"
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std", "zeroize"] }
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -41,8 +41,11 @@ rustix = { version = "1.1", features = ["fs", "net", "process", "time"], optiona
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-manual-roots-no-provider"], optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 webpki-roots = { version = "1.0.10", optional = true }
+ring = { version = "0.17", optional = true }
+x509-cert = { version = "0.3", optional = true }
 
 [dev-dependencies]
+keep-approval = { path = "../keep-approval", features = ["test-attestation"] }
 nostr-relay-builder = "0.44"
 keep-core = { path = "../keep-core", features = ["testing"] }
 tempfile = { workspace = true }

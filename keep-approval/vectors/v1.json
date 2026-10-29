@@ -276,11 +276,15 @@
   "pairing": {
     "approver_digest": "93576d8803d758cca1502ac7370a868d42ee3e02c090db3efde28946c154a85e",
     "approver_sig": "8d5e6800316d89d8b7b59cdcb7b8262d8d1403114a81115ce583b7d2f7d05e1502e3db511e9d158a7068e18e2470b773b2b2bb10044865c8cee48ac6592e3c42",
+    "attestation_challenge": "cb3989adb0df7d1b01ec00661e33ecd29e4f16edf0b05d8747b389daf247582c",
     "fingerprint": "2b14 0ed1 feb5 e3e2 623a",
     "message": {
       "alg": "p256",
       "approver": "02591ab771ebbcfd6d9cb9094d106528add1a69d44c2c1f627f089ec58b9c61adf",
       "approver_sig": "8d5e6800316d89d8b7b59cdcb7b8262d8d1403114a81115ce583b7d2f7d05e1502e3db511e9d158a7068e18e2470b773b2b2bb10044865c8cee48ac6592e3c42",
+      "attestation": [
+        "3000"
+      ],
       "label": "My phone",
       "proof": "18a29b2a75750a995ca500ad238a67aa9ba8230641a5e9b5cd93ea9fea6390ee",
       "type": "pair",

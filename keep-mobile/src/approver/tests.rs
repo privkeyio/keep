@@ -104,6 +104,11 @@ struct Phone {
 }
 
 /// A handler paired with a gateway whose channel key is `channel`.
+/// A chain the phone sends as it is; only the gateway judges it.
+fn chain() -> Vec<Vec<u8>> {
+    vec![vec![0x30, 0x00]]
+}
+
 fn paired() -> Phone {
     let memory = Arc::new(Memory::default());
     let storage: Arc<dyn SecureStorage> = memory.clone();
@@ -583,12 +588,34 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
         start.digest,
         sig::pair_approver_digest(&sig::xonly(&channel), &transport, &a)
     );
+    // The challenge the key is made with is this session's.
+    assert_eq!(
+        handler
+            .pairing_attestation_challenge(uri.to_string())
+            .unwrap(),
+        sig::pair_attestation_challenge(&[3u8; 32], &sig::xonly(&channel))
+    );
+    // A chain no gateway would read is refused before anything is sent.
+    let good: p256::ecdsa::Signature = approver.sign(&start.digest);
+    for bad in [vec![], vec![vec![0x30, 0x00]; 6], vec![vec![0u8; 2049]]] {
+        assert!(handler
+            .clone()
+            .finish_pairing(good.to_der().as_bytes().to_vec(), bad, Arc::new(Nobody))
+            .unwrap_err()
+            .to_string()
+            .contains("attestation"));
+    }
+    assert!(!handler.status().pairing, "nothing kept");
     // A signature by another key is refused before anything is sent.
     let other = p256::ecdsa::SigningKey::from_slice(&[6u8; 32]).unwrap();
     let wrong: p256::ecdsa::Signature = other.sign(&start.digest);
     assert!(handler
         .clone()
-        .finish_pairing(wrong.to_der().as_bytes().to_vec(), Arc::new(Nobody))
+        .finish_pairing(
+            wrong.to_der().as_bytes().to_vec(),
+            chain(),
+            Arc::new(Nobody)
+        )
         .unwrap_err()
         .to_string()
         .contains("does not verify"));
@@ -599,7 +626,7 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     let right = right.to_der().as_bytes().to_vec();
     assert!(handler
         .clone()
-        .finish_pairing(right.clone(), Arc::new(Nobody))
+        .finish_pairing(right.clone(), chain(), Arc::new(Nobody))
         .is_err());
     assert!(!handler.status().pairing);
     assert!(!handler.status().running);
@@ -611,7 +638,7 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     assert!(phone
         .handler
         .clone()
-        .finish_pairing(right, Arc::new(Nobody))
+        .finish_pairing(right, chain(), Arc::new(Nobody))
         .unwrap_err()
         .to_string()
         .contains("already paired"));
@@ -1139,14 +1166,18 @@ fn a_pairing_a_relay_takes_waits_for_the_gateway() {
     let signature: p256::ecdsa::Signature = approver.sign(&start.digest);
     handler
         .clone()
-        .finish_pairing(signature.to_der().as_bytes().to_vec(), Arc::new(Nobody))
+        .finish_pairing(
+            signature.to_der().as_bytes().to_vec(),
+            chain(),
+            Arc::new(Nobody),
+        )
         .unwrap();
     let status = handler.status();
     assert!(status.pairing && status.running && !status.paired);
     assert!(handler.lock().begun.is_none(), "sent once");
     assert!(handler
         .clone()
-        .finish_pairing(vec![], Arc::new(Nobody))
+        .finish_pairing(vec![], chain(), Arc::new(Nobody))
         .unwrap_err()
         .to_string()
         .contains("no pairing was begun"));

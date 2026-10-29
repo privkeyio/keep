@@ -27,6 +27,63 @@ pub const MAX_RELAYS: usize = 8;
 /// The longest relay URL.
 pub const MAX_RELAY_LEN: usize = 256;
 
+/// The Android app whose approver keys a gateway takes.
+pub const APP_PACKAGE: &str = "io.privkey.keep";
+
+/// SHA-256 of that app's release signing certificate, the one key its
+/// GitHub, F-Droid and Zapstore builds share.
+pub const APP_SIGNER: &str = "3eb0e6f6f4e0962ebd717f84eea47428b73087b686c956633d6a9fcc4c854f50";
+
+/// The most certificates an attestation chain carries: a leaf, the
+/// intermediates and the root.
+pub const MAX_CHAIN_CERTS: usize = 5;
+
+/// The largest certificate in an attestation chain, in bytes.
+pub const MAX_CERT_BYTES: usize = 2048;
+
+/// The Android Key Attestation certificate chain of the approver key, DER,
+/// leaf first and root last, as `KeyStore.getCertificateChain` returns it.
+/// Carried as an array of lowercase hex; parsing bounds only its size, and
+/// the gateway judges what it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertChain(pub Vec<Vec<u8>>);
+
+impl CertChain {
+    /// A chain of 1 to [`MAX_CHAIN_CERTS`] certificates of 1 to
+    /// [`MAX_CERT_BYTES`] bytes each.
+    pub fn new(certs: Vec<Vec<u8>>) -> Result<Self> {
+        if certs.is_empty() || certs.len() > MAX_CHAIN_CERTS {
+            return Err(malformed(format!(
+                "an attestation chain holds 1 to {MAX_CHAIN_CERTS} certificates"
+            )));
+        }
+        if certs
+            .iter()
+            .any(|c| c.is_empty() || c.len() > MAX_CERT_BYTES)
+        {
+            return Err(malformed(format!(
+                "an attestation certificate is 1 to {MAX_CERT_BYTES} bytes"
+            )));
+        }
+        Ok(Self(certs))
+    }
+}
+
+impl serde::Serialize for CertChain {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(hex::encode))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for CertChain {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Cert(#[serde(with = "crate::codec::hex_vec")] Vec<u8>);
+        let certs = Vec::<Cert>::deserialize(d)?;
+        Self::new(certs.into_iter().map(|c| c.0).collect()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// A pairing session, as the phone scans it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingUri {
@@ -221,6 +278,27 @@ mod tests {
                 "wss://relay.example.com".into(),
                 "ws://127.0.0.1:7777/inbox".into(),
             ],
+        }
+    }
+
+    #[test]
+    fn an_attestation_chain_is_bounded() {
+        let parse = |certs: Vec<String>| serde_json::from_value::<CertChain>(certs.into());
+        let cert = |len: usize| "ab".repeat(len);
+        assert_eq!(
+            parse(vec![cert(1), cert(MAX_CERT_BYTES)]).unwrap(),
+            CertChain(vec![vec![0xab], vec![0xab; MAX_CERT_BYTES]])
+        );
+        assert!(parse(vec![cert(4); MAX_CHAIN_CERTS]).is_ok());
+        for bad in [
+            vec![],
+            vec![cert(4); MAX_CHAIN_CERTS + 1],
+            vec![cert(0)],
+            vec![cert(MAX_CERT_BYTES + 1)],
+            vec!["AB".into()],
+            vec!["abc".into()],
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad:?}");
         }
     }
 
