@@ -2534,7 +2534,7 @@ async fn run_software_dkg_ceremony(publish: bool) -> Option<usize> {
             let mut cmd = match &printed {
                 Some(args) => {
                     let args = args
-                        .replace("GROUP_SUBKEY_NAME", &shell_quote(name))
+                        .replace("'GROUP_SUBKEY_NAME'", &shell_quote(name))
                         .replace("INDEX", &index);
                     // The coordinator's name is the default, so a participant
                     // who enrolled under it can leave --name out.

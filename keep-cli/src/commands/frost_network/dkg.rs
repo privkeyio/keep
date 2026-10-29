@@ -997,7 +997,8 @@ pub fn cmd_frost_network_group_create(
             .collect();
         out.info(&format!(
             "Send this command to every participant out of band; each puts in its own \
-             group-subkey name and index: keep frost network dkg --group GROUP_SUBKEY_NAME \
+             group-subkey name, inside the quotes, and index: keep frost network dkg --group \
+             'GROUP_SUBKEY_NAME' \
              --name {} --group-id {} --threshold {threshold} --participants {participants} \
              --index INDEX --relay {}{subkey_args}",
             shell_quote(name),
@@ -1090,8 +1091,9 @@ pub fn cmd_frost_network_group_create(
         }
         out.newline();
         out.info(&format!(
-            "Each participant now runs, with its own group-subkey name and index: keep frost \
-             network dkg --group GROUP_SUBKEY_NAME --group-id {} --threshold {threshold} \
+            "Each participant now runs, with its own group-subkey name inside the quotes and its \
+             index: keep frost network dkg --group 'GROUP_SUBKEY_NAME' --group-id {} \
+             --threshold {threshold} \
              --participants {participants} --index INDEX --relay {}",
             hex::encode(group_id),
             shell_quote(relay)
