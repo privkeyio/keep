@@ -258,14 +258,13 @@ const FOLLOWS_GLOBAL: &str = "global";
 
 /// The key of `account`'s override for `package`, or `None` when `account` is
 /// not a 32-byte hex group key or `package` is empty. The account part is a
-/// fixed 64 characters, so two scoped keys never collide. A legacy key that
-/// spells out a scoped one is only ever read as a floor, so it can tighten
-/// that account but never loosen it.
+/// fixed 64 characters, so two scoped keys never collide, and the prefix is
+/// not the legacy one, so no legacy key reads as an account's own choice.
 fn app_override_key(account: &str, package: &str) -> Option<String> {
     let account_ok = account.len() == 64 && account.bytes().all(|b| b.is_ascii_hexdigit());
     (account_ok && !package.is_empty()).then(|| {
         format!(
-            "sign_policy_override:{}:{package}",
+            "sign_policy_account_override:{}:{package}",
             account.to_ascii_lowercase()
         )
     })
@@ -2010,8 +2009,17 @@ mod tests {
     #[test]
     fn a_package_that_spells_out_another_accounts_key_gains_nothing() {
         const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let store = SignPolicyStore::new(MockPolicyStorage::new());
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
         store.set_global_policy(SignPolicySelection::Manual);
+        storage.map.lock().unwrap().insert(
+            legacy_override_key(&format!("{ACCOUNT}:com.app")),
+            SignPolicySelection::Auto.to_ordinal().to_string(),
+        );
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Manual
+        );
         assert!(store.set_app_override(
             ACCOUNT.into(),
             "com.app".into(),
