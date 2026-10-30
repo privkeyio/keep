@@ -318,25 +318,19 @@ impl KeepAgentSession {
         }
 
         let token = self.token.lock().await;
-        let session = self
-            .manager
-            .validate_and_get(&token, &self.session_id)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-
-        session
-            .check_operation(&Operation::SignNostrEvent)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-        session
-            .check_event_kind(kind as u16)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-
         let secret = self
             .secret_key
             .as_ref()
             .ok_or_else(|| Error::from_reason("No secret key configured"))?;
 
         self.manager
-            .record_request(&self.session_id)
+            .check_and_record_with(
+                &token,
+                &self.session_id,
+                &Operation::SignNostrEvent,
+                |session| session.check_event_kind(kind as u16),
+            )
+            .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         use nostr_sdk::prelude::{EventBuilder, Keys, Kind, Tag};
@@ -412,13 +406,11 @@ impl KeepAgentSession {
             .analyze_psbt(&psbt)
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
-        session
-            .scope()
-            .check_psbt(&analysis)
-            .map_err(|e| Error::from_reason(e.to_string()))?;
-
         self.manager
-            .record_request(&self.session_id)
+            .check_and_record_with(&token, &self.session_id, &Operation::SignPsbt, |session| {
+                session.scope().check_psbt(&analysis)
+            })
+            .map_err(|e| Error::from_reason(e.to_string()))?
             .map_err(|e| Error::from_reason(e.to_string()))?;
 
         signer

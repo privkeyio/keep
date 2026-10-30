@@ -118,6 +118,38 @@ impl SessionManager {
         Ok(session.info())
     }
 
+    /// Validate the token, check `op` and then `check`, and record the
+    /// request, all under one lock, so concurrent calls cannot all pass the
+    /// rate limit before any is recorded. Nothing is recorded unless both
+    /// checks pass. Errors from `check` come back as the inner result.
+    pub fn check_and_record_with<T, E>(
+        &self,
+        token: &SessionToken,
+        session_id: &str,
+        op: &Operation,
+        check: impl FnOnce(&AgentSession) -> std::result::Result<T, E>,
+    ) -> Result<std::result::Result<T, E>> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| AgentError::Other("Failed to acquire session lock".into()))?;
+
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+
+        if !session.validate_token(token) {
+            return Err(AgentError::InvalidToken);
+        }
+
+        session.check_operation(op)?;
+        let checked = check(session);
+        if checked.is_ok() {
+            session.record_request();
+        }
+        Ok(checked)
+    }
+
     pub fn revoke_session(&self, session_id: &str) -> Result<bool> {
         let mut sessions = self
             .sessions
@@ -194,6 +226,73 @@ mod tests {
         let wrong_token = SessionToken::generate();
         let result = manager.validate_and_get(&wrong_token, &session_id);
         assert!(matches!(result, Err(AgentError::InvalidToken)));
+    }
+
+    #[test]
+    fn concurrent_calls_cannot_pass_the_rate_limit_together() {
+        use crate::rate_limit::RateLimitConfig;
+        let manager = Arc::new(SessionManager::new([0u8; 32]));
+        let config = SessionConfig::new(SessionScope::nostr_only())
+            .with_rate_limit(RateLimitConfig::new(5, 100, 1000));
+        let (token, session_id) = manager
+            .create_session(config, SessionMetadata::default())
+            .unwrap();
+        let start = Arc::new(std::sync::Barrier::new(32));
+        let passed: usize = (0..32)
+            .map(|_| {
+                let (manager, token, id, start) = (
+                    manager.clone(),
+                    token.clone(),
+                    session_id.clone(),
+                    start.clone(),
+                );
+                std::thread::spawn(move || {
+                    start.wait();
+                    manager
+                        .check_and_record_with(&token, &id, &Operation::SignNostrEvent, |_| {
+                            std::thread::yield_now();
+                            Ok::<_, ()>(())
+                        })
+                        .is_ok()
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap() as usize)
+            .sum();
+        assert_eq!(passed, 5);
+    }
+
+    #[test]
+    fn a_refused_check_records_nothing() {
+        use crate::rate_limit::RateLimitConfig;
+        let manager = SessionManager::new([0u8; 32]);
+        let config = SessionConfig::new(SessionScope::nostr_only().with_event_kinds([1]))
+            .with_rate_limit(RateLimitConfig::new(1, 100, 1000));
+        let (token, id) = manager
+            .create_session(config, SessionMetadata::default())
+            .unwrap();
+        let op = Operation::SignNostrEvent;
+        for _ in 0..3 {
+            let refused =
+                manager.check_and_record_with(&token, &id, &op, |s| s.check_event_kind(4));
+            assert!(matches!(
+                refused,
+                Ok(Err(AgentError::EventKindNotAllowed(4)))
+            ));
+        }
+        assert!(matches!(
+            manager.check_and_record_with(&token, &id, &op, |_| Ok::<_, ()>(())),
+            Ok(Ok(()))
+        ));
+        assert!(matches!(
+            manager.check_and_record_with(&token, &id, &op, |_| Ok::<_, ()>(())),
+            Err(AgentError::RateLimitExceeded(_))
+        ));
+        assert!(matches!(
+            manager.check_and_record_with(&SessionToken::generate(), &id, &op, |_| Ok::<_, ()>(())),
+            Err(AgentError::InvalidToken)
+        ));
     }
 
     #[test]
