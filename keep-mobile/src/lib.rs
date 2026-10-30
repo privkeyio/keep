@@ -3263,10 +3263,14 @@ impl KeepMobile {
 
     /// Replace a group's relay config that cannot be read. The lost record may
     /// have blocked peers, so the replacement blocks sending to and receiving
-    /// from every share index this device does not hold, and the owner allows
-    /// peers again one by one. Relays and NIP-46 grants start empty. A readable
-    /// record is refused, an absent one is left absent, and a group with no
-    /// share held here has its record deleted, since nothing reads it.
+    /// from every share index this device does not hold. Those blocks travel
+    /// with a backup, and a peer can only be allowed again where peer policies
+    /// are edited. Relays start at the defaults an absent record reads, and
+    /// NIP-46 grants start empty. A record a storage fault made unreadable is
+    /// replaced too, so its relays are lost. A readable record is refused and
+    /// an absent one is left absent. When no share of the group is
+    /// listed, the reset is refused too, since a storage fault can hide a held
+    /// share. `delete_relay_config` removes a record whose group is gone.
     pub fn reset_unreadable_relay_config(
         &self,
         group_pubkey: String,
@@ -3294,13 +3298,13 @@ impl KeepMobile {
             .filter(|m| hex::encode(&m.group_pubkey) == group)
             .collect();
         let Some(total) = held.iter().map(|m| m.total_shares).max() else {
-            return self.storage.delete_share_by_key(key).map_err(|e| {
-                KeepMobileError::StorageError {
-                    msg: format!("failed to delete relay config: {e}"),
-                }
+            return Err(KeepMobileError::InvalidInput {
+                msg: "no share of this group is listed".into(),
             });
         };
         let stored = persistence::StoredRelayConfig {
+            frost_relays: keep_core::relay::default_frost_relays(),
+            bunker_relays: keep_core::relay::default_frost_relays(),
             peer_policies: (1..=total)
                 .filter(|i| !held.iter().any(|m| m.identifier == *i))
                 .map(|share_index| keep_core::relay::PeerPolicyEntry {
@@ -7313,7 +7317,12 @@ mod restore_backup_metadata_tests {
         let reset = persistence::load_relay_config(&mobile.storage, &key)
             .unwrap()
             .unwrap();
-        assert!(reset.frost_relays.is_empty() && reset.bunker_permissions.is_empty());
+        assert_eq!(reset.frost_relays, keep_core::relay::default_frost_relays());
+        assert_eq!(
+            reset.bunker_relays,
+            keep_core::relay::default_frost_relays()
+        );
+        assert!(reset.profile_relays.is_empty() && reset.bunker_permissions.is_empty());
         let blocked: Vec<_> = reset
             .peer_policies
             .iter()
@@ -7336,10 +7345,15 @@ mod restore_backup_metadata_tests {
             .lock()
             .unwrap()
             .insert(other.clone(), b"not json".to_vec());
-        mobile
-            .reset_unreadable_relay_config(hex::encode([9u8; 32]))
-            .unwrap();
-        assert!(!storage.data.lock().unwrap().contains_key(&other));
+        assert!(matches!(
+            mobile.reset_unreadable_relay_config(hex::encode([9u8; 32])),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert_eq!(
+            storage.data.lock().unwrap().get(&other).map(Vec::as_slice),
+            Some(&b"not json"[..]),
+            "a share the listing missed may still be held, so its record stays"
+        );
         assert!(mobile.reset_unreadable_relay_config("zz".into()).is_err());
     }
 
