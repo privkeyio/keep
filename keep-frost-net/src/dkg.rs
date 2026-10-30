@@ -1879,6 +1879,122 @@ mod tests {
         assert!(parse_roster_from_event(&ev, "deadbeef").is_err());
     }
 
+    fn raw_announcement(
+        threshold: Option<&str>,
+        participants: Option<&str>,
+        p_tags: &[(&str, &str)],
+        content: &str,
+    ) -> Event {
+        let mut builder = EventBuilder::new(Kind::Custom(DKG_KIND_ANNOUNCE), content);
+        if let Some(t) = threshold {
+            builder = builder.tag(Tag::custom(
+                TagKind::custom("threshold"),
+                vec![t.to_string()],
+            ));
+        }
+        if let Some(n) = participants {
+            builder = builder.tag(Tag::custom(
+                TagKind::custom("participants"),
+                vec![n.to_string()],
+            ));
+        }
+        for (pubkey, index) in p_tags {
+            builder = builder.tag(Tag::custom(
+                TagKind::custom("p"),
+                vec![pubkey.to_string(), String::new(), index.to_string()],
+            ));
+        }
+        builder.sign_with_keys(&make_identity_keys(0x42)).unwrap()
+    }
+
+    /// Each malformed announcement is refused by the check that targets it, not
+    /// by whichever later check happens to trip.
+    #[test]
+    fn parse_roster_rejects_each_malformed_announcement() {
+        let (n1, _) = make_pubkey(1);
+        let (n2, _) = make_pubkey(2);
+        let group_id = hex::encode(frost_group_id("g", 2, 2, &[n1.clone(), n2.clone()]));
+        let other_id = hex::encode(frost_group_id("other", 2, 2, &[n1.clone(), n2.clone()]));
+        let content = serde_json::json!({ "name": "g", "description": "x" }).to_string();
+        let honest = [(n1.as_str(), "1"), (n2.as_str(), "2")];
+        let non_hex = "zz".repeat(32);
+
+        parse_roster_from_event(
+            &raw_announcement(Some("2"), Some("2"), &honest, &content),
+            &group_id,
+        )
+        .expect("the unmodified announcement must parse, or every rejection below is vacuous");
+
+        let cases = [
+            (
+                "missing threshold",
+                raw_announcement(None, Some("2"), &honest, &content),
+                group_id.as_str(),
+                "missing a `threshold` tag",
+            ),
+            (
+                "unparseable threshold",
+                raw_announcement(Some("two"), Some("2"), &honest, &content),
+                &group_id,
+                "missing a `threshold` tag",
+            ),
+            (
+                "missing participants",
+                raw_announcement(Some("2"), None, &honest, &content),
+                &group_id,
+                "missing a `participants` tag",
+            ),
+            (
+                "unparseable participants",
+                raw_announcement(Some("2"), Some("-1"), &honest, &content),
+                &group_id,
+                "missing a `participants` tag",
+            ),
+            (
+                "non-hex p-tag pubkey",
+                raw_announcement(
+                    Some("2"),
+                    Some("2"),
+                    &[(&n1, "1"), (&non_hex, "2")],
+                    &content,
+                ),
+                &group_id,
+                "could not parse participant pubkey",
+            ),
+            (
+                "unparseable p-tag index",
+                raw_announcement(Some("2"), Some("2"), &[(&n1, "1"), (&n2, "two")], &content),
+                &group_id,
+                "carries 1 p-tags but claims 2 participants",
+            ),
+            (
+                "content not JSON",
+                raw_announcement(Some("2"), Some("2"), &honest, "not json"),
+                &group_id,
+                "content is not JSON",
+            ),
+            (
+                "content without a name",
+                raw_announcement(Some("2"), Some("2"), &honest, r#"{"description":"x"}"#),
+                &group_id,
+                "missing a `name` field",
+            ),
+            (
+                "queried d-tag of another group",
+                raw_announcement(Some("2"), Some("2"), &honest, &content),
+                &other_id,
+                "does not match the queried d-tag",
+            ),
+        ];
+        for (case, ev, queried, want) in cases {
+            let err = match parse_roster_from_event(&ev, queried) {
+                Ok(_) => panic!("{case}: accepted a malformed announcement"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(want), "{case}: wrong rejection: {err}");
+        }
+    }
+
     /// A roster handed over out of band pins the same keys and the same group id
     /// as the announcement of that roster would, so a published and an
     /// unpublished run of one group meet on one channel.
@@ -2113,6 +2229,88 @@ mod tests {
                 .unwrap(),
         );
         assert!(cert.verify(&roster).is_err());
+    }
+
+    /// §6: each way a presented certificate can fall short is refused by the
+    /// check that targets it: a short or padded set, a confirmation filed under
+    /// an unrostered index, the wrong event kind, a different transcript, and a
+    /// signature that does not verify.
+    #[test]
+    fn certificate_refuses_each_malformed_confirmation_set() {
+        let transcript = [0x55; 32];
+        let k2 = make_identity_keys(2);
+        let signed = |kind: u16, content: String| {
+            EventBuilder::new(Kind::Custom(kind), content)
+                .sign_with_keys(&k2)
+                .unwrap()
+        };
+        let (roster, honest) = cert_fixture(transcript);
+        honest.verify(&roster).unwrap();
+
+        let mut short = honest.clone();
+        short.confirmations.remove(&2);
+
+        let mut padded = honest.clone();
+        padded
+            .confirmations
+            .insert(3, signed(DKG_KIND_CONFIRM, hex::encode(transcript)));
+
+        let mut misfiled = honest.clone();
+        let two = misfiled.confirmations.remove(&2).unwrap();
+        misfiled.confirmations.insert(3, two);
+
+        let mut wrong_kind = honest.clone();
+        wrong_kind
+            .confirmations
+            .insert(2, signed(DKG_KIND_ROUND1, hex::encode(transcript)));
+
+        let mut other_transcript = honest.clone();
+        other_transcript
+            .confirmations
+            .insert(2, signed(DKG_KIND_CONFIRM, hex::encode([0xbb; 32])));
+
+        let mut forged = honest.clone();
+        let real = &honest.confirmations[&2];
+        forged.confirmations.insert(
+            2,
+            Event::new(
+                real.id,
+                real.pubkey,
+                real.created_at,
+                real.kind,
+                real.tags.iter().cloned(),
+                real.content.clone(),
+                honest.confirmations[&1].sig,
+            ),
+        );
+
+        let cases = [
+            ("n-1 confirmations", short, "carries 1 confirmations"),
+            ("n+1 confirmations", padded, "carries 3 confirmations"),
+            (
+                "confirmation at an unrostered index",
+                misfiled,
+                "missing the confirmation for participant index 2",
+            ),
+            ("non-confirm kind", wrong_kind, "not the confirm kind"),
+            (
+                "signature over a different transcript",
+                other_transcript,
+                "signs a different transcript",
+            ),
+            (
+                "signature that does not verify",
+                forged,
+                "certificate confirmation for index 2: Invalid signature",
+            ),
+        ];
+        for (case, cert, want) in cases {
+            let err = match cert.verify(&roster) {
+                Ok(()) => panic!("{case}: accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(want), "{case}: wrong rejection: {err}");
+        }
     }
 
     /// §5: a missing round-1 package for any index fails closed rather than
@@ -2569,6 +2767,26 @@ mod tests {
     /// Run a 2-of-2 DKG in which each participant's cancel flag is set when it
     /// collects its first event of `cancel_on`.
     async fn cancel_when_collecting(cancel_on: u16) -> Vec<Result<DkgOutcome>> {
+        cancel_when_collecting_with_phases(cancel_on)
+            .await
+            .into_iter()
+            .map(|(result, _)| result)
+            .collect()
+    }
+
+    #[derive(Default)]
+    struct PhaseLog(StdMutex<Vec<DkgPhase>>);
+    impl DkgProgress for PhaseLog {
+        fn phase(&self, phase: DkgPhase) {
+            self.0.lock().unwrap().push(phase);
+        }
+    }
+
+    /// As [`cancel_when_collecting`], also returning every phase each
+    /// participant reported.
+    async fn cancel_when_collecting_with_phases(
+        cancel_on: u16,
+    ) -> Vec<(Result<DkgOutcome>, Vec<DkgPhase>)> {
         let keys = mesh_keys(2);
         let roster = mesh_roster(&keys, 2, [0x5e; 32]);
         let relay = EphemeralRelay::new(RelayBehavior {
@@ -2586,7 +2804,8 @@ mod tests {
                 let roster = roster.clone();
                 local.spawn_local(async move {
                     let mut session = SoftwareDkgSession::init(2, 2, index).unwrap();
-                    run_software_dkg(
+                    let log = PhaseLog::default();
+                    let result = run_software_dkg(
                         &mut session,
                         &transport,
                         &keys,
@@ -2595,9 +2814,10 @@ mod tests {
                         index,
                         Duration::from_secs(5),
                         &cancel,
-                        &NoopProgress,
+                        &log,
                     )
-                    .await
+                    .await;
+                    (result, log.0.into_inner().unwrap())
                 })
             })
             .collect();
@@ -2818,5 +3038,246 @@ mod tests {
         let mut partial = cert.clone();
         partial.confirmations.remove(&3);
         assert!(partial.verify(&roster).is_err());
+    }
+
+    /// Cancelling once round 2 is collecting aborts the run before any
+    /// participant finalizes a share.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_round2_aborts_before_finalizing() {
+        let mut errors = Vec::new();
+        for (result, phases) in cancel_when_collecting_with_phases(DKG_KIND_ROUND2).await {
+            assert!(
+                !phases.iter().any(|p| matches!(p, DkgPhase::Finalizing)),
+                "finalized after a round 2 cancel: {phases:?}"
+            );
+            match result {
+                Ok(_) => panic!("a participant completed after a round 2 cancel"),
+                Err(e) => errors.push(e.to_string()),
+            }
+        }
+        assert!(errors.iter().any(|e| e.contains("cancelled")), "{errors:?}");
+    }
+
+    /// `count` distinct events of `kind` on channel `group` from one off-roster
+    /// key. Only the ids differ: the coordinator counts distinct ids before any
+    /// other check, so the flood needs no valid signatures.
+    fn flood(kind: u16, group: &str, count: usize) -> Vec<Event> {
+        let template = EventBuilder::new(Kind::Custom(kind), "junk")
+            .tag(Tag::custom(TagKind::custom("d"), vec![group.to_string()]))
+            .tag(Tag::custom(
+                TagKind::custom("dkg_mode"),
+                vec![DKG_MODE_SOFTWARE_V1.to_string()],
+            ))
+            .sign_with_keys(&make_identity_keys(0x77))
+            .unwrap();
+        (0..count as u64)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&i.to_be_bytes());
+                Event::new(
+                    EventId::from_byte_array(id),
+                    template.pubkey,
+                    template.created_at,
+                    template.kind,
+                    template.tags.iter().cloned(),
+                    template.content.clone(),
+                    template.sig,
+                )
+            })
+            .collect()
+    }
+
+    /// A relay that delivers `flood` on every poll, fed through a real
+    /// [`ClientTransport`] buffer so its cap is what the coordinator sees.
+    struct FloodedClientTransport {
+        inner: ClientTransport,
+        flood: Vec<Event>,
+    }
+
+    impl DkgTransport for FloodedClientTransport {
+        fn send_event<'a>(&'a self, _event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_events(
+            &self,
+            filter: Filter,
+            _timeout: Duration,
+        ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
+            Box::pin(async move {
+                self.inner.retarget(&filter);
+                for ev in &self.flood {
+                    self.inner.buffer(&filter, ev.clone());
+                }
+                Ok(self.inner.matching(&filter))
+            })
+        }
+    }
+
+    /// One distinct event past [`MAX_DKG_EVENTS_SEEN`], delivered through the
+    /// live transport's buffer, aborts the round as a flood. A buffer cap at or
+    /// below the bound would hide the flood and fail the round as a timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_through_the_client_transport_aborts_rather_than_timing_out() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x60; 32]);
+        let transport = FloodedClientTransport {
+            inner: ClientTransport::new(Client::new(make_identity_keys(11))),
+            flood: flood(DKG_KIND_ROUND1, "g", MAX_DKG_EVENTS_SEEN + 1),
+        };
+        let mut session = SoftwareDkgSession::init(2, 2, 1).unwrap();
+        let result = run_software_dkg(
+            &mut session,
+            &transport,
+            &keys[0],
+            &roster,
+            "g",
+            1,
+            Duration::from_secs(2),
+            &AtomicBool::new(false),
+            &NoopProgress,
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("completed with no peer"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("too many distinct DKG round1 events"),
+            "flood was not reported as one: {err}"
+        );
+    }
+
+    /// Resolves after 30 s of wall-clock time. The round timeout runs on the wall
+    /// clock while these tests' time is paused, so a guard against a round that
+    /// never times out has to as well.
+    async fn wall_clock_hang_guard() {
+        let wall = Instant::now();
+        while wall.elapsed() < Duration::from_secs(30) {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Exactly [`MAX_DKG_EVENTS_SEEN`] distinct events is within the bound: the
+    /// round keeps waiting for its peer and times out instead of aborting.
+    #[tokio::test(start_paused = true)]
+    async fn exactly_the_flood_bound_does_not_abort() {
+        let keys = mesh_keys(2);
+        let roster = mesh_roster(&keys, 2, [0x61; 32]);
+        let bus = MeshBus::default();
+        for ev in flood(DKG_KIND_ROUND1, "g", MAX_DKG_EVENTS_SEEN) {
+            bus.preload(ev);
+        }
+        let result = tokio::select! {
+            r = run_party(&bus, &keys[0], &roster, "g", 1, Duration::from_secs(5)) => r,
+            () = wall_clock_hang_guard() => panic!("the round never timed out"),
+        };
+        let err = match result {
+            Ok(_) => panic!("completed with no peer"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("Timeout: waiting for peer round1 packages"),
+            "expected a round 1 timeout: {err}"
+        );
+    }
+
+    /// A flood in any round aborts every participant's run with the flood
+    /// error, even though honest peers are present and would otherwise finish.
+    #[tokio::test(start_paused = true)]
+    async fn a_flood_in_any_round_aborts_the_run() {
+        for (kind, round) in [
+            (DKG_KIND_ROUND1, "round1"),
+            (DKG_KIND_ROUND2, "round2"),
+            (DKG_KIND_CONFIRM, "confirm"),
+        ] {
+            let keys = mesh_keys(2);
+            let roster = mesh_roster(&keys, 2, [0x62; 32]);
+            let bus = MeshBus::default();
+            for ev in flood(kind, "g", MAX_DKG_EVENTS_SEEN + 1) {
+                bus.preload(ev);
+            }
+            let to = Duration::from_secs(300);
+            let (r1, r2) = tokio::join!(
+                run_party(&bus, &keys[0], &roster, "g", 1, to),
+                run_party(&bus, &keys[1], &roster, "g", 2, to),
+            );
+            let want = format!("too many distinct DKG {round} events");
+            for result in [r1, r2] {
+                let err = match result {
+                    Ok(_) => panic!("{round}: completed through a flood"),
+                    Err(e) => e.to_string(),
+                };
+                assert!(err.contains(&want), "{round}: {err}");
+            }
+        }
+    }
+
+    /// Reports this participant's sends of one kind as accepted but never
+    /// delivers them, as a peer that stalls in that round.
+    struct SilentIn {
+        inner: MeshTransport,
+        kind: Kind,
+    }
+
+    impl DkgTransport for SilentIn {
+        fn send_event<'a>(&'a self, event: &'a Event) -> DkgBoxFuture<'a, Result<()>> {
+            if event.kind == self.kind {
+                return Box::pin(async { Ok(()) });
+            }
+            self.inner.send_event(event)
+        }
+
+        fn fetch_events(
+            &self,
+            filter: Filter,
+            timeout: Duration,
+        ) -> DkgBoxFuture<'_, Result<Vec<Event>>> {
+            self.inner.fetch_events(filter, timeout)
+        }
+    }
+
+    /// A peer that goes silent in any round makes that round time out with an
+    /// error naming what it was waiting for, rather than hanging the run.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_silent_in_any_round_times_that_round_out() {
+        for (kind, waiting) in [
+            (DKG_KIND_ROUND1, "waiting for peer round1 packages"),
+            (DKG_KIND_ROUND2, "waiting for peer round2 shares"),
+            (DKG_KIND_CONFIRM, "waiting for peer group-key confirmations"),
+        ] {
+            let keys = mesh_keys(2);
+            let roster = mesh_roster(&keys, 2, [0x63; 32]);
+            let bus = MeshBus::default();
+            let to = Duration::from_secs(5);
+            let silent = async {
+                let mut session = SoftwareDkgSession::init(2, 2, 2).unwrap();
+                let transport = SilentIn {
+                    inner: MeshTransport { bus: bus.clone() },
+                    kind: Kind::Custom(kind),
+                };
+                run_software_dkg(
+                    &mut session,
+                    &transport,
+                    &keys[1],
+                    &roster,
+                    "g",
+                    2,
+                    to,
+                    &AtomicBool::new(false),
+                    &NoopProgress,
+                )
+                .await
+            };
+            let result = tokio::select! {
+                (r1, _) = async { tokio::join!(run_party(&bus, &keys[0], &roster, "g", 1, to), silent) } => r1,
+                () = wall_clock_hang_guard() => panic!("{waiting}: the round never timed out"),
+            };
+            let err = match result {
+                Ok(_) => panic!("{waiting}: completed without the silent peer"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains(waiting), "{waiting}: {err}");
+        }
     }
 }
