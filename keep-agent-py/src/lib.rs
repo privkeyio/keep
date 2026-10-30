@@ -321,22 +321,21 @@ impl PyAgentSession {
         content: &str,
         tags: Option<Vec<Vec<String>>>,
     ) -> PyResult<String> {
-        let session = self
-            .manager
+        self.manager
             .validate_and_get(&self.token, &self.session_id)
             .map_err(to_py_err)?;
-
-        session
-            .check_operation(&Operation::SignNostrEvent)
-            .map_err(to_py_err)?;
-        session.check_event_kind(kind).map_err(to_py_err)?;
-
         let secret = self.secret_key.as_ref().ok_or_else(|| {
             PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor.")
         })?;
 
         self.manager
-            .record_request(&self.session_id)
+            .check_and_record_with(
+                &self.token,
+                &self.session_id,
+                &Operation::SignNostrEvent,
+                |session| session.check_event_kind(kind),
+            )
+            .map_err(to_py_err)?
             .map_err(to_py_err)?;
 
         use nostr_sdk::prelude::*;
@@ -412,14 +411,15 @@ impl PyAgentSession {
 
         let analysis = signer.analyze_psbt(&psbt).map_err(to_py_err)?;
 
-        session
-            .scope()
-            .check_psbt(&analysis)
-            .map_err(to_py_value_err)?;
-
         self.manager
-            .record_request(&self.session_id)
-            .map_err(to_py_err)?;
+            .check_and_record_with(
+                &self.token,
+                &self.session_id,
+                &Operation::SignPsbt,
+                |session| session.scope().check_psbt(&analysis),
+            )
+            .map_err(to_py_err)?
+            .map_err(to_py_value_err)?;
 
         signer.sign_psbt(&mut psbt).map_err(to_py_err)?;
 
