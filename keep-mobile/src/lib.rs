@@ -3261,6 +3261,59 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// Replace a group's relay config that cannot be read. The lost record may
+    /// have blocked peers, so the replacement blocks sending to and receiving
+    /// from every share index this device does not hold, and the owner allows
+    /// peers again one by one. Relays and NIP-46 grants start empty. A readable
+    /// record is refused, an absent one is left absent, and a group with no
+    /// share held here has its record deleted, since nothing reads it.
+    pub fn reset_unreadable_relay_config(
+        &self,
+        group_pubkey: String,
+    ) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        let key = relay_config_key(Some(&group_pubkey));
+        let _guard = self
+            .relay_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match persistence::load_relay_config(&self.storage, &key) {
+            Ok(Some(_)) => {
+                return Err(KeepMobileError::InvalidInput {
+                    msg: "the relay config is readable".into(),
+                })
+            }
+            Ok(None) => return Ok(()),
+            Err(_) => {}
+        }
+        let group = group_pubkey.to_ascii_lowercase();
+        let held: Vec<ShareMetadataInfo> = self
+            .storage
+            .list_all_shares()
+            .into_iter()
+            .filter(|m| hex::encode(&m.group_pubkey) == group)
+            .collect();
+        let Some(total) = held.iter().map(|m| m.total_shares).max() else {
+            return self.storage.delete_share_by_key(key).map_err(|e| {
+                KeepMobileError::StorageError {
+                    msg: format!("failed to delete relay config: {e}"),
+                }
+            });
+        };
+        let stored = persistence::StoredRelayConfig {
+            peer_policies: (1..=total)
+                .filter(|i| !held.iter().any(|m| m.identifier == *i))
+                .map(|share_index| keep_core::relay::PeerPolicyEntry {
+                    share_index,
+                    allow_send: false,
+                    allow_receive: false,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        persistence::persist_relay_config(&self.storage, &key, &stored)
+    }
+
     pub fn get_kill_switch(&self) -> Result<bool, KeepMobileError> {
         persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
     }
@@ -7199,6 +7252,95 @@ mod restore_backup_metadata_tests {
             .wallet_descriptor_delete(hex::encode(group))
             .expect("writes go through once the index is reset");
         assert!(mobile.wallet_descriptor_list().is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_relay_config_resets_to_blocking_every_peer() {
+        let pass = "correct horse battery staple";
+        let group = hex::encode([7u8; 32]);
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(true)],
+            vec![],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            pass,
+        )
+        .expect("backup should build");
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        mobile.restore_backup(bytes, pass.into()).unwrap();
+        let key = relay_config_key(Some(&group));
+
+        assert!(mobile.reset_unreadable_relay_config(group.clone()).is_ok());
+        assert!(!storage.data.lock().unwrap().contains_key(&key));
+
+        mobile
+            .save_relay_config(
+                Some(group.clone()),
+                RelayConfigInfo {
+                    frost_relays: vec!["wss://relay.example.com".into()],
+                    profile_relays: vec![],
+                    bunker_relays: vec![],
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            mobile.reset_unreadable_relay_config(group.clone()),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert_eq!(
+            persistence::load_relay_config(&mobile.storage, &key)
+                .unwrap()
+                .unwrap()
+                .frost_relays,
+            vec!["wss://relay.example.com/".to_string()]
+        );
+
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(key.clone(), b"not json".to_vec());
+        mobile
+            .reset_unreadable_relay_config(group.to_ascii_uppercase())
+            .unwrap();
+        let reset = persistence::load_relay_config(&mobile.storage, &key)
+            .unwrap()
+            .unwrap();
+        assert!(reset.frost_relays.is_empty() && reset.bunker_permissions.is_empty());
+        let blocked: Vec<_> = reset
+            .peer_policies
+            .iter()
+            .map(|p| (p.share_index, p.allow_send, p.allow_receive))
+            .collect();
+        assert_eq!(blocked, vec![(2, false, false), (3, false, false)]);
+
+        let backup = mobile.create_backup(pass.into()).unwrap();
+        let decrypted = decrypt_backup_data(&backup, pass).unwrap();
+        assert_eq!(decrypted.relay_configs.len(), 1);
+        assert_eq!(decrypted.relay_configs[0].peer_policies.len(), 2);
+        assert!(decrypted.relay_configs[0]
+            .peer_policies
+            .iter()
+            .all(|p| !p.allow_send && !p.allow_receive));
+
+        let other = relay_config_key(Some(&hex::encode([9u8; 32])));
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(other.clone(), b"not json".to_vec());
+        mobile
+            .reset_unreadable_relay_config(hex::encode([9u8; 32]))
+            .unwrap();
+        assert!(!storage.data.lock().unwrap().contains_key(&other));
+        assert!(mobile.reset_unreadable_relay_config("zz".into()).is_err());
     }
 
     // A restore while the active-share pointer cannot be read leaves it as it
