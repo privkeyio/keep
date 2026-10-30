@@ -302,6 +302,32 @@ fn test_builds_trust_the_test_root_and_releases_do_not() {
 }
 
 #[test]
+fn only_an_e2e_build_trusts_another_app_signer() {
+    #[cfg(not(keep_e2e_roots))]
+    assert_eq!(app_signers(), [APP_SIGNER]);
+    let other = "3e".repeat(32);
+    let m = mint(&Record {
+        signers: vec![hex::decode(&other).unwrap()],
+        ..good()
+    });
+    let verified = verify_chain(&m.chain, &trusted_roots(), NOW).unwrap();
+    let record = KeyDescription::parse(&verified.record).unwrap();
+    let app = record.software.application_id.as_deref().unwrap();
+    assert!(check_application(app, &[APP_SIGNER])
+        .unwrap_err()
+        .contains("Keep app"));
+    check_application(app, &[APP_SIGNER, &other]).unwrap();
+    #[cfg(keep_e2e_roots)]
+    if let Some(signer) = E2E_APP_SIGNER {
+        check(&mint(&Record {
+            signers: vec![hex::decode(signer).unwrap()],
+            ..good()
+        }))
+        .unwrap();
+    }
+}
+
+#[test]
 fn a_well_made_approver_key_is_taken() {
     assert_eq!(
         check(&mint(&good())).unwrap(),

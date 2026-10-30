@@ -241,6 +241,38 @@ pub(crate) fn verify(
 #[cfg(any(test, keep_e2e_roots))]
 const TEST_ROOT: &str = "154771a464a03f6cdf496bb877d55fb3425faa9986d8bdba1e7402bfcf276094";
 
+/// The digest of a local test key an end to end build trusts as the Keep
+/// app's signer beside the release key, given as `KEEP_E2E_APP_SIGNER` when
+/// it is built with `--cfg keep_e2e_roots`, so a phone running a build
+/// signed with that key can pair. A release never does.
+#[cfg(keep_e2e_roots)]
+pub(crate) const E2E_APP_SIGNER: Option<&str> = option_env!("KEEP_E2E_APP_SIGNER");
+
+#[cfg(keep_e2e_roots)]
+const _: () = if let Some(s) = E2E_APP_SIGNER {
+    let b = s.as_bytes();
+    assert!(
+        b.len() == 64,
+        "KEEP_E2E_APP_SIGNER is 64 lowercase hex digits"
+    );
+    let mut i = 0;
+    while i < b.len() {
+        assert!(
+            b[i].is_ascii_digit() || matches!(b[i], b'a'..=b'f'),
+            "KEEP_E2E_APP_SIGNER is 64 lowercase hex digits"
+        );
+        i += 1;
+    }
+};
+
+fn app_signers() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut signers = vec![APP_SIGNER];
+    #[cfg(keep_e2e_roots)]
+    signers.extend(E2E_APP_SIGNER);
+    signers
+}
+
 fn trusted_roots() -> Vec<&'static str> {
     #[allow(unused_mut)]
     let mut roots = GOOGLE_ROOTS.to_vec();
@@ -611,12 +643,14 @@ fn judge(record: &KeyDescription, challenge: &[u8; 32]) -> Result<bool, String> 
             .application_id
             .as_deref()
             .ok_or("the attestation names no app")?,
+        &app_signers(),
     )?;
     Ok(grapheneos)
 }
 
-/// The record's app must be the Keep app alone, signed with its release key.
-fn check_application(der: &[u8]) -> Result<(), String> {
+/// The record's app must be the Keep app alone, signed with one key of
+/// `signers`.
+fn check_application(der: &[u8], signers: &[&str]) -> Result<(), String> {
     let wrong = || "the approver key was not made by the Keep app".to_string();
     let mut outer = Der::new(der);
     let mut id = Der::new(outer.expect(UNIVERSAL, true, 16)?);
@@ -631,7 +665,7 @@ fn check_application(der: &[u8]) -> Result<(), String> {
     }
     let mut digests = Der::new(id.expect(UNIVERSAL, true, 17)?);
     let digest = digests.octets()?;
-    if !digests.is_empty() || hex::encode(digest) != APP_SIGNER {
+    if !digests.is_empty() || !signers.contains(&hex::encode(digest).as_str()) {
         return Err(wrong());
     }
     Ok(())

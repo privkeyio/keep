@@ -375,6 +375,12 @@ pub async fn run(
         admin = %sockets.admin.display(),
         "agent gateway listening"
     );
+    #[cfg(keep_e2e_roots)]
+    tracing::warn!(
+        app_signer = attestation::E2E_APP_SIGNER.unwrap_or("none"),
+        "an end to end test build, never to be deployed: it trusts a test attestation root, \
+         a test inject CA and the test app signer named here"
+    );
     let remove_all = || {
         server::remove_socket(&sockets.agent);
         server::remove_socket(&sockets.admin);

@@ -22,6 +22,11 @@
 #   sudo KEEP_GATEWAY_E2E=1 scripts/gateway-approvals-e2e.sh \
 #     target/e2e-roots/release/keep target/release/examples/approval_peer [old-keep]
 #
+# Built with KEEP_E2E_APP_SIGNER also set, to a test signing key's SHA-256
+# certificate digest as `apksigner verify --print-certs` prints it, the same
+# keep pairs a real phone running Keep signed with that key. A release build
+# takes only the release key.
+#
 # With KEEP_E2E_PHONE naming keep-mobile's mobile_approver example, that is
 # the phone instead: the app's own approver code, against the real gateway.
 #
