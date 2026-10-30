@@ -142,10 +142,10 @@ def until(pattern, secs):
             break
         buf += chunk
     sys.exit("timed out waiting for %r; got %r" % (pattern, buf[-2000:]))
-uri = until(rb"(keep-approver:v1\?[^\s]+)", 30).group(1).decode()
+uri = until(rb"(keep-approver:v1\?[^\s]+)\r?\n", 30).group(1).decode()
 open(uri_out + ".tmp", "w").write(uri)
 os.rename(uri_out + ".tmp", uri_out)
-shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)", 120).group(1).decode()
+shown = until(rb"shows fingerprint:\s+([0-9a-f]{4}(?: [0-9a-f]{4})+)\r?\n", 120).group(1).decode()
 for _ in range(600):
     if os.path.exists(phone_fp) and os.path.getsize(phone_fp):
         break
