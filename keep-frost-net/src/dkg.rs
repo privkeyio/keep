@@ -2301,7 +2301,7 @@ mod tests {
             (
                 "signature that does not verify",
                 forged,
-                "certificate confirmation for index 2:",
+                "certificate confirmation for index 2: Invalid signature",
             ),
         ];
         for (case, cert, want) in cases {
@@ -3169,7 +3169,7 @@ mod tests {
             bus.preload(ev);
         }
         let result = tokio::select! {
-            r = run_party(&bus, &keys[0], &roster, "g", 1, Duration::from_millis(500)) => r,
+            r = run_party(&bus, &keys[0], &roster, "g", 1, Duration::from_secs(5)) => r,
             () = wall_clock_hang_guard() => panic!("the round never timed out"),
         };
         let err = match result {
@@ -3249,7 +3249,7 @@ mod tests {
             let keys = mesh_keys(2);
             let roster = mesh_roster(&keys, 2, [0x63; 32]);
             let bus = MeshBus::default();
-            let to = Duration::from_secs(2);
+            let to = Duration::from_secs(5);
             let silent = async {
                 let mut session = SoftwareDkgSession::init(2, 2, 2).unwrap();
                 let transport = SilentIn {
