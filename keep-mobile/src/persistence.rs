@@ -1117,6 +1117,15 @@ pub(crate) struct StoredBunkerConfig {
     /// transport key so saved client sessions keep authenticating after a restart.
     #[serde(default)]
     pub(crate) connect_secret: Option<String>,
+    /// Clients a revoke has dropped and rotated the connect secret for, but
+    /// whose persisted grants may not be gone yet. The grants live in another
+    /// record, so the two writes cannot be one, and a start finishes the
+    /// revoke before it serves. Hex pubkeys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) pending_revokes: Vec<String>,
+    /// As `pending_revokes`, for a revoke of every client.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) pending_revoke_all: bool,
 }
 
 pub(crate) fn load_bunker_config(

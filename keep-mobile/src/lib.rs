@@ -3324,6 +3324,8 @@ impl KeepMobile {
             authorized_clients: config.authorized_clients,
             transport_secret: existing.transport_secret,
             connect_secret: existing.connect_secret,
+            pending_revokes: existing.pending_revokes,
+            pending_revoke_all: existing.pending_revoke_all,
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
