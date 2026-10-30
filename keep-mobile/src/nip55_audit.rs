@@ -23,6 +23,9 @@ pub struct Nip55AuditEntry {
     pub event_kind: Option<i32>,
     pub decision: String,
     pub was_automatic: bool,
+    /// Identifies the request a row belongs to, so a later row can name it.
+    /// 32 lowercase hex characters, or `None` for rows that carry no id.
+    pub request_id: Option<String>,
     pub previous_hash: Option<String>,
     pub entry_hash: String,
 }
@@ -48,6 +51,7 @@ fn audit_entry_hash_inner(
     decision: &str,
     timestamp: i64,
     was_automatic: bool,
+    request_id: Option<&str>,
     hmac_key: &[u8],
 ) -> String {
     // Must match keep-android `PermissionStore.calculateEntryHash` byte-for-byte:
@@ -67,7 +71,11 @@ fn audit_entry_hash_inner(
     // framing would be more robust in the abstract but is a coordinated
     // keep-android byte-format change + row migration, unnecessary given these
     // field domains.
-    let content = format!(
+    //
+    // A request id is appended as an eighth segment only when present, so rows
+    // without one hash exactly as before. It is lowercase hex, and the seventh
+    // segment is "true" or "false", so neither can absorb the extra delimiter.
+    let mut content = format!(
         "{}|{}|{}|{}|{}|{}|{}",
         previous_hash.unwrap_or(""),
         caller,
@@ -77,7 +85,15 @@ fn audit_entry_hash_inner(
         timestamp,
         was_automatic,
     );
+    if let Some(id) = request_id {
+        content.push('|');
+        content.push_str(id);
+    }
     hex::encode(hmac_sha256(hmac_key, content.as_bytes()))
+}
+
+fn is_request_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Compute the keyed-HMAC chain hash for one audit entry. The hex output links
@@ -92,16 +108,21 @@ pub fn nip55_audit_entry_hash(
     decision: String,
     timestamp: i64,
     was_automatic: bool,
+    request_id: Option<String>,
     hmac_key: Vec<u8>,
 ) -> String {
     // Fail closed on a missing key, matching keep-android `calculateEntryHash`
     // (`?: throw IllegalStateException("HMAC key not initialized ...")`). Without
     // this an empty key silently yields a key-independent, forgeable MAC.
+    let hmac_key = zeroize::Zeroizing::new(hmac_key);
     assert!(
         !hmac_key.is_empty(),
         "HMAC key not initialized - cannot compute audit entry hash"
     );
-    let hmac_key = zeroize::Zeroizing::new(hmac_key);
+    assert!(
+        request_id.as_deref().is_none_or(is_request_id),
+        "audit request id must be 32 lowercase hex characters"
+    );
     audit_entry_hash_inner(
         previous_hash.as_deref(),
         &caller,
@@ -110,6 +131,7 @@ pub fn nip55_audit_entry_hash(
         &decision,
         timestamp,
         was_automatic,
+        request_id.as_deref(),
         hmac_key.as_slice(),
     )
 }
@@ -176,6 +198,11 @@ pub fn nip55_verify_audit_chain(
     for entry in &entries {
         if in_legacy {
             if entry.entry_hash.is_empty() {
+                // Legacy rows predate request ids, so one that carries an id
+                // was written by someone without the key.
+                if entry.request_id.is_some() {
+                    return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                }
                 legacy_skipped += 1;
                 if legacy_skipped > MAX_LEADING_LEGACY {
                     return Nip55ChainStatus::Tampered { entry_id: entry.id };
@@ -201,6 +228,9 @@ pub fn nip55_verify_audit_chain(
             }
         }
 
+        if !entry.request_id.as_deref().is_none_or(is_request_id) {
+            return Nip55ChainStatus::Tampered { entry_id: entry.id };
+        }
         let calculated = audit_entry_hash_inner(
             entry.previous_hash.as_deref(),
             &entry.caller,
@@ -209,6 +239,7 @@ pub fn nip55_verify_audit_chain(
             &entry.decision,
             entry.timestamp,
             entry.was_automatic,
+            entry.request_id.as_deref(),
             hmac_key.as_slice(),
         );
         if !ct_eq(&calculated, &entry.entry_hash) {
@@ -265,7 +296,7 @@ pub fn nip55_audit_tip_mac(
     let hmac_key = zeroize::Zeroizing::new(hmac_key);
     // Domain tag + count binding: `|` cannot appear in the decimal count or the
     // hex hash, so the encoding is unambiguous and cannot collide with the
-    // 6-pipe per-entry content even under the shared key.
+    // 6- or 7-pipe per-entry content even under the shared key.
     let content = format!(
         "{}|{}|{}",
         TIP_MAC_DOMAIN,
@@ -330,8 +361,17 @@ mod tests {
         ts: i64,
         auto: bool,
     ) -> Nip55AuditEntry {
-        let hash =
-            audit_entry_hash_inner(prev, caller, "SIGN_EVENT", kind, decision, ts, auto, KEY);
+        let hash = audit_entry_hash_inner(
+            prev,
+            caller,
+            "SIGN_EVENT",
+            kind,
+            decision,
+            ts,
+            auto,
+            None,
+            KEY,
+        );
         Nip55AuditEntry {
             id,
             timestamp: ts,
@@ -340,6 +380,7 @@ mod tests {
             event_kind: kind,
             decision: decision.to_string(),
             was_automatic: auto,
+            request_id: None,
             previous_hash: prev.map(|s| s.to_string()),
             entry_hash: hash,
         }
@@ -357,6 +398,7 @@ mod tests {
             "allow".into(),
             1_700_000_000_000,
             true,
+            None,
             KEY.to_vec(),
         );
         let literal = "|com.app|SIGN_EVENT|-1|allow|1700000000000|true";
@@ -374,10 +416,138 @@ mod tests {
             "deny".into(),
             5,
             false,
+            None,
             KEY.to_vec(),
         );
         let literal = "ab|c|GET_PUBLIC_KEY||deny|5|false";
         assert_eq!(got, hex::encode(hmac_sha256(KEY, literal.as_bytes())));
+    }
+
+    const REQUEST: &str = "0123456789abcdef0123456789abcdef";
+
+    fn with_request(prev: Option<&str>, id: i64, request_id: &str) -> Nip55AuditEntry {
+        let mut e = entry(id, prev, "com.app", Some(1), "allow", 100 + id, true);
+        e.request_id = Some(request_id.into());
+        e.entry_hash = audit_entry_hash_inner(
+            prev,
+            "com.app",
+            "SIGN_EVENT",
+            Some(1),
+            "allow",
+            100 + id,
+            true,
+            Some(request_id),
+            KEY,
+        );
+        e
+    }
+
+    #[test]
+    fn a_request_id_is_an_eighth_segment() {
+        let got = nip55_audit_entry_hash(
+            None,
+            "com.app".into(),
+            "SIGN_EVENT".into(),
+            Some(1),
+            "abandoned".into(),
+            5,
+            true,
+            Some(REQUEST.into()),
+            KEY.to_vec(),
+        );
+        let literal = format!("|com.app|SIGN_EVENT|1|abandoned|5|true|{REQUEST}");
+        assert_eq!(got, hex::encode(hmac_sha256(KEY, literal.as_bytes())));
+    }
+
+    #[test]
+    fn a_malformed_request_id_is_not_hashed() {
+        for bad in [
+            format!("{REQUEST}|x"),
+            REQUEST.to_ascii_uppercase(),
+            REQUEST[1..].to_string(),
+            String::new(),
+        ] {
+            let hashed = std::panic::catch_unwind(|| {
+                nip55_audit_entry_hash(
+                    None,
+                    "com.app".into(),
+                    "SIGN_EVENT".into(),
+                    Some(1),
+                    "allow".into(),
+                    5,
+                    true,
+                    Some(bad.clone()),
+                    KEY.to_vec(),
+                )
+            });
+            assert!(hashed.is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_row_carrying_a_request_id_is_tampered() {
+        let mut legacy = legacy_entry(1);
+        legacy.request_id = Some(REQUEST.into());
+        let e2 = entry(2, None, "com.app", Some(1), "allow", 200, false);
+        assert_eq!(
+            nip55_verify_audit_chain(vec![legacy, e2], KEY.to_vec()),
+            Nip55ChainStatus::Tampered { entry_id: 1 }
+        );
+    }
+
+    #[test]
+    fn a_tip_anchored_chain_ending_in_a_request_id_verifies() {
+        let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
+        let e2 = with_request(Some(&e1.entry_hash), 2, REQUEST);
+        let entries = vec![e1, e2];
+        let tip = tip_of(&entries);
+        assert_eq!(
+            nip55_verify_audit_chain_with_tip(entries, KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Valid
+        );
+    }
+
+    #[test]
+    fn a_request_id_is_covered_by_the_chain() {
+        let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
+        let e2 = with_request(Some(&e1.entry_hash), 2, REQUEST);
+        let e3 = entry(
+            3,
+            Some(&e2.entry_hash),
+            "com.app",
+            Some(1),
+            "allow",
+            300,
+            false,
+        );
+        let intact = vec![e1, e2, e3];
+        assert_eq!(
+            nip55_verify_audit_chain(intact.clone(), KEY.to_vec()),
+            Nip55ChainStatus::Valid
+        );
+
+        let other = "fedcba9876543210fedcba9876543210";
+        for (case, request_id) in [
+            ("re-pointed", Some(other.to_string())),
+            ("removed", None),
+            ("uppercased", Some(REQUEST.to_ascii_uppercase())),
+            ("delimiter", Some(format!("{}|", &REQUEST[1..]))),
+            ("empty", Some(String::new())),
+        ] {
+            let mut rows = intact.clone();
+            rows[1].request_id = request_id;
+            assert_eq!(
+                nip55_verify_audit_chain(rows, KEY.to_vec()),
+                Nip55ChainStatus::Tampered { entry_id: 2 },
+                "{case}"
+            );
+        }
+        let mut added = intact;
+        added[2].request_id = Some(REQUEST.into());
+        assert_eq!(
+            nip55_verify_audit_chain(added, KEY.to_vec()),
+            Nip55ChainStatus::Tampered { entry_id: 3 }
+        );
     }
 
     #[test]
@@ -539,6 +709,7 @@ mod tests {
             event_kind: None,
             decision: "allow".into(),
             was_automatic: false,
+            request_id: None,
             previous_hash: None,
             entry_hash: String::new(),
         };
@@ -569,6 +740,7 @@ mod tests {
             event_kind: None,
             decision: "allow".to_string(),
             was_automatic: false,
+            request_id: None,
             previous_hash: None,
             entry_hash: String::new(),
         }
@@ -646,6 +818,7 @@ mod tests {
             "allow".into(),
             100,
             false,
+            None,
             Vec::new(),
         );
     }
