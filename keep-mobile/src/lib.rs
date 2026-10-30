@@ -1085,8 +1085,6 @@ impl KeepMobile {
 
         Self::validate_share_name(&name)?;
 
-        self.ensure_share_capacity()?;
-
         let passphrase = Zeroizing::new(passphrase);
         let export = ShareExport::parse(&data)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
@@ -1101,6 +1099,14 @@ impl KeepMobile {
             .to_share(&passphrase, &name)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
+        // Re-importing a stored share does not add one, so only a new group
+        // is held to the cap.
+        if self
+            .listed_share_identifier(&hex::encode(share.group_pubkey()))?
+            .is_none()
+        {
+            self.ensure_share_capacity()?;
+        }
         self.store_share_package(&share)
     }
 
@@ -1353,7 +1359,11 @@ impl KeepMobile {
     }
 
     pub fn get_active_share_metadata(&self) -> Option<ShareMetadataInfo> {
-        let key = self.resolve_active_share().ok()?;
+        let key = match self.storage.read_active_share_key() {
+            signing_policy::StorageRead::Found { value } => value,
+            signing_policy::StorageRead::Absent => self.resolve_active_share().ok()?,
+            signing_policy::StorageRead::Unavailable => return None,
+        };
         // As in `load_stored_share_info`: an active-share pointer that resolves
         // but whose record is unreadable or malformed is corruption, not absence,
         // so log it rather than returning a bare `None` (#792).
@@ -11923,6 +11933,49 @@ mod share_registry_tests {
                 index_unreadable: true,
                 unreadable_groups: vec![group],
             }
+        );
+    }
+
+    #[test]
+    fn active_share_metadata_follows_the_pointer() {
+        let (storage, mobile) = setup();
+        let share = &group_shares()[0];
+        mobile.store_share_package(share).unwrap();
+        let key = hex::encode(share.group_pubkey());
+        storage.set_active_share_key(Some(key)).unwrap();
+        storage.mark_unreadable("ab".repeat(32));
+        let meta = mobile.get_active_share_metadata().unwrap();
+        assert_eq!(meta.group_pubkey, share.group_pubkey().to_vec());
+    }
+
+    #[test]
+    fn reimporting_a_stored_share_at_the_cap_is_allowed() {
+        let (storage, mobile) = setup();
+        let shares = group_shares();
+        let export = |share: &SharePackage| {
+            ShareExport::from_share(share, PASS)
+                .unwrap()
+                .to_json()
+                .unwrap()
+        };
+        mobile
+            .import_share(export(&shares[0]), PASS.into(), "first".into())
+            .unwrap();
+        for i in 0..MAX_STORED_SHARES - 1 {
+            storage.mark_unreadable(format!("{i:064x}"));
+        }
+
+        mobile
+            .import_share(export(&shares[0]), PASS.into(), "renamed".into())
+            .unwrap();
+        let other = TrustedDealer::new(ThresholdConfig::new(2, 3).unwrap())
+            .generate("other")
+            .unwrap()
+            .0;
+        let result = mobile.import_share(export(&other[0]), PASS.into(), "other".into());
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("Maximum")),
+            "got {result:?}"
         );
     }
 }
