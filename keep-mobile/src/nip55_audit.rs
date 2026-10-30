@@ -114,6 +114,7 @@ pub fn nip55_audit_entry_hash(
     // Fail closed on a missing key, matching keep-android `calculateEntryHash`
     // (`?: throw IllegalStateException("HMAC key not initialized ...")`). Without
     // this an empty key silently yields a key-independent, forgeable MAC.
+    let hmac_key = zeroize::Zeroizing::new(hmac_key);
     assert!(
         !hmac_key.is_empty(),
         "HMAC key not initialized - cannot compute audit entry hash"
@@ -122,7 +123,6 @@ pub fn nip55_audit_entry_hash(
         request_id.as_deref().is_none_or(is_request_id),
         "audit request id must be 32 lowercase hex characters"
     );
-    let hmac_key = zeroize::Zeroizing::new(hmac_key);
     audit_entry_hash_inner(
         previous_hash.as_deref(),
         &caller,
