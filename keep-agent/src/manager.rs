@@ -101,27 +101,15 @@ impl SessionManager {
         session_id: &str,
         op: &Operation,
     ) -> Result<crate::session::SessionInfo> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|_| AgentError::Other("Failed to acquire session lock".into()))?;
-
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
-
-        if !session.validate_token(token) {
-            return Err(AgentError::InvalidToken);
-        }
-
-        session.check_and_record_operation(op)?;
-        Ok(session.info())
+        self.check_and_record_with(token, session_id, op, |s| Ok(s.info()))?
     }
 
     /// Validate the token, check `op` and then `check`, and record the
     /// request, all under one lock, so concurrent calls cannot all pass the
     /// rate limit before any is recorded. Nothing is recorded unless both
     /// checks pass. Errors from `check` come back as the inner result.
+    /// `check` runs under the write lock, so it must not call back into this
+    /// manager.
     pub fn check_and_record_with<T, E>(
         &self,
         token: &SessionToken,
@@ -292,6 +280,22 @@ mod tests {
         assert!(matches!(
             manager.check_and_record_with(&SessionToken::generate(), &id, &op, |_| Ok::<_, ()>(())),
             Err(AgentError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn a_revoked_session_cannot_be_checked_and_recorded() {
+        let manager = SessionManager::new([0u8; 32]);
+        let config = SessionConfig::new(SessionScope::nostr_only());
+        let (token, id) = manager
+            .create_session(config, SessionMetadata::default())
+            .unwrap();
+        assert!(manager.revoke_session(&id).unwrap());
+        assert!(matches!(
+            manager.check_and_record_with(&token, &id, &Operation::SignNostrEvent, |_| {
+                Ok::<_, ()>(())
+            }),
+            Err(AgentError::SessionNotFound(_))
         ));
     }
 
