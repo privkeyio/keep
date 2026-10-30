@@ -45,6 +45,10 @@ updates:
       # redb it moves with the toolchain bump.
       - dependency-name: "tray-icon"
         versions: [">= 0.25"]
+      # parking_lot 0.13 (with lock_api 0.5 and parking_lot_core 0.10) requires
+      # Rust 1.95, so it too moves with the toolchain bump.
+      - dependency-name: "parking_lot"
+        versions: [">= 0.13"]
       # keep-frost-net's pinned relay transport hands nostr-sdk a socket of the
       # relay stack's own types, so both must stay at the versions nostr-sdk 0.44
       # resolves (async-wsocket 0.13, tokio-tungstenite 0.26). Bumping either
