@@ -198,6 +198,11 @@ pub fn nip55_verify_audit_chain(
     for entry in &entries {
         if in_legacy {
             if entry.entry_hash.is_empty() {
+                // Legacy rows predate request ids, so one that carries an id
+                // was written by someone without the key.
+                if entry.request_id.is_some() {
+                    return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                }
                 legacy_skipped += 1;
                 if legacy_skipped > MAX_LEADING_LEGACY {
                     return Nip55ChainStatus::Tampered { entry_id: entry.id };
@@ -455,18 +460,50 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "32 lowercase hex")]
     fn a_malformed_request_id_is_not_hashed() {
-        nip55_audit_entry_hash(
-            None,
-            "com.app".into(),
-            "SIGN_EVENT".into(),
-            Some(1),
-            "allow".into(),
-            5,
-            true,
-            Some(format!("{REQUEST}|x")),
-            KEY.to_vec(),
+        for bad in [
+            format!("{REQUEST}|x"),
+            REQUEST.to_ascii_uppercase(),
+            REQUEST[1..].to_string(),
+            String::new(),
+        ] {
+            let hashed = std::panic::catch_unwind(|| {
+                nip55_audit_entry_hash(
+                    None,
+                    "com.app".into(),
+                    "SIGN_EVENT".into(),
+                    Some(1),
+                    "allow".into(),
+                    5,
+                    true,
+                    Some(bad.clone()),
+                    KEY.to_vec(),
+                )
+            });
+            assert!(hashed.is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_row_carrying_a_request_id_is_tampered() {
+        let mut legacy = legacy_entry(1);
+        legacy.request_id = Some(REQUEST.into());
+        let e2 = entry(2, None, "com.app", Some(1), "allow", 200, false);
+        assert_eq!(
+            nip55_verify_audit_chain(vec![legacy, e2], KEY.to_vec()),
+            Nip55ChainStatus::Tampered { entry_id: 1 }
+        );
+    }
+
+    #[test]
+    fn a_tip_anchored_chain_ending_in_a_request_id_verifies() {
+        let e1 = entry(1, None, "com.app", Some(1), "allow", 100, false);
+        let e2 = with_request(Some(&e1.entry_hash), 2, REQUEST);
+        let entries = vec![e1, e2];
+        let tip = tip_of(&entries);
+        assert_eq!(
+            nip55_verify_audit_chain_with_tip(entries, KEY.to_vec(), Some(tip)),
+            Nip55ChainStatus::Valid
         );
     }
 
@@ -495,6 +532,7 @@ mod tests {
             ("removed", None),
             ("uppercased", Some(REQUEST.to_ascii_uppercase())),
             ("delimiter", Some(format!("{}|", &REQUEST[1..]))),
+            ("empty", Some(String::new())),
         ] {
             let mut rows = intact.clone();
             rows[1].request_id = request_id;
