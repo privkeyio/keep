@@ -880,9 +880,29 @@ impl From<&ShareMetadata> for ShareMetadataInfo {
 /// The descriptors a backup carries, and whether the index could be read. An
 /// unreadable index falls back to the descriptors of the groups held here, and
 /// any other group's is left out.
+/// The group of every share held here, readable or not, or `None` when the
+/// registry cannot be read.
+fn held_groups(storage: &Arc<dyn SecureStorage>) -> Option<Vec<String>> {
+    let ShareRegistryRead::Readable { shares, unreadable } = storage.read_share_registry() else {
+        return None;
+    };
+    Some(
+        shares
+            .into_iter()
+            .map(|meta| hex::encode(meta.group_pubkey))
+            .chain(
+                unreadable
+                    .into_iter()
+                    .filter(|key| validate_hex_pubkey(key).is_ok())
+                    .map(|key| key.to_ascii_lowercase()),
+            )
+            .collect(),
+    )
+}
+
 fn descriptors_for_backup(
     storage: &Arc<dyn SecureStorage>,
-    held: &[ShareMetadataInfo],
+    held: Vec<String>,
 ) -> (persistence::DescriptorLoad, bool) {
     match persistence::load_descriptors(storage) {
         Ok(load) => (load, false),
@@ -890,12 +910,12 @@ fn descriptors_for_backup(
             tracing::warn!(
                 "Descriptor index unreadable, backing up the descriptors of held groups only: {e}"
             );
-            let held: std::collections::BTreeSet<String> = held
-                .iter()
-                .map(|meta| hex::encode(&meta.group_pubkey))
-                .collect();
             (
-                persistence::load_listed_descriptors(storage, held, true),
+                persistence::load_listed_descriptors(
+                    storage,
+                    held.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                    true,
+                ),
                 true,
             )
         }
@@ -2704,16 +2724,9 @@ impl KeepMobile {
                 .map_err(|_| KeepMobileError::StorageError {
                     msg: "descriptor lock poisoned".into(),
                 })?;
-        let ShareRegistryRead::Readable { shares, unreadable } = self.storage.read_share_registry()
-        else {
-            return Err(KeepMobileError::StorageError {
-                msg: "The share registry cannot be read, so the held groups are unknown".into(),
-            });
-        };
-        let held = shares
-            .into_iter()
-            .map(|meta| hex::encode(meta.group_pubkey))
-            .chain(unreadable);
+        let held = held_groups(&self.storage).ok_or_else(|| KeepMobileError::StorageError {
+            msg: "The share registry cannot be read, so the held groups are unknown".into(),
+        })?;
         let index = persistence::repair_descriptor_index(&self.storage, held, replace_unreadable)?;
         Ok(u32::try_from(index.len()).unwrap_or(u32::MAX))
     }
@@ -3491,7 +3504,13 @@ impl KeepMobile {
         // delete gets past until `wallet_descriptor_repair_index` runs: the
         // descriptors of the groups held here are read without it, and any
         // other group's is left out.
-        let (load, _) = descriptors_for_backup(&self.storage, &all_share_meta);
+        let (load, _) = descriptors_for_backup(
+            &self.storage,
+            all_share_meta
+                .iter()
+                .map(|meta| hex::encode(&meta.group_pubkey))
+                .collect(),
+        );
         if !load.unreadable.is_empty() {
             tracing::warn!(
                 unreadable = %load.unreadable.join(", "),
@@ -3692,8 +3711,10 @@ impl KeepMobile {
     /// enumerates, is left out of a backup without showing up here, so an
     /// empty result is not proof the backup is complete.
     pub fn backup_descriptor_gaps(&self) -> BackupDescriptorGaps {
-        let (load, index_unreadable) =
-            descriptors_for_backup(&self.storage, &self.storage.list_all_shares());
+        let (load, index_unreadable) = descriptors_for_backup(
+            &self.storage,
+            held_groups(&self.storage).unwrap_or_default(),
+        );
         BackupDescriptorGaps {
             index_unreadable,
             unreadable_groups: load.unreadable,
@@ -3917,7 +3938,7 @@ impl KeepMobile {
         }
 
         for (group_hex, _, _) in prepared_shares.iter().chain(prepared_keys.iter()) {
-            if self.storage.load_share_by_key(group_hex.clone()).is_ok() {
+            if self.listed_share_identifier(group_hex)?.is_some() {
                 return Err(KeepMobileError::BackupError {
                     msg: format!("key/share already exists for group {group_hex}"),
                 });
@@ -5380,24 +5401,40 @@ impl KeepMobile {
         })
     }
 
+    /// The identifier of the share the registry lists under `key`, if any.
+    /// It is read from the registry rather than the record, since a record
+    /// load can take the cipher a platform queued for the write that follows.
+    /// A share that cannot be read is refused rather than written over, since
+    /// the failure may be a fault on a healthy share: it is removed first.
+    fn listed_share_identifier(&self, key: &str) -> Result<Option<u16>, KeepMobileError> {
+        let ShareRegistryRead::Readable { shares, unreadable } = self.storage.read_share_registry()
+        else {
+            return Err(KeepMobileError::StorageError {
+                msg: "The share registry cannot be read".into(),
+            });
+        };
+        if unreadable.iter().any(|k| k.eq_ignore_ascii_case(key)) {
+            return Err(KeepMobileError::StorageError {
+                msg: "The stored share of this group cannot be read, so it is not replaced".into(),
+            });
+        }
+        Ok(shares
+            .iter()
+            .find(|m| hex::encode(&m.group_pubkey) == key)
+            .map(|m| m.identifier))
+    }
+
     fn store_share_package(&self, share: &SharePackage) -> Result<ShareInfo, KeepMobileError> {
         let metadata: ShareMetadataInfo = (&share.metadata).into();
         let group_pubkey_hex = hex::encode(&metadata.group_pubkey);
 
-        // A record that cannot be read is written over: it cannot be recovered,
-        // and importing over it is how a share is restored from its backup.
-        if let Ok(bytes) = self.storage.load_share_by_key(group_pubkey_hex.clone()) {
-            let stored_identifier = serde_json::from_slice::<StoredShareData>(&bytes)
-                .ok()
-                .and_then(|stored| {
-                    serde_json::from_str::<ShareMetadata>(&stored.metadata_json).ok()
-                })
-                .map(|stored| stored.identifier);
-            if stored_identifier.is_some_and(|id| id != metadata.identifier) {
-                return Err(KeepMobileError::InvalidShare {
-                    msg: "Another share of this group is already stored".into(),
-                });
-            }
+        if self
+            .listed_share_identifier(&group_pubkey_hex)?
+            .is_some_and(|id| id != metadata.identifier)
+        {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Another share of this group is already stored".into(),
+            });
         }
 
         let stored = StoredShareData {
@@ -5996,7 +6033,7 @@ impl KeepMobile {
         match (shares.as_slice(), unreadable.is_empty()) {
             ([only], true) => Ok(hex::encode(&only.group_pubkey)),
             ([], true) => self.migrate_legacy_share(),
-            ([], false) if unreadable.len() == 1 => Err(KeepMobileError::StorageError {
+            ([], false) => Err(KeepMobileError::StorageError {
                 msg: "The stored share cannot be read".into(),
             }),
             _ => Err(KeepMobileError::StorageError {
@@ -11394,6 +11431,8 @@ mod share_registry_tests {
     struct RegistryStorage {
         records: StdMutex<HashMap<String, (Vec<u8>, ShareMetadataInfo)>>,
         unreadable: StdMutex<Vec<String>>,
+        failing: StdMutex<Vec<String>>,
+        loaded: StdMutex<Vec<String>>,
         registry_unavailable: AtomicBool,
         active: StdMutex<Option<String>>,
     }
@@ -11401,6 +11440,9 @@ mod share_registry_tests {
     impl RegistryStorage {
         fn mark_unreadable(&self, key: String) {
             self.unreadable.lock().unwrap().push(key);
+        }
+        fn fail_loads_of(&self, key: String) {
+            self.failing.lock().unwrap().push(key);
         }
         fn raw(&self, key: &str) -> Option<Vec<u8>> {
             self.records
@@ -11437,7 +11479,10 @@ mod share_registry_tests {
             Ok(())
         }
         fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError> {
-            if self.unreadable.lock().unwrap().contains(&key) {
+            self.loaded.lock().unwrap().push(key.clone());
+            if self.unreadable.lock().unwrap().contains(&key)
+                || self.failing.lock().unwrap().contains(&key)
+            {
                 return Err(KeepMobileError::StorageError {
                     msg: "key alias invalidated".into(),
                 });
@@ -11640,18 +11685,41 @@ mod share_registry_tests {
     }
 
     #[test]
-    fn importing_over_an_unreadable_record_writes_it() {
+    fn importing_over_an_unreadable_record_is_refused() {
         let (storage, mobile) = setup();
         let shares = group_shares();
         mobile.store_share_package(&shares[0]).unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         storage.mark_unreadable(key.clone());
 
+        let result = mobile.store_share_package(&shares[1]);
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("not replaced")),
+            "got {result:?}"
+        );
+        storage.unreadable.lock().unwrap().clear();
+        assert_eq!(
+            stored_identifier(&storage, &key),
+            shares[0].metadata.identifier
+        );
+
+        storage.delete_share_by_key(key.clone()).unwrap();
         mobile.store_share_package(&shares[1]).unwrap();
         assert_eq!(
             stored_identifier(&storage, &key),
             shares[1].metadata.identifier
         );
+    }
+
+    #[test]
+    fn importing_a_share_loads_no_record() {
+        let (storage, mobile) = setup();
+        let shares = group_shares();
+        mobile.store_share_package(&shares[0]).unwrap();
+        mobile.store_share_package(&shares[0]).unwrap();
+        assert!(mobile.store_share_package(&shares[1]).is_err());
+        let key = hex::encode(shares[0].group_pubkey());
+        assert!(!storage.loaded.lock().unwrap().contains(&key));
     }
 
     #[test]
@@ -11683,7 +11751,15 @@ mod share_registry_tests {
         storage
             .store_share_by_key(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec(), meta)
             .unwrap();
-        storage.mark_unreadable(unreadable.clone());
+        storage.mark_unreadable(unreadable.to_ascii_uppercase());
+        storage.mark_unreadable("not a group".into());
+        storage
+            .store_share_by_key(
+                format!("{DESCRIPTOR_KEY_PREFIX}not a group"),
+                b"{}".to_vec(),
+                persistence::storage_metadata("descriptor"),
+            )
+            .unwrap();
 
         assert_eq!(mobile.wallet_descriptor_repair_index(true).unwrap(), 1);
         let index: Vec<String> =
@@ -11753,11 +11829,100 @@ mod share_registry_tests {
 
         let (storage, mobile) = setup();
         storage.registry_unavailable.store(true, Ordering::SeqCst);
-        mobile.restore_backup(backup.clone(), PASS.into()).unwrap();
+        assert!(mobile.restore_backup(backup.clone(), PASS.into()).is_err());
         assert_eq!(storage.get_active_share_key(), None);
+        assert!(storage
+            .records
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|k| k == CLOCK_FLOOR_STORAGE_KEY));
 
         let (storage, mobile) = setup();
         mobile.restore_backup(backup, PASS.into()).unwrap();
         assert!(storage.get_active_share_key().is_some());
+    }
+
+    #[test]
+    fn importing_over_a_record_that_failed_to_load_is_refused() {
+        let (storage, mobile) = setup();
+        let shares = group_shares();
+        mobile.store_share_package(&shares[0]).unwrap();
+        let key = hex::encode(shares[0].group_pubkey());
+        storage.fail_loads_of(key.clone());
+
+        let result = mobile.store_share_package(&shares[1]);
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
+            "got {result:?}"
+        );
+        storage.failing.lock().unwrap().clear();
+        assert_eq!(
+            stored_identifier(&storage, &key),
+            shares[0].metadata.identifier
+        );
+    }
+
+    #[test]
+    fn restoring_over_a_stored_or_unreadable_share_is_refused() {
+        let shares = group_shares();
+        let (_, source) = setup();
+        source.store_share_package(&shares[1]).unwrap();
+        let backup = source.create_backup(PASS.into()).unwrap();
+
+        let (storage, mobile) = setup();
+        mobile.store_share_package(&shares[0]).unwrap();
+        let key = hex::encode(shares[0].group_pubkey());
+        storage.fail_loads_of(key.clone());
+        assert!(mobile.restore_backup(backup.clone(), PASS.into()).is_err());
+        storage.failing.lock().unwrap().clear();
+        assert_eq!(
+            stored_identifier(&storage, &key),
+            shares[0].metadata.identifier
+        );
+
+        storage.mark_unreadable(key.clone());
+        assert!(mobile.restore_backup(backup, PASS.into()).is_err());
+        storage.unreadable.lock().unwrap().clear();
+        assert_eq!(
+            stored_identifier(&storage, &key),
+            shares[0].metadata.identifier
+        );
+    }
+
+    #[test]
+    fn resolving_with_only_unreadable_shares_says_they_cannot_be_read() {
+        let (storage, mobile) = setup();
+        storage.mark_unreadable("ab".repeat(32));
+        storage.mark_unreadable("cd".repeat(32));
+        let result = mobile.resolve_active_share();
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("cannot be read")),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn descriptor_gaps_cover_the_group_of_an_unreadable_share() {
+        let (storage, mobile) = setup();
+        let group = "ab".repeat(32);
+        let descriptor = format!("{DESCRIPTOR_KEY_PREFIX}{group}");
+        let meta = persistence::storage_metadata("descriptor");
+        storage
+            .store_share_by_key(descriptor.clone(), b"{}".to_vec(), meta.clone())
+            .unwrap();
+        storage
+            .store_share_by_key(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec(), meta)
+            .unwrap();
+        storage.mark_unreadable(group.clone());
+        storage.mark_unreadable(descriptor);
+
+        assert_eq!(
+            mobile.backup_descriptor_gaps(),
+            BackupDescriptorGaps {
+                index_unreadable: true,
+                unreadable_groups: vec![group],
+            }
+        );
     }
 }

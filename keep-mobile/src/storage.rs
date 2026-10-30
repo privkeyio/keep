@@ -115,7 +115,10 @@ pub trait SecureStorage: Send + Sync {
     /// Read the share registry as it is: `Readable` with every share that could
     /// be read and, under `unreadable`, the key of every share that exists but
     /// could not be, `Unavailable` when the registry itself cannot be read. A
-    /// share must never be dropped silently. No fallback and no side effect.
+    /// share must never be dropped silently. A registry entry with no record
+    /// stored behind it is absent, not unreadable. No fallback and no side
+    /// effect, and it must not throw: a fault reading the registry is
+    /// `Unavailable`.
     ///
     /// Callers that count shares or build a backup rely on the difference:
     /// taking an unreadable share for an absent one undercounts the store and
