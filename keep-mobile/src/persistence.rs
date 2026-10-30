@@ -644,13 +644,16 @@ pub(crate) fn load_descriptors(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<DescriptorLoad, KeepMobileError> {
     let index = load_descriptor_index(storage)?;
-    Ok(load_listed_descriptors(storage, index))
+    Ok(load_listed_descriptors(storage, index, false))
 }
 
 /// The descriptors recorded for `groups`, read one by one without the index.
+/// With `skip_absent`, a group with no record is left out of `unreadable`: a
+/// group the index never listed may simply have no descriptor.
 pub(crate) fn load_listed_descriptors(
     storage: &Arc<dyn SecureStorage>,
     groups: impl IntoIterator<Item = String>,
+    skip_absent: bool,
 ) -> DescriptorLoad {
     let mut loaded = Vec::new();
     let mut unreadable = Vec::new();
@@ -663,6 +666,7 @@ pub(crate) fn load_listed_descriptors(
                     unreadable.push(group_hex);
                 }
             },
+            Err(KeepMobileError::StorageNotFound) if skip_absent => {}
             Err(e) => {
                 tracing::warn!("Cannot read the descriptor for {group_hex}: {e}");
                 unreadable.push(group_hex);

@@ -891,7 +891,10 @@ fn descriptors_for_backup(
                 .iter()
                 .map(|meta| hex::encode(&meta.group_pubkey))
                 .collect();
-            (persistence::load_listed_descriptors(storage, held), true)
+            (
+                persistence::load_listed_descriptors(storage, held, true),
+                true,
+            )
         }
     }
 }
@@ -3597,14 +3600,21 @@ impl KeepMobile {
         .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
     }
 
-    /// The wallet descriptors `create_backup` would leave out right now.
+    /// The wallet descriptors `create_backup` would leave out right now, as far
+    /// as this side can tell.
     ///
     /// A backup proceeds without a descriptor it cannot read, so the shares are
     /// never held hostage to one bad record, but a user who restores from it and
     /// wipes this device loses what locates the funds. Call this before offering
-    /// the backup and show any gap. Each group listed can still be passed to
-    /// `wallet_descriptor_delete`, and an unreadable index is fixed with
-    /// `wallet_descriptor_repair_index`.
+    /// the backup and show any gap.
+    ///
+    /// With `index_unreadable`, only the descriptors of groups held here are
+    /// backed up and any other group's is left out, and every descriptor
+    /// delete fails until `wallet_descriptor_repair_index` runs. Otherwise each
+    /// group in `unreadable_groups` can be passed to `wallet_descriptor_delete`.
+    /// A record stored but not listed in the index, which nothing here
+    /// enumerates, is left out of a backup without showing up here, so an
+    /// empty result is not proof the backup is complete.
     pub fn backup_descriptor_gaps(&self) -> BackupDescriptorGaps {
         let (load, index_unreadable) =
             descriptors_for_backup(&self.storage, &self.storage.list_all_shares());
@@ -7118,7 +7128,11 @@ mod restore_backup_metadata_tests {
         let pass = "correct horse battery staple";
         let bytes = keep_core::backup::create_backup_from_data(
             vec![],
-            vec![backup_share(true)],
+            vec![backup_share(true), {
+                let mut share = backup_share(true);
+                share.group_pubkey = hex::encode([9u8; 32]);
+                share
+            }],
             [group, [8u8; 32]]
                 .map(|group_pubkey| keep_core::wallet::WalletDescriptor {
                     group_pubkey,
@@ -7154,12 +7168,21 @@ mod restore_backup_metadata_tests {
             .unwrap()
             .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
         assert!(mobile.wallet_descriptor_delete(hex::encode(group)).is_err());
+        // The held group with no descriptor is not a gap, and the one with a
+        // descriptor is read without the index.
+        assert_eq!(
+            mobile.backup_descriptor_gaps(),
+            BackupDescriptorGaps {
+                index_unreadable: true,
+                unreadable_groups: vec![],
+            }
+        );
 
         let backup = mobile
             .create_backup(pass.into())
             .expect("an unreadable index must not deny the share backup");
         let decrypted = decrypt_backup_data(&backup, pass).unwrap();
-        assert_eq!(decrypted.shares.len(), 1);
+        assert_eq!(decrypted.shares.len(), 2);
         assert_eq!(
             decrypted.wallet_descriptors.len(),
             1,
