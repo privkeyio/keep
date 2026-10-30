@@ -141,6 +141,14 @@ impl SignPolicySelection {
 
     /// Parse an ordinal, defaulting to the safest mode (`Manual`) on any
     /// unknown/garbage value, matching keep-android's `fromOrdinal`.
+    fn stricter(self, other: Self) -> Self {
+        if self.to_ordinal() <= other.to_ordinal() {
+            self
+        } else {
+            other
+        }
+    }
+
     fn from_ordinal(ordinal: u8) -> Self {
         match ordinal {
             1 => SignPolicySelection::Basic,
@@ -237,8 +245,21 @@ pub trait SignPolicySelectionStorage: Send + Sync {
 
 const GLOBAL_SIGN_POLICY_KEY: &str = "global_sign_policy";
 
-fn app_override_key(package: &str) -> String {
+/// The key of an override set before overrides were per account. It names no
+/// account, so it may be another account's, and it is only ever a floor.
+fn legacy_override_key(package: &str) -> String {
     format!("sign_policy_override:{package}")
+}
+
+/// The key of `account`'s override for `package`, or `None` when `account` is
+/// not a 32-byte hex group key.
+fn app_override_key(account: &str, package: &str) -> Option<String> {
+    (account.len() == 64 && account.bytes().all(|b| b.is_ascii_hexdigit())).then(|| {
+        format!(
+            "sign_policy_override:{}:{package}",
+            account.to_ascii_lowercase()
+        )
+    })
 }
 
 /// Core-owned store for the sign-policy selection, so the selection state and
@@ -295,17 +316,35 @@ impl SignPolicyStore {
         )
     }
 
-    /// The per-app override, or `None` if the app follows the global policy.
-    /// An override that is stored but cannot be read or parsed is `Manual`:
-    /// it may be stricter than the global policy, so it is never taken as
-    /// absent.
-    pub fn app_override(&self, package: String) -> Option<SignPolicySelection> {
-        self.selection(app_override_key(&package))
-            .map(|s| s.unwrap_or(SignPolicySelection::Manual))
+    /// `account`'s override for `package`, or `None` if the app follows the
+    /// global policy. `account` is the active group key in hex, so an override
+    /// set under one account never applies under another.
+    ///
+    /// An override that is stored but cannot be read or parsed is `Manual`: it
+    /// may be stricter than the global policy, so it is never taken as absent.
+    /// An override from before overrides were per account belongs to no known
+    /// account, so it can only tighten what this account resolves to. An
+    /// `account` that is not a group key is `Manual`.
+    pub fn app_override(&self, account: String, package: String) -> Option<SignPolicySelection> {
+        let Some(key) = app_override_key(&account, &package) else {
+            return Some(SignPolicySelection::Manual);
+        };
+        let read = |s: Option<SignPolicySelection>| s.unwrap_or(SignPolicySelection::Manual);
+        let scoped = self.selection(key).map(read);
+        match self.selection(legacy_override_key(&package)).map(read) {
+            None => scoped,
+            Some(legacy) => Some(
+                scoped
+                    .unwrap_or_else(|| self.global_policy())
+                    .stricter(legacy),
+            ),
+        }
     }
 
-    /// Set (`Some`) or clear (`None`) the per-app override. Returns whether the
-    /// write persisted.
+    /// Set (`Some`) or clear (`None`) `account`'s override for `package`, and
+    /// drop any override from before overrides were per account, so the
+    /// owner's choice is not held under that older floor. Returns whether both
+    /// writes persisted, and `false` for an `account` that is not a group key.
     ///
     /// A failed clear matters most: an override is typically stricter than the
     /// global policy, so a caller that treats an unconfirmed clear as done can
@@ -313,20 +352,27 @@ impl SignPolicyStore {
     /// nothing tracking it. Callers must keep their own index until this reports
     /// `true`, and must re-attempt on `false` rather than assume the override
     /// was left untouched, since `false` does not say which value is stored.
-    pub fn set_app_override(&self, package: String, policy: Option<SignPolicySelection>) -> bool {
-        match policy {
-            Some(p) => self
-                .storage
-                .save(app_override_key(&package), p.to_ordinal().to_string()),
-            None => self.storage.remove(app_override_key(&package)),
-        }
+    pub fn set_app_override(
+        &self,
+        account: String,
+        package: String,
+        policy: Option<SignPolicySelection>,
+    ) -> bool {
+        let Some(key) = app_override_key(&account, &package) else {
+            return false;
+        };
+        let written = match policy {
+            Some(p) => self.storage.save(key, p.to_ordinal().to_string()),
+            None => self.storage.remove(key),
+        };
+        written && self.storage.remove(legacy_override_key(&package))
     }
 
-    /// Resolve the effective selection for a package: per-app override (`Manual`
-    /// when stored but unreadable), else the global policy, else `Manual`.
-    /// Mirrors keep-android's precedence.
-    pub fn effective_policy(&self, package: String) -> SignPolicySelection {
-        self.app_override(package)
+    /// Resolve the effective selection for `package` under `account`: its
+    /// override (see [`Self::app_override`]), else the global policy, else
+    /// `Manual`. Mirrors keep-android's precedence.
+    pub fn effective_policy(&self, account: String, package: String) -> SignPolicySelection {
+        self.app_override(account, package)
             .unwrap_or_else(|| self.global_policy())
     }
 
@@ -335,8 +381,8 @@ impl SignPolicyStore {
     /// [`PolicyMode::Auto`], which silently re-disables the stricter `Basic` tier
     /// -- do NOT route the decision path through it. Use [`Self::effective_policy`]
     /// with [`evaluate_sign_policy_selection`] instead.
-    pub fn effective_policy_mode(&self, package: String) -> PolicyMode {
-        self.effective_policy(package).policy_mode()
+    pub fn effective_policy_mode(&self, account: String, package: String) -> PolicyMode {
+        self.effective_policy(account, package).policy_mode()
     }
 }
 
@@ -1616,6 +1662,8 @@ mod tests {
         }
     }
 
+    const ACCOUNT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     /// A stored value [`MockPolicyStorage`] reports as unreadable.
     const UNREADABLE: &str = "\u{0}unreadable";
 
@@ -1669,23 +1717,31 @@ mod tests {
     fn setters_report_whether_the_write_persisted() {
         let ok = SignPolicyStore::new(MockPolicyStorage::new());
         assert!(ok.set_global_policy(SignPolicySelection::Basic));
-        assert!(ok.set_app_override("com.example".into(), Some(SignPolicySelection::Manual)));
-        assert!(ok.set_app_override("com.example".into(), None));
+        assert!(ok.set_app_override(
+            ACCOUNT.into(),
+            "com.example".into(),
+            Some(SignPolicySelection::Manual)
+        ));
+        assert!(ok.set_app_override(ACCOUNT.into(), "com.example".into(), None));
 
         // A store that cannot persist must say so, for both the set and the
         // clear: a caller that assumed success would drop the only record that
         // the old, possibly looser, selection is still in force.
         let bad = SignPolicyStore::new(Arc::new(FailingPolicyStorage));
         assert!(!bad.set_global_policy(SignPolicySelection::Auto));
-        assert!(!bad.set_app_override("com.example".into(), Some(SignPolicySelection::Auto)));
-        assert!(!bad.set_app_override("com.example".into(), None));
+        assert!(!bad.set_app_override(
+            ACCOUNT.into(),
+            "com.example".into(),
+            Some(SignPolicySelection::Auto)
+        ));
+        assert!(!bad.set_app_override(ACCOUNT.into(), "com.example".into(), None));
         // Nor can it be read: everything resolves to Manual.
         assert_eq!(
-            bad.app_override("com.example".into()),
+            bad.app_override(ACCOUNT.into(), "com.example".into()),
             Some(SignPolicySelection::Manual)
         );
         assert_eq!(
-            bad.effective_policy("com.example".into()),
+            bad.effective_policy(ACCOUNT.into(), "com.example".into()),
             SignPolicySelection::Manual
         );
         assert_eq!(bad.global_policy(), SignPolicySelection::Manual);
@@ -1743,7 +1799,7 @@ mod tests {
         let store = SignPolicyStore::new(storage.clone());
         store.set_global_policy(SignPolicySelection::Auto);
         assert_eq!(
-            store.effective_policy("com.app".into()),
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
             SignPolicySelection::Auto,
             "absent: the global"
         );
@@ -1752,14 +1808,14 @@ mod tests {
                 .map
                 .lock()
                 .unwrap()
-                .insert(app_override_key("com.app"), stored.into());
+                .insert(app_override_key(ACCOUNT, "com.app").unwrap(), stored.into());
             assert_eq!(
-                store.app_override("com.app".into()),
+                store.app_override(ACCOUNT.into(), "com.app".into()),
                 Some(SignPolicySelection::Manual),
                 "{stored:?}"
             );
             assert_eq!(
-                store.effective_policy("com.app".into()),
+                store.effective_policy(ACCOUNT.into(), "com.app".into()),
                 SignPolicySelection::Manual,
                 "{stored:?}"
             );
@@ -1770,16 +1826,20 @@ mod tests {
                 .map
                 .lock()
                 .unwrap()
-                .insert(app_override_key("com.app"), stored.into());
+                .insert(app_override_key(ACCOUNT, "com.app").unwrap(), stored.into());
             assert_eq!(
-                store.effective_policy("com.app".into()),
+                store.effective_policy(ACCOUNT.into(), "com.app".into()),
                 SignPolicySelection::Manual,
                 "{stored:?}"
             );
         }
         // An unreadable or unparseable global is Manual too, and a readable
         // override still wins over it.
-        store.set_app_override("com.app".into(), Some(SignPolicySelection::Auto));
+        store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Auto),
+        );
         for stored in [UNREADABLE, "auto"] {
             storage
                 .map
@@ -1788,11 +1848,11 @@ mod tests {
                 .insert(GLOBAL_SIGN_POLICY_KEY.into(), stored.into());
             assert_eq!(store.global_policy(), SignPolicySelection::Manual);
             assert_eq!(
-                store.effective_policy("com.other".into()),
+                store.effective_policy(ACCOUNT.into(), "com.other".into()),
                 SignPolicySelection::Manual
             );
             assert_eq!(
-                store.effective_policy("com.app".into()),
+                store.effective_policy(ACCOUNT.into(), "com.app".into()),
                 SignPolicySelection::Auto
             );
         }
@@ -1803,32 +1863,147 @@ mod tests {
         let store = SignPolicyStore::new(MockPolicyStorage::new());
         store.set_global_policy(SignPolicySelection::Manual);
         // No override -> follows global.
-        assert!(store.app_override("com.app".into()).is_none());
+        assert!(store
+            .app_override(ACCOUNT.into(), "com.app".into())
+            .is_none());
         assert_eq!(
-            store.effective_policy_mode("com.app".into()),
+            store.effective_policy_mode(ACCOUNT.into(), "com.app".into()),
             PolicyMode::Manual
         );
         // Override wins over global.
-        store.set_app_override("com.app".into(), Some(SignPolicySelection::Auto));
+        store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Auto),
+        );
         assert_eq!(
-            store.app_override("com.app".into()),
+            store.app_override(ACCOUNT.into(), "com.app".into()),
             Some(SignPolicySelection::Auto)
         );
         assert_eq!(
-            store.effective_policy_mode("com.app".into()),
+            store.effective_policy_mode(ACCOUNT.into(), "com.app".into()),
             PolicyMode::Auto
         );
         // A different app still follows global.
         assert_eq!(
-            store.effective_policy("com.other".into()),
+            store.effective_policy(ACCOUNT.into(), "com.other".into()),
             SignPolicySelection::Manual
         );
         // Clearing the override reverts to global.
-        store.set_app_override("com.app".into(), None);
-        assert!(store.app_override("com.app".into()).is_none());
+        store.set_app_override(ACCOUNT.into(), "com.app".into(), None);
+        assert!(store
+            .app_override(ACCOUNT.into(), "com.app".into())
+            .is_none());
         assert_eq!(
-            store.effective_policy("com.app".into()),
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
             SignPolicySelection::Manual
         );
+    }
+
+    #[test]
+    fn an_override_belongs_to_the_account_it_was_set_under() {
+        const OTHER: &str = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+        let store = SignPolicyStore::new(MockPolicyStorage::new());
+        store.set_global_policy(SignPolicySelection::Manual);
+        assert!(store.set_app_override(
+            OTHER.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Auto)
+        ));
+        assert_eq!(
+            store.effective_policy(OTHER.to_lowercase(), "com.app".into()),
+            SignPolicySelection::Auto
+        );
+        assert!(store
+            .app_override(ACCOUNT.into(), "com.app".into())
+            .is_none());
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Manual
+        );
+        for bad in ["", "aa", &ACCOUNT[1..], &format!("{}g", &ACCOUNT[1..])] {
+            assert_eq!(
+                store.effective_policy(bad.into(), "com.app".into()),
+                SignPolicySelection::Manual,
+                "{bad:?}"
+            );
+            assert!(!store.set_app_override(
+                bad.into(),
+                "com.app".into(),
+                Some(SignPolicySelection::Auto)
+            ));
+        }
+    }
+
+    #[test]
+    fn an_override_from_before_accounts_only_tightens() {
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        let legacy = |value: &str| {
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .insert(legacy_override_key("com.app"), value.into());
+        };
+        store.set_global_policy(SignPolicySelection::Auto);
+        legacy("2");
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Auto,
+            "no looser than the global"
+        );
+        store.set_global_policy(SignPolicySelection::Manual);
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Manual,
+            "an Auto from another account is not carried"
+        );
+
+        store.set_global_policy(SignPolicySelection::Auto);
+        for (stored, expected) in [
+            ("0", SignPolicySelection::Manual),
+            ("1", SignPolicySelection::Basic),
+            (UNREADABLE, SignPolicySelection::Manual),
+        ] {
+            legacy(stored);
+            assert_eq!(
+                store.app_override(ACCOUNT.into(), "com.app".into()),
+                Some(expected),
+                "{stored:?}"
+            );
+        }
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .insert(app_override_key(ACCOUNT, "com.app").unwrap(), "2".into());
+        legacy("1");
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Basic,
+            "the floor holds over this account's own override"
+        );
+
+        assert!(store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Auto)
+        ));
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Auto,
+            "the owner's choice drops the floor"
+        );
+        legacy("0");
+        assert!(store.set_app_override(ACCOUNT.into(), "com.app".into(), None));
+        assert!(store
+            .app_override(ACCOUNT.into(), "com.app".into())
+            .is_none());
+        assert!(!storage
+            .map
+            .lock()
+            .unwrap()
+            .contains_key(&legacy_override_key("com.app")));
     }
 }
