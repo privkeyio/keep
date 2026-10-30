@@ -101,7 +101,21 @@ impl SessionManager {
         session_id: &str,
         op: &Operation,
     ) -> Result<crate::session::SessionInfo> {
-        self.check_and_record_with(token, session_id, op, |s| Ok(s.info()))?
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| AgentError::Other("Failed to acquire session lock".into()))?;
+
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| AgentError::SessionNotFound(session_id.to_string()))?;
+
+        if !session.validate_token(token) {
+            return Err(AgentError::InvalidToken);
+        }
+
+        session.check_and_record_operation(op)?;
+        Ok(session.info())
     }
 
     /// Validate the token, check `op` and then `check`, and record the
@@ -281,6 +295,22 @@ mod tests {
             manager.check_and_record_with(&SessionToken::generate(), &id, &op, |_| Ok::<_, ()>(())),
             Err(AgentError::InvalidToken)
         ));
+    }
+
+    #[test]
+    fn check_and_record_reports_the_request_it_recorded() {
+        use crate::rate_limit::RateLimitConfig;
+        let manager = SessionManager::new([0u8; 32]);
+        let config = SessionConfig::new(SessionScope::nostr_only())
+            .with_rate_limit(RateLimitConfig::new(5, 100, 1000));
+        let (token, id) = manager
+            .create_session(config, SessionMetadata::default())
+            .unwrap();
+        let info = manager
+            .check_and_record(&token, &id, &Operation::SignNostrEvent)
+            .unwrap();
+        assert_eq!(info.requests_today, 1);
+        assert_eq!(info.requests_remaining, 999);
     }
 
     #[test]

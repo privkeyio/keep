@@ -318,6 +318,9 @@ impl KeepAgentSession {
         }
 
         let token = self.token.lock().await;
+        self.manager
+            .validate_and_get(&token, &self.session_id)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
         let secret = self
             .secret_key
             .as_ref()

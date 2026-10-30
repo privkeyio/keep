@@ -321,6 +321,9 @@ impl PyAgentSession {
         content: &str,
         tags: Option<Vec<Vec<String>>>,
     ) -> PyResult<String> {
+        self.manager
+            .validate_and_get(&self.token, &self.session_id)
+            .map_err(to_py_err)?;
         let secret = self.secret_key.as_ref().ok_or_else(|| {
             PyRuntimeError::new_err("No secret key configured. Pass secret_key to constructor.")
         })?;
