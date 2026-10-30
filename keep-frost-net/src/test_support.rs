@@ -201,6 +201,12 @@ mod memory_transport {
         fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
             self.me.lock().unwrap().sender.subscribe()
         }
+
+        fn relay_health<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Vec<crate::node::RelayHealth>> + Send + 'a>> {
+            Box::pin(async move { Vec::new() })
+        }
     }
 }
 

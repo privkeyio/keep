@@ -126,8 +126,8 @@ pub use node::{
     migrate_kfp_v1_peer_policies, DescriptorLookupUnavailable, DuressFreeze, DuressPersister,
     HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck,
     PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawAndRequireStructuredHooks,
-    RefuseRawSignatureHooks, RequireStructuredPayloadHooks, ServeHooks, SessionInfo, SigningHooks,
-    SuccessorLookup,
+    RefuseRawSignatureHooks, RelayHealth, RelayHealthStatus, RequireStructuredPayloadHooks,
+    ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};

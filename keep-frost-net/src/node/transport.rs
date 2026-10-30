@@ -36,6 +36,56 @@ pub trait CosignTransport: Send + Sync {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Event>>> + Send + 'a>>;
     fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification>;
+    /// Connection state of relays already in the pool. This does not dial or
+    /// ping; it reads the status and stats the pool is already tracking.
+    /// Transports with no relay sockets return an empty list.
+    fn relay_health<'a>(&'a self) -> Pin<Box<dyn Future<Output = Vec<RelayHealth>> + Send + 'a>>;
+}
+
+/// One relay's connection state, as already tracked by the nostr pool.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayHealth {
+    /// Pool URL without a trailing slash, so a caller can match its configured
+    /// string after the same normalization.
+    pub url: String,
+    pub status: RelayHealthStatus,
+    /// Unix milliseconds of the last successful connection. `0` if never.
+    pub last_connected_ms: u64,
+    /// Smoothed round trip in milliseconds, once the pool has enough samples.
+    pub rtt_ms: Option<u64>,
+}
+
+/// Coarse relay status. The pool's eight states collapse to the three a
+/// surface can show without re-implementing connection logic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayHealthStatus {
+    Connecting,
+    Connected,
+    Offline,
+}
+
+pub(crate) fn relay_health_from_parts(
+    url: &RelayUrl,
+    status: RelayStatus,
+    connected_at_secs: u64,
+    latency: Option<Duration>,
+) -> RelayHealth {
+    let status = match status {
+        RelayStatus::Initialized
+        | RelayStatus::Pending
+        | RelayStatus::Connecting
+        | RelayStatus::Sleeping => RelayHealthStatus::Connecting,
+        RelayStatus::Connected => RelayHealthStatus::Connected,
+        RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned => {
+            RelayHealthStatus::Offline
+        }
+    };
+    RelayHealth {
+        url: url.as_str_without_trailing_slash().to_string(),
+        status,
+        last_connected_ms: connected_at_secs.saturating_mul(1_000),
+        rtt_ms: latency.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+    }
 }
 
 /// [`CosignTransport`] backed by a concrete `nostr_sdk::Client`.
@@ -145,6 +195,28 @@ impl CosignTransport for NostrTransport {
     fn notifications(&self) -> broadcast::Receiver<RelayPoolNotification> {
         self.client.notifications()
     }
+
+    fn relay_health<'a>(&'a self) -> Pin<Box<dyn Future<Output = Vec<RelayHealth>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut health: Vec<RelayHealth> = self
+                .client
+                .relays()
+                .await
+                .iter()
+                .map(|(url, relay)| {
+                    let stats = relay.stats();
+                    relay_health_from_parts(
+                        url,
+                        relay.status(),
+                        stats.connected_at().as_secs(),
+                        stats.latency(),
+                    )
+                })
+                .collect();
+            health.sort_by(|left, right| left.url.cmp(&right.url));
+            health
+        })
+    }
 }
 
 #[cfg(test)]
@@ -216,5 +288,55 @@ mod tests {
             require_accepted(&output(&[], &[("wss://b.example", "blocked: kind")])).unwrap_err();
         assert!(err.contains("blocked: kind"), "{err}");
         assert!(require_accepted(&output(&[], &[])).is_err());
+    }
+
+    #[test]
+    fn relay_health_collapses_pool_status_and_timing() {
+        let url = RelayUrl::parse("wss://relay.example.com/").unwrap();
+        let cases = [
+            (RelayStatus::Initialized, RelayHealthStatus::Connecting),
+            (RelayStatus::Pending, RelayHealthStatus::Connecting),
+            (RelayStatus::Connecting, RelayHealthStatus::Connecting),
+            (RelayStatus::Sleeping, RelayHealthStatus::Connecting),
+            (RelayStatus::Connected, RelayHealthStatus::Connected),
+            (RelayStatus::Disconnected, RelayHealthStatus::Offline),
+            (RelayStatus::Terminated, RelayHealthStatus::Offline),
+            (RelayStatus::Banned, RelayHealthStatus::Offline),
+        ];
+        for (status, expected) in cases {
+            let health = relay_health_from_parts(
+                &url,
+                status,
+                1_700_000_000,
+                Some(Duration::from_millis(42)),
+            );
+            assert_eq!(health.status, expected, "{status}");
+            assert_eq!(health.url, "wss://relay.example.com");
+            assert_eq!(health.last_connected_ms, 1_700_000_000_000);
+            assert_eq!(health.rtt_ms, Some(42));
+        }
+
+        let unseen = relay_health_from_parts(&url, RelayStatus::Disconnected, 0, None);
+        assert_eq!(unseen.last_connected_ms, 0);
+        assert_eq!(unseen.rtt_ms, None);
+    }
+
+    #[test]
+    fn pool_relay_url_identity_strips_slash_case_and_default_port() {
+        let url = RelayUrl::parse("wss://Relay.Example.com:443/").unwrap();
+        assert_eq!(
+            url.as_str_without_trailing_slash(),
+            "wss://relay.example.com"
+        );
+        let plain = RelayUrl::parse("wss://relay.example.com").unwrap();
+        assert_eq!(
+            plain.as_str_without_trailing_slash(),
+            "wss://relay.example.com"
+        );
+        let path = RelayUrl::parse("wss://relay.example.com/path/").unwrap();
+        assert_eq!(
+            path.as_str_without_trailing_slash(),
+            "wss://relay.example.com/path"
+        );
     }
 }

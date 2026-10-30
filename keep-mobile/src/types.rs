@@ -241,12 +241,35 @@ pub enum ConnectionStatus {
     Error { message: String },
 }
 
+/// Coarse per-relay state. The nostr pool's eight statuses are collapsed in
+/// the core; surfaces must not reclassify them.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelayHealthStatus {
+    Connecting,
+    Connected,
+    Offline,
+}
+
+/// Health of one relay in the FROST nostr pool. Profile and bunker relays are
+/// not included.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct RelayHealth {
+    pub url: String,
+    pub status: RelayHealthStatus,
+    /// Unix milliseconds of the last successful connection. `0` if never.
+    pub last_connected_ms: u64,
+    /// Round trip in milliseconds. Absent until the pool has enough samples.
+    pub rtt_ms: Option<u64>,
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct KeepLiveState {
     pub rev: u64,
     pub connection_status: ConnectionStatus,
     pub peers: Vec<PeerInfo>,
     pub pending_requests: Vec<SignRequest>,
+    /// Per-relay health for the live FROST pool. Empty before the node is up.
+    pub relays: Vec<RelayHealth>,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

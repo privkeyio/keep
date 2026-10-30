@@ -58,8 +58,9 @@ pub use storage::{PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo,
 pub use types::{
     AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
     DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult, GeneratedShareInfo,
-    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig,
-    RosterVerification, SignRequest, SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
+    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig, RelayHealth,
+    RelayHealthStatus, RosterVerification, SignRequest, SignRequestMetadata, ThresholdConfig,
+    WalletDescriptorInfo,
 };
 pub use warden_auth::WardenGovernance;
 
@@ -814,14 +815,78 @@ struct StateContext {
     pending: Arc<Mutex<Vec<PendingRequest>>>,
     callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     rev: Arc<std::sync::atomic::AtomicU64>,
+    /// Last relay snapshot delivered to the callback. The health poll uses it
+    /// to avoid bumping `rev` while nothing about the relays changed.
+    last_relays: std::sync::Mutex<Option<Vec<RelayHealth>>>,
+}
+
+fn convert_relay_health(health: keep_frost_net::RelayHealth) -> RelayHealth {
+    RelayHealth {
+        url: health.url,
+        status: match health.status {
+            keep_frost_net::RelayHealthStatus::Connecting => RelayHealthStatus::Connecting,
+            keep_frost_net::RelayHealthStatus::Connected => RelayHealthStatus::Connected,
+            keep_frost_net::RelayHealthStatus::Offline => RelayHealthStatus::Offline,
+        },
+        last_connected_ms: health.last_connected_ms,
+        rtt_ms: health.rtt_ms,
+    }
 }
 
 impl StateContext {
+    async fn relay_snapshot(&self) -> Vec<RelayHealth> {
+        self.node
+            .relay_health()
+            .await
+            .into_iter()
+            .map(convert_relay_health)
+            .collect()
+    }
+
+    fn store_relays(&self, relays: &[RelayHealth]) {
+        let mut guard = self
+            .last_relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(relays.to_vec());
+    }
+
+    fn relays_unchanged(&self, relays: &[RelayHealth]) -> bool {
+        let guard = self
+            .last_relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.as_ref().is_some_and(|previous| previous == relays)
+    }
+
     async fn push(&self, connection_status: &ConnectionStatus) {
         let Some(cb) = self.callback.read().await.clone() else {
             return;
         };
+        let relays = self.relay_snapshot().await;
+        self.store_relays(&relays);
+        self.emit(cb, connection_status, relays).await;
+    }
 
+    /// Re-read pool health and push only when it differs from the last snapshot.
+    async fn push_relays_if_changed(&self, connection_status: &ConnectionStatus) {
+        let Some(cb) = self.callback.read().await.clone() else {
+            return;
+        };
+        let relays = self.relay_snapshot().await;
+        if self.relays_unchanged(&relays) {
+            return;
+        }
+        self.store_relays(&relays);
+        self.emit(cb, connection_status, relays).await;
+    }
+
+    async fn emit(
+        &self,
+        cb: Arc<dyn KeepStateCallback>,
+        connection_status: &ConnectionStatus,
+        relays: Vec<RelayHealth>,
+    ) {
         let peers: Vec<PeerInfo> = self
             .node
             .peer_status()
@@ -845,6 +910,7 @@ impl StateContext {
             connection_status: connection_status.clone(),
             peers,
             pending_requests,
+            relays,
         };
 
         if let Err(e) = tokio::task::spawn_blocking(move || cb.on_state_changed(state))
@@ -4625,6 +4691,7 @@ impl KeepMobile {
                 pending: self.pending_requests.clone(),
                 callback: self.state_callback.clone(),
                 rev: self.state_rev.clone(),
+                last_relays: std::sync::Mutex::new(None),
             };
             // Retire any prior node before starting the new one so its pending
             // requests are cleared up front. Clearing before the tasks below
@@ -5296,18 +5363,33 @@ impl KeepMobile {
         })
     }
 
+    /// How often the live node re-reads nostr relay status. This does not open
+    /// connections; it samples status the pool already tracks, and pushes only
+    /// when that snapshot changes.
+    const RELAY_HEALTH_POLL: Duration = Duration::from_secs(2);
+
     async fn event_listener(
         mut event_rx: broadcast::Receiver<KfpNodeEvent>,
         mut request_rx: mpsc::Receiver<(SessionInfo, mpsc::Sender<bool>)>,
         desc: DescriptorContext,
         state: StateContext,
     ) {
-        // FIXME: connection_status is hardcoded; KfpNodeEvent doesn't
-        // emit connect/disconnect events yet, so we can't track real state.
+        // Aggregate connection_status stays Connected on purpose. KfpNodeEvent
+        // still has no connect/disconnect signal, and the connect button treats
+        // Connected as "already up". Per-relay health on KeepLiveState is the
+        // live signal; it is sampled from the pool, not from KfpNodeEvent,
+        // because pool notifications do not carry relay status changes.
         let connection_status = ConnectionStatus::Connected;
+        let mut health_tick = tokio::time::interval(Self::RELAY_HEALTH_POLL);
+        health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` completes immediately. The push below is the first snapshot.
+        health_tick.tick().await;
         state.push(&connection_status).await;
         loop {
             tokio::select! {
+                _ = health_tick.tick() => {
+                    state.push_relays_if_changed(&connection_status).await;
+                }
                 result = event_rx.recv() => {
                     match result {
                         Ok(KfpNodeEvent::SignatureComplete { session_id, .. })
