@@ -249,6 +249,16 @@ pub struct KeepLiveState {
     pub pending_requests: Vec<SignRequest>,
 }
 
+/// What `create_backup` would leave out of a backup.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct BackupDescriptorGaps {
+    /// The descriptor index could not be read, so only the descriptors of
+    /// groups held on this device are backed up.
+    pub index_unreadable: bool,
+    /// Groups whose descriptor record could not be read and is left out.
+    pub unreadable_groups: Vec<String>,
+}
+
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct BackupInfo {
     pub key_count: u32,

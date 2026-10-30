@@ -56,10 +56,11 @@ pub use signing_policy::{
 };
 pub use storage::{PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo, StoredShareInfo};
 pub use types::{
-    AnnouncedXpubInfo, BackupInfo, ConnectionStatus, DescriptorProposal, DeviceRegistrationInfo,
-    DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult, GeneratedShareInfo,
-    KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus, RecoveryTierConfig,
-    RosterVerification, SignRequest, SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
+    AnnouncedXpubInfo, BackupDescriptorGaps, BackupInfo, ConnectionStatus, DescriptorProposal,
+    DeviceRegistrationInfo, DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult,
+    GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus,
+    RecoveryTierConfig, RosterVerification, SignRequest, SignRequestMetadata, ThresholdConfig,
+    WalletDescriptorInfo,
 };
 pub use warden_auth::WardenGovernance;
 
@@ -869,6 +870,31 @@ impl From<&ShareMetadata> for ShareMetadataInfo {
             total_shares: metadata.total_shares,
             group_pubkey: metadata.group_pubkey.to_vec(),
             did_backup: metadata.did_backup,
+        }
+    }
+}
+
+/// The descriptors a backup carries, and whether the index could be read. An
+/// unreadable index falls back to the descriptors of the groups held here, and
+/// any other group's is left out.
+fn descriptors_for_backup(
+    storage: &Arc<dyn SecureStorage>,
+    held: &[ShareMetadataInfo],
+) -> (persistence::DescriptorLoad, bool) {
+    match persistence::load_descriptors(storage) {
+        Ok(load) => (load, false),
+        Err(e) => {
+            tracing::warn!(
+                "Descriptor index unreadable, backing up the descriptors of held groups only: {e}"
+            );
+            let held: std::collections::BTreeSet<String> = held
+                .iter()
+                .map(|meta| hex::encode(&meta.group_pubkey))
+                .collect();
+            (
+                persistence::load_listed_descriptors(storage, held, true),
+                true,
+            )
         }
     }
 }
@@ -3383,26 +3409,13 @@ impl KeepMobile {
         // `wallet_descriptor_delete` call site can only pass a group the list
         // returned, which by construction excludes the entry that is blocking.
         // So a single unreadable record would permanently deny every backup of
-        // the share material behind a generic failure. Surfacing this properly
-        // needs a channel the exported signature does not have; `unreadable` is
-        // the seam for it.
+        // the share material behind a generic failure. The app learns of the
+        // omission from `backup_descriptor_gaps` instead.
         // The same holds for an index that cannot be read, which no save or
         // delete gets past until `wallet_descriptor_repair_index` runs: the
         // descriptors of the groups held here are read without it, and any
         // other group's is left out.
-        let load = match persistence::load_descriptors(&self.storage) {
-            Ok(load) => load,
-            Err(e) => {
-                tracing::warn!(
-                    "Descriptor index unreadable, backing up the descriptors of held groups only: {e}"
-                );
-                let held: std::collections::BTreeSet<String> = all_share_meta
-                    .iter()
-                    .map(|meta| hex::encode(&meta.group_pubkey))
-                    .collect();
-                persistence::load_listed_descriptors(&self.storage, held)
-            }
-        };
+        let (load, _) = descriptors_for_backup(&self.storage, &all_share_meta);
         if !load.unreadable.is_empty() {
             tracing::warn!(
                 unreadable = %load.unreadable.join(", "),
@@ -3585,6 +3598,30 @@ impl KeepMobile {
             &passphrase,
         )
         .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })
+    }
+
+    /// The wallet descriptors `create_backup` would leave out right now, as far
+    /// as this side can tell.
+    ///
+    /// A backup proceeds without a descriptor it cannot read, so the shares are
+    /// never held hostage to one bad record, but a user who restores from it and
+    /// wipes this device loses what locates the funds. Call this before offering
+    /// the backup and show any gap.
+    ///
+    /// With `index_unreadable`, only the descriptors of groups held here are
+    /// backed up and any other group's is left out, and every descriptor
+    /// delete fails until `wallet_descriptor_repair_index` runs. Otherwise each
+    /// group in `unreadable_groups` can be passed to `wallet_descriptor_delete`.
+    /// A record stored but not listed in the index, which nothing here
+    /// enumerates, is left out of a backup without showing up here, so an
+    /// empty result is not proof the backup is complete.
+    pub fn backup_descriptor_gaps(&self) -> BackupDescriptorGaps {
+        let (load, index_unreadable) =
+            descriptors_for_backup(&self.storage, &self.storage.list_all_shares());
+        BackupDescriptorGaps {
+            index_unreadable,
+            unreadable_groups: load.unreadable,
+        }
     }
 
     pub fn verify_backup(
@@ -6276,7 +6313,7 @@ mod import_teardown_tests {
         storage
             .store_share_by_key(
                 DESCRIPTOR_INDEX_KEY.into(),
-                serde_json::to_vec(&vec![orphan]).unwrap(),
+                serde_json::to_vec(&vec![orphan.clone()]).unwrap(),
                 persistence::storage_metadata("descriptor_index"),
             )
             .unwrap();
@@ -6284,6 +6321,32 @@ mod import_teardown_tests {
         mobile
             .create_backup("a-sufficiently-long-passphrase".into())
             .expect("an unreadable descriptor must not deny the share backup");
+        let gaps = mobile.backup_descriptor_gaps();
+        assert!(!gaps.index_unreadable);
+        assert_eq!(gaps.unreadable_groups, vec![orphan.clone()]);
+        mobile.wallet_descriptor_delete(orphan).unwrap();
+        assert!(mobile.backup_descriptor_gaps().unreadable_groups.is_empty());
+    }
+
+    #[test]
+    fn backup_descriptor_gaps_reports_an_unreadable_index() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        assert_eq!(
+            mobile.backup_descriptor_gaps(),
+            BackupDescriptorGaps {
+                index_unreadable: false,
+                unreadable_groups: vec![],
+            }
+        );
+        storage
+            .store_share_by_key(
+                DESCRIPTOR_INDEX_KEY.into(),
+                b"not json".to_vec(),
+                persistence::storage_metadata("descriptor_index"),
+            )
+            .unwrap();
+        assert!(mobile.backup_descriptor_gaps().index_unreadable);
     }
 
     // The list surface must not hand foreign code a raw registration token,
@@ -7065,7 +7128,11 @@ mod restore_backup_metadata_tests {
         let pass = "correct horse battery staple";
         let bytes = keep_core::backup::create_backup_from_data(
             vec![],
-            vec![backup_share(true)],
+            vec![backup_share(true), {
+                let mut share = backup_share(true);
+                share.group_pubkey = hex::encode([9u8; 32]);
+                share
+            }],
             [group, [8u8; 32]]
                 .map(|group_pubkey| keep_core::wallet::WalletDescriptor {
                     group_pubkey,
@@ -7101,12 +7168,21 @@ mod restore_backup_metadata_tests {
             .unwrap()
             .insert(DESCRIPTOR_INDEX_KEY.into(), b"not json".to_vec());
         assert!(mobile.wallet_descriptor_delete(hex::encode(group)).is_err());
+        // The held group with no descriptor is not a gap, and the one with a
+        // descriptor is read without the index.
+        assert_eq!(
+            mobile.backup_descriptor_gaps(),
+            BackupDescriptorGaps {
+                index_unreadable: true,
+                unreadable_groups: vec![],
+            }
+        );
 
         let backup = mobile
             .create_backup(pass.into())
             .expect("an unreadable index must not deny the share backup");
         let decrypted = decrypt_backup_data(&backup, pass).unwrap();
-        assert_eq!(decrypted.shares.len(), 1);
+        assert_eq!(decrypted.shares.len(), 2);
         assert_eq!(
             decrypted.wallet_descriptors.len(),
             1,
