@@ -257,11 +257,13 @@ fn legacy_override_key(package: &str) -> String {
 const FOLLOWS_GLOBAL: &str = "global";
 
 /// The key of `account`'s override for `package`, or `None` when `account` is
-/// not a 32-byte hex group key or `package` could collide with another key.
+/// not a 32-byte hex group key or `package` is empty. The account part is a
+/// fixed 64 characters, so two scoped keys never collide. A legacy key that
+/// spells out a scoped one is only ever read as a floor, so it can tighten
+/// that account but never loosen it.
 fn app_override_key(account: &str, package: &str) -> Option<String> {
     let account_ok = account.len() == 64 && account.bytes().all(|b| b.is_ascii_hexdigit());
-    let package_ok = !package.is_empty() && !package.contains(':');
-    (account_ok && package_ok).then(|| {
+    (account_ok && !package.is_empty()).then(|| {
         format!(
             "sign_policy_override:{}:{package}",
             account.to_ascii_lowercase()
@@ -331,8 +333,8 @@ impl SignPolicyStore {
     /// may be stricter than the global policy, so it is never taken as absent.
     /// Until the account chooses for the app, an override from before
     /// overrides were per account, which belongs to no known account, can only
-    /// tighten the global policy. An `account` that is not a group key, or a
-    /// `package` with a `:`, is `Manual`.
+    /// tighten the global policy. An `account` that is not a group key, or an
+    /// empty `package`, is `Manual`.
     pub fn app_override(&self, account: String, package: String) -> Option<SignPolicySelection> {
         let Some(key) = app_override_key(&account, &package) else {
             return Some(SignPolicySelection::Manual);
@@ -355,7 +357,7 @@ impl SignPolicyStore {
     /// clear records that the app follows the global policy for this account,
     /// which, like a set, supersedes any override from before overrides were
     /// per account for this account only. Returns whether the write persisted,
-    /// and `false` for an invalid `account` or `package`.
+    /// and `false` for an invalid `account` or an empty `package`.
     ///
     /// A failed clear matters most: an override is typically stricter than the
     /// global policy, so a caller that treats an unconfirmed clear as done can
@@ -2006,23 +2008,41 @@ mod tests {
     }
 
     #[test]
-    fn a_package_that_could_collide_with_another_key_is_refused() {
-        let storage = MockPolicyStorage::new();
-        let store = SignPolicyStore::new(storage.clone());
-        store.set_global_policy(SignPolicySelection::Auto);
+    fn a_package_that_spells_out_another_accounts_key_gains_nothing() {
+        const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let store = SignPolicyStore::new(MockPolicyStorage::new());
+        store.set_global_policy(SignPolicySelection::Manual);
+        assert!(store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Auto)
+        ));
         let spoof = format!("{ACCOUNT}:com.app");
-        storage
-            .map
-            .lock()
-            .unwrap()
-            .insert(app_override_key(ACCOUNT, "com.app").unwrap(), "2".into());
-        for package in [spoof.as_str(), "", "a:b"] {
-            assert_eq!(
-                store.effective_policy(ACCOUNT.into(), package.into()),
-                SignPolicySelection::Manual,
-                "{package:?}"
-            );
-            assert!(!store.set_app_override(ACCOUNT.into(), package.into(), None));
-        }
+        assert_eq!(
+            store.effective_policy(OTHER.into(), spoof.clone()),
+            SignPolicySelection::Manual
+        );
+        assert!(store.set_app_override(OTHER.into(), spoof, None));
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.app".into()),
+            SignPolicySelection::Auto
+        );
+
+        let nip46 = format!("nip46:{OTHER}");
+        assert!(store.set_app_override(
+            ACCOUNT.into(),
+            nip46.clone(),
+            Some(SignPolicySelection::Basic)
+        ));
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), nip46),
+            SignPolicySelection::Basic
+        );
+
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), String::new()),
+            SignPolicySelection::Manual
+        );
+        assert!(!store.set_app_override(ACCOUNT.into(), String::new(), None));
     }
 }
