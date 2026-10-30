@@ -428,6 +428,8 @@ impl ServerCallbacks for CallbackBridge {
             .persist_bunker_permissions(grants, &self.grant_scope, serving)
         {
             tracing::warn!("failed to persist bunker permissions: {e}");
+        } else if let Err(e) = clear_pending_revokes(&self.mobile, serving) {
+            tracing::warn!("failed to clear finished revokes: {e}");
         }
     }
 }
@@ -512,37 +514,11 @@ impl BunkerHandler {
         })
     }
 
-    /// Runs `f` on the stored bunker config under its lock.
     fn with_bunker_config<T>(
         &self,
         f: impl FnOnce(&mut crate::persistence::StoredBunkerConfig) -> Result<T, KeepMobileError>,
     ) -> Result<T, KeepMobileError> {
-        let _guard =
-            self.mobile
-                .bunker_config_lock
-                .lock()
-                .map_err(|_| KeepMobileError::StorageError {
-                    msg: "bunker config lock poisoned".into(),
-                })?;
-
-        let mut stored = crate::persistence::load_bunker_config(
-            &self.mobile.storage,
-            crate::BUNKER_CONFIG_STORAGE_KEY,
-        )?
-        .unwrap_or_default();
-
-        // Zeroize the decrypted plaintext secrets in `stored` on every exit path
-        // (the new secrets on success, the loaded old secrets on any error),
-        // since `StoredBunkerConfig` is not `ZeroizeOnDrop`.
-        let result = f(&mut stored);
-
-        if let Some(s) = stored.transport_secret.as_mut() {
-            s.zeroize();
-        }
-        if let Some(s) = stored.connect_secret.as_mut() {
-            s.zeroize();
-        }
-        result
+        with_bunker_config(&self.mobile, f)
     }
 
     /// The clients a revoke left pending: whether every client was revoked,
@@ -584,7 +560,7 @@ impl BunkerHandler {
     /// The persisted grants a start restores, less those of any client a
     /// revoke left pending. Those revokes are finished first where they can
     /// be. Where they cannot, the grants stay on disk but are not served, and
-    /// the engine's next persist replaces them.
+    /// the engine's next persist replaces them and clears the marks.
     fn grants_to_restore(&self, scope: &str) -> Result<Vec<PreGrantedApp>, KeepMobileError> {
         let (all, clients) = self.pending_revokes()?;
         if let Err(e) = self.finish_pending_revokes() {
@@ -908,6 +884,58 @@ fn decode_transport_secret(hex_str: &str) -> Option<Zeroizing<[u8; 32]>> {
     let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(decoded.as_slice().try_into().ok()?);
     nostr_sdk::secp256k1::SecretKey::from_slice(bytes.as_slice()).ok()?;
     Some(bytes)
+}
+
+/// Runs `f` on the stored bunker config under its lock.
+fn with_bunker_config<T>(
+    mobile: &KeepMobile,
+    f: impl FnOnce(&mut crate::persistence::StoredBunkerConfig) -> Result<T, KeepMobileError>,
+) -> Result<T, KeepMobileError> {
+    let _guard = mobile
+        .bunker_config_lock
+        .lock()
+        .map_err(|_| KeepMobileError::StorageError {
+            msg: "bunker config lock poisoned".into(),
+        })?;
+
+    let mut stored =
+        crate::persistence::load_bunker_config(&mobile.storage, crate::BUNKER_CONFIG_STORAGE_KEY)?
+            .unwrap_or_default();
+
+    // Zeroize the decrypted plaintext secrets in `stored` on every exit path
+    // (the new secrets on success, the loaded old secrets on any error),
+    // since `StoredBunkerConfig` is not `ZeroizeOnDrop`.
+    let result = f(&mut stored);
+
+    if let Some(s) = stored.transport_secret.as_mut() {
+        s.zeroize();
+    }
+    if let Some(s) = stored.connect_secret.as_mut() {
+        s.zeroize();
+    }
+    result
+}
+
+/// Clears every pending revoke once a serving bunker has persisted its whole
+/// grant set, which replaced whatever grants those revokes left on disk. A
+/// revoke stops the server before it writes its mark, so checking `serving`
+/// under the bunker config lock never clears a mark written after the persist.
+fn clear_pending_revokes(
+    mobile: &KeepMobile,
+    serving: impl FnOnce() -> bool,
+) -> Result<(), KeepMobileError> {
+    with_bunker_config(mobile, |stored| {
+        if !serving() || (!stored.pending_revoke_all && stored.pending_revokes.is_empty()) {
+            return Ok(());
+        }
+        stored.pending_revoke_all = false;
+        stored.pending_revokes.clear();
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })
 }
 
 /// Loads the persisted bunker transport key + connect secret, generating and
@@ -2458,6 +2486,61 @@ mod tests {
         assert!(served_clients(&handler).is_empty());
         assert!(restored_clients(&mobile).is_empty());
         assert!(!stored_config(&storage).pending_revoke_all);
+    }
+
+    // A start that could not finish a revoke serves without the revoked
+    // client's grants, so its first persist replaces them and the mark goes.
+    // Kept, the mark would erase a later approval of that client at the next
+    // start. A server that a later revoke stopped clears nothing.
+    #[test]
+    fn a_serving_bunkers_persist_finishes_pending_revokes() {
+        struct Silent;
+        impl BunkerCallbacks for Silent {
+            fn on_log(&self, _event: BunkerLogEvent) {}
+            fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+                BunkerApprovalResult {
+                    approved: false,
+                    remember: BunkerRememberDuration::JustThisTime,
+                }
+            }
+            fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+        }
+
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (a, b) = (
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+        );
+        persist_remembered(&mobile, &[a, b]);
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::relay_config_key(None));
+        handler.revoke_client(a.to_hex()).unwrap();
+        assert_eq!(served_clients(&handler), vec![b.to_hex()]);
+        assert_eq!(stored_config(&storage).pending_revokes, vec![a.to_hex()]);
+
+        let (transport, _) = load_or_create_bunker_keys(&mobile).unwrap();
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(Silent),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: grant_scope(&transport, &GROUP).unwrap(),
+            serving: Arc::new(AtomicBool::new(true)),
+        };
+        *mem.fail_writes_to.lock().unwrap() = None;
+        ServerCallbacks::persist_permissions(&bridge, vec![remembered(&a), remembered(&b)]);
+        assert!(stored_config(&storage).pending_revokes.is_empty());
+        assert_eq!(served_clients(&handler).len(), 2, "a was approved again");
+
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::relay_config_key(None));
+        handler.revoke_client(b.to_hex()).unwrap();
+        *mem.fail_writes_to.lock().unwrap() = None;
+        ServerCallbacks::persist_permissions(&bridge, vec![remembered(&a), remembered(&b)]);
+        assert_eq!(stored_config(&storage).pending_revokes, vec![b.to_hex()]);
+        assert_eq!(served_clients(&handler), vec![a.to_hex()]);
     }
 
     // A relay config that cannot be read keeps the mark set, but must not
