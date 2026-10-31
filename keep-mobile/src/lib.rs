@@ -1934,12 +1934,7 @@ impl KeepMobile {
                     tracing::warn!("failed to stash pending DKG marker before import: {e}");
                 }
 
-                match self.import_share_export(
-                    result.share_export,
-                    passphrase.to_string(),
-                    name,
-                    true,
-                ) {
+                match self.import_share(result.share_export, passphrase.to_string(), name) {
                     Ok(info) => {
                         // Import confirmed; clear the stash (best-effort — a stale
                         // stash is recovered idempotently, never lost).
@@ -5490,8 +5485,8 @@ impl KeepMobile {
     /// share there. An import has no way to tell a copy of a stored share from
     /// a forgery short of reading its record, so none is written over, with
     /// one exception: when `own_same` is set, the same share (the same index
-    /// of a threshold group of the same size) may be, which only this device's
-    /// own DKG result asks for. A stored key (1-of-1) is never written over:
+    /// of a threshold group of the same size) may be, which only the recovery
+    /// of this device's own DKG stash asks for. A stored key (1-of-1) is never written over:
     /// its record holds the seed words it was created from.
     fn refuse_listed_share(
         &self,
@@ -5519,10 +5514,11 @@ impl KeepMobile {
         }
     }
 
-    /// Import a share export, as [`Self::import_share`] does. `own` marks an
-    /// export this device produced in a DKG ceremony (its result, or the stash
-    /// kept of it), which may write over the same share of its group: a
-    /// recovery redoes an import that landed before its stash was cleared.
+    /// Import a share export, as [`Self::import_share`] does. `own` marks the
+    /// stash a DKG ceremony on this device kept of its result, which may write
+    /// over the same share of its group: a recovery redoes an import that
+    /// landed before its stash was cleared. A ceremony's own import needs no
+    /// exception, since its group is new.
     fn import_share_export(
         &self,
         data: String,
@@ -12316,6 +12312,22 @@ mod share_registry_tests {
         );
         assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
         assert!(mobile.pending_dkg_share().unwrap().is_some());
+    }
+
+    // A stored key holds the seed words it was made from, so not even a
+    // ceremony's own stash writes over it.
+    #[test]
+    fn a_stored_key_is_never_written_over_by_a_dkg_stash() {
+        let (storage, mobile) = setup();
+        let info = import_nsec(&mobile).unwrap();
+        let before = storage.raw(&info.group_pubkey).unwrap();
+        let data = mobile.export_share(PASS.into()).unwrap();
+        let result = mobile.import_share_export(data, PASS.into(), "again".into(), true);
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This key is already stored"),
+            "got {result:?}"
+        );
+        assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
     }
 
     // At the cap a share already stored is refused as stored, not as over the

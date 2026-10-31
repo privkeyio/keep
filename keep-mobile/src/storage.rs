@@ -95,8 +95,10 @@ pub trait SecureStorage: Send + Sync {
     ///
     /// For a share key (a group public key in hex), when `key` already holds
     /// share data that the share registry does not list, the write must be
-    /// refused, unless `metadata` names the same group and share index, which
-    /// redoes a write that stopped before the registry was updated. Other
+    /// refused, unless `metadata` names the same group, share index, threshold
+    /// and share count as the stored data, which redoes a write that stopped
+    /// before the registry was updated. Listing such data at startup instead
+    /// is better still, since core then refuses the write itself. Other
     /// records stored through this method are never in the registry, and the
     /// rule does not apply to them. Core checks for a share it would replace through the
     /// registry alone, so a share left out of it is one only this refusal
