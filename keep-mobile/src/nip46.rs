@@ -459,6 +459,9 @@ impl ServerCallbacks for CallbackBridge {
                         dropped = evicted.len(),
                         "authorized bunker client list dropped the oldest entries"
                     );
+                    // Outside the config lock. Revoking through the engine
+                    // persists a grant snapshot, and that takes the lock again.
+                    revoke_evicted_clients(&self.mobile, &evicted);
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("failed to record authorized bunker client: {e}"),
@@ -1018,6 +1021,55 @@ pub(crate) fn set_bunker_enabled(
             stored,
         )
     })
+}
+
+/// Drops remembered grants for clients just removed from the roster.
+///
+/// A remembered kind is allowed by the in-memory engine without consulting
+/// the roster, so an evicted client would keep signing until the next start.
+/// The engine snapshot, when this server is still the one being served,
+/// replaces the persisted grants. The per-client forget covers a grant that
+/// snapshot did not write, and does not touch a client still on the roster.
+/// Neither failure fails the connect: the client was already evicted.
+fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) {
+    let clients: Vec<PublicKey> = evicted
+        .iter()
+        .filter_map(|stored| PublicKey::parse(stored).ok())
+        .collect();
+    if clients.is_empty() {
+        return;
+    }
+    let handler = mobile
+        .live_bunker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(handler) = handler {
+        let revoke = async {
+            for client in &clients {
+                handler.revoke_client(client).await;
+            }
+        };
+        // `on_connect` runs on the bunker runtime. `Runtime::block_on` panics
+        // there; a current-thread runtime cannot `block_in_place` either.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle)
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+            {
+                tokio::task::block_in_place(|| handle.block_on(revoke));
+            }
+            Ok(_) => tracing::warn!(
+                "evicted bunker clients stay granted in memory: this runtime cannot wait on the engine"
+            ),
+            Err(_) => mobile.runtime.block_on(revoke),
+        }
+    }
+    for client in &clients {
+        if let Err(e) = mobile.forget_bunker_permissions(Some(client)) {
+            tracing::warn!("failed to drop an evicted bunker client's grants: {e}");
+        }
+    }
 }
 
 /// Records one explicit connect on the roster. Does not rotate the connect
@@ -2789,6 +2841,7 @@ mod tests {
         let mut stored = stored_config(&storage);
         stored.authorized_clients = oldest.iter().map(|key| key.to_hex()).collect();
         persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        persist_grants(&mobile, &[oldest[0], oldest[1]]);
         let newest = nostr_sdk::Keys::generate().public_key();
         let (bridge, _) = noted(&mobile, true);
         connect_as(
@@ -2806,6 +2859,102 @@ mod tests {
             .iter()
             .any(|client| client == &oldest[0].to_hex()));
         assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+        let grants = restored_clients(&mobile);
+        assert!(
+            !grants.iter().any(|client| client == &oldest[0].to_hex()),
+            "an evicted client's remembered grant is dropped"
+        );
+        assert!(
+            grants.iter().any(|client| client == &oldest[1].to_hex()),
+            "a client that stayed on the roster keeps its grant"
+        );
+    }
+
+    // While the bunker is running, the in-memory grant — not the roster —
+    // decides a remembered kind. Evicting the client has to revoke that grant
+    // too, or it keeps signing until the next start.
+    #[test]
+    fn evicting_a_client_revokes_its_live_grant() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let (dropped, kept) = (oldest[0], oldest[1]);
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[dropped, kept]);
+
+        let noted = Arc::new(Noted {
+            connects: Mutex::new(Vec::new()),
+            prompts: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(CallbackBridge {
+            callbacks: Arc::clone(&noted) as Arc<dyn BunkerCallbacks>,
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: grant_scope(&transport, &GROUP).unwrap(),
+            serving: Arc::new(AtomicBool::new(true)),
+        });
+        let handler = Arc::new(SignerHandler::new(
+            Arc::new(tokio::sync::Mutex::new(keep_core::keyring::Keyring::new())),
+            Arc::new(tokio::sync::Mutex::new(keep_nip46::PermissionManager::new())),
+            Arc::new(tokio::sync::Mutex::new(keep_nip46::AuditLog::new(8))),
+            Some(Arc::clone(&bridge) as Arc<dyn ServerCallbacks>),
+        ));
+        mobile.runtime.block_on(async {
+            for client in [dropped, kept] {
+                let app = PreGrantedApp::from_stored(&remembered(&client)).unwrap();
+                handler
+                    .restore_client(
+                        app.pubkey,
+                        app.name,
+                        app.permissions,
+                        app.auto_approve_kinds,
+                        app.duration,
+                        app.connected_at,
+                        app.timed_kind_grants,
+                        app.explicitly_remembered,
+                    )
+                    .await;
+            }
+        });
+        *mobile.live_bunker.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&handler));
+
+        let before = mobile.runtime.block_on(handler.list_clients());
+        assert!(before.iter().any(|app| app.pubkey == dropped));
+        assert!(before.iter().any(|app| app.pubkey == kept));
+
+        let newest = nostr_sdk::Keys::generate().public_key();
+        connect_as(
+            &bridge,
+            &newest.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &dropped.to_hex()));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &kept.to_hex()));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+
+        let grants = restored_clients(&mobile);
+        assert!(!grants.iter().any(|client| client == &dropped.to_hex()));
+        assert!(grants.iter().any(|client| client == &kept.to_hex()));
+        let after = mobile.runtime.block_on(handler.list_clients());
+        assert!(after.iter().all(|app| app.pubkey != dropped));
+        assert!(after.iter().any(|app| {
+            app.pubkey == kept && app.auto_approve_kinds.contains(&Kind::from(1u16))
+        }));
     }
 
     // Connect is asked of a client the roster does not list. Every other method
