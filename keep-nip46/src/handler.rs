@@ -488,34 +488,40 @@ impl SignerHandler {
             .as_ref()
             .map_or(ClientListing::Unrestricted, |cb| cb.client_listing());
         let mut pm = self.permissions.lock().await;
-        let admitted = match &listing {
-            ClientListing::Unrestricted => Ok(false),
-            ClientListing::Listed(listed) => pm
-                .admit_listed(&app_pubkey, listed)
-                .ok_or_else(|| KeepError::CapacityExceeded("too many connected apps".into())),
-            ClientListing::Unavailable => Err(KeepError::PermissionDenied(
-                "the connected app list cannot be read".into(),
-            )),
-        };
-        let displaced = match admitted {
-            Ok(displaced) => displaced,
-            Err(e) => {
-                drop(pm);
-                self.audit.lock().await.log(
-                    AuditEntry::new(AuditAction::Connect, app_pubkey)
-                        .with_success(false)
-                        .with_reason("not admitted"),
-                );
-                return Err(e);
+        let (refusal, dropped) = match &listing {
+            ClientListing::Unrestricted => (None, false),
+            ClientListing::Listed(listed) => {
+                let (admitted, dropped) = pm.admit_listed(&app_pubkey, listed);
+                let refusal = (!admitted)
+                    .then(|| KeepError::CapacityExceeded("too many connected apps".into()));
+                (refusal, dropped)
             }
+            ClientListing::Unavailable => (
+                Some(KeepError::PermissionDenied(
+                    "the connected app list cannot be read".into(),
+                )),
+                false,
+            ),
         };
+        if let Some(e) = refusal {
+            drop(pm);
+            if dropped {
+                self.persist_permissions().await;
+            }
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::Connect, app_pubkey)
+                    .with_success(false)
+                    .with_reason("not admitted"),
+            );
+            return Err(e);
+        }
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
             return Err(KeepError::CapacityExceeded(
                 "too many connected apps".into(),
             ));
         }
         drop(pm);
-        if displaced {
+        if dropped {
             self.persist_permissions().await;
         }
 
@@ -2669,7 +2675,7 @@ mod tests {
 
     struct ListingCallbacks {
         listing: std::sync::Mutex<ClientListing>,
-        snapshots: std::sync::Mutex<usize>,
+        snapshots: std::sync::Mutex<Vec<Vec<keep_core::relay::StoredBunkerPermission>>>,
     }
     impl crate::types::ServerCallbacks for ListingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
@@ -2679,15 +2685,15 @@ mod tests {
         fn client_listing(&self) -> ClientListing {
             self.listing.lock().unwrap().clone()
         }
-        fn persist_permissions(&self, _grants: Vec<keep_core::relay::StoredBunkerPermission>) {
-            *self.snapshots.lock().unwrap() += 1;
+        fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
+            self.snapshots.lock().unwrap().push(grants);
         }
     }
 
     fn listing_handler(listing: ClientListing) -> (SignerHandler, Arc<ListingCallbacks>) {
         let cb = Arc::new(ListingCallbacks {
             listing: std::sync::Mutex::new(listing),
-            snapshots: std::sync::Mutex::new(0),
+            snapshots: std::sync::Mutex::new(Vec::new()),
         });
         let handler = SignerHandler::new(
             setup_keyring(),
@@ -2752,16 +2758,48 @@ mod tests {
     async fn listed_client_displaces_an_unlisted_app_and_persists() {
         let client = Keys::generate().public_key();
         let (handler, cb) = listing_handler(ClientListing::Unrestricted);
-        for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
-            connect(&handler, Keys::generate().public_key(), "secret")
+        let unlisted: Vec<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        for app in &unlisted {
+            connect(&handler, *app, "secret").await.unwrap();
+            assert!(handler
+                .permissions
+                .lock()
                 .await
-                .unwrap();
+                .grant_kind_forever(app, Kind::TextNote));
         }
         *cb.listing.lock().unwrap() = ClientListing::Listed(HashSet::from([client]));
-        let before = *cb.snapshots.lock().unwrap();
         connect(&handler, client, "secret").await.unwrap();
-        assert!(handler.permissions.lock().await.get_app(&client).is_some());
-        assert_eq!(*cb.snapshots.lock().unwrap(), before + 1);
+
+        let pm = handler.permissions.lock().await;
+        assert!(pm.get_app(&client).is_some());
+        let displaced: Vec<&PublicKey> = unlisted
+            .iter()
+            .filter(|app| pm.get_app(app).is_none())
+            .collect();
+        assert_eq!(displaced.len(), 1);
+        let snapshot = cb.snapshots.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(snapshot.len(), PermissionManager::MAX_CONNECTED_APPS - 1);
+        assert!(!snapshot
+            .iter()
+            .any(|p| p.pubkey_hex == displaced[0].to_hex()));
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_app_already_connected_reconnects_past_the_cap() {
+        let app = Keys::generate().public_key();
+        let (handler, cb) = listing_handler(ClientListing::Unrestricted);
+        connect(&handler, app, "secret").await.unwrap();
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        *cb.listing.lock().unwrap() = ClientListing::Listed(listed);
+        connect(&handler, app, "secret").await.unwrap();
+        assert!(matches!(
+            connect(&handler, Keys::generate().public_key(), "secret").await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
     }
 
     #[tokio::test]
