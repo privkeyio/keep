@@ -132,8 +132,15 @@ impl Waiting {
 
 /// Keep what the outcomes still need at `local_now`: a request past its
 /// time a little longer, without its payload, and a decided one for as long
-/// as its outcome can still arrive. Whether anything changed.
-fn prune(waiting: &mut Vec<Waiting>, local_now: u64) -> bool {
+/// as its outcome can still arrive. Requests that passed their time undecided
+/// since the last prune are added to `lapsed`. Whether anything changed.
+fn prune(waiting: &mut Vec<Waiting>, local_now: u64, lapsed: &mut Vec<Hex32>) -> bool {
+    lapsed.extend(
+        waiting
+            .iter()
+            .filter(|w| w.request.is_some() && w.until <= local_now)
+            .map(|w| w.id),
+    );
     let before = waiting.len();
     waiting.retain(|w| {
         let grace = if w.decided {
@@ -310,6 +317,11 @@ pub struct ApproverStatus {
     pub label: Option<String>,
     pub fingerprint: Option<String>,
     pub relays: Vec<String>,
+    /// Why the approver could not serve its relays at the last attempt, a
+    /// start or a move to the gateway's new relays, until one succeeds or it
+    /// stops. A start with no network succeeds and connects once the network
+    /// is back; relays that never answer raise the silence alert instead.
+    pub last_error: Option<String>,
     /// The gateway's freeze epoch, from the latest anchor kept.
     pub epoch: Option<u64>,
     pub all_frozen: bool,
@@ -331,6 +343,10 @@ pub enum ApproverEvent {
     },
     PairingRefused {
         reason: String,
+        /// The gateway refused, and the pairing is forgotten on this phone,
+        /// so the approver key made for it can go. Otherwise an answer failed
+        /// its checks and the pairing still waits for the gateway.
+        ended: bool,
     },
     Request {
         request: ApprovalRequest,
@@ -338,6 +354,11 @@ pub enum ApproverEvent {
     /// A request that failed a check, never offered for approval.
     RequestRefused {
         reason: String,
+    },
+    /// A request shown to the owner passed its time undecided and can no
+    /// longer be decided here. The gateway's `expired` outcome may follow.
+    RequestExpired {
+        request_id: String,
     },
     Outcome {
         request_id: String,
@@ -559,6 +580,8 @@ pub struct ApproverHandler {
     /// Closed, or dropped: the `KeepMobile`'s approver slot is given back.
     closed: AtomicBool,
     callbacks: Mutex<Option<Arc<dyn ApproverCallbacks>>>,
+    /// See [`ApproverStatus::last_error`].
+    last_error: Mutex<Option<String>>,
 }
 
 impl Drop for ApproverHandler {
@@ -664,6 +687,7 @@ impl ApproverHandler {
     /// Stop serving. Callers hold `lifecycle`.
     fn halt(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(running) = self
             .running
             .lock()
@@ -686,6 +710,13 @@ impl ApproverHandler {
     /// still enforces every recorded pin, and a mismatch stops it here. Relays
     /// that never connect are reported by the gateway-silence alert.
     fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
+        let result = self.serve(relays, keys);
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+            result.as_ref().err().map(|e| e.to_string());
+        result
+    }
+
+    fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
         checked_relays(&relays)?;
         let transport = keys.public_key();
         let proxy = self.mobile.configured_proxy()?;
@@ -915,6 +946,7 @@ impl ApproverHandler {
                 Ok(Pairing::Refused { reason, .. }) => {
                     fx.events.push(ApproverEvent::PairingRefused {
                         reason: gateway_text(&reason),
+                        ended: true,
                     });
                     forget = true;
                 }
@@ -947,11 +979,13 @@ impl ApproverHandler {
                         }
                         Err(e) => fx.events.push(ApproverEvent::PairingRefused {
                             reason: gateway_text(&e.to_string()),
+                            ended: false,
                         }),
                     }
                 }
                 Err(e) => fx.events.push(ApproverEvent::PairingRefused {
                     reason: gateway_text(&e.to_string()),
+                    ended: false,
                 }),
             },
             kind::REQUEST if stored.paired => {
@@ -995,7 +1029,9 @@ impl ApproverHandler {
                 {
                     stored.alert(alert_text(&alert), &mut fx);
                 }
-                prune(&mut stored.waiting, local_now);
+                let mut lapsed = Vec::new();
+                prune(&mut stored.waiting, local_now, &mut lapsed);
+                fx.events.extend(lapsed_events(lapsed));
                 if stored
                     .waiting
                     .iter()
@@ -1102,7 +1138,9 @@ impl ApproverHandler {
         if !stored.paired {
             return fx;
         }
-        let mut changed = prune(&mut stored.waiting, local_now);
+        let mut lapsed = Vec::new();
+        let mut changed = prune(&mut stored.waiting, local_now, &mut lapsed);
+        fx.events.extend(lapsed_events(lapsed));
         for alert in stored.tracker.due_alerts(local_now) {
             stored.alert(alert_text(&alert), &mut fx);
             changed = true;
@@ -1135,6 +1173,23 @@ impl ApproverHandler {
         }
         fx
     }
+}
+
+/// Refuse to begin a pairing over one paired or waiting for the gateway.
+fn not_pairing(inner: &Inner) -> Result<(), KeepMobileError> {
+    match inner.stored.as_ref() {
+        Some(s) if s.paired => Err(invalid("already paired: remove this pairing first")),
+        Some(_) => Err(invalid(
+            "a pairing is waiting for the gateway's answer: cancel it first",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn lapsed_events(lapsed: Vec<Hex32>) -> impl Iterator<Item = ApproverEvent> {
+    lapsed.into_iter().map(|id| ApproverEvent::RequestExpired {
+        request_id: id.to_hex(),
+    })
 }
 
 fn anchor_event(tracker: &AnchorTracker) -> ApproverEvent {
@@ -1189,6 +1244,7 @@ impl ApproverHandler {
             generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             callbacks: Mutex::new(None),
+            last_error: Mutex::new(None),
         }))
     }
 
@@ -1198,6 +1254,11 @@ impl ApproverHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
+        let last_error = self
+            .last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let inner = self.lock();
         let Some(stored) = inner.stored.as_ref() else {
             return ApproverStatus {
@@ -1207,6 +1268,7 @@ impl ApproverHandler {
                 label: None,
                 fingerprint: None,
                 relays: Vec::new(),
+                last_error,
                 epoch: None,
                 all_frozen: false,
                 frozen_credentials: Vec::new(),
@@ -1223,6 +1285,7 @@ impl ApproverHandler {
             label: Some(stored.label.clone()),
             fingerprint: stored.fingerprint().ok(),
             relays: stored.relays.clone(),
+            last_error,
             epoch: stored.tracker.epoch(),
             all_frozen: frozen.is_some_and(|f| f.all),
             frozen_credentials: frozen
@@ -1265,7 +1328,11 @@ impl ApproverHandler {
 
     /// The attestation challenge for the pairing code `uri`, to make the
     /// approver key with (`setAttestationChallenge`) before pairing begins.
+    /// Refused while paired or while a pairing waits for the gateway, so a
+    /// new approver key is never made over the one in use.
     pub fn pairing_attestation_challenge(&self, uri: String) -> Result<Vec<u8>, KeepMobileError> {
+        self.open_check()?;
+        not_pairing(&self.lock())?;
         let uri = PairingUri::parse(&uri).map_err(|e| invalid(e.to_string()))?;
         Ok(sig::pair_attestation_challenge(&uri.secret, &uri.gateway).to_vec())
     }
@@ -1283,9 +1350,7 @@ impl ApproverHandler {
     ) -> Result<PairingStart, KeepMobileError> {
         self.open_check()?;
         let mut inner = self.lock();
-        if inner.stored.as_ref().is_some_and(|s| s.paired) {
-            return Err(invalid("already paired: remove this pairing first"));
-        }
+        not_pairing(&inner)?;
         let uri = PairingUri::parse(&uri).map_err(|e| invalid(e.to_string()))?;
         checked_relays(&uri.relays)?;
         keep_approval::change::check_label(&label, "label").map_err(|e| invalid(e.to_string()))?;

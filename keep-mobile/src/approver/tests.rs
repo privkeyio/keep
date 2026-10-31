@@ -478,7 +478,7 @@ fn a_refused_pairing_forgets_the_phones_state() {
     let events = phone.take(kind::PAIRING, &refused);
     assert!(matches!(
         &events[..],
-        [ApproverEvent::PairingRefused { reason }] if reason == "nope"
+        [ApproverEvent::PairingRefused { reason, ended: true }] if reason == "nope"
     ));
     assert!(phone.handler.lock().stored.is_none());
     // Requests are ignored until paired.
@@ -647,6 +647,12 @@ fn pairing_begins_with_the_gateways_code_and_checks_the_approver_signature() {
     assert!(handler.lock().begun.is_some());
     // Paired meanwhile: never overwritten.
     let phone = paired();
+    assert!(phone
+        .handler
+        .pairing_attestation_challenge(uri.to_string())
+        .unwrap_err()
+        .to_string()
+        .contains("already paired"));
     let begun = handler.lock().begun.take();
     phone.handler.lock().begun = begun;
     assert!(phone
@@ -1266,7 +1272,23 @@ fn a_pairing_a_relay_takes_waits_for_the_gateway() {
         .unwrap();
     let status = handler.status();
     assert!(status.pairing && status.running && !status.paired);
+    assert_eq!(status.label.as_deref(), Some("phone"));
+    assert_eq!(
+        status.fingerprint.as_deref(),
+        Some(start.fingerprint.as_str())
+    );
     assert!(handler.lock().begun.is_none(), "sent once");
+    // No new approver key is made over the pairing waiting for the gateway.
+    assert!(handler
+        .pairing_attestation_challenge(uri.to_string())
+        .unwrap_err()
+        .to_string()
+        .contains("waiting for the gateway"));
+    assert!(handler
+        .begin_pairing(uri.to_string(), vec![2; 33], "phone".into())
+        .unwrap_err()
+        .to_string()
+        .contains("waiting for the gateway"));
     assert!(handler
         .clone()
         .finish_pairing(vec![], chain(), Arc::new(Nobody))
@@ -1598,6 +1620,11 @@ fn relays_another_socket_would_refuse_are_refused() {
         matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
         "{err}"
     );
+    let status = phone.handler.status();
+    assert!(!status.running);
+    assert_eq!(status.last_error, Some(err.to_string()));
+    phone.handler.stop();
+    assert_eq!(phone.handler.status().last_error, None);
 }
 
 // A move to relays the approver cannot use leaves it serving the old ones, so
@@ -1609,10 +1636,15 @@ fn a_failed_move_to_new_relays_keeps_the_old_ones_serving() {
     let relay = phone.mobile.runtime.block_on(start_mock_relay());
     let url = phone.mobile.runtime.block_on(relay.url()).to_string();
     serve(&phone, url.clone());
+    assert_eq!(phone.handler.status().last_error, None);
     phone
         .handler
         .move_relays(vec!["wss://user@relay.example".into()]);
     assert!(phone.handler.status().running);
+    assert!(
+        phone.handler.status().last_error.is_some(),
+        "a failed move is told to the app, not only logged"
+    );
     assert_eq!(
         phone.stored(|s| s.relays.clone()),
         vec![url],
@@ -1638,7 +1670,12 @@ fn a_move_to_new_relays_is_kept_once_they_serve() {
     let first_url = phone.mobile.runtime.block_on(first.url()).to_string();
     let second_url = phone.mobile.runtime.block_on(second.url()).to_string();
     serve(&phone, first_url);
+    phone
+        .handler
+        .move_relays(vec!["wss://user@relay.example".into()]);
+    assert!(phone.handler.status().last_error.is_some());
     phone.handler.move_relays(vec![second_url.clone()]);
+    assert_eq!(phone.handler.status().last_error, None);
     assert_eq!(phone.stored(|s| s.relays.clone()), vec![second_url.clone()]);
     let kept = phone.memory.0.lock().unwrap()[STATE_KEY].clone();
     assert!(
@@ -1689,4 +1726,112 @@ fn a_paired_answer_moving_relays_stores_them_only_after_the_move() {
     assert!(!String::from_utf8(kept)
         .unwrap()
         .contains("elsewhere.example"));
+}
+
+// An answer that fails its checks leaves the pairing waiting, and says so,
+// so the app keeps the approver key the pairing was sent with.
+#[test]
+fn a_pairing_answer_that_fails_its_checks_does_not_end_the_pairing() {
+    let phone = paired();
+    let approver = phone.stored(|s| {
+        s.paired = false;
+        s.approver
+    });
+    let answer = wire::to_text(&Pairing::Paired {
+        v: V1,
+        transport: Hex32(sig::xonly(&Keys::generate())),
+        approver,
+        relays: vec![],
+        deadline_secs: 60,
+        anchor: anchor(1),
+        frozen: Frozen {
+            epoch: 0,
+            all: false,
+            credentials: vec![],
+            unfrozen: vec![],
+        },
+    });
+    let events = phone.take(kind::PAIRING, &answer);
+    assert!(
+        matches!(
+            &events[..],
+            [ApproverEvent::PairingRefused { ended: false, .. }]
+        ),
+        "{events:?}"
+    );
+    assert!(phone.handler.status().pairing);
+    let events = phone.take(kind::PAIRING, "not json");
+    assert!(
+        matches!(
+            &events[..],
+            [ApproverEvent::PairingRefused { ended: false, .. }]
+        ),
+        "{events:?}"
+    );
+    assert!(phone.handler.status().pairing);
+}
+
+fn expired(events: &[ApproverEvent]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            ApproverEvent::RequestExpired { request_id } => Some(request_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+// A request that passes its time undecided is told to the app once, so it
+// drops it and its notification without polling; a decided one is not.
+#[test]
+fn a_request_past_its_time_is_told_to_the_app_once() {
+    let phone = paired();
+    let open = phone.request(20, "x", 10);
+    let decided = phone.request(21, "y", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&open));
+    phone.take(kind::REQUEST, &wire::to_text(&decided));
+    let id = decided.request_id.to_hex();
+    phone.stored(|s| {
+        let w = s
+            .waiting
+            .iter_mut()
+            .find(|w| w.id == decided.request_id)
+            .unwrap();
+        w.decided = true;
+        w.request = None;
+    });
+    let t = now();
+    assert!(expired(&phone.handler.tick_at(t).events).is_empty());
+    let fx = phone.handler.tick_at(t + 121);
+    assert_eq!(expired(&fx.events), vec![open.request_id.to_hex().as_str()]);
+    assert!(!expired(&fx.events).contains(&id.as_str()));
+    assert!(expired(&phone.handler.tick_at(t + 136).events).is_empty());
+}
+
+// A request that passed its time while the app was stopped is told on the
+// first tick after the restart, and when the next request arrives first.
+#[test]
+fn a_request_that_passed_its_time_while_stopped_is_told_after_a_restart() {
+    let phone = paired();
+    let first = phone.request(22, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&first));
+    phone.stored(|s| {
+        s.waiting[0].until = now() - 1;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    let fx = phone.handler.tick_at(now());
+    assert_eq!(
+        expired(&fx.events),
+        vec![first.request_id.to_hex().as_str()]
+    );
+
+    let phone = paired();
+    let first = phone.request(22, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&first));
+    phone.stored(|s| s.waiting[0].until = now() - 1);
+    let next = phone.request(23, "y", 10);
+    let events = phone.take(kind::REQUEST, &wire::to_text(&next));
+    assert_eq!(expired(&events), vec![first.request_id.to_hex().as_str()]);
+    assert!(shown_request(&events).is_some());
 }
