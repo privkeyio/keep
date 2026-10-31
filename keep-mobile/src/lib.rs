@@ -3817,6 +3817,12 @@ impl KeepMobile {
     /// health statuses are written sequentially via `SecureStorage`. A failure
     /// partway through may leave partial state. Callers should treat a
     /// returned error as "possibly partially restored" and retry or clean up.
+    ///
+    /// A backup's relay configs and health statuses are written only for the
+    /// groups whose share or key it restores. Its descriptors are written for
+    /// those groups and for groups neither held nor holding a descriptor here.
+    /// Its proxy and kill switch are written only onto a device that held no
+    /// share.
     pub fn restore_backup(
         &self,
         data: Vec<u8>,
@@ -3825,15 +3831,6 @@ impl KeepMobile {
         let file_size = data.len();
         let decrypted = decrypt_backup_data(&data, &passphrase)?;
         let info = backup_info(&decrypted, file_size);
-        // A device with one share runs on it with no pointer written, so an
-        // absent pointer alone does not mean no account is in use, and nor
-        // does a share or registry that cannot be read.
-        let had_shares = self.storage.has_share()
-            || !matches!(
-                self.storage.read_share_registry(),
-                ShareRegistryRead::Readable { shares, unreadable }
-                    if shares.is_empty() && unreadable.is_empty()
-            );
 
         let mut first_group_hex: Option<String> = None;
 
@@ -3950,6 +3947,18 @@ impl KeepMobile {
             prepared_keys.push((group_hex, serialized, metadata_info));
         }
 
+        // A backup's relay configs and health statuses are written only for
+        // the groups whose share or key it writes. A restore refuses any group
+        // already listed, so this keeps a backup from rewriting a held
+        // account's peer policies or bunker permissions while bringing no share
+        // for it.
+        let restored: std::collections::HashSet<String> = prepared_shares
+            .iter()
+            .chain(prepared_keys.iter())
+            .map(|(group_hex, _, _)| group_hex.clone())
+            .collect();
+        let mut skipped = 0usize;
+
         for wd in &decrypted.wallet_descriptors {
             let policy_hash_hex = if wd.policy_hash == [0u8; 32] {
                 None
@@ -3993,6 +4002,10 @@ impl KeepMobile {
 
         for rc in &decrypted.relay_configs {
             let group_hex = hex::encode(rc.group_pubkey);
+            if !restored.contains(&group_hex) {
+                skipped += 1;
+                continue;
+            }
             let stored_relay = persistence::StoredRelayConfig {
                 frost_relays: rc.frost_relays.clone(),
                 profile_relays: rc.profile_relays.clone(),
@@ -4006,6 +4019,10 @@ impl KeepMobile {
         }
 
         for hs in &decrypted.health_statuses {
+            if !restored.contains(&hex::encode(hs.group_pubkey)) {
+                skipped += 1;
+                continue;
+            }
             prepared_health.push(KeyHealthStatusInfo {
                 group_pubkey: hex::encode(hs.group_pubkey),
                 share_index: hs.share_index,
@@ -4016,11 +4033,27 @@ impl KeepMobile {
                 is_critical: false,
             });
         }
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                "restore skips settings of groups it restores no share or key for"
+            );
+        }
 
         let write = self
             .share_write_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Read under the lock, so an import or restore running alongside is
+        // seen. A device with one share runs on it with no pointer written, so
+        // an absent pointer alone does not mean no account is in use, and nor
+        // does a share or registry that cannot be read.
+        let had_shares = self.storage.has_share()
+            || !matches!(
+                self.storage.read_share_registry(),
+                ShareRegistryRead::Readable { shares, unreadable }
+                    if shares.is_empty() && unreadable.is_empty()
+            );
         for (group_hex, _, _) in prepared_shares.iter().chain(prepared_keys.iter()) {
             if self.listed_share_identifier(group_hex)?.is_some() {
                 return Err(KeepMobileError::BackupError {
@@ -4035,6 +4068,29 @@ impl KeepMobile {
         // descriptor writes first means a descriptor failure leaves nothing
         // behind, and `persist_descriptor` is idempotent for a group already in
         // the index, so the retry completes instead of being rejected.
+        // A descriptor is kept for a group with no share, since a backup carries
+        // every descriptor the device stored and the descriptor is what locates
+        // the funds. So one for a group this restore does not write is written
+        // only when that group is not held and has no descriptor stored, and
+        // none is when the held groups cannot be read.
+        let held = self.held_groups_with_legacy();
+        let before = prepared_descriptors.len();
+        prepared_descriptors.retain(|desc| {
+            restored.contains(&desc.group_pubkey)
+                || held.as_ref().is_some_and(|held| {
+                    !held.contains(&desc.group_pubkey)
+                        && matches!(
+                            persistence::load_descriptor(&self.storage, &desc.group_pubkey),
+                            Err(KeepMobileError::StorageNotFound)
+                        )
+                })
+        });
+        if prepared_descriptors.len() < before {
+            tracing::warn!(
+                skipped = before - prepared_descriptors.len(),
+                "restore skips descriptors of groups held here or already described"
+            );
+        }
         for desc_info in prepared_descriptors {
             persistence::persist_descriptor(&self.storage, &desc_info)?;
         }
@@ -4059,23 +4115,29 @@ impl KeepMobile {
             persistence::persist_health_status(&self.storage, &health_info)?;
         }
 
-        if let Some(proxy) = &decrypted.config.proxy {
-            let stored_proxy = persistence::StoredProxyConfig {
-                enabled: proxy.enabled,
-                port: proxy.port,
-            };
-            persistence::persist_proxy_config(
+        // The proxy and kill switch govern every account on the device, so a
+        // restore onto a device already holding one keeps its own: otherwise
+        // restoring a backup could turn off the kill switch or the proxy the
+        // device's accounts run under.
+        if !had_shares {
+            if let Some(proxy) = &decrypted.config.proxy {
+                let stored_proxy = persistence::StoredProxyConfig {
+                    enabled: proxy.enabled,
+                    port: proxy.port,
+                };
+                persistence::persist_proxy_config(
+                    &self.storage,
+                    PROXY_CONFIG_STORAGE_KEY,
+                    &stored_proxy,
+                )?;
+            }
+
+            persistence::persist_kill_switch(
                 &self.storage,
-                PROXY_CONFIG_STORAGE_KEY,
-                &stored_proxy,
+                KILL_SWITCH_STORAGE_KEY,
+                decrypted.config.kill_switch,
             )?;
         }
-
-        persistence::persist_kill_switch(
-            &self.storage,
-            KILL_SWITCH_STORAGE_KEY,
-            decrypted.config.kill_switch,
-        )?;
 
         // The pointer is set only on a device that held no share: setting it
         // anywhere else switches accounts without the cleanup a switch needs,
@@ -6263,6 +6325,17 @@ impl KeepMobile {
     /// Android implementation of that getter is itself a resolver that infers a
     /// pointer from its registry and persists it, so that write still happens
     /// one layer down and is not reached through this.
+    /// The groups held here, counting a legacy single share the registry may
+    /// not list, or `None` when they cannot all be read.
+    fn held_groups_with_legacy(&self) -> Option<std::collections::HashSet<String>> {
+        let mut held: std::collections::HashSet<String> =
+            held_groups(&self.storage)?.into_iter().collect();
+        if self.storage.has_share() {
+            held.insert(hex::encode(self.storage.get_share_metadata()?.group_pubkey));
+        }
+        Some(held)
+    }
+
     fn resolve_active_share(&self) -> Result<String, KeepMobileError> {
         let ShareRegistryRead::Readable { shares, unreadable } = self.storage.read_share_registry()
         else {
@@ -7319,6 +7392,8 @@ mod restore_backup_metadata_tests {
         /// The active-share pointer fails to read: its getter answers `None`,
         /// as Android's does on a fault.
         pointer_unreadable: std::sync::atomic::AtomicBool,
+        /// A legacy single share the registry does not list.
+        legacy: StdMutex<Option<ShareMetadataInfo>>,
     }
 
     impl SecureStorage for RecordingStorage {
@@ -7329,10 +7404,10 @@ mod restore_backup_metadata_tests {
             Err(KeepMobileError::StorageNotFound)
         }
         fn has_share(&self) -> bool {
-            false
+            self.legacy.lock().unwrap().is_some()
         }
         fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
-            None
+            self.legacy.lock().unwrap().clone()
         }
         fn delete_share(&self) -> Result<(), KeepMobileError> {
             Ok(())
@@ -7795,6 +7870,230 @@ mod restore_backup_metadata_tests {
             .restore_backup(bytes, "correct horse battery staple".into())
             .expect("restore should succeed");
         assert_eq!(*storage.active.lock().unwrap(), None);
+    }
+
+    fn settings_backup(
+        shares: Vec<keep_core::backup::BackupShare>,
+        groups: &[[u8; 32]],
+        kill_switch: bool,
+        proxy_port: u16,
+    ) -> Vec<u8> {
+        let relays = groups
+            .iter()
+            .map(|g| {
+                let mut rc = keep_core::relay::RelayConfig::new(*g);
+                rc.frost_relays = vec!["wss://from-backup.example".into()];
+                rc
+            })
+            .collect();
+        let descriptors = groups
+            .iter()
+            .map(|g| keep_core::wallet::WalletDescriptor {
+                group_pubkey: *g,
+                external_descriptor: "wpkh(xpub.../0/*)".into(),
+                internal_descriptor: "wpkh(xpub.../1/*)".into(),
+                network: "bitcoin".into(),
+                created_at: 1_700_000_000,
+                device_registrations: vec![],
+                policy_hash: [9u8; 32],
+                version: 1,
+                previous_descriptor_hash: None,
+                policy: None,
+            })
+            .collect();
+        let health = groups
+            .iter()
+            .map(|g| keep_core::wallet::KeyHealthStatus {
+                group_pubkey: *g,
+                share_index: 1,
+                last_check_timestamp: 1_700_000_000,
+                responsive: true,
+                created_at: Some(1_700_000_000),
+            })
+            .collect();
+        keep_core::backup::create_backup_from_data(
+            vec![],
+            shares,
+            descriptors,
+            relays,
+            health,
+            keep_core::backup::BackupConfig {
+                kill_switch,
+                proxy: Some(keep_core::storage::ProxyConfig {
+                    enabled: true,
+                    port: proxy_port,
+                }),
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build")
+    }
+
+    // A restore refuses a group already held, and the settings it carries for
+    // such a group are not written either: a backup with no share for a held
+    // account must not rewrite its relays, peer policies, bunker permissions,
+    // descriptor or health, nor the proxy and kill switch the device runs under.
+    #[test]
+    fn a_restore_writes_settings_only_for_what_it_restores() {
+        let (storage, _) = restore_one(true);
+        let held = hex::encode([7u8; 32]);
+        let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
+        let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
+        persistence::persist_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY, true).unwrap();
+        let leftover = WalletDescriptorInfo {
+            group_pubkey: hex::encode([6u8; 32]),
+            external_descriptor: "wpkh(xpub-kept/0/*)".into(),
+            internal_descriptor: "wpkh(xpub-kept/1/*)".into(),
+            network: "bitcoin".into(),
+            created_at: 1_600_000_000,
+            device_registrations: vec![],
+            policy_hash_hex: None,
+            version: 1,
+            previous_descriptor_hash_hex: None,
+            policy_json: None,
+        };
+        persistence::persist_descriptor(&dyn_storage, &leftover).unwrap();
+        let unreadable = format!("{DESCRIPTOR_KEY_PREFIX}{}", hex::encode([4u8; 32]));
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(unreadable, b"not json".to_vec());
+        let held_relays = relay_config_key(Some(&held));
+        let before: Vec<(String, Vec<u8>)> = {
+            let data = storage.data.lock().unwrap();
+            let mut v: Vec<_> = data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            v.sort();
+            v
+        };
+
+        let mut new_share = backup_share(true);
+        new_share.group_pubkey = hex::encode([8u8; 32]);
+        let bytes = settings_backup(
+            vec![new_share],
+            &[[7u8; 32], [8u8; 32], [9u8; 32], [6u8; 32], [4u8; 32]],
+            false,
+            9050,
+        );
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+
+        let new_group = hex::encode([8u8; 32]);
+        let new_relays =
+            persistence::load_relay_config(&dyn_storage, &relay_config_key(Some(&new_group)))
+                .unwrap()
+                .expect("the restored group's relays are written");
+        assert_eq!(new_relays.frost_relays, vec!["wss://from-backup.example"]);
+        assert!(persistence::load_descriptor(&dyn_storage, &new_group).is_ok());
+        let health = persistence::load_health_statuses(&dyn_storage);
+        assert_eq!(
+            health
+                .iter()
+                .map(|h| h.group_pubkey.clone())
+                .collect::<Vec<_>>(),
+            vec![new_group.clone()]
+        );
+
+        assert!(persistence::load_relay_config(&dyn_storage, &held_relays)
+            .unwrap()
+            .is_none());
+        assert!(persistence::load_descriptor(&dyn_storage, &held).is_err());
+        assert!(
+            persistence::load_descriptor(&dyn_storage, &hex::encode([9u8; 32])).is_ok(),
+            "a descriptor for a group neither held nor stored here is kept"
+        );
+        assert_eq!(
+            persistence::load_descriptor(&dyn_storage, &hex::encode([6u8; 32]))
+                .unwrap()
+                .external_descriptor,
+            "wpkh(xpub-kept/0/*)",
+            "a descriptor already stored here is not written over"
+        );
+        for other in [[9u8; 32], [6u8; 32]] {
+            assert!(persistence::load_relay_config(
+                &dyn_storage,
+                &relay_config_key(Some(&hex::encode(other)))
+            )
+            .unwrap()
+            .is_none());
+        }
+        assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        assert!(
+            persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = mobile.wallet_descriptor_list();
+        assert!(listed
+            .iter()
+            .any(|d| d.group_pubkey == hex::encode([6u8; 32])));
+        let data = storage.data.lock().unwrap();
+        for (key, value) in before.iter().filter(|(k, _)| k != DESCRIPTOR_INDEX_KEY) {
+            assert_eq!(data.get(key), Some(value), "{key} is left as it was");
+        }
+    }
+
+    // A legacy single share the registry does not list is held all the same: a
+    // backup writes no descriptor for its group, and keeps the device's proxy
+    // and kill switch.
+    #[test]
+    fn a_restore_treats_an_unlisted_legacy_share_as_held() {
+        let storage = Arc::new(RecordingStorage::default());
+        let legacy = [5u8; 32];
+        *storage.legacy.lock().unwrap() = Some(ShareMetadataInfo {
+            name: "legacy".into(),
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: legacy.to_vec(),
+            did_backup: true,
+        });
+        let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
+        let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
+        let mut new_share = backup_share(true);
+        new_share.group_pubkey = hex::encode([8u8; 32]);
+        let bytes = settings_backup(vec![new_share], &[legacy, [8u8; 32]], true, 9050);
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert!(matches!(
+            persistence::load_descriptor(&dyn_storage, &hex::encode(legacy)),
+            Err(KeepMobileError::StorageNotFound)
+        ));
+        assert!(persistence::load_descriptor(&dyn_storage, &hex::encode([8u8; 32])).is_ok());
+        assert!(!persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        assert!(
+            persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // A device that held no share takes the backup's proxy and kill switch.
+    #[test]
+    fn a_restore_onto_an_empty_device_takes_the_backup_proxy_and_kill_switch() {
+        let storage = Arc::new(RecordingStorage::default());
+        let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
+        let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
+        let bytes = settings_backup(vec![backup_share(true)], &[[7u8; 32]], true, 9050);
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        let proxy = persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("proxy restored");
+        assert!(proxy.enabled);
+        assert_eq!(proxy.port, 9050);
+        assert!(persistence::load_relay_config(
+            &dyn_storage,
+            &relay_config_key(Some(&hex::encode([7u8; 32])))
+        )
+        .unwrap()
+        .is_some());
     }
 
     // A pointer that cannot be read does not leave the node to be built on the
