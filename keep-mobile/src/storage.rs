@@ -91,6 +91,14 @@ pub trait SecureStorage: Send + Sync {
     fn get_share_metadata(&self) -> Option<ShareMetadataInfo>;
     fn delete_share(&self) -> Result<(), KeepMobileError>;
 
+    /// Store `data` under `key`.
+    ///
+    /// When `key` already holds share data that the share registry does not
+    /// list, the write must be refused, unless `metadata` names the same group
+    /// and share index, which redoes a write that stopped before the registry
+    /// was updated. Core checks for a share it would replace through the
+    /// registry alone, so a share left out of it is one only this refusal
+    /// keeps from being written over.
     fn store_share_by_key(
         &self,
         key: String,
