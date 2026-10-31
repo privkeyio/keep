@@ -1319,6 +1319,12 @@ mod tests {
         fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
             Vec::new()
         }
+        fn read_share_registry(&self) -> crate::storage::ShareRegistryRead {
+            crate::storage::ShareRegistryRead::Readable {
+                shares: self.list_all_shares(),
+                unreadable: vec![],
+            }
+        }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.data.lock().unwrap().remove(&key);
             Ok(())

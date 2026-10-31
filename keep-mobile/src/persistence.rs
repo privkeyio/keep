@@ -1424,6 +1424,12 @@ mod descriptor_index_tests {
         fn list_all_shares(&self) -> Vec<ShareMetadataInfo> {
             vec![]
         }
+        fn read_share_registry(&self) -> crate::storage::ShareRegistryRead {
+            crate::storage::ShareRegistryRead::Readable {
+                shares: self.list_all_shares(),
+                unreadable: vec![],
+            }
+        }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.records.lock().unwrap().remove(&key);
             Ok(())

@@ -3,7 +3,7 @@
 
 use crate::KeepMobileError;
 
-#[derive(uniffi::Record, Clone, Debug)]
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct ShareMetadataInfo {
     pub name: String,
     pub identifier: u16,
@@ -48,6 +48,29 @@ pub struct StoredShareInfo {
     pub did_backup: bool,
 }
 
+/// The share registry as read, without dropping anything: `Readable` lists the
+/// shares that could be read and, in `unreadable`, the storage keys (group
+/// pubkey hex) of shares that exist but could not be. `Unavailable` means the
+/// registry itself could not be read.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum ShareRegistryRead {
+    Readable {
+        shares: Vec<ShareMetadataInfo>,
+        unreadable: Vec<String>,
+    },
+    Unavailable,
+}
+
+/// Whether every stored share can be read. `SomeUnreadable` lists the group
+/// pubkeys (hex) of shares that exist but cannot be read, `Unavailable` means
+/// the share registry itself cannot be read.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum ShareStoreStatus {
+    Readable,
+    SomeUnreadable { group_pubkeys: Vec<String> },
+    Unavailable,
+}
+
 /// Platform-provided secure storage for encrypted share data and wallet
 /// descriptor records.
 ///
@@ -89,6 +112,18 @@ pub trait SecureStorage: Send + Sync {
     /// refusal into exactly the permission it was there to withhold.
     fn load_share_by_key(&self, key: String) -> Result<Vec<u8>, KeepMobileError>;
     fn list_all_shares(&self) -> Vec<ShareMetadataInfo>;
+    /// Read the share registry as it is: `Readable` with every share that could
+    /// be read and, under `unreadable`, the key of every share that exists but
+    /// could not be, `Unavailable` when the registry itself cannot be read. A
+    /// share must never be dropped silently. A registry entry with no record
+    /// stored behind it is absent, not unreadable. No fallback and no side
+    /// effect, and it must not throw: a fault reading the registry is
+    /// `Unavailable`.
+    ///
+    /// Callers that count shares or build a backup rely on the difference:
+    /// taking an unreadable share for an absent one undercounts the store and
+    /// produces a backup that is missing it.
+    fn read_share_registry(&self) -> ShareRegistryRead;
     /// Delete the record under `key`.
     ///
     /// Callers must not read an `Err` as "nothing was removed". An
