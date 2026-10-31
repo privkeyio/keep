@@ -12,8 +12,8 @@ mod transport;
 
 pub use psbt::PsbtSessionSnapshot;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
-pub use transport::CosignTransport;
 pub(crate) use transport::{require_accepted, NostrTransport};
+pub use transport::{CosignTransport, RelayHealth, RelayHealthStatus};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
@@ -2140,6 +2140,12 @@ impl KfpNode {
     /// Number of pre-exchanged commitments pooled for the given peer.
     pub fn nonce_pool_peer_available(&self, share_index: u16) -> usize {
         self.nonce_pool.peer_available(share_index)
+    }
+
+    /// Per-relay connection state from the nostr pool. Empty when the transport
+    /// has no relay sockets. Does not open connections.
+    pub async fn relay_health(&self) -> Vec<RelayHealth> {
+        self.transport.relay_health().await
     }
 
     pub fn peer_status(&self) -> Vec<(u16, PeerStatus, Option<String>, PublicKey)> {
