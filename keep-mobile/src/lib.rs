@@ -5620,12 +5620,19 @@ impl KeepMobile {
         self.storage
             .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
         // Writing a share already stored again leaves the account the owner
-        // has selected, and its live node, alone unless it is that share.
+        // has selected, and its live node, alone, unless the pointer may name
+        // this share: a node can run on a share the pointer cannot be read
+        // for, so only a pointer read as another share keeps the node.
         if !rewrite {
             self.storage
                 .set_active_share_key(Some(group_pubkey_hex.clone()))?;
         }
-        if !rewrite || self.storage.get_active_share_key().as_deref() == Some(&group_pubkey_hex) {
+        let keeps_node = rewrite
+            && matches!(
+                self.storage.read_active_share_key(),
+                crate::signing_policy::StorageRead::Found { value } if value != group_pubkey_hex
+            );
+        if !keeps_node {
             self.invalidate_live_node();
         }
 
@@ -11609,6 +11616,7 @@ mod share_registry_tests {
         loaded: StdMutex<Vec<String>>,
         registry_unavailable: AtomicBool,
         active: StdMutex<Option<String>>,
+        active_unreadable: AtomicBool,
     }
 
     impl RegistryStorage {
@@ -11695,6 +11703,9 @@ mod share_registry_tests {
             self.active.lock().unwrap().clone()
         }
         fn read_active_share_key(&self) -> crate::signing_policy::StorageRead {
+            if self.active_unreadable.load(Ordering::SeqCst) {
+                return crate::signing_policy::StorageRead::Unavailable;
+            }
             match self.get_active_share_key() {
                 Some(value) => crate::signing_policy::StorageRead::Found { value },
                 None => crate::signing_policy::StorageRead::Absent,
@@ -12317,12 +12328,12 @@ mod share_registry_tests {
             .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
             .unwrap();
         stash(&storage, &export, Some(PASS));
-        let other = ShareExport::from_share(&group_shares()[0], PASS)
+        let another_group = ShareExport::from_share(&group_shares()[0], PASS)
             .unwrap()
             .to_json()
             .unwrap();
         let selected = mobile
-            .import_share(other, PASS.into(), "selected".into())
+            .import_share(another_group, PASS.into(), "selected".into())
             .unwrap()
             .group_pubkey;
         crate::import_teardown_tests::seed_pending_request(&mobile);
@@ -12334,6 +12345,30 @@ mod share_registry_tests {
             assert_eq!(mobile.pending_requests.lock().await.len(), 1);
         });
         assert!(mobile.pending_dkg_share().unwrap().is_none());
+    }
+
+    // A node can run on a share the pointer cannot be read for, so a rewrite
+    // keeps the node only when the pointer is read as another share.
+    #[test]
+    fn recovering_with_an_unreadable_pointer_tears_the_node_down() {
+        let (storage, mobile) = setup();
+        let export = ShareExport::from_share(&group_shares()[0], PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        mobile
+            .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
+            .unwrap();
+        storage.active.lock().unwrap().take();
+        stash(&storage, &export, Some(PASS));
+        storage.active_unreadable.store(true, Ordering::SeqCst);
+        crate::import_teardown_tests::seed_pending_request(&mobile);
+
+        mobile.recover_dkg_share(None).unwrap();
+
+        mobile.runtime.block_on(async {
+            assert!(mobile.pending_requests.lock().await.is_empty());
+        });
     }
 
     // A passphrase-protected stash holds an export from outside, so recovery
