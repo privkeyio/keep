@@ -36,4 +36,4 @@ pub use permissions::{
 };
 pub use rate_limit::{RateLimitConfig, RateLimiter};
 pub use server::{PreGrantedApp, Server, ServerConfig};
-pub use types::{ApprovalRequest, LogEvent, ServerCallbacks, NIP98_HTTP_AUTH};
+pub use types::{ApprovalRequest, ClientListing, LogEvent, ServerCallbacks, NIP98_HTTP_AUTH};

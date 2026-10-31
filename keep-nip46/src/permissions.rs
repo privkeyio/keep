@@ -292,6 +292,42 @@ impl PermissionManager {
         self.apps.len() < Self::MAX_CONNECTED_APPS
     }
 
+    /// Applies `ClientListing::Listed` to a connect from `pubkey`: `None` when
+    /// it is refused, otherwise whether an app was dropped to make room.
+    /// Counting the listed clients that are not connected yet keeps their
+    /// slots free, and a listed client finding the table full displaces the
+    /// least recently used app that is not listed.
+    pub fn admit_listed(
+        &mut self,
+        pubkey: &PublicKey,
+        listed: &HashSet<PublicKey>,
+    ) -> Option<bool> {
+        let before = self.apps.len();
+        if listed.contains(pubkey) {
+            if !self.ensure_capacity(pubkey) {
+                let unlisted = self
+                    .apps
+                    .values()
+                    .filter(|app| !listed.contains(&app.pubkey))
+                    .min_by_key(|app| app.last_used)
+                    .map(|app| app.pubkey)?;
+                self.apps.remove(&unlisted);
+            }
+        } else if !self.unlisted_fits(pubkey, listed) {
+            self.evict_expired();
+            if !self.unlisted_fits(pubkey, listed) {
+                return None;
+            }
+        }
+        Some(self.apps.len() < before)
+    }
+
+    fn unlisted_fits(&self, pubkey: &PublicKey, listed: &HashSet<PublicKey>) -> bool {
+        let unlisted = self.apps.keys().filter(|k| !listed.contains(k)).count();
+        let joining = usize::from(!self.apps.contains_key(pubkey));
+        listed.len() + unlisted + joining <= Self::MAX_CONNECTED_APPS
+    }
+
     pub fn connect(&mut self, pubkey: PublicKey, name: String) -> bool {
         if !self.ensure_capacity(&pubkey) {
             return false;
@@ -1720,5 +1756,85 @@ mod tests {
             expiry <= before + NIP98_MAX_REMEMBER_SECS + 2,
             "a month-long NIP-98 refusal must be clamped to the same window an approval gets"
         );
+    }
+
+    fn keys(n: usize) -> Vec<PublicKey> {
+        (0..n).map(|_| Keys::generate().public_key()).collect()
+    }
+
+    #[test]
+    fn admit_listed_keeps_slots_for_listed_clients_not_yet_connected() {
+        let mut pm = PermissionManager::new();
+        let listed: HashSet<PublicKey> = keys(60).into_iter().collect();
+        for pk in keys(39) {
+            assert_eq!(pm.admit_listed(&pk, &listed), Some(false));
+            assert!(pm.connect(pk, "App".into()));
+        }
+        let last = Keys::generate().public_key();
+        assert_eq!(pm.admit_listed(&last, &listed), Some(false));
+        assert!(pm.connect(last, "App".into()));
+        let refused = Keys::generate().public_key();
+        assert_eq!(pm.admit_listed(&refused, &listed), None);
+        assert!(!pm.apps.contains_key(&refused));
+        assert_eq!(
+            pm.admit_listed(&last, &listed),
+            Some(false),
+            "an app already connected takes no new slot"
+        );
+        for pk in &listed {
+            assert_eq!(pm.admit_listed(pk, &listed), Some(false));
+            assert!(pm.connect(*pk, "App".into()));
+        }
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+    }
+
+    #[test]
+    fn admit_listed_refuses_an_unlisted_client_at_the_cap() {
+        let mut pm = PermissionManager::new();
+        let listed: HashSet<PublicKey> = keys(PermissionManager::MAX_CONNECTED_APPS)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            pm.admit_listed(&Keys::generate().public_key(), &listed),
+            None
+        );
+        let mut listed = listed;
+        let dropped = *listed.iter().next().unwrap();
+        listed.remove(&dropped);
+        assert_eq!(
+            pm.admit_listed(&Keys::generate().public_key(), &listed),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn admit_listed_displaces_the_least_recent_unlisted_app_for_a_listed_client() {
+        let mut pm = PermissionManager::new();
+        let unlisted = keys(PermissionManager::MAX_CONNECTED_APPS);
+        for (i, pk) in unlisted.iter().enumerate() {
+            assert!(pm.connect(*pk, "App".into()));
+            pm.apps.get_mut(pk).unwrap().last_used = Timestamp::from(1_000 + i as u64);
+        }
+        let client = Keys::generate().public_key();
+        let listed = HashSet::from([client]);
+        assert_eq!(pm.admit_listed(&client, &listed), Some(true));
+        assert!(!pm.apps.contains_key(&unlisted[0]));
+        assert!(pm.apps.contains_key(&unlisted[1]));
+        assert!(pm.connect(client, "App".into()));
+        assert_eq!(pm.admit_listed(&client, &listed), Some(false));
+    }
+
+    #[test]
+    fn admit_listed_never_displaces_a_listed_app() {
+        let mut pm = PermissionManager::new();
+        let connected = keys(PermissionManager::MAX_CONNECTED_APPS);
+        for pk in &connected {
+            assert!(pm.connect(*pk, "App".into()));
+        }
+        let client = Keys::generate().public_key();
+        let mut listed: HashSet<PublicKey> = connected.iter().copied().collect();
+        listed.insert(client);
+        assert_eq!(pm.admit_listed(&client, &listed), None);
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
     }
 }

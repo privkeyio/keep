@@ -4580,6 +4580,15 @@ impl KeepMobile {
         &self,
         client: Option<&nostr_sdk::PublicKey>,
     ) -> Result<(), KeepMobileError> {
+        self.retain_bunker_permissions(|pubkey| client.is_some_and(|c| pubkey != Some(c)))
+    }
+
+    /// Keep only the persisted NIP-46 grants whose client `keep` accepts. It
+    /// gets `None` for a grant whose pubkey does not parse.
+    pub(crate) fn retain_bunker_permissions(
+        &self,
+        keep: impl Fn(Option<&nostr_sdk::PublicKey>) -> bool,
+    ) -> Result<(), KeepMobileError> {
         let key = relay_config_key(None);
         let _guard = self
             .relay_config_lock
@@ -4595,15 +4604,13 @@ impl KeepMobile {
             }
         };
         let before = stored.bunker_permissions.len();
-        match client {
-            Some(client) => stored.bunker_permissions.retain(|grant| {
+        stored.bunker_permissions.retain(|grant| {
+            keep(
                 nostr_sdk::PublicKey::from_hex(&grant.pubkey_hex)
                     .ok()
-                    .as_ref()
-                    != Some(client)
-            }),
-            None => stored.bunker_permissions.clear(),
-        }
+                    .as_ref(),
+            )
+        });
         if stored.bunker_permissions.len() == before {
             return Ok(());
         }
