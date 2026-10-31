@@ -4919,20 +4919,9 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
         let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
-        // A key stored already is the same key, and writing it again would
-        // drop the seed words stored with it, so it is only made active.
-        if let Some(listed) = self.listed_same_share(&group_pubkey_hex, &metadata_info)? {
-            self.storage
-                .set_active_share_key(Some(group_pubkey_hex.clone()))?;
-            self.invalidate_live_node();
-            return Ok(ShareInfo {
-                name: listed.name,
-                share_index: listed.identifier,
-                threshold: listed.threshold,
-                total_shares: listed.total_shares,
-                group_pubkey: group_pubkey_hex,
-            });
-        }
+        // Nothing listed under the key can be the same 1-of-1 share as this
+        // one, since a stored key is never written over.
+        self.listed_same_share(&group_pubkey_hex, &metadata_info)?;
         self.ensure_share_capacity()?;
         self.storage.store_share_by_key(
             group_pubkey_hex.clone(),
@@ -5501,10 +5490,12 @@ impl KeepMobile {
     }
 
     /// The share listed under `key` when it is the share `incoming` describes
-    /// (the same index of a group of the same threshold and size), `None`
-    /// when none is listed, and an error for any other share of the group, so
-    /// a write never replaces the whole key with one of its shares or one
-    /// share with another.
+    /// (the same index of a threshold group of the same size), `None` when
+    /// none is listed, and an error for any other share of the group, so a
+    /// write never replaces one share with another. A stored key (1-of-1) is
+    /// never written over at all: its record holds the seed words it was
+    /// created from, and an import has no way to tell a copy of it from a
+    /// forgery short of reading that record.
     fn listed_same_share(
         &self,
         key: &str,
@@ -5512,6 +5503,11 @@ impl KeepMobile {
     ) -> Result<Option<ShareMetadataInfo>, KeepMobileError> {
         let shape = |m: &ShareMetadataInfo| (m.identifier, m.threshold, m.total_shares);
         match self.listed_share(key)? {
+            Some(listed) if listed.threshold == 1 && listed.total_shares == 1 => {
+                Err(KeepMobileError::InvalidShare {
+                    msg: "This key is already stored".into(),
+                })
+            }
             Some(listed) if shape(&listed) != shape(incoming) => {
                 Err(KeepMobileError::InvalidShare {
                     msg: "Another share of this group is already stored".into(),
@@ -11813,7 +11809,7 @@ mod share_registry_tests {
     }
 
     #[test]
-    fn importing_a_stored_key_again_keeps_its_record_and_seed_words() {
+    fn importing_a_stored_key_again_is_refused_and_keeps_its_seed_words() {
         const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let (storage, mobile) = setup();
         let created = mobile
@@ -11825,28 +11821,24 @@ mod share_registry_tests {
             use nostr_sdk::prelude::{SecretKey, ToBech32};
             SecretKey::from_slice(&*key).unwrap().to_bech32().unwrap()
         };
-        let again = mobile.import_nsec(nsec.into_bytes(), "b".into()).unwrap();
-        assert_eq!(again.group_pubkey, created.group_pubkey);
-        assert_eq!(again.name, "a");
+        let already = |r: Result<ShareInfo, KeepMobileError>| matches!(&r, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored"));
+        assert!(already(mobile.import_nsec(nsec.into_bytes(), "b".into())));
+        assert!(already(mobile.create_account_from_mnemonic(
+            WORDS.as_bytes().to_vec(),
+            String::new(),
+            "c".into()
+        )));
+        let export = mobile.export_share("passphrase-123".into()).unwrap();
+        assert!(already(mobile.import_share(
+            export,
+            "passphrase-123".into(),
+            "d".into()
+        )));
         assert_eq!(storage.raw(&created.group_pubkey).unwrap(), before);
         assert!(mobile
-            .get_seed_words(created.group_pubkey.clone())
+            .get_seed_words(created.group_pubkey)
             .unwrap()
             .is_some());
-        mobile
-            .create_account_from_mnemonic(WORDS.as_bytes().to_vec(), String::new(), "c".into())
-            .unwrap();
-        assert_eq!(storage.raw(&created.group_pubkey).unwrap(), before);
-    }
-
-    #[test]
-    fn importing_a_stored_key_again_at_the_cap_is_not_refused() {
-        let (storage, mobile) = setup();
-        let key = import_nsec(&mobile).unwrap().group_pubkey;
-        for i in 0..MAX_STORED_SHARES - 1 {
-            storage.mark_unreadable(format!("{i:064x}"));
-        }
-        assert_eq!(import_nsec(&mobile).unwrap().group_pubkey, key);
     }
 
     #[test]
@@ -11862,7 +11854,7 @@ mod share_registry_tests {
             .unwrap();
         let result = mobile.store_share_package(share);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("Another share")),
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&key).unwrap(), b"key");
