@@ -478,7 +478,8 @@ fn a_refused_pairing_forgets_the_phones_state() {
     let events = phone.take(kind::PAIRING, &refused);
     assert!(matches!(
         &events[..],
-        [ApproverEvent::PairingRefused { reason, ended: true }] if reason == "nope"
+        [ApproverEvent::PairingRefused { reason, ended: true, approver_key }]
+            if reason == "nope" && approver_key[..] == phone.approver.verifying_key().to_encoded_point(true).as_bytes()[..]
     ));
     assert!(phone.handler.lock().stored.is_none());
     // Requests are ignored until paired.
@@ -1625,6 +1626,17 @@ fn relays_another_socket_would_refuse_are_refused() {
     assert_eq!(status.last_error, Some(err.to_string()));
     phone.handler.stop();
     assert_eq!(phone.handler.status().last_error, None);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap_err();
+    let relay = phone.mobile.runtime.block_on(start_mock_relay());
+    let url = phone.mobile.runtime.block_on(relay.url()).to_string();
+    phone.stored(|s| s.relays = vec![url]);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert_eq!(
+        phone.handler.status().last_error,
+        None,
+        "a start that serves clears it"
+    );
+    phone.handler.stop();
 }
 
 // A move to relays the approver cannot use leaves it serving the old ones, so
@@ -1790,7 +1802,6 @@ fn a_request_past_its_time_is_told_to_the_app_once() {
     let decided = phone.request(21, "y", 10);
     phone.take(kind::REQUEST, &wire::to_text(&open));
     phone.take(kind::REQUEST, &wire::to_text(&decided));
-    let id = decided.request_id.to_hex();
     phone.stored(|s| {
         let w = s
             .waiting
@@ -1804,8 +1815,25 @@ fn a_request_past_its_time_is_told_to_the_app_once() {
     assert!(expired(&phone.handler.tick_at(t).events).is_empty());
     let fx = phone.handler.tick_at(t + 121);
     assert_eq!(expired(&fx.events), vec![open.request_id.to_hex().as_str()]);
-    assert!(!expired(&fx.events).contains(&id.as_str()));
     assert!(expired(&phone.handler.tick_at(t + 136).events).is_empty());
+}
+
+// A request whose outcome came before its time is never told as expired.
+#[test]
+fn a_request_ended_by_its_outcome_is_not_told_as_expired() {
+    let phone = paired();
+    let request = phone.request(24, "x", 10);
+    phone.take(kind::REQUEST, &wire::to_text(&request));
+    phone.take(
+        kind::OUTCOME,
+        &wire::to_text(&Outcome {
+            v: V1,
+            request_id: request.request_id,
+            outcome: OutcomeKind::Canceled,
+            by: None,
+        }),
+    );
+    assert!(expired(&phone.handler.tick_at(now() + 121).events).is_empty());
 }
 
 // A request that passed its time while the app was stopped is told on the
@@ -1834,4 +1862,39 @@ fn a_request_that_passed_its_time_while_stopped_is_told_after_a_restart() {
     let events = phone.take(kind::REQUEST, &wire::to_text(&next));
     assert_eq!(expired(&events), vec![first.request_id.to_hex().as_str()]);
     assert!(shown_request(&events).is_some());
+}
+
+// A pairing the gateway never answers, kept across a restart, is removed with
+// `forget`, after which a new pairing can begin.
+#[test]
+fn a_pairing_left_waiting_across_a_restart_is_removed_with_forget() {
+    let phone = paired();
+    phone.stored(|s| {
+        s.paired = false;
+        phone.handler.persist(s).unwrap();
+    });
+    let phone = phone.reopen();
+    assert!(phone.handler.status().pairing);
+    let uri = PairingUri {
+        gateway: sig::xonly(&Keys::generate()),
+        secret: Zeroizing::new([3u8; 32]),
+        relays: vec!["wss://relay.example".into()],
+    }
+    .to_uri()
+    .unwrap();
+    assert!(phone
+        .handler
+        .pairing_attestation_challenge(uri.to_string())
+        .is_err());
+    phone.handler.forget().unwrap();
+    let phone = phone.reopen();
+    assert!(!phone.handler.status().pairing);
+    phone
+        .handler
+        .pairing_attestation_challenge(uri.to_string())
+        .unwrap();
+    phone
+        .handler
+        .begin_pairing(uri.to_string(), vec![2; 33], "phone".into())
+        .unwrap();
 }

@@ -136,7 +136,7 @@ impl ApproverCallbacks for Printer {
     fn on_event(&self, event: ApproverEvent) {
         match event {
             ApproverEvent::Paired { .. } => say("paired"),
-            ApproverEvent::PairingRefused { reason, ended } => {
+            ApproverEvent::PairingRefused { reason, ended, .. } => {
                 say(&format!("refused {reason} ended={ended}"))
             }
             ApproverEvent::Request { request } => {

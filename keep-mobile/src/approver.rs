@@ -347,6 +347,11 @@ pub enum ApproverEvent {
         /// so the approver key made for it can go. Otherwise an answer failed
         /// its checks and the pairing still waits for the gateway.
         ended: bool,
+        /// The approver key of the pairing this is about (33 bytes,
+        /// compressed P-256). The event reaches the app after the state
+        /// changed, so the app deletes only a key that matches: one made for
+        /// a pairing begun since stays.
+        approver_key: Vec<u8>,
     },
     Request {
         request: ApprovalRequest,
@@ -356,7 +361,10 @@ pub enum ApproverEvent {
         reason: String,
     },
     /// A request shown to the owner passed its time undecided and can no
-    /// longer be decided here. The gateway's `expired` outcome may follow.
+    /// longer be decided here. Its outcome may still follow, and a decision
+    /// sent as it lapsed can still come back approved or denied, so a later
+    /// outcome wins. Sent again after a restart if the state could not be
+    /// saved, so the app treats a repeat as nothing new.
     RequestExpired {
         request_id: String,
     },
@@ -947,6 +955,7 @@ impl ApproverHandler {
                     fx.events.push(ApproverEvent::PairingRefused {
                         reason: gateway_text(&reason),
                         ended: true,
+                        approver_key: stored.approver.0.to_vec(),
                     });
                     forget = true;
                 }
@@ -980,12 +989,14 @@ impl ApproverHandler {
                         Err(e) => fx.events.push(ApproverEvent::PairingRefused {
                             reason: gateway_text(&e.to_string()),
                             ended: false,
+                            approver_key: stored.approver.0.to_vec(),
                         }),
                     }
                 }
                 Err(e) => fx.events.push(ApproverEvent::PairingRefused {
                     reason: gateway_text(&e.to_string()),
                     ended: false,
+                    approver_key: stored.approver.0.to_vec(),
                 }),
             },
             kind::REQUEST if stored.paired => {
@@ -1180,7 +1191,7 @@ fn not_pairing(inner: &Inner) -> Result<(), KeepMobileError> {
     match inner.stored.as_ref() {
         Some(s) if s.paired => Err(invalid("already paired: remove this pairing first")),
         Some(_) => Err(invalid(
-            "a pairing is waiting for the gateway's answer: cancel it first",
+            "a pairing is waiting for the gateway's answer: remove it first",
         )),
         None => Ok(()),
     }
