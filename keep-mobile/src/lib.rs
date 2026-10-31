@@ -11968,6 +11968,14 @@ mod share_registry_tests {
         mobile
             .import_share(export(&shares[0]), PASS.into(), "renamed".into())
             .unwrap();
+        let key = hex::encode(shares[0].group_pubkey());
+        let stored: StoredShareData = serde_json::from_slice(&storage.raw(&key).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ShareMetadata>(&stored.metadata_json)
+                .unwrap()
+                .name,
+            "renamed"
+        );
         let other = TrustedDealer::new(ThresholdConfig::new(2, 3).unwrap())
             .generate("other")
             .unwrap()
