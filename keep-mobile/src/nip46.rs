@@ -365,13 +365,16 @@ impl ServerCallbacks for CallbackBridge {
         if let Err(e) = std::thread::Builder::new()
             .name("nip46-approval".into())
             .spawn(move || {
-                // Dropped when the platform returns, however it returns, so a
-                // callback that panics releases its slot too.
-                let _slot = slot;
+                // Released when the platform returns, before the answer is
+                // sent, so the caller observes the slot as free. A panic drops
+                // it on the way out, still before `tx` is dropped.
+                let slot = slot;
+                let answer = callbacks.request_approval(request);
+                drop(slot);
                 // Ignored deliberately: a send fails only once the timeout
                 // below has already answered for this request and dropped the
                 // receiver.
-                let _ = tx.send(callbacks.request_approval(request));
+                let _ = tx.send(answer);
             })
         {
             tracing::error!("Refusing {asked_for} from {asked_by}, no thread to ask on: {e}");
