@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use nostr_sdk::prelude::*;
+use std::collections::HashSet;
 
 /// NIP-98 HTTP Auth event kind (27235). Web clients such as nostr-tools'
 /// `BunkerSigner` sign a fresh auth event for every API call, so the bunkers
@@ -142,10 +143,28 @@ pub enum ConnectAuthorization {
     AutoApproved,
 }
 
+/// The clients the consumer lists as connected, which decides who a connect
+/// may admit once the app table is near its cap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientListing {
+    /// No list is kept: a connect is bounded only by the app table.
+    Unrestricted,
+    /// A listed client is always admitted. Any other is admitted only while
+    /// the listed clients and the apps already connected leave a slot free.
+    Listed(HashSet<PublicKey>),
+    /// The list could not be read, so no connect is admitted.
+    Unavailable,
+}
+
 pub trait ServerCallbacks: Send + Sync + 'static {
     fn on_log(&self, event: LogEvent);
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
     fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    /// Read on every connect, after its secret or approval is checked and
+    /// before anything is granted. Default: no list.
+    fn client_listing(&self) -> ClientListing {
+        ClientListing::Unrestricted
+    }
     /// Called after the in-memory permission grants change (a remember-grant is
     /// written or a client is revoked), passing a full snapshot of the current
     /// grants so the consumer can persist them durably. Default no-op: keep-web

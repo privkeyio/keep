@@ -23,8 +23,8 @@ use crate::permissions::{
 };
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
-    ApprovalRequest, ApprovalResult, ConnectAuthorization, HttpAuthDetails, RememberDuration,
-    ServerCallbacks, NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
+    ApprovalRequest, ApprovalResult, ClientListing, ConnectAuthorization, HttpAuthDetails,
+    RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
 };
 
 /// Max displayed length of a NIP-98 `u`/`method` value. A kilobyte-scale tag
@@ -483,13 +483,47 @@ impl SignerHandler {
             requested_perms = Permission::ALL;
         }
 
+        let listing = self
+            .callbacks
+            .as_ref()
+            .map_or(ClientListing::Unrestricted, |cb| cb.client_listing());
         let mut pm = self.permissions.lock().await;
+        let (refusal, dropped) = match &listing {
+            ClientListing::Unrestricted => (None, false),
+            ClientListing::Listed(listed) => {
+                let (admitted, dropped) = pm.admit_listed(&app_pubkey, listed);
+                let refusal = (!admitted)
+                    .then(|| KeepError::CapacityExceeded("too many connected apps".into()));
+                (refusal, dropped)
+            }
+            ClientListing::Unavailable => (
+                Some(KeepError::PermissionDenied(
+                    "the connected app list cannot be read".into(),
+                )),
+                false,
+            ),
+        };
+        if let Some(e) = refusal {
+            drop(pm);
+            if dropped {
+                self.persist_permissions().await;
+            }
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::Connect, app_pubkey)
+                    .with_success(false)
+                    .with_reason("not admitted"),
+            );
+            return Err(e);
+        }
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
             return Err(KeepError::CapacityExceeded(
                 "too many connected apps".into(),
             ));
         }
         drop(pm);
+        if dropped {
+            self.persist_permissions().await;
+        }
 
         self.audit
             .lock()
@@ -2637,5 +2671,145 @@ mod tests {
             !after_revoke.iter().any(|p| p.pubkey_hex == app_hex),
             "revoked app must be removed from the persisted snapshot"
         );
+    }
+
+    struct ListingCallbacks {
+        listing: std::sync::Mutex<ClientListing>,
+        snapshots: std::sync::Mutex<Vec<Vec<keep_core::relay::StoredBunkerPermission>>>,
+    }
+    impl crate::types::ServerCallbacks for ListingCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+            ApprovalResult::rejected()
+        }
+        fn client_listing(&self) -> ClientListing {
+            self.listing.lock().unwrap().clone()
+        }
+        fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
+            self.snapshots.lock().unwrap().push(grants);
+        }
+    }
+
+    fn listing_handler(listing: ClientListing) -> (SignerHandler, Arc<ListingCallbacks>) {
+        let cb = Arc::new(ListingCallbacks {
+            listing: std::sync::Mutex::new(listing),
+            snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_expected_secret("secret".into());
+        (handler, cb)
+    }
+
+    async fn connect(
+        handler: &SignerHandler,
+        app: PublicKey,
+        secret: &str,
+    ) -> Result<ConnectAuthorization> {
+        handler
+            .handle_connect(app, None, Some(secret.into()), None)
+            .await
+    }
+
+    #[tokio::test]
+    async fn connect_at_the_listed_cap_is_refused_before_any_grant() {
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let (handler, _) = listing_handler(ClientListing::Listed(listed.clone()));
+
+        let stranger = Keys::generate().public_key();
+        assert!(matches!(
+            connect(&handler, stranger, "secret").await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .get_app(&stranger)
+            .is_none());
+
+        let client = *listed.iter().next().unwrap();
+        assert_eq!(
+            connect(&handler, client, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
+        assert!(handler.permissions.lock().await.get_app(&client).is_some());
+    }
+
+    #[tokio::test]
+    async fn connect_with_a_wrong_secret_is_refused_as_before_at_the_cap() {
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let (handler, _) = listing_handler(ClientListing::Listed(listed));
+        assert!(matches!(
+            connect(&handler, Keys::generate().public_key(), "wrong").await,
+            Err(KeepError::PermissionDenied(msg)) if msg == "invalid secret"
+        ));
+    }
+
+    #[tokio::test]
+    async fn listed_client_displaces_an_unlisted_app_and_persists() {
+        let client = Keys::generate().public_key();
+        let (handler, cb) = listing_handler(ClientListing::Unrestricted);
+        let unlisted: Vec<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        for app in &unlisted {
+            connect(&handler, *app, "secret").await.unwrap();
+            assert!(handler
+                .permissions
+                .lock()
+                .await
+                .grant_kind_forever(app, Kind::TextNote));
+        }
+        *cb.listing.lock().unwrap() = ClientListing::Listed(HashSet::from([client]));
+        connect(&handler, client, "secret").await.unwrap();
+
+        let pm = handler.permissions.lock().await;
+        assert!(pm.get_app(&client).is_some());
+        let displaced: Vec<&PublicKey> = unlisted
+            .iter()
+            .filter(|app| pm.get_app(app).is_none())
+            .collect();
+        assert_eq!(displaced.len(), 1);
+        let snapshot = cb.snapshots.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(snapshot.len(), PermissionManager::MAX_CONNECTED_APPS - 1);
+        assert!(!snapshot
+            .iter()
+            .any(|p| p.pubkey_hex == displaced[0].to_hex()));
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_app_already_connected_reconnects_past_the_cap() {
+        let app = Keys::generate().public_key();
+        let (handler, cb) = listing_handler(ClientListing::Unrestricted);
+        connect(&handler, app, "secret").await.unwrap();
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        *cb.listing.lock().unwrap() = ClientListing::Listed(listed);
+        connect(&handler, app, "secret").await.unwrap();
+        assert!(matches!(
+            connect(&handler, Keys::generate().public_key(), "secret").await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn connect_is_refused_when_the_list_cannot_be_read() {
+        let (handler, _) = listing_handler(ClientListing::Unavailable);
+        let app = Keys::generate().public_key();
+        assert!(matches!(
+            connect(&handler, app, "secret").await,
+            Err(KeepError::PermissionDenied(_))
+        ));
+        assert!(handler.permissions.lock().await.get_app(&app).is_none());
     }
 }

@@ -4,13 +4,14 @@
 use crate::network::validate_relay_url;
 use crate::{KeepMobile, KeepMobileError};
 use keep_nip46::types::{
-    ApprovalRequest, ApprovalResult, LogEvent, RememberDuration, ServerCallbacks,
+    ApprovalRequest, ApprovalResult, ClientListing, LogEvent, RememberDuration, ServerCallbacks,
 };
 use keep_nip46::{
     FrostSigner, NetworkFrostSigner, Permission, PreGrantedApp, RateLimitConfig, Server,
     ServerConfig, SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -418,6 +419,16 @@ impl ServerCallbacks for CallbackBridge {
             .on_connect(pubkey.to_string(), name.to_string(), authorization.into());
     }
 
+    fn client_listing(&self) -> ClientListing {
+        match listed_clients(&self.mobile) {
+            Ok(listed) => ClientListing::Listed(listed),
+            Err(e) => {
+                tracing::warn!(error = %e, "refusing connect: the authorized client list cannot be read");
+                ClientListing::Unavailable
+            }
+        }
+    }
+
     fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
         let serving = || {
             self.serving.load(Ordering::Acquire)
@@ -558,9 +569,12 @@ impl BunkerHandler {
     }
 
     /// The persisted grants a start restores, less those of any client a
-    /// revoke left pending. Those revokes are finished first where they can
-    /// be. Where they cannot, the grants stay on disk but are not served, and
-    /// the engine's next persist replaces them and clears the marks.
+    /// revoke left pending or `authorized_clients` does not list. Those
+    /// revokes are finished first where they can be. Where they cannot, the
+    /// grants stay on disk but are not served, and the engine's next persist
+    /// replaces them and clears the marks. The grants of unlisted clients are
+    /// dropped from disk too, so listing such a client again does not bring
+    /// them back.
     fn grants_to_restore(&self, scope: &str) -> Result<Vec<PreGrantedApp>, KeepMobileError> {
         let (all, clients) = self.pending_revokes()?;
         if let Err(e) = self.finish_pending_revokes() {
@@ -569,7 +583,14 @@ impl BunkerHandler {
         if all {
             return Ok(Vec::new());
         }
-        let revoked: std::collections::HashSet<PublicKey> = clients
+        let listed = listed_clients(&self.mobile)?;
+        if let Err(e) = self
+            .mobile
+            .retain_bunker_permissions(|pk| pk.is_some_and(|pk| listed.contains(pk)))
+        {
+            tracing::warn!(error = %e, "unlisted clients' grants are still stored; not restoring them");
+        }
+        let revoked: HashSet<PublicKey> = clients
             .iter()
             .filter_map(|c| PublicKey::from_hex(c).ok())
             .collect();
@@ -578,7 +599,8 @@ impl BunkerHandler {
             .load_bunker_permissions(scope)
             .iter()
             .filter(|grant| {
-                PublicKey::from_hex(&grant.pubkey_hex).map_or(true, |pk| !revoked.contains(&pk))
+                PublicKey::from_hex(&grant.pubkey_hex)
+                    .is_ok_and(|pk| listed.contains(&pk) && !revoked.contains(&pk))
             })
             .filter_map(PreGrantedApp::from_stored)
             .collect())
@@ -884,6 +906,19 @@ fn decode_transport_secret(hex_str: &str) -> Option<Zeroizing<[u8; 32]>> {
     let bytes: Zeroizing<[u8; 32]> = Zeroizing::new(decoded.as_slice().try_into().ok()?);
     nostr_sdk::secp256k1::SecretKey::from_slice(bytes.as_slice()).ok()?;
     Some(bytes)
+}
+
+/// The clients `authorized_clients` lists. Entries are parsed rather than
+/// compared as text, so one an older install stored in another case still
+/// matches, and one that does not parse names no client.
+fn listed_clients(mobile: &KeepMobile) -> Result<HashSet<PublicKey>, KeepMobileError> {
+    with_bunker_config(mobile, |stored| {
+        Ok(stored
+            .authorized_clients
+            .iter()
+            .filter_map(|c| PublicKey::parse(c).ok())
+            .collect())
+    })
 }
 
 /// Runs `f` on the stored bunker config under its lock.
@@ -1758,7 +1793,14 @@ mod tests {
             .collect()
     }
 
+    /// Remembers grants for `clients` and lists them, as the platform lists
+    /// every client that holds a grant.
     fn persist_remembered(mobile: &KeepMobile, clients: &[PublicKey]) {
+        set_listed(mobile, clients.iter().map(PublicKey::to_hex).collect());
+        persist_grants(mobile, clients);
+    }
+
+    fn persist_grants(mobile: &KeepMobile, clients: &[PublicKey]) {
         let (transport, _) = load_or_create_bunker_keys(mobile).unwrap();
         mobile
             .persist_bunker_permissions(
@@ -1767,6 +1809,114 @@ mod tests {
                 || true,
             )
             .unwrap();
+    }
+
+    fn set_listed(mobile: &KeepMobile, clients: Vec<String>) {
+        with_bunker_config(mobile, |stored| {
+            stored.authorized_clients = clients;
+            crate::persistence::persist_bunker_config(
+                &mobile.storage,
+                BUNKER_CONFIG_STORAGE_KEY,
+                stored,
+            )
+        })
+        .unwrap();
+    }
+
+    // A client the platform dropped from its list without a revoke keeps no
+    // grant: a start neither serves nor keeps it, so listing that client
+    // again later does not bring it back.
+    #[test]
+    fn a_start_drops_the_grants_of_unlisted_clients() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (listed, mixed_case, unlisted) = (
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+        );
+        persist_grants(&mobile, &[listed, mixed_case, unlisted]);
+        set_listed(
+            &mobile,
+            vec![
+                listed.to_hex(),
+                mixed_case.to_hex().to_uppercase(),
+                "not a key".into(),
+            ],
+        );
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+
+        let mut served = served_clients(&handler);
+        served.sort();
+        let mut expected = vec![listed.to_hex(), mixed_case.to_hex()];
+        expected.sort();
+        assert_eq!(served, expected);
+        let mut stored = restored_clients(&mobile);
+        stored.sort();
+        assert_eq!(stored, expected, "the unlisted client's grant is gone");
+
+        set_listed(
+            &mobile,
+            vec![listed.to_hex(), mixed_case.to_hex(), unlisted.to_hex()],
+        );
+        assert!(!served_clients(&handler).contains(&unlisted.to_hex()));
+    }
+
+    #[test]
+    fn a_start_with_no_listed_clients_restores_none() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        persist_remembered(&mobile, &[nostr_sdk::Keys::generate().public_key()]);
+        set_listed(&mobile, Vec::new());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        assert!(served_clients(&handler).is_empty());
+        assert!(restored_clients(&mobile).is_empty());
+    }
+
+    #[test]
+    fn the_engine_reads_the_authorized_client_list_on_each_connect() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let client = nostr_sdk::Keys::generate().public_key();
+        set_listed(
+            &mobile,
+            vec![client.to_hex().to_uppercase(), "not a key".into()],
+        );
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(NoCallbacks),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
+        };
+        assert_eq!(
+            ServerCallbacks::client_listing(&bridge),
+            ClientListing::Listed(HashSet::from([client]))
+        );
+
+        mem.data
+            .lock()
+            .unwrap()
+            .insert(BUNKER_CONFIG_STORAGE_KEY.into(), b"not json".to_vec());
+        assert_eq!(
+            ServerCallbacks::client_listing(&bridge),
+            ClientListing::Unavailable
+        );
+    }
+
+    struct NoCallbacks;
+    impl BunkerCallbacks for NoCallbacks {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            BunkerApprovalResult {
+                approved: false,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
     }
 
     // With no bunker running there is no engine to persist a revoke, so the
@@ -2419,6 +2569,108 @@ mod tests {
         }
     }
 
+    // End to end over a relay with the production callback bridge: once the
+    // platform lists the most clients it allows, a stranger holding the
+    // connect secret is refused and granted nothing, a listed client still
+    // connects, and a slot the platform frees admits the stranger.
+    #[test]
+    fn a_connect_past_the_listed_cap_is_refused_end_to_end() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let scope = grant_scope(&transport, &GROUP).unwrap();
+        let listed = nostr_sdk::Keys::generate();
+        let mut clients: Vec<String> = (1..keep_nip46::PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| nostr_sdk::Keys::generate().public_key().to_hex())
+            .collect();
+        clients.push(listed.public_key().to_hex());
+        set_listed(&mobile, clients.clone());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let relay = mobile
+            .runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let url = mobile.runtime.block_on(relay.url()).to_string();
+        let keyring = {
+            let mut keyring = keep_core::keyring::Keyring::new();
+            let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+            keyring
+                .load_key(
+                    *keypair.public_bytes(),
+                    *keypair.secret_bytes(),
+                    keep_core::keys::KeyType::Nostr,
+                    "test".into(),
+                )
+                .unwrap();
+            Arc::new(tokio::sync::Mutex::new(keyring))
+        };
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, _, _) = serve_stored(&mobile, &starter, &url, keyring, &scope, &prompts);
+        let connect = serde_json::json!([bunker.to_hex(), secret.as_str()]);
+        let ask = |client: &nostr_sdk::Client, keys, id, method, params| {
+            mobile
+                .runtime
+                .block_on(ask_over_relay(client, keys, bunker, id, method, params))
+        };
+
+        let stranger = nostr_sdk::Keys::generate();
+        let stranger_client = listening(&mobile, &url, &stranger, bunker);
+        assert_eq!(
+            error_of(ask(
+                &stranger_client,
+                &stranger,
+                "full",
+                "connect",
+                connect.clone()
+            ))
+            .as_deref(),
+            Some("Capacity exceeded"),
+        );
+        assert_eq!(
+            error_of(ask(
+                &stranger_client,
+                &stranger,
+                "full-key",
+                "get_public_key",
+                serde_json::json!([])
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "the refused connect granted nothing"
+        );
+
+        let listed_client = listening(&mobile, &url, &listed, bunker);
+        assert_eq!(
+            error_of(ask(
+                &listed_client,
+                &listed,
+                "listed",
+                "connect",
+                connect.clone()
+            )),
+            None
+        );
+
+        clients.remove(0);
+        set_listed(&mobile, clients);
+        assert_eq!(
+            error_of(ask(
+                &stranger_client,
+                &stranger,
+                "freed",
+                "connect",
+                connect
+            )),
+            None,
+            "a freed slot admits the stranger"
+        );
+        assert_eq!(prompts.load(Ordering::Acquire), 0, "nothing asked the user");
+        starter.stop_bunker();
+        for c in [stranger_client, listed_client] {
+            mobile.runtime.block_on(c.disconnect());
+        }
+    }
+
     // A revoke that cannot complete leaves the bunker stopped, so the old
     // secret does not keep serving, and reports the failure.
     #[test]
@@ -2537,6 +2789,7 @@ mod tests {
             serving: Arc::new(AtomicBool::new(true)),
         };
         *mem.fail_writes_to.lock().unwrap() = None;
+        set_listed(&mobile, vec![a.to_hex(), b.to_hex()]);
         ServerCallbacks::persist_permissions(&bridge, vec![remembered(&a), remembered(&b)]);
         assert!(stored_config(&storage).pending_revokes.is_empty());
         assert_eq!(served_clients(&handler).len(), 2, "a was approved again");
@@ -2665,6 +2918,28 @@ mod tests {
         assert_eq!(reloaded.connect_secret.as_deref(), Some(secret.as_str()));
         assert_eq!(reloaded.pending_revokes, vec!["p".to_string()]);
         assert!(reloaded.pending_revoke_all);
+    }
+
+    #[test]
+    fn save_bunker_config_refuses_more_clients_than_the_engine_holds() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
+        let save = |n: usize| {
+            mobile.save_bunker_config(crate::BunkerConfigInfo {
+                enabled: true,
+                authorized_clients: (0..n).map(|i| format!("{i:064x}")).collect(),
+            })
+        };
+        save(max).unwrap();
+        assert!(matches!(
+            save(max + 1),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        let stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.authorized_clients.len(), max);
     }
 
     // Saving unrelated config (e.g. toggling enabled) must not rotate the keys.
