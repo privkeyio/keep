@@ -2920,6 +2920,28 @@ mod tests {
         assert!(reloaded.pending_revoke_all);
     }
 
+    #[test]
+    fn save_bunker_config_refuses_more_clients_than_the_engine_holds() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
+        let save = |n: usize| {
+            mobile.save_bunker_config(crate::BunkerConfigInfo {
+                enabled: true,
+                authorized_clients: (0..n).map(|i| format!("{i:064x}")).collect(),
+            })
+        };
+        save(max).unwrap();
+        assert!(matches!(
+            save(max + 1),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        let stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.authorized_clients.len(), max);
+    }
+
     // Saving unrelated config (e.g. toggling enabled) must not rotate the keys.
     #[test]
     fn rewriting_config_preserves_keys() {

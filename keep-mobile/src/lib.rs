@@ -3488,6 +3488,16 @@ impl KeepMobile {
     }
 
     pub fn save_bunker_config(&self, config: BunkerConfigInfo) -> Result<(), KeepMobileError> {
+        // A listed client is always admitted only while the list fits the
+        // engine's app table.
+        if config.authorized_clients.len() > keep_nip46::PermissionManager::MAX_CONNECTED_APPS {
+            return Err(KeepMobileError::InvalidInput {
+                msg: format!(
+                    "At most {} clients can be authorized",
+                    keep_nip46::PermissionManager::MAX_CONNECTED_APPS
+                ),
+            });
+        }
         // Preserve the persisted transport key + connect secret so toggling the
         // bunker off/on (or any other config save) does not rotate the bunker://
         // URL out from under already-paired clients. The whole read-modify-write
