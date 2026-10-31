@@ -1900,6 +1900,22 @@ mod tests {
     }
 
     #[test]
+    fn expired_listed_apps_leave_room_for_a_listed_client() {
+        let mut pm = PermissionManager::new();
+        let old = keys(PermissionManager::MAX_CONNECTED_APPS);
+        for pk in &old {
+            assert!(pm.connect(*pk, "App".into()));
+            let app = pm.apps.get_mut(pk).unwrap();
+            app.duration = PermissionDuration::Seconds(1);
+            app.connected_at = Timestamp::from(1_000);
+        }
+        let client = Keys::generate().public_key();
+        let mut listed: HashSet<PublicKey> = old.iter().copied().collect();
+        listed.insert(client);
+        assert!(admit(&mut pm, &client, &listed).0);
+    }
+
+    #[test]
     fn would_connect_matches_ensure_capacity() {
         let mut pm = PermissionManager::new();
         let connected = keys(PermissionManager::MAX_CONNECTED_APPS);

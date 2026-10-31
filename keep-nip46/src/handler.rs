@@ -402,7 +402,7 @@ impl SignerHandler {
 
     /// Why a connect from `app_pubkey` would not be admitted now, if it would
     /// not, without changing anything.
-    async fn admission_refused(&self, app_pubkey: &PublicKey) -> Option<KeepError> {
+    async fn admission_refused(&self, app_pubkey: &PublicKey) -> Option<&'static str> {
         let listing = self
             .callbacks
             .as_ref()
@@ -411,13 +411,9 @@ impl SignerHandler {
         let admitted = match &listing {
             ClientListing::Unrestricted => pm.would_connect(app_pubkey),
             ClientListing::Listed(listed) => pm.would_admit_listed(app_pubkey, listed),
-            ClientListing::Unavailable => {
-                return Some(KeepError::PermissionDenied(
-                    "the connected app list cannot be read".into(),
-                ))
-            }
+            ClientListing::Unavailable => return Some("app list unreadable"),
         };
-        (!admitted).then(|| KeepError::CapacityExceeded("too many connected apps".into()))
+        (!admitted).then_some("too many connected apps")
     }
 
     pub async fn handle_connect(
@@ -453,13 +449,16 @@ impl SignerHandler {
         } else if !self.auto_approve {
             // Nobody is asked to approve a connect admission would refuse.
             // Admission itself runs after approval, on the list read again.
-            if let Some(e) = self.admission_refused(&app_pubkey).await {
+            // The client is told only that it was rejected, as when the owner
+            // says no, so an unapproved key learns nothing of the signer's
+            // state.
+            if let Some(why) = self.admission_refused(&app_pubkey).await {
                 self.audit.lock().await.log(
                     AuditEntry::new(AuditAction::Connect, app_pubkey)
                         .with_success(false)
-                        .with_reason("not admitted"),
+                        .with_reason(format!("not admitted before asking: {why}")),
                 );
-                return Err(e);
+                return Err(KeepError::UserRejected);
             }
             // Connect-time approval ignores the remember-duration today: the
             // app-level lifetime is configured separately via the bunker's
@@ -546,6 +545,12 @@ impl SignerHandler {
             return Err(e);
         }
         if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
+            drop(pm);
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::Connect, app_pubkey)
+                    .with_success(false)
+                    .with_reason("not admitted"),
+            );
             return Err(KeepError::CapacityExceeded(
                 "too many connected apps".into(),
             ));
@@ -2765,7 +2770,7 @@ mod tests {
         let stranger = Keys::generate().public_key();
         assert!(matches!(
             ask(&handler, stranger).await,
-            Err(KeepError::CapacityExceeded(_))
+            Err(KeepError::UserRejected)
         ));
         assert_eq!(prompts(&cb), 0);
         assert!(handler
@@ -2774,13 +2779,21 @@ mod tests {
             .await
             .get_app(&stranger)
             .is_none());
+        assert_eq!(
+            last_reason(&handler).await.as_deref(),
+            Some("not admitted before asking: too many connected apps")
+        );
 
         *cb.listing.lock().unwrap() = ClientListing::Unavailable;
         assert!(matches!(
             ask(&handler, stranger).await,
-            Err(KeepError::PermissionDenied(_))
+            Err(KeepError::UserRejected)
         ));
         assert_eq!(prompts(&cb), 0);
+        assert_eq!(
+            last_reason(&handler).await.as_deref(),
+            Some("not admitted before asking: app list unreadable")
+        );
 
         let (handler, cb) = prompting_handler(ClientListing::Unrestricted);
         for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
@@ -2789,9 +2802,36 @@ mod tests {
         let before = prompts(&cb);
         assert!(matches!(
             ask(&handler, stranger).await,
-            Err(KeepError::CapacityExceeded(_))
+            Err(KeepError::UserRejected)
         ));
         assert_eq!(prompts(&cb), before);
+    }
+
+    async fn last_reason(handler: &SignerHandler) -> Option<String> {
+        handler
+            .audit
+            .lock()
+            .await
+            .recent(1)
+            .next()
+            .and_then(|e| e.reason.clone())
+    }
+
+    // A connect that finds the table full once past any prompt is refused and
+    // audited like any other refusal.
+    #[tokio::test]
+    async fn a_connect_refused_for_room_at_admission_is_audited() {
+        let (handler, _) = listing_handler(ClientListing::Unrestricted);
+        for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
+            connect(&handler, Keys::generate().public_key(), "secret")
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            connect(&handler, Keys::generate().public_key(), "secret").await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert_eq!(last_reason(&handler).await.as_deref(), Some("not admitted"));
     }
 
     // A connect admission would take is asked once and admitted, including a
