@@ -247,7 +247,8 @@ const GLOBAL_SIGN_POLICY_KEY: &str = "global_sign_policy";
 
 /// The key of an override set before overrides were per account. It names no
 /// account, so it may be any account's: it is never deleted, and it only
-/// tightens an account that has not chosen for the app itself.
+/// tightens an account that has not chosen for the app itself, until one
+/// account adopts it.
 fn legacy_override_key(package: &str) -> String {
     format!("sign_policy_override:{package}")
 }
@@ -351,9 +352,10 @@ impl SignPolicyStore {
     /// An override that is stored but cannot be read or parsed is `Manual`: it
     /// may be stricter than the global policy, so it is never taken as absent.
     /// Until the account chooses for the app, an override from before
-    /// overrides were per account, which belongs to no known account, can only
-    /// tighten the global policy. An `account` that is not a group key, or an
-    /// empty `package`, is `Manual`.
+    /// overrides were per account can only tighten the global policy, unless
+    /// another account has adopted it (see [`Self::adopt_legacy_override`]).
+    /// An `account` that is not a group key, or an empty `package`, is
+    /// `Manual`.
     pub fn app_override(&self, account: String, package: String) -> Option<SignPolicySelection> {
         let Some(key) = app_override_key(&account, &package) else {
             return Some(SignPolicySelection::Manual);
@@ -362,10 +364,24 @@ impl SignPolicyStore {
             StorageRead::Found { value } if value == FOLLOWS_GLOBAL => None,
             StorageRead::Found { value } => Some(parse_selection(&value)),
             StorageRead::Unavailable => Some(SignPolicySelection::Manual),
+            StorageRead::Absent if self.adopted_by_another(&account, &package) => None,
             StorageRead::Absent => self.selection(legacy_override_key(&package)).map(|legacy| {
                 self.global_policy()
                     .stricter(legacy.unwrap_or(SignPolicySelection::Manual))
             }),
+        }
+    }
+
+    /// Whether another account adopted the legacy override for `package`, so
+    /// it was that account's and is no floor for this one, as an account
+    /// switch cleared it before overrides were per account. A claim that
+    /// cannot be read, or names no account, leaves the floor in place.
+    fn adopted_by_another(&self, account: &str, package: &str) -> bool {
+        match self.storage.load(legacy_adopted_key(package)) {
+            StorageRead::Found { value } => {
+                app_override_key(&value, package).is_some() && !value.eq_ignore_ascii_case(account)
+            }
+            StorageRead::Absent | StorageRead::Unavailable => false,
         }
     }
 
@@ -401,14 +417,16 @@ impl SignPolicyStore {
     /// Make the override `package` had before overrides were per account
     /// `account`'s own. The legacy key names no account, so the caller passes
     /// the account active at the first launch that reads overrides per account,
-    /// which is the one the override governed until then. Every other account
-    /// still reads it only as a floor, and it is never removed.
+    /// which is the one the override governed until then. Once adopted it is
+    /// no floor for any other account, which follows its own policy for the
+    /// app as it did after an account switch before. It is never removed.
     ///
     /// The first call for a package claims it for its account, and a later call
     /// for any other account returns `true` and writes nothing, so a retry after
     /// an account switch cannot hand the override to a second account. The
     /// claim is written before the override, so a failure between the two
-    /// leaves the claimed account stricter, never another account looser. An
+    /// leaves the claimed account still floored by the legacy override, while
+    /// every other account follows its own policy for the app from then. An
     /// account that has already chosen for the app keeps its choice. A legacy
     /// override that cannot be parsed is adopted as `Manual`, the floor it
     /// already enforced.
@@ -2117,7 +2135,11 @@ mod tests {
         // Adopted once: a second account, or a retry after a switch, gains nothing.
         assert!(adopt(OTHER));
         assert!(!has(app_override_key(OTHER, "com.app").unwrap()));
-        assert_eq!(effective(OTHER), SignPolicySelection::Manual);
+        assert_eq!(
+            store.app_override(OTHER.into(), "com.app".into()),
+            None,
+            "the claimer's override is no floor for another account"
+        );
 
         // A claim whose override never landed still keeps every other account out.
         set(legacy_override_key("com.other"), "2");
@@ -2129,6 +2151,56 @@ mod tests {
             store.effective_policy(ACCOUNT.into(), "com.other".into()),
             SignPolicySelection::Auto
         );
+    }
+
+    #[test]
+    fn an_adopted_legacy_override_is_no_floor_for_other_accounts() {
+        const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        let set = |key: String, value: &str| {
+            storage.map.lock().unwrap().insert(key, value.into());
+        };
+        let other = || store.app_override(OTHER.into(), "com.app".into());
+        store.set_global_policy(SignPolicySelection::Auto);
+        set(legacy_override_key("com.app"), "0");
+        assert_eq!(
+            other(),
+            Some(SignPolicySelection::Manual),
+            "a floor until adopted"
+        );
+
+        assert!(store.adopt_legacy_override(ACCOUNT.to_ascii_uppercase(), "com.app".into()));
+        assert_eq!(other(), None);
+        assert_eq!(
+            store.effective_policy(OTHER.into(), "com.app".into()),
+            SignPolicySelection::Auto
+        );
+        assert_eq!(
+            store.app_override(ACCOUNT.into(), "com.app".into()),
+            Some(SignPolicySelection::Manual)
+        );
+
+        // The claimer's own override not landed yet: still floored.
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .remove(&app_override_key(ACCOUNT, "com.app").unwrap());
+        assert_eq!(
+            store.app_override(ACCOUNT.into(), "com.app".into()),
+            Some(SignPolicySelection::Manual)
+        );
+        assert_eq!(
+            store.app_override(ACCOUNT.to_ascii_uppercase(), "com.app".into()),
+            Some(SignPolicySelection::Manual),
+            "the claim matches its account in any case"
+        );
+
+        for claim in [UNREADABLE, "", "not an account", "aa"] {
+            set(legacy_adopted_key("com.app"), claim);
+            assert_eq!(other(), Some(SignPolicySelection::Manual), "{claim:?}");
+        }
     }
 
     #[test]
