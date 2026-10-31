@@ -89,6 +89,22 @@ pub enum KeepMobileError {
         expected: String,
         actual: String,
     },
+
+    /// An import found this key already stored.
+    #[error("This key is already stored")]
+    KeyAlreadyStored,
+
+    /// An import found this exact share already stored.
+    #[error("This share is already stored")]
+    ShareAlreadyStored,
+
+    /// An import found another share of the same group already stored.
+    #[error("Another share of this group is already stored")]
+    GroupShareAlreadyStored,
+
+    /// A bunker config listed more authorized clients than the signer holds.
+    #[error("At most {max} clients can be authorized")]
+    TooManyAuthorizedClients { max: u32 },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {

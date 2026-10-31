@@ -2934,7 +2934,7 @@ mod tests {
         save(max).unwrap();
         assert!(matches!(
             save(max + 1),
-            Err(KeepMobileError::InvalidInput { .. })
+            Err(KeepMobileError::TooManyAuthorizedClients { max: m }) if m as usize == max
         ));
         let stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
             .unwrap()
