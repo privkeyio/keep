@@ -1138,43 +1138,17 @@ impl KeepMobile {
         self.do_initialize(relays, Some(proxy))
     }
 
+    /// Import a share export. A share already stored under its group is
+    /// never written over: an export holds nothing an attacker cannot forge
+    /// for a group and index, so a copy and a forgery look the same until the
+    /// stored record is read. Delete the stored share first to replace it.
     pub fn import_share(
         &self,
         data: String,
         passphrase: String,
         name: String,
     ) -> Result<ShareInfo, KeepMobileError> {
-        if data.len() > MAX_IMPORT_DATA_SIZE {
-            return Err(KeepMobileError::InvalidShare {
-                msg: "Import data exceeds maximum size".into(),
-            });
-        }
-
-        Self::validate_share_name(&name)?;
-
-        let passphrase = Zeroizing::new(passphrase);
-        let export = ShareExport::parse(&data)
-            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
-
-        if export.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
-            return Err(KeepMobileError::InvalidShare {
-                msg: "Only secp256k1 (Bitcoin/Nostr) shares are supported on mobile".into(),
-            });
-        }
-
-        let share = export
-            .to_share(&passphrase, &name)
-            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
-
-        // Re-importing a stored share does not add one, so only a new group
-        // is held to the cap.
-        if self
-            .listed_share_identifier(&hex::encode(share.group_pubkey()))?
-            .is_none()
-        {
-            self.ensure_share_capacity()?;
-        }
-        self.store_share_package(&share)
+        self.import_share_export(data, passphrase, name, false)
     }
 
     pub fn import_nsec(&self, nsec: Vec<u8>, name: String) -> Result<ShareInfo, KeepMobileError> {
@@ -1960,7 +1934,12 @@ impl KeepMobile {
                     tracing::warn!("failed to stash pending DKG marker before import: {e}");
                 }
 
-                match self.import_share(result.share_export, passphrase.to_string(), name) {
+                match self.import_share_export(
+                    result.share_export,
+                    passphrase.to_string(),
+                    name,
+                    true,
+                ) {
                     Ok(info) => {
                         // Import confirmed; clear the stash (best-effort — a stale
                         // stash is recovered idempotently, never lost).
@@ -2048,10 +2027,13 @@ impl KeepMobile {
             })?)
         };
 
-        let info = self.import_share(
+        // Only a ceremony's own stash is vault-protected, so only it may
+        // redo an import that landed before the stash was cleared.
+        let info = self.import_share_export(
             secret.share_export.to_string(),
             passphrase.to_string(),
             marker.name,
+            marker.vault_protected,
         )?;
 
         if let Err(e) = persistence::delete_pending_dkg_stash(
@@ -4936,9 +4918,7 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
         let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
-        // Nothing listed under the key can be the same 1-of-1 share as this
-        // one, since a stored key is never written over.
-        self.listed_same_share(&group_pubkey_hex, &metadata_info)?;
+        self.refuse_listed_share(&group_pubkey_hex, &metadata_info, false)?;
         self.ensure_share_capacity()?;
         self.storage.store_share_by_key(
             group_pubkey_hex.clone(),
@@ -5506,20 +5486,22 @@ impl KeepMobile {
         Ok(self.listed_share(key)?.map(|m| m.identifier))
     }
 
-    /// The share listed under `key` when it is the share `incoming` describes
-    /// (the same index of a threshold group of the same size), `None` when
-    /// none is listed, and an error for any other share of the group, so a
-    /// write never replaces one share with another. A stored key (1-of-1) is
-    /// never written over at all: its record holds the seed words it was
-    /// created from, and an import has no way to tell a copy of it from a
-    /// forgery short of reading that record.
-    fn listed_same_share(
+    /// Refuse a write of `incoming` under `key` when the registry lists a
+    /// share there. An import has no way to tell a copy of a stored share from
+    /// a forgery short of reading its record, so none is written over, with
+    /// one exception: when `own_same` is set, the same share (the same index
+    /// of a threshold group of the same size) may be, which only this device's
+    /// own DKG result asks for. A stored key (1-of-1) is never written over:
+    /// its record holds the seed words it was created from.
+    fn refuse_listed_share(
         &self,
         key: &str,
         incoming: &ShareMetadataInfo,
-    ) -> Result<Option<ShareMetadataInfo>, KeepMobileError> {
+        own_same: bool,
+    ) -> Result<(), KeepMobileError> {
         let shape = |m: &ShareMetadataInfo| (m.identifier, m.threshold, m.total_shares);
         match self.listed_share(key)? {
+            None => Ok(()),
             Some(listed) if listed.threshold == 1 && listed.total_shares == 1 => {
                 Err(KeepMobileError::InvalidShare {
                     msg: "This key is already stored".into(),
@@ -5530,8 +5512,55 @@ impl KeepMobile {
                     msg: "Another share of this group is already stored".into(),
                 })
             }
-            listed => Ok(listed),
+            Some(_) if own_same => Ok(()),
+            Some(_) => Err(KeepMobileError::InvalidShare {
+                msg: "This share is already stored".into(),
+            }),
         }
+    }
+
+    /// Import a share export, as [`Self::import_share`] does. `own` marks an
+    /// export this device produced in a DKG ceremony (its result, or the stash
+    /// kept of it), which may write over the same share of its group: a
+    /// recovery redoes an import that landed before its stash was cleared.
+    fn import_share_export(
+        &self,
+        data: String,
+        passphrase: String,
+        name: String,
+        own: bool,
+    ) -> Result<ShareInfo, KeepMobileError> {
+        if data.len() > MAX_IMPORT_DATA_SIZE {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Import data exceeds maximum size".into(),
+            });
+        }
+
+        Self::validate_share_name(&name)?;
+
+        let passphrase = Zeroizing::new(passphrase);
+        let export = ShareExport::parse(&data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        if export.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Only secp256k1 (Bitcoin/Nostr) shares are supported on mobile".into(),
+            });
+        }
+
+        let share = export
+            .to_share(&passphrase, &name)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        // Writing a stored share again does not add one, so only a new group
+        // is held to the cap.
+        if self
+            .listed_share_identifier(&hex::encode(share.group_pubkey()))?
+            .is_none()
+        {
+            self.ensure_share_capacity()?;
+        }
+        self.store_share_package(&share, own)
     }
 
     /// The share the registry lists under `key`, read as
@@ -5553,11 +5582,15 @@ impl KeepMobile {
             .find(|m| hex::encode(&m.group_pubkey) == key))
     }
 
-    fn store_share_package(&self, share: &SharePackage) -> Result<ShareInfo, KeepMobileError> {
+    fn store_share_package(
+        &self,
+        share: &SharePackage,
+        own: bool,
+    ) -> Result<ShareInfo, KeepMobileError> {
         let metadata: ShareMetadataInfo = (&share.metadata).into();
         let group_pubkey_hex = hex::encode(&metadata.group_pubkey);
 
-        self.listed_same_share(&group_pubkey_hex, &metadata)?;
+        self.refuse_listed_share(&group_pubkey_hex, &metadata, own)?;
 
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
@@ -6909,7 +6942,7 @@ mod import_teardown_tests {
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "imported-share".into());
         let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
 
-        let info = mobile.store_share_package(&share).unwrap();
+        let info = mobile.store_share_package(&share, false).unwrap();
 
         assert_pending_cleared(&mobile);
         assert_eq!(
@@ -6929,7 +6962,7 @@ mod import_teardown_tests {
         let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
         let share = SharePackage::new(metadata.clone(), &key_package, &pubkey_package).unwrap();
-        let info = mobile.store_share_package(&share).unwrap();
+        let info = mobile.store_share_package(&share, false).unwrap();
 
         // Loaded under its own (correct) key: accepted.
         assert!(mobile.load_share_package().is_ok());
@@ -6964,7 +6997,7 @@ mod import_teardown_tests {
         let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
         let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
-        mobile.store_share_package(&share).unwrap();
+        mobile.store_share_package(&share, false).unwrap();
         let expected_secret = key_package.signing_share().serialize();
 
         let ncryptsec = mobile
@@ -6992,7 +7025,7 @@ mod import_teardown_tests {
         let group_pubkey: [u8; 32] = vk_bytes[1..33].try_into().unwrap();
         let metadata = ShareMetadata::new(1, 1, 1, group_pubkey, "share".into());
         let share = SharePackage::new(metadata, &key_package, &pubkey_package).unwrap();
-        mobile.store_share_package(&share).unwrap();
+        mobile.store_share_package(&share, false).unwrap();
 
         // 0xFF is never valid UTF-8: reject rather than silently mangle the password.
         let result = mobile.export_ncryptsec(vec![0xff, 0xfe]);
@@ -11703,7 +11736,9 @@ mod share_registry_tests {
     #[test]
     fn share_store_status_reports_each_variant() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         assert_eq!(mobile.share_store_status(), ShareStoreStatus::Readable);
 
         let missing = "ab".repeat(32);
@@ -11723,7 +11758,7 @@ mod share_registry_tests {
     fn create_backup_holds_every_readable_share() {
         let (_, mobile) = setup();
         let share = &group_shares()[0];
-        mobile.store_share_package(share).unwrap();
+        mobile.store_share_package(share, false).unwrap();
         let bytes = mobile.create_backup(PASS.into()).unwrap();
         let decrypted = decrypt_backup_data(&bytes, PASS).unwrap();
         assert_eq!(decrypted.shares.len(), 1);
@@ -11736,7 +11771,9 @@ mod share_registry_tests {
     #[test]
     fn create_backup_refuses_when_a_share_is_unreadable() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         storage.mark_unreadable("ab".repeat(32));
         let result = mobile.create_backup(PASS.into());
         assert!(
@@ -11748,7 +11785,9 @@ mod share_registry_tests {
     #[test]
     fn create_backup_refuses_when_the_registry_is_unavailable() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         storage.registry_unavailable.store(true, Ordering::SeqCst);
         let result = mobile.create_backup(PASS.into());
         assert!(
@@ -11760,14 +11799,18 @@ mod share_registry_tests {
     #[test]
     fn share_cap_counts_unreadable_shares() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         for i in 0..MAX_STORED_SHARES - 2 {
             storage.mark_unreadable(format!("{i:064x}"));
         }
         import_nsec(&mobile).unwrap();
 
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         for i in 0..MAX_STORED_SHARES - 1 {
             storage.mark_unreadable(format!("{i:064x}"));
         }
@@ -11869,7 +11912,7 @@ mod share_registry_tests {
         storage
             .store_share_by_key(key.clone(), b"key".to_vec(), meta)
             .unwrap();
-        let result = mobile.store_share_package(share);
+        let result = mobile.store_share_package(share, false);
         assert!(
             matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
             "got {result:?}"
@@ -11881,7 +11924,7 @@ mod share_registry_tests {
     fn importing_another_share_of_a_stored_group_is_refused() {
         let (storage, mobile) = setup();
         let shares = group_shares();
-        mobile.store_share_package(&shares[0]).unwrap();
+        mobile.store_share_package(&shares[0], false).unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         let before = storage.raw(&key).unwrap();
 
@@ -11894,28 +11937,61 @@ mod share_registry_tests {
         assert_eq!(storage.raw(&key).unwrap(), before);
     }
 
+    // An export holds nothing an attacker cannot forge for a group and index,
+    // so a stored threshold share is never written over by an import, the same
+    // share included; only this device's own DKG result may redo its write.
     #[test]
-    fn reimporting_the_same_share_overwrites_it() {
+    fn a_stored_share_is_written_over_only_by_its_own_dkg_result() {
         let (storage, mobile) = setup();
-        let mut share = group_shares().remove(0);
-        mobile.store_share_package(&share).unwrap();
+        let mut shares = group_shares();
+        let other = shares.remove(1);
+        let mut share = shares.remove(0);
+        let info = mobile.store_share_package(&share, false).unwrap();
+        let before = storage.raw(&info.group_pubkey).unwrap();
         share.metadata.name = "renamed".into();
-        let info = mobile.store_share_package(&share).unwrap();
+        let result = mobile.store_share_package(&share, false);
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            "got {result:?}"
+        );
+        assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
+        let export = ShareExport::from_share(&share, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let result = mobile.import_share(export.clone(), PASS.into(), "renamed".into());
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            "got {result:?}"
+        );
+        assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
+
+        let info = mobile
+            .import_share_export(export, PASS.into(), "renamed".into(), true)
+            .unwrap();
         assert_eq!(info.name, "renamed");
         let stored: StoredShareData =
             serde_json::from_slice(&storage.raw(&info.group_pubkey).unwrap()).unwrap();
         assert!(stored.metadata_json.contains("renamed"));
+        // Even its own result never replaces another share of the group.
+        let export = ShareExport::from_share(&other, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        assert!(mobile
+            .import_share_export(export, PASS.into(), "x".into(), true)
+            .is_err());
     }
 
     #[test]
     fn importing_over_an_unreadable_record_is_refused() {
         let (storage, mobile) = setup();
         let shares = group_shares();
-        mobile.store_share_package(&shares[0]).unwrap();
+        mobile.store_share_package(&shares[0], false).unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         storage.mark_unreadable(key.clone());
 
-        let result = mobile.store_share_package(&shares[1]);
+        let result = mobile.store_share_package(&shares[1], false);
         assert!(
             matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("not replaced")),
             "got {result:?}"
@@ -11927,7 +12003,7 @@ mod share_registry_tests {
         );
 
         storage.delete_share_by_key(key.clone()).unwrap();
-        mobile.store_share_package(&shares[1]).unwrap();
+        mobile.store_share_package(&shares[1], false).unwrap();
         assert_eq!(
             stored_identifier(&storage, &key),
             shares[1].metadata.identifier
@@ -11938,15 +12014,16 @@ mod share_registry_tests {
     fn importing_a_share_loads_no_record() {
         let (storage, mobile) = setup();
         let shares = group_shares();
-        mobile.store_share_package(&shares[0]).unwrap();
-        mobile.store_share_package(&shares[0]).unwrap();
-        assert!(mobile.store_share_package(&shares[1]).is_err());
+        mobile.store_share_package(&shares[0], false).unwrap();
+        assert!(mobile.store_share_package(&shares[0], false).is_err());
+        mobile.store_share_package(&shares[0], true).unwrap();
+        assert!(mobile.store_share_package(&shares[1], false).is_err());
         let key = hex::encode(shares[0].group_pubkey());
         assert!(!storage.loaded.lock().unwrap().contains(&key));
     }
 
     #[test]
-    fn importing_over_a_malformed_record_writes_it() {
+    fn importing_over_a_malformed_record_is_refused_until_it_is_removed() {
         let (storage, mobile) = setup();
         let share = &group_shares()[1];
         let key = hex::encode(share.group_pubkey());
@@ -11954,14 +12031,19 @@ mod share_registry_tests {
             .store_share_by_key(key.clone(), b"not json".to_vec(), (&share.metadata).into())
             .unwrap();
 
-        mobile.store_share_package(share).unwrap();
+        assert!(mobile.store_share_package(share, false).is_err());
+        assert_eq!(storage.raw(&key).unwrap(), b"not json");
+        storage.delete_share_by_key(key.clone()).unwrap();
+        mobile.store_share_package(share, false).unwrap();
         assert_eq!(stored_identifier(&storage, &key), share.metadata.identifier);
     }
 
     #[test]
     fn repairing_the_descriptor_index_keeps_an_unreadable_shares_group() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         let unreadable = "ab".repeat(32);
         let meta = persistence::storage_metadata("descriptor");
         storage
@@ -11993,7 +12075,9 @@ mod share_registry_tests {
     #[test]
     fn repairing_the_descriptor_index_refuses_when_the_registry_is_unavailable() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         storage.registry_unavailable.store(true, Ordering::SeqCst);
         let result = mobile.wallet_descriptor_repair_index(true);
         assert!(
@@ -12006,7 +12090,7 @@ mod share_registry_tests {
     fn resolving_the_active_share_counts_unreadable_shares() {
         let (storage, mobile) = setup();
         let share = &group_shares()[0];
-        mobile.store_share_package(share).unwrap();
+        mobile.store_share_package(share, false).unwrap();
         assert_eq!(
             mobile.resolve_active_share().unwrap(),
             hex::encode(share.group_pubkey())
@@ -12030,7 +12114,9 @@ mod share_registry_tests {
     #[test]
     fn resolving_the_active_share_refuses_when_the_registry_is_unavailable() {
         let (storage, mobile) = setup();
-        mobile.store_share_package(&group_shares()[0]).unwrap();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         storage.registry_unavailable.store(true, Ordering::SeqCst);
         let result = mobile.resolve_active_share();
         assert!(
@@ -12042,7 +12128,9 @@ mod share_registry_tests {
     #[test]
     fn restoring_beside_an_unreadable_share_leaves_the_pointer_unset() {
         let (_, source) = setup();
-        source.store_share_package(&group_shares()[0]).unwrap();
+        source
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
         let backup = source.create_backup(PASS.into()).unwrap();
 
         let (storage, mobile) = setup();
@@ -12070,11 +12158,11 @@ mod share_registry_tests {
     fn importing_over_a_record_that_failed_to_load_is_refused() {
         let (storage, mobile) = setup();
         let shares = group_shares();
-        mobile.store_share_package(&shares[0]).unwrap();
+        mobile.store_share_package(&shares[0], false).unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         storage.fail_loads_of(key.clone());
 
-        let result = mobile.store_share_package(&shares[1]);
+        let result = mobile.store_share_package(&shares[1], false);
         assert!(
             matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
             "got {result:?}"
@@ -12090,11 +12178,11 @@ mod share_registry_tests {
     fn restoring_over_a_stored_or_unreadable_share_is_refused() {
         let shares = group_shares();
         let (_, source) = setup();
-        source.store_share_package(&shares[1]).unwrap();
+        source.store_share_package(&shares[1], false).unwrap();
         let backup = source.create_backup(PASS.into()).unwrap();
 
         let (storage, mobile) = setup();
-        mobile.store_share_package(&shares[0]).unwrap();
+        mobile.store_share_package(&shares[0], false).unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         storage.fail_loads_of(key.clone());
         assert!(mobile.restore_backup(backup.clone(), PASS.into()).is_err());
@@ -12153,7 +12241,7 @@ mod share_registry_tests {
     fn active_share_metadata_follows_the_pointer() {
         let (storage, mobile) = setup();
         let share = &group_shares()[0];
-        mobile.store_share_package(share).unwrap();
+        mobile.store_share_package(share, false).unwrap();
         let key = hex::encode(share.group_pubkey());
         storage.set_active_share_key(Some(key)).unwrap();
         storage.mark_unreadable("ab".repeat(32));
@@ -12161,8 +12249,79 @@ mod share_registry_tests {
         assert_eq!(meta.group_pubkey, share.group_pubkey().to_vec());
     }
 
+    fn stash(storage: &Arc<RegistryStorage>, export: &str, vault: Option<&str>) {
+        let storage = storage.clone() as Arc<dyn SecureStorage>;
+        persistence::persist_pending_dkg_secret(
+            &storage,
+            DKG_PENDING_SECRET_KEY,
+            &persistence::PendingDkgSecret {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                share_export: Zeroizing::new(export.into()),
+                vault_passphrase: vault.map(|p| Zeroizing::new(p.into())),
+            },
+        )
+        .unwrap();
+        persistence::persist_pending_dkg_marker(
+            &storage,
+            DKG_PENDING_MARKER_KEY,
+            &persistence::PendingDkgMarker {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                name: "ceremony".into(),
+                group_pubkey_hex: "cafe".into(),
+                vault_protected: vault.is_some(),
+            },
+        )
+        .unwrap();
+    }
+
+    // A ceremony's import that landed before its stash was cleared is redone
+    // by recovery, which clears the stash, rather than left stuck behind a
+    // refusal.
     #[test]
-    fn reimporting_a_stored_share_at_the_cap_is_allowed() {
+    fn recovering_a_ceremony_whose_import_landed_completes() {
+        let (storage, mobile) = setup();
+        let share = &group_shares()[0];
+        let export = ShareExport::from_share(share, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        mobile
+            .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
+            .unwrap();
+        stash(&storage, &export, Some(PASS));
+        let info = mobile.recover_dkg_share(None).unwrap();
+        assert_eq!(info.name, "ceremony");
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
+    }
+
+    // A passphrase-protected stash holds an export from outside, so recovery
+    // gives it no exception: it never writes over a stored share.
+    #[test]
+    fn recovering_a_passphrase_stash_never_writes_over_a_stored_share() {
+        let (storage, mobile) = setup();
+        let share = &group_shares()[0];
+        let export = ShareExport::from_share(share, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let info = mobile
+            .import_share(export.clone(), PASS.into(), "first".into())
+            .unwrap();
+        let before = storage.raw(&info.group_pubkey).unwrap();
+        stash(&storage, &export, None);
+        let result = mobile.recover_dkg_share(Some(PASS.into()));
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            "got {result:?}"
+        );
+        assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
+        assert!(mobile.pending_dkg_share().unwrap().is_some());
+    }
+
+    // At the cap a share already stored is refused as stored, not as over the
+    // cap, and a ceremony's own result for it is still written.
+    #[test]
+    fn reimporting_a_stored_share_at_the_cap() {
         let (storage, mobile) = setup();
         let shares = group_shares();
         let export = |share: &SharePackage| {
@@ -12178,8 +12337,13 @@ mod share_registry_tests {
             storage.mark_unreadable(format!("{i:064x}"));
         }
 
+        let result = mobile.import_share(export(&shares[0]), PASS.into(), "renamed".into());
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            "got {result:?}"
+        );
         mobile
-            .import_share(export(&shares[0]), PASS.into(), "renamed".into())
+            .import_share_export(export(&shares[0]), PASS.into(), "renamed".into(), true)
             .unwrap();
         let key = hex::encode(shares[0].group_pubkey());
         let stored: StoredShareData = serde_json::from_slice(&storage.raw(&key).unwrap()).unwrap();
