@@ -89,6 +89,22 @@ pub enum KeepMobileError {
         expected: String,
         actual: String,
     },
+
+    /// An import found this key already stored.
+    #[error("This key is already stored")]
+    KeyAlreadyStored,
+
+    /// An import found this exact share already stored.
+    #[error("This share is already stored")]
+    ShareAlreadyStored,
+
+    /// An import found another share of the same group already stored.
+    #[error("Another share of this group is already stored")]
+    GroupShareAlreadyStored,
+
+    /// A bunker config listed more authorized clients than the signer holds.
+    #[error("At most {max} clients can be authorized")]
+    TooManyAuthorizedClients { max: u32 },
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
@@ -122,5 +138,30 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for KeepMobileError {
         KeepMobileError::FrostError {
             msg: format!("Callback error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeepMobileError;
+
+    #[test]
+    fn duplicate_and_limit_refusals_display_their_message() {
+        assert_eq!(
+            KeepMobileError::KeyAlreadyStored.to_string(),
+            "This key is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::ShareAlreadyStored.to_string(),
+            "This share is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::GroupShareAlreadyStored.to_string(),
+            "Another share of this group is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::TooManyAuthorizedClients { max: 100 }.to_string(),
+            "At most 100 clients can be authorized"
+        );
     }
 }

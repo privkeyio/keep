@@ -3484,11 +3484,8 @@ impl KeepMobile {
         // A listed client is always admitted only while the list fits the
         // engine's app table.
         if config.authorized_clients.len() > keep_nip46::PermissionManager::MAX_CONNECTED_APPS {
-            return Err(KeepMobileError::InvalidInput {
-                msg: format!(
-                    "At most {} clients can be authorized",
-                    keep_nip46::PermissionManager::MAX_CONNECTED_APPS
-                ),
+            return Err(KeepMobileError::TooManyAuthorizedClients {
+                max: keep_nip46::PermissionManager::MAX_CONNECTED_APPS as u32,
             });
         }
         // Preserve the persisted transport key + connect secret so toggling the
@@ -5527,19 +5524,13 @@ impl KeepMobile {
         match self.listed_share(key)? {
             None => Ok(false),
             Some(listed) if listed.threshold == 1 && listed.total_shares == 1 => {
-                Err(KeepMobileError::InvalidShare {
-                    msg: "This key is already stored".into(),
-                })
+                Err(KeepMobileError::KeyAlreadyStored)
             }
             Some(listed) if shape(&listed) != shape(incoming) => {
-                Err(KeepMobileError::InvalidShare {
-                    msg: "Another share of this group is already stored".into(),
-                })
+                Err(KeepMobileError::GroupShareAlreadyStored)
             }
             Some(_) if own_same => Ok(true),
-            Some(_) => Err(KeepMobileError::InvalidShare {
-                msg: "This share is already stored".into(),
-            }),
+            Some(_) => Err(KeepMobileError::ShareAlreadyStored),
         }
     }
 
@@ -5687,9 +5678,7 @@ impl KeepMobile {
         if !(bool::from(same_key) && same_public)
             || stored.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr
         {
-            return Err(KeepMobileError::InvalidShare {
-                msg: "This share is already stored".into(),
-            });
+            return Err(KeepMobileError::ShareAlreadyStored);
         }
         let metadata: ShareMetadataInfo =
             (&serde_json::from_str::<ShareMetadata>(&stored.metadata_json)
@@ -11939,7 +11928,7 @@ mod share_registry_tests {
             .unwrap();
         let result = import_nsec(&mobile2);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("Another share")),
+            matches!(&result, Err(KeepMobileError::GroupShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage2.raw(&key).unwrap(), b"share");
@@ -11967,7 +11956,9 @@ mod share_registry_tests {
             use nostr_sdk::prelude::{SecretKey, ToBech32};
             SecretKey::from_slice(&*key).unwrap().to_bech32().unwrap()
         };
-        let already = |r: Result<ShareInfo, KeepMobileError>| matches!(&r, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored"));
+        let already = |r: Result<ShareInfo, KeepMobileError>| {
+            matches!(&r, Err(KeepMobileError::KeyAlreadyStored))
+        };
         assert!(already(mobile.import_nsec(nsec.into_bytes(), "b".into())));
         assert!(already(mobile.create_account_from_mnemonic(
             WORDS.as_bytes().to_vec(),
@@ -12000,7 +11991,7 @@ mod share_registry_tests {
             .unwrap();
         let result = mobile.store_share_package(share, false);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
+            matches!(&result, Err(KeepMobileError::KeyAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&key).unwrap(), b"key");
@@ -12017,7 +12008,7 @@ mod share_registry_tests {
         let export = ShareExport::from_share(&shares[1], "pass").unwrap();
         let result = mobile.import_share(export.to_json().unwrap(), "pass".into(), "other".into());
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
+            matches!(&result, Err(KeepMobileError::GroupShareAlreadyStored)),
             "another identifier of a stored group must be refused, got {result:?}"
         );
         assert_eq!(storage.raw(&key).unwrap(), before);
@@ -12038,7 +12029,7 @@ mod share_registry_tests {
         share.metadata.name = "renamed".into();
         let result = mobile.store_share_package(&share, false);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
@@ -12048,7 +12039,7 @@ mod share_registry_tests {
             .unwrap();
         let result = mobile.import_share(export.clone(), PASS.into(), "renamed".into());
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
@@ -12249,7 +12240,7 @@ mod share_registry_tests {
 
         let result = mobile.store_share_package(&shares[1], false);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("already stored")),
+            matches!(&result, Err(KeepMobileError::GroupShareAlreadyStored)),
             "got {result:?}"
         );
         storage.failing.lock().unwrap().clear();
@@ -12423,7 +12414,7 @@ mod share_registry_tests {
         let result = mobile.recover_dkg_share(None);
 
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&key).unwrap(), refreshed);
@@ -12489,7 +12480,7 @@ mod share_registry_tests {
         let result = mobile.recover_dkg_share(None);
 
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&key).unwrap(), damaged);
@@ -12538,7 +12529,7 @@ mod share_registry_tests {
         stash(&storage, &export, None);
         let result = mobile.recover_dkg_share(Some(PASS.into()));
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
@@ -12555,7 +12546,7 @@ mod share_registry_tests {
         let data = mobile.export_share(PASS.into()).unwrap();
         let result = mobile.import_share_export(data, PASS.into(), "again".into(), true);
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This key is already stored"),
+            matches!(&result, Err(KeepMobileError::KeyAlreadyStored)),
             "got {result:?}"
         );
         assert_eq!(storage.raw(&info.group_pubkey).unwrap(), before);
@@ -12582,7 +12573,7 @@ mod share_registry_tests {
 
         let result = mobile.import_share(export(&shares[0]), PASS.into(), "renamed".into());
         assert!(
-            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            matches!(&result, Err(KeepMobileError::ShareAlreadyStored)),
             "got {result:?}"
         );
         let landed = mobile
