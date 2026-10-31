@@ -258,7 +258,9 @@ pub struct RelayHealth {
     pub status: RelayHealthStatus,
     /// Unix milliseconds of the last successful connection. `0` if never.
     pub last_connected_ms: u64,
-    /// Round trip in milliseconds. Absent until the pool has enough samples.
+    /// Mean round trip in milliseconds over the relay's pings, for display
+    /// only. Absent until the pool has enough samples and while the relay is
+    /// not connected.
     pub rtt_ms: Option<u64>,
 }
 

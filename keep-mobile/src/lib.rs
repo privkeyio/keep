@@ -815,9 +815,28 @@ struct StateContext {
     pending: Arc<Mutex<Vec<PendingRequest>>>,
     callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     rev: Arc<std::sync::atomic::AtomicU64>,
-    /// Last relay snapshot delivered to the callback. The health poll uses it
-    /// to avoid bumping `rev` while nothing about the relays changed.
-    last_relays: std::sync::Mutex<Option<Vec<RelayHealth>>>,
+    last_relays: LastRelays,
+}
+
+/// The last relay snapshot delivered to the callback. The health poll uses it
+/// to avoid bumping `rev` while nothing about the relays changed.
+#[derive(Default)]
+struct LastRelays(std::sync::Mutex<Option<Vec<RelayHealth>>>);
+
+impl LastRelays {
+    /// Record `relays` as delivered, returning whether they differ from the
+    /// last snapshot recorded.
+    fn record(&self, relays: &[RelayHealth]) -> bool {
+        let mut last = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if last.as_deref() == Some(relays) {
+            return false;
+        }
+        *last = Some(relays.to_vec());
+        true
+    }
 }
 
 fn convert_relay_health(health: keep_frost_net::RelayHealth) -> RelayHealth {
@@ -843,28 +862,12 @@ impl StateContext {
             .collect()
     }
 
-    fn store_relays(&self, relays: &[RelayHealth]) {
-        let mut guard = self
-            .last_relays
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(relays.to_vec());
-    }
-
-    fn relays_unchanged(&self, relays: &[RelayHealth]) -> bool {
-        let guard = self
-            .last_relays
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.as_ref().is_some_and(|previous| previous == relays)
-    }
-
     async fn push(&self, connection_status: &ConnectionStatus) {
         let Some(cb) = self.callback.read().await.clone() else {
             return;
         };
         let relays = self.relay_snapshot().await;
-        self.store_relays(&relays);
+        self.last_relays.record(&relays);
         self.emit(cb, connection_status, relays).await;
     }
 
@@ -874,10 +877,9 @@ impl StateContext {
             return;
         };
         let relays = self.relay_snapshot().await;
-        if self.relays_unchanged(&relays) {
+        if !self.last_relays.record(&relays) {
             return;
         }
-        self.store_relays(&relays);
         self.emit(cb, connection_status, relays).await;
     }
 
@@ -4691,7 +4693,7 @@ impl KeepMobile {
                 pending: self.pending_requests.clone(),
                 callback: self.state_callback.clone(),
                 rev: self.state_rev.clone(),
-                last_relays: std::sync::Mutex::new(None),
+                last_relays: LastRelays::default(),
             };
             // Retire any prior node before starting the new one so its pending
             // requests are cleared up front. Clearing before the tasks below
@@ -11123,5 +11125,36 @@ mod velocity_fault_tests {
             mobile.list_trusted_wardens().unwrap(),
             vec![hex::encode(bundle.warden_pubkey)]
         );
+    }
+}
+
+#[cfg(test)]
+mod relay_health_tests {
+    use super::*;
+
+    fn relay(url: &str, status: RelayHealthStatus, rtt_ms: Option<u64>) -> RelayHealth {
+        RelayHealth {
+            url: url.into(),
+            status,
+            last_connected_ms: 1_700_000_000_000,
+            rtt_ms,
+        }
+    }
+
+    #[test]
+    fn a_relay_snapshot_is_delivered_only_when_it_changes() {
+        let last = LastRelays::default();
+        let up = vec![relay("wss://a", RelayHealthStatus::Connected, None)];
+        assert!(last.record(&up), "the first snapshot is always delivered");
+        assert!(!last.record(&up));
+        assert!(!last.record(&up.clone()));
+
+        let down = vec![relay("wss://a", RelayHealthStatus::Offline, None)];
+        assert!(last.record(&down));
+        assert!(!last.record(&down));
+        let measured = vec![relay("wss://a", RelayHealthStatus::Connected, Some(40))];
+        assert!(last.record(&measured));
+        assert!(last.record(&[]));
+        assert!(!last.record(&[]));
     }
 }

@@ -51,7 +51,10 @@ pub struct RelayHealth {
     pub status: RelayHealthStatus,
     /// Unix milliseconds of the last successful connection. `0` if never.
     pub last_connected_ms: u64,
-    /// Smoothed round trip in milliseconds, once the pool has enough samples.
+    /// Mean round trip in milliseconds over every ping the pool has sent this
+    /// relay, so it moves slowly. `None` until the pool has enough samples, and
+    /// whenever the relay is not connected. The relay controls its own pongs,
+    /// so this is for display only.
     pub rtt_ms: Option<u64>,
 }
 
@@ -84,7 +87,9 @@ pub(crate) fn relay_health_from_parts(
         url: url.as_str_without_trailing_slash().to_string(),
         status,
         last_connected_ms: connected_at_secs.saturating_mul(1_000),
-        rtt_ms: latency.map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+        rtt_ms: latency
+            .filter(|_| status == RelayHealthStatus::Connected)
+            .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
     }
 }
 
@@ -313,7 +318,8 @@ mod tests {
             assert_eq!(health.status, expected, "{status}");
             assert_eq!(health.url, "wss://relay.example.com");
             assert_eq!(health.last_connected_ms, 1_700_000_000_000);
-            assert_eq!(health.rtt_ms, Some(42));
+            let rtt = (expected == RelayHealthStatus::Connected).then_some(42);
+            assert_eq!(health.rtt_ms, rtt, "{status}");
         }
 
         let unseen = relay_health_from_parts(&url, RelayStatus::Disconnected, 0, None);
