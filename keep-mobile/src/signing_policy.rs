@@ -377,6 +377,38 @@ impl SignPolicyStore {
         self.storage.save(key, value)
     }
 
+    /// Make the override `package` had before overrides were per account
+    /// `account`'s own, once. The caller passes the account that was active
+    /// when the override was set, so it keeps governing that account as it did
+    /// before; every other account still reads it only as a floor, and it is
+    /// never removed.
+    ///
+    /// Nothing is written when `account` has already chosen for the app or
+    /// there is no legacy override. A legacy override that cannot be parsed is
+    /// adopted as `Manual`, the floor it already enforced. Returns `true` once
+    /// nothing is left to do, and `false` when the call should be retried: a
+    /// key could not be read or the write did not persist. An invalid
+    /// `account` or an empty `package` is `false`.
+    pub fn adopt_legacy_override(&self, account: String, package: String) -> bool {
+        let Some(key) = app_override_key(&account, &package) else {
+            return false;
+        };
+        match self.storage.load(key.clone()) {
+            StorageRead::Found { .. } => return true,
+            StorageRead::Unavailable => return false,
+            StorageRead::Absent => {}
+        }
+        let legacy = match self.storage.load(legacy_override_key(&package)) {
+            StorageRead::Absent => return true,
+            StorageRead::Unavailable => return false,
+            StorageRead::Found { value } => value.parse::<u8>().map_or(
+                SignPolicySelection::Manual,
+                SignPolicySelection::from_ordinal,
+            ),
+        };
+        self.storage.save(key, legacy.to_ordinal().to_string())
+    }
+
     /// Resolve the effective selection for `package` under `account`: its
     /// override (see [`Self::app_override`]), else the global policy, else
     /// `Manual`. Mirrors keep-android's precedence.
@@ -2004,6 +2036,64 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&legacy_override_key("com.app")));
+    }
+
+    #[test]
+    fn adopting_a_legacy_override_gives_it_to_one_account() {
+        const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        let set = |key: String, value: &str| {
+            storage.map.lock().unwrap().insert(key, value.into());
+        };
+        let scoped = |account: &str| app_override_key(account, "com.app").unwrap();
+        let adopt = |account: &str| store.adopt_legacy_override(account.into(), "com.app".into());
+        let effective = |account: &str| store.effective_policy(account.into(), "com.app".into());
+        store.set_global_policy(SignPolicySelection::Manual);
+
+        assert!(adopt(ACCOUNT), "no legacy override is nothing to do");
+        assert!(!storage.map.lock().unwrap().contains_key(&scoped(ACCOUNT)));
+
+        set(legacy_override_key("com.app"), "2");
+        assert_eq!(effective(ACCOUNT), SignPolicySelection::Manual);
+        assert!(adopt(ACCOUNT));
+        assert_eq!(effective(ACCOUNT), SignPolicySelection::Auto);
+        assert_eq!(effective(OTHER), SignPolicySelection::Manual);
+        assert!(storage
+            .map
+            .lock()
+            .unwrap()
+            .contains_key(&legacy_override_key("com.app")));
+
+        // An account's own choice is never replaced, including a clear.
+        assert!(store.set_app_override(ACCOUNT.into(), "com.app".into(), None));
+        assert!(adopt(ACCOUNT));
+        assert_eq!(store.app_override(ACCOUNT.into(), "com.app".into()), None);
+
+        set(legacy_override_key("com.app"), "not a tier");
+        assert!(adopt(OTHER));
+        assert_eq!(effective(OTHER), SignPolicySelection::Manual);
+        assert_eq!(
+            storage.map.lock().unwrap().get(&scoped(OTHER)).unwrap(),
+            "0"
+        );
+
+        // Unreadable keys and invalid arguments ask for a retry and write nothing.
+        const THIRD: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        set(legacy_override_key("com.app"), UNREADABLE);
+        assert!(!adopt(THIRD));
+        set(legacy_override_key("com.app"), "2");
+        set(scoped(THIRD), UNREADABLE);
+        assert!(!adopt(THIRD));
+        assert_eq!(
+            storage.map.lock().unwrap().get(&scoped(THIRD)).unwrap(),
+            UNREADABLE
+        );
+        assert!(!adopt("not an account"));
+        assert!(!store.adopt_legacy_override(ACCOUNT.into(), String::new()));
+
+        let failing = SignPolicyStore::new(Arc::new(FailingPolicyStorage));
+        assert!(!failing.adopt_legacy_override(ACCOUNT.into(), "com.app".into()));
     }
 
     #[test]
