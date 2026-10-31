@@ -4893,8 +4893,6 @@ impl KeepMobile {
     ) -> Result<ShareInfo, KeepMobileError> {
         Self::validate_share_name(&name)?;
 
-        self.ensure_share_capacity()?;
-
         let key_bytes =
             Zeroizing::new(
                 hex::decode(hex_key).map_err(|_| KeepMobileError::InvalidShare {
@@ -4922,6 +4920,23 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
         let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
+        // Only a key imported before may be replaced: a share of a threshold
+        // group under the same key would be lost.
+        match self.listed_share(&group_pubkey_hex)? {
+            None => self.ensure_share_capacity()?,
+            Some(listed)
+                if (listed.identifier, listed.threshold, listed.total_shares)
+                    == (
+                        metadata_info.identifier,
+                        metadata_info.threshold,
+                        metadata_info.total_shares,
+                    ) => {}
+            Some(_) => {
+                return Err(KeepMobileError::InvalidShare {
+                    msg: "Another share of this group is already stored".into(),
+                })
+            }
+        }
         self.storage.store_share_by_key(
             group_pubkey_hex.clone(),
             serialized,
@@ -5485,6 +5500,12 @@ impl KeepMobile {
     /// A share that cannot be read is refused rather than written over, since
     /// the failure may be a fault on a healthy share: it is removed first.
     fn listed_share_identifier(&self, key: &str) -> Result<Option<u16>, KeepMobileError> {
+        Ok(self.listed_share(key)?.map(|m| m.identifier))
+    }
+
+    /// The share the registry lists under `key`, read as
+    /// [`Self::listed_share_identifier`] reads it.
+    fn listed_share(&self, key: &str) -> Result<Option<ShareMetadataInfo>, KeepMobileError> {
         let ShareRegistryRead::Readable { shares, unreadable } = self.storage.read_share_registry()
         else {
             return Err(KeepMobileError::StorageError {
@@ -5497,9 +5518,8 @@ impl KeepMobile {
             });
         }
         Ok(shares
-            .iter()
-            .find(|m| hex::encode(&m.group_pubkey) == key)
-            .map(|m| m.identifier))
+            .into_iter()
+            .find(|m| hex::encode(&m.group_pubkey) == key))
     }
 
     fn store_share_package(&self, share: &SharePackage) -> Result<ShareInfo, KeepMobileError> {
@@ -11740,11 +11760,44 @@ mod share_registry_tests {
         storage.registry_unavailable.store(true, Ordering::SeqCst);
         let result = import_nsec(&mobile);
         assert!(
-            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("unknown")),
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("cannot be read")),
             "an unknown share count must refuse, got {result:?}"
         );
         storage.registry_unavailable.store(false, Ordering::SeqCst);
         assert!(storage.list_all_shares().is_empty());
+    }
+
+    #[test]
+    fn importing_a_key_never_replaces_a_threshold_share_of_its_group() {
+        let (storage, mobile) = setup();
+        let key = import_nsec(&mobile).unwrap().group_pubkey;
+        assert_eq!(
+            import_nsec(&mobile).unwrap().group_pubkey,
+            key,
+            "a key imports again"
+        );
+
+        let (storage2, mobile2) = setup();
+        let mut meta = storage.records.lock().unwrap()[&key].1.clone();
+        meta.threshold = 2;
+        meta.total_shares = 3;
+        storage2
+            .store_share_by_key(key.clone(), b"share".to_vec(), meta)
+            .unwrap();
+        let result = import_nsec(&mobile2);
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg.contains("Another share")),
+            "got {result:?}"
+        );
+        assert_eq!(storage2.raw(&key).unwrap(), b"share");
+
+        let (storage3, mobile3) = setup();
+        storage3.mark_unreadable(key.clone());
+        let result = import_nsec(&mobile3);
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("not replaced")),
+            "got {result:?}"
+        );
     }
 
     #[test]
