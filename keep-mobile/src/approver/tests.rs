@@ -84,6 +84,9 @@ impl SecureStorage for Memory {
         }
     }
     fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+        if self.1.load(Ordering::SeqCst) {
+            return Err(KeepMobileError::StorageError { msg: "full".into() });
+        }
         self.0.lock().unwrap().remove(&key);
         Ok(())
     }
@@ -1897,4 +1900,40 @@ fn a_pairing_left_waiting_across_a_restart_is_removed_with_forget() {
         .handler
         .begin_pairing(uri.to_string(), vec![2; 33], "phone".into())
         .unwrap();
+}
+
+// A refusal whose pairing cannot be deleted does not end it: the pairing would
+// come back at the next start, so the app keeps its key and the owner can
+// remove it.
+#[test]
+fn a_refused_pairing_that_cannot_be_forgotten_is_not_ended() {
+    let phone = paired();
+    phone.stored(|s| {
+        s.paired = false;
+        phone.handler.persist(s).unwrap();
+    });
+    phone.memory.1.store(true, Ordering::SeqCst);
+    let refused = wire::to_text(&Pairing::Refused {
+        v: V1,
+        reason: "nope".into(),
+    });
+    let fx = {
+        let mut inner = phone.handler.lock();
+        phone
+            .handler
+            .handle(&mut inner, kind::PAIRING, &refused, now())
+    };
+    assert!(
+        matches!(
+            &fx.events[..],
+            [ApproverEvent::PairingRefused { ended: false, .. }]
+        ),
+        "{:?}",
+        fx.events
+    );
+    assert!(!fx.halt);
+    assert!(phone.handler.status().pairing);
+    phone.memory.1.store(false, Ordering::SeqCst);
+    phone.handler.forget().unwrap();
+    assert!(!phone.reopen().handler.status().pairing);
 }

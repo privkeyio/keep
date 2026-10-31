@@ -945,19 +945,15 @@ impl ApproverHandler {
     /// Take one message from the gateway, at the phone's `local_now`.
     fn handle(&self, inner: &mut Inner, kind: u16, content: &str, local_now: u64) -> Effects {
         let mut fx = Effects::default();
-        let mut forget = false;
+        // The gateway's refusal: its reason and the pairing's approver key.
+        let mut forget = None;
         let Some(stored) = inner.stored.as_mut() else {
             return fx;
         };
         match kind {
             kind::PAIRING if !stored.paired => match wire::parse::<Pairing>(content) {
                 Ok(Pairing::Refused { reason, .. }) => {
-                    fx.events.push(ApproverEvent::PairingRefused {
-                        reason: gateway_text(&reason),
-                        ended: true,
-                        approver_key: stored.approver.0.to_vec(),
-                    });
-                    forget = true;
+                    forget = Some((gateway_text(&reason), stored.approver.0.to_vec()));
                 }
                 Ok(message) => {
                     let Ok(keys) = stored.keys() else {
@@ -1127,10 +1123,25 @@ impl ApproverHandler {
             }
             _ => {}
         }
-        if forget {
-            inner.set(None);
-            let _ = self.mobile.storage.delete_share_by_key(STATE_KEY.into());
-            fx.halt = true;
+        if let Some((reason, approver_key)) = forget {
+            // Ended only once the stored pairing is gone: one left behind
+            // comes back at the next start, still waiting, with its key.
+            let ended = match self.mobile.storage.delete_share_by_key(STATE_KEY.into()) {
+                Ok(()) | Err(KeepMobileError::StorageNotFound) => true,
+                Err(e) => {
+                    tracing::error!(error = %e, "a refused pairing could not be forgotten");
+                    false
+                }
+            };
+            if ended {
+                inner.set(None);
+                fx.halt = true;
+            }
+            fx.events.push(ApproverEvent::PairingRefused {
+                reason,
+                ended,
+                approver_key,
+            });
         }
         fx
     }
