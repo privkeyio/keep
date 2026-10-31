@@ -1486,9 +1486,9 @@ impl KeepMobile {
         // behind this teardown by that lock.
         //
         // Unconditional over the result too, because `delete_share_by_key` is
-        // not atomic. The Android implementation clears the share data, then
-        // deletes the keystore aliases, then rewrites the registry, and either
-        // of the last two can fail after the data is already gone. So an `Err`
+        // not atomic. The Android implementation deletes the keystore aliases,
+        // then clears the share data, then rewrites the registry, and either
+        // of the last two can fail after the keys are already gone. So an `Err`
         // does not mean the share survived, and skipping the teardown on it
         // would leave the live node holding the only remaining copy of a share
         // the platform has already destroyed, while the caller is told the
@@ -6394,9 +6394,9 @@ mod import_teardown_tests {
 
     // A delete that reports failure must still tear the node down, because
     // `SecureStorage::delete_share_by_key` is not atomic: the Android
-    // implementation clears the share data, then deletes the keystore aliases,
+    // implementation deletes the keystore aliases, then clears the share data,
     // then rewrites the registry, and either of the last two fails after the
-    // data is already gone. So an `Err` does not mean the share survived, and
+    // keys are already gone. So an `Err` does not mean the share survived, and
     // skipping the teardown on it would leave the live node holding the only
     // remaining copy of a share the platform had already destroyed, still on
     // the relays, while the caller is told the delete failed.
