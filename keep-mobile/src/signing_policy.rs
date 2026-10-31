@@ -252,6 +252,20 @@ fn legacy_override_key(package: &str) -> String {
     format!("sign_policy_override:{package}")
 }
 
+/// Names the account that adopted the legacy override for `package`, so no
+/// other account can adopt it.
+fn legacy_adopted_key(package: &str) -> String {
+    format!("sign_policy_legacy_adopted:{package}")
+}
+
+/// A stored selection, or `Manual` when it cannot be parsed.
+fn parse_selection(value: &str) -> SignPolicySelection {
+    value.parse::<u8>().map_or(
+        SignPolicySelection::Manual,
+        SignPolicySelection::from_ordinal,
+    )
+}
+
 /// Stored under an account's key when it clears its override, so the app
 /// follows the global policy for that account rather than the legacy floor.
 const FOLLOWS_GLOBAL: &str = "global";
@@ -277,6 +291,9 @@ fn app_override_key(account: &str, package: &str) -> Option<String> {
 #[derive(uniffi::Object)]
 pub struct SignPolicyStore {
     storage: Arc<dyn SignPolicySelectionStorage>,
+    /// Held across an override's read and write, so an adoption never writes
+    /// over an override set while it ran.
+    override_lock: Mutex<()>,
 }
 
 impl SignPolicyStore {
@@ -300,7 +317,10 @@ impl SignPolicyStore {
 impl SignPolicyStore {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SignPolicySelectionStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            override_lock: Mutex::new(()),
+        }
     }
 
     /// The global sign-policy selection, defaulting to `Manual` when unset,
@@ -340,10 +360,7 @@ impl SignPolicyStore {
         };
         match self.storage.load(key) {
             StorageRead::Found { value } if value == FOLLOWS_GLOBAL => None,
-            StorageRead::Found { value } => Some(value.parse::<u8>().map_or(
-                SignPolicySelection::Manual,
-                SignPolicySelection::from_ordinal,
-            )),
+            StorageRead::Found { value } => Some(parse_selection(&value)),
             StorageRead::Unavailable => Some(SignPolicySelection::Manual),
             StorageRead::Absent => self.selection(legacy_override_key(&package)).map(|legacy| {
                 self.global_policy()
@@ -373,8 +390,67 @@ impl SignPolicyStore {
         let Some(key) = app_override_key(&account, &package) else {
             return false;
         };
+        let _guard = self
+            .override_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let value = policy.map_or(FOLLOWS_GLOBAL.to_string(), |p| p.to_ordinal().to_string());
         self.storage.save(key, value)
+    }
+
+    /// Make the override `package` had before overrides were per account
+    /// `account`'s own. The legacy key names no account, so the caller passes
+    /// the account active at the first launch that reads overrides per account,
+    /// which is the one the override governed until then. Every other account
+    /// still reads it only as a floor, and it is never removed.
+    ///
+    /// The first call for a package claims it for its account, and a later call
+    /// for any other account returns `true` and writes nothing, so a retry after
+    /// an account switch cannot hand the override to a second account. The
+    /// claim is written before the override, so a failure between the two
+    /// leaves the claimed account stricter, never another account looser. An
+    /// account that has already chosen for the app keeps its choice. A legacy
+    /// override that cannot be parsed is adopted as `Manual`, the floor it
+    /// already enforced.
+    ///
+    /// Returns `true` once nothing is left to do, including for an invalid
+    /// `account` or an empty `package`, which have nothing to adopt, and
+    /// `false` when a key could not be read or a write did not persist, so the
+    /// call should be retried. It runs under the same lock as
+    /// [`Self::set_app_override`], so a choice made while it runs is not
+    /// written over.
+    pub fn adopt_legacy_override(&self, account: String, package: String) -> bool {
+        let Some(key) = app_override_key(&account, &package) else {
+            return true;
+        };
+        let _guard = self
+            .override_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let account = account.to_ascii_lowercase();
+        let claim = legacy_adopted_key(&package);
+        match self.storage.load(claim.clone()) {
+            StorageRead::Found { value } if value != account => return true,
+            StorageRead::Unavailable => return false,
+            StorageRead::Found { .. } | StorageRead::Absent => {}
+        }
+        let legacy = match self.storage.load(legacy_override_key(&package)) {
+            StorageRead::Absent => return true,
+            StorageRead::Unavailable => return false,
+            StorageRead::Found { value } => parse_selection(&value).to_ordinal().to_string(),
+        };
+        // A scoped value equal to the legacy one may be what a write that did
+        // not persist left in a cache, so it is written again.
+        let write = match self.storage.load(key.clone()) {
+            StorageRead::Unavailable => return false,
+            StorageRead::Found { value } => value == legacy,
+            StorageRead::Absent => true,
+        };
+        // The claim is written again on a retry for the same reason.
+        if !self.storage.save(claim, account) {
+            return false;
+        }
+        !write || self.storage.save(key, legacy)
     }
 
     /// Resolve the effective selection for `package` under `account`: its
@@ -2004,6 +2080,243 @@ mod tests {
             .lock()
             .unwrap()
             .contains_key(&legacy_override_key("com.app")));
+    }
+
+    #[test]
+    fn adopting_a_legacy_override_gives_it_to_one_account() {
+        const OTHER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        let set = |key: String, value: &str| {
+            storage.map.lock().unwrap().insert(key, value.into());
+        };
+        let has = |key: String| storage.map.lock().unwrap().contains_key(&key);
+        let adopt = |account: &str| store.adopt_legacy_override(account.into(), "com.app".into());
+        let effective = |account: &str| store.effective_policy(account.into(), "com.app".into());
+        store.set_global_policy(SignPolicySelection::Manual);
+
+        assert!(adopt(ACCOUNT), "no legacy override is nothing to do");
+        assert!(!has(app_override_key(ACCOUNT, "com.app").unwrap()));
+        assert!(!has(legacy_adopted_key("com.app")));
+
+        set(legacy_override_key("com.app"), "2");
+        assert_eq!(effective(ACCOUNT), SignPolicySelection::Manual);
+        assert!(adopt(&ACCOUNT.to_ascii_uppercase()));
+        assert_eq!(effective(ACCOUNT), SignPolicySelection::Auto);
+        assert_eq!(
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .get(&legacy_adopted_key("com.app"))
+                .unwrap(),
+            ACCOUNT
+        );
+        assert!(has(legacy_override_key("com.app")));
+
+        // Adopted once: a second account, or a retry after a switch, gains nothing.
+        assert!(adopt(OTHER));
+        assert!(!has(app_override_key(OTHER, "com.app").unwrap()));
+        assert_eq!(effective(OTHER), SignPolicySelection::Manual);
+
+        // A claim whose override never landed still keeps every other account out.
+        set(legacy_override_key("com.other"), "2");
+        set(legacy_adopted_key("com.other"), ACCOUNT);
+        assert!(store.adopt_legacy_override(OTHER.into(), "com.other".into()));
+        assert!(!has(app_override_key(OTHER, "com.other").unwrap()));
+        assert!(store.adopt_legacy_override(ACCOUNT.into(), "com.other".into()));
+        assert_eq!(
+            store.effective_policy(ACCOUNT.into(), "com.other".into()),
+            SignPolicySelection::Auto
+        );
+    }
+
+    #[test]
+    fn adopting_keeps_the_legacy_tier_and_an_accounts_own_choice() {
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        store.set_global_policy(SignPolicySelection::Auto);
+        for (stored, expected) in [
+            ("0", SignPolicySelection::Manual),
+            ("1", SignPolicySelection::Basic),
+            ("7", SignPolicySelection::Manual),
+            ("not a tier", SignPolicySelection::Manual),
+        ] {
+            storage.map.lock().unwrap().clear();
+            store.set_global_policy(SignPolicySelection::Auto);
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .insert(legacy_override_key("com.app"), stored.into());
+            assert!(store.adopt_legacy_override(ACCOUNT.into(), "com.app".into()));
+            assert_eq!(
+                store.app_override(ACCOUNT.into(), "com.app".into()),
+                Some(expected),
+                "{stored:?}"
+            );
+        }
+
+        storage.map.lock().unwrap().clear();
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .insert(legacy_override_key("com.app"), "2".into());
+        assert!(store.set_app_override(ACCOUNT.into(), "com.app".into(), None));
+        assert!(store.adopt_legacy_override(ACCOUNT.into(), "com.app".into()));
+        assert_eq!(store.app_override(ACCOUNT.into(), "com.app".into()), None);
+    }
+
+    #[test]
+    fn adopting_retries_on_what_it_cannot_read_or_write() {
+        let storage = MockPolicyStorage::new();
+        let store = SignPolicyStore::new(storage.clone());
+        let set = |key: String, value: &str| {
+            storage.map.lock().unwrap().insert(key, value.into());
+        };
+        let adopt = || store.adopt_legacy_override(ACCOUNT.into(), "com.app".into());
+        let scoped = app_override_key(ACCOUNT, "com.app").unwrap();
+
+        set(legacy_override_key("com.app"), UNREADABLE);
+        assert!(!adopt());
+        set(legacy_override_key("com.app"), "2");
+        set(scoped.clone(), UNREADABLE);
+        assert!(!adopt());
+        assert_eq!(
+            storage.map.lock().unwrap().get(&scoped).unwrap(),
+            UNREADABLE
+        );
+        set(legacy_adopted_key("com.app"), UNREADABLE);
+        storage.map.lock().unwrap().remove(&scoped);
+        assert!(!adopt());
+        assert!(!storage.map.lock().unwrap().contains_key(&scoped));
+
+        assert!(store.adopt_legacy_override("not an account".into(), "com.app".into()));
+        assert!(store.adopt_legacy_override(ACCOUNT.into(), String::new()));
+    }
+
+    /// Reads come from a cache that keeps every write, while the backing file
+    /// takes no write to a key in `unpersisted`.
+    struct CachingPolicyStorage {
+        cache: Mutex<HashMap<String, String>>,
+        disk: Mutex<HashMap<String, String>>,
+        unpersisted: Mutex<Vec<String>>,
+    }
+    impl SignPolicySelectionStorage for CachingPolicyStorage {
+        fn load(&self, key: String) -> StorageRead {
+            match self.cache.lock().unwrap().get(&key) {
+                Some(value) => StorageRead::Found {
+                    value: value.clone(),
+                },
+                None => StorageRead::Absent,
+            }
+        }
+        fn save(&self, key: String, value: String) -> bool {
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(key.clone(), value.clone());
+            if self.unpersisted.lock().unwrap().contains(&key) {
+                return false;
+            }
+            self.disk.lock().unwrap().insert(key, value);
+            true
+        }
+        fn remove(&self, key: String) -> bool {
+            self.cache.lock().unwrap().remove(&key);
+            self.disk.lock().unwrap().remove(&key);
+            true
+        }
+    }
+
+    #[test]
+    fn adopting_claims_first_and_writes_again_what_a_failed_write_left_in_a_cache() {
+        let scoped = app_override_key(ACCOUNT, "com.app").unwrap();
+        let claim = legacy_adopted_key("com.app");
+        let storage = Arc::new(CachingPolicyStorage {
+            cache: Mutex::new(HashMap::from([(
+                legacy_override_key("com.app"),
+                "2".into(),
+            )])),
+            disk: Mutex::new(HashMap::new()),
+            unpersisted: Mutex::new(vec![claim.clone()]),
+        });
+        let store = SignPolicyStore::new(storage.clone());
+        let adopt = || store.adopt_legacy_override(ACCOUNT.into(), "com.app".into());
+        let on_disk = |key: &str| storage.disk.lock().unwrap().get(key).cloned();
+
+        assert!(!adopt());
+        assert_eq!(on_disk(&scoped), None, "no override without a claim");
+
+        *storage.unpersisted.lock().unwrap() = vec![scoped.clone()];
+        assert!(!adopt());
+        assert_eq!(on_disk(&claim).as_deref(), Some(ACCOUNT));
+        assert_eq!(on_disk(&scoped), None);
+
+        storage.unpersisted.lock().unwrap().clear();
+        assert!(adopt());
+        assert_eq!(on_disk(&scoped).as_deref(), Some("2"));
+    }
+
+    /// Reads the scoped key, then signals and stalls before answering, so a
+    /// writer on another thread can land between an adoption's read and write.
+    struct StallingPolicyStorage {
+        inner: Arc<MockPolicyStorage>,
+        stall_on: String,
+        reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+    impl SignPolicySelectionStorage for StallingPolicyStorage {
+        fn load(&self, key: String) -> StorageRead {
+            let read = self.inner.load(key.clone());
+            if key == self.stall_on {
+                if let Some(reached) = self.reached.lock().unwrap().take() {
+                    reached.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            read
+        }
+        fn save(&self, key: String, value: String) -> bool {
+            self.inner.save(key, value)
+        }
+        fn remove(&self, key: String) -> bool {
+            self.inner.remove(key)
+        }
+    }
+
+    #[test]
+    fn adopting_does_not_write_over_a_choice_made_while_it_runs() {
+        let inner = MockPolicyStorage::new();
+        inner
+            .map
+            .lock()
+            .unwrap()
+            .insert(legacy_override_key("com.app"), "2".into());
+        let (reached, wait) = std::sync::mpsc::channel();
+        let store = Arc::new(SignPolicyStore::new(Arc::new(StallingPolicyStorage {
+            inner,
+            stall_on: app_override_key(ACCOUNT, "com.app").unwrap(),
+            reached: Mutex::new(Some(reached)),
+        })));
+
+        let adopting = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.adopt_legacy_override(ACCOUNT.into(), "com.app".into())
+            })
+        };
+        wait.recv().unwrap();
+        assert!(store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Manual)
+        ));
+        assert!(adopting.join().unwrap());
+        assert_eq!(
+            store.app_override(ACCOUNT.into(), "com.app".into()),
+            Some(SignPolicySelection::Manual)
+        );
     }
 
     #[test]
