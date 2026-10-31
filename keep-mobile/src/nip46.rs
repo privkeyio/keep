@@ -1030,7 +1030,10 @@ pub(crate) fn set_bunker_enabled(
 /// The engine snapshot, when this server is still the one being served,
 /// replaces the persisted grants. The per-client forget covers a grant that
 /// snapshot did not write, and does not touch a client still on the roster.
-/// Neither failure fails the connect: the client was already evicted.
+/// When that forget fails, the client is marked pending so a later start
+/// retries the drop and does not serve the grant. The mark does not stop the
+/// bunker or rotate the connect secret. Neither failure fails the connect:
+/// the client was already evicted.
 fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) {
     let clients: Vec<PublicKey> = evicted
         .iter()
@@ -1068,8 +1071,29 @@ fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) {
     for client in &clients {
         if let Err(e) = mobile.forget_bunker_permissions(Some(client)) {
             tracing::warn!("failed to drop an evicted bunker client's grants: {e}");
+            if let Err(mark) = mark_evicted_revoke(mobile, client) {
+                tracing::warn!("failed to remember an evicted bunker client's revoke: {mark}");
+            }
         }
     }
+}
+
+/// Remembers that `client`'s persisted grants still have to go. Does not stop
+/// the bunker and does not rotate the connect secret: those belong to an
+/// operator revoke, and this client was only evicted to make room.
+fn mark_evicted_revoke(mobile: &KeepMobile, client: &PublicKey) -> Result<(), KeepMobileError> {
+    let hex = client.to_hex();
+    with_bunker_config(mobile, |stored| {
+        if stored.pending_revokes.contains(&hex) {
+            return Ok(());
+        }
+        stored.pending_revokes.push(hex);
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })
 }
 
 /// Records one explicit connect on the roster. Does not rotate the connect
@@ -2955,6 +2979,92 @@ mod tests {
         assert!(after.iter().any(|app| {
             app.pubkey == kept && app.auto_approve_kinds.contains(&Kind::from(1u16))
         }));
+    }
+
+    // The grant record is separate from the roster. When dropping an evicted
+    // client's grant fails, the client stays pending so a start will not serve
+    // it and will retry the drop. That mark must not stop the bunker or rotate
+    // the connect secret, and the client cannot be written back while it holds.
+    #[test]
+    fn a_failed_eviction_revoke_stays_pending_without_a_new_secret() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (_, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let generation = *mobile.live_generation.borrow();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let (dropped, kept) = (oldest[0], oldest[1]);
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[dropped, kept]);
+
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::relay_config_key(None));
+        let (bridge, _) = noted(&mobile, true);
+        let newest = nostr_sdk::Keys::generate().public_key();
+        connect_as(
+            &bridge,
+            &newest.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        connect_as(
+            &bridge,
+            &dropped.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(*mobile.live_generation.borrow(), generation);
+        assert!(bridge.serving.load(Ordering::Acquire));
+        assert_eq!(stored.pending_revokes, vec![dropped.to_hex()]);
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &dropped.to_hex()));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &kept.to_hex()));
+        assert_eq!(stored.authorized_clients.last(), Some(&newest.to_hex()));
+        assert!(
+            restored_clients(&mobile)
+                .iter()
+                .any(|client| client == &dropped.to_hex()),
+            "the grant write failed, so it is still stored"
+        );
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let served = served_clients(&handler);
+        assert!(!served.iter().any(|client| client == &dropped.to_hex()));
+        assert!(served.iter().any(|client| client == &kept.to_hex()));
+        assert_eq!(
+            stored_config(&storage).pending_revokes,
+            vec![dropped.to_hex()],
+            "the retry failed, so the mark stays"
+        );
+        assert_eq!(
+            stored_config(&storage).connect_secret.as_deref(),
+            Some(secret.as_str())
+        );
+
+        *mem.fail_writes_to.lock().unwrap() = None;
+        let served = served_clients(&handler);
+        assert!(!served.iter().any(|client| client == &dropped.to_hex()));
+        assert!(served.iter().any(|client| client == &kept.to_hex()));
+        assert!(
+            !restored_clients(&mobile)
+                .iter()
+                .any(|client| client == &dropped.to_hex()),
+            "the retry dropped the grant"
+        );
+        assert!(stored_config(&storage).pending_revokes.is_empty());
+        assert_eq!(
+            stored_config(&storage).connect_secret.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(*mobile.live_generation.borrow(), generation);
+        assert!(bridge.serving.load(Ordering::Acquire));
     }
 
     // Connect is asked of a client the roster does not list. Every other method
