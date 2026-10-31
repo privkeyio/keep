@@ -149,8 +149,11 @@ pub enum ConnectAuthorization {
 pub enum ClientListing {
     /// No list is kept: a connect is bounded only by the app table.
     Unrestricted,
-    /// A listed client is always admitted. Any other is admitted only while
-    /// the listed clients and the apps already connected leave a slot free.
+    /// A listed client is always admitted. A client that is not listed is
+    /// admitted while the listed clients and the apps already connected leave
+    /// a slot free, and also when the list itself is already full. The
+    /// consumer then records the newcomer and drops the oldest listed client,
+    /// and that client's grant, so the list returns to its cap.
     Listed(HashSet<PublicKey>),
     /// The list could not be read, so no connect is admitted.
     Unavailable,
@@ -172,6 +175,21 @@ pub trait ServerCallbacks: Send + Sync + 'static {
     /// this to write the snapshot to its relay-config storage so remembered
     /// grants survive a service restart.
     fn persist_permissions(&self, _grants: Vec<keep_core::relay::StoredBunkerPermission>) {}
+    /// Records an explicit connect on the consumer's roster after the grant is
+    /// installed and before the connect is acknowledged. `Err` fails the
+    /// connect. Default: nothing to record.
+    fn commit_authorized_client(
+        &self,
+        _pubkey: &str,
+        _authorization: ConnectAuthorization,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Whether `pubkey` may call anything other than the secret-checked
+    /// connect. Default: no roster is enforced.
+    fn client_authorized(&self, _pubkey: &PublicKey) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

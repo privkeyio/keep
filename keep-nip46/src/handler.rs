@@ -366,6 +366,21 @@ impl SignerHandler {
     }
 
     async fn require_permission(&self, app_pubkey: &PublicKey, perm: Permission) -> Result<()> {
+        let authorized = self
+            .callbacks
+            .as_ref()
+            .map(|cb| cb.client_authorized(app_pubkey))
+            .unwrap_or(true);
+        if !authorized {
+            self.audit.lock().await.log(
+                AuditEntry::new(AuditAction::PermissionDenied, *app_pubkey)
+                    .with_success(false)
+                    .with_reason("client is not authorized"),
+            );
+            return Err(KeepError::PermissionDenied(
+                "the client is not authorized".into(),
+            ));
+        }
         let pm = self.permissions.lock().await;
         if pm.has_permission(app_pubkey, perm) {
             Ok(())
@@ -544,7 +559,18 @@ impl SignerHandler {
             );
             return Err(e);
         }
-        if !pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds) {
+        let one_over = matches!(
+            &listing,
+            ClientListing::Listed(listed)
+                if listed.len() >= PermissionManager::MAX_CONNECTED_APPS
+                    && !listed.contains(&app_pubkey)
+        );
+        let connected = if one_over {
+            pm.connect_one_over_capacity(app_pubkey, name.clone(), requested_perms, auto_kinds)
+        } else {
+            pm.connect_with_permissions(app_pubkey, name.clone(), requested_perms, auto_kinds)
+        };
+        if !connected {
             drop(pm);
             self.audit.lock().await.log(
                 AuditEntry::new(AuditAction::Connect, app_pubkey)
@@ -558,6 +584,27 @@ impl SignerHandler {
         drop(pm);
         if dropped {
             self.persist_permissions().await;
+        }
+        if matches!(
+            authorization,
+            ConnectAuthorization::SecretMatched | ConnectAuthorization::UserApproved
+        ) {
+            if let Some(cb) = &self.callbacks {
+                if let Err(reason) =
+                    cb.commit_authorized_client(&app_pubkey.to_hex(), authorization)
+                {
+                    self.permissions.lock().await.revoke(&app_pubkey);
+                    self.persist_permissions().await;
+                    self.audit.lock().await.log(
+                        AuditEntry::new(AuditAction::Connect, app_pubkey)
+                            .with_success(false)
+                            .with_reason(reason),
+                    );
+                    return Err(KeepError::PermissionDenied(
+                        "the authorized client list was not updated".into(),
+                    ));
+                }
+            }
         }
 
         self.audit
@@ -2871,23 +2918,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_at_the_listed_cap_is_refused_before_any_grant() {
+    async fn connect_at_the_listed_cap_admits_the_newcomer() {
         let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
             .map(|_| Keys::generate().public_key())
             .collect();
         let (handler, _) = listing_handler(ClientListing::Listed(listed.clone()));
 
         let stranger = Keys::generate().public_key();
-        assert!(matches!(
-            connect(&handler, stranger, "secret").await,
-            Err(KeepError::CapacityExceeded(_))
-        ));
+        assert_eq!(
+            connect(&handler, stranger, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
         assert!(handler
             .permissions
             .lock()
             .await
             .get_app(&stranger)
-            .is_none());
+            .is_some());
 
         let client = *listed.iter().next().unwrap();
         assert_eq!(
@@ -2951,10 +2998,12 @@ mod tests {
             .collect();
         *cb.listing.lock().unwrap() = ClientListing::Listed(listed);
         connect(&handler, app, "secret").await.unwrap();
-        assert!(matches!(
-            connect(&handler, Keys::generate().public_key(), "secret").await,
-            Err(KeepError::CapacityExceeded(_))
-        ));
+        let stranger = Keys::generate().public_key();
+        assert_eq!(
+            connect(&handler, stranger, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
+        assert!(handler.permissions.lock().await.get_app(&stranger).is_some());
     }
 
     #[tokio::test]
