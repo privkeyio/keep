@@ -140,3 +140,28 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for KeepMobileError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::KeepMobileError;
+
+    #[test]
+    fn duplicate_and_limit_refusals_display_their_message() {
+        assert_eq!(
+            KeepMobileError::KeyAlreadyStored.to_string(),
+            "This key is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::ShareAlreadyStored.to_string(),
+            "This share is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::GroupShareAlreadyStored.to_string(),
+            "Another share of this group is already stored"
+        );
+        assert_eq!(
+            KeepMobileError::TooManyAuthorizedClients { max: 100 }.to_string(),
+            "At most 100 clients can be authorized"
+        );
+    }
+}

@@ -35,6 +35,10 @@ interface KeepMobileError {
     BackupError(string msg);
     EncryptionError(string msg);
     CertificatePinMismatch(string hostname, string expected, string actual);
+    KeyAlreadyStored();
+    ShareAlreadyStored();
+    GroupShareAlreadyStored();
+    TooManyAuthorizedClients(u32 max);
 };
 
 dictionary ShareMetadataInfo {
