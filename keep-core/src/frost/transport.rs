@@ -498,6 +498,17 @@ fn check_metadata_matches(
     {
         return Err(mismatch());
     }
+    // With one signer the share is the whole key, so its public point is the
+    // group key. Nothing else ties the secret to the key it claims to be.
+    if export.threshold == 1 {
+        let share_point = key_package
+            .verifying_share()
+            .serialize()
+            .map_err(|_| mismatch())?;
+        if share_point.get(1..33) != verifying_key.get(1..33) {
+            return Err(mismatch());
+        }
+    }
     Ok(())
 }
 
@@ -824,6 +835,44 @@ impl ShareExport {
 mod tests {
     use super::*;
     use crate::frost::{ThresholdConfig, TrustedDealer};
+
+    /// A 1-of-1 share holding `secret` that claims the group key of `claimed`.
+    fn one_of_one(secret: [u8; 32], claimed: [u8; 32]) -> SharePackage {
+        use frost_secp256k1_tr::keys::{
+            KeyPackage, PublicKeyPackage, SigningShare, VerifyingShare,
+        };
+        use frost_secp256k1_tr::{Identifier, SigningKey, VerifyingKey};
+        let share = SigningShare::deserialize(&secret).unwrap();
+        let verifying_key = VerifyingKey::from(&SigningKey::deserialize(&claimed).unwrap());
+        let id = Identifier::try_from(1u16).unwrap();
+        let key_package = KeyPackage::new(id, share, VerifyingShare::from(share), verifying_key, 1);
+        let pubkey_package = PublicKeyPackage::new(
+            std::collections::BTreeMap::from([(id, VerifyingShare::from(share))]),
+            verifying_key,
+            None,
+        );
+        let group: [u8; 32] = verifying_key.serialize().unwrap()[1..33]
+            .try_into()
+            .unwrap();
+        let metadata = crate::frost::ShareMetadata::new(1, 1, 1, group, "key".into());
+        SharePackage::new(metadata, &key_package, &pubkey_package).unwrap()
+    }
+
+    #[test]
+    fn a_one_of_one_share_must_hold_the_key_it_claims() {
+        let import = |share: &SharePackage| {
+            let export = ShareExport::from_share(share, "pass").unwrap();
+            ShareExport::from_json(&export.to_json().unwrap())
+                .unwrap()
+                .to_share("pass", "imported")
+        };
+        assert!(import(&one_of_one([1u8; 32], [1u8; 32])).is_ok());
+        let forged = import(&one_of_one([2u8; 32], [1u8; 32]));
+        assert!(
+            matches!(&forged, Err(KeepError::Frost(msg)) if msg.contains("does not match")),
+            "a share that is not the key it claims must be refused"
+        );
+    }
 
     #[test]
     fn export_of_a_stale_stored_share_carries_a_consistent_key_package() {
