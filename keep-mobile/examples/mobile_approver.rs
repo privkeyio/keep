@@ -136,7 +136,9 @@ impl ApproverCallbacks for Printer {
     fn on_event(&self, event: ApproverEvent) {
         match event {
             ApproverEvent::Paired { .. } => say("paired"),
-            ApproverEvent::PairingRefused { reason } => say(&format!("refused {reason}")),
+            ApproverEvent::PairingRefused { reason, ended, .. } => {
+                say(&format!("refused {reason} ended={ended}"))
+            }
             ApproverEvent::Request { request } => {
                 say(&format!(
                     "request {} \"{}\" {}",
@@ -145,6 +147,10 @@ impl ApproverCallbacks for Printer {
                 self.requests.lock().unwrap().push_back(request.request_id);
             }
             ApproverEvent::RequestRefused { reason } => say(&format!("bad-request {reason}")),
+            ApproverEvent::RequestExpired { request_id } => {
+                self.requests.lock().unwrap().retain(|r| *r != request_id);
+                say(&format!("lapsed {request_id}"))
+            }
             ApproverEvent::Outcome {
                 request_id,
                 outcome,
