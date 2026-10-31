@@ -325,6 +325,35 @@ impl PermissionManager {
         (admitted, self.apps.len() < before)
     }
 
+    /// Whether [`Self::ensure_capacity`] would make room for `pubkey`,
+    /// without changing anything.
+    pub fn would_connect(&self, pubkey: &PublicKey) -> bool {
+        self.apps.contains_key(pubkey) || self.live().count() < Self::MAX_CONNECTED_APPS
+    }
+
+    /// Whether [`Self::admit_listed`] would admit `pubkey`, without changing
+    /// anything, so a connect is refused before anyone is asked to approve it.
+    pub fn would_admit_listed(&self, pubkey: &PublicKey, listed: &HashSet<PublicKey>) -> bool {
+        if self.apps.contains_key(pubkey) {
+            return true;
+        }
+        let unlisted = self
+            .live()
+            .filter(|app| !listed.contains(&app.pubkey))
+            .count();
+        if listed.contains(pubkey) {
+            self.live().count() < Self::MAX_CONNECTED_APPS || unlisted > 0
+        } else {
+            listed.len() + unlisted < Self::MAX_CONNECTED_APPS
+        }
+    }
+
+    fn live(&self) -> impl Iterator<Item = &AppPermission> {
+        self.apps
+            .values()
+            .filter(|app| !app.duration.is_expired(app.connected_at))
+    }
+
     fn unlisted_fits(&self, listed: &HashSet<PublicKey>) -> bool {
         let unlisted = self.apps.keys().filter(|k| !listed.contains(k)).count();
         listed.len() + unlisted < Self::MAX_CONNECTED_APPS
@@ -1764,27 +1793,41 @@ mod tests {
         (0..n).map(|_| Keys::generate().public_key()).collect()
     }
 
+    /// `admit_listed`, first checking `would_admit_listed` gives the same
+    /// answer, so a connect refused before its prompt is one admission would
+    /// refuse.
+    fn admit(
+        pm: &mut PermissionManager,
+        pubkey: &PublicKey,
+        listed: &HashSet<PublicKey>,
+    ) -> (bool, bool) {
+        let would = pm.would_admit_listed(pubkey, listed);
+        let result = pm.admit_listed(pubkey, listed);
+        assert_eq!(would, result.0);
+        result
+    }
+
     #[test]
     fn admit_listed_keeps_slots_for_listed_clients_not_yet_connected() {
         let mut pm = PermissionManager::new();
         let listed: HashSet<PublicKey> = keys(60).into_iter().collect();
         for pk in keys(39) {
-            assert_eq!(pm.admit_listed(&pk, &listed), (true, false));
+            assert_eq!(admit(&mut pm, &pk, &listed), (true, false));
             assert!(pm.connect(pk, "App".into()));
         }
         let last = Keys::generate().public_key();
-        assert_eq!(pm.admit_listed(&last, &listed), (true, false));
+        assert_eq!(admit(&mut pm, &last, &listed), (true, false));
         assert!(pm.connect(last, "App".into()));
         let refused = Keys::generate().public_key();
-        assert_eq!(pm.admit_listed(&refused, &listed), (false, false));
+        assert_eq!(admit(&mut pm, &refused, &listed), (false, false));
         assert!(!pm.apps.contains_key(&refused));
         assert_eq!(
-            pm.admit_listed(&last, &listed),
+            admit(&mut pm, &last, &listed),
             (true, false),
             "an app already connected takes no new slot"
         );
         for pk in &listed {
-            assert_eq!(pm.admit_listed(pk, &listed), (true, false));
+            assert_eq!(admit(&mut pm, pk, &listed), (true, false));
             assert!(pm.connect(*pk, "App".into()));
         }
         assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
@@ -1797,14 +1840,14 @@ mod tests {
             .into_iter()
             .collect();
         assert_eq!(
-            pm.admit_listed(&Keys::generate().public_key(), &listed),
+            admit(&mut pm, &Keys::generate().public_key(), &listed),
             (false, false)
         );
         let mut listed = listed;
         let dropped = *listed.iter().next().unwrap();
         listed.remove(&dropped);
         assert_eq!(
-            pm.admit_listed(&Keys::generate().public_key(), &listed),
+            admit(&mut pm, &Keys::generate().public_key(), &listed),
             (true, false)
         );
     }
@@ -1819,11 +1862,11 @@ mod tests {
         }
         let client = Keys::generate().public_key();
         let listed = HashSet::from([client]);
-        assert_eq!(pm.admit_listed(&client, &listed), (true, true));
+        assert_eq!(admit(&mut pm, &client, &listed), (true, true));
         assert!(!pm.apps.contains_key(&unlisted[0]));
         assert!(pm.apps.contains_key(&unlisted[1]));
         assert!(pm.connect(client, "App".into()));
-        assert_eq!(pm.admit_listed(&client, &listed), (true, false));
+        assert_eq!(admit(&mut pm, &client, &listed), (true, false));
     }
 
     #[test]
@@ -1836,7 +1879,38 @@ mod tests {
         let client = Keys::generate().public_key();
         let mut listed: HashSet<PublicKey> = connected.iter().copied().collect();
         listed.insert(client);
-        assert_eq!(pm.admit_listed(&client, &listed), (false, false));
+        assert_eq!(admit(&mut pm, &client, &listed), (false, false));
         assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+    }
+
+    #[test]
+    fn expired_apps_count_as_free_slots_before_and_at_admission() {
+        let mut pm = PermissionManager::new();
+        let old = keys(PermissionManager::MAX_CONNECTED_APPS);
+        for pk in &old {
+            assert!(pm.connect(*pk, "App".into()));
+            let app = pm.apps.get_mut(pk).unwrap();
+            app.duration = PermissionDuration::Seconds(1);
+            app.connected_at = Timestamp::from(1_000);
+        }
+        let stranger = Keys::generate().public_key();
+        assert!(pm.would_connect(&stranger));
+        assert_eq!(admit(&mut pm, &stranger, &HashSet::new()), (true, true));
+        assert!(pm.apps.is_empty());
+    }
+
+    #[test]
+    fn would_connect_matches_ensure_capacity() {
+        let mut pm = PermissionManager::new();
+        let connected = keys(PermissionManager::MAX_CONNECTED_APPS);
+        for pk in &connected {
+            assert!(pm.would_connect(pk));
+            assert!(pm.connect(*pk, "App".into()));
+        }
+        let stranger = Keys::generate().public_key();
+        assert!(!pm.would_connect(&stranger));
+        assert!(!pm.ensure_capacity(&stranger));
+        assert!(pm.would_connect(&connected[0]));
+        assert!(pm.ensure_capacity(&connected[0]));
     }
 }

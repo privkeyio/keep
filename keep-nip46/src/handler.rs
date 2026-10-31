@@ -400,6 +400,26 @@ impl SignerHandler {
         }
     }
 
+    /// Why a connect from `app_pubkey` would not be admitted now, if it would
+    /// not, without changing anything.
+    async fn admission_refused(&self, app_pubkey: &PublicKey) -> Option<KeepError> {
+        let listing = self
+            .callbacks
+            .as_ref()
+            .map_or(ClientListing::Unrestricted, |cb| cb.client_listing());
+        let pm = self.permissions.lock().await;
+        let admitted = match &listing {
+            ClientListing::Unrestricted => pm.would_connect(app_pubkey),
+            ClientListing::Listed(listed) => pm.would_admit_listed(app_pubkey, listed),
+            ClientListing::Unavailable => {
+                return Some(KeepError::PermissionDenied(
+                    "the connected app list cannot be read".into(),
+                ))
+            }
+        };
+        (!admitted).then(|| KeepError::CapacityExceeded("too many connected apps".into()))
+    }
+
     pub async fn handle_connect(
         &self,
         app_pubkey: PublicKey,
@@ -431,6 +451,16 @@ impl SignerHandler {
             }
             ConnectAuthorization::SecretMatched
         } else if !self.auto_approve {
+            // Nobody is asked to approve a connect admission would refuse.
+            // Admission itself runs after approval, on the list read again.
+            if let Some(e) = self.admission_refused(&app_pubkey).await {
+                self.audit.lock().await.log(
+                    AuditEntry::new(AuditAction::Connect, app_pubkey)
+                        .with_success(false)
+                        .with_reason("not admitted"),
+                );
+                return Err(e);
+            }
             // Connect-time approval ignores the remember-duration today: the
             // app-level lifetime is configured separately via the bunker's
             // existing connect path. Per-kind remember semantics apply at
@@ -2676,11 +2706,14 @@ mod tests {
     struct ListingCallbacks {
         listing: std::sync::Mutex<ClientListing>,
         snapshots: std::sync::Mutex<Vec<Vec<keep_core::relay::StoredBunkerPermission>>>,
+        prompts: std::sync::atomic::AtomicUsize,
     }
     impl crate::types::ServerCallbacks for ListingCallbacks {
         fn on_log(&self, _event: crate::types::LogEvent) {}
         fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
-            ApprovalResult::rejected()
+            self.prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ApprovalResult::approved_once()
         }
         fn client_listing(&self) -> ClientListing {
             self.listing.lock().unwrap().clone()
@@ -2691,18 +2724,100 @@ mod tests {
     }
 
     fn listing_handler(listing: ClientListing) -> (SignerHandler, Arc<ListingCallbacks>) {
+        let (handler, cb) = prompting_handler(listing);
+        (handler.with_expected_secret("secret".into()), cb)
+    }
+
+    /// A handler that asks the owner to approve each connect, and the owner
+    /// approves.
+    fn prompting_handler(listing: ClientListing) -> (SignerHandler, Arc<ListingCallbacks>) {
         let cb = Arc::new(ListingCallbacks {
             listing: std::sync::Mutex::new(listing),
             snapshots: std::sync::Mutex::new(Vec::new()),
+            prompts: std::sync::atomic::AtomicUsize::new(0),
         });
         let handler = SignerHandler::new(
             setup_keyring(),
             Arc::new(Mutex::new(PermissionManager::new())),
             Arc::new(Mutex::new(AuditLog::new(100))),
             Some(cb.clone()),
-        )
-        .with_expected_secret("secret".into());
+        );
         (handler, cb)
+    }
+
+    fn prompts(cb: &ListingCallbacks) -> usize {
+        cb.prompts.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    async fn ask(handler: &SignerHandler, app: PublicKey) -> Result<ConnectAuthorization> {
+        handler.handle_connect(app, None, None, None).await
+    }
+
+    // The owner is never asked to approve a connect that admission would then
+    // refuse: at the listed cap, with the list unreadable, or with the table
+    // full.
+    #[tokio::test]
+    async fn a_connect_admission_would_refuse_is_refused_before_the_prompt() {
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let (handler, cb) = prompting_handler(ClientListing::Listed(listed.clone()));
+        let stranger = Keys::generate().public_key();
+        assert!(matches!(
+            ask(&handler, stranger).await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert_eq!(prompts(&cb), 0);
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .get_app(&stranger)
+            .is_none());
+
+        *cb.listing.lock().unwrap() = ClientListing::Unavailable;
+        assert!(matches!(
+            ask(&handler, stranger).await,
+            Err(KeepError::PermissionDenied(_))
+        ));
+        assert_eq!(prompts(&cb), 0);
+
+        let (handler, cb) = prompting_handler(ClientListing::Unrestricted);
+        for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
+            ask(&handler, Keys::generate().public_key()).await.unwrap();
+        }
+        let before = prompts(&cb);
+        assert!(matches!(
+            ask(&handler, stranger).await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert_eq!(prompts(&cb), before);
+    }
+
+    // A connect admission would take is asked once and admitted, including a
+    // listed client that finds the table full of apps it displaces.
+    #[tokio::test]
+    async fn a_connect_admission_would_take_is_asked_and_admitted() {
+        let (handler, cb) = prompting_handler(ClientListing::Unrestricted);
+        let app = Keys::generate().public_key();
+        assert_eq!(
+            ask(&handler, app).await.unwrap(),
+            ConnectAuthorization::UserApproved
+        );
+        assert_eq!(prompts(&cb), 1);
+
+        for _ in 1..PermissionManager::MAX_CONNECTED_APPS {
+            ask(&handler, Keys::generate().public_key()).await.unwrap();
+        }
+        let client = Keys::generate().public_key();
+        *cb.listing.lock().unwrap() = ClientListing::Listed(HashSet::from([client]));
+        let before = prompts(&cb);
+        assert_eq!(
+            ask(&handler, client).await.unwrap(),
+            ConnectAuthorization::UserApproved
+        );
+        assert_eq!(prompts(&cb), before + 1);
+        assert!(handler.permissions.lock().await.get_app(&client).is_some());
     }
 
     async fn connect(
