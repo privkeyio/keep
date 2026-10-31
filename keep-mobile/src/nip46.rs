@@ -457,10 +457,11 @@ impl ServerCallbacks for CallbackBridge {
             authorization,
             keep_nip46::types::ConnectAuthorization::SecretMatched
                 | keep_nip46::types::ConnectAuthorization::UserApproved
-        ) && let Err(e) = self.commit_authorized_client(pubkey, authorization)
-        {
-            tracing::warn!("failed to record authorized bunker client: {e}");
-            return;
+        ) {
+            if let Err(e) = self.commit_authorized_client(pubkey, authorization) {
+                tracing::warn!("failed to record authorized bunker client: {e}");
+                return;
+            }
         }
         self.callbacks
             .on_connect(pubkey.to_string(), name.to_string(), authorization.into());
@@ -3535,10 +3536,11 @@ mod tests {
 
     // End to end over a relay with the production callback bridge: once the
     // platform lists the most clients it allows, a stranger holding the
-    // connect secret is refused and granted nothing, a listed client still
-    // connects, and a slot the platform frees admits the stranger.
+    // connect secret is admitted and the oldest client is dropped. A client
+    // who was already listed still connects, and the newcomer can read the
+    // signing key. A slot the platform then frees admits another stranger.
     #[test]
-    fn a_connect_past_the_listed_cap_is_refused_end_to_end() {
+    fn a_connect_past_the_listed_cap_drops_the_oldest_end_to_end() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
         let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
@@ -3577,7 +3579,10 @@ mod tests {
                 .block_on(ask_over_relay(client, keys, bunker, id, method, params))
         };
 
+        let oldest = clients[0].clone();
         let stranger = nostr_sdk::Keys::generate();
+        let stranger_hex = stranger.public_key().to_hex();
+        let listed_hex = listed.public_key().to_hex();
         let stranger_client = listening(&mobile, &url, &stranger, bunker);
         assert_eq!(
             error_of(ask(
@@ -3586,10 +3591,28 @@ mod tests {
                 "full",
                 "connect",
                 connect.clone()
-            ))
-            .as_deref(),
-            Some("Capacity exceeded"),
+            )),
+            None,
+            "a full roster admits the next explicit connect"
         );
+        let stored = stored_config(&storage);
+        assert_eq!(
+            stored.authorized_clients.len(),
+            keep_nip46::PermissionManager::MAX_CONNECTED_APPS
+        );
+        assert_eq!(
+            stored.authorized_clients.last().map(String::as_str),
+            Some(stranger_hex.as_str())
+        );
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &oldest));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &listed_hex));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
         assert_eq!(
             error_of(ask(
                 &stranger_client,
@@ -3597,10 +3620,9 @@ mod tests {
                 "full-key",
                 "get_public_key",
                 serde_json::json!([])
-            ))
-            .as_deref(),
-            Some("Permission denied"),
-            "the refused connect granted nothing"
+            )),
+            None,
+            "the admitted connect granted the signing key"
         );
 
         let listed_client = listening(&mobile, &url, &listed, bunker);
@@ -3615,22 +3637,25 @@ mod tests {
             None
         );
 
-        clients.remove(0);
-        set_listed(&mobile, clients);
+        let mut current = stored_config(&storage).authorized_clients;
+        let freed = current.remove(0);
+        set_listed(&mobile, current.clone());
+        let other = nostr_sdk::Keys::generate();
+        let other_hex = other.public_key().to_hex();
+        let other_client = listening(&mobile, &url, &other, bunker);
         assert_eq!(
-            error_of(ask(
-                &stranger_client,
-                &stranger,
-                "freed",
-                "connect",
-                connect
-            )),
+            error_of(ask(&other_client, &other, "freed", "connect", connect)),
             None,
             "a freed slot admits the stranger"
         );
+        let after = stored_config(&storage).authorized_clients;
+        assert_eq!(after.len(), current.len() + 1);
+        assert!(!after.iter().any(|client| client == &freed));
+        assert_eq!(after.last().map(String::as_str), Some(other_hex.as_str()));
+        assert!(current.iter().all(|client| after.contains(client)));
         assert_eq!(prompts.load(Ordering::Acquire), 0, "nothing asked the user");
         starter.stop_bunker();
-        for c in [stranger_client, listed_client] {
+        for c in [stranger_client, listed_client, other_client] {
             mobile.runtime.block_on(c.disconnect());
         }
     }

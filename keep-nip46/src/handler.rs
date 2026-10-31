@@ -3003,7 +3003,12 @@ mod tests {
             connect(&handler, stranger, "secret").await.unwrap(),
             ConnectAuthorization::SecretMatched
         );
-        assert!(handler.permissions.lock().await.get_app(&stranger).is_some());
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .get_app(&stranger)
+            .is_some());
     }
 
     #[tokio::test]
