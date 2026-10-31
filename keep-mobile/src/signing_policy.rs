@@ -291,6 +291,9 @@ fn app_override_key(account: &str, package: &str) -> Option<String> {
 #[derive(uniffi::Object)]
 pub struct SignPolicyStore {
     storage: Arc<dyn SignPolicySelectionStorage>,
+    /// Held across an override's read and write, so an adoption never writes
+    /// over an override set while it ran.
+    override_lock: Mutex<()>,
 }
 
 impl SignPolicyStore {
@@ -314,7 +317,10 @@ impl SignPolicyStore {
 impl SignPolicyStore {
     #[uniffi::constructor]
     pub fn new(storage: Arc<dyn SignPolicySelectionStorage>) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            override_lock: Mutex::new(()),
+        }
     }
 
     /// The global sign-policy selection, defaulting to `Manual` when unset,
@@ -384,6 +390,10 @@ impl SignPolicyStore {
         let Some(key) = app_override_key(&account, &package) else {
             return false;
         };
+        let _guard = self
+            .override_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let value = policy.map_or(FOLLOWS_GLOBAL.to_string(), |p| p.to_ordinal().to_string());
         self.storage.save(key, value)
     }
@@ -406,12 +416,17 @@ impl SignPolicyStore {
     /// Returns `true` once nothing is left to do, including for an invalid
     /// `account` or an empty `package`, which have nothing to adopt, and
     /// `false` when a key could not be read or a write did not persist, so the
-    /// call should be retried. Callers must not run it concurrently with
-    /// [`Self::set_app_override`] for the same package.
+    /// call should be retried. It runs under the same lock as
+    /// [`Self::set_app_override`], so a choice made while it runs is not
+    /// written over.
     pub fn adopt_legacy_override(&self, account: String, package: String) -> bool {
         let Some(key) = app_override_key(&account, &package) else {
             return true;
         };
+        let _guard = self
+            .override_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let account = account.to_ascii_lowercase();
         let claim = legacy_adopted_key(&package);
         match self.storage.load(claim.clone()) {
@@ -2242,6 +2257,66 @@ mod tests {
         storage.unpersisted.lock().unwrap().clear();
         assert!(adopt());
         assert_eq!(on_disk(&scoped).as_deref(), Some("2"));
+    }
+
+    /// Reads the scoped key, then signals and stalls before answering, so a
+    /// writer on another thread can land between an adoption's read and write.
+    struct StallingPolicyStorage {
+        inner: Arc<MockPolicyStorage>,
+        stall_on: String,
+        reached: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+    impl SignPolicySelectionStorage for StallingPolicyStorage {
+        fn load(&self, key: String) -> StorageRead {
+            let read = self.inner.load(key.clone());
+            if key == self.stall_on {
+                if let Some(reached) = self.reached.lock().unwrap().take() {
+                    reached.send(()).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            read
+        }
+        fn save(&self, key: String, value: String) -> bool {
+            self.inner.save(key, value)
+        }
+        fn remove(&self, key: String) -> bool {
+            self.inner.remove(key)
+        }
+    }
+
+    #[test]
+    fn adopting_does_not_write_over_a_choice_made_while_it_runs() {
+        let inner = MockPolicyStorage::new();
+        inner
+            .map
+            .lock()
+            .unwrap()
+            .insert(legacy_override_key("com.app"), "2".into());
+        let (reached, wait) = std::sync::mpsc::channel();
+        let store = Arc::new(SignPolicyStore::new(Arc::new(StallingPolicyStorage {
+            inner,
+            stall_on: app_override_key(ACCOUNT, "com.app").unwrap(),
+            reached: Mutex::new(Some(reached)),
+        })));
+
+        let adopting = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.adopt_legacy_override(ACCOUNT.into(), "com.app".into())
+            })
+        };
+        wait.recv().unwrap();
+        assert!(store.set_app_override(
+            ACCOUNT.into(),
+            "com.app".into(),
+            Some(SignPolicySelection::Manual)
+        ));
+        assert!(adopting.join().unwrap());
+        assert_eq!(
+            store.app_override(ACCOUNT.into(), "com.app".into()),
+            Some(SignPolicySelection::Manual)
+        );
     }
 
     #[test]
