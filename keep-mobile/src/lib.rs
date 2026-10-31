@@ -744,6 +744,11 @@ pub struct KeepMobile {
     /// (the teardown it calls takes `node_lifecycle_lock`), so it cannot
     /// self-deadlock.
     active_share_lock: Arc<std::sync::Mutex<()>>,
+    /// Held from the check that no share is listed under a group, and that the
+    /// cap has room, through the write of that group's share, so two writes
+    /// cannot both pass the check and the second replace the first. Taken
+    /// inside `active_share_lock` when both are held.
+    share_write_lock: Arc<std::sync::Mutex<()>>,
 }
 
 struct PendingRequest {
@@ -1104,6 +1109,7 @@ impl KeepMobile {
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_share_lock: Arc::new(std::sync::Mutex::new(())),
+            share_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -4011,6 +4017,10 @@ impl KeepMobile {
             });
         }
 
+        let write = self
+            .share_write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for (group_hex, _, _) in prepared_shares.iter().chain(prepared_keys.iter()) {
             if self.listed_share_identifier(group_hex)?.is_some() {
                 return Err(KeepMobileError::BackupError {
@@ -4038,6 +4048,7 @@ impl KeepMobile {
             self.storage
                 .store_share_by_key(group_hex, serialized, metadata_info)?;
         }
+        drop(write);
 
         for (group_hex, stored_relay) in prepared_relays {
             let key = relay_config_key(Some(&group_hex));
@@ -4924,13 +4935,19 @@ impl KeepMobile {
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
 
         let group_pubkey_hex = hex::encode(&metadata_info.group_pubkey);
-        self.refuse_listed_share(&group_pubkey_hex, &metadata_info, false)?;
-        self.ensure_share_capacity()?;
-        self.storage.store_share_by_key(
-            group_pubkey_hex.clone(),
-            serialized,
-            metadata_info.clone(),
-        )?;
+        {
+            let _write = self
+                .share_write_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.refuse_listed_share(&group_pubkey_hex, &metadata_info, false)?;
+            self.ensure_share_capacity()?;
+            self.storage.store_share_by_key(
+                group_pubkey_hex.clone(),
+                serialized,
+                metadata_info.clone(),
+            )?;
+        }
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
@@ -5561,14 +5578,6 @@ impl KeepMobile {
             .to_share(&passphrase, &name)
             .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
-        // Writing a stored share again does not add one, so only a new group
-        // is held to the cap.
-        if self
-            .listed_share_identifier(&hex::encode(share.group_pubkey()))?
-            .is_none()
-        {
-            self.ensure_share_capacity()?;
-        }
         self.store_share_package(&share, own)
     }
 
@@ -5609,21 +5618,30 @@ impl KeepMobile {
                 })?,
         );
 
+        let pubkey_package_bytes = share
+            .pubkey_package()
+            .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
+            .serialize()
+            .map_err(|e| KeepMobileError::FrostError {
+                msg: format!("Serialization failed: {e}"),
+            })?;
+
+        let write = self
+            .share_write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.refuse_listed_share(&group_pubkey_hex, &metadata, own)? {
-            return self.landed_share(&group_pubkey_hex, &key_package_bytes);
+            return self.landed_share(&group_pubkey_hex, &key_package_bytes, &pubkey_package_bytes);
         }
+        // Writing a stored share again is refused above, so only a new group
+        // reaches the cap.
+        self.ensure_share_capacity()?;
 
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
                 .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?,
             key_package_bytes,
-            pubkey_package_bytes: share
-                .pubkey_package()
-                .map_err(|e| KeepMobileError::FrostError { msg: e.to_string() })?
-                .serialize()
-                .map_err(|e| KeepMobileError::FrostError {
-                    msg: format!("Serialization failed: {e}"),
-                })?,
+            pubkey_package_bytes,
             plaintext_mnemonic: None,
             ciphersuite: keep_core::frost::Ciphersuite::Secp256k1Tr,
         };
@@ -5633,6 +5651,7 @@ impl KeepMobile {
 
         self.storage
             .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
+        drop(write);
         self.storage
             .set_active_share_key(Some(group_pubkey_hex.clone()))?;
 
@@ -5647,23 +5666,27 @@ impl KeepMobile {
         })
     }
 
-    /// The stored share under `key`, when it holds `key_package_bytes`: a DKG
-    /// stash whose import already landed. Nothing is written, so the record
-    /// keeps what it learned since (its backup flag, its name), and the
-    /// selected account and live node are left alone. A stored share holding
-    /// other key material is refused.
+    /// The stored share under `key`, when it holds the same key package and
+    /// public key package as the stash: a DKG stash whose import already
+    /// landed. Nothing is written, so the record keeps what it learned since
+    /// (its backup flag, its name), and the selected account and live node are
+    /// left alone. A stored share holding anything else is refused, so the
+    /// stash, which may be the only usable copy, is kept.
     fn landed_share(
         &self,
         key: &str,
         key_package_bytes: &[u8],
+        pubkey_package_bytes: &[u8],
     ) -> Result<ShareInfo, KeepMobileError> {
         let data = self.storage.load_share_by_key(key.to_string())?;
         let stored: StoredShareData = serde_json::from_slice(&data)
             .map_err(|e| KeepMobileError::StorageError { msg: e.to_string() })?;
-        if !bool::from(subtle::ConstantTimeEq::ct_eq(
-            stored.key_package_bytes.as_slice(),
-            key_package_bytes,
-        )) {
+        let same_key =
+            subtle::ConstantTimeEq::ct_eq(stored.key_package_bytes.as_slice(), key_package_bytes);
+        let same_public = stored.pubkey_package_bytes.as_slice() == pubkey_package_bytes;
+        if !(bool::from(same_key) && same_public)
+            || stored.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr
+        {
             return Err(KeepMobileError::InvalidShare {
                 msg: "This share is already stored".into(),
             });
@@ -11652,6 +11675,11 @@ mod share_registry_tests {
         loaded: StdMutex<Vec<String>>,
         registry_unavailable: AtomicBool,
         active: StdMutex<Option<String>>,
+        /// While set, each registry read waits briefly for a read from a
+        /// second thread, so two writers that check before either writes are
+        /// made to overlap.
+        rendezvous: AtomicBool,
+        readers: StdMutex<std::collections::HashSet<std::thread::ThreadId>>,
     }
 
     impl RegistryStorage {
@@ -11725,10 +11753,21 @@ mod share_registry_tests {
             if self.registry_unavailable.load(Ordering::SeqCst) {
                 return crate::storage::ShareRegistryRead::Unavailable;
             }
-            crate::storage::ShareRegistryRead::Readable {
+            let read = crate::storage::ShareRegistryRead::Readable {
                 shares: self.list_all_shares(),
                 unreadable: self.unreadable.lock().unwrap().clone(),
+            };
+            if self.rendezvous.load(Ordering::SeqCst) {
+                self.readers
+                    .lock()
+                    .unwrap()
+                    .insert(std::thread::current().id());
+                let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+                while self.readers.lock().unwrap().len() < 2 && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
+            read
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.records.lock().unwrap().remove(&key);
@@ -12422,6 +12461,64 @@ mod share_registry_tests {
             assert_eq!(mobile.pending_requests.lock().await.len(), 1);
         });
         assert!(mobile.pending_dkg_share().unwrap().is_none());
+    }
+
+    // A stored record whose public key package differs from the stash's is
+    // not taken as the landed import: the stash may be the only usable copy.
+    #[test]
+    fn recovering_over_another_public_key_package_is_refused() {
+        let (storage, mobile) = setup();
+        let share = &group_shares()[0];
+        let export = ShareExport::from_share(share, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        mobile
+            .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
+            .unwrap();
+        let key = hex::encode(share.group_pubkey());
+        let mut record: StoredShareData =
+            serde_json::from_slice(&storage.raw(&key).unwrap()).unwrap();
+        record.pubkey_package_bytes = b"damaged".to_vec();
+        let damaged = serde_json::to_vec(&record).unwrap();
+        storage
+            .store_share_by_key(key.clone(), damaged.clone(), (&share.metadata).into())
+            .unwrap();
+        stash(&storage, &export, Some(PASS));
+
+        let result = mobile.recover_dkg_share(None);
+
+        assert!(
+            matches!(&result, Err(KeepMobileError::InvalidShare { msg }) if msg == "This share is already stored"),
+            "got {result:?}"
+        );
+        assert_eq!(storage.raw(&key).unwrap(), damaged);
+        assert!(mobile.pending_dkg_share().unwrap().is_some());
+    }
+
+    // Two imports into the same new group that check before either writes
+    // cannot both succeed: the second would replace the first's share.
+    #[test]
+    fn concurrent_imports_into_one_new_group_store_one_share() {
+        let (storage, mobile) = setup();
+        let shares = group_shares();
+        let key = hex::encode(shares[0].group_pubkey());
+        storage.rendezvous.store(true, Ordering::SeqCst);
+        let results: Vec<_> = std::thread::scope(|scope| {
+            let threads: Vec<_> = shares[..2]
+                .iter()
+                .map(|share| {
+                    let mobile = &mobile;
+                    scope.spawn(move || mobile.store_share_package(share, false))
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        storage.rendezvous.store(false, Ordering::SeqCst);
+
+        let stored: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        assert_eq!(stored.len(), 1, "got {results:?}");
+        assert_eq!(stored_identifier(&storage, &key), stored[0].share_index);
     }
 
     // A passphrase-protected stash holds an export from outside, so recovery
