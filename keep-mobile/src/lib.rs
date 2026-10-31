@@ -1138,10 +1138,13 @@ impl KeepMobile {
         self.do_initialize(relays, Some(proxy))
     }
 
-    /// Import a share export. A share already stored under its group is
+    /// Import a share export. A share the registry lists under its group is
     /// never written over: an export holds nothing an attacker cannot forge
     /// for a group and index, so a copy and a forgery look the same until the
     /// stored record is read. Delete the stored share first to replace it.
+    /// Share data the registry does not list, left by an interrupted write,
+    /// is guarded only by the platform, as
+    /// [`SecureStorage::store_share_by_key`] describes.
     pub fn import_share(
         &self,
         data: String,
@@ -5493,10 +5496,10 @@ impl KeepMobile {
         key: &str,
         incoming: &ShareMetadataInfo,
         own_same: bool,
-    ) -> Result<(), KeepMobileError> {
+    ) -> Result<bool, KeepMobileError> {
         let shape = |m: &ShareMetadataInfo| (m.identifier, m.threshold, m.total_shares);
         match self.listed_share(key)? {
-            None => Ok(()),
+            None => Ok(false),
             Some(listed) if listed.threshold == 1 && listed.total_shares == 1 => {
                 Err(KeepMobileError::InvalidShare {
                     msg: "This key is already stored".into(),
@@ -5507,7 +5510,7 @@ impl KeepMobile {
                     msg: "Another share of this group is already stored".into(),
                 })
             }
-            Some(_) if own_same => Ok(()),
+            Some(_) if own_same => Ok(true),
             Some(_) => Err(KeepMobileError::InvalidShare {
                 msg: "This share is already stored".into(),
             }),
@@ -5586,7 +5589,7 @@ impl KeepMobile {
         let metadata: ShareMetadataInfo = (&share.metadata).into();
         let group_pubkey_hex = hex::encode(&metadata.group_pubkey);
 
-        self.refuse_listed_share(&group_pubkey_hex, &metadata, own)?;
+        let rewrite = self.refuse_listed_share(&group_pubkey_hex, &metadata, own)?;
 
         let stored = StoredShareData {
             metadata_json: serde_json::to_string(&share.metadata)
@@ -5616,10 +5619,15 @@ impl KeepMobile {
 
         self.storage
             .store_share_by_key(group_pubkey_hex.clone(), serialized, metadata.clone())?;
-        self.storage
-            .set_active_share_key(Some(group_pubkey_hex.clone()))?;
-
-        self.invalidate_live_node();
+        // Writing a share already stored again leaves the account the owner
+        // has selected, and its live node, alone unless it is that share.
+        if !rewrite {
+            self.storage
+                .set_active_share_key(Some(group_pubkey_hex.clone()))?;
+        }
+        if !rewrite || self.storage.get_active_share_key().as_deref() == Some(&group_pubkey_hex) {
+            self.invalidate_live_node();
+        }
 
         Ok(ShareInfo {
             name: metadata.name,
@@ -6311,7 +6319,7 @@ mod import_teardown_tests {
     // the node starts None in this harness (a real KfpNode needs a live
     // network), so the pending request it clears is the observable proof the
     // teardown block ran on the import path.
-    fn seed_pending_request(mobile: &KeepMobile) {
+    pub(super) fn seed_pending_request(mobile: &KeepMobile) {
         let (tx, _rx) = mpsc::channel::<bool>(1);
         mobile.runtime.block_on(async {
             mobile.pending_requests.lock().await.push(PendingRequest {
@@ -12285,8 +12293,46 @@ mod share_registry_tests {
             .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
             .unwrap();
         stash(&storage, &export, Some(PASS));
+        crate::import_teardown_tests::seed_pending_request(&mobile);
         let info = mobile.recover_dkg_share(None).unwrap();
         assert_eq!(info.name, "ceremony");
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
+        assert_eq!(storage.get_active_share_key(), Some(info.group_pubkey));
+        mobile.runtime.block_on(async {
+            assert!(mobile.pending_requests.lock().await.is_empty());
+        });
+    }
+
+    // A recovery that writes a stored share again leaves the account the owner
+    // selected since, and its pending requests, alone.
+    #[test]
+    fn recovering_a_landed_ceremony_keeps_the_selected_account() {
+        let (storage, mobile) = setup();
+        let share = &group_shares()[0];
+        let export = ShareExport::from_share(share, PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        mobile
+            .import_share_export(export.clone(), PASS.into(), "ceremony".into(), true)
+            .unwrap();
+        stash(&storage, &export, Some(PASS));
+        let other = ShareExport::from_share(&group_shares()[0], PASS)
+            .unwrap()
+            .to_json()
+            .unwrap();
+        let selected = mobile
+            .import_share(other, PASS.into(), "selected".into())
+            .unwrap()
+            .group_pubkey;
+        crate::import_teardown_tests::seed_pending_request(&mobile);
+
+        mobile.recover_dkg_share(None).unwrap();
+
+        assert_eq!(storage.get_active_share_key(), Some(selected));
+        mobile.runtime.block_on(async {
+            assert_eq!(mobile.pending_requests.lock().await.len(), 1);
+        });
         assert!(mobile.pending_dkg_share().unwrap().is_none());
     }
 
