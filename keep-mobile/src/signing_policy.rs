@@ -353,8 +353,9 @@ impl SignPolicyStore {
     /// may be stricter than the global policy, so it is never taken as absent.
     /// Until the account chooses for the app, an override from before
     /// overrides were per account can only tighten the global policy, unless
-    /// another account has adopted it (see [`Self::adopt_legacy_override`]). An `account` that is not a group key, or an
-    /// empty `package`, is `Manual`.
+    /// another account has adopted it (see [`Self::adopt_legacy_override`]).
+    /// An `account` that is not a group key, or an empty `package`, is
+    /// `Manual`.
     pub fn app_override(&self, account: String, package: String) -> Option<SignPolicySelection> {
         let Some(key) = app_override_key(&account, &package) else {
             return Some(SignPolicySelection::Manual);
@@ -424,7 +425,8 @@ impl SignPolicyStore {
     /// for any other account returns `true` and writes nothing, so a retry after
     /// an account switch cannot hand the override to a second account. The
     /// claim is written before the override, so a failure between the two
-    /// leaves the claimed account stricter, never another account looser. An
+    /// leaves the claimed account still floored by the legacy override, while
+    /// every other account follows its own policy for the app from then. An
     /// account that has already chosen for the app keeps its choice. A legacy
     /// override that cannot be parsed is adopted as `Manual`, the floor it
     /// already enforced.
@@ -2133,7 +2135,11 @@ mod tests {
         // Adopted once: a second account, or a retry after a switch, gains nothing.
         assert!(adopt(OTHER));
         assert!(!has(app_override_key(OTHER, "com.app").unwrap()));
-        assert_eq!(effective(OTHER), SignPolicySelection::Manual);
+        assert_eq!(
+            store.app_override(OTHER.into(), "com.app".into()),
+            None,
+            "the claimer's override is no floor for another account"
+        );
 
         // A claim whose override never landed still keeps every other account out.
         set(legacy_override_key("com.other"), "2");
@@ -2184,6 +2190,11 @@ mod tests {
         assert_eq!(
             store.app_override(ACCOUNT.into(), "com.app".into()),
             Some(SignPolicySelection::Manual)
+        );
+        assert_eq!(
+            store.app_override(ACCOUNT.to_ascii_uppercase(), "com.app".into()),
+            Some(SignPolicySelection::Manual),
+            "the claim matches its account in any case"
         );
 
         for claim in [UNREADABLE, "", "not an account", "aa"] {
