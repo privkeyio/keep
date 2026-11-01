@@ -487,32 +487,40 @@ impl ServerCallbacks for CallbackBridge {
         let (evicted, added) =
             record_authorized_client(&self.mobile, pubkey, || self.serving_now())
                 .map_err(|e| e.to_string())?;
-        let authorized = PublicKey::from_hex(pubkey).is_ok_and(|parsed| {
-            matches!(bunker_client_authorized(&self.mobile, &parsed), Ok(true))
-        });
-        if !authorized {
-            return Err(keep_nip46::types::CLIENT_NOT_RECORDED.into());
-        }
-        if evicted.is_empty() {
-            return Ok(());
-        }
-        // Outside the config lock. Revoking through the engine persists a
-        // grant snapshot, and that takes the lock again.
-        if let Err(reason) = revoke_evicted_clients(&self.mobile, &evicted) {
-            // A client this connect just added is removed with the rollback.
-            // One who was already listed stays: they were not the overflow.
-            if let Err(rollback) =
-                restore_evicted_clients(&self.mobile, &evicted, added.then_some(pubkey))
-            {
-                tracing::warn!("failed to roll back an authorized client eviction: {rollback}");
+        // Read before the revoke, whose rollback can take the newcomer back
+        // off the roster, but answered after it: the eviction is already
+        // written, so its grants go whether or not the newcomer is authorized.
+        let authorized = match PublicKey::from_hex(pubkey) {
+            Ok(parsed) => bunker_client_authorized(&self.mobile, &parsed)
+                .map_err(|e| format!("the authorized client list could not be read: {e}")),
+            Err(_) => Ok(false),
+        };
+        if !evicted.is_empty() {
+            // Outside the config lock. Revoking through the engine persists a
+            // grant snapshot, and that takes the lock again.
+            if let Err(reason) = revoke_evicted_clients(&self.mobile, &evicted) {
+                // A client this connect just added is removed with the
+                // rollback. One who was already listed stays: they were not
+                // the overflow.
+                if let Err(rollback) =
+                    restore_evicted_clients(&self.mobile, &evicted, added.then_some(pubkey))
+                {
+                    tracing::warn!("failed to roll back an authorized client eviction: {rollback}");
+                }
+                return match authorized {
+                    Ok(false) => Err(keep_nip46::types::CLIENT_NOT_RECORDED.into()),
+                    _ => Err(reason),
+                };
             }
-            return Err(reason);
+            tracing::info!(
+                dropped = evicted.len(),
+                "authorized bunker client list dropped the oldest entries"
+            );
         }
-        tracing::info!(
-            dropped = evicted.len(),
-            "authorized bunker client list dropped the oldest entries"
-        );
-        Ok(())
+        match authorized? {
+            true => Ok(()),
+            false => Err(keep_nip46::types::CLIENT_NOT_RECORDED.into()),
+        }
     }
 
     fn client_authorized(&self, pubkey: &PublicKey) -> bool {
@@ -1080,7 +1088,8 @@ pub(crate) fn set_bunker_enabled(
 /// acknowledging a client whose predecessor is still granted. No live handler
 /// means the disk forget is the whole job. A failed disk forget is marked
 /// pending and does not fail the connect, stop the bunker, or rotate the
-/// connect secret.
+/// connect secret. A forget that cannot be marked either is an error, so the
+/// caller puts the roster back rather than leave a grant nothing will retry.
 fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) -> Result<(), String> {
     let clients: Vec<PublicKey> = evicted
         .iter()
@@ -1115,15 +1124,22 @@ fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) -> Result<(),
             Err(_) => mobile.runtime.block_on(revoke),
         }
     }
+    let mut unmarked = None;
     for client in &clients {
         if let Err(e) = mobile.forget_bunker_permissions(Some(client)) {
             tracing::warn!("failed to drop an evicted bunker client's grants: {e}");
             if let Err(mark) = mark_evicted_revoke(mobile, client) {
                 tracing::warn!("failed to remember an evicted bunker client's revoke: {mark}");
+                unmarked.get_or_insert(mark);
             }
         }
     }
-    Ok(())
+    match unmarked {
+        Some(e) => Err(format!(
+            "an evicted bunker client's grants could not be dropped or marked pending: {e}"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Remembers that `client`'s persisted grants still have to go. Does not stop
@@ -3300,6 +3316,33 @@ mod tests {
     // client's grant fails, the client stays pending so a start will not serve
     // it and will retry the drop. That mark must not stop the bunker or rotate
     // the connect secret, and the client cannot be written back while it holds.
+    // A grant that can neither be dropped nor marked pending would survive with
+    // nothing to retry it, so the eviction must fail and the roster go back.
+    #[test]
+    fn an_eviction_revoke_that_cannot_be_marked_pending_fails() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        load_or_create_bunker_keys(&mobile).unwrap();
+        let dropped = nostr_sdk::Keys::generate().public_key();
+        mem.data.lock().unwrap().insert(
+            crate::relay_config_key(None),
+            b"not a relay config".to_vec(),
+        );
+        *mem.fail_writes_to.lock().unwrap() = Some(BUNKER_CONFIG_STORAGE_KEY.into());
+
+        assert!(revoke_evicted_clients(&mobile, &[dropped.to_hex()]).is_err());
+        assert!(stored_config(&storage).pending_revokes.is_empty());
+
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(revoke_evicted_clients(&mobile, &[dropped.to_hex()]).is_ok());
+        assert_eq!(
+            stored_config(&storage).pending_revokes,
+            vec![dropped.to_hex()],
+            "a forget that fails but is marked is not an error"
+        );
+    }
+
     #[test]
     fn a_failed_eviction_revoke_stays_pending_without_a_new_secret() {
         let mem = Arc::new(MemStorage::default());
