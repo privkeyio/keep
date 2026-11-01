@@ -2833,37 +2833,59 @@ mod tests {
     }
 
     // The owner is never asked to approve a connect that admission would then
-    // refuse: at the listed cap, with the list unreadable, or with the table
-    // full.
+    // refuse. A roster that is already full still admits, and the consumer
+    // drops the oldest, so that stranger is asked. A roster that is holding
+    // the remaining slots for clients it has not connected yet refuses the
+    // unlisted stranger first. An unreadable list refuses before the prompt
+    // too.
     #[tokio::test]
     async fn a_connect_admission_would_refuse_is_refused_before_the_prompt() {
         let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
             .map(|_| Keys::generate().public_key())
             .collect();
-        let (handler, cb) = prompting_handler(ClientListing::Listed(listed.clone()));
+        let (handler, cb) = prompting_handler(ClientListing::Listed(listed));
         let stranger = Keys::generate().public_key();
-        assert!(matches!(
-            ask(&handler, stranger).await,
-            Err(KeepError::UserRejected)
-        ));
-        assert_eq!(prompts(&cb), 0);
+        assert_eq!(
+            ask(&handler, stranger).await.unwrap(),
+            ConnectAuthorization::UserApproved
+        );
+        assert_eq!(prompts(&cb), 1);
         assert!(handler
             .permissions
             .lock()
             .await
             .get_app(&stranger)
-            .is_none());
+            .is_some());
+
+        let reserved = Keys::generate().public_key();
+        let (handler, cb) = prompting_handler(ClientListing::Listed(HashSet::from([reserved])));
+        for _ in 0..PermissionManager::MAX_CONNECTED_APPS - 1 {
+            ask(&handler, Keys::generate().public_key()).await.unwrap();
+        }
+        let before = prompts(&cb);
+        let refused = Keys::generate().public_key();
+        assert!(matches!(
+            ask(&handler, refused).await,
+            Err(KeepError::UserRejected)
+        ));
+        assert_eq!(prompts(&cb), before);
+        assert!(handler.permissions.lock().await.get_app(&refused).is_none());
         assert_eq!(
             last_reason(&handler).await.as_deref(),
             Some("not admitted before asking: too many connected apps")
         );
+        assert_eq!(
+            ask(&handler, reserved).await.unwrap(),
+            ConnectAuthorization::UserApproved
+        );
+        assert_eq!(prompts(&cb), before + 1);
 
         *cb.listing.lock().unwrap() = ClientListing::Unavailable;
         assert!(matches!(
-            ask(&handler, stranger).await,
+            ask(&handler, refused).await,
             Err(KeepError::UserRejected)
         ));
-        assert_eq!(prompts(&cb), 0);
+        assert_eq!(prompts(&cb), before + 1);
         assert_eq!(
             last_reason(&handler).await.as_deref(),
             Some("not admitted before asking: app list unreadable")
@@ -3226,6 +3248,7 @@ mod tests {
         let cb = Arc::new(ListingCallbacks {
             listing: std::sync::Mutex::new(ClientListing::Listed(listed)),
             snapshots: std::sync::Mutex::new(Vec::new()),
+            prompts: std::sync::atomic::AtomicUsize::new(0),
         });
         // No connect secret: this is AutoApproved, which is not recorded and
         // must not take the one-over slot.

@@ -479,11 +479,14 @@ impl ServerCallbacks for CallbackBridge {
         ) {
             return Ok(());
         }
-        // Already-listed is an empty eviction. A refusal (not serving, or
-        // pending revoke) is also empty, and is not the same thing: the
-        // client is authorized only when the roster check says so.
-        let evicted = record_authorized_client(&self.mobile, pubkey, || self.serving_now())
-            .map_err(|e| e.to_string())?;
+        // Already listed and within the cap is an empty eviction. A refusal
+        // (not serving, or pending revoke) is also empty, and is not the same
+        // thing: the client is authorized only when the roster check says so.
+        // A client already listed on a roster past the cap is not added again;
+        // the overflow is still returned so those grants are revoked.
+        let (evicted, added) =
+            record_authorized_client(&self.mobile, pubkey, || self.serving_now())
+                .map_err(|e| e.to_string())?;
         let authorized = PublicKey::from_hex(pubkey).is_ok_and(|parsed| {
             matches!(bunker_client_authorized(&self.mobile, &parsed), Ok(true))
         });
@@ -496,7 +499,11 @@ impl ServerCallbacks for CallbackBridge {
         // Outside the config lock. Revoking through the engine persists a
         // grant snapshot, and that takes the lock again.
         if let Err(reason) = revoke_evicted_clients(&self.mobile, &evicted) {
-            if let Err(rollback) = restore_evicted_clients(&self.mobile, &evicted, pubkey) {
+            // A client this connect just added is removed with the rollback.
+            // One who was already listed stays: they were not the overflow.
+            if let Err(rollback) =
+                restore_evicted_clients(&self.mobile, &evicted, added.then_some(pubkey))
+            {
                 tracing::warn!("failed to roll back an authorized client eviction: {rollback}");
             }
             return Err(reason);
@@ -1143,23 +1150,28 @@ fn mark_evicted_revoke(mobile: &KeepMobile, client: &PublicKey) -> Result<(), Ke
 /// Puts `evicted` back at the front of the roster, in order, and removes
 /// `newcomer` when this connect added them. Used when their grants could not
 /// be dropped, so the connect does not leave a still-granted client off the
-/// list.
+/// list. A client who was already listed is not a newcomer and stays.
 fn restore_evicted_clients(
     mobile: &KeepMobile,
     evicted: &[String],
-    newcomer_hex: &str,
+    newcomer_hex: Option<&str>,
 ) -> Result<(), KeepMobileError> {
-    let newcomer =
-        PublicKey::from_hex(newcomer_hex).map_err(|_| KeepMobileError::InvalidInput {
-            msg: "Invalid client pubkey hex".into(),
-        })?;
+    let newcomer = newcomer_hex
+        .map(|hex| {
+            PublicKey::from_hex(hex).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "Invalid client pubkey hex".into(),
+            })
+        })
+        .transpose()?;
     with_bunker_config(mobile, |stored| {
-        if let Some(pos) = stored
-            .authorized_clients
-            .iter()
-            .rposition(|client| same_client(client, &newcomer))
-        {
-            stored.authorized_clients.remove(pos);
+        if let Some(newcomer) = &newcomer {
+            if let Some(pos) = stored
+                .authorized_clients
+                .iter()
+                .rposition(|client| same_client(client, newcomer))
+            {
+                stored.authorized_clients.remove(pos);
+            }
         }
         let mut restored = evicted.to_vec();
         restored.append(&mut std::mem::take(&mut stored.authorized_clients));
@@ -1177,26 +1189,39 @@ fn restore_evicted_clients(
 /// whose server is no longer the one being served: a revoke stops that server
 /// and bumps the generation before it drops the client, so the connect that
 /// already passed the secret check cannot write the client back.
+///
+/// The bool is whether this call inserted the client. A client already listed
+/// is not inserted again. When that roster is past the cap, the client is
+/// moved to the newest end before the front is drained, so the trim cannot
+/// drop the client that just connected, and the drained keys are returned for
+/// revoke. A roster within the cap is left in order.
 fn record_authorized_client(
     mobile: &KeepMobile,
     pubkey_hex: &str,
     serving: impl FnOnce() -> bool,
-) -> Result<Vec<String>, KeepMobileError> {
+) -> Result<(Vec<String>, bool), KeepMobileError> {
     let pubkey = PublicKey::from_hex(pubkey_hex).map_err(|_| KeepMobileError::InvalidInput {
         msg: "Invalid client pubkey hex".into(),
     })?;
     with_bunker_config(mobile, |stored| {
         if !serving() || client_pending_revoke(stored, &pubkey) {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         }
-        if stored
+        let added = if let Some(pos) = stored
             .authorized_clients
             .iter()
-            .any(|client| same_client(client, &pubkey))
+            .position(|client| same_client(client, &pubkey))
         {
-            return Ok(Vec::new());
-        }
-        stored.authorized_clients.push(pubkey.to_hex());
+            if stored.authorized_clients.len() <= MAX_AUTHORIZED_CLIENTS {
+                return Ok((Vec::new(), false));
+            }
+            let existing = stored.authorized_clients.remove(pos);
+            stored.authorized_clients.push(existing);
+            false
+        } else {
+            stored.authorized_clients.push(pubkey.to_hex());
+            true
+        };
         let evicted = if stored.authorized_clients.len() > MAX_AUTHORIZED_CLIENTS {
             let keep_from = stored.authorized_clients.len() - MAX_AUTHORIZED_CLIENTS;
             stored.authorized_clients.drain(..keep_from).collect()
@@ -1208,7 +1233,7 @@ fn record_authorized_client(
             crate::BUNKER_CONFIG_STORAGE_KEY,
             stored,
         )?;
-        Ok(evicted)
+        Ok((evicted, added))
     })
 }
 
@@ -3002,6 +3027,62 @@ mod tests {
         );
     }
 
+    // A roster already past the cap is trimmed when someone on it connects
+    // again. That client moves to the newest end first, so the overflow
+    // dropped is not them, and the grants of the dropped clients go with them.
+    // At the cap, a reconnect leaves the order alone.
+    #[test]
+    fn reconnecting_trims_a_roster_past_the_cap() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS + 2)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let reconnecting = oldest[0];
+        let dropped = [oldest[1], oldest[2]];
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[reconnecting, dropped[0], dropped[1], oldest[3]]);
+        let (bridge, _) = noted(&mobile, true);
+        connect_as(
+            &bridge,
+            &reconnecting.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert_eq!(
+            stored.authorized_clients.last(),
+            Some(&reconnecting.to_hex())
+        );
+        for client in &dropped {
+            assert!(!stored
+                .authorized_clients
+                .iter()
+                .any(|listed| listed == &client.to_hex()));
+        }
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|listed| listed == &oldest[3].to_hex()));
+        assert!(bunker_client_authorized(&mobile, &reconnecting).unwrap());
+        let grants = restored_clients(&mobile);
+        assert!(grants.iter().any(|client| client == &reconnecting.to_hex()));
+        assert!(grants.iter().any(|client| client == &oldest[3].to_hex()));
+        for client in &dropped {
+            assert!(!grants.iter().any(|listed| listed == &client.to_hex()));
+            assert!(!bunker_client_authorized(&mobile, client).unwrap());
+        }
+
+        let before = stored.authorized_clients.clone();
+        connect_as(
+            &bridge,
+            &oldest[3].to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert_eq!(stored_config(&storage).authorized_clients, before);
+    }
+
     // While the bunker is running, the in-memory grant — not the roster —
     // decides a remembered kind. Evicting the client has to revoke that grant
     // too, or it keeps signing until the next start.
@@ -3888,10 +3969,16 @@ mod tests {
 
         mobile
             .save_bunker_config(crate::BunkerConfigInfo {
-                enabled: false,
+                enabled: true,
                 authorized_clients: vec!["c".into()],
             })
             .unwrap();
+        let enabled = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("config persisted");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.authorized_clients, vec!["kept".to_string()]);
+
         mobile
             .save_bunker_config(crate::BunkerConfigInfo {
                 enabled: false,
