@@ -620,11 +620,23 @@ impl SignerHandler {
                 // The roster dropped its oldest key, but that key may not have
                 // been connected, so the revoke removed nothing and this
                 // newcomer is one app past the cap. Drop an unlisted app the
-                // fresh listing does not name until the table fits again.
+                // fresh listing does not name until the table fits again. A
+                // re-read that fails uses the listing this connect was admitted
+                // on: it still names every client that must stay, and not the
+                // unlisted app standing in the evicted slot.
                 if one_over {
-                    if let ClientListing::Listed(listed) = cb.client_listing() {
+                    let fresh = cb.client_listing();
+                    let listed = match &fresh {
+                        ClientListing::Listed(listed) => Some(listed),
+                        ClientListing::Unavailable => match &listing {
+                            ClientListing::Listed(listed) => Some(listed),
+                            _ => None,
+                        },
+                        ClientListing::Unrestricted => None,
+                    };
+                    if let Some(listed) = listed {
                         let mut pm = self.permissions.lock().await;
-                        let trimmed = pm.release_unlisted_over_cap(&app_pubkey, &listed);
+                        let trimmed = pm.release_unlisted_over_cap(&app_pubkey, listed);
                         drop(pm);
                         if trimmed {
                             self.persist_permissions().await;
@@ -3160,6 +3172,92 @@ mod tests {
         );
         assert!(pm.get_app(&next).is_some());
         assert!(pm.get_app(&stranger).is_some());
+    }
+
+    /// Same shape as [`OrderedRoster`], but the listing goes unreadable after
+    /// the commit that overflows it. The trim has to use the listing the
+    /// connect already admitted against.
+    struct RosterHiddenAfterOverflow {
+        clients: std::sync::Mutex<Vec<PublicKey>>,
+        hide: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::types::ServerCallbacks for RosterHiddenAfterOverflow {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+            ApprovalResult::rejected()
+        }
+        fn client_listing(&self) -> ClientListing {
+            if self.hide.load(std::sync::atomic::Ordering::Relaxed) {
+                return ClientListing::Unavailable;
+            }
+            ClientListing::Listed(self.clients.lock().unwrap().iter().copied().collect())
+        }
+        fn commit_authorized_client(
+            &self,
+            pubkey: &str,
+            _authorization: ConnectAuthorization,
+        ) -> std::result::Result<(), String> {
+            let parsed = PublicKey::from_hex(pubkey).map_err(|e| e.to_string())?;
+            let mut clients = self.clients.lock().unwrap();
+            if clients.contains(&parsed) {
+                return Ok(());
+            }
+            let overflow = clients.len() >= PermissionManager::MAX_CONNECTED_APPS;
+            clients.push(parsed);
+            if clients.len() > PermissionManager::MAX_CONNECTED_APPS {
+                clients.remove(0);
+            }
+            if overflow {
+                self.hide.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn one_over_connect_trims_when_the_roster_reread_fails() {
+        let oldest: Vec<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let cb = Arc::new(RosterHiddenAfterOverflow {
+            clients: std::sync::Mutex::new(Vec::new()),
+            hide: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_expected_secret("secret".into());
+
+        let filler = Keys::generate().public_key();
+        connect(&handler, filler, "secret").await.unwrap();
+        *cb.clients.lock().unwrap() = oldest.clone();
+        for client in oldest.iter().skip(1) {
+            connect(&handler, *client, "secret").await.unwrap();
+        }
+
+        let stranger = Keys::generate().public_key();
+        assert_eq!(
+            connect(&handler, stranger, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
+        assert!(
+            cb.hide.load(std::sync::atomic::Ordering::Relaxed),
+            "the post-commit listing read must have failed"
+        );
+        let pm = handler.permissions.lock().await;
+        assert_eq!(
+            pm.list_apps().count(),
+            PermissionManager::MAX_CONNECTED_APPS
+        );
+        assert!(pm.get_app(&stranger).is_some());
+        assert!(
+            pm.get_app(&filler).is_none(),
+            "the unlisted app makes the room when the roster cannot be reread"
+        );
     }
 
     struct FailingCommit {
