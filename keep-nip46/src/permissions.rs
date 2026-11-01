@@ -297,7 +297,9 @@ impl PermissionManager {
     /// Counting the listed clients that are not connected yet keeps their
     /// slots free, and a listed client finding the table full displaces the
     /// least recently used app that is not listed. An app already connected
-    /// takes no new slot, so it is admitted again.
+    /// takes no new slot, so it is admitted again. A client who is not listed
+    /// is still admitted when the list itself is already at the cap: the
+    /// consumer drops the oldest listed client to make room.
     pub fn admit_listed(
         &mut self,
         pubkey: &PublicKey,
@@ -316,6 +318,8 @@ impl PermissionManager {
                     .map(|app| app.pubkey);
                 unlisted.is_some_and(|k| self.apps.remove(&k).is_some())
             }
+        } else if listed.len() >= Self::MAX_CONNECTED_APPS {
+            true
         } else {
             self.unlisted_fits(listed) || {
                 self.evict_expired();
@@ -344,7 +348,8 @@ impl PermissionManager {
         if listed.contains(pubkey) {
             self.live().count() < Self::MAX_CONNECTED_APPS || unlisted > 0
         } else {
-            listed.len() + unlisted < Self::MAX_CONNECTED_APPS
+            listed.len() >= Self::MAX_CONNECTED_APPS
+                || listed.len() + unlisted < Self::MAX_CONNECTED_APPS
         }
     }
 
@@ -376,7 +381,35 @@ impl PermissionManager {
         requested: Permission,
         auto_kinds: HashSet<Kind>,
     ) -> bool {
-        if !self.ensure_capacity(&pubkey) {
+        self.connect_app(pubkey, name, requested, auto_kinds, false)
+    }
+
+    /// Inserts one app past [`Self::MAX_CONNECTED_APPS`] when the table is
+    /// already exactly full. The connect path uses this only for a client the
+    /// roster will immediately make room for. [`Self::connect`] and
+    /// [`Self::connect_with_permissions`] stay strictly capped.
+    pub fn connect_one_over_capacity(
+        &mut self,
+        pubkey: PublicKey,
+        name: String,
+        requested: Permission,
+        auto_kinds: HashSet<Kind>,
+    ) -> bool {
+        self.connect_app(pubkey, name, requested, auto_kinds, true)
+    }
+
+    fn connect_app(
+        &mut self,
+        pubkey: PublicKey,
+        name: String,
+        requested: Permission,
+        auto_kinds: HashSet<Kind>,
+        allow_one_extra: bool,
+    ) -> bool {
+        let one_extra = allow_one_extra
+            && self.apps.len() == Self::MAX_CONNECTED_APPS
+            && !self.apps.contains_key(&pubkey);
+        if !self.ensure_capacity(&pubkey) && !one_extra {
             return false;
         }
         match self.apps.entry(pubkey) {
@@ -433,9 +466,34 @@ impl PermissionManager {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
     pub fn is_connected(&self, pubkey: &PublicKey) -> bool {
         self.apps.contains_key(pubkey)
+    }
+
+    /// Drops least-recently-used apps that are neither `keep` nor listed until
+    /// the table is back within [`Self::MAX_CONNECTED_APPS`]. A one-over connect
+    /// uses this when evicting the oldest roster key removed no app, so the
+    /// table cannot stay above the cap and refuse the next newcomer. A listed
+    /// client is never dropped. Returns whether an app was removed.
+    pub(crate) fn release_unlisted_over_cap(
+        &mut self,
+        keep: &PublicKey,
+        listed: &HashSet<PublicKey>,
+    ) -> bool {
+        let before = self.apps.len();
+        while self.apps.len() > Self::MAX_CONNECTED_APPS {
+            let victim = self
+                .apps
+                .values()
+                .filter(|app| &app.pubkey != keep && !listed.contains(&app.pubkey))
+                .min_by_key(|app| app.last_used)
+                .map(|app| app.pubkey);
+            let Some(victim) = victim else {
+                break;
+            };
+            self.apps.remove(&victim);
+        }
+        self.apps.len() < before
     }
 
     /// Decide a request without prompting, or say that prompting is needed.
@@ -1834,14 +1892,15 @@ mod tests {
     }
 
     #[test]
-    fn admit_listed_refuses_an_unlisted_client_at_the_cap() {
+    fn admit_listed_admits_an_unlisted_client_when_the_roster_is_full() {
         let mut pm = PermissionManager::new();
         let listed: HashSet<PublicKey> = keys(PermissionManager::MAX_CONNECTED_APPS)
             .into_iter()
             .collect();
         assert_eq!(
             admit(&mut pm, &Keys::generate().public_key(), &listed),
-            (false, false)
+            (true, false),
+            "a full roster admits the newcomer; the consumer drops the oldest"
         );
         let mut listed = listed;
         let dropped = *listed.iter().next().unwrap();
@@ -1867,6 +1926,71 @@ mod tests {
         assert!(pm.apps.contains_key(&unlisted[1]));
         assert!(pm.connect(client, "App".into()));
         assert_eq!(admit(&mut pm, &client, &listed), (true, false));
+    }
+
+    #[test]
+    fn release_unlisted_over_cap_drops_an_unconnected_oldest_slots_stand_in() {
+        let mut pm = PermissionManager::new();
+        let listed_keys = keys(PermissionManager::MAX_CONNECTED_APPS);
+        let oldest = listed_keys[0];
+        let listed: HashSet<PublicKey> = listed_keys.iter().copied().collect();
+        for pk in listed_keys.iter().skip(1) {
+            assert!(pm.connect(*pk, "App".into()));
+        }
+        let filler = Keys::generate().public_key();
+        assert!(pm.connect(filler, "filler".into()));
+        pm.apps.get_mut(&filler).unwrap().last_used = Timestamp::from(1);
+        assert!(!pm.apps.contains_key(&oldest));
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+
+        let newcomer = Keys::generate().public_key();
+        assert!(pm.connect_one_over_capacity(
+            newcomer,
+            "new".into(),
+            Permission::GET_PUBLIC_KEY,
+            HashSet::new()
+        ));
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS + 1);
+        assert!(pm.release_unlisted_over_cap(&newcomer, &listed));
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+        assert!(pm.apps.contains_key(&newcomer));
+        assert!(!pm.apps.contains_key(&filler));
+        assert!(pm.apps.contains_key(&listed_keys[1]));
+
+        let next = Keys::generate().public_key();
+        assert!(pm.connect_one_over_capacity(
+            next,
+            "next".into(),
+            Permission::GET_PUBLIC_KEY,
+            HashSet::new()
+        ));
+        assert!(pm.release_unlisted_over_cap(&next, &listed));
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS);
+        assert!(pm.apps.contains_key(&next));
+        assert!(pm.apps.contains_key(&listed_keys[1]));
+    }
+
+    #[test]
+    fn release_unlisted_over_cap_does_not_drop_a_listed_client() {
+        let mut pm = PermissionManager::new();
+        let listed_keys = keys(PermissionManager::MAX_CONNECTED_APPS);
+        let listed: HashSet<PublicKey> = listed_keys.iter().copied().collect();
+        for pk in &listed_keys {
+            assert!(pm.connect(*pk, "App".into()));
+        }
+        let newcomer = Keys::generate().public_key();
+        assert!(pm.connect_one_over_capacity(
+            newcomer,
+            "new".into(),
+            Permission::GET_PUBLIC_KEY,
+            HashSet::new()
+        ));
+        assert!(!pm.release_unlisted_over_cap(&newcomer, &listed));
+        assert_eq!(pm.apps.len(), PermissionManager::MAX_CONNECTED_APPS + 1);
+        assert!(pm.apps.contains_key(&newcomer));
+        for pk in &listed_keys {
+            assert!(pm.apps.contains_key(pk));
+        }
     }
 
     #[test]

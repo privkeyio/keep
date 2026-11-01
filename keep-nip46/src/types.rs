@@ -143,14 +143,28 @@ pub enum ConnectAuthorization {
     AutoApproved,
 }
 
+/// `commit_authorized_client` returns this when the consumer refused to record
+/// the client (pending revoke, or not the client that server is serving). The
+/// connect fails and that client's in-memory grant is removed.
+pub const CLIENT_NOT_RECORDED: &str = "the client was not recorded";
+
 /// The clients the consumer lists as connected, which decides who a connect
 /// may admit once the app table is near its cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientListing {
     /// No list is kept: a connect is bounded only by the app table.
     Unrestricted,
-    /// A listed client is always admitted. Any other is admitted only while
-    /// the listed clients and the apps already connected leave a slot free.
+    /// A listed client is always admitted. A client that is not listed is
+    /// admitted while the listed clients and the apps already connected leave
+    /// a slot free, and also when the list itself is already full. The
+    /// consumer then records the newcomer and drops the oldest listed client,
+    /// and that client's grant, so the list returns to its cap.
+    ///
+    /// Returning this obliges the same impl to override
+    /// [`ServerCallbacks::commit_authorized_client`]. The default commit
+    /// records nothing. The engine will not drop a client this listing names
+    /// to make room, so a table whose other apps are all listed stays one past
+    /// its cap, and the next newcomer is refused.
     Listed(HashSet<PublicKey>),
     /// The list could not be read, so no connect is admitted.
     Unavailable,
@@ -161,7 +175,8 @@ pub trait ServerCallbacks: Send + Sync + 'static {
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
     fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
     /// Read on every connect, after its secret or approval is checked and
-    /// before anything is granted. Default: no list.
+    /// before anything is granted. Default: no list. An impl that returns
+    /// [`ClientListing::Listed`] also overrides [`Self::commit_authorized_client`].
     fn client_listing(&self) -> ClientListing {
         ClientListing::Unrestricted
     }
@@ -172,6 +187,27 @@ pub trait ServerCallbacks: Send + Sync + 'static {
     /// this to write the snapshot to its relay-config storage so remembered
     /// grants survive a service restart.
     fn persist_permissions(&self, _grants: Vec<keep_core::relay::StoredBunkerPermission>) {}
+    /// Records an explicit connect on the consumer's roster after the grant is
+    /// installed and before the connect is acknowledged. `Err` fails the
+    /// connect. A grant this connect just installed is removed. An app that was
+    /// already connected keeps its grants, unless the error is
+    /// [`CLIENT_NOT_RECORDED`]: the consumer refused to record the client, and
+    /// its in-memory grant is removed too. Default: nothing to record, which
+    /// is only correct with [`ClientListing::Unrestricted`]. A
+    /// [`ClientListing::Listed`] roster overrides this and records the client,
+    /// dropping the oldest when that roster is full.
+    fn commit_authorized_client(
+        &self,
+        _pubkey: &str,
+        _authorization: ConnectAuthorization,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Whether `pubkey` may call anything other than the secret-checked
+    /// connect. Default: no roster is enforced.
+    fn client_authorized(&self, _pubkey: &PublicKey) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

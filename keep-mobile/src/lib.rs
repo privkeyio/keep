@@ -455,6 +455,9 @@ pub struct ProxyConfigInfo {
     pub port: u16,
 }
 
+/// `authorized_clients` is the engine's roster. [`KeepMobile::save_bunker_config`]
+/// changes `enabled` only; an explicit connect adds to the roster and a revoke
+/// removes from it.
 #[derive(uniffi::Record)]
 pub struct BunkerConfigInfo {
     pub enabled: bool,
@@ -3480,37 +3483,17 @@ impl KeepMobile {
         })
     }
 
+    /// Persists `config.enabled` and nothing else.
+    ///
+    /// `authorized_clients` is not applied. The engine writes that roster when
+    /// a client connects with the secret or an explicit approval, and removes
+    /// from it on revoke. A platform save that passes back the list it read
+    /// earlier — an enable toggle — must not replace clients added since that
+    /// read, and an empty list — an account switch — does not revoke anyone.
+    /// [`crate::nip46::BunkerHandler::revoke_all_clients`] does. Secrets and
+    /// pending revokes are preserved, as before.
     pub fn save_bunker_config(&self, config: BunkerConfigInfo) -> Result<(), KeepMobileError> {
-        // A listed client is always admitted only while the list fits the
-        // engine's app table.
-        if config.authorized_clients.len() > keep_nip46::PermissionManager::MAX_CONNECTED_APPS {
-            return Err(KeepMobileError::TooManyAuthorizedClients {
-                max: keep_nip46::PermissionManager::MAX_CONNECTED_APPS as u32,
-            });
-        }
-        // Preserve the persisted transport key + connect secret so toggling the
-        // bunker off/on (or any other config save) does not rotate the bunker://
-        // URL out from under already-paired clients. The whole read-modify-write
-        // runs under bunker_config_lock so a save that loaded a stale snapshot
-        // (transport_secret: None) cannot clobber keys freshly generated and
-        // persisted by a concurrent load_or_create_bunker_keys.
-        let _guard = self
-            .bunker_config_lock
-            .lock()
-            .map_err(|_| KeepMobileError::StorageError {
-                msg: "bunker config lock poisoned".into(),
-            })?;
-        let existing = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?
-            .unwrap_or_default();
-        let stored = persistence::StoredBunkerConfig {
-            enabled: config.enabled,
-            authorized_clients: config.authorized_clients,
-            transport_secret: existing.transport_secret,
-            connect_secret: existing.connect_secret,
-            pending_revokes: existing.pending_revokes,
-            pending_revoke_all: existing.pending_revoke_all,
-        };
-        persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
+        nip46::set_bunker_enabled(self, config.enabled)
     }
 
     pub fn create_backup(&self, passphrase: String) -> Result<Vec<u8>, KeepMobileError> {
