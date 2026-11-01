@@ -488,7 +488,7 @@ impl ServerCallbacks for CallbackBridge {
             matches!(bunker_client_authorized(&self.mobile, &parsed), Ok(true))
         });
         if !authorized {
-            return Err("the client was not recorded".into());
+            return Err(keep_nip46::types::CLIENT_NOT_RECORDED.into());
         }
         if evicted.is_empty() {
             return Ok(());

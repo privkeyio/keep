@@ -24,7 +24,8 @@ use crate::permissions::{
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::types::{
     ApprovalRequest, ApprovalResult, ClientListing, ConnectAuthorization, HttpAuthDetails,
-    RememberDuration, ServerCallbacks, NIP98_HTTP_AUTH, NIP98_MAX_REMEMBER_SECS,
+    RememberDuration, ServerCallbacks, CLIENT_NOT_RECORDED, NIP98_HTTP_AUTH,
+    NIP98_MAX_REMEMBER_SECS,
 };
 
 /// Max displayed length of a NIP-98 `u`/`method` value. A kilobyte-scale tag
@@ -559,12 +560,21 @@ impl SignerHandler {
             );
             return Err(e);
         }
-        let one_over = matches!(
-            &listing,
-            ClientListing::Listed(listed)
-                if listed.len() >= PermissionManager::MAX_CONNECTED_APPS
-                    && !listed.contains(&app_pubkey)
+        // Only an explicit connect is recorded, and only that connect may take
+        // the one extra slot: the roster write is what drops the oldest client.
+        // AutoApproved skips that write, so it stays inside the strict cap.
+        let explicit = matches!(
+            authorization,
+            ConnectAuthorization::SecretMatched | ConnectAuthorization::UserApproved
         );
+        let already_connected = pm.is_connected(&app_pubkey);
+        let one_over = explicit
+            && matches!(
+                &listing,
+                ClientListing::Listed(listed)
+                    if listed.len() >= PermissionManager::MAX_CONNECTED_APPS
+                        && !listed.contains(&app_pubkey)
+            );
         let connected = if one_over {
             pm.connect_one_over_capacity(app_pubkey, name.clone(), requested_perms, auto_kinds)
         } else {
@@ -585,16 +595,19 @@ impl SignerHandler {
         if dropped {
             self.persist_permissions().await;
         }
-        if matches!(
-            authorization,
-            ConnectAuthorization::SecretMatched | ConnectAuthorization::UserApproved
-        ) {
+        if explicit {
             if let Some(cb) = &self.callbacks {
                 if let Err(reason) =
                     cb.commit_authorized_client(&app_pubkey.to_hex(), authorization)
                 {
-                    self.permissions.lock().await.revoke(&app_pubkey);
-                    self.persist_permissions().await;
+                    // The grant installed by this connect must not survive a
+                    // roster write that failed. An app that was already
+                    // connected keeps its grants, unless the consumer refused
+                    // to record it at all.
+                    if !already_connected || reason == CLIENT_NOT_RECORDED {
+                        self.permissions.lock().await.revoke(&app_pubkey);
+                        self.persist_permissions().await;
+                    }
                     self.audit.lock().await.log(
                         AuditEntry::new(AuditAction::Connect, app_pubkey)
                             .with_success(false)
@@ -603,6 +616,20 @@ impl SignerHandler {
                     return Err(KeepError::PermissionDenied(
                         "the authorized client list was not updated".into(),
                     ));
+                }
+                // The roster dropped its oldest key, but that key may not have
+                // been connected, so the revoke removed nothing and this
+                // newcomer is one app past the cap. Drop an unlisted app the
+                // fresh listing does not name until the table fits again.
+                if one_over {
+                    if let ClientListing::Listed(listed) = cb.client_listing() {
+                        let mut pm = self.permissions.lock().await;
+                        let trimmed = pm.release_unlisted_over_cap(&app_pubkey, &listed);
+                        drop(pm);
+                        if trimmed {
+                            self.persist_permissions().await;
+                        }
+                    }
                 }
             }
         }
@@ -3009,6 +3036,228 @@ mod tests {
             .await
             .get_app(&stranger)
             .is_some());
+    }
+
+    /// Oldest-first roster. Recording a new key drops the front of the list and
+    /// does not touch the app table: that is the consumer the engine has to
+    /// reconcile with when the dropped key was not connected.
+    struct OrderedRoster {
+        clients: std::sync::Mutex<Vec<PublicKey>>,
+    }
+
+    impl crate::types::ServerCallbacks for OrderedRoster {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+            ApprovalResult::rejected()
+        }
+        fn client_listing(&self) -> ClientListing {
+            ClientListing::Listed(self.clients.lock().unwrap().iter().copied().collect())
+        }
+        fn commit_authorized_client(
+            &self,
+            pubkey: &str,
+            _authorization: ConnectAuthorization,
+        ) -> std::result::Result<(), String> {
+            let parsed = PublicKey::from_hex(pubkey).map_err(|e| e.to_string())?;
+            let mut clients = self.clients.lock().unwrap();
+            if clients.contains(&parsed) {
+                return Ok(());
+            }
+            clients.push(parsed);
+            if clients.len() > PermissionManager::MAX_CONNECTED_APPS {
+                clients.remove(0);
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn one_over_connect_returns_to_the_cap_when_the_oldest_is_not_connected() {
+        let oldest: Vec<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let not_connected = oldest[0];
+        let kept = oldest[1];
+        let cb = Arc::new(OrderedRoster {
+            clients: std::sync::Mutex::new(Vec::new()),
+        });
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_expected_secret("secret".into());
+
+        let filler = Keys::generate().public_key();
+        connect(&handler, filler, "secret").await.unwrap();
+        *cb.clients.lock().unwrap() = oldest.clone();
+        for client in oldest.iter().skip(1) {
+            connect(&handler, *client, "secret").await.unwrap();
+        }
+        assert_eq!(
+            handler.permissions.lock().await.list_apps().count(),
+            PermissionManager::MAX_CONNECTED_APPS
+        );
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .get_app(&not_connected)
+            .is_none());
+
+        let stranger = Keys::generate().public_key();
+        assert_eq!(
+            connect(&handler, stranger, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
+        {
+            let pm = handler.permissions.lock().await;
+            assert_eq!(
+                pm.list_apps().count(),
+                PermissionManager::MAX_CONNECTED_APPS
+            );
+            assert!(pm.get_app(&stranger).is_some());
+            assert!(
+                pm.get_app(&filler).is_none(),
+                "the unlisted app makes the room"
+            );
+            assert!(pm.get_app(&kept).is_some());
+            assert!(pm.get_app(&not_connected).is_none());
+        }
+
+        let next = Keys::generate().public_key();
+        assert_eq!(
+            connect(&handler, next, "secret").await.unwrap(),
+            ConnectAuthorization::SecretMatched
+        );
+        let pm = handler.permissions.lock().await;
+        assert_eq!(
+            pm.list_apps().count(),
+            PermissionManager::MAX_CONNECTED_APPS
+        );
+        assert!(pm.get_app(&next).is_some());
+        assert!(pm.get_app(&stranger).is_some());
+    }
+
+    struct FailingCommit {
+        error: std::sync::Mutex<Option<String>>,
+    }
+
+    impl crate::types::ServerCallbacks for FailingCommit {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, _request: ApprovalRequest) -> ApprovalResult {
+            ApprovalResult::rejected()
+        }
+        fn commit_authorized_client(
+            &self,
+            _pubkey: &str,
+            _authorization: ConnectAuthorization,
+        ) -> std::result::Result<(), String> {
+            match self.error.lock().unwrap().clone() {
+                Some(reason) => Err(reason),
+                None => Ok(()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_roster_write_keeps_an_existing_grant_and_drops_a_new_one() {
+        let cb = Arc::new(FailingCommit {
+            error: std::sync::Mutex::new(None),
+        });
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_expected_secret("secret".into());
+
+        let app = Keys::generate().public_key();
+        connect(&handler, app, "secret").await.unwrap();
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .has_permission(&app, Permission::GET_PUBLIC_KEY));
+
+        *cb.error.lock().unwrap() = Some("disk full".into());
+        assert!(matches!(
+            connect(&handler, app, "secret").await,
+            Err(KeepError::PermissionDenied(msg))
+                if msg == "the authorized client list was not updated"
+        ));
+        assert!(
+            handler
+                .permissions
+                .lock()
+                .await
+                .has_permission(&app, Permission::GET_PUBLIC_KEY),
+            "a failed rewrite must not drop grants the app already had"
+        );
+
+        *cb.error.lock().unwrap() = Some(CLIENT_NOT_RECORDED.into());
+        assert!(matches!(
+            connect(&handler, app, "secret").await,
+            Err(KeepError::PermissionDenied(_))
+        ));
+        assert!(handler.permissions.lock().await.get_app(&app).is_none());
+
+        let stranger = Keys::generate().public_key();
+        *cb.error.lock().unwrap() = Some("disk full".into());
+        assert!(matches!(
+            connect(&handler, stranger, "secret").await,
+            Err(KeepError::PermissionDenied(_))
+        ));
+        assert!(handler
+            .permissions
+            .lock()
+            .await
+            .get_app(&stranger)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_auto_approved_connect_does_not_pass_the_app_cap() {
+        let listed: HashSet<PublicKey> = (0..PermissionManager::MAX_CONNECTED_APPS)
+            .map(|_| Keys::generate().public_key())
+            .collect();
+        let cb = Arc::new(ListingCallbacks {
+            listing: std::sync::Mutex::new(ClientListing::Listed(listed)),
+            snapshots: std::sync::Mutex::new(Vec::new()),
+        });
+        // No connect secret: this is AutoApproved, which is not recorded and
+        // must not take the one-over slot.
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb),
+        )
+        .with_auto_approve(true);
+
+        for _ in 0..PermissionManager::MAX_CONNECTED_APPS {
+            let app = Keys::generate().public_key();
+            assert_eq!(
+                handler.handle_connect(app, None, None, None).await.unwrap(),
+                ConnectAuthorization::AutoApproved
+            );
+        }
+        assert_eq!(
+            handler.permissions.lock().await.list_apps().count(),
+            PermissionManager::MAX_CONNECTED_APPS
+        );
+        let extra = Keys::generate().public_key();
+        assert!(matches!(
+            handler.handle_connect(extra, None, None, None).await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert!(handler.permissions.lock().await.get_app(&extra).is_none());
+        assert_eq!(
+            handler.permissions.lock().await.list_apps().count(),
+            PermissionManager::MAX_CONNECTED_APPS
+        );
     }
 
     #[tokio::test]

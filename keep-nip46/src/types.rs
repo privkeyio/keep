@@ -143,6 +143,11 @@ pub enum ConnectAuthorization {
     AutoApproved,
 }
 
+/// `commit_authorized_client` returns this when the consumer refused to record
+/// the client (pending revoke, or not the client that server is serving). The
+/// connect fails and that client's in-memory grant is removed.
+pub const CLIENT_NOT_RECORDED: &str = "the client was not recorded";
+
 /// The clients the consumer lists as connected, which decides who a connect
 /// may admit once the app table is near its cap.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -177,7 +182,10 @@ pub trait ServerCallbacks: Send + Sync + 'static {
     fn persist_permissions(&self, _grants: Vec<keep_core::relay::StoredBunkerPermission>) {}
     /// Records an explicit connect on the consumer's roster after the grant is
     /// installed and before the connect is acknowledged. `Err` fails the
-    /// connect. Default: nothing to record.
+    /// connect. A grant this connect just installed is removed. An app that was
+    /// already connected keeps its grants, unless the error is
+    /// [`CLIENT_NOT_RECORDED`]: the consumer refused to record the client, and
+    /// its in-memory grant is removed too. Default: nothing to record.
     fn commit_authorized_client(
         &self,
         _pubkey: &str,
