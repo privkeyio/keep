@@ -25,12 +25,50 @@ pub struct SignRequest {
     pub metadata: Option<SignRequestMetadata>,
 }
 
+/// What a request signs, read from the structured body the responder has
+/// already matched against the signed bytes. Every field is absent when the
+/// request carries no such body.
 #[derive(uniffi::Record, Clone, Debug)]
 pub struct SignRequestMetadata {
+    /// The kind of a Nostr event.
     pub event_kind: Option<u32>,
+    /// The start of a Nostr event's content, sanitized for display.
     pub content_preview: Option<String>,
+    /// Not filled for a co-sign request: a spend is described by `spend`,
+    /// which carries the fee a single amount would leave out.
     pub amount_sats: Option<u64>,
+    /// Not filled for a co-sign request, for the same reason.
     pub destination: Option<String>,
+    /// Every output of a Bitcoin spend and its fee, when the signature commits
+    /// to all of them. A prompt must show the fee with the outputs: a spend
+    /// paying a small amount can leave the rest of a large input to miners.
+    #[uniffi(default = None)]
+    pub spend: Option<SpendSummary>,
+}
+
+/// A Bitcoin spend whose signature commits to every output and every input's
+/// amount, so each number here is what the signature authorizes. No output is
+/// labeled as change: which ones return to the group is not established here.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct SpendSummary {
+    /// Every output of the transaction, in order.
+    pub outputs: Vec<SpendOutput>,
+    /// Everything the inputs supply, the outputs plus the fee.
+    pub consumed_sats: u64,
+    /// What is left for miners.
+    pub fee_sats: u64,
+}
+
+/// One output of a Bitcoin spend.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct SpendOutput {
+    pub amount_sats: u64,
+    /// The output as an address on the account's network. Absent when the
+    /// account has no wallet descriptor naming its network, or when the script
+    /// has no address form.
+    pub address: Option<String>,
+    /// The output script in hex.
+    pub script_hex: String,
 }
 
 #[derive(uniffi::Record, Clone, Debug)]

@@ -86,6 +86,19 @@ dictionary SignRequestMetadata {
     string? content_preview;
     u64? amount_sats;
     string? destination;
+    SpendSummary? spend = null;
+};
+
+dictionary SpendSummary {
+    sequence<SpendOutput> outputs;
+    u64 consumed_sats;
+    u64 fee_sats;
+};
+
+dictionary SpendOutput {
+    u64 amount_sats;
+    string? address;
+    string script_hex;
 };
 
 dictionary PsbtInfo {
