@@ -802,10 +802,11 @@ fn silence_alerts_once_until_an_anchor_arrives() {
     let phone = paired();
     let t = now();
     phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
+    let seen = now();
     assert!(alerts(&phone.handler.tick_at(t + 60).events).is_empty());
-    let fx = phone.handler.tick_at(t + SILENCE_SECS);
+    let fx = phone.handler.tick_at(seen + SILENCE_SECS);
     assert_eq!(alerts(&fx.events), vec![SILENT_ALERT]);
-    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 15).events).is_empty());
+    assert!(alerts(&phone.handler.tick_at(seen + SILENCE_SECS + 15).events).is_empty());
     assert!(phone
         .handler
         .status()
@@ -814,11 +815,11 @@ fn silence_alerts_once_until_an_anchor_arrives() {
         .any(|a| a.message == SILENT_ALERT));
     // Restarted while still silent: not raised again.
     let phone = phone.reopen();
-    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 30).events).is_empty());
+    assert!(alerts(&phone.handler.tick_at(seen + SILENCE_SECS + 30).events).is_empty());
     let seq = phone.handler.status().alerts[0].seq;
     phone.handler.acknowledge_alerts(seq).unwrap();
     let phone = phone.reopen();
-    assert!(alerts(&phone.handler.tick_at(t + SILENCE_SECS + 45).events).is_empty());
+    assert!(alerts(&phone.handler.tick_at(seen + SILENCE_SECS + 45).events).is_empty());
     // An anchor ends the silence; the next one alerts again.
     phone.take(kind::ANCHOR, &anchor_text(t + 1, 101, 3, false));
     let later = now() + SILENCE_SECS;
