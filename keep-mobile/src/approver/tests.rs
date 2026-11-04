@@ -776,6 +776,7 @@ fn a_freeze_is_resent_until_shown_and_alerts_once_when_it_is_not() {
     phone.take(kind::ANCHOR, &anchor_text(t, 100, 3, false));
     // Not running: not sent now, but kept to resend.
     assert!(phone.handler.freeze(None).is_err());
+    let sent = now();
     assert_eq!(phone.stored(|s| s.counter), 1);
     let fx = phone.handler.tick_at(t + 15);
     assert_eq!(fx.send.len(), 1);
@@ -786,11 +787,11 @@ fn a_freeze_is_resent_until_shown_and_alerts_once_when_it_is_not() {
     assert_eq!(freeze.scope, Scope::All);
     assert_eq!((freeze.counter, freeze.epoch), (2, 3));
     assert!(alerts(&fx.events).is_empty());
-    let fx = phone.handler.tick_at(t + FREEZE_SHOWN_SECS);
+    let fx = phone.handler.tick_at(sent + FREEZE_SHOWN_SECS);
     let shown = alerts(&fx.events);
     assert_eq!(shown.len(), 1);
     assert!(shown[0].contains("has not shown at the gateway"));
-    assert!(alerts(&phone.handler.tick_at(t + FREEZE_SHOWN_SECS + 15).events).is_empty());
+    assert!(alerts(&phone.handler.tick_at(sent + FREEZE_SHOWN_SECS + 15).events).is_empty());
     // An anchor showing it ends the resends.
     phone.take(kind::ANCHOR, &anchor_text(t + 1, 101, 4, true));
     assert!(phone.handler.tick_at(t + 200).send.is_empty());
