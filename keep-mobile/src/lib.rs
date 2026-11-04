@@ -8640,6 +8640,164 @@ mod sign_request_mapping_tests {
 }
 
 #[cfg(test)]
+mod cosign_prompt_e2e_tests {
+    //! A co-signer running the phone's own hooks, asked over the network by a
+    //! requester holding the other share. The prompt is built the way the
+    //! event loop builds it, from the session the hooks hand over.
+    use super::*;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use keep_frost_net::test_support::{key_spend_payload, MemoryBus};
+    use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Pair {
+        group_pubkey: [u8; 32],
+        requester: Arc<KfpNode>,
+        prompts: mpsc::Receiver<SignRequest>,
+        _shutdown: Vec<Option<mpsc::Sender<()>>>,
+    }
+
+    /// A 2-of-2 group: share 1 is the phone, answering every prompt with
+    /// `answer`; share 2 requests.
+    async fn pair(answer: bool) -> Pair {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 2).unwrap());
+        let (shares, _) = dealer.generate("cosign-prompt-e2e").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let bus = MemoryBus::new();
+        let mut nodes: Vec<KfpNode> = shares
+            .into_iter()
+            .map(|share| {
+                KfpNode::with_transport(
+                    share,
+                    bus.transport() as Arc<dyn CosignTransport>,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        nodes[0].set_hooks(Arc::new(MobileSigningHooks {
+            request_tx,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::new(
+                super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off(),
+            ),
+        }));
+        let (prompt_tx, prompts) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some((session, response_tx)) = request_rx.recv().await {
+                let _ = prompt_tx
+                    .send(sign_request_from_session(
+                        &session,
+                        Some(bitcoin::Network::Bitcoin),
+                    ))
+                    .await;
+                let _ = response_tx.send(answer).await;
+            }
+        });
+        let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
+        let shutdown = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+        let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+        for node in &nodes {
+            let node = Arc::clone(node);
+            tokio::spawn(async move {
+                let _ = node.run().await;
+            });
+        }
+        // Both ways: a phone that has not admitted the requester drops its
+        // request unanswered, which would read as a refusal.
+        for rx in &mut seen {
+            timeout(Duration::from_secs(30), async {
+                while !matches!(rx.recv().await, Ok(KfpNodeEvent::PeerDiscovered { .. })) {}
+            })
+            .await
+            .expect("the phone and the requester must discover each other");
+        }
+        Pair {
+            group_pubkey,
+            requester: Arc::clone(&nodes[1]),
+            prompts,
+            _shutdown: shutdown,
+        }
+    }
+
+    async fn ask(pair: &Pair, sighash_type: u8) -> ([u8; 32], keep_frost_net::Result<[u8; 64]>) {
+        let spent = bitcoin::ScriptBuf::new_op_return([1u8; 4]);
+        let (sighash, payload) = key_spend_payload(&spent, sighash_type);
+        let result = timeout(
+            Duration::from_secs(30),
+            pair.requester.request_signature_structured(
+                sighash.to_vec(),
+                keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH,
+                Some(payload),
+            ),
+        )
+        .await
+        .expect("the request must finish");
+        (sighash, result)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_phone_is_shown_the_spend_it_signs() {
+        let mut pair = pair(true).await;
+        let (sighash, result) = ask(&pair, 0x00).await;
+        let signature = result.expect("an approved spend is signed");
+        use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+        Secp256k1::verification_only()
+            .verify_schnorr(
+                &Signature::from_slice(&signature).unwrap(),
+                &Message::from_digest(sighash),
+                &XOnlyPublicKey::from_slice(&pair.group_pubkey).unwrap(),
+            )
+            .expect("the signature verifies under the group key");
+
+        let prompt = pair.prompts.try_recv().expect("the phone was asked");
+        assert!(pair.prompts.try_recv().is_err(), "asked once");
+        assert_eq!(
+            prompt.message_type,
+            keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
+        );
+        assert!(prompt.type_verified);
+        let metadata = prompt.metadata.expect("described");
+        assert_eq!((metadata.amount_sats, metadata.destination), (None, None));
+        let spend = metadata.spend.expect("the spend is shown");
+        assert_eq!((spend.consumed_sats, spend.fee_sats), (100_000, 1_000));
+        assert_eq!(spend.outputs.len(), 1);
+        assert_eq!(spend.outputs[0].amount_sats, 99_000);
+        assert_eq!(spend.outputs[0].script_hex, "6a0400000000");
+        assert_eq!(
+            spend.outputs[0].address, None,
+            "an OP_RETURN has no address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spend_declined_at_the_prompt_is_not_signed() {
+        let mut pair = pair(false).await;
+        let (_, result) = ask(&pair, 0x00).await;
+        let err = result.expect_err("declined, so no signature").to_string();
+        assert!(err.contains("Request rejected"), "{err}");
+        assert!(pair.prompts.try_recv().is_ok(), "the phone was asked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spend_the_prompt_cannot_describe_never_reaches_it() {
+        let mut pair = pair(true).await;
+        let (_, result) = ask(&pair, 0x03).await;
+        let err = result.expect_err("refused, so no signature").to_string();
+        assert!(err.contains("cannot describe"), "{err}");
+        assert!(
+            pair.prompts.try_recv().is_err(),
+            "the phone was never asked"
+        );
+    }
+}
+
+#[cfg(test)]
 mod baseline_presign_policy_tests {
     use super::*;
     use std::collections::HashMap;
@@ -8648,12 +8806,12 @@ mod baseline_presign_policy_tests {
     /// Storage whose only job is to answer the kill-switch read. Seeded
     /// directly rather than through `store_share_by_key`, which requires share
     /// metadata that has nothing to do with a boolean.
-    struct KillSwitchOffStorage {
+    pub(super) struct KillSwitchOffStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
     }
 
     impl KillSwitchOffStorage {
-        fn with_switch_off() -> Self {
+        pub(super) fn with_switch_off() -> Self {
             let mut data = HashMap::new();
             data.insert(
                 KILL_SWITCH_STORAGE_KEY.to_string(),
