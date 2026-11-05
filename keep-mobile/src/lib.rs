@@ -698,7 +698,11 @@ impl SigningHooks for MobileSigningHooks {
             }
         }
 
-        if self.consume_pre_approval(&session.message) {
+        // A pre-approval is a bare hash with no spend behind it, so it never
+        // stands in for the prompt on a request that moves funds.
+        let moves_funds = session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
+            || session.taproot_tweak.is_some();
+        if !moves_funds && self.consume_pre_approval(&session.message) {
             return Ok(());
         }
 
@@ -760,6 +764,17 @@ impl SigningHooks for MobileSigningHooks {
     }
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+
+    /// Approves only a spend whose prompt carries every output and the fee in
+    /// `SignRequest.metadata.spend`, and leaves the decision to that prompt in
+    /// `pre_sign`. A client must render that summary before it ships this.
+    fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
+        session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
+            && session
+                .structured_payload
+                .as_deref()
+                .is_some_and(|p| keep_frost_net::CommittedSpend::from_payload(p).is_ok())
+    }
 }
 
 /// Identity of the single in-flight `frost_run_dkg`: its run id and the cancel
@@ -1339,6 +1354,8 @@ impl KeepMobile {
         self.do_import_nsec(&hex_key, name, Some(mnemonic_bytes))
     }
 
+    /// Let the next co-sign request for `message` skip the prompt. A Bitcoin
+    /// request is always prompted, pre-approved or not.
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
         use sha2::{Digest, Sha256};
         let hash: [u8; 32] = Sha256::digest(&message).into();
@@ -8665,6 +8682,7 @@ mod cosign_prompt_e2e_tests {
         group_pubkey: [u8; 32],
         requester: Arc<KfpNode>,
         prompts: mpsc::Receiver<SignRequest>,
+        pre_approved: PreApprovedHashes,
         _shutdown: Vec<Option<mpsc::Sender<()>>>,
     }
 
@@ -8706,9 +8724,10 @@ mod cosign_prompt_e2e_tests {
         )
         .unwrap();
         let (request_tx, mut request_rx) = mpsc::channel(4);
+        let pre_approved: PreApprovedHashes = Arc::new(StdMutex::new(HashMap::new()));
         nodes[0].set_hooks(Arc::new(MobileSigningHooks {
             request_tx,
-            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            pre_approved_hashes: Arc::clone(&pre_approved),
             storage: Arc::clone(&storage),
         }));
         // What the event loop does with each request the hooks hand over:
@@ -8744,6 +8763,7 @@ mod cosign_prompt_e2e_tests {
             group_pubkey,
             requester: Arc::clone(&nodes[1]),
             prompts,
+            pre_approved,
             _shutdown: shutdown,
         }
     }
@@ -8773,6 +8793,119 @@ mod cosign_prompt_e2e_tests {
         .await
         .expect("the request must finish");
         (sighash, result)
+    }
+
+    /// Records `sighash` the way `set_signing_pre_approved` does.
+    fn pre_approve(pair: &Pair, sighash: &[u8; 32]) {
+        use sha2::{Digest, Sha256};
+        let hash: [u8; 32] = Sha256::digest(sighash).into();
+        pair.pre_approved
+            .lock()
+            .unwrap()
+            .insert(hash, std::time::Instant::now());
+    }
+
+    /// The group's BIP-86 output, spent on the key path.
+    fn group_output(pair: &Pair) -> bitcoin::ScriptBuf {
+        keep_core::frost::taproot::TaprootTweak::default()
+            .script_pubkey(&pair.group_pubkey)
+            .unwrap()
+    }
+
+    fn key_path_payload(pair: &Pair, sighash_type: u8) -> ([u8; 32], Vec<u8>) {
+        key_spend_payload_paying(&group_output(pair), sighash_type, 0, pays())
+    }
+
+    async fn ask_key_path(
+        pair: &Pair,
+        (sighash, payload): ([u8; 32], Vec<u8>),
+    ) -> keep_frost_net::Result<[u8; 64]> {
+        timeout(
+            Duration::from_secs(30),
+            pair.requester.request_key_path_spend(
+                sighash.to_vec(),
+                payload,
+                vec![],
+                Default::default(),
+            ),
+        )
+        .await
+        .expect("the request must finish")
+    }
+
+    fn assert_shows_the_spend(prompt: SignRequest) {
+        assert_eq!(
+            prompt.message_type,
+            keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
+        );
+        assert!(prompt.type_verified);
+        let spend = prompt
+            .metadata
+            .and_then(|m| m.spend)
+            .expect("the spend is shown");
+        assert_eq!((spend.consumed_sats, spend.fee_sats), (100_000, 1_000));
+        assert_eq!(spend.outputs.len(), 1);
+        assert_eq!(spend.outputs[0].amount_sats, 99_000);
+        assert_eq!(
+            spend.outputs[0].script_hex,
+            pays().script_pubkey.to_hex_string()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_phone_signs_a_key_path_spend_it_is_shown() {
+        let mut pair = pair(true).await;
+        for sighash_type in [0x00, 0x01] {
+            let (sighash, payload) = key_path_payload(&pair, sighash_type);
+            let signature = ask_key_path(&pair, (sighash, payload))
+                .await
+                .expect("an approved key-path spend is signed");
+            keep_core::frost::taproot::verify_key_path_signature(
+                &signature,
+                &sighash,
+                &group_output(&pair),
+            )
+            .expect("the signature verifies under the output key it spends");
+            assert_shows_the_spend(pair.prompts.try_recv().expect("the phone was asked"));
+            assert!(pair.prompts.try_recv().is_err(), "asked once");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_path_spend_declined_at_the_prompt_is_not_signed() {
+        let mut pair = pair(false).await;
+        let err = ask_key_path(&pair, key_path_payload(&pair, 0x00))
+            .await
+            .expect_err("declined, so no signature")
+            .to_string();
+        assert!(err.contains("Request rejected"), "{err}");
+        assert_shows_the_spend(pair.prompts.try_recv().expect("the phone was asked"));
+    }
+
+    /// A pre-approval is a bare hash, so a spend still goes to the prompt, and
+    /// the pre-approval is left unspent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pre_approval_does_not_skip_the_prompt_for_a_spend() {
+        let mut pair = pair(false).await;
+
+        let (sighash, payload) = key_path_payload(&pair, 0x00);
+        pre_approve(&pair, &sighash);
+        let err = ask_key_path(&pair, (sighash, payload))
+            .await
+            .expect_err("declined at the prompt despite the pre-approval")
+            .to_string();
+        assert!(err.contains("Request rejected"), "{err}");
+        assert!(pair.prompts.try_recv().is_ok(), "the phone was asked");
+
+        let spent = bitcoin::ScriptBuf::new_op_return([1u8; 4]);
+        let (sighash, _) = key_spend_payload_paying(&spent, 0x00, 0, pays());
+        pre_approve(&pair, &sighash);
+        let (_, result) = ask(&pair, 0x00).await;
+        let err = result.expect_err("declined at the prompt").to_string();
+        assert!(err.contains("Request rejected"), "{err}");
+        assert!(pair.prompts.try_recv().is_ok(), "the phone was asked");
+
+        assert_eq!(pair.pre_approved.lock().unwrap().len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -9020,13 +9153,44 @@ mod baseline_presign_policy_tests {
             );
         }
         approve();
-        hooks
+        let err = hooks
             .pre_sign(&with_payload(spend_payload(
                 &[(1_000, p2wsh(2))],
                 &[2_000],
                 0x00,
             )))
-            .expect("a describable spend reaches the pre-approval");
+            .expect_err("a describable spend goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+        assert_eq!(
+            pre_approved.lock().unwrap().len(),
+            1,
+            "a spend never consumes a pre-approval"
+        );
+    }
+
+    #[test]
+    fn only_a_key_path_spend_the_prompt_can_show_is_approved_for_it() {
+        use super::sign_request_mapping_tests::{p2wsh, spend_payload};
+        let hooks = MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+        };
+        let session = |message_type: &str, payload: Option<Vec<u8>>| SessionInfo {
+            structured_payload: payload,
+            taproot_tweak: Some(Default::default()),
+            ..session_with(message_type, vec![7u8; 32])
+        };
+        let shown = || Some(spend_payload(&[(1_000, p2wsh(2))], &[2_000], 0x00));
+        assert!(hooks.approve_key_path_spend(&session("bitcoin-sighash", shown())));
+        assert!(!hooks.approve_key_path_spend(&session("bitcoin-sighash", None)));
+        assert!(!hooks.approve_key_path_spend(&session("nostr-event", shown())));
+        for flag in [0x03, 0x81] {
+            assert!(!hooks.approve_key_path_spend(&session(
+                "bitcoin-sighash",
+                Some(spend_payload(&[(1_000, p2wsh(2))], &[2_000], flag)),
+            )));
+        }
     }
 
     /// The gap a denylist leaves. An empty label is not "raw", so the string
@@ -9121,10 +9285,7 @@ mod baseline_presign_policy_tests {
         };
 
         hooks
-            .pre_sign(&session_with(
-                keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH,
-                message,
-            ))
+            .pre_sign(&session_with(keep_frost_net::MSG_TYPE_NOSTR_EVENT, message))
             .expect("a pre-approved request with an ordinary label must still pass");
     }
 }
