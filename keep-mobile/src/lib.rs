@@ -9169,6 +9169,33 @@ mod baseline_presign_policy_tests {
     }
 
     #[test]
+    fn a_pre_approval_does_not_skip_the_prompt_for_a_tweaked_request() {
+        let message = vec![7u8; 32];
+        let pre_approved: PreApprovedHashes = Arc::new(StdMutex::new(HashMap::new()));
+        {
+            use sha2::{Digest, Sha256};
+            let hash: [u8; 32] = Sha256::digest(&message).into();
+            pre_approved
+                .lock()
+                .unwrap()
+                .insert(hash, std::time::Instant::now());
+        }
+        let hooks = MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: Arc::clone(&pre_approved),
+            storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+        };
+        let err = hooks
+            .pre_sign(&SessionInfo {
+                taproot_tweak: Some(Default::default()),
+                ..session_with(keep_frost_net::MSG_TYPE_NOSTR_EVENT, message)
+            })
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+        assert_eq!(pre_approved.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn only_a_key_path_spend_the_prompt_can_show_is_approved_for_it() {
         use super::sign_request_mapping_tests::{p2wsh, spend_payload};
         let hooks = MobileSigningHooks {
