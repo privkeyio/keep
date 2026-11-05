@@ -151,76 +151,22 @@ impl KeySpendPolicy {
         let payload = structured_payload.ok_or_else(|| {
             "a key-path spend without its PSBT payload cannot be checked".to_owned()
         })?;
-        let payload: BitcoinSighashPayload = serde_json::from_slice(payload)
-            .map_err(|e| format!("bitcoin-sighash payload decode failed: {e}"))?;
-        let psbt = bitcoin::Psbt::deserialize(&payload.psbt)
-            .map_err(|e| format!("bitcoin-sighash payload PSBT decode failed: {e}"))?;
-
-        // Everything below reads the outputs and the prevouts as authentic
-        // because the digest commits to all of them, which holds only for these
-        // two flags: ANYONECANPAY binds one input's amount, SINGLE and NONE
-        // bind no outputs or only one. `verify_taproot_key_spend` already
-        // refuses anything else ahead of this on the request path; repeated
-        // here so this public method is sound wherever it is called from.
-        if !matches!(payload.sighash_type, 0x00 | 0x01) {
-            return Err(format!(
-                "a key-path spend must use SIGHASH_DEFAULT or SIGHASH_ALL, not {:#x}",
-                payload.sighash_type
-            ));
-        }
-
-        let outputs = &psbt.unsigned_tx.output;
-        if outputs.is_empty() {
-            return Err("a spend with no outputs sends the whole input to fees".into());
-        }
-        if psbt.unsigned_tx.input.is_empty() {
-            return Err("a spend with no inputs consumes nothing and signs nothing".into());
-        }
-        let mut paid = Amount::ZERO;
-        for (i, out) in outputs.iter().enumerate() {
+        let spend = CommittedSpend::from_payload(payload)?;
+        for (i, out) in spend.outputs.iter().enumerate() {
             if !self.allowed_destinations.contains(&out.script_pubkey) {
                 return Err(format!(
                     "output {i} pays {}, which is not an allowed destination",
                     out.script_pubkey
                 ));
             }
-            // Checked: a hostile payload can name output values summing past
-            // u64, and a wrapping total would read as a small spend.
-            paid = paid
-                .checked_add(out.value)
-                .ok_or_else(|| "the output total overflows".to_owned())?;
         }
-
-        // The signature commits to every input's prevout under
-        // `SIGHASH_DEFAULT`/`ALL`, and the digest was recomputed from exactly
-        // these prevouts, so they are as authentic as the outputs. The count
-        // check keeps this sound when called outside that path.
-        if payload.prevouts.len() != psbt.unsigned_tx.input.len() {
-            return Err(format!(
-                "the payload carries {} prevouts for {} inputs",
-                payload.prevouts.len(),
-                psbt.unsigned_tx.input.len()
-            ));
-        }
-        let mut consumed = Amount::ZERO;
-        for (i, prevout) in payload.prevouts.iter().enumerate() {
-            let prevout = bitcoin::consensus::deserialize::<bitcoin::TxOut>(prevout)
-                .map_err(|e| format!("prevout {i} decode failed: {e}"))?;
-            consumed = consumed
-                .checked_add(prevout.value)
-                .ok_or_else(|| "the input total overflows".to_owned())?;
-        }
-        // `Amount`'s `Sub` panics on underflow, so the fee is taken with
-        // `checked_sub` rather than relying on this refusal staying above it.
-        // Outputs paying more than the inputs supply is consensus-invalid, so
-        // no honest request looks like this.
-        let fee = consumed.checked_sub(paid).ok_or_else(|| {
-            format!(
-                "the outputs pay {} sats from {} sats of inputs, which cannot be signed",
-                paid.to_sat(),
-                consumed.to_sat()
-            )
-        })?;
+        let CommittedSpend {
+            consumed,
+            paid,
+            fee,
+            txid,
+            ..
+        } = spend;
 
         // Satoshis, not `Amount`'s BTC rendering, so these read in the unit the
         // operator configured on the command line.
@@ -246,7 +192,93 @@ impl KeySpendPolicy {
             consumed,
             paid,
             fee,
+            txid,
+        })
+    }
+}
+
+/// What a key-path spend's signature authorizes, read from its payload: every
+/// output the transaction pays and what its inputs supply.
+///
+/// Authentic only because the payload's flag is `SIGHASH_DEFAULT` or
+/// `SIGHASH_ALL`, which commit to every output and every input's prevout, and
+/// only once [`crate::verify_structured_payload`] has proven the digest is this
+/// payload's sighash. Any other flag is refused here: ANYONECANPAY binds one
+/// input's amount, and SINGLE and NONE bind one output or none, so the rest
+/// could be anything when the signature lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedSpend {
+    /// Every output of the unsigned transaction, in order.
+    pub outputs: Vec<bitcoin::TxOut>,
+    /// Everything the inputs supply, the outputs plus the fee.
+    pub consumed: Amount,
+    /// What the outputs pay in total.
+    pub paid: Amount,
+    /// What is left for miners.
+    pub fee: Amount,
+    /// The unsigned transaction's id.
+    pub txid: bitcoin::Txid,
+}
+
+impl CommittedSpend {
+    /// Read the spend from a `bitcoin-sighash` payload.
+    pub fn from_payload(structured_payload: &[u8]) -> Result<Self, String> {
+        let payload: BitcoinSighashPayload = serde_json::from_slice(structured_payload)
+            .map_err(|e| format!("bitcoin-sighash payload decode failed: {e}"))?;
+        let psbt = bitcoin::Psbt::deserialize(&payload.psbt)
+            .map_err(|e| format!("bitcoin-sighash payload PSBT decode failed: {e}"))?;
+        if !matches!(payload.sighash_type, 0x00 | 0x01) {
+            return Err(format!(
+                "a key-path spend must use SIGHASH_DEFAULT or SIGHASH_ALL, not {:#x}",
+                payload.sighash_type
+            ));
+        }
+        let outputs = psbt.unsigned_tx.output.clone();
+        if outputs.is_empty() {
+            return Err("a spend with no outputs sends the whole input to fees".into());
+        }
+        if psbt.unsigned_tx.input.is_empty() {
+            return Err("a spend with no inputs consumes nothing and signs nothing".into());
+        }
+        let mut paid = Amount::ZERO;
+        for out in &outputs {
+            // Checked: a hostile payload can name output values summing past
+            // u64, and a wrapping total would read as a small spend.
+            paid = paid
+                .checked_add(out.value)
+                .ok_or_else(|| "the output total overflows".to_owned())?;
+        }
+        if payload.prevouts.len() != psbt.unsigned_tx.input.len() {
+            return Err(format!(
+                "the payload carries {} prevouts for {} inputs",
+                payload.prevouts.len(),
+                psbt.unsigned_tx.input.len()
+            ));
+        }
+        let mut consumed = Amount::ZERO;
+        for (i, prevout) in payload.prevouts.iter().enumerate() {
+            let prevout = bitcoin::consensus::deserialize::<bitcoin::TxOut>(prevout)
+                .map_err(|e| format!("prevout {i} decode failed: {e}"))?;
+            consumed = consumed
+                .checked_add(prevout.value)
+                .ok_or_else(|| "the input total overflows".to_owned())?;
+        }
+        // `Amount`'s `Sub` panics on underflow. Outputs paying more than the
+        // inputs supply is consensus-invalid, so no honest request looks like
+        // this.
+        let fee = consumed.checked_sub(paid).ok_or_else(|| {
+            format!(
+                "the outputs pay {} sats from {} sats of inputs, which cannot be signed",
+                paid.to_sat(),
+                consumed.to_sat()
+            )
+        })?;
+        Ok(Self {
             txid: psbt.unsigned_tx.compute_txid(),
+            outputs,
+            consumed,
+            paid,
+            fee,
         })
     }
 }

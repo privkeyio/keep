@@ -39,6 +39,7 @@ nostr-sdk = { version = "0.44", default-features = false }
 tracing-android = "0.2"
 
 [dev-dependencies]
+keep-frost-net = { path = "../keep-frost-net", default-features = false, features = ["testing"] }
 keep-approval = { path = "../keep-approval", features = ["test-attestation"] }
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"] }
 nostr-relay-builder = "0.44"

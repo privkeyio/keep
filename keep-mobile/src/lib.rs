@@ -63,7 +63,7 @@ pub use types::{
     DeviceRegistrationInfo, DkgConfig, DkgParticipant, DkgProgressUpdate, FrostGenerationResult,
     GeneratedShareInfo, KeepLiveState, KeyHealthStatusInfo, PeerInfo, PeerStatus,
     RecoveryTierConfig, RelayHealth, RelayHealthStatus, RosterVerification, SignRequest,
-    SignRequestMetadata, ThresholdConfig, WalletDescriptorInfo,
+    SignRequestMetadata, SpendOutput, SpendSummary, ThresholdConfig, WalletDescriptorInfo,
 };
 pub use warden_auth::WardenGovernance;
 
@@ -298,11 +298,15 @@ fn init_logging() {
 /// verified sender rather than taken from the payload, so a peer cannot claim
 /// another peer's index.
 ///
-/// `metadata` stays empty. Its fields come from the session's structured
-/// payload, which needs decoding per message type before it can be trusted to
-/// populate an amount or a destination, and showing a wrong amount would be
-/// worse than showing none.
-fn sign_request_from_session(session: &keep_frost_net::SessionInfo) -> SignRequest {
+/// `metadata` is filled only from a structured payload, which the responder
+/// has recomputed against the signed bytes before this runs, and for a Bitcoin
+/// spend only under a flag that commits to every output and input amount. See
+/// `request_metadata`. `network` names the account's network, for showing
+/// outputs as addresses.
+fn sign_request_from_session(
+    session: &keep_frost_net::SessionInfo,
+    network: Option<bitcoin::Network>,
+) -> SignRequest {
     SignRequest {
         id: hex::encode(session.session_id),
         session_id: session.session_id.to_vec(),
@@ -323,9 +327,94 @@ fn sign_request_from_session(session: &keep_frost_net::SessionInfo) -> SignReque
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        metadata: None,
+        metadata: request_metadata(session, network),
     }
 }
+
+/// What the request signs, from its structured body. Present only with one:
+/// the responder has recomputed the signed bytes from that body before this
+/// runs and refused the request on a mismatch, so each field here is what the
+/// signature covers rather than what the requester claims.
+fn request_metadata(
+    session: &keep_frost_net::SessionInfo,
+    network: Option<bitcoin::Network>,
+) -> Option<SignRequestMetadata> {
+    let payload = session.structured_payload.as_deref()?;
+    match session.message_type.as_str() {
+        keep_frost_net::MSG_TYPE_NOSTR_EVENT => {
+            let event: keep_frost_net::NostrEventPayload = serde_json::from_slice(payload).ok()?;
+            Some(SignRequestMetadata {
+                event_kind: Some(u32::from(event.kind)),
+                content_preview: Some(keep_nip46::handler::sanitize_prompt_field(
+                    &event.content,
+                    CONTENT_PREVIEW_DISPLAY_MAX,
+                )),
+                amount_sats: None,
+                destination: None,
+                spend: None,
+            })
+        }
+        keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH => {
+            // Refused for a flag that leaves outputs or input amounts open, so
+            // nothing is shown that the signature does not fix.
+            let spend = keep_frost_net::CommittedSpend::from_payload(payload).ok()?;
+            let outputs: Vec<SpendOutput> = spend
+                .outputs
+                .iter()
+                .map(|out| SpendOutput {
+                    amount_sats: out.value.to_sat(),
+                    address: network.and_then(|network| {
+                        bitcoin::Address::from_script(&out.script_pubkey, network)
+                            .ok()
+                            .map(|address| address.to_string())
+                    }),
+                    script_hex: hex::encode(out.script_pubkey.as_bytes()),
+                })
+                .collect();
+            // The single-amount fields stay empty even for one output: a prompt
+            // that renders them shows "N sats to X" without the fee, so a spend
+            // paying a little and leaving the rest of a large input to miners
+            // would read as a small payment.
+            Some(SignRequestMetadata {
+                event_kind: None,
+                content_preview: None,
+                amount_sats: None,
+                destination: None,
+                spend: Some(SpendSummary {
+                    outputs,
+                    consumed_sats: spend.consumed.to_sat(),
+                    fee_sats: spend.fee.to_sat(),
+                }),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The prompt for a co-sign request, with a Bitcoin request's addresses on
+/// the group's descriptor network. Only a Bitcoin request reads storage.
+fn prompt_for(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey: &[u8; 32],
+    session: &keep_frost_net::SessionInfo,
+) -> SignRequest {
+    let network = (session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH)
+        .then(|| descriptor_network(storage, group_pubkey))
+        .flatten();
+    sign_request_from_session(session, network)
+}
+
+/// The network named by the account's wallet descriptor, if it has one.
+fn descriptor_network(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey: &[u8; 32],
+) -> Option<bitcoin::Network> {
+    let descriptor = persistence::load_descriptor(storage, &hex::encode(group_pubkey)).ok()?;
+    keep_bitcoin::parse_network(&descriptor.network).ok()
+}
+
+/// Display cap for a Nostr event's content, matching the NIP-46 prompt's.
+const CONTENT_PREVIEW_DISPLAY_MAX: usize = 256;
 
 /// Display cap for the requester-supplied label, matching the method-name cap
 /// used for the other short prompt field in this codebase. The wire validator
@@ -588,6 +677,25 @@ impl SigningHooks for MobileSigningHooks {
                 hex::encode(session.session_id),
                 session.requester
             )));
+        }
+
+        // A Bitcoin request with a body is shown with every output and its fee,
+        // which needs a flag committing to all of them. Under any other flag the
+        // outputs or input amounts the signature leaves open could be anything
+        // when it lands, so it is refused rather than shown as a verified
+        // Bitcoin request with no amounts. No producer here uses another flag.
+        // Before the pre-approval short-circuit, like the checks above.
+        if session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH {
+            if let Some(payload) = session.structured_payload.as_deref() {
+                keep_frost_net::CommittedSpend::from_payload(payload).map_err(|e| {
+                    keep_frost_net::FrostNetError::PolicyViolation(format!(
+                        "co-signer refuses a Bitcoin request it cannot describe: {e}. \
+                         session_id={}, requester=share {}",
+                        hex::encode(session.session_id),
+                        session.requester
+                    ))
+                })?;
+            }
         }
 
         if self.consume_pre_approval(&session.message) {
@@ -6007,15 +6115,15 @@ impl KeepMobile {
                     let Some((session, response_tx)) = result else {
                         break;
                     };
+                    // Built before taking the pending lock: it calls into platform
+                    // storage.
+                    let info = prompt_for(&desc.storage, desc.node.group_pubkey(), &session);
                     let mut guard = state.pending.lock().await;
                     if guard.len() >= MAX_PENDING_REQUESTS {
                         let _ = response_tx.send(false).await;
                         continue;
                     }
-                    guard.push(PendingRequest {
-                        info: sign_request_from_session(&session),
-                        response_tx,
-                    });
+                    guard.push(PendingRequest { info, response_tx });
                     drop(guard);
                     state.push(&connection_status).await;
                 }
@@ -6377,7 +6485,7 @@ mod import_teardown_tests {
     use std::sync::Mutex as StdMutex;
 
     #[derive(Default)]
-    struct MemStorage {
+    pub(super) struct MemStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
         active: StdMutex<Option<String>>,
     }
@@ -8218,7 +8326,7 @@ mod sign_request_mapping_tests {
     fn the_label_reaches_the_approval_request() {
         // Without this the Android summary falls back to an empty string and the
         // user approves 32 bytes with nothing saying which domain they belong to.
-        let req = sign_request_from_session(&session("nostr-event", 3));
+        let req = sign_request_from_session(&session("nostr-event", 3), None);
         assert_eq!(req.message_type, "nostr-event");
     }
 
@@ -8227,7 +8335,7 @@ mod sign_request_mapping_tests {
         // The notification renders the summary as multi-line text, so an
         // embedded newline would let the requester append their own lines
         // beneath the real one.
-        let req = sign_request_from_session(&session("nostr-event\nApproved by Keep", 1));
+        let req = sign_request_from_session(&session("nostr-event\nApproved by Keep", 1), None);
         assert!(
             !req.message_type.contains('\n'),
             "got: {:?}",
@@ -8237,7 +8345,7 @@ mod sign_request_mapping_tests {
 
     #[test]
     fn a_bidi_override_cannot_rewrite_the_text_around_it() {
-        let req = sign_request_from_session(&session("nostr\u{202E}drowssap", 1));
+        let req = sign_request_from_session(&session("nostr\u{202E}drowssap", 1), None);
         assert!(
             !req.message_type.contains('\u{202E}'),
             "got: {:?}",
@@ -8247,7 +8355,7 @@ mod sign_request_mapping_tests {
 
     #[test]
     fn an_overlong_label_cannot_crowd_out_the_rest_of_the_prompt() {
-        let req = sign_request_from_session(&session(&"A".repeat(64), 1));
+        let req = sign_request_from_session(&session(&"A".repeat(64), 1), None);
         assert!(
             req.message_type.chars().count() <= MESSAGE_TYPE_DISPLAY_MAX + 3,
             "got {} chars",
@@ -8258,14 +8366,14 @@ mod sign_request_mapping_tests {
     #[test]
     fn an_ordinary_label_survives_sanitizing_intact() {
         // The stripping must not eat the normal case it exists to display.
-        let req = sign_request_from_session(&session("bitcoin-sighash", 1));
+        let req = sign_request_from_session(&session("bitcoin-sighash", 1), None);
         assert_eq!(req.message_type, "bitcoin-sighash");
     }
 
     #[test]
     fn a_request_without_a_structured_body_is_not_verified() {
         // Nothing checked the label, so surfaces must not present it as settled.
-        let req = sign_request_from_session(&session("nostr-event", 1));
+        let req = sign_request_from_session(&session("nostr-event", 1), None);
         assert!(!req.type_verified);
     }
 
@@ -8274,11 +8382,10 @@ mod sign_request_mapping_tests {
         // Reaching this point with a body attached means the responder already
         // recomputed the digest from it and matched the signed bytes; a mismatch
         // or an unknown label is refused before the hook runs.
-        let req = sign_request_from_session(&session_with_payload(
-            "bitcoin-sighash",
-            1,
-            Some(b"{}".to_vec()),
-        ));
+        let req = sign_request_from_session(
+            &session_with_payload("bitcoin-sighash", 1, Some(b"{}".to_vec())),
+            None,
+        );
         assert!(req.type_verified);
     }
 
@@ -8286,7 +8393,7 @@ mod sign_request_mapping_tests {
     fn the_untouched_fields_are_untouched() {
         // Pins the half of the extraction that was meant to be behaviour-preserving.
         let s = session("nostr-event", 2);
-        let req = sign_request_from_session(&s);
+        let req = sign_request_from_session(&s, None);
         assert_eq!(req.id, hex::encode(s.session_id));
         assert_eq!(req.session_id, s.session_id.to_vec());
         assert!(req.metadata.is_none());
@@ -8294,16 +8401,440 @@ mod sign_request_mapping_tests {
 
     #[test]
     fn the_requesting_peer_reaches_the_approval_request() {
-        let req = sign_request_from_session(&session("nostr-event", 4));
+        let req = sign_request_from_session(&session("nostr-event", 4), None);
         assert_eq!(req.from_peer, 4, "the approver needs to know who asked");
+    }
+
+    pub(super) fn spend_payload(
+        outputs: &[(u64, bitcoin::ScriptBuf)],
+        inputs: &[u64],
+        flag: u32,
+    ) -> Vec<u8> {
+        use bitcoin::hashes::Hash;
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: inputs
+                .iter()
+                .enumerate()
+                .map(|(i, _)| bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint::new(
+                        bitcoin::Txid::from_byte_array([i as u8 + 1; 32]),
+                        0,
+                    ),
+                    ..Default::default()
+                })
+                .collect(),
+            output: outputs
+                .iter()
+                .map(|(sats, script)| bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(*sats),
+                    script_pubkey: script.clone(),
+                })
+                .collect(),
+        };
+        let prevouts = inputs
+            .iter()
+            .map(|sats| {
+                bitcoin::consensus::serialize(&bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(*sats),
+                    script_pubkey: p2wsh(9),
+                })
+            })
+            .collect();
+        serde_json::to_vec(&keep_frost_net::BitcoinSighashPayload {
+            psbt: bitcoin::Psbt::from_unsigned_tx(tx).unwrap().serialize(),
+            input_index: 0,
+            sighash_type: flag,
+            prevouts,
+        })
+        .unwrap()
+    }
+
+    pub(super) fn p2wsh(byte: u8) -> bitcoin::ScriptBuf {
+        use bitcoin::hashes::Hash;
+        bitcoin::ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::from_byte_array([byte; 32]))
+    }
+
+    fn spend_request(payload: Vec<u8>, network: Option<bitcoin::Network>) -> SignRequest {
+        sign_request_from_session(
+            &session_with_payload("bitcoin-sighash", 1, Some(payload)),
+            network,
+        )
+    }
+
+    // Every output and the fee reach the prompt, so a person approving a spend
+    // an agent started sees where the money goes. No output is singled out.
+    #[test]
+    fn a_spend_shows_every_output_and_its_fee() {
+        let pay = p2wsh(2);
+        let back = p2wsh(3);
+        let req = spend_request(
+            spend_payload(
+                &[(70_000, pay.clone()), (29_000, back.clone())],
+                &[60_000, 40_000],
+                0,
+            ),
+            Some(bitcoin::Network::Bitcoin),
+        );
+        let meta = req.metadata.expect("a verified spend is described");
+        assert_eq!(
+            meta.amount_sats, None,
+            "no single amount speaks for the spend"
+        );
+        assert_eq!(meta.destination, None);
+        let spend = meta.spend.expect("the spend is summarized");
+        assert_eq!(spend.consumed_sats, 100_000);
+        assert_eq!(spend.fee_sats, 1_000);
+        let shown: Vec<_> = spend
+            .outputs
+            .iter()
+            .map(|o| (o.amount_sats, o.script_hex.clone(), o.address.clone()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    70_000,
+                    hex::encode(pay.as_bytes()),
+                    Some(
+                        bitcoin::Address::from_script(&pay, bitcoin::Network::Bitcoin)
+                            .unwrap()
+                            .to_string()
+                    )
+                ),
+                (
+                    29_000,
+                    hex::encode(back.as_bytes()),
+                    Some(
+                        bitcoin::Address::from_script(&back, bitcoin::Network::Bitcoin)
+                            .unwrap()
+                            .to_string()
+                    )
+                ),
+            ]
+        );
+        assert!(shown[0].2.as_deref().unwrap().starts_with("bc1q"));
+    }
+
+    // A spend with one output still leaves the single-amount fields empty: a
+    // prompt showing only "1000 sats to X" would hide a fee taking the rest of a
+    // large input. The fee travels with the output.
+    #[test]
+    fn a_single_output_spend_keeps_its_fee_beside_it() {
+        let pay = p2wsh(2);
+        let req = spend_request(
+            spend_payload(&[(1_000, pay.clone())], &[500_000_000], 1),
+            None,
+        );
+        let meta = req.metadata.unwrap();
+        assert_eq!(meta.amount_sats, None);
+        assert_eq!(meta.destination, None);
+        let spend = meta.spend.unwrap();
+        assert_eq!(spend.fee_sats, 499_999_000);
+        assert_eq!(spend.consumed_sats, 500_000_000);
+        assert_eq!(spend.outputs.len(), 1);
+        assert_eq!(spend.outputs[0].amount_sats, 1_000);
+        assert_eq!(spend.outputs[0].script_hex, hex::encode(pay.as_bytes()));
+        assert_eq!(spend.outputs[0].address, None, "no network, no address");
+
+        let req = spend_request(
+            spend_payload(&[(99_000, pay)], &[100_000], 1),
+            Some(bitcoin::Network::Testnet),
+        );
+        let address = req.metadata.unwrap().spend.unwrap().outputs[0]
+            .address
+            .clone()
+            .unwrap();
+        assert!(address.starts_with("tb1q"), "{address}");
+    }
+
+    // A flag that leaves outputs or input amounts open shows no amounts, since
+    // the transaction that lands may pay something else.
+    #[test]
+    fn a_spend_the_signature_does_not_fix_shows_no_amounts() {
+        for flag in [0x02, 0x03, 0x81, 0x82, 0x83] {
+            let req = spend_request(spend_payload(&[(1_000, p2wsh(2))], &[2_000], flag), None);
+            assert!(req.metadata.is_none(), "flag {flag:#x}");
+            assert!(req.type_verified);
+        }
+    }
+
+    // Outputs paying more than the inputs supply is no spend at all, and the
+    // prompt says nothing rather than show a negative or wrapped fee.
+    #[test]
+    fn an_impossible_spend_shows_no_amounts() {
+        let req = spend_request(spend_payload(&[(5_000, p2wsh(2))], &[1_000], 0), None);
+        assert!(req.metadata.is_none());
+    }
+
+    // A Nostr event's kind and content reach the prompt, sanitized like every
+    // other requester-supplied field.
+    #[test]
+    fn a_nostr_event_shows_its_kind_and_content() {
+        let event = keep_frost_net::NostrEventPayload {
+            pubkey: [1u8; 32],
+            created_at: 1_700_000_000,
+            kind: 1,
+            tags: vec![],
+            content: format!("gm\nApproved by Keep \u{202E}{}", "x".repeat(400)),
+        };
+        let req = sign_request_from_session(
+            &session_with_payload("nostr-event", 1, Some(serde_json::to_vec(&event).unwrap())),
+            None,
+        );
+        let meta = req.metadata.unwrap();
+        assert_eq!(meta.event_kind, Some(1));
+        let preview = meta.content_preview.unwrap();
+        assert!(preview.starts_with("gm"));
+        assert!(!preview.contains('\n') && !preview.contains('\u{202E}'));
+        assert!(preview.chars().count() <= CONTENT_PREVIEW_DISPLAY_MAX + 3);
+        assert!(meta.spend.is_none() && meta.amount_sats.is_none());
+    }
+
+    // A body under a label it does not belong to is refused before this runs,
+    // and here it describes nothing.
+    #[test]
+    fn a_body_under_another_label_describes_nothing() {
+        let req = sign_request_from_session(
+            &session_with_payload(
+                "nostr-event",
+                1,
+                Some(spend_payload(&[(1_000, p2wsh(2))], &[2_000], 0)),
+            ),
+            None,
+        );
+        assert!(req.metadata.is_none());
+    }
+
+    // The network comes from the account's wallet descriptor, and without one
+    // no address is guessed.
+    #[test]
+    fn the_network_is_the_descriptors() {
+        let storage: Arc<dyn SecureStorage> =
+            Arc::new(super::import_teardown_tests::MemStorage::default());
+        let group = [7u8; 32];
+        assert_eq!(descriptor_network(&storage, &group), None);
+        persistence::persist_descriptor(
+            &storage,
+            &WalletDescriptorInfo {
+                group_pubkey: hex::encode(group),
+                external_descriptor: "tr(xpub.../0/*)".into(),
+                internal_descriptor: "tr(xpub.../1/*)".into(),
+                network: "testnet".into(),
+                created_at: 1_700_000_000,
+                device_registrations: vec![],
+                policy_hash_hex: None,
+                version: 1,
+                previous_descriptor_hash_hex: None,
+                policy_json: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor_network(&storage, &group),
+            Some(bitcoin::Network::Testnet)
+        );
+        assert_eq!(descriptor_network(&storage, &[8u8; 32]), None);
     }
 
     #[test]
     fn the_preview_is_bounded_and_hex() {
-        let req = sign_request_from_session(&session("nostr-event", 1));
+        let req = sign_request_from_session(&session("nostr-event", 1), None);
         // Eight bytes rendered as hex, not the whole digest.
         assert_eq!(req.message_preview.len(), 16);
         assert!(req.message_preview.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+}
+
+#[cfg(test)]
+mod cosign_prompt_e2e_tests {
+    //! A co-signer running the phone's own hooks, asked over the network by a
+    //! requester holding the other share. The prompt is built the way the
+    //! event loop builds it, from the session the hooks hand over.
+    use super::*;
+    use keep_core::frost::{ThresholdConfig, TrustedDealer};
+    use keep_frost_net::test_support::{key_spend_payload_paying, MemoryBus};
+    use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent};
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    struct Pair {
+        group_pubkey: [u8; 32],
+        requester: Arc<KfpNode>,
+        prompts: mpsc::Receiver<SignRequest>,
+        _shutdown: Vec<Option<mpsc::Sender<()>>>,
+    }
+
+    /// A 2-of-2 group: share 1 is the phone, answering every prompt with
+    /// `answer`; share 2 requests.
+    async fn pair(answer: bool) -> Pair {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 2).unwrap());
+        let (shares, _) = dealer.generate("cosign-prompt-e2e").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let bus = MemoryBus::new();
+        let mut nodes: Vec<KfpNode> = shares
+            .into_iter()
+            .map(|share| {
+                KfpNode::with_transport(
+                    share,
+                    bus.transport() as Arc<dyn CosignTransport>,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let storage: Arc<dyn SecureStorage> =
+            Arc::new(super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off());
+        persistence::persist_descriptor(
+            &storage,
+            &WalletDescriptorInfo {
+                group_pubkey: hex::encode(group_pubkey),
+                external_descriptor: "tr(xpub.../0/*)".into(),
+                internal_descriptor: "tr(xpub.../1/*)".into(),
+                network: "testnet".into(),
+                created_at: 1_700_000_000,
+                device_registrations: vec![],
+                policy_hash_hex: None,
+                version: 1,
+                previous_descriptor_hash_hex: None,
+                policy_json: None,
+            },
+        )
+        .unwrap();
+        let (request_tx, mut request_rx) = mpsc::channel(4);
+        nodes[0].set_hooks(Arc::new(MobileSigningHooks {
+            request_tx,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::clone(&storage),
+        }));
+        // What the event loop does with each request the hooks hand over:
+        // build its prompt, then wait on the user.
+        let (prompt_tx, prompts) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some((session, response_tx)) = request_rx.recv().await {
+                let _ = prompt_tx
+                    .send(prompt_for(&storage, &group_pubkey, &session))
+                    .await;
+                let _ = response_tx.send(answer).await;
+            }
+        });
+        let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
+        let shutdown = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+        let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+        for node in &nodes {
+            let node = Arc::clone(node);
+            tokio::spawn(async move {
+                let _ = node.run().await;
+            });
+        }
+        // Both ways: a phone that has not admitted the requester drops its
+        // request unanswered, which would read as a refusal.
+        for rx in &mut seen {
+            timeout(Duration::from_secs(30), async {
+                while !matches!(rx.recv().await, Ok(KfpNodeEvent::PeerDiscovered { .. })) {}
+            })
+            .await
+            .expect("the phone and the requester must discover each other");
+        }
+        Pair {
+            group_pubkey,
+            requester: Arc::clone(&nodes[1]),
+            prompts,
+            _shutdown: shutdown,
+        }
+    }
+
+    /// 99 000 sats to a P2WPKH output, whose address depends on the network.
+    fn pays() -> bitcoin::TxOut {
+        use bitcoin::hashes::Hash;
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(99_000),
+            script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [3u8; 20],
+            )),
+        }
+    }
+
+    async fn ask(pair: &Pair, sighash_type: u8) -> ([u8; 32], keep_frost_net::Result<[u8; 64]>) {
+        let spent = bitcoin::ScriptBuf::new_op_return([1u8; 4]);
+        let (sighash, payload) = key_spend_payload_paying(&spent, sighash_type, 0, pays());
+        let result = timeout(
+            Duration::from_secs(30),
+            pair.requester.request_signature_structured(
+                sighash.to_vec(),
+                keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH,
+                Some(payload),
+            ),
+        )
+        .await
+        .expect("the request must finish");
+        (sighash, result)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_phone_is_shown_the_spend_it_signs() {
+        let mut pair = pair(true).await;
+        let (sighash, result) = ask(&pair, 0x00).await;
+        let signature = result.expect("an approved spend is signed");
+        use bitcoin::secp256k1::{schnorr::Signature, Message, Secp256k1, XOnlyPublicKey};
+        Secp256k1::verification_only()
+            .verify_schnorr(
+                &Signature::from_slice(&signature).unwrap(),
+                &Message::from_digest(sighash),
+                &XOnlyPublicKey::from_slice(&pair.group_pubkey).unwrap(),
+            )
+            .expect("the signature verifies under the group key");
+
+        let prompt = pair.prompts.try_recv().expect("the phone was asked");
+        assert!(pair.prompts.try_recv().is_err(), "asked once");
+        assert_eq!(
+            prompt.message_type,
+            keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
+        );
+        assert!(prompt.type_verified);
+        let metadata = prompt.metadata.expect("described");
+        assert_eq!((metadata.amount_sats, metadata.destination), (None, None));
+        let spend = metadata.spend.expect("the spend is shown");
+        assert_eq!((spend.consumed_sats, spend.fee_sats), (100_000, 1_000));
+        assert_eq!(spend.outputs.len(), 1);
+        assert_eq!(spend.outputs[0].amount_sats, 99_000);
+        assert_eq!(
+            spend.outputs[0].script_hex,
+            pays().script_pubkey.to_hex_string()
+        );
+        let address = spend.outputs[0]
+            .address
+            .as_deref()
+            .expect("a P2WPKH address");
+        assert!(
+            address.starts_with("tb1q"),
+            "shown on the descriptor's network: {address}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spend_declined_at_the_prompt_is_not_signed() {
+        let mut pair = pair(false).await;
+        let (_, result) = ask(&pair, 0x00).await;
+        let err = result.expect_err("declined, so no signature").to_string();
+        assert!(err.contains("Request rejected"), "{err}");
+        assert!(pair.prompts.try_recv().is_ok(), "the phone was asked");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_spend_the_prompt_cannot_describe_never_reaches_it() {
+        let mut pair = pair(true).await;
+        let (_, result) = ask(&pair, 0x03).await;
+        let err = result.expect_err("refused, so no signature").to_string();
+        assert!(err.contains("cannot describe"), "{err}");
+        assert!(
+            pair.prompts.try_recv().is_err(),
+            "the phone was never asked"
+        );
     }
 }
 
@@ -8316,12 +8847,12 @@ mod baseline_presign_policy_tests {
     /// Storage whose only job is to answer the kill-switch read. Seeded
     /// directly rather than through `store_share_by_key`, which requires share
     /// metadata that has nothing to do with a boolean.
-    struct KillSwitchOffStorage {
+    pub(super) struct KillSwitchOffStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
     }
 
     impl KillSwitchOffStorage {
-        fn with_switch_off() -> Self {
+        pub(super) fn with_switch_off() -> Self {
             let mut data = HashMap::new();
             data.insert(
                 KILL_SWITCH_STORAGE_KEY.to_string(),
@@ -8446,6 +8977,56 @@ mod baseline_presign_policy_tests {
             format!("{err}").contains("raw"),
             "refusal should name the policy that fired, got: {err}"
         );
+    }
+
+    /// A Bitcoin request the prompt cannot describe is refused, even with a
+    /// pre-approval recorded, and one it can describe goes on.
+    #[test]
+    fn a_bitcoin_request_under_an_uncommitting_flag_is_refused() {
+        use super::sign_request_mapping_tests::{p2wsh, spend_payload};
+        let message = vec![7u8; 32];
+        let pre_approved: PreApprovedHashes = Arc::new(StdMutex::new(HashMap::new()));
+        let hooks = MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: Arc::clone(&pre_approved),
+            storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+        };
+        let approve = || {
+            use sha2::{Digest, Sha256};
+            let hash: [u8; 32] = Sha256::digest(&message).into();
+            pre_approved
+                .lock()
+                .unwrap()
+                .insert(hash, std::time::Instant::now());
+        };
+        let with_payload = |payload: Vec<u8>| SessionInfo {
+            structured_payload: Some(payload),
+            ..session_with("bitcoin-sighash", message.clone())
+        };
+        for payload in [
+            spend_payload(&[(1_000, p2wsh(2))], &[2_000], 0x03),
+            spend_payload(&[(1_000, p2wsh(2))], &[2_000], 0x81),
+            spend_payload(&[(5_000, p2wsh(2))], &[1_000], 0x00),
+        ] {
+            approve();
+            let err = hooks
+                .pre_sign(&with_payload(payload))
+                .expect_err("an undescribable Bitcoin request is refused");
+            assert!(format!("{err}").contains("cannot describe"), "{err}");
+            assert_eq!(
+                pre_approved.lock().unwrap().len(),
+                1,
+                "a refused request leaves the pre-approval in place"
+            );
+        }
+        approve();
+        hooks
+            .pre_sign(&with_payload(spend_payload(
+                &[(1_000, p2wsh(2))],
+                &[2_000],
+                0x00,
+            )))
+            .expect("a describable spend reaches the pre-approval");
     }
 
     /// The gap a denylist leaves. An empty label is not "raw", so the string

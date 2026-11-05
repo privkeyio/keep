@@ -267,6 +267,21 @@ pub fn key_spend_payload_of(
     sighash_type: u8,
     vout: u32,
 ) -> ([u8; 32], Vec<u8>) {
+    let pays = bitcoin::TxOut {
+        value: bitcoin::Amount::from_sat(99_000),
+        script_pubkey: bitcoin::ScriptBuf::new_op_return([0u8; 4]),
+    };
+    key_spend_payload_paying(spent, sighash_type, vout, pays)
+}
+
+/// As [`key_spend_payload_of`], with `pays` as the transaction's one output in
+/// place of the 99 000 sat OP_RETURN.
+pub fn key_spend_payload_paying(
+    spent: &bitcoin::ScriptBuf,
+    sighash_type: u8,
+    vout: u32,
+    pays: bitcoin::TxOut,
+) -> ([u8; 32], Vec<u8>) {
     use bitcoin::absolute::LockTime;
     use bitcoin::hashes::Hash;
     use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
@@ -286,10 +301,7 @@ pub fn key_spend_payload_of(
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
         }],
-        output: vec![TxOut {
-            value: Amount::from_sat(99_000),
-            script_pubkey: bitcoin::ScriptBuf::new_op_return([0u8; 4]),
-        }],
+        output: vec![pays],
     };
     let sighash = SighashCache::new(&tx)
         .taproot_key_spend_signature_hash(
