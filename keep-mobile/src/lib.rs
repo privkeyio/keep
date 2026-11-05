@@ -391,6 +391,19 @@ fn request_metadata(
     }
 }
 
+/// The prompt for a co-sign request, with a Bitcoin request's addresses on
+/// the group's descriptor network. Only a Bitcoin request reads storage.
+fn prompt_for(
+    storage: &Arc<dyn SecureStorage>,
+    group_pubkey: &[u8; 32],
+    session: &keep_frost_net::SessionInfo,
+) -> SignRequest {
+    let network = (session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH)
+        .then(|| descriptor_network(storage, group_pubkey))
+        .flatten();
+    sign_request_from_session(session, network)
+}
+
 /// The network named by the account's wallet descriptor, if it has one.
 fn descriptor_network(
     storage: &Arc<dyn SecureStorage>,
@@ -6102,20 +6115,15 @@ impl KeepMobile {
                     let Some((session, response_tx)) = result else {
                         break;
                     };
-                    // Read before taking the pending lock: it calls into platform
-                    // storage, and only a Bitcoin request needs it.
-                    let network = (session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH)
-                        .then(|| descriptor_network(&desc.storage, desc.node.group_pubkey()))
-                        .flatten();
+                    // Built before taking the pending lock: it calls into platform
+                    // storage.
+                    let info = prompt_for(&desc.storage, desc.node.group_pubkey(), &session);
                     let mut guard = state.pending.lock().await;
                     if guard.len() >= MAX_PENDING_REQUESTS {
                         let _ = response_tx.send(false).await;
                         continue;
                     }
-                    guard.push(PendingRequest {
-                        info: sign_request_from_session(&session, network),
-                        response_tx,
-                    });
+                    guard.push(PendingRequest { info, response_tx });
                     drop(guard);
                     state.push(&connection_status).await;
                 }
@@ -8646,7 +8654,7 @@ mod cosign_prompt_e2e_tests {
     //! event loop builds it, from the session the hooks hand over.
     use super::*;
     use keep_core::frost::{ThresholdConfig, TrustedDealer};
-    use keep_frost_net::test_support::{key_spend_payload, MemoryBus};
+    use keep_frost_net::test_support::{key_spend_payload_paying, MemoryBus};
     use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent};
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
@@ -8679,22 +8687,37 @@ mod cosign_prompt_e2e_tests {
                 .unwrap()
             })
             .collect();
+        let storage: Arc<dyn SecureStorage> =
+            Arc::new(super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off());
+        persistence::persist_descriptor(
+            &storage,
+            &WalletDescriptorInfo {
+                group_pubkey: hex::encode(group_pubkey),
+                external_descriptor: "tr(xpub.../0/*)".into(),
+                internal_descriptor: "tr(xpub.../1/*)".into(),
+                network: "testnet".into(),
+                created_at: 1_700_000_000,
+                device_registrations: vec![],
+                policy_hash_hex: None,
+                version: 1,
+                previous_descriptor_hash_hex: None,
+                policy_json: None,
+            },
+        )
+        .unwrap();
         let (request_tx, mut request_rx) = mpsc::channel(4);
         nodes[0].set_hooks(Arc::new(MobileSigningHooks {
             request_tx,
             pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
-            storage: Arc::new(
-                super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off(),
-            ),
+            storage: Arc::clone(&storage),
         }));
+        // What the event loop does with each request the hooks hand over:
+        // build its prompt, then wait on the user.
         let (prompt_tx, prompts) = mpsc::channel(4);
         tokio::spawn(async move {
             while let Some((session, response_tx)) = request_rx.recv().await {
                 let _ = prompt_tx
-                    .send(sign_request_from_session(
-                        &session,
-                        Some(bitcoin::Network::Bitcoin),
-                    ))
+                    .send(prompt_for(&storage, &group_pubkey, &session))
                     .await;
                 let _ = response_tx.send(answer).await;
             }
@@ -8725,9 +8748,20 @@ mod cosign_prompt_e2e_tests {
         }
     }
 
+    /// 99 000 sats to a P2WPKH output, whose address depends on the network.
+    fn pays() -> bitcoin::TxOut {
+        use bitcoin::hashes::Hash;
+        bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(99_000),
+            script_pubkey: bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array(
+                [3u8; 20],
+            )),
+        }
+    }
+
     async fn ask(pair: &Pair, sighash_type: u8) -> ([u8; 32], keep_frost_net::Result<[u8; 64]>) {
         let spent = bitcoin::ScriptBuf::new_op_return([1u8; 4]);
-        let (sighash, payload) = key_spend_payload(&spent, sighash_type);
+        let (sighash, payload) = key_spend_payload_paying(&spent, sighash_type, 0, pays());
         let result = timeout(
             Duration::from_secs(30),
             pair.requester.request_signature_structured(
@@ -8768,10 +8802,17 @@ mod cosign_prompt_e2e_tests {
         assert_eq!((spend.consumed_sats, spend.fee_sats), (100_000, 1_000));
         assert_eq!(spend.outputs.len(), 1);
         assert_eq!(spend.outputs[0].amount_sats, 99_000);
-        assert_eq!(spend.outputs[0].script_hex, "6a0400000000");
         assert_eq!(
-            spend.outputs[0].address, None,
-            "an OP_RETURN has no address"
+            spend.outputs[0].script_hex,
+            pays().script_pubkey.to_hex_string()
+        );
+        let address = spend.outputs[0]
+            .address
+            .as_deref()
+            .expect("a P2WPKH address");
+        assert!(
+            address.starts_with("tb1q"),
+            "shown on the descriptor's network: {address}"
         );
     }
 
@@ -8972,6 +9013,11 @@ mod baseline_presign_policy_tests {
                 .pre_sign(&with_payload(payload))
                 .expect_err("an undescribable Bitcoin request is refused");
             assert!(format!("{err}").contains("cannot describe"), "{err}");
+            assert_eq!(
+                pre_approved.lock().unwrap().len(),
+                1,
+                "a refused request leaves the pre-approval in place"
+            );
         }
         approve();
         hooks
