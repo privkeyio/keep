@@ -336,15 +336,13 @@ fn spawn_async_with_timeout<T: Send + 'static>(
 
 const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
 
-/// The network budget of a signing request, plus this app's wait for its own
-/// user's answer (`SIGNING_RESPONSE_TIMEOUT`) on every failover attempt, plus
-/// margin, so a round a co-signer is still approving is not abandoned here
-/// first.
-const FROST_SIGN_TIMEOUT: Duration = Duration::from_secs(
-    keep_frost_net::MAX_SIGNING_REQUEST_DURATION.as_secs()
-        + keep_frost_net::MAX_FAILOVER_ATTEMPTS as u64 * crate::SIGNING_RESPONSE_TIMEOUT.as_secs()
-        + 5,
-);
+/// The network budget of a signing request plus margin, so a round a co-signer
+/// is still approving is not abandoned here first. The request's own approval
+/// adds nothing: its pre-approval is claimed before the call, and
+/// `OwnRequestGuard` lets every failover attempt through without waiting on a
+/// human.
+const FROST_SIGN_TIMEOUT: Duration =
+    Duration::from_secs(keep_frost_net::MAX_SIGNING_REQUEST_DURATION.as_secs() + 5);
 
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
@@ -772,7 +770,14 @@ impl Nip55Handler {
         // canonical fields ensures the responder's recompute matches ours.
         let structured = build_structured_nostr_payload(&event)?;
 
+        if !crate::consume_pre_approval(&self.mobile.pre_approved_hashes, &event_hash) {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "event was not approved for signing".into(),
+            });
+        }
+
         let node_arc = self.mobile.node.clone();
+        let in_flight = self.mobile.own_requests_in_flight.clone();
         let signature = spawn_async_with_timeout(
             &self.mobile,
             FROST_SIGN_TIMEOUT,
@@ -780,6 +785,7 @@ impl Nip55Handler {
             async move {
                 let node_guard = node_arc.read().await;
                 let node = node_guard.as_ref().ok_or(KeepMobileError::NotInitialized)?;
+                let _own_request = crate::OwnRequestGuard::hold(&in_flight, &event_hash);
                 node.request_signature_structured(
                     event_hash.to_vec(),
                     keep_frost_net::MSG_TYPE_NOSTR_EVENT,
