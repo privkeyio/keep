@@ -73,10 +73,15 @@ pub enum ShareStoreStatus {
 
 /// What `remove_unreadable_share` did. Only `Removed` changed anything, and it
 /// set the share aside rather than destroying it.
+///
+/// `cleared_active_pointer` means this call cleared the active account
+/// pointer. A retry after a partial failure can report `false` even though
+/// the share was the active account, so callers must re-read the active
+/// account after any `Err` and must not treat `false` as "was not active".
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
 pub enum UnreadableShareRemoval {
     /// Set aside, from where `restore_quarantined_share` puts it back.
-    Removed,
+    Removed { cleared_active_pointer: bool },
     /// The share can be read now, so it was kept.
     Readable,
     /// The registry lists it unreadable but its stored share still loads, so
@@ -90,6 +95,25 @@ pub enum UnreadableShareRemoval {
     /// The share registry cannot be read, so whether the share is unreadable
     /// is unknown.
     RegistryUnavailable,
+}
+
+/// What `discard_lost_share` did. Only `Discarded` changed anything.
+///
+/// `cleared_active_pointer` means this call cleared the active account
+/// pointer. A retry after a partial failure can report `false` even though
+/// the share was the active account, so callers must re-read the active
+/// account after any `Err` and must not treat `false` as "was not active".
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum QuarantineDiscard {
+    /// Destroyed.
+    Discarded { cleared_active_pointer: bool },
+    /// Its data decrypts again, so it was kept and should be restored.
+    Readable,
+    /// Whether its secret is lost could not be confirmed, as when the device
+    /// was not authenticated, so it was kept.
+    Unverified,
+    /// No share of this group is set aside.
+    NotSetAside,
 }
 
 /// Platform-provided secure storage for encrypted share data and wallet
