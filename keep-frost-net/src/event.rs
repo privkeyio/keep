@@ -232,6 +232,27 @@ impl KfpEventBuilder {
             .map_err(|e| FrostNetError::Nostr(e.to_string()))
     }
 
+    pub fn approval_pending(
+        keys: &Keys,
+        recipient: &PublicKey,
+        payload: SignApprovalPendingPayload,
+    ) -> Result<Event> {
+        let session_id = payload.session_id;
+        let msg = KfpMessage::SignApprovalPending(payload);
+        let content = msg.to_json()?;
+
+        let encrypted = nip44::encrypt(keys.secret_key(), recipient, &content, nip44::Version::V2)
+            .map_err(|e| FrostNetError::Crypto(e.to_string()))?;
+
+        EventBuilder::new(Kind::Custom(KFP_EVENT_KIND), encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
+            .tag(Tag::public_key(*recipient))
+            .tag(Tag::custom(TagKind::custom("s"), [hex::encode(session_id)]))
+            .tag(Tag::custom(TagKind::custom("t"), ["sign_approval_pending"]))
+            .sign_with_keys(keys)
+            .map_err(|e| FrostNetError::Nostr(e.to_string()))
+    }
+
     pub fn ping(keys: &Keys, recipient: &PublicKey) -> Result<Event> {
         let payload = PingPayload::new();
         let msg = KfpMessage::Ping(payload);

@@ -336,6 +336,10 @@ fn spawn_async_with_timeout<T: Send + 'static>(
 
 const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
 
+/// One round held open for a co-signer's approval prompt, the pre-round
+/// liveness ping, one plain failover round, and margin.
+const FROST_SIGN_TIMEOUT: Duration = Duration::from_secs(90);
+
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
     mobile: Arc<KeepMobile>,
@@ -765,7 +769,7 @@ impl Nip55Handler {
         let node_arc = self.mobile.node.clone();
         let signature = spawn_async_with_timeout(
             &self.mobile,
-            FROST_OP_TIMEOUT,
+            FROST_SIGN_TIMEOUT,
             "Signing request",
             async move {
                 let node_guard = node_arc.read().await;

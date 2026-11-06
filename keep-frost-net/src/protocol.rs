@@ -34,6 +34,10 @@ pub const MAX_CAPABILITY_LENGTH: usize = 64;
 /// peers announcing it are chosen for a tweaked session: a peer that predates the
 /// field drops it and would sign untweaked, which no aggregate can use.
 pub const CAPABILITY_TAPROOT_TWEAK: &str = "taproot-tweak";
+/// Announced by nodes that understand [`SignApprovalPendingPayload`]. A
+/// co-signer sends one only to a requester announcing it, and gives such a
+/// requester's round up to the longer approval cap.
+pub const CAPABILITY_APPROVAL_PENDING: &str = "approval-pending";
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_ERROR_CODE_LENGTH: usize = 64;
 pub const MAX_ERROR_MESSAGE_LENGTH: usize = 1024;
@@ -120,6 +124,7 @@ pub enum KfpMessage {
     Commitment(CommitmentPayload),
     SignatureShare(SignatureSharePayload),
     SignatureComplete(SignatureCompletePayload),
+    SignApprovalPending(SignApprovalPendingPayload),
     EcdhRequest(EcdhRequestPayload),
     EcdhShare(EcdhSharePayload),
     EcdhComplete(EcdhCompletePayload),
@@ -157,6 +162,7 @@ impl KfpMessage {
             KfpMessage::Commitment(_) => "commitment",
             KfpMessage::SignatureShare(_) => "signature_share",
             KfpMessage::SignatureComplete(_) => "signature_complete",
+            KfpMessage::SignApprovalPending(_) => "sign_approval_pending",
             KfpMessage::EcdhRequest(_) => "ecdh_request",
             KfpMessage::EcdhShare(_) => "ecdh_share",
             KfpMessage::EcdhComplete(_) => "ecdh_complete",
@@ -192,6 +198,7 @@ impl KfpMessage {
             KfpMessage::Commitment(p) => Some(&p.session_id),
             KfpMessage::SignatureShare(p) => Some(&p.session_id),
             KfpMessage::SignatureComplete(p) => Some(&p.session_id),
+            KfpMessage::SignApprovalPending(p) => Some(&p.session_id),
             KfpMessage::EcdhRequest(p) => Some(&p.session_id),
             KfpMessage::EcdhShare(p) => Some(&p.session_id),
             KfpMessage::EcdhComplete(p) => Some(&p.session_id),
@@ -261,6 +268,7 @@ impl KfpMessage {
             KfpMessage::NonceCommitment(p) => validate_nonce_commitment(p),
             KfpMessage::Commitment(p) => validate_commitment(p),
             KfpMessage::SignatureShare(p) => validate_signature_share(p),
+            KfpMessage::SignApprovalPending(p) => validate_sign_approval_pending(p),
             KfpMessage::Error(p) => validate_error(p),
             KfpMessage::EcdhRequest(p) => validate_ecdh_request(p),
             KfpMessage::EcdhShare(p) => validate_ecdh_share(p),
@@ -428,6 +436,13 @@ fn validate_commitment(p: &CommitmentPayload) -> Result<(), &'static str> {
 fn validate_signature_share(p: &SignatureSharePayload) -> Result<(), &'static str> {
     if p.signature_share.len() > MAX_SIGNATURE_SHARE_SIZE {
         return Err("Signature share exceeds maximum size");
+    }
+    Ok(())
+}
+
+fn validate_sign_approval_pending(p: &SignApprovalPendingPayload) -> Result<(), &'static str> {
+    if p.share_index == 0 {
+        return Err("share_index must be non-zero");
     }
     Ok(())
 }
@@ -1016,7 +1031,11 @@ impl AnnouncePayload {
             verifying_share,
             proof_signature,
             timestamp,
-            capabilities: vec!["sign".into(), CAPABILITY_TAPROOT_TWEAK.into()],
+            capabilities: vec![
+                "sign".into(),
+                CAPABILITY_TAPROOT_TWEAK.into(),
+                CAPABILITY_APPROVAL_PENDING.into(),
+            ],
             name: None,
             attestation: None,
             tpm_attestation: None,
@@ -1361,6 +1380,31 @@ impl NonceCommitmentPayload {
             group_pubkey,
             share_index,
             commitments,
+            created_at: Timestamp::now().as_secs(),
+        }
+    }
+
+    pub fn is_within_replay_window(&self, window_secs: u64) -> bool {
+        within_replay_window(self.created_at, window_secs)
+    }
+}
+
+/// Sent by a co-signer whose approval of a sign request is waiting on a human,
+/// so a requester announcing [`CAPABILITY_APPROVAL_PENDING`] keeps the round
+/// open up to its approval cap instead of abandoning it.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SignApprovalPendingPayload {
+    #[serde(with = "hex_bytes")]
+    pub session_id: [u8; 32],
+    pub share_index: u16,
+    pub created_at: u64,
+}
+
+impl SignApprovalPendingPayload {
+    pub fn new(session_id: [u8; 32], share_index: u16) -> Self {
+        Self {
+            session_id,
+            share_index,
             created_at: Timestamp::now().as_secs(),
         }
     }
@@ -2798,7 +2842,28 @@ mod tests {
             .capabilities
             .iter()
             .any(|c| c == CAPABILITY_TAPROOT_TWEAK));
+        assert!(announce
+            .capabilities
+            .iter()
+            .any(|c| c == CAPABILITY_APPROVAL_PENDING));
         assert!(announce.capabilities.iter().any(|c| c == "sign"));
+    }
+
+    /// The pending report round-trips, and a node that predates it fails to
+    /// parse it, which its receive path drops without a reply.
+    #[test]
+    fn approval_pending_round_trips_and_is_unknown_to_older_nodes() {
+        let msg = KfpMessage::SignApprovalPending(SignApprovalPendingPayload::new([7u8; 32], 2));
+        let json = msg.to_json().unwrap();
+        assert!(matches!(
+            KfpMessage::from_json(&json).unwrap(),
+            KfpMessage::SignApprovalPending(p) if p.session_id == [7u8; 32] && p.share_index == 2
+        ));
+        let older = json.replace("sign_approval_pending", "a_message_from_the_future");
+        assert!(KfpMessage::from_json(&older).is_err());
+
+        let zero = KfpMessage::SignApprovalPending(SignApprovalPendingPayload::new([7u8; 32], 0));
+        assert!(zero.validate().is_err());
     }
 
     /// A derivation path deeper than `MAX_DERIVATION_PATH_DEPTH` is refused at

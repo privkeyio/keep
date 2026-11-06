@@ -11,6 +11,7 @@ mod signing;
 mod transport;
 
 pub use psbt::PsbtSessionSnapshot;
+pub use signing::APPROVAL_ROUND_HARD_CAP;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
 pub(crate) use transport::{require_accepted, NostrTransport};
 pub use transport::{CosignTransport, RelayHealth, RelayHealthStatus};
@@ -398,6 +399,15 @@ impl From<&NetworkSession> for SessionInfo {
     }
 }
 
+/// How [`SigningHooks::begin_approval`] answers a sign request.
+pub enum Approval {
+    /// Decided now: `Ok` co-signs, `Err` refuses.
+    Decided(Result<()>),
+    /// Waiting on a human. Resolves to the decision, which counts only if it
+    /// arrives before the deadline the hook was given.
+    Pending(std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>),
+}
+
 /// Hooks for observing and controlling the signing process.
 ///
 /// Implementations should be non-blocking and return quickly to avoid
@@ -451,6 +461,24 @@ pub trait SigningHooks: Send + Sync {
     fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
         let _ = session;
         false
+    }
+
+    /// Called on a co-signer after [`Self::pre_sign`] allowed a sign request.
+    /// Return [`Approval::Pending`] when the decision waits on a human: the
+    /// node keeps answering other messages, tells a requester announcing
+    /// [`crate::CAPABILITY_APPROVAL_PENDING`] to hold the round open, and
+    /// refuses if the future has not resolved by `deadline`. The default
+    /// approves at once, leaving the whole decision to `pre_sign`.
+    ///
+    /// A hook that overrides this must keep `pre_sign` non-interactive: the
+    /// node calls it first for every request, and again once a pending
+    /// approval resolves in favor, before anything is committed, so it is
+    /// where the policy and the kill switch belong. The returned future must
+    /// not show anything until it is first polled: the node can still refuse
+    /// the request after this returns and drop the future unpolled.
+    fn begin_approval(&self, session: &SessionInfo, deadline: std::time::Instant) -> Approval {
+        let _ = (session, deadline);
+        Approval::Decided(Ok(()))
     }
 }
 
@@ -755,6 +783,12 @@ pub enum KfpNodeEvent {
         session_id: [u8; 32],
         signature: [u8; 64],
     },
+    /// A co-signer of a round this node requested is waiting on its human's
+    /// approval, so the round stays open up to [`APPROVAL_ROUND_HARD_CAP`].
+    CosignerApprovalPending {
+        session_id: [u8; 32],
+        share_index: u16,
+    },
     SigningFailed {
         session_id: [u8; 32],
         error: String,
@@ -978,6 +1012,14 @@ impl std::fmt::Debug for KfpNodeEvent {
                 .debug_struct("SignatureComplete")
                 .field("session_id", &hex::encode(session_id))
                 .field("signature", &hex::encode(signature))
+                .finish(),
+            Self::CosignerApprovalPending {
+                session_id,
+                share_index,
+            } => f
+                .debug_struct("CosignerApprovalPending")
+                .field("session_id", &hex::encode(session_id))
+                .field("share_index", share_index)
                 .finish(),
             Self::SigningFailed {
                 session_id,
@@ -1244,6 +1286,16 @@ pub struct KfpNode {
         >,
     >,
     learned_verifying_shares: RwLock<learning::LearnedVerifyingShares>,
+    /// Sign requests whose approval is waiting on a human, by session id.
+    pending_approvals: RwLock<HashMap<[u8; 32], signing::PendingApproval>>,
+    approval_tx: mpsc::Sender<signing::ApprovalOutcome>,
+    approval_rx: TokioMutex<Option<mpsc::Receiver<signing::ApprovalOutcome>>>,
+    approval_generation: std::sync::atomic::AtomicU64,
+    /// Sign requests a human denied, by session id, with when (seconds), so a
+    /// redelivered copy is not shown again.
+    denied_approvals: RwLock<HashMap<[u8; 32], u64>>,
+    /// Rounds this node requested that are still waiting for their signature.
+    requested_rounds: RwLock<HashMap<[u8; 32], signing::RequestedRound>>,
     /// The latest proof of each admitted member, relayed in this node's
     /// announces so members whose share lacks the set can learn it.
     member_proofs: RwLock<BTreeMap<u16, MemberProof>>,
@@ -1518,6 +1570,7 @@ impl KfpNode {
         let our_index = share.metadata.identifier;
         let (event_tx, _) = broadcast::channel(1000);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
+        let (approval_tx, approval_rx) = mpsc::channel(signing::MAX_PENDING_APPROVALS);
 
         let mut session_manager = match nonce_store {
             Some(store) => {
@@ -1576,6 +1629,12 @@ impl KfpNode {
             version_mismatch_reported: RwLock::new(HashSet::new()),
             early_commitments: RwLock::new(HashMap::new()),
             learned_verifying_shares: RwLock::new(learning::LearnedVerifyingShares::default()),
+            pending_approvals: RwLock::new(HashMap::new()),
+            approval_tx,
+            approval_rx: TokioMutex::new(Some(approval_rx)),
+            approval_generation: std::sync::atomic::AtomicU64::new(0),
+            denied_approvals: RwLock::new(HashMap::new()),
+            requested_rounds: RwLock::new(HashMap::new()),
             member_proofs: RwLock::new(BTreeMap::new()),
             hooks: RwLock::new(Arc::new(NoOpHooks)),
             event_tx,
@@ -2650,6 +2709,12 @@ impl KfpNode {
             .await
             .take()
             .ok_or_else(|| FrostNetError::Session("run() has already been started".into()))?;
+        let mut approval_rx = self
+            .approval_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| FrostNetError::Session("run() has already been started".into()))?;
         let mut notifications = self.transport.notifications();
 
         let since = Timestamp::now() - Duration::from_secs(300);
@@ -2811,7 +2876,13 @@ impl KfpNode {
                         }
                     }
                 }
+                Some(outcome) = approval_rx.recv() => {
+                    if let Err(e) = self.finish_approval(outcome).await {
+                        warn!(error = %e, "Failed to finish an approved sign request");
+                    }
+                }
                 _ = cleanup_interval.tick() => {
+                    self.expire_pending_approvals();
                     self.sessions.write().cleanup_expired();
                     self.ecdh_sessions.write().cleanup_expired();
                     self.oprf_sessions.write().cleanup_expired();
@@ -2867,6 +2938,10 @@ impl KfpNode {
                     }
                 }
             }
+        }
+
+        for (_, pending) in self.pending_approvals.write().drain() {
+            pending.abort();
         }
 
         // Cancel any in-flight background re-announce and await it, so its
@@ -2956,6 +3031,7 @@ impl KfpNode {
             KfpMessage::Commitment(p) => self.handle_commitment(sender, p).await,
             KfpMessage::SignatureShare(p) => self.handle_signature_share(sender, p).await,
             KfpMessage::SignatureComplete(p) => self.handle_signature_complete(sender, p).await,
+            KfpMessage::SignApprovalPending(p) => self.handle_sign_approval_pending(sender, p),
             KfpMessage::EcdhRequest(p) => self.handle_ecdh_request(sender, p).await,
             KfpMessage::EcdhShare(p) => self.handle_ecdh_share(sender, p).await,
             KfpMessage::EcdhComplete(p) => self.handle_ecdh_complete(sender, p).await,
