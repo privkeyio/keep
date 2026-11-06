@@ -11,8 +11,8 @@ mod signing;
 mod transport;
 
 pub use psbt::PsbtSessionSnapshot;
-pub use signing::APPROVAL_ROUND_HARD_CAP;
 pub(crate) use signing::SIGNING_ROUND_TIMEOUT;
+pub use signing::{APPROVAL_ROUND_HARD_CAP, MAX_FAILOVER_ATTEMPTS, MAX_SIGNING_REQUEST_DURATION};
 pub(crate) use transport::{require_accepted, NostrTransport};
 pub use transport::{CosignTransport, RelayHealth, RelayHealthStatus};
 
@@ -458,6 +458,10 @@ pub trait SigningHooks: Send + Sync {
     /// the node's own checks only prove whose output it is, not where the money
     /// goes. A co-signer opts in only where something decides that: a human who
     /// is shown the spend, or a destination and amount policy.
+    ///
+    /// When [`Self::begin_approval`] returns [`Approval::Pending`], this is
+    /// called again on the hooks in place once the human approves, so it must
+    /// be idempotent and must not prompt.
     fn approve_key_path_spend(&self, session: &SessionInfo) -> bool {
         let _ = session;
         false

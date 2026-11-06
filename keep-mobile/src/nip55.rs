@@ -336,9 +336,15 @@ fn spawn_async_with_timeout<T: Send + 'static>(
 
 const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
 
-/// One round held open for a co-signer's approval prompt, the pre-round
-/// liveness ping, one plain failover round, and margin.
-const FROST_SIGN_TIMEOUT: Duration = Duration::from_secs(90);
+/// The network budget of a signing request, plus this app's wait for its own
+/// user's answer (`SIGNING_RESPONSE_TIMEOUT`) on every failover attempt, plus
+/// margin, so a round a co-signer is still approving is not abandoned here
+/// first.
+const FROST_SIGN_TIMEOUT: Duration = Duration::from_secs(
+    keep_frost_net::MAX_SIGNING_REQUEST_DURATION.as_secs()
+        + keep_frost_net::MAX_FAILOVER_ATTEMPTS as u64 * crate::SIGNING_RESPONSE_TIMEOUT.as_secs()
+        + 5,
+);
 
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {

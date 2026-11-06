@@ -128,7 +128,7 @@ pub use node::{
     OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
     RefuseRawAndRequireStructuredHooks, RefuseRawSignatureHooks, RelayHealth, RelayHealthStatus,
     RequireStructuredPayloadHooks, ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
-    APPROVAL_ROUND_HARD_CAP,
+    APPROVAL_ROUND_HARD_CAP, MAX_FAILOVER_ATTEMPTS, MAX_SIGNING_REQUEST_DURATION,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};

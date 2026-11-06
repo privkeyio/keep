@@ -573,10 +573,23 @@ async fn an_instant_co_signer_waits_for_a_slow_approval() {
             })
         })
         .collect();
-    for rx in &mut rxs {
-        for _ in 0..2 {
-            wait_for(rx, |e| matches!(e, KfpNodeEvent::PeerDiscovered { .. })).await;
-        }
+    for (i, rx) in rxs.iter_mut().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        timeout(Duration::from_secs(30), async {
+            while seen.len() < 2 {
+                match rx.recv().await {
+                    Ok(KfpNodeEvent::PeerDiscovered { share_index, .. }) => {
+                        seen.insert(share_index);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("node {i}'s event channel closed")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("node {i} discovered only {seen:?}"));
     }
 
     let result = timeout(

@@ -14,7 +14,7 @@ use crate::protocol::*;
 use crate::session::{derive_session_id, derive_session_id_salted};
 use keep_core::frost::taproot::{self, TaprootTweak};
 
-use super::{Approval, KfpNode, KfpNodeEvent, NonceId, SessionInfo};
+use super::{Approval, KfpNode, KfpNodeEvent, NonceId, SessionInfo, SigningHooks};
 use crate::nonce_pool::{serialize_commitment, NoncePool};
 
 /// Per-round wait for the aggregated signature. Below the 20s peer announce
@@ -66,10 +66,28 @@ pub(crate) struct PendingApproval {
     deadline: tokio::time::Instant,
     generation: u64,
     task: tokio::task::AbortHandle,
+    outcome_queued: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PendingApproval {
     pub(crate) fn abort(&self) {
+        self.task.abort();
+    }
+
+    /// Whether the entry still holds the session: its prompt is open, or its
+    /// decision is already queued for the run loop and must still be handled.
+    /// A wait that panicked or was cancelled queued nothing, so its deadline
+    /// frees it.
+    fn is_live(&self, now: tokio::time::Instant) -> bool {
+        self.deadline > now
+            || self
+                .outcome_queued
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for PendingApproval {
+    fn drop(&mut self) {
         self.task.abort();
     }
 }
@@ -122,13 +140,24 @@ impl Drop for RequestedRoundGuard<'_> {
 /// Upper bound on failover retries for a single signing request. Caps the
 /// worst-case wall-clock cost of repeated round timeouts (each up to
 /// `SIGNING_ROUND_TIMEOUT`) under a partition or latency event.
-pub(crate) const MAX_FAILOVER_ATTEMPTS: usize = 3;
+pub const MAX_FAILOVER_ATTEMPTS: usize = 3;
 
 /// Wait for the pre-round liveness ping. A co-signer that dropped since its last
 /// announce is excluded after at most this long, instead of burning a full
 /// `SIGNING_ROUND_TIMEOUT` round. The ping returns as soon as every co-signer
 /// pongs, so the all-online path is bounded by one round-trip, not this value.
 const LIVENESS_PING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The longest [`KfpNode::request_signature`] can take outside this node's
+/// own `pre_sign`, which runs once per failover attempt and is not bounded
+/// here: the one liveness ping before the first attempt, every attempt held
+/// open for a co-signer's approval, and a margin. A caller's timeout shorter
+/// than this can abandon a round a co-signer is still approving.
+pub const MAX_SIGNING_REQUEST_DURATION: Duration = Duration::from_secs(
+    LIVENESS_PING_TIMEOUT.as_secs()
+        + MAX_FAILOVER_ATTEMPTS as u64 * APPROVAL_ROUND_HARD_CAP.as_secs()
+        + 5,
+);
 
 /// Error from a single signing round. `attempted` lists the non-self peers that
 /// failed to respond in this round, so a timed-out round can exclude them and
@@ -752,49 +781,39 @@ impl KfpNode {
             }
         }
 
+        // Before the key-path check, so a redelivered copy of a request already
+        // awaiting approval, denied, or consumed never runs that hook again.
+        let Some(admission) = self.admit_for_approval(&from, &request, requester).await? else {
+            return Ok(());
+        };
+
+        // A request referencing our pooled nonce that we no longer hold cannot
+        // be signed, so the requester is told to fall back before any prompt.
+        if let Some(missing) = self.stale_own_nonce(&request) {
+            return self.signal_stale_nonce(&from, &request, missing).await;
+        }
+
         // A key-path spend: the input must spend this group's output for the
         // path and tweak, under SIGHASH_DEFAULT or ALL, before anything is
         // committed. The structured payload is present (protocol validation)
         // and already proven to hash to `message` above.
         let hooks = self.hooks.read().clone();
-        if let Some(tweak) = request.taproot_tweak {
-            let check = self
-                .check_key_path_spend(
-                    &request.message_type,
-                    request.structured_payload.as_deref(),
-                    &request.derivation_path,
-                    tweak,
-                )
-                .and_then(|_| {
-                    if hooks.approve_key_path_spend(&session_info) {
-                        Ok(())
-                    } else {
-                        Err(FrostNetError::PolicyViolation(
-                            "this co-signer does not approve key-path spends".into(),
-                        ))
-                    }
-                });
-            if let Err(e) = check {
-                warn!(
-                    session_id = %hex::encode(request.session_id),
-                    error = %e,
-                    "Sign request refused: key-path spend check failed"
-                );
-                self.record_refusal(&request, Some(requester));
-                self.send_session_error(
-                    &from,
-                    "policy_violation",
-                    &e.to_string(),
-                    request.session_id,
-                )
-                .await?;
-                return Ok(());
-            }
-        }
-
-        let Some(admission) = self.admit_for_approval(&from, &request, requester).await? else {
+        if let Err(e) = self.check_key_path_request(hooks.as_ref(), &request, &session_info) {
+            warn!(
+                session_id = %hex::encode(request.session_id),
+                error = %e,
+                "Sign request refused: key-path spend check failed"
+            );
+            self.record_refusal(&request, Some(requester));
+            self.send_session_error(
+                &from,
+                "policy_violation",
+                &e.to_string(),
+                request.session_id,
+            )
+            .await?;
             return Ok(());
-        };
+        }
 
         // After the key-path check, not before: these hooks are where a human
         // approval prompt and the kill switch refuse, and a prompt must never be
@@ -825,11 +844,89 @@ impl KfpNode {
                 )
                 .await
             }
+            Approval::Pending(_) if self.approvals_full(requester) => {
+                let busy = FrostNetError::PolicyViolation(
+                    "too many sign requests are already awaiting approval".into(),
+                );
+                self.refuse_by_policy(&from, &request, requester, &busy)
+                    .await
+            }
             Approval::Pending(approval) => {
                 self.hold_for_approval(from, request, requester, admission.deadline, approval)
                     .await
             }
         }
+    }
+
+    /// The key-path spend checks for a request carrying a taproot tweak, the
+    /// hook's approval included. A request without one passes.
+    fn check_key_path_request(
+        &self,
+        hooks: &dyn SigningHooks,
+        request: &SignRequestPayload,
+        session_info: &SessionInfo,
+    ) -> Result<()> {
+        let Some(tweak) = request.taproot_tweak else {
+            return Ok(());
+        };
+        self.check_key_path_spend(
+            &request.message_type,
+            request.structured_payload.as_deref(),
+            &request.derivation_path,
+            tweak,
+        )?;
+        if hooks.approve_key_path_spend(session_info) {
+            Ok(())
+        } else {
+            Err(FrostNetError::PolicyViolation(
+                "this co-signer does not approve key-path spends".into(),
+            ))
+        }
+    }
+
+    /// The id of our own pooled nonce that `request` references, if any. The
+    /// sentinel id ([0u8; 32]) marks the requester's echo-only commitment,
+    /// never our consumable nonce, so it is excluded.
+    fn own_nonce_ref(&self, request: &SignRequestPayload) -> Option<[u8; 32]> {
+        request
+            .nonce_refs
+            .iter()
+            .find(|nref| {
+                nref.share_index == self.share.metadata.identifier && nref.nonce_id != [0u8; 32]
+            })
+            .map(|nref| nref.nonce_id)
+    }
+
+    /// Our own pooled nonce that `request` references but we no longer hold.
+    fn stale_own_nonce(&self, request: &SignRequestPayload) -> Option<[u8; 32]> {
+        self.own_nonce_ref(request)
+            .filter(|id| !self.nonce_pool.contains_own(id))
+    }
+
+    /// The requester reserved one of our pooled commitments and already
+    /// embedded it in its own session, skipping the interactive commitment
+    /// round. If we no longer hold the referenced secret nonce (consumed,
+    /// evicted, or lost on restart), we cannot reproduce that commitment:
+    /// sending a fresh one would collide on the requester as a duplicate and
+    /// hang it until timeout. Signal the requester so it fails fast.
+    async fn signal_stale_nonce(
+        &self,
+        from: &PublicKey,
+        request: &SignRequestPayload,
+        missing: [u8; 32],
+    ) -> Result<()> {
+        warn!(
+            session_id = %hex::encode(request.session_id),
+            nonce_id = %hex::encode(missing),
+            "Referenced pre-exchanged nonce unavailable; signaling requester"
+        );
+        self.send_session_error(
+            from,
+            "stale_nonce",
+            "Referenced pre-exchanged nonce no longer available",
+            request.session_id,
+        )
+        .await
     }
 
     fn sign_request_info(&self, request: &SignRequestPayload, requester: u16) -> SessionInfo {
@@ -908,11 +1005,9 @@ impl KfpNode {
         let held_by = {
             let mut pending = self.pending_approvals.write();
             match pending.get(&request.session_id) {
-                Some(entry) if entry.deadline > now => Some(entry.requester),
+                Some(entry) if entry.is_live(now) => Some(entry.requester),
                 Some(_) => {
-                    if let Some(stale) = pending.remove(&request.session_id) {
-                        stale.abort();
-                    }
+                    pending.remove(&request.session_id);
                     None
                 }
                 None => None,
@@ -959,22 +1054,6 @@ impl KfpNode {
             }
         }
 
-        let full = {
-            let pending = self.pending_approvals.read();
-            let live = || pending.values().filter(|p| p.deadline > now);
-            live().count() >= MAX_PENDING_APPROVALS
-                || live().filter(|p| p.requester == requester).count()
-                    >= MAX_PENDING_APPROVALS_PER_REQUESTER
-        };
-        if full {
-            let busy = FrostNetError::PolicyViolation(
-                "too many sign requests are already awaiting approval".into(),
-            );
-            self.refuse_by_policy(from, request, requester, &busy)
-                .await?;
-            return Ok(None);
-        }
-
         let age = Timestamp::now()
             .as_secs()
             .saturating_sub(request.created_at);
@@ -995,6 +1074,15 @@ impl KfpNode {
             deadline: now + Duration::from_secs(window),
             too_old_to_prompt: age >= max_age,
         }))
+    }
+
+    fn approvals_full(&self, requester: u16) -> bool {
+        let now = tokio::time::Instant::now();
+        let pending = self.pending_approvals.read();
+        let live = || pending.values().filter(|p| p.is_live(now));
+        live().count() >= MAX_PENDING_APPROVALS
+            || live().filter(|p| p.requester == requester).count()
+                >= MAX_PENDING_APPROVALS_PER_REQUESTER
     }
 
     fn was_denied(&self, session_id: &[u8; 32]) -> bool {
@@ -1036,21 +1124,24 @@ impl KfpNode {
             .approval_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tx = self.approval_tx.clone();
+        let outcome_queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let queued = std::sync::Arc::clone(&outcome_queued);
         let task = tokio::spawn(async move {
             let verdict = match tokio::time::timeout_at(deadline, approval).await {
                 Ok(Ok(())) => Verdict::Approved,
                 Ok(Err(e)) => Verdict::Denied(e),
                 Err(_) => Verdict::TimedOut,
             };
-            let _ = tx
-                .send(ApprovalOutcome {
+            if let Ok(permit) = tx.reserve().await {
+                queued.store(true, std::sync::atomic::Ordering::Release);
+                permit.send(ApprovalOutcome {
                     from,
                     request,
                     requester,
                     generation,
                     verdict,
-                })
-                .await;
+                });
+            }
         });
         let replaced = self.pending_approvals.write().insert(
             session_id,
@@ -1059,6 +1150,7 @@ impl KfpNode {
                 deadline,
                 generation,
                 task: task.abort_handle(),
+                outcome_queued,
             },
         );
         if let Some(replaced) = replaced {
@@ -1135,6 +1227,12 @@ impl KfpNode {
         requester: u16,
         pending: &PendingApproval,
     ) -> Result<()> {
+        // First, so an approval that landed late runs no hook.
+        if tokio::time::Instant::now() >= pending.deadline {
+            return Err(FrostNetError::Timeout(
+                "approval arrived after the round's deadline".into(),
+            ));
+        }
         if self.is_entropy_degraded() {
             return Err(FrostNetError::PolicyViolation(
                 "OS RNG health check failed; co-signing refused".into(),
@@ -1156,26 +1254,19 @@ impl KfpNode {
             )));
         }
         let hooks = self.hooks.read().clone();
-        hooks.pre_sign(&self.sign_request_info(request, requester))?;
-        if tokio::time::Instant::now() >= pending.deadline {
-            return Err(FrostNetError::Timeout(
-                "approval arrived after the round's deadline".into(),
-            ));
-        }
-        Ok(())
+        let session_info = self.sign_request_info(request, requester);
+        self.check_key_path_request(hooks.as_ref(), request, &session_info)?;
+        hooks.pre_sign(&session_info)
     }
 
     /// Drop pending approvals whose deadline has passed, cancelling the wait,
-    /// and denials older than the replay window.
+    /// unless their decision is already queued, and denials older than the
+    /// replay window.
     pub(crate) fn expire_pending_approvals(&self) {
         let now = tokio::time::Instant::now();
-        self.pending_approvals.write().retain(|_, pending| {
-            let live = pending.deadline > now;
-            if !live {
-                pending.abort();
-            }
-            live
-        });
+        self.pending_approvals
+            .write()
+            .retain(|_, pending| pending.is_live(now));
         let now = Timestamp::now().as_secs();
         self.denied_approvals
             .write()
@@ -1190,45 +1281,16 @@ impl KfpNode {
         request: SignRequestPayload,
         requester: u16,
     ) -> Result<()> {
-        // Locate the requester's reference to our own pre-exchanged nonce, if
-        // any. The sentinel id ([0u8; 32]) marks the requester's echo-only
-        // commitment, never our consumable nonce, so it is excluded here.
         // Pre-exchange applies only when we still hold the referenced single-use
         // secret nonce; check availability without consuming so the nonce_refs
-        // can be fully validated before the nonce is burned.
-        let own_nonce_id = request
-            .nonce_refs
-            .iter()
-            .find(|nref| {
-                nref.share_index == self.share.metadata.identifier && nref.nonce_id != [0u8; 32]
-            })
-            .map(|nref| nref.nonce_id);
+        // can be fully validated before the nonce is burned. Checked again
+        // here because the pool can lose the nonce while a prompt is open.
+        let own_nonce_id = self.own_nonce_ref(&request);
         let used_pre_exchange = own_nonce_id
             .map(|id| self.nonce_pool.contains_own(&id))
             .unwrap_or(false);
-
-        // The requester reserved one of our pooled commitments and already
-        // embedded it in its own session, skipping the interactive commitment
-        // round. If we no longer hold the referenced secret nonce (consumed,
-        // evicted, or lost on restart), we cannot reproduce that commitment:
-        // sending a fresh one would collide on the requester as a duplicate and
-        // hang it until timeout. Signal the requester so it fails fast.
-        if let Some(missing) = own_nonce_id {
-            if !used_pre_exchange {
-                warn!(
-                    session_id = %hex::encode(request.session_id),
-                    nonce_id = %hex::encode(missing),
-                    "Referenced pre-exchanged nonce unavailable; signaling requester"
-                );
-                self.send_session_error(
-                    &from,
-                    "stale_nonce",
-                    "Referenced pre-exchanged nonce no longer available",
-                    request.session_id,
-                )
-                .await?;
-                return Ok(());
-            }
+        if let Some(missing) = own_nonce_id.filter(|_| !used_pre_exchange) {
+            return self.signal_stale_nonce(&from, &request, missing).await;
         }
 
         // When pre-exchange is used, the requester includes every participant's
@@ -2669,8 +2731,19 @@ impl KfpNode {
                     }
                     // `Lagged` is recoverable: the receiver stays live, so keep
                     // waiting rather than aborting a valid signing round. Mirrors
-                    // the ECDH recv loop (#562).
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    // the ECDH recv loop (#562). A pending report lost in the
+                    // lag is still on record, so it extends the round all the
+                    // same.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if self
+                            .requested_rounds
+                            .read()
+                            .get(&session_id)
+                            .is_some_and(|round| !round.pending.is_empty())
+                        {
+                            deadline = deadline.max(approval_deadline);
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Some(Err(PeerRoundFailure {
                             error: "Event channel closed".into(),
@@ -3496,6 +3569,163 @@ mod gate_tests {
         assert!(hooks.approvals.lock().is_empty());
     }
 
+    /// Approves key-path spends while `approve` holds, counting each ask, and
+    /// prompts with a future that approves once `release` is notified.
+    struct PromptingKeyPathHooks {
+        approve: bool,
+        asked: std::sync::atomic::AtomicUsize,
+        pre_signs: std::sync::atomic::AtomicUsize,
+        prompts: std::sync::atomic::AtomicUsize,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl PromptingKeyPathHooks {
+        fn new(approve: bool) -> Self {
+            Self {
+                approve,
+                asked: Default::default(),
+                pre_signs: Default::default(),
+                prompts: Default::default(),
+                release: Default::default(),
+            }
+        }
+    }
+
+    impl crate::SigningHooks for PromptingKeyPathHooks {
+        fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+            self.pre_signs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+        fn approve_key_path_spend(&self, _session: &SessionInfo) -> bool {
+            self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.approve
+        }
+        fn begin_approval(
+            &self,
+            _session: &SessionInfo,
+            _deadline: std::time::Instant,
+        ) -> crate::Approval {
+            self.prompts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let release = std::sync::Arc::clone(&self.release);
+            crate::Approval::Pending(Box::pin(async move {
+                release.notified().await;
+                Ok(())
+            }))
+        }
+    }
+
+    /// A copy of a key-path spend already awaiting approval is ignored before
+    /// the key-path hook, so that hook is asked once.
+    #[tokio::test]
+    async fn a_redelivered_key_path_spend_asks_the_hook_once() {
+        let (node, _relay, peer) = node_with_requester().await;
+        let hooks = std::sync::Arc::new(PromptingKeyPathHooks::new(true));
+        node.set_hooks(hooks.clone());
+        let path = [0u32, 2];
+        let tweak = TaprootTweakPayload::default();
+        let req = key_spend_request(&node, &own_output(&node, &path, tweak), 0x00, &path, tweak);
+        let session_id = req.session_id;
+        node.handle_sign_request(peer, req.clone()).await.unwrap();
+        node.handle_sign_request(peer, req).await.unwrap();
+
+        assert!(node.pending_approvals.read().contains_key(&session_id));
+        assert_eq!(hooks.prompts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(hooks.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!refused(&node, &session_id));
+    }
+
+    /// An approved key-path spend is checked against the hooks in place when
+    /// the approval lands: hooks swapped during the prompt to ones refusing
+    /// key-path spends stop it before any commitment.
+    #[tokio::test]
+    async fn hooks_swapped_during_a_prompt_decide_the_key_path_spend() {
+        for swap_to in [None, Some(false), Some(true)] {
+            let (node, _relay, peer) = node_with_requester().await;
+            let prompting = std::sync::Arc::new(PromptingKeyPathHooks::new(true));
+            node.set_hooks(prompting.clone());
+            let path = [0u32, 2];
+            let tweak = TaprootTweakPayload::default();
+            let req =
+                key_spend_request(&node, &own_output(&node, &path, tweak), 0x00, &path, tweak);
+            let session_id = req.session_id;
+            node.handle_sign_request(peer, req).await.unwrap();
+            assert!(node.pending_approvals.read().contains_key(&session_id));
+
+            let swapped = swap_to.map(|approve| {
+                let hooks = std::sync::Arc::new(RecordingHooks::approving(approve));
+                node.set_hooks(hooks.clone());
+                hooks
+            });
+            prompting.release.notify_one();
+            let mut outcomes = node.approval_rx.lock().await.take().unwrap();
+            let outcome = outcomes.recv().await.unwrap();
+            node.finish_approval(outcome).await.unwrap();
+
+            let signs = swap_to.unwrap_or(true);
+            let case = format!("swap_to={swap_to:?}");
+            assert_eq!(
+                node.sessions.read().get_session(&session_id).is_some(),
+                signs,
+                "{case}"
+            );
+            assert_eq!(refused(&node, &session_id), !signs, "{case}");
+            if let Some(hooks) = swapped {
+                assert_eq!(*hooks.approvals.lock(), vec![Some(tweak)], "{case}");
+            }
+        }
+    }
+
+    /// An approval that lands after its deadline is refused as late before
+    /// any hook runs again, and nothing is committed.
+    #[tokio::test]
+    async fn a_late_approval_runs_no_hook() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (node, _relay, peer) = node_with_requester().await;
+        let hooks = std::sync::Arc::new(PromptingKeyPathHooks::new(true));
+        node.set_hooks(hooks.clone());
+        let path = [0u32, 2];
+        let tweak = TaprootTweakPayload::default();
+        let req = key_spend_request(&node, &own_output(&node, &path, tweak), 0x00, &path, tweak);
+        let session_id = req.session_id;
+        node.handle_sign_request(peer, req).await.unwrap();
+        assert_eq!(
+            (hooks.asked.load(SeqCst), hooks.pre_signs.load(SeqCst)),
+            (1, 1)
+        );
+
+        hooks.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !node.pending_approvals.read()[&session_id]
+                .outcome_queued
+                .load(SeqCst)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the approval is queued");
+        node.pending_approvals
+            .write()
+            .get_mut(&session_id)
+            .unwrap()
+            .deadline = tokio::time::Instant::now();
+
+        let mut outcomes = node.approval_rx.lock().await.take().unwrap();
+        let outcome = outcomes.recv().await.unwrap();
+        assert!(matches!(outcome.verdict, Verdict::Approved));
+        node.finish_approval(outcome).await.unwrap();
+
+        assert!(refused(&node, &session_id));
+        assert!(node.sessions.read().get_session(&session_id).is_none());
+        assert_eq!(
+            (hooks.asked.load(SeqCst), hooks.pre_signs.load(SeqCst)),
+            (1, 1)
+        );
+    }
+
     /// The liveness prune judges only peers a round could select, so an old peer
     /// that cannot take part in a key-path spend is not counted as a spare.
     #[tokio::test]
@@ -4175,8 +4405,99 @@ mod approval_tests {
         }
     }
 
-    fn expired_notice_sent(node: &KfpNode, session_id: &[u8; 32]) -> bool {
-        refused(node, session_id) && !node.pending_approvals.read().contains_key(session_id)
+    /// Keeps every event a node sends, in place of a relay. Ephemeral KFP
+    /// events are not stored by a relay, so they cannot be fetched back there.
+    struct RecordingTransport {
+        sent: parking_lot::Mutex<Vec<Event>>,
+        notifications: tokio::sync::broadcast::Sender<RelayPoolNotification>,
+    }
+
+    impl crate::node::CosignTransport for RecordingTransport {
+        fn send_event<'a>(
+            &'a self,
+            event: &'a Event,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            self.sent.lock().push(event.clone());
+            Box::pin(async { Ok(()) })
+        }
+        fn subscribe<'a>(
+            &'a self,
+            _filter: Filter,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fetch_events<'a>(
+            &'a self,
+            filter: Filter,
+            _timeout: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Event>>> + Send + 'a>>
+        {
+            let matched = self
+                .sent
+                .lock()
+                .iter()
+                .filter(|e| filter.match_event(e, MatchEventOptions::default()))
+                .cloned()
+                .collect();
+            Box::pin(async { Ok(matched) })
+        }
+        fn notifications(&self) -> tokio::sync::broadcast::Receiver<RelayPoolNotification> {
+            self.notifications.subscribe()
+        }
+        fn relay_health<'a>(
+            &'a self,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<crate::node::RelayHealth>> + Send + 'a>,
+        > {
+            Box::pin(async { Vec::new() })
+        }
+    }
+
+    /// Identifier 1 of a 2-of-3 group, over a [`RecordingTransport`].
+    fn recording_node() -> KfpNode {
+        let dealer = TrustedDealer::new(ThresholdConfig::two_of_three());
+        let (mut shares, _) = dealer.generate("approval-recording-test").unwrap();
+        let share = shares.remove(0);
+        let keys = crate::node::derive_keys_from_share(&share).unwrap();
+        let transport = Arc::new(RecordingTransport {
+            sent: Default::default(),
+            notifications: tokio::sync::broadcast::channel(16).0,
+        });
+        KfpNode::assemble(
+            share,
+            keys,
+            transport,
+            None,
+            None,
+            Arc::new(crate::node::pin_report::PinReports::new()),
+        )
+        .unwrap()
+    }
+
+    /// The session errors `node` sent to `keys`, decrypted as that recipient.
+    async fn errors_sent_to(node: &KfpNode, keys: &Keys) -> Vec<ErrorPayload> {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KFP_EVENT_KIND))
+            .author(node.keys.public_key())
+            .pubkey(keys.public_key());
+        node.transport
+            .fetch_events(filter, Duration::from_secs(2))
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|ev| match KfpEventBuilder::decrypt_message(keys, ev) {
+                Ok(KfpMessage::Error(error)) => Some(error),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn codes(errors: &[ErrorPayload], session_id: &[u8; 32]) -> Vec<String> {
+        errors
+            .iter()
+            .filter(|e| e.session_id == Some(*session_id))
+            .map(|e| e.code.clone())
+            .collect()
     }
 
     /// A prompt for a request too old to finish inside the requester's round
@@ -4197,8 +4518,8 @@ mod approval_tests {
             (false, 13, true),
             (false, 0, true),
         ] {
-            let (node, _relay) = test_node().await;
-            let (_, peer) = approval_peer(capable);
+            let node = recording_node();
+            let (keys, peer) = approval_peer(capable);
             let from = peer.pubkey;
             node.peers.write().add_peer(peer);
             let hooks = Arc::new(PollingHooks::default());
@@ -4216,8 +4537,240 @@ mod approval_tests {
                 usize::from(shown),
                 "{case}"
             );
-            assert_eq!(expired_notice_sent(&node, &session_id), !shown, "{case}");
+            assert_eq!(refused(&node, &session_id), !shown, "{case}");
+            assert_eq!(
+                node.pending_approvals.read().contains_key(&session_id),
+                shown,
+                "{case}"
+            );
+            let expected: Vec<String> = if shown {
+                Vec::new()
+            } else {
+                vec!["request_expired".into()]
+            };
+            assert_eq!(
+                codes(&errors_sent_to(&node, &keys).await, &session_id),
+                expected,
+                "{case}"
+            );
         }
+    }
+
+    /// An open prompt is cancelled with the node that holds it, even when the
+    /// node's run loop never drains it.
+    #[tokio::test]
+    async fn an_open_prompt_does_not_outlive_its_node() {
+        let (node, _relay) = test_node().await;
+        let (_, peer) = approval_peer(true);
+        let from = peer.pubkey;
+        node.peers.write().add_peer(peer);
+        let hooks = Arc::new(PollingHooks::default());
+        node.set_hooks(hooks.clone());
+
+        node.handle_sign_request(from, request_for(&node, [0x81; 32], 0))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(hooks.polls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&hooks.polls), 2, "the prompt is open");
+
+        drop(node);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(Arc::strong_count(&hooks.polls), 1, "the prompt was dropped");
+    }
+
+    /// A request referencing our pooled nonce that is gone is answered with
+    /// `stale_nonce` before any hook, so no prompt is shown for it.
+    #[tokio::test]
+    async fn a_stale_nonce_reference_never_reaches_the_hook() {
+        let node = recording_node();
+        let (keys, peer) = approval_peer(true);
+        let from = peer.pubkey;
+        node.peers.write().add_peer(peer);
+        let hooks = Arc::new(PollingHooks::default());
+        node.set_hooks(hooks.clone());
+
+        let kp = node.share.key_package().unwrap();
+        let (_, commitment) = node.commit_nonces(kp.signing_share()).unwrap();
+        let request = request_for(&node, [0x61; 32], 0).with_nonce_refs(vec![NonceRef {
+            share_index: 1,
+            nonce_id: [7; 32],
+            commitment: serialize_commitment(&commitment).unwrap(),
+        }]);
+        let session_id = request.session_id;
+        node.handle_sign_request(from, request).await.unwrap();
+
+        assert_eq!(hooks.pre_signs.load(Ordering::SeqCst), 0);
+        assert_eq!(hooks.prompts.load(Ordering::SeqCst), 0);
+        assert!(!node.pending_approvals.read().contains_key(&session_id));
+        assert_eq!(
+            codes(&errors_sent_to(&node, &keys).await, &session_id),
+            vec!["stale_nonce".to_string()]
+        );
+    }
+
+    /// Denies as soon as the prompt is polled.
+    #[derive(Default)]
+    struct DenyingHooks {
+        prompts: AtomicUsize,
+    }
+
+    impl crate::SigningHooks for DenyingHooks {
+        fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+            Ok(())
+        }
+        fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+        fn begin_approval(
+            &self,
+            _session: &SessionInfo,
+            _deadline: std::time::Instant,
+        ) -> crate::Approval {
+            self.prompts.fetch_add(1, Ordering::SeqCst);
+            crate::Approval::Pending(Box::pin(async {
+                Err(FrostNetError::PolicyViolation("denied".into()))
+            }))
+        }
+    }
+
+    /// A denial already queued for the run loop when its deadline passes is
+    /// kept through expiry, so it is still remembered and refuses a copy
+    /// without another prompt.
+    #[tokio::test]
+    async fn a_denial_queued_past_the_deadline_is_still_remembered() {
+        let (node, _relay) = test_node().await;
+        let (_, peer) = approval_peer(true);
+        let from = peer.pubkey;
+        node.peers.write().add_peer(peer);
+        let hooks = Arc::new(DenyingHooks::default());
+        node.set_hooks(hooks.clone());
+
+        let request = request_for(&node, [0x91; 32], 0);
+        let session_id = request.session_id;
+        node.handle_sign_request(from, request.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !node.pending_approvals.read()[&session_id]
+                .outcome_queued
+                .load(Ordering::SeqCst)
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the denial is queued");
+        node.pending_approvals
+            .write()
+            .get_mut(&session_id)
+            .unwrap()
+            .deadline = tokio::time::Instant::now();
+
+        node.expire_pending_approvals();
+        assert!(node.pending_approvals.read().contains_key(&session_id));
+        node.handle_sign_request(from, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(hooks.prompts.load(Ordering::SeqCst), 1);
+
+        let mut outcomes = node.approval_rx.lock().await.take().unwrap();
+        let outcome = outcomes.recv().await.unwrap();
+        node.finish_approval(outcome).await.unwrap();
+        assert!(node.was_denied(&session_id));
+        node.handle_sign_request(from, request).await.unwrap();
+        assert_eq!(hooks.prompts.load(Ordering::SeqCst), 1);
+    }
+
+    /// Opens a prompt whose wait panics.
+    struct PanickingHooks;
+
+    impl crate::SigningHooks for PanickingHooks {
+        fn pre_sign(&self, _session: &SessionInfo) -> Result<()> {
+            Ok(())
+        }
+        fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+        fn begin_approval(
+            &self,
+            _session: &SessionInfo,
+            _deadline: std::time::Instant,
+        ) -> crate::Approval {
+            crate::Approval::Pending(Box::pin(async { panic!("the prompt crashed") }))
+        }
+    }
+
+    /// A prompt whose wait panicked queued no decision, so its deadline frees
+    /// the session and the requester's slot, and a copy is asked about again.
+    #[tokio::test]
+    async fn a_panicked_prompt_frees_its_slot_at_the_deadline() {
+        let (node, _relay) = test_node().await;
+        let (_, peer) = approval_peer(true);
+        let from = peer.pubkey;
+        node.peers.write().add_peer(peer);
+        node.set_hooks(Arc::new(PanickingHooks));
+        hold_prompts(&node, MAX_PENDING_APPROVALS_PER_REQUESTER - 1, 0, true);
+
+        let request = request_for(&node, [0xA1; 32], 0);
+        let session_id = request.session_id;
+        node.handle_sign_request(from, request.clone())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !node.pending_approvals.read()[&session_id]
+                .task
+                .is_finished()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the prompt's wait ended");
+        node.pending_approvals
+            .write()
+            .get_mut(&session_id)
+            .unwrap()
+            .deadline = tokio::time::Instant::now();
+
+        node.expire_pending_approvals();
+        assert!(!node.pending_approvals.read().contains_key(&session_id));
+        assert!(!node.approvals_full(2));
+
+        let hooks = Arc::new(PollingHooks::default());
+        node.set_hooks(hooks.clone());
+        node.handle_sign_request(from, request).await.unwrap();
+        assert_eq!(hooks.prompts.load(Ordering::SeqCst), 1);
+        assert!(node.pending_approvals.read().contains_key(&session_id));
+        assert!(!refused(&node, &session_id));
+    }
+
+    /// A pending report the requester's round loop misses to a lagged event
+    /// channel is still on record, so it holds the round open all the same.
+    #[tokio::test]
+    async fn a_pending_report_lost_to_lag_still_extends_the_round() {
+        let (node, _relay) = test_node().await;
+        let two = Keys::generate().public_key();
+        node.peers.write().add_peer(Peer::new(two, 2));
+        let node = Arc::new(node);
+        let requester = Arc::clone(&node);
+        let request =
+            tokio::spawn(async move { requester.request_signature(vec![0x71; 32], "test").await });
+        let session_id = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(id) = node.requested_rounds.read().keys().next().copied() {
+                    return id;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request opens its round");
+
+        node.handle_sign_approval_pending(two, SignApprovalPendingPayload::new(session_id, 2))
+            .unwrap();
+        for _ in 0..1100 {
+            let _ = node.event_tx.send(KfpNodeEvent::EntropyDegraded);
+        }
+        tokio::time::sleep(SIGNING_ROUND_TIMEOUT + Duration::from_secs(2)).await;
+        assert!(!request.is_finished(), "the round is still held open");
+        request.abort();
     }
 
     /// A hook that decides at once gets no age gate, as before prompts could
@@ -4294,6 +4847,7 @@ mod approval_tests {
                 deadline: tokio::time::Instant::now() + APPROVAL_ROUND_HARD_CAP,
                 generation: u64::MAX,
                 task: tokio::spawn(async {}).abort_handle(),
+                outcome_queued: Default::default(),
             },
         );
         node.handle_sign_request(from, other_request).await.unwrap();
@@ -4327,6 +4881,7 @@ mod approval_tests {
                 deadline: tokio::time::Instant::now() + APPROVAL_ROUND_HARD_CAP,
                 generation: 2,
                 task: tokio::spawn(async {}).abort_handle(),
+                outcome_queued: Default::default(),
             },
         );
         node.finish_approval(ApprovalOutcome {
@@ -4466,11 +5021,36 @@ mod approval_tests {
         assert_eq!(hooks.calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Holds `from_requester` prompts for requester 2 and `from_others` for
+    /// requester 3, live or past their deadline with the wait still running.
+    fn hold_prompts(node: &KfpNode, from_requester: usize, from_others: usize, live: bool) {
+        let held = (0..from_requester)
+            .map(|_| 2)
+            .chain((0..from_others).map(|_| 3));
+        for (i, requester) in held.enumerate() {
+            node.pending_approvals.write().insert(
+                [i as u8; 32],
+                PendingApproval {
+                    requester,
+                    deadline: if live {
+                        tokio::time::Instant::now() + APPROVAL_ROUND_HARD_CAP
+                    } else {
+                        tokio::time::Instant::now()
+                    },
+                    generation: i as u64,
+                    task: tokio::spawn(std::future::pending::<()>()).abort_handle(),
+                    outcome_queued: Default::default(),
+                },
+            );
+        }
+    }
+
     /// A requester already holding its share of open prompts is refused
     /// before another is shown, as is anyone once the node holds its total.
+    /// The prompt is dropped unpolled.
     #[tokio::test]
     async fn open_prompts_are_capped_per_requester_and_in_total() {
-        for (from_requester, from_others, live, asked) in [
+        for (from_requester, from_others, live, shown) in [
             (MAX_PENDING_APPROVALS_PER_REQUESTER - 1, 0, true, true),
             (MAX_PENDING_APPROVALS_PER_REQUESTER, 0, true, false),
             (MAX_PENDING_APPROVALS_PER_REQUESTER, 0, false, true),
@@ -4482,39 +5062,53 @@ mod approval_tests {
             let (_, peer) = approval_peer(true);
             let from = peer.pubkey;
             node.peers.write().add_peer(peer);
-            let hooks = Arc::new(CountingHooks::default());
+            let hooks = Arc::new(PollingHooks::default());
             node.set_hooks(hooks.clone());
-            let held = (0..from_requester)
-                .map(|_| 2)
-                .chain((0..from_others).map(|_| 3));
-            for (i, requester) in held.enumerate() {
-                node.pending_approvals.write().insert(
-                    [i as u8; 32],
-                    PendingApproval {
-                        requester,
-                        deadline: if live {
-                            tokio::time::Instant::now() + APPROVAL_ROUND_HARD_CAP
-                        } else {
-                            tokio::time::Instant::now()
-                        },
-                        generation: i as u64,
-                        task: tokio::spawn(async {}).abort_handle(),
-                    },
-                );
-            }
+            hold_prompts(&node, from_requester, from_others, live);
 
             let request = request_for(&node, [0xC0; 32], 0);
             let session_id = request.session_id;
             node.handle_sign_request(from, request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
 
             let case = format!("requester={from_requester} others={from_others} live={live}");
             assert_eq!(
-                hooks.calls.load(Ordering::SeqCst),
-                usize::from(asked),
+                hooks.polls.load(Ordering::SeqCst),
+                usize::from(shown),
                 "{case}"
             );
-            assert_eq!(refused(&node, &session_id), !asked, "{case}");
+            assert_eq!(refused(&node, &session_id), !shown, "{case}");
+            assert_eq!(
+                node.pending_approvals.read().contains_key(&session_id),
+                shown,
+                "{case}"
+            );
         }
+    }
+
+    /// A hook that decides at once takes no prompt slot, so it signs even
+    /// when every slot is held.
+    #[tokio::test]
+    async fn a_decided_hook_signs_when_every_prompt_slot_is_held() {
+        let (node, _relay) = test_node().await;
+        let (_, peer) = approval_peer(true);
+        let from = peer.pubkey;
+        node.peers.write().add_peer(peer);
+        let hooks = Arc::new(CountingHooks::default());
+        node.set_hooks(hooks.clone());
+        hold_prompts(
+            &node,
+            MAX_PENDING_APPROVALS_PER_REQUESTER,
+            MAX_PENDING_APPROVALS - MAX_PENDING_APPROVALS_PER_REQUESTER,
+            true,
+        );
+
+        let request = request_for(&node, [0xC1; 32], 0);
+        let session_id = request.session_id;
+        node.handle_sign_request(from, request).await.unwrap();
+        assert_eq!(hooks.calls.load(Ordering::SeqCst), 1);
+        assert!(!refused(&node, &session_id));
+        assert!(node.sessions.read().get_session(&session_id).is_some());
     }
 
     /// A requester node holding a round with participants 1 and 2, peer 2's
