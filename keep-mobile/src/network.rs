@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
-use subtle::ConstantTimeEq;
-
 use crate::error::KeepMobileError;
 use crate::types::PeerStatus;
 
@@ -31,13 +29,6 @@ pub(crate) fn validate_hex_pubkey(key: &str) -> Result<(), KeepMobileError> {
         });
     }
     Ok(())
-}
-
-pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    bool::from(a.ct_eq(b))
 }
 
 pub(crate) fn parse_loopback_proxy(
