@@ -234,7 +234,9 @@ pub enum ShareProbe {
     Loads { data: Vec<u8> },
     /// Only on positive evidence that this device can never decrypt it: the
     /// key is permanently invalidated or missing, or the stored ciphertext
-    /// fails authentication or is structurally truncated.
+    /// fails authentication or is structurally truncated, or the key exists
+    /// but the record holds neither IV nor ciphertext, confirmed below any
+    /// layer that reads an unloadable record as empty.
     Lost,
     /// Everything else, including no authentication, a cancelled prompt, a
     /// transient fault or anything unclassified.
