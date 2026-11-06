@@ -3955,15 +3955,19 @@ impl KeepMobile {
     /// block, but the relays and grants of the lost record are not in it. A
     /// storage fault that clears up is worth retrying, otherwise
     /// `reset_unreadable_relay_config` writes the same record on this device.
-    /// Call this before offering the backup and show any gap.
-    pub fn backup_relay_config_gaps(&self) -> Vec<String> {
-        let mut groups: Vec<String> = held_groups(&self.storage).unwrap_or_default();
+    /// Call this before offering the backup and show any gap. Refused when
+    /// the share registry cannot be read, since the held groups are unknown.
+    pub fn backup_relay_config_gaps(&self) -> Result<Vec<String>, KeepMobileError> {
+        let mut groups =
+            held_groups(&self.storage).ok_or_else(|| KeepMobileError::StorageError {
+                msg: "The share registry cannot be read, so the held groups are unknown".into(),
+            })?;
         groups.sort();
         groups.dedup();
         groups.retain(|group| {
             persistence::load_relay_config(&self.storage, &relay_config_key(Some(group))).is_err()
         });
-        groups
+        Ok(groups)
     }
 
     pub fn verify_backup(
@@ -7999,7 +8003,7 @@ mod restore_backup_metadata_tests {
             vec![(2, false, false)],
             "a readable record is backed up as stored"
         );
-        assert!(mobile.backup_relay_config_gaps().is_empty());
+        assert!(mobile.backup_relay_config_gaps().unwrap().is_empty());
 
         storage
             .data
@@ -8036,7 +8040,7 @@ mod restore_backup_metadata_tests {
             "a backup does not rewrite the device's record"
         );
         assert!(mobile.get_relay_config(Some(group.clone())).is_err());
-        assert_eq!(mobile.backup_relay_config_gaps(), vec![group]);
+        assert_eq!(mobile.backup_relay_config_gaps().unwrap(), vec![group]);
 
         let restored = Arc::new(RecordingStorage::default());
         let fresh = KeepMobile::new(Arc::clone(&restored) as Arc<dyn SecureStorage>).unwrap();
@@ -13238,6 +13242,21 @@ mod share_registry_tests {
         let index: Vec<String> =
             serde_json::from_slice(&storage.raw(DESCRIPTOR_INDEX_KEY).unwrap()).unwrap();
         assert_eq!(index, vec![unreadable]);
+    }
+
+    #[test]
+    fn backup_relay_config_gaps_refuses_when_the_registry_is_unavailable() {
+        let (storage, mobile) = setup();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
+        assert!(mobile.backup_relay_config_gaps().unwrap().is_empty());
+        storage.registry_unavailable.store(true, Ordering::SeqCst);
+        let result = mobile.backup_relay_config_gaps();
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("registry cannot be read")),
+            "got {result:?}"
+        );
     }
 
     #[test]
