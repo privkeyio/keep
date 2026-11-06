@@ -824,6 +824,20 @@ fn handle_node_event(
                 "RNG HEALTH CHECK FAILED: co-signing refused on this node".to_string(),
             );
         }
+        KfpNodeEvent::CosignerApprovalPending {
+            session_id,
+            share_index,
+        } => {
+            push_log(
+                frost_events,
+                now_secs,
+                EventLogType::SignRequest,
+                format!(
+                    "Peer #{share_index} is waiting on approval: {}",
+                    &hex::encode(session_id)[..8]
+                ),
+            );
+        }
         KfpNodeEvent::RelayPinRejected { relay_host, reason } => {
             push_log(
                 frost_events,

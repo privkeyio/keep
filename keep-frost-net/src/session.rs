@@ -207,6 +207,16 @@ impl NetworkSession {
         self
     }
 
+    /// Lengthens the timeout to `timeout`, never shortening it.
+    pub fn extend_timeout(&mut self, timeout: Duration) {
+        self.timeout = self.timeout.max(timeout);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
     pub fn session_id(&self) -> &[u8; 32] {
         &self.session_id
     }
@@ -720,7 +730,7 @@ pub struct SessionManager {
     max_rehydrations: u16,
 }
 
-fn validate_session_id(
+pub(crate) fn validate_session_id(
     session_id: [u8; 32],
     message: &[u8],
     participants: &[u16],

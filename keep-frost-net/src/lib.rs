@@ -123,11 +123,12 @@ pub use key_spend_window::{KeySpendWindow, KEY_SPEND_WINDOW};
 #[cfg(feature = "testing")]
 pub use node::CosignTransport;
 pub use node::{
-    migrate_kfp_v1_peer_policies, DescriptorLookupUnavailable, DuressFreeze, DuressPersister,
-    HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks, OprfShareSealAck,
-    PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot, RefuseRawAndRequireStructuredHooks,
-    RefuseRawSignatureHooks, RelayHealth, RelayHealthStatus, RequireStructuredPayloadHooks,
-    ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
+    migrate_kfp_v1_peer_policies, Approval, DescriptorLookupUnavailable, DuressFreeze,
+    DuressPersister, HealthCheckResult, KeepDescriptorLookup, KfpNode, KfpNodeEvent, NoOpHooks,
+    OprfShareSealAck, PeerPolicy, PersistedDescriptorLookup, PsbtSessionSnapshot,
+    RefuseRawAndRequireStructuredHooks, RefuseRawSignatureHooks, RelayHealth, RelayHealthStatus,
+    RequireStructuredPayloadHooks, ServeHooks, SessionInfo, SigningHooks, SuccessorLookup,
+    APPROVAL_ROUND_HARD_CAP, MAX_FAILOVER_ATTEMPTS, MAX_SIGNING_REQUEST_DURATION,
 };
 pub use nonce_pool::{NonceId, NoncePool, DEFAULT_POOL_TARGET, MAX_POOL_ENTRIES};
 pub use nonce_store::{FileNonceStore, MemoryNonceStore, NonceStore};
@@ -150,10 +151,10 @@ pub use protocol::{
     OprfEvalRequestPayload, OprfEvalSharePayload, PingPayload, PolicyTier, PongPayload,
     PreExchangedCommitment, PsbtAbortPayload, PsbtFinalizePayload, PsbtInputInfo, PsbtOutputInfo,
     PsbtProposePayload, PsbtSignPayload, RefreshCompletePayload, RefreshRequestPayload,
-    RefreshRound1Payload, RefreshRound2Payload, SignRequestPayload, SignatureCompletePayload,
-    SignatureSharePayload, TaprootTweakPayload, TpmQuoteEvidence, WalletPolicy,
-    XpubAnnouncePayload, CAPABILITY_TAPROOT_TWEAK, DEFAULT_REPLAY_WINDOW_SECS,
-    DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
+    RefreshRound1Payload, RefreshRound2Payload, SignApprovalPendingPayload, SignRequestPayload,
+    SignatureCompletePayload, SignatureSharePayload, TaprootTweakPayload, TpmQuoteEvidence,
+    WalletPolicy, XpubAnnouncePayload, CAPABILITY_APPROVAL_PENDING, CAPABILITY_TAPROOT_TWEAK,
+    DEFAULT_REPLAY_WINDOW_SECS, DESCRIPTOR_ACK_PHASE_TIMEOUT_SECS, DESCRIPTOR_ACK_TIMEOUT_SECS,
     DESCRIPTOR_CONTRIBUTION_TIMEOUT_SECS, DESCRIPTOR_FINALIZE_TIMEOUT_SECS,
     DESCRIPTOR_SESSION_MAX_TIMEOUT_SECS, DESCRIPTOR_SESSION_TIMEOUT_SECS, KFP_EVENT_KIND,
     KFP_VERSION, MAX_CAPABILITIES, MAX_CAPABILITY_LENGTH, MAX_COMMITMENT_SIZE,
