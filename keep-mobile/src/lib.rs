@@ -451,6 +451,19 @@ fn message_hash(message: &[u8]) -> [u8; 32] {
     Sha256::digest(message).into()
 }
 
+/// Record a pre-approval for `message`, evicting the oldest at the cap.
+fn insert_pre_approval(hashes: &PreApprovedHashes, message: &[u8]) {
+    let hash = message_hash(message);
+    let now = std::time::Instant::now();
+    let mut guard = lock_pre_approved(hashes);
+    if guard.len() >= MAX_PRE_APPROVED_HASHES && !guard.contains_key(&hash) {
+        if let Some(&oldest) = guard.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k) {
+            guard.remove(&oldest);
+        }
+    }
+    guard.insert(hash, now);
+}
+
 /// Spend the pre-approval recorded for `message`, if there is one.
 fn consume_pre_approval(hashes: &PreApprovedHashes, message: &[u8]) -> bool {
     lock_pre_approved(hashes)
@@ -893,6 +906,10 @@ pub struct KeepMobile {
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) pre_approved_hashes: PreApprovedHashes,
+    /// Events the user approved for this app's own NIP-55 sign path. Only that
+    /// path reads it, and the signing hooks never see it, so an approval the
+    /// path did not claim cannot approve a peer's co-sign request.
+    pub(crate) nip55_approvals: PreApprovedHashes,
     pub(crate) own_requests_in_flight: OwnRequestsInFlight,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
@@ -1329,6 +1346,7 @@ impl KeepMobile {
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            nip55_approvals: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             own_requests_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
@@ -1464,38 +1482,31 @@ impl KeepMobile {
     }
 
     /// Let the next co-sign request for `message` skip the prompt. A Bitcoin
-    /// request is always prompted, pre-approved or not.
+    /// request is always prompted, pre-approved or not. This writes the map the
+    /// signing hooks consume for peer co-sign requests, which the NIP-55 sign
+    /// path never reads.
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
-        let hash = message_hash(&message);
-        let now = std::time::Instant::now();
-        let mut guard = lock_pre_approved(&self.pre_approved_hashes);
-        if guard.len() >= MAX_PRE_APPROVED_HASHES {
-            if let Some(&oldest) = guard.iter().min_by_key(|(_, &t)| t).map(|(k, _)| k) {
-                guard.remove(&oldest);
-            }
-        }
-        guard.insert(hash, now);
+        insert_pre_approval(&self.pre_approved_hashes, &message);
     }
 
-    /// Pre-approve a specific Nostr event (by its computed event id) so the next
-    /// matching sign request auto-approves without prompting. Convenience wrapper
-    /// over [`set_signing_pre_approved`] for NIP-55 callers holding event JSON.
-    /// The NIP-55 sign path claims this approval before it sends anything and
-    /// refuses an event that has none.
+    /// Approve a specific Nostr event (by its computed event id) for this app's
+    /// own NIP-55 sign path, which claims the approval before it sends anything
+    /// and refuses an event that has none. It goes in a map of its own that the
+    /// signing hooks never read, so an approval the sign path did not claim
+    /// never lets a peer's co-sign request for that event skip the prompt.
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
         let event: serde_json::Value =
             serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
         crate::nip55::validate_nostr_event(&event)?;
         let event_hash = crate::nip55::compute_nostr_event_id(&event)?;
-        self.set_signing_pre_approved(event_hash.to_vec());
+        insert_pre_approval(&self.nip55_approvals, &event_hash);
         Ok(())
     }
 
     pub fn clear_signing_pre_approval(&self) {
-        self.pre_approved_hashes
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        for hashes in [&self.pre_approved_hashes, &self.nip55_approvals] {
+            hashes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
     }
 
     pub fn get_pending_requests(&self) -> Vec<SignRequest> {
@@ -9728,6 +9739,24 @@ mod cosign_prompt_e2e_tests {
     }
 
     #[test]
+    fn nip55_does_not_sign_on_a_peer_pre_approval() {
+        let phone = nip55_phone();
+        let handler = Nip55Handler::new(Arc::clone(&phone.mobile));
+        let event_json = nip55_event(&phone);
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        let event_id = crate::nip55::compute_nostr_event_id(&event).unwrap();
+        phone.mobile.set_signing_pre_approved(event_id.to_vec());
+        let err = handler
+            .handle_request(sign_event_request(event_json), "caller".into())
+            .expect_err("a peer pre-approval does not sign a NIP-55 event");
+        assert!(
+            matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("not approved")),
+            "{err:?}"
+        );
+        assert_eq!(phone.mobile.pre_approved_hashes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn nip55_signs_a_pre_approved_event_without_a_prompt() {
         let phone = nip55_phone();
         let handler = Nip55Handler::new(Arc::clone(&phone.mobile));
@@ -9745,6 +9774,7 @@ mod cosign_prompt_e2e_tests {
             "the phone was never asked"
         );
         assert!(phone.mobile.pre_approved_hashes.lock().unwrap().is_empty());
+        assert!(phone.mobile.nip55_approvals.lock().unwrap().is_empty());
         assert!(phone
             .mobile
             .own_requests_in_flight
@@ -10213,6 +10243,92 @@ mod baseline_presign_policy_tests {
             .pre_sign(&nostr_session(1, &message))
             .expect_err("the kill switch refuses before anything is approved");
         assert!(format!("{err}").contains("disabled"), "{err}");
+    }
+
+    /// Hooks for share 1 wired to `mobile` the way the live node's are, with a
+    /// closed prompt channel so reaching the prompt fails at once.
+    fn hooks_of(mobile: &KeepMobile) -> MobileSigningHooks {
+        MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: mobile.pre_approved_hashes.clone(),
+            own_identifier: 1,
+            own_requests_in_flight: mobile.own_requests_in_flight.clone(),
+            storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+        }
+    }
+
+    fn approvable_event() -> (String, [u8; 32]) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let event = serde_json::json!({
+            "pubkey": hex::encode([7u8; 32]),
+            "created_at": now,
+            "kind": 1,
+            "tags": [],
+            "content": "own request",
+        });
+        let id = crate::nip55::compute_nostr_event_id(&event).unwrap();
+        (event.to_string(), id)
+    }
+
+    fn mobile() -> KeepMobile {
+        KeepMobile::new(Arc::new(KillSwitchOffStorage::with_switch_off())).unwrap()
+    }
+
+    #[test]
+    fn an_unclaimed_nip55_approval_does_not_approve_a_peer_request() {
+        let mobile = mobile();
+        let (event_json, event_id) = approvable_event();
+        mobile.pre_approve_nostr_event(event_json).unwrap();
+        let err = hooks_of(&mobile)
+            .pre_sign(&nostr_session(2, &event_id))
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+        assert_eq!(mobile.nip55_approvals.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_signing_pre_approval_lets_one_peer_request_through() {
+        let mobile = mobile();
+        let message = [5u8; 32];
+        mobile.set_signing_pre_approved(message.to_vec());
+        let hooks = hooks_of(&mobile);
+        hooks
+            .pre_sign(&nostr_session(2, &message))
+            .expect("the pre-approved peer request skips the prompt");
+        let err = hooks
+            .pre_sign(&nostr_session(2, &message))
+            .expect_err("the approval is spent, so this goes to the closed prompt");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+    }
+
+    #[test]
+    fn clearing_pre_approvals_empties_both_maps() {
+        let mobile = mobile();
+        let (event_json, _) = approvable_event();
+        mobile.pre_approve_nostr_event(event_json).unwrap();
+        mobile.set_signing_pre_approved(vec![5u8; 32]);
+        assert_eq!(mobile.pre_approved_hashes.lock().unwrap().len(), 1);
+        assert_eq!(mobile.nip55_approvals.lock().unwrap().len(), 1);
+        mobile.clear_signing_pre_approval();
+        assert!(mobile.pre_approved_hashes.lock().unwrap().is_empty());
+        assert!(mobile.nip55_approvals.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn re_approving_a_held_message_in_a_full_map_evicts_nothing() {
+        let mobile = mobile();
+        for i in 0..MAX_PRE_APPROVED_HASHES {
+            mobile.set_signing_pre_approved((i as u32).to_be_bytes().to_vec());
+        }
+        mobile.set_signing_pre_approved(7u32.to_be_bytes().to_vec());
+        let held = mobile.pre_approved_hashes.lock().unwrap();
+        assert_eq!(held.len(), MAX_PRE_APPROVED_HASHES);
+        for i in 0..MAX_PRE_APPROVED_HASHES {
+            assert!(held.contains_key(&message_hash(&(i as u32).to_be_bytes())));
+        }
     }
 
     #[test]

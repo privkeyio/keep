@@ -738,6 +738,10 @@ impl Nip55Handler {
         Ok(Nip55Response::ok(result))
     }
 
+    /// Signs only an event approved through `pre_approve_nostr_event`, claimed
+    /// from `nip55_approvals`. The signing hooks never read that map, so an
+    /// approval left unclaimed here never approves a peer's co-sign request,
+    /// and a pre-approval set for peer requests never signs an event here.
     fn handle_sign_event(
         &self,
         event_json: String,
@@ -770,7 +774,7 @@ impl Nip55Handler {
         // canonical fields ensures the responder's recompute matches ours.
         let structured = build_structured_nostr_payload(&event)?;
 
-        if !crate::consume_pre_approval(&self.mobile.pre_approved_hashes, &event_hash) {
+        if !crate::consume_pre_approval(&self.mobile.nip55_approvals, &event_hash) {
             return Err(KeepMobileError::InvalidInput {
                 msg: "event was not approved for signing".into(),
             });
