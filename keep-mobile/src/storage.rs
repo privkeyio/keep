@@ -71,6 +71,27 @@ pub enum ShareStoreStatus {
     Unavailable,
 }
 
+/// What `remove_unreadable_share` did. Only `Removed` changed anything, and it
+/// set the share aside rather than destroying it.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum UnreadableShareRemoval {
+    /// Set aside, from where `restore_quarantined_share` puts it back.
+    Removed,
+    /// The share can be read now, so it was kept.
+    Readable,
+    /// The registry lists it unreadable but its stored share still loads, so
+    /// its secret is not lost and it was kept.
+    Recoverable,
+    /// Whether its secret can still be decrypted could not be confirmed, as
+    /// when the device was not authenticated, so it was kept.
+    Unverified,
+    /// No share of this group is stored.
+    Absent,
+    /// The share registry cannot be read, so whether the share is unreadable
+    /// is unknown.
+    RegistryUnavailable,
+}
+
 /// Platform-provided secure storage for encrypted share data and wallet
 /// descriptor records.
 ///
@@ -158,4 +179,68 @@ pub trait SecureStorage: Send + Sync {
     /// active account without the cleanup a switch needs.
     fn read_active_share_key(&self) -> crate::signing_policy::StorageRead;
     fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError>;
+    /// Set the share under `key` aside without destroying anything. Its
+    /// record and key aliases stay where they are, but `read_share_registry`,
+    /// `list_all_shares` and the active-share fallback no longer list it, and
+    /// `store_share_by_key` refuses to write `key` until it is restored or
+    /// deleted. `load_share_by_key` still attempts the real load, so a share
+    /// that becomes readable again can be told apart from one that is lost.
+    fn quarantine_share_by_key(&self, key: String) -> Result<(), KeepMobileError>;
+    /// List the share under `key` again, exactly as it was before
+    /// `quarantine_share_by_key`.
+    fn restore_quarantined_share(&self, key: String) -> Result<(), KeepMobileError>;
+    /// The key of every share set aside and neither restored nor deleted.
+    /// `delete_share_by_key` on one of them destroys it and clears the mark.
+    /// An `Err` when the set of marks cannot be read, never an empty list.
+    fn list_quarantined_share_keys(&self) -> Result<Vec<String>, KeepMobileError>;
+    /// Try to decrypt the share under `key` and say what became of it, for
+    /// deciding whether a share is lost. Core destroys a share only on
+    /// `Lost`, so an implementation must answer `Lost` only on positive
+    /// evidence and `Unknown` for every other failure. Core reads an `Err`
+    /// as `Unknown`, so throwing never destroys anything.
+    fn probe_share_by_key(&self, key: String) -> Result<ShareProbe, KeepMobileError>;
 }
+
+/// What `SecureStorage::probe_share_by_key` found.
+#[derive(uniffi::Enum)]
+pub enum ShareProbe {
+    /// The share data, decrypted with the share's own key. It consumes the
+    /// request's DECRYPT cipher as a load does. Data that does not validate
+    /// as a usable share is never discarded.
+    Loads { data: Vec<u8> },
+    /// Only on positive evidence that this device can never decrypt it: the
+    /// key is permanently invalidated or missing, or the stored ciphertext
+    /// fails authentication or is structurally truncated.
+    Lost,
+    /// Everything else, including no authentication, a cancelled prompt, a
+    /// transient fault or anything unclassified.
+    Unknown,
+}
+
+/// The quarantine and probe methods of a test store that has no quarantine.
+#[cfg(test)]
+macro_rules! quarantine_unsupported {
+    () => {
+        fn quarantine_share_by_key(&self, _: String) -> Result<(), $crate::KeepMobileError> {
+            Err($crate::KeepMobileError::StorageError {
+                msg: "quarantine unsupported".into(),
+            })
+        }
+        fn restore_quarantined_share(&self, _: String) -> Result<(), $crate::KeepMobileError> {
+            Err($crate::KeepMobileError::StorageError {
+                msg: "quarantine unsupported".into(),
+            })
+        }
+        fn list_quarantined_share_keys(&self) -> Result<Vec<String>, $crate::KeepMobileError> {
+            Ok(Vec::new())
+        }
+        fn probe_share_by_key(
+            &self,
+            _: String,
+        ) -> Result<$crate::storage::ShareProbe, $crate::KeepMobileError> {
+            Ok($crate::storage::ShareProbe::Unknown)
+        }
+    };
+}
+#[cfg(test)]
+pub(crate) use quarantine_unsupported;

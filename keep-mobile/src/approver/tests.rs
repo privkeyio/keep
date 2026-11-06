@@ -39,6 +39,7 @@ async fn start_mock_relay() -> nostr_relay_builder::MockRelay {
 struct Memory(Mutex<Map<String, Vec<u8>>>, AtomicBool);
 
 impl SecureStorage for Memory {
+    crate::storage::quarantine_unsupported!();
     fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
         Ok(())
     }

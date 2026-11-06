@@ -55,8 +55,8 @@ pub use signing_policy::{
     SigningRiskAssessment, SigningRiskFactor, StorageRead, UsageStats,
 };
 pub use storage::{
-    PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo, ShareRegistryRead,
-    ShareStoreStatus, StoredShareInfo,
+    PendingShareInfo, SecureStorage, ShareInfo, ShareMetadataInfo, ShareProbe, ShareRegistryRead,
+    ShareStoreStatus, StoredShareInfo, UnreadableShareRemoval,
 };
 pub use types::{
     AnnouncedXpubInfo, BackupDescriptorGaps, BackupInfo, ConnectionStatus, DescriptorProposal,
@@ -869,8 +869,10 @@ pub struct KeepMobile {
     active_share_lock: Arc<std::sync::Mutex<()>>,
     /// Held from the check that no share is listed under a group, and that the
     /// cap has room, through the write of that group's share, so two writes
-    /// cannot both pass the check and the second replace the first. Taken
-    /// inside `active_share_lock` when both are held.
+    /// cannot both pass the check and the second replace the first. Setting a
+    /// share aside, restoring it and discarding it take it too, so none of
+    /// them lands between that check and the write. Taken inside
+    /// `active_share_lock` when both are held.
     share_write_lock: Arc<std::sync::Mutex<()>>,
 }
 
@@ -1492,7 +1494,19 @@ impl KeepMobile {
         })
     }
 
+    /// Delete the legacy share. Refused while any share is set aside, since a
+    /// set-aside share migrated from the legacy slot may still depend on the
+    /// key this deletes.
     pub fn delete_share(&self) -> Result<(), KeepMobileError> {
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !self.storage.list_quarantined_share_keys()?.is_empty() {
+            return Err(KeepMobileError::StorageError {
+                msg: "A share is set aside, restore or discard it first".into(),
+            });
+        }
         let result = self.storage.delete_share();
         self.invalidate_live_node();
         result
@@ -1641,6 +1655,7 @@ impl KeepMobile {
             .active_share_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.refuse_set_aside(&group_pubkey)?;
         self.storage.load_share_by_key(group_pubkey.clone())?;
         self.storage.set_active_share_key(Some(group_pubkey))?;
 
@@ -1658,60 +1673,143 @@ impl KeepMobile {
             .active_share_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let is_active = match self.storage.read_active_share_key() {
-            signing_policy::StorageRead::Found { value } => {
-                constant_time_eq(value.as_bytes(), group_pubkey.as_bytes())
+        if self.is_quarantined(&group_pubkey)? {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "This share is set aside, use discard_quarantined_share to destroy it".into(),
+            });
+        }
+        self.take_share_out(group_pubkey)
+    }
+
+    /// Set aside a share the registry lists as unreadable. Its record and key
+    /// aliases are kept, it is no longer listed, loaded or importable over,
+    /// and `restore_quarantined_share` puts it back. Nothing changes unless,
+    /// under the locks share deletes, account switches and share writes take,
+    /// the registry still lists the group unreadable and the platform either
+    /// confirms its secret is lost or decrypts data that is not a usable share
+    /// of the group. A secret that decrypts into a usable share is not lost,
+    /// whatever its metadata, and one the platform could not probe is kept.
+    pub fn remove_unreadable_share(
+        &self,
+        group_pubkey: String,
+    ) -> Result<UnreadableShareRemoval, KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _write = self
+            .share_write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = match self.storage.read_share_registry() {
+            ShareRegistryRead::Unavailable => {
+                return Ok(UnreadableShareRemoval::RegistryUnavailable)
             }
-            signing_policy::StorageRead::Absent => false,
-            // Whether this is the active share decides whether the pointer is
-            // cleared with it, so a pointer that cannot be read refuses the
-            // delete rather than leave it naming a share that is gone.
-            signing_policy::StorageRead::Unavailable => {
-                return Err(KeepMobileError::StorageError {
-                    msg: "The active account could not be read; select an account, then delete"
+            ShareRegistryRead::Readable { shares, unreadable } => {
+                match unreadable
+                    .into_iter()
+                    .find(|key| key.eq_ignore_ascii_case(&group_pubkey))
+                {
+                    Some(key) => key,
+                    None if shares.iter().any(|m| {
+                        hex::encode(&m.group_pubkey).eq_ignore_ascii_case(&group_pubkey)
+                    }) =>
+                    {
+                        return Ok(UnreadableShareRemoval::Readable)
+                    }
+                    None => return Ok(UnreadableShareRemoval::Absent),
+                }
+            }
+        };
+        match self.probe_share(&key) {
+            ShareProbe::Unknown => return Ok(UnreadableShareRemoval::Unverified),
+            ShareProbe::Loads { data } => {
+                let data = Zeroizing::new(data);
+                if Self::share_package_from_record(&key, &data).is_ok() {
+                    return Ok(UnreadableShareRemoval::Recoverable);
+                }
+            }
+            ShareProbe::Lost => {}
+        }
+        self.set_share_aside(key)?;
+        Ok(UnreadableShareRemoval::Removed)
+    }
+
+    /// The groups whose share `remove_unreadable_share` set aside.
+    pub fn list_quarantined_shares(&self) -> Result<Vec<String>, KeepMobileError> {
+        self.storage.list_quarantined_share_keys()
+    }
+
+    /// List a share set aside by `remove_unreadable_share` again. Refused while
+    /// the registry cannot be read or lists a share of the same group.
+    pub fn restore_quarantined_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _write = self
+            .share_write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = self.quarantined_key(&group_pubkey)?;
+        match self.storage.read_share_registry() {
+            ShareRegistryRead::Unavailable => Err(KeepMobileError::StorageError {
+                msg: "The share registry cannot be read".into(),
+            }),
+            ShareRegistryRead::Readable { shares, unreadable }
+                if unreadable.iter().any(|k| k.eq_ignore_ascii_case(&key))
+                    || shares
+                        .iter()
+                        .any(|m| hex::encode(&m.group_pubkey).eq_ignore_ascii_case(&key)) =>
+            {
+                Err(KeepMobileError::ShareAlreadyStored)
+            }
+            ShareRegistryRead::Readable { .. } => self.storage.restore_quarantined_share(key),
+        }
+    }
+
+    /// Destroy a share set aside by `remove_unreadable_share`, which cannot be
+    /// undone. Only a share the platform confirms is lost is destroyed: one
+    /// whose data decrypts again is restored rather than destroyed, and one
+    /// that could not be probed is kept until the probe can answer. Data that
+    /// decrypts but does not validate as a usable share is never discarded
+    /// either. Validation also reads the metadata, so an intact secret whose
+    /// metadata is broken fails it too, and such a share keeps its slot until
+    /// it is restored.
+    pub fn discard_quarantined_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        validate_hex_pubkey(&group_pubkey)?;
+        let _active = self
+            .active_share_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _write = self
+            .share_write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = self.quarantined_key(&group_pubkey)?;
+        match self.probe_share(&key) {
+            ShareProbe::Lost => self.take_share_out(key),
+            ShareProbe::Loads { data } => {
+                drop(Zeroizing::new(data));
+                Err(KeepMobileError::InvalidInput {
+                    msg: "This share can be read again, so restore it rather than discard it"
                         .into(),
                 })
             }
-        };
-
-        if is_active {
-            self.storage.set_active_share_key(None)?;
+            ShareProbe::Unknown => Err(KeepMobileError::StorageError {
+                msg:
+                    "Whether this share is lost could not be confirmed. Authenticate and try again"
+                        .into(),
+            }),
         }
-
-        // Attempt the removal first, then tear down whatever the outcome.
-        //
-        // Unconditional over the pointer, because the pointer does not say
-        // which share the live node was built from: `load_share_package`
-        // resolves the share when no pointer is set, so a node can be running
-        // on a share the pointer never named, and gating teardown on the
-        // pointer left that node holding the deleted share's key material,
-        // still subscribed to the relays and still able to contribute signature
-        // shares, with any already-queued request still approvable.
-        //
-        // After the removal, because `do_initialize` holds
-        // `node_lifecycle_lock` across both the share load and the node install
-        // while taking no `active_share_lock`. Tearing down before the record is
-        // gone leaves a window where a concurrent initialize resolves the
-        // still-present share and installs a node on it; doing it after means
-        // such an initialize either no longer finds the record or is serialized
-        // behind this teardown by that lock.
-        //
-        // Unconditional over the result too, because `delete_share_by_key` is
-        // not atomic. The Android implementation deletes the keystore aliases,
-        // then clears the share data, then rewrites the registry, and either
-        // of the last two can fail after the keys are already gone. So an `Err`
-        // does not mean the share survived, and skipping the teardown on it
-        // would leave the live node holding the only remaining copy of a share
-        // the platform has already destroyed, while the caller is told the
-        // delete failed. Tearing down costs a reconnect either way.
-        let deleted = self.storage.delete_share_by_key(group_pubkey);
-        self.invalidate_live_node();
-        deleted
     }
 
     // Load-modify-store without locking; acceptable in single-user mobile context
     pub fn mark_share_backed_up(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
         validate_hex_pubkey(&group_pubkey)?;
+        self.refuse_set_aside(&group_pubkey)?;
 
         let data = self.storage.load_share_by_key(group_pubkey.clone())?;
         let mut stored: StoredShareData = serde_json::from_slice(&data)
@@ -1744,6 +1842,7 @@ impl KeepMobile {
             });
         }
         Self::validate_share_name(name)?;
+        self.refuse_set_aside(&group_pubkey)?;
 
         let data = self.storage.load_share_by_key(group_pubkey.clone())?;
         let mut stored: StoredShareData = serde_json::from_slice(&data)
@@ -4233,8 +4332,10 @@ impl KeepMobile {
         // Read under the lock, so an import or restore running alongside is
         // seen. A device with one share runs on it with no pointer written, so
         // an absent pointer alone does not mean no account is in use, and nor
-        // does a share or registry that cannot be read.
-        let had_shares = self.storage.has_share()
+        // does a share or registry that cannot be read. A share set aside is
+        // still held, and a set of marks that cannot be read refuses.
+        let had_shares = !self.storage.list_quarantined_share_keys()?.is_empty()
+            || self.storage.has_share()
             || !matches!(
                 self.storage.read_share_registry(),
                 ShareRegistryRead::Readable { shares, unreadable }
@@ -5691,9 +5792,121 @@ impl KeepMobile {
 }
 
 impl KeepMobile {
+    fn quarantined_key(&self, group_pubkey: &str) -> Result<String, KeepMobileError> {
+        self.storage
+            .list_quarantined_share_keys()?
+            .into_iter()
+            .find(|key| key.eq_ignore_ascii_case(group_pubkey))
+            .ok_or(KeepMobileError::StorageNotFound)
+    }
+
+    fn refuse_set_aside(&self, group_pubkey: &str) -> Result<(), KeepMobileError> {
+        if self.is_quarantined(group_pubkey)? {
+            return Err(KeepMobileError::StorageError {
+                msg: "This share is set aside, restore it first".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn probe_share(&self, key: &str) -> ShareProbe {
+        self.storage
+            .probe_share_by_key(key.to_string())
+            .unwrap_or_else(|e| {
+                tracing::warn!("share probe failed: {e}");
+                ShareProbe::Unknown
+            })
+    }
+
+    fn is_quarantined(&self, group_pubkey: &str) -> Result<bool, KeepMobileError> {
+        Ok(self
+            .storage
+            .list_quarantined_share_keys()?
+            .iter()
+            .any(|key| key.eq_ignore_ascii_case(group_pubkey)))
+    }
+
+    /// Whether the active pointer names `group_pubkey`.
+    fn names_active_share(&self, group_pubkey: &str) -> Result<bool, KeepMobileError> {
+        match self.storage.read_active_share_key() {
+            signing_policy::StorageRead::Found { value } => {
+                Ok(constant_time_eq(value.as_bytes(), group_pubkey.as_bytes()))
+            }
+            signing_policy::StorageRead::Absent => Ok(false),
+            // Whether this is the active share decides whether the pointer is
+            // cleared with it, so a pointer that cannot be read refuses the
+            // delete rather than leave it naming a share that is gone.
+            signing_policy::StorageRead::Unavailable => Err(KeepMobileError::StorageError {
+                msg: "The active account could not be read; select an account, then try again"
+                    .into(),
+            }),
+        }
+    }
+
+    /// Set the share under `key` aside, then clear the active pointer when it
+    /// names the share. The caller holds `active_share_lock`.
+    fn set_share_aside(&self, key: String) -> Result<(), KeepMobileError> {
+        let is_active = self.names_active_share(&key)?;
+        // The pointer is cleared only once the share is set aside, so a
+        // quarantine that fails leaves the account selected. The node is torn
+        // down whatever the outcome, for the reasons `take_share_out` gives.
+        let set_aside = self.storage.quarantine_share_by_key(key).and_then(|()| {
+            if is_active {
+                self.storage.set_active_share_key(None)
+            } else {
+                Ok(())
+            }
+        });
+        self.invalidate_live_node();
+        set_aside
+    }
+
+    /// Delete the share under `group_pubkey`, clearing the active pointer when
+    /// it names the share. The caller holds `active_share_lock`.
+    fn take_share_out(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
+        let is_active = self.names_active_share(&group_pubkey)?;
+
+        if is_active {
+            self.storage.set_active_share_key(None)?;
+        }
+
+        // Attempt the removal first, then tear down whatever the outcome.
+        //
+        // Unconditional over the pointer, because the pointer does not say
+        // which share the live node was built from: `load_share_package`
+        // resolves the share when no pointer is set, so a node can be running
+        // on a share the pointer never named, and gating teardown on the
+        // pointer left that node holding the deleted share's key material,
+        // still subscribed to the relays and still able to contribute signature
+        // shares, with any already-queued request still approvable.
+        //
+        // After the removal, because `do_initialize` holds
+        // `node_lifecycle_lock` across both the share load and the node install
+        // while taking no `active_share_lock`. Tearing down before the record is
+        // gone leaves a window where a concurrent initialize resolves the
+        // still-present share and installs a node on it; doing it after means
+        // such an initialize either no longer finds the record or is serialized
+        // behind this teardown by that lock.
+        //
+        // Unconditional over the result too, because `delete_share_by_key` is
+        // not atomic. The Android implementation deletes the keystore aliases,
+        // then clears the share data, then rewrites the registry, and either
+        // of the last two can fail after the keys are already gone. So an `Err`
+        // does not mean the share survived, and skipping the teardown on it
+        // would leave the live node holding the only remaining copy of a share
+        // the platform has already destroyed, while the caller is told the
+        // delete failed. Tearing down costs a reconnect either way.
+        let deleted = self.storage.delete_share_by_key(group_pubkey);
+        self.invalidate_live_node();
+        deleted
+    }
+
     fn ensure_share_capacity(&self) -> Result<(), KeepMobileError> {
+        let quarantined = self.storage.list_quarantined_share_keys()?.len();
         let count = match self.storage.read_share_registry() {
-            ShareRegistryRead::Readable { shares, unreadable } => shares.len() + unreadable.len(),
+            ShareRegistryRead::Readable { shares, unreadable } => {
+                shares.len() + unreadable.len() + quarantined
+            }
             ShareRegistryRead::Unavailable => return Err(KeepMobileError::StorageError {
                 msg: "The share registry cannot be read, so the number of stored shares is unknown"
                     .into(),
@@ -5826,6 +6039,11 @@ impl KeepMobile {
     /// The share the registry lists under `key`, read as
     /// [`Self::listed_share_identifier`] reads it.
     fn listed_share(&self, key: &str) -> Result<Option<ShareMetadataInfo>, KeepMobileError> {
+        if self.is_quarantined(key)? {
+            return Err(KeepMobileError::StorageError {
+                msg: "A share of this group is set aside; restore or discard it first".into(),
+            });
+        }
         let ShareRegistryRead::Readable { shares, unreadable } = self.storage.read_share_registry()
         else {
             return Err(KeepMobileError::StorageError {
@@ -6382,26 +6600,38 @@ impl KeepMobile {
                 _ => self.resolve_active_share()?,
             },
         };
-        let data = self.storage.load_share_by_key(key.clone())?;
-        let stored: StoredShareData = serde_json::from_slice(&data)
-            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
-
-        let mut metadata: keep_core::frost::ShareMetadata =
-            serde_json::from_str(&stored.metadata_json)
-                .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+        if self.is_quarantined(&key)? {
+            return Err(KeepMobileError::StorageError {
+                msg: "The active share is set aside, select another account or restore it".into(),
+            });
+        }
+        let data = Zeroizing::new(self.storage.load_share_by_key(key.clone())?);
+        let mut share = Self::share_package_from_record(&key, &data)?;
 
         if let Some(display_name) = self
             .storage
             .get_share_metadata()
             .filter(|m| {
-                m.group_pubkey == metadata.group_pubkey && m.identifier == metadata.identifier
+                m.group_pubkey == share.metadata.group_pubkey
+                    && m.identifier == share.metadata.identifier
             })
             .map(|m| m.name)
         {
-            if display_name != metadata.name {
-                metadata.name = display_name;
+            if display_name != share.metadata.name {
+                share.metadata.name = display_name;
             }
         }
+        Ok(share)
+    }
+
+    /// The share a record stored under `key` holds, refused unless it is a
+    /// usable secp256k1 share of the group `key` names.
+    fn share_package_from_record(key: &str, data: &[u8]) -> Result<SharePackage, KeepMobileError> {
+        let stored: StoredShareData = serde_json::from_slice(data)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
+
+        let metadata: keep_core::frost::ShareMetadata = serde_json::from_str(&stored.metadata_json)
+            .map_err(|e| KeepMobileError::InvalidShare { msg: e.to_string() })?;
 
         if stored.ciphersuite != keep_core::frost::Ciphersuite::Secp256k1Tr {
             return Err(KeepMobileError::InvalidShare {
@@ -6549,6 +6779,7 @@ impl KeepMobile {
                 })?;
 
         let key = hex::encode(&legacy_metadata.group_pubkey);
+        self.refuse_set_aside(&key)?;
 
         self.storage
             .store_share_by_key(key.clone(), legacy_data, legacy_metadata)?;
@@ -6572,6 +6803,7 @@ mod import_teardown_tests {
     }
 
     impl SecureStorage for MemStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -6746,6 +6978,7 @@ mod import_teardown_tests {
         }
 
         impl SecureStorage for TruncatingStorage {
+            crate::storage::quarantine_unsupported!();
             fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
                 self.inner.store_share(d, m)
             }
@@ -6886,6 +7119,7 @@ mod import_teardown_tests {
         struct UndeletableStorage(MemStorage);
 
         impl SecureStorage for UndeletableStorage {
+            crate::storage::quarantine_unsupported!();
             fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
                 self.0.store_share(d, m)
             }
@@ -7381,6 +7615,7 @@ mod cert_pin_ffi_tests {
     }
 
     impl SecureStorage for MemStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -7575,6 +7810,7 @@ mod restore_backup_metadata_tests {
     }
 
     impl SecureStorage for RecordingStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -7688,6 +7924,7 @@ mod restore_backup_metadata_tests {
         }
 
         impl SecureStorage for IndexUnwritableStorage {
+            crate::storage::quarantine_unsupported!();
             fn store_share(&self, d: Vec<u8>, m: ShareMetadataInfo) -> Result<(), KeepMobileError> {
                 self.inner.store_share(d, m)
             }
@@ -9214,6 +9451,7 @@ mod baseline_presign_policy_tests {
     }
 
     impl SecureStorage for KillSwitchOffStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -9552,6 +9790,7 @@ mod dkg_pending_share_tests {
     }
 
     impl SecureStorage for FailingShareStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             Ok(())
         }
@@ -10097,6 +10336,7 @@ mod velocity_fault_tests {
     }
 
     impl SecureStorage for FaultingStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             unimplemented!()
         }
@@ -12948,6 +13188,21 @@ mod share_registry_tests {
         loaded: StdMutex<Vec<String>>,
         registry_unavailable: AtomicBool,
         active: StdMutex<Option<String>>,
+        quarantined: StdMutex<Vec<String>>,
+        /// While set, quarantined keys stay listed.
+        list_quarantined: AtomicBool,
+        /// Listed unreadable while their record still loads, as when only
+        /// the metadata of a share cannot be read.
+        metadata_unreadable: StdMutex<Vec<String>>,
+        /// Probed as lost.
+        undecryptable: StdMutex<Vec<String>>,
+        /// Probed as unknown, as when the device is not authenticated.
+        probe_unknown: StdMutex<Vec<String>>,
+        quarantine_list_fails: AtomicBool,
+        quarantine_fails: AtomicBool,
+        probe_fails: AtomicBool,
+        clear_pointer_fails: AtomicBool,
+        legacy_deleted: AtomicBool,
         /// While set, each registry read waits briefly for a read from a
         /// second thread, so two writers that check before either writes are
         /// made to overlap.
@@ -12985,6 +13240,7 @@ mod share_registry_tests {
             None
         }
         fn delete_share(&self) -> Result<(), KeepMobileError> {
+            self.legacy_deleted.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn store_share_by_key(
@@ -12993,6 +13249,11 @@ mod share_registry_tests {
             data: Vec<u8>,
             meta: ShareMetadataInfo,
         ) -> Result<(), KeepMobileError> {
+            if self.quarantined.lock().unwrap().contains(&key) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "share is set aside".into(),
+                });
+            }
             self.records.lock().unwrap().insert(key, (data, meta));
             Ok(())
         }
@@ -13012,12 +13273,17 @@ mod share_registry_tests {
                 return Vec::new();
             }
             let unreadable = self.unreadable.lock().unwrap();
+            let quarantined = self.quarantined.lock().unwrap();
             self.records
                 .lock()
                 .unwrap()
                 .iter()
                 .filter(|(key, (_, meta))| {
-                    !meta.group_pubkey.is_empty() && !unreadable.contains(key)
+                    !meta.group_pubkey.is_empty()
+                        && !unreadable.contains(key)
+                        && (self.list_quarantined.load(Ordering::SeqCst)
+                            || !quarantined.contains(key))
+                        && !self.metadata_unreadable.lock().unwrap().contains(key)
                 })
                 .map(|(_, (_, meta))| meta.clone())
                 .collect()
@@ -13026,9 +13292,18 @@ mod share_registry_tests {
             if self.registry_unavailable.load(Ordering::SeqCst) {
                 return crate::storage::ShareRegistryRead::Unavailable;
             }
+            let quarantined = self.quarantined.lock().unwrap().clone();
             let read = crate::storage::ShareRegistryRead::Readable {
                 shares: self.list_all_shares(),
-                unreadable: self.unreadable.lock().unwrap().clone(),
+                unreadable: self
+                    .unreadable
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .chain(self.metadata_unreadable.lock().unwrap().iter())
+                    .filter(|key| !quarantined.contains(key))
+                    .cloned()
+                    .collect(),
             };
             if self.rendezvous.load(Ordering::SeqCst) {
                 self.readers
@@ -13044,7 +13319,53 @@ mod share_registry_tests {
         }
         fn delete_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
             self.records.lock().unwrap().remove(&key);
+            self.unreadable.lock().unwrap().retain(|k| k != &key);
+            self.quarantined.lock().unwrap().retain(|k| k != &key);
             Ok(())
+        }
+        fn quarantine_share_by_key(&self, key: String) -> Result<(), KeepMobileError> {
+            if self.quarantine_fails.load(Ordering::SeqCst) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "quarantine failed".into(),
+                });
+            }
+            let mut quarantined = self.quarantined.lock().unwrap();
+            if !quarantined.contains(&key) {
+                quarantined.push(key);
+            }
+            Ok(())
+        }
+        fn restore_quarantined_share(&self, key: String) -> Result<(), KeepMobileError> {
+            self.quarantined.lock().unwrap().retain(|k| k != &key);
+            Ok(())
+        }
+        fn list_quarantined_share_keys(&self) -> Result<Vec<String>, KeepMobileError> {
+            if self.quarantine_list_fails.load(Ordering::SeqCst) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "quarantine marks unreadable".into(),
+                });
+            }
+            Ok(self.quarantined.lock().unwrap().clone())
+        }
+        fn probe_share_by_key(
+            &self,
+            key: String,
+        ) -> Result<crate::storage::ShareProbe, KeepMobileError> {
+            if self.probe_fails.load(Ordering::SeqCst) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "probe threw".into(),
+                });
+            }
+            if self.undecryptable.lock().unwrap().contains(&key) {
+                return Ok(crate::storage::ShareProbe::Lost);
+            }
+            if self.probe_unknown.lock().unwrap().contains(&key) {
+                return Ok(crate::storage::ShareProbe::Unknown);
+            }
+            Ok(match self.raw(&key) {
+                Some(data) => crate::storage::ShareProbe::Loads { data },
+                None => crate::storage::ShareProbe::Unknown,
+            })
         }
         fn get_active_share_key(&self) -> Option<String> {
             self.active.lock().unwrap().clone()
@@ -13056,6 +13377,11 @@ mod share_registry_tests {
             }
         }
         fn set_active_share_key(&self, key: Option<String>) -> Result<(), KeepMobileError> {
+            if key.is_none() && self.clear_pointer_fails.load(Ordering::SeqCst) {
+                return Err(KeepMobileError::StorageError {
+                    msg: "pointer write failed".into(),
+                });
+            }
             *self.active.lock().unwrap() = key;
             Ok(())
         }
@@ -13111,6 +13437,500 @@ mod share_registry_tests {
 
         storage.registry_unavailable.store(true, Ordering::SeqCst);
         assert_eq!(mobile.share_store_status(), ShareStoreStatus::Unavailable);
+    }
+
+    #[test]
+    fn an_unreadable_share_is_set_aside_not_destroyed() {
+        let (storage, mobile) = setup();
+        let share = group_shares().swap_remove(0);
+        let group = mobile
+            .store_share_package(&share, false)
+            .unwrap()
+            .group_pubkey;
+        assert_eq!(*storage.active.lock().unwrap(), Some(group.clone()));
+
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Readable
+        );
+        assert_eq!(
+            mobile.remove_unreadable_share("cd".repeat(32)).unwrap(),
+            UnreadableShareRemoval::Absent
+        );
+        storage.registry_unavailable.store(true, Ordering::SeqCst);
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::RegistryUnavailable
+        );
+        storage.registry_unavailable.store(false, Ordering::SeqCst);
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+
+        let record = storage.raw(&group).unwrap();
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        assert_eq!(
+            mobile.list_quarantined_shares().unwrap(),
+            vec![group.clone()]
+        );
+        assert_eq!(storage.raw(&group), Some(record), "the record is kept");
+        assert_eq!(mobile.share_store_status(), ShareStoreStatus::Readable);
+        assert_eq!(*storage.active.lock().unwrap(), None);
+
+        let import = mobile.store_share_package(&share, false);
+        assert!(
+            matches!(&import, Err(KeepMobileError::StorageError { msg }) if msg.contains("restore or discard it first")),
+            "got {import:?}"
+        );
+
+        mobile.restore_quarantined_share(group.clone()).unwrap();
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+        assert_eq!(
+            mobile.share_store_status(),
+            ShareStoreStatus::SomeUnreadable {
+                group_pubkeys: vec![group.clone()]
+            }
+        );
+
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        mobile.discard_quarantined_share(group.clone()).unwrap();
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+        assert_eq!(storage.raw(&group), None);
+        assert!(matches!(
+            mobile.discard_quarantined_share(group),
+            Err(KeepMobileError::StorageNotFound)
+        ));
+    }
+
+    #[test]
+    fn a_share_whose_record_loads_is_never_set_aside_or_discarded() {
+        let (storage, mobile) = setup();
+        let group = mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap()
+            .group_pubkey;
+        storage
+            .metadata_unreadable
+            .lock()
+            .unwrap()
+            .push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Recoverable
+        );
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+
+        storage.quarantine_share_by_key(group.clone()).unwrap();
+        let discard = mobile.discard_quarantined_share(group.clone());
+        assert!(
+            matches!(&discard, Err(KeepMobileError::InvalidInput { .. })),
+            "got {discard:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+    }
+
+    #[test]
+    fn a_set_aside_share_is_not_restored_over_a_listed_one() {
+        let (storage, mobile) = setup();
+        let group = mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap()
+            .group_pubkey;
+        // A bridge that still lists the slot, as when a share was stored there
+        // after the one set aside.
+        storage.quarantined.lock().unwrap().push(group.clone());
+        storage.list_quarantined.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            mobile.restore_quarantined_share(group.clone()),
+            Err(KeepMobileError::ShareAlreadyStored)
+        ));
+        storage.registry_unavailable.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            mobile.restore_quarantined_share(group),
+            Err(KeepMobileError::StorageError { .. })
+        ));
+    }
+
+    fn stored_group(mobile: &KeepMobile, share: &SharePackage) -> String {
+        mobile
+            .store_share_package(share, false)
+            .unwrap()
+            .group_pubkey
+    }
+
+    #[test]
+    fn an_unreadable_share_that_cannot_be_probed_is_kept() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        let record = storage.raw(&group).unwrap();
+        storage.mark_unreadable(group.clone());
+        storage.probe_unknown.lock().unwrap().push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Unverified
+        );
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+        assert_eq!(storage.raw(&group), Some(record));
+        assert_eq!(*storage.active.lock().unwrap(), Some(group));
+    }
+
+    #[test]
+    fn an_unreadable_share_that_decrypts_is_recoverable() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Recoverable
+        );
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+        assert_eq!(*storage.active.lock().unwrap(), Some(group));
+    }
+
+    #[test]
+    fn an_unreadable_share_that_decrypts_to_junk_is_set_aside() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.records.lock().unwrap().get_mut(&group).unwrap().0 = b"junk".to_vec();
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        assert_eq!(
+            mobile.list_quarantined_shares().unwrap(),
+            vec![group.clone()]
+        );
+        assert_eq!(storage.raw(&group), Some(b"junk".to_vec()));
+    }
+
+    #[test]
+    fn a_set_aside_share_is_discarded_only_when_lost() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        storage.undecryptable.lock().unwrap().clear();
+
+        storage.probe_unknown.lock().unwrap().push(group.clone());
+        let discard = mobile.discard_quarantined_share(group.clone());
+        assert!(
+            matches!(&discard, Err(KeepMobileError::StorageError { msg }) if msg.contains("could not be confirmed")),
+            "got {discard:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+        storage.probe_unknown.lock().unwrap().clear();
+
+        let discard = mobile.discard_quarantined_share(group.clone());
+        assert!(
+            matches!(&discard, Err(KeepMobileError::InvalidInput { .. })),
+            "got {discard:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+
+        storage.records.lock().unwrap().get_mut(&group).unwrap().0 = b"junk".to_vec();
+        let discard = mobile.discard_quarantined_share(group.clone());
+        assert!(
+            matches!(&discard, Err(KeepMobileError::InvalidInput { .. })),
+            "got {discard:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+        assert_eq!(
+            mobile.list_quarantined_shares().unwrap(),
+            vec![group.clone()]
+        );
+
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        mobile.discard_quarantined_share(group.clone()).unwrap();
+        assert_eq!(storage.raw(&group), None);
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+    }
+
+    #[test]
+    fn setting_a_share_aside_tears_down_the_live_node() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        crate::import_teardown_tests::seed_pending_request(&mobile);
+        assert_eq!(
+            mobile.remove_unreadable_share(group).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        mobile.runtime.block_on(async {
+            assert!(mobile.pending_requests.lock().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn a_failed_set_aside_keeps_the_active_pointer() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        storage.quarantine_fails.store(true, Ordering::SeqCst);
+        crate::import_teardown_tests::seed_pending_request(&mobile);
+        assert!(mobile.remove_unreadable_share(group.clone()).is_err());
+        assert_eq!(*storage.active.lock().unwrap(), Some(group));
+        mobile.runtime.block_on(async {
+            assert!(mobile.pending_requests.lock().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn set_aside_restore_and_discard_take_uppercase_hex() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        let upper = group.to_uppercase();
+        assert_ne!(upper, group);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(upper.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        assert_eq!(
+            mobile.list_quarantined_shares().unwrap(),
+            vec![group.clone()]
+        );
+        mobile.restore_quarantined_share(upper.clone()).unwrap();
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+        assert_eq!(
+            mobile.remove_unreadable_share(upper.clone()).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        mobile.discard_quarantined_share(upper).unwrap();
+        assert_eq!(storage.raw(&group), None);
+    }
+
+    #[test]
+    fn restoring_a_backup_over_a_set_aside_share_is_refused() {
+        let shares = group_shares();
+        let (_, source) = setup();
+        source.store_share_package(&shares[1], false).unwrap();
+        let backup = source.create_backup(PASS.into()).unwrap();
+
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &shares[0]);
+        storage.quarantine_share_by_key(group.clone()).unwrap();
+        let result = mobile.restore_backup(backup, PASS.into());
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("restore or discard it first")),
+            "got {result:?}"
+        );
+        assert_eq!(
+            stored_identifier(&storage, &group),
+            shares[0].metadata.identifier
+        );
+        assert_eq!(mobile.list_quarantined_shares().unwrap(), vec![group]);
+    }
+
+    #[test]
+    fn a_set_aside_share_cannot_be_selected_loaded_or_deleted() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.quarantine_share_by_key(group.clone()).unwrap();
+
+        let load = mobile.load_share_package();
+        assert!(
+            matches!(&load, Err(KeepMobileError::StorageError { msg }) if msg.contains("set aside")),
+            "got {:?}",
+            load.err()
+        );
+
+        *storage.active.lock().unwrap() = None;
+        let select = mobile.set_active_share(group.clone());
+        assert!(
+            matches!(&select, Err(KeepMobileError::StorageError { msg }) if msg.contains("set aside")),
+            "got {select:?}"
+        );
+        assert_eq!(*storage.active.lock().unwrap(), None);
+
+        let delete = mobile.delete_share_by_key(group.to_uppercase());
+        assert!(
+            matches!(&delete, Err(KeepMobileError::InvalidInput { msg }) if msg.contains("discard_quarantined_share")),
+            "got {delete:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+        assert_eq!(mobile.list_quarantined_shares().unwrap(), vec![group]);
+    }
+
+    #[test]
+    fn an_unreadable_quarantine_list_refuses_an_import() {
+        let (storage, mobile) = setup();
+        storage.quarantine_list_fails.store(true, Ordering::SeqCst);
+        let share = &group_shares()[0];
+        let result = mobile.store_share_package(share, false);
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { .. })),
+            "got {result:?}"
+        );
+        let key = hex::encode(share.group_pubkey());
+        assert!(storage.raw(&key).is_none());
+        assert!(mobile.listed_share(&key).is_err());
+        assert!(mobile.ensure_share_capacity().is_err());
+        assert!(mobile.list_quarantined_shares().is_err());
+    }
+
+    #[test]
+    fn share_cap_counts_set_aside_shares() {
+        let (storage, mobile) = setup();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
+        for i in 0..MAX_STORED_SHARES - 2 {
+            storage
+                .quarantined
+                .lock()
+                .unwrap()
+                .push(format!("{i:064x}"));
+        }
+        import_nsec(&mobile).unwrap();
+
+        let (storage, mobile) = setup();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
+        for i in 0..MAX_STORED_SHARES - 1 {
+            storage
+                .quarantined
+                .lock()
+                .unwrap()
+                .push(format!("{i:064x}"));
+        }
+        let result = import_nsec(&mobile);
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("Maximum")),
+            "set-aside shares must count toward the cap, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_that_throws_neither_sets_aside_nor_discards() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        storage.probe_fails.store(true, Ordering::SeqCst);
+        assert_eq!(
+            mobile.remove_unreadable_share(group.clone()).unwrap(),
+            UnreadableShareRemoval::Unverified
+        );
+        assert!(mobile.list_quarantined_shares().unwrap().is_empty());
+
+        storage.quarantine_share_by_key(group.clone()).unwrap();
+        let discard = mobile.discard_quarantined_share(group.clone());
+        assert!(
+            matches!(&discard, Err(KeepMobileError::StorageError { msg }) if msg.contains("could not be confirmed")),
+            "got {discard:?}"
+        );
+        assert!(storage.raw(&group).is_some());
+    }
+
+    #[test]
+    fn a_pointer_left_by_a_failed_clear_is_refused() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        storage.clear_pointer_fails.store(true, Ordering::SeqCst);
+        let removal = mobile.remove_unreadable_share(group.clone());
+        assert!(
+            matches!(&removal, Err(KeepMobileError::StorageError { msg }) if msg.contains("pointer write failed")),
+            "got {removal:?}"
+        );
+        assert_eq!(
+            mobile.list_quarantined_shares().unwrap(),
+            vec![group.clone()]
+        );
+        assert_eq!(*storage.active.lock().unwrap(), Some(group.clone()));
+        let load = mobile.load_share_package();
+        assert!(
+            matches!(&load, Err(KeepMobileError::StorageError { msg }) if msg.contains("set aside")),
+            "got {:?}",
+            load.err()
+        );
+        assert_eq!(
+            mobile.remove_unreadable_share(group).unwrap(),
+            UnreadableShareRemoval::Absent
+        );
+    }
+
+    #[test]
+    fn the_legacy_share_is_not_deleted_while_a_share_is_set_aside() {
+        let (storage, mobile) = setup();
+        storage.quarantined.lock().unwrap().push("ab".repeat(32));
+        let delete = mobile.delete_share();
+        assert!(
+            matches!(&delete, Err(KeepMobileError::StorageError { msg }) if msg.contains("set aside")),
+            "got {delete:?}"
+        );
+        assert!(!storage.legacy_deleted.load(Ordering::SeqCst));
+
+        storage.quarantined.lock().unwrap().clear();
+        storage.quarantine_list_fails.store(true, Ordering::SeqCst);
+        assert!(mobile.delete_share().is_err());
+        assert!(!storage.legacy_deleted.load(Ordering::SeqCst));
+
+        storage.quarantine_list_fails.store(false, Ordering::SeqCst);
+        mobile.delete_share().unwrap();
+        assert!(storage.legacy_deleted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_set_aside_share_is_not_renamed_or_marked_backed_up() {
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &group_shares()[0]);
+        storage.quarantine_share_by_key(group.clone()).unwrap();
+        let record = storage.raw(&group);
+        let rename = mobile.rename_share(group.clone(), "renamed".into());
+        assert!(
+            matches!(&rename, Err(KeepMobileError::StorageError { msg }) if msg.contains("restore it first")),
+            "got {rename:?}"
+        );
+        let mark = mobile.mark_share_backed_up(group.clone());
+        assert!(
+            matches!(&mark, Err(KeepMobileError::StorageError { msg }) if msg.contains("restore it first")),
+            "got {mark:?}"
+        );
+        assert_eq!(storage.raw(&group), record);
+    }
+
+    #[test]
+    fn restoring_beside_a_set_aside_share_keeps_the_device_settings() {
+        let shares = group_shares();
+        let (_, source) = setup();
+        source
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
+        let backup = source.create_backup(PASS.into()).unwrap();
+
+        let (storage, mobile) = setup();
+        let group = stored_group(&mobile, &shares[0]);
+        storage.mark_unreadable(group.clone());
+        storage.undecryptable.lock().unwrap().push(group.clone());
+        assert_eq!(
+            mobile.remove_unreadable_share(group).unwrap(),
+            UnreadableShareRemoval::Removed
+        );
+        assert_eq!(storage.get_active_share_key(), None);
+        mobile.restore_backup(backup.clone(), PASS.into()).unwrap();
+        assert_eq!(storage.get_active_share_key(), None);
+        assert!(storage.raw(KILL_SWITCH_STORAGE_KEY).is_none());
+
+        let (storage, mobile) = setup();
+        storage.quarantine_list_fails.store(true, Ordering::SeqCst);
+        assert!(mobile.restore_backup(backup, PASS.into()).is_err());
     }
 
     #[test]
