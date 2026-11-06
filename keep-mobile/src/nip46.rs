@@ -180,10 +180,11 @@ pub fn parse_bunker_url(url: &str) -> Result<ParsedBunkerUrl, KeepMobileError> {
     })
 }
 
-/// Why a NIP-46 connect was authorized, asserted by the signer core. The Kotlin
-/// consumer should persist a client as authorized only for an explicit-consent
-/// reason (`SecretMatched`/`UserApproved`), never for `AutoApproved`, so that
-/// authorization does not depend on the callback merely having fired.
+/// Why a NIP-46 connect was authorized, asserted by the signer core. An
+/// explicit-consent reason (`SecretMatched` or `UserApproved`) is written to
+/// the bunker's authorized-client roster before the foreign callback runs.
+/// `AutoApproved` is not. That roster is the authorization record; the
+/// callback having fired is not, and the foreign side must not write it.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectAuthorization {
     SecretMatched,
@@ -220,7 +221,11 @@ pub trait BunkerCallbacks: Send + Sync {
     /// Fired when an app completes the NIP-46 connect handshake. `pubkey` and
     /// `name` are untrusted, remote-derived values: render them as inert text,
     /// never as markup. `authorization` states why the core authorized the
-    /// connect; persist authorization only for explicit-consent reasons.
+    /// connect. An explicit-consent connect is already on the authorized-client
+    /// roster when this runs; `AutoApproved` is not recorded. Display metadata
+    /// for a pubkey that [`crate::KeepMobile::get_bunker_config`] no longer
+    /// lists should be dropped — the roster keeps the newest
+    /// [`MAX_AUTHORIZED_CLIENTS`] and forgets the oldest.
     fn on_connect(&self, pubkey: String, name: String, authorization: ConnectAuthorization);
 }
 
@@ -276,6 +281,13 @@ impl CallbackBridge {
             remember: RememberDuration::JustThisTime,
         }
     }
+
+    /// This server is still the one being served. A stop, or a revoke that
+    /// bumps the generation, makes a later write from this bridge a no-op.
+    fn serving_now(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+            && *self.mobile.live_generation.borrow() == self.generation
+    }
 }
 
 impl ServerCallbacks for CallbackBridge {
@@ -289,6 +301,26 @@ impl ServerCallbacks for CallbackBridge {
     }
 
     fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        // Connect is the unauthenticated entry. Every other method is asked
+        // only for a client the roster still lists. The platform is not a
+        // second reader of that decision: a miss, or a roster that cannot be
+        // read, is a refusal and does not take a prompt slot.
+        if request.method != "connect" {
+            let allowed = bunker_client_authorized(&self.mobile, &request.app_pubkey);
+            if !matches!(allowed, Ok(true)) {
+                tracing::warn!(
+                    "Refusing {} from {}: {}",
+                    request.method,
+                    request.app_pubkey.to_hex(),
+                    match allowed {
+                        Ok(false) => "the client is not authorized".to_string(),
+                        Ok(true) => unreachable!("matched above"),
+                        Err(e) => format!("authorized clients could not be read: {e}"),
+                    }
+                );
+                return Self::refused();
+            }
+        }
         let request = BunkerApprovalRequest {
             app_pubkey: request.app_pubkey.to_hex(),
             app_name: request.app_name,
@@ -340,13 +372,16 @@ impl ServerCallbacks for CallbackBridge {
         if let Err(e) = std::thread::Builder::new()
             .name("nip46-approval".into())
             .spawn(move || {
-                // Dropped when the platform returns, however it returns, so a
-                // callback that panics releases its slot too.
-                let _slot = slot;
+                // Released when the platform returns, before the answer is
+                // sent, so the caller observes the slot as free. A panic drops
+                // it on the way out, still before `tx` is dropped.
+                let slot = slot;
+                let answer = callbacks.request_approval(request);
+                drop(slot);
                 // Ignored deliberately: a send fails only once the timeout
                 // below has already answered for this request and dropped the
                 // receiver.
-                let _ = tx.send(callbacks.request_approval(request));
+                let _ = tx.send(answer);
             })
         {
             tracing::error!("Refusing {asked_for} from {asked_by}, no thread to ask on: {e}");
@@ -415,8 +450,81 @@ impl ServerCallbacks for CallbackBridge {
         name: &str,
         authorization: keep_nip46::types::ConnectAuthorization,
     ) {
+        // The roster write is the authorization. A failure is not a connect
+        // the UI should observe, whether this callback is the server's or a
+        // direct caller. `AutoApproved` is not a record of consent.
+        if matches!(
+            authorization,
+            keep_nip46::types::ConnectAuthorization::SecretMatched
+                | keep_nip46::types::ConnectAuthorization::UserApproved
+        ) {
+            if let Err(e) = self.commit_authorized_client(pubkey, authorization) {
+                tracing::warn!("failed to record authorized bunker client: {e}");
+                return;
+            }
+        }
         self.callbacks
             .on_connect(pubkey.to_string(), name.to_string(), authorization.into());
+    }
+
+    fn commit_authorized_client(
+        &self,
+        pubkey: &str,
+        authorization: keep_nip46::types::ConnectAuthorization,
+    ) -> Result<(), String> {
+        if !matches!(
+            authorization,
+            keep_nip46::types::ConnectAuthorization::SecretMatched
+                | keep_nip46::types::ConnectAuthorization::UserApproved
+        ) {
+            return Ok(());
+        }
+        // Already listed and within the cap is an empty eviction. A refusal
+        // (not serving, or pending revoke) is also empty, and is not the same
+        // thing: the client is authorized only when the roster check says so.
+        // A client already listed on a roster past the cap is not added again;
+        // the overflow is still returned so those grants are revoked.
+        let (evicted, added) =
+            record_authorized_client(&self.mobile, pubkey, || self.serving_now())
+                .map_err(|e| e.to_string())?;
+        // Read before the revoke, whose rollback can take the newcomer back
+        // off the roster, but answered after it: the eviction is already
+        // written, so its grants go whether or not the newcomer is authorized.
+        let authorized = match PublicKey::from_hex(pubkey) {
+            Ok(parsed) => bunker_client_authorized(&self.mobile, &parsed)
+                .map_err(|e| format!("the authorized client list could not be read: {e}")),
+            Err(_) => Ok(false),
+        };
+        if !evicted.is_empty() {
+            // Outside the config lock. Revoking through the engine persists a
+            // grant snapshot, and that takes the lock again.
+            if let Err(reason) = revoke_evicted_clients(&self.mobile, &evicted) {
+                // A client this connect just added is removed with the
+                // rollback. One who was already listed stays: they were not
+                // the overflow.
+                if let Err(rollback) =
+                    restore_evicted_clients(&self.mobile, &evicted, added.then_some(pubkey))
+                {
+                    tracing::warn!("failed to roll back an authorized client eviction: {rollback}");
+                }
+                return match authorized {
+                    Ok(false) => Err(keep_nip46::types::CLIENT_NOT_RECORDED.into()),
+                    _ => Err(reason),
+                };
+            }
+            tracing::info!(
+                dropped = evicted.len(),
+                "authorized bunker client list dropped the oldest entries"
+            );
+        }
+        match authorized? {
+            true => Ok(()),
+            false => Err(keep_nip46::types::CLIENT_NOT_RECORDED.into()),
+        }
+    }
+
+    fn client_authorized(&self, pubkey: &PublicKey) -> bool {
+        matches!(bunker_client_authorized(&self.mobile, pubkey), Ok(true))
     }
 
     fn client_listing(&self) -> ClientListing {
@@ -430,16 +538,14 @@ impl ServerCallbacks for CallbackBridge {
     }
 
     fn persist_permissions(&self, grants: Vec<keep_core::relay::StoredBunkerPermission>) {
-        let serving = || {
-            self.serving.load(Ordering::Acquire)
-                && *self.mobile.live_generation.borrow() == self.generation
-        };
+        let snapshot = grants.clone();
         if let Err(e) = self
             .mobile
-            .persist_bunker_permissions(grants, &self.grant_scope, serving)
+            .persist_bunker_permissions(grants, &self.grant_scope, || self.serving_now())
         {
             tracing::warn!("failed to persist bunker permissions: {e}");
-        } else if let Err(e) = clear_pending_revokes(&self.mobile, serving) {
+        } else if let Err(e) = clear_pending_revokes(&self.mobile, &snapshot, || self.serving_now())
+        {
             tracing::warn!("failed to clear finished revokes: {e}");
         }
     }
@@ -921,6 +1027,232 @@ fn listed_clients(mobile: &KeepMobile) -> Result<HashSet<PublicKey>, KeepMobileE
     })
 }
 
+/// How many clients the roster remembers. The oldest are dropped. The same
+/// bound as the in-memory connected-app cap and the Android client's cap.
+const MAX_AUTHORIZED_CLIENTS: usize = 100;
+
+fn same_client(stored: &str, pubkey: &PublicKey) -> bool {
+    PublicKey::parse(stored).ok().as_ref() == Some(pubkey)
+}
+
+fn client_pending_revoke(
+    stored: &crate::persistence::StoredBunkerConfig,
+    pubkey: &PublicKey,
+) -> bool {
+    stored.pending_revoke_all
+        || stored
+            .pending_revokes
+            .iter()
+            .any(|pending| same_client(pending, pubkey))
+}
+
+/// Whether `pubkey` is on the roster and not pending revoke.
+pub(crate) fn bunker_client_authorized(
+    mobile: &KeepMobile,
+    pubkey: &PublicKey,
+) -> Result<bool, KeepMobileError> {
+    with_bunker_config(mobile, |stored| {
+        Ok(!client_pending_revoke(stored, pubkey)
+            && stored
+                .authorized_clients
+                .iter()
+                .any(|client| same_client(client, pubkey)))
+    })
+}
+
+/// Sets `enabled` and leaves the roster, secrets, and pending revokes alone.
+/// [`crate::KeepMobile::save_bunker_config`] is this: the platform no longer
+/// writes who is authorized.
+pub(crate) fn set_bunker_enabled(
+    mobile: &KeepMobile,
+    enabled: bool,
+) -> Result<(), KeepMobileError> {
+    with_bunker_config(mobile, |stored| {
+        stored.enabled = enabled;
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })
+}
+
+/// Drops remembered grants for clients just removed from the roster.
+///
+/// A remembered kind is allowed by the in-memory engine without consulting
+/// the roster, so an evicted client would keep signing until the next start.
+/// When a live handler exists, that in-memory revoke is awaited: on a
+/// multi-thread runtime via `block_in_place`, or on this process's runtime
+/// when the caller is not already on one. A current-thread runtime cannot
+/// wait, and that is an error — the caller puts the roster back rather than
+/// acknowledging a client whose predecessor is still granted. No live handler
+/// means the disk forget is the whole job. A failed disk forget is marked
+/// pending and does not fail the connect, stop the bunker, or rotate the
+/// connect secret. A forget that cannot be marked either is an error, so the
+/// caller puts the roster back rather than leave a grant nothing will retry.
+fn revoke_evicted_clients(mobile: &KeepMobile, evicted: &[String]) -> Result<(), String> {
+    let clients: Vec<PublicKey> = evicted
+        .iter()
+        .filter_map(|stored| PublicKey::parse(stored).ok())
+        .collect();
+    if clients.is_empty() {
+        return Ok(());
+    }
+    let handler = mobile
+        .live_bunker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade);
+    if let Some(handler) = handler {
+        let revoke = async {
+            for client in &clients {
+                handler.revoke_client(client).await;
+            }
+        };
+        // `on_connect` runs on the bunker runtime. `Runtime::block_on` panics
+        // there; a current-thread runtime cannot `block_in_place` either.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(revoke));
+            }
+            Ok(_) => {
+                return Err(
+                    "evicted bunker client grants could not be dropped on this runtime".into(),
+                );
+            }
+            Err(_) => mobile.runtime.block_on(revoke),
+        }
+    }
+    let mut unmarked = None;
+    for client in &clients {
+        if let Err(e) = mobile.forget_bunker_permissions(Some(client)) {
+            tracing::warn!("failed to drop an evicted bunker client's grants: {e}");
+            if let Err(mark) = mark_evicted_revoke(mobile, client) {
+                tracing::warn!("failed to remember an evicted bunker client's revoke: {mark}");
+                unmarked.get_or_insert(mark);
+            }
+        }
+    }
+    match unmarked {
+        Some(e) => Err(format!(
+            "an evicted bunker client's grants could not be dropped or marked pending: {e}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Remembers that `client`'s persisted grants still have to go. Does not stop
+/// the bunker and does not rotate the connect secret: those belong to an
+/// operator revoke, and this client was only evicted to make room.
+fn mark_evicted_revoke(mobile: &KeepMobile, client: &PublicKey) -> Result<(), KeepMobileError> {
+    with_bunker_config(mobile, |stored| {
+        if stored
+            .pending_revokes
+            .iter()
+            .any(|pending| same_client(pending, client))
+        {
+            return Ok(());
+        }
+        stored.pending_revokes.push(client.to_hex());
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })
+}
+
+/// Puts `evicted` back at the front of the roster, in order, and removes
+/// `newcomer` when this connect added them. Used when their grants could not
+/// be dropped, so the connect does not leave a still-granted client off the
+/// list. A client who was already listed is not a newcomer and stays.
+fn restore_evicted_clients(
+    mobile: &KeepMobile,
+    evicted: &[String],
+    newcomer_hex: Option<&str>,
+) -> Result<(), KeepMobileError> {
+    let newcomer = newcomer_hex
+        .map(|hex| {
+            PublicKey::from_hex(hex).map_err(|_| KeepMobileError::InvalidInput {
+                msg: "Invalid client pubkey hex".into(),
+            })
+        })
+        .transpose()?;
+    with_bunker_config(mobile, |stored| {
+        if let Some(newcomer) = &newcomer {
+            if let Some(pos) = stored
+                .authorized_clients
+                .iter()
+                .rposition(|client| same_client(client, newcomer))
+            {
+                stored.authorized_clients.remove(pos);
+            }
+        }
+        let mut restored = evicted.to_vec();
+        restored.append(&mut std::mem::take(&mut stored.authorized_clients));
+        stored.authorized_clients = restored;
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })
+}
+
+/// Records one explicit connect on the roster. Does not rotate the connect
+/// secret. A client pending revoke is not recorded, and neither is a connect
+/// whose server is no longer the one being served: a revoke stops that server
+/// and bumps the generation before it drops the client, so the connect that
+/// already passed the secret check cannot write the client back.
+///
+/// The bool is whether this call inserted the client. A client already listed
+/// is not inserted again. When that roster is past the cap, the client is
+/// moved to the newest end before the front is drained, so the trim cannot
+/// drop the client that just connected, and the drained keys are returned for
+/// revoke. A roster within the cap is left in order.
+fn record_authorized_client(
+    mobile: &KeepMobile,
+    pubkey_hex: &str,
+    serving: impl FnOnce() -> bool,
+) -> Result<(Vec<String>, bool), KeepMobileError> {
+    let pubkey = PublicKey::from_hex(pubkey_hex).map_err(|_| KeepMobileError::InvalidInput {
+        msg: "Invalid client pubkey hex".into(),
+    })?;
+    with_bunker_config(mobile, |stored| {
+        if !serving() || client_pending_revoke(stored, &pubkey) {
+            return Ok((Vec::new(), false));
+        }
+        let added = if let Some(pos) = stored
+            .authorized_clients
+            .iter()
+            .position(|client| same_client(client, &pubkey))
+        {
+            if stored.authorized_clients.len() <= MAX_AUTHORIZED_CLIENTS {
+                return Ok((Vec::new(), false));
+            }
+            let existing = stored.authorized_clients.remove(pos);
+            stored.authorized_clients.push(existing);
+            false
+        } else {
+            stored.authorized_clients.push(pubkey.to_hex());
+            true
+        };
+        let evicted = if stored.authorized_clients.len() > MAX_AUTHORIZED_CLIENTS {
+            let keep_from = stored.authorized_clients.len() - MAX_AUTHORIZED_CLIENTS;
+            stored.authorized_clients.drain(..keep_from).collect()
+        } else {
+            Vec::new()
+        };
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )?;
+        Ok((evicted, added))
+    })
+}
+
 /// Runs `f` on the stored bunker config under its lock.
 fn with_bunker_config<T>(
     mobile: &KeepMobile,
@@ -951,20 +1283,47 @@ fn with_bunker_config<T>(
     result
 }
 
-/// Clears every pending revoke once a serving bunker has persisted its whole
-/// grant set, which replaced whatever grants those revokes left on disk. A
-/// revoke stops the server before it writes its mark, so checking `serving`
-/// under the bunker config lock never clears a mark written after the persist.
+/// Drops pending-revoke marks a serving persist has finished.
+///
+/// A per-client mark goes when that pubkey is absent from `grants`, or when
+/// it is in `grants` and back on the roster. A mark for a client `grants`
+/// still contains, who is not listed, stays. `pending_revoke_all` clears only
+/// when `grants` is empty: a non-empty snapshot is not a fresh approval of
+/// everyone. A revoke stops the server before it writes its mark, so checking
+/// `serving` under the bunker config lock never clears a mark written after
+/// this persist.
 fn clear_pending_revokes(
     mobile: &KeepMobile,
+    grants: &[keep_core::relay::StoredBunkerPermission],
     serving: impl FnOnce() -> bool,
 ) -> Result<(), KeepMobileError> {
     with_bunker_config(mobile, |stored| {
         if !serving() || (!stored.pending_revoke_all && stored.pending_revokes.is_empty()) {
             return Ok(());
         }
-        stored.pending_revoke_all = false;
-        stored.pending_revokes.clear();
+        let before = stored.pending_revokes.len();
+        let revoke_all = stored.pending_revoke_all;
+        stored.pending_revokes.retain(|pending| {
+            let Some(pubkey) = PublicKey::parse(pending).ok() else {
+                return true;
+            };
+            let in_snapshot = grants
+                .iter()
+                .any(|grant| same_client(&grant.pubkey_hex, &pubkey));
+            if !in_snapshot {
+                return false;
+            }
+            !stored
+                .authorized_clients
+                .iter()
+                .any(|client| same_client(client, &pubkey))
+        });
+        if grants.is_empty() {
+            stored.pending_revoke_all = false;
+        }
+        if stored.pending_revokes.len() == before && stored.pending_revoke_all == revoke_all {
+            return Ok(());
+        }
         crate::persistence::persist_bunker_config(
             &mobile.storage,
             crate::BUNKER_CONFIG_STORAGE_KEY,
@@ -1640,7 +1999,10 @@ mod tests {
             )
             .unwrap(),
             app_name: "an app".into(),
-            method: "sign_event".into(),
+            // `connect` is the unauthenticated entry, so this reaches the foreign
+            // callback. A `sign_event` from a client the roster does not list is
+            // refused before a prompt; that gate has its own test.
+            method: "connect".into(),
             event_kind: None,
             event_content: None,
             requested_permissions: None,
@@ -1697,7 +2059,7 @@ mod tests {
                     )
                     .unwrap(),
                     app_name: "an app".into(),
-                    method: "sign_event".into(),
+                    method: "connect".into(),
                     event_kind: None,
                     event_content: None,
                     requested_permissions: None,
@@ -2397,6 +2759,733 @@ mod tests {
         assert_ne!(again.as_str(), rotated.as_str());
     }
 
+    struct Noted {
+        connects: Mutex<Vec<(String, ConnectAuthorization)>>,
+        prompts: AtomicUsize,
+    }
+
+    impl BunkerCallbacks for Noted {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            self.prompts.fetch_add(1, Ordering::AcqRel);
+            BunkerApprovalResult {
+                approved: true,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, pubkey: String, _name: String, authorization: ConnectAuthorization) {
+            self.connects.lock().unwrap().push((pubkey, authorization));
+        }
+    }
+
+    fn noted(mobile: &Arc<KeepMobile>, serving: bool) -> (CallbackBridge, Arc<Noted>) {
+        let noted = Arc::new(Noted {
+            connects: Mutex::new(Vec::new()),
+            prompts: AtomicUsize::new(0),
+        });
+        let bridge = CallbackBridge {
+            callbacks: Arc::clone(&noted) as Arc<dyn BunkerCallbacks>,
+            mobile: Arc::clone(mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: String::new(),
+            serving: Arc::new(AtomicBool::new(serving)),
+        };
+        (bridge, noted)
+    }
+
+    fn connect_as(
+        bridge: &CallbackBridge,
+        pubkey: &str,
+        authorization: keep_nip46::types::ConnectAuthorization,
+    ) {
+        ServerCallbacks::on_connect(bridge, pubkey, "an app", authorization);
+    }
+
+    // The roster is written on an explicit connect, before the foreign callback,
+    // and an automatic connect is not a record of consent. A second connect for
+    // the same key, however it was spelled, does not add it again, and none of
+    // this rotates the connect secret.
+    #[test]
+    fn an_explicit_connect_joins_the_roster_and_an_automatic_one_does_not() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (_, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let (bridge, noted) = noted(&mobile, true);
+        let (by_secret, by_user, automatic, already) = (
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+            nostr_sdk::Keys::generate().public_key(),
+        );
+        let mut stored = stored_config(&storage);
+        stored
+            .authorized_clients
+            .push(nostr_sdk::ToBech32::to_bech32(&already).unwrap());
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+
+        connect_as(
+            &bridge,
+            &by_secret.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        connect_as(
+            &bridge,
+            &by_secret.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        connect_as(
+            &bridge,
+            &by_user.to_hex(),
+            keep_nip46::types::ConnectAuthorization::UserApproved,
+        );
+        connect_as(
+            &bridge,
+            &automatic.to_hex(),
+            keep_nip46::types::ConnectAuthorization::AutoApproved,
+        );
+        connect_as(
+            &bridge,
+            &already.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        connect_as(
+            &bridge,
+            "not-a-key",
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(
+            stored.authorized_clients,
+            vec![
+                nostr_sdk::ToBech32::to_bech32(&already).unwrap(),
+                by_secret.to_hex(),
+                by_user.to_hex(),
+            ]
+        );
+        assert!(bunker_client_authorized(&mobile, &by_secret).unwrap());
+        assert!(bunker_client_authorized(&mobile, &by_user).unwrap());
+        assert!(bunker_client_authorized(&mobile, &already).unwrap());
+        assert!(!bunker_client_authorized(&mobile, &automatic).unwrap());
+        let connects = noted.connects.lock().unwrap();
+        assert_eq!(connects.len(), 5);
+        assert!(
+            connects.iter().all(|(pubkey, _)| pubkey != "not-a-key"),
+            "a pubkey that does not parse is not a connect the UI is told about"
+        );
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+    }
+
+    // A revoke stops the server and names the client before the list changes.
+    // A connect that already passed the secret check must not write the client
+    // back, and must not rotate the secret the revoke just replaced.
+    #[test]
+    fn a_connect_after_a_revoke_cannot_put_the_client_back() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let client = nostr_sdk::Keys::generate().public_key();
+        let other = nostr_sdk::Keys::generate().public_key();
+        let (_, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let (bridge, _) = noted(&mobile, true);
+        connect_as(
+            &bridge,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(bunker_client_authorized(&mobile, &client).unwrap());
+
+        let mut stored = stored_config(&storage);
+        stored.authorized_clients.clear();
+        stored.pending_revokes = vec![nostr_sdk::ToBech32::to_bech32(&client).unwrap()];
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        connect_as(
+            &bridge,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::UserApproved,
+        );
+        assert!(stored_config(&storage).authorized_clients.is_empty());
+        assert!(!bunker_client_authorized(&mobile, &client).unwrap());
+
+        let mut stored = stored_config(&storage);
+        stored.pending_revokes.clear();
+        stored.pending_revoke_all = true;
+        stored.authorized_clients = vec![other.to_hex()];
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        connect_as(
+            &bridge,
+            &other.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        let fresh = nostr_sdk::Keys::generate().public_key();
+        connect_as(
+            &bridge,
+            &fresh.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert_eq!(
+            stored_config(&storage).authorized_clients,
+            vec![other.to_hex()]
+        );
+        assert!(!bunker_client_authorized(&mobile, &other).unwrap());
+        assert!(!bunker_client_authorized(&mobile, &fresh).unwrap());
+
+        let mut stored = stored_config(&storage);
+        stored.pending_revoke_all = false;
+        stored.authorized_clients.clear();
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        let (stopped, _) = noted(&mobile, false);
+        connect_as(
+            &stopped,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(stored_config(&storage).authorized_clients.is_empty());
+
+        let (stale, _) = noted(&mobile, true);
+        mobile
+            .live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        connect_as(
+            &stale,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(stored_config(&storage).authorized_clients.is_empty());
+
+        let (live, noted_live) = noted(&mobile, true);
+        connect_as(
+            &live,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert_eq!(
+            stored_config(&storage).authorized_clients,
+            vec![client.to_hex()]
+        );
+        BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_client(client.to_hex())
+            .unwrap();
+        let (_, rotated) = load_or_create_bunker_keys(&mobile).unwrap();
+        assert_ne!(rotated.as_str(), secret.as_str());
+        connect_as(
+            &live,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(stored_config(&storage).authorized_clients.is_empty());
+        assert!(!bunker_client_authorized(&mobile, &client).unwrap());
+        let (_, still) = load_or_create_bunker_keys(&mobile).unwrap();
+        assert_eq!(still.as_str(), rotated.as_str());
+        assert!(!noted_live.connects.lock().unwrap().is_empty());
+    }
+
+    // A roster that cannot be written fails the connect. The foreign callback
+    // does not run, and the client is not authorized.
+    #[test]
+    fn a_connect_the_roster_cannot_store_does_not_notify() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let client = nostr_sdk::Keys::generate().public_key();
+        *mem.fail_writes_to.lock().unwrap() = Some(BUNKER_CONFIG_STORAGE_KEY.into());
+        let (bridge, noted) = noted(&mobile, true);
+        connect_as(
+            &bridge,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(noted.connects.lock().unwrap().is_empty());
+        assert!(load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .is_none());
+        assert!(!bunker_client_authorized(&mobile, &client).unwrap());
+    }
+
+    #[test]
+    fn the_roster_keeps_the_newest_hundred_clients() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (_, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let mut stored = stored_config(&storage);
+        stored.authorized_clients = oldest.iter().map(|key| key.to_hex()).collect();
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        persist_grants(&mobile, &[oldest[0], oldest[1]]);
+        let newest = nostr_sdk::Keys::generate().public_key();
+        let (bridge, _) = noted(&mobile, true);
+        connect_as(
+            &bridge,
+            &newest.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert_eq!(stored.authorized_clients[0], oldest[1].to_hex());
+        assert_eq!(stored.authorized_clients.last(), Some(&newest.to_hex()));
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &oldest[0].to_hex()));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+        let grants = restored_clients(&mobile);
+        assert!(
+            !grants.iter().any(|client| client == &oldest[0].to_hex()),
+            "an evicted client's remembered grant is dropped"
+        );
+        assert!(
+            grants.iter().any(|client| client == &oldest[1].to_hex()),
+            "a client that stayed on the roster keeps its grant"
+        );
+    }
+
+    // A roster already past the cap is trimmed when someone on it connects
+    // again. That client moves to the newest end first, so the overflow
+    // dropped is not them, and the grants of the dropped clients go with them.
+    // At the cap, a reconnect leaves the order alone.
+    #[test]
+    fn reconnecting_trims_a_roster_past_the_cap() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS + 2)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let reconnecting = oldest[0];
+        let dropped = [oldest[1], oldest[2]];
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[reconnecting, dropped[0], dropped[1], oldest[3]]);
+        let (bridge, _) = noted(&mobile, true);
+        connect_as(
+            &bridge,
+            &reconnecting.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert_eq!(
+            stored.authorized_clients.last(),
+            Some(&reconnecting.to_hex())
+        );
+        for client in &dropped {
+            assert!(!stored
+                .authorized_clients
+                .iter()
+                .any(|listed| listed == &client.to_hex()));
+        }
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|listed| listed == &oldest[3].to_hex()));
+        assert!(bunker_client_authorized(&mobile, &reconnecting).unwrap());
+        let grants = restored_clients(&mobile);
+        assert!(grants.iter().any(|client| client == &reconnecting.to_hex()));
+        assert!(grants.iter().any(|client| client == &oldest[3].to_hex()));
+        for client in &dropped {
+            assert!(!grants.iter().any(|listed| listed == &client.to_hex()));
+            assert!(!bunker_client_authorized(&mobile, client).unwrap());
+        }
+
+        let before = stored.authorized_clients.clone();
+        connect_as(
+            &bridge,
+            &oldest[3].to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert_eq!(stored_config(&storage).authorized_clients, before);
+    }
+
+    // While the bunker is running, the in-memory grant — not the roster —
+    // decides a remembered kind. Evicting the client has to revoke that grant
+    // too, or it keeps signing until the next start.
+    #[test]
+    fn evicting_a_client_revokes_its_live_grant() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let (dropped, kept) = (oldest[0], oldest[1]);
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[dropped, kept]);
+
+        let noted = Arc::new(Noted {
+            connects: Mutex::new(Vec::new()),
+            prompts: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(CallbackBridge {
+            callbacks: Arc::clone(&noted) as Arc<dyn BunkerCallbacks>,
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: grant_scope(&transport, &GROUP).unwrap(),
+            serving: Arc::new(AtomicBool::new(true)),
+        });
+        let handler = Arc::new(SignerHandler::new(
+            Arc::new(tokio::sync::Mutex::new(keep_core::keyring::Keyring::new())),
+            Arc::new(tokio::sync::Mutex::new(keep_nip46::PermissionManager::new())),
+            Arc::new(tokio::sync::Mutex::new(keep_nip46::AuditLog::new(8))),
+            Some(Arc::clone(&bridge) as Arc<dyn ServerCallbacks>),
+        ));
+        mobile.runtime.block_on(async {
+            for client in [dropped, kept] {
+                let app = PreGrantedApp::from_stored(&remembered(&client)).unwrap();
+                handler
+                    .restore_client(
+                        app.pubkey,
+                        app.name,
+                        app.permissions,
+                        app.auto_approve_kinds,
+                        app.duration,
+                        app.connected_at,
+                        app.timed_kind_grants,
+                        app.explicitly_remembered,
+                    )
+                    .await;
+            }
+        });
+        *mobile.live_bunker.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&handler));
+
+        let before = mobile.runtime.block_on(handler.list_clients());
+        assert!(before.iter().any(|app| app.pubkey == dropped));
+        assert!(before.iter().any(|app| app.pubkey == kept));
+
+        let newest = nostr_sdk::Keys::generate().public_key();
+        connect_as(
+            &bridge,
+            &newest.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &dropped.to_hex()));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &kept.to_hex()));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+
+        let grants = restored_clients(&mobile);
+        assert!(!grants.iter().any(|client| client == &dropped.to_hex()));
+        assert!(grants.iter().any(|client| client == &kept.to_hex()));
+        let after = mobile.runtime.block_on(handler.list_clients());
+        assert!(after.iter().all(|app| app.pubkey != dropped));
+        assert!(after.iter().any(|app| {
+            app.pubkey == kept && app.auto_approve_kinds.contains(&Kind::from(1u16))
+        }));
+    }
+
+    // The signer, not the foreign callback, admits one more client when the
+    // roster is already full and then drops the oldest client and that
+    // client's grant. The connect secret is not a credential this revokes.
+    #[test]
+    fn a_connect_at_a_full_roster_drops_the_oldest_client_and_its_grant() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let (dropped, kept) = (oldest[0], oldest[1]);
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[dropped, kept]);
+
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        let expected = PublicKey::from_slice(keypair.public_bytes()).unwrap();
+        let mut keyring = keep_core::keyring::Keyring::new();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+
+        let noted = Arc::new(Noted {
+            connects: Mutex::new(Vec::new()),
+            prompts: AtomicUsize::new(0),
+        });
+        let bridge = Arc::new(CallbackBridge {
+            callbacks: Arc::clone(&noted) as Arc<dyn BunkerCallbacks>,
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: grant_scope(&transport, &GROUP).unwrap(),
+            serving: Arc::new(AtomicBool::new(true)),
+        });
+        let handler = Arc::new(
+            SignerHandler::new(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                Arc::new(tokio::sync::Mutex::new(keep_nip46::PermissionManager::new())),
+                Arc::new(tokio::sync::Mutex::new(keep_nip46::AuditLog::new(8))),
+                Some(Arc::clone(&bridge) as Arc<dyn ServerCallbacks>),
+            )
+            .with_expected_secret("secret".into()),
+        );
+        mobile.runtime.block_on(async {
+            for client in [dropped, kept] {
+                let app = PreGrantedApp::from_stored(&remembered(&client)).unwrap();
+                handler
+                    .restore_client(
+                        app.pubkey,
+                        app.name,
+                        app.permissions,
+                        app.auto_approve_kinds,
+                        app.duration,
+                        app.connected_at,
+                        app.timed_kind_grants,
+                        app.explicitly_remembered,
+                    )
+                    .await;
+            }
+        });
+        *mobile.live_bunker.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::downgrade(&handler));
+
+        let newest = nostr_sdk::Keys::generate().public_key();
+        let authorization = mobile
+            .runtime
+            .block_on(handler.handle_connect(newest, None, Some("secret".into()), None))
+            .expect("a full roster admits the next explicit connect");
+        assert_eq!(
+            authorization,
+            keep_nip46::types::ConnectAuthorization::SecretMatched
+        );
+        assert!(
+            noted.connects.lock().unwrap().is_empty(),
+            "handle_connect records the client; the foreign callback is separate"
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients.len(), MAX_AUTHORIZED_CLIENTS);
+        assert_eq!(stored.authorized_clients[0], kept.to_hex());
+        assert_eq!(stored.authorized_clients.last(), Some(&newest.to_hex()));
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &dropped.to_hex()));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &kept.to_hex()));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+        assert!(bunker_client_authorized(&mobile, &newest).unwrap());
+        assert!(!bunker_client_authorized(&mobile, &dropped).unwrap());
+
+        let grants = restored_clients(&mobile);
+        assert!(!grants.iter().any(|client| client == &dropped.to_hex()));
+        assert!(grants.iter().any(|client| client == &kept.to_hex()));
+        let after = mobile.runtime.block_on(handler.list_clients());
+        assert!(after.iter().all(|app| app.pubkey != dropped));
+        assert!(after.iter().any(|app| {
+            app.pubkey == kept && app.auto_approve_kinds.contains(&Kind::from(1u16))
+        }));
+        assert!(after.iter().any(|app| app.pubkey == newest));
+
+        let denied = mobile
+            .runtime
+            .block_on(handler.handle_get_public_key(dropped));
+        assert!(
+            matches!(
+                denied,
+                Err(keep_core::error::KeepError::PermissionDenied(_))
+            ),
+            "{denied:?}"
+        );
+        let published = mobile
+            .runtime
+            .block_on(handler.handle_get_public_key(newest))
+            .expect("the admitted client can read the signing key");
+        assert_eq!(published, expected);
+    }
+
+    // The grant record is separate from the roster. When dropping an evicted
+    // client's grant fails, the client stays pending so a start will not serve
+    // it and will retry the drop. That mark must not stop the bunker or rotate
+    // the connect secret, and the client cannot be written back while it holds.
+    // A grant that can neither be dropped nor marked pending would survive with
+    // nothing to retry it, so the eviction must fail and the roster go back.
+    #[test]
+    fn an_eviction_revoke_that_cannot_be_marked_pending_fails() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        load_or_create_bunker_keys(&mobile).unwrap();
+        let dropped = nostr_sdk::Keys::generate().public_key();
+        mem.data.lock().unwrap().insert(
+            crate::relay_config_key(None),
+            b"not a relay config".to_vec(),
+        );
+        *mem.fail_writes_to.lock().unwrap() = Some(BUNKER_CONFIG_STORAGE_KEY.into());
+
+        assert!(revoke_evicted_clients(&mobile, &[dropped.to_hex()]).is_err());
+        assert!(stored_config(&storage).pending_revokes.is_empty());
+
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(revoke_evicted_clients(&mobile, &[dropped.to_hex()]).is_ok());
+        assert_eq!(
+            stored_config(&storage).pending_revokes,
+            vec![dropped.to_hex()],
+            "a forget that fails but is marked is not an error"
+        );
+    }
+
+    #[test]
+    fn a_failed_eviction_revoke_stays_pending_without_a_new_secret() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (_, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let generation = *mobile.live_generation.borrow();
+        let oldest: Vec<PublicKey> = (0..MAX_AUTHORIZED_CLIENTS)
+            .map(|_| nostr_sdk::Keys::generate().public_key())
+            .collect();
+        let (dropped, kept) = (oldest[0], oldest[1]);
+        set_listed(&mobile, oldest.iter().map(PublicKey::to_hex).collect());
+        persist_grants(&mobile, &[dropped, kept]);
+
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::relay_config_key(None));
+        let (bridge, _) = noted(&mobile, true);
+        let newest = nostr_sdk::Keys::generate().public_key();
+        connect_as(
+            &bridge,
+            &newest.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        connect_as(
+            &bridge,
+            &dropped.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+
+        let stored = stored_config(&storage);
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
+        assert_eq!(*mobile.live_generation.borrow(), generation);
+        assert!(bridge.serving.load(Ordering::Acquire));
+        assert_eq!(stored.pending_revokes, vec![dropped.to_hex()]);
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &dropped.to_hex()));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &kept.to_hex()));
+        assert_eq!(stored.authorized_clients.last(), Some(&newest.to_hex()));
+        assert!(
+            restored_clients(&mobile)
+                .iter()
+                .any(|client| client == &dropped.to_hex()),
+            "the grant write failed, so it is still stored"
+        );
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let served = served_clients(&handler);
+        assert!(!served.iter().any(|client| client == &dropped.to_hex()));
+        assert!(served.iter().any(|client| client == &kept.to_hex()));
+        assert_eq!(
+            stored_config(&storage).pending_revokes,
+            vec![dropped.to_hex()],
+            "the retry failed, so the mark stays"
+        );
+        assert_eq!(
+            stored_config(&storage).connect_secret.as_deref(),
+            Some(secret.as_str())
+        );
+
+        *mem.fail_writes_to.lock().unwrap() = None;
+        let served = served_clients(&handler);
+        assert!(!served.iter().any(|client| client == &dropped.to_hex()));
+        assert!(served.iter().any(|client| client == &kept.to_hex()));
+        assert!(
+            !restored_clients(&mobile)
+                .iter()
+                .any(|client| client == &dropped.to_hex()),
+            "the retry dropped the grant"
+        );
+        assert!(stored_config(&storage).pending_revokes.is_empty());
+        assert_eq!(
+            stored_config(&storage).connect_secret.as_deref(),
+            Some(secret.as_str())
+        );
+        assert_eq!(*mobile.live_generation.borrow(), generation);
+        assert!(bridge.serving.load(Ordering::Acquire));
+    }
+
+    // Connect is asked of a client the roster does not list. Every other method
+    // is refused, without taking a prompt slot, until an explicit connect
+    // records them. A pending revoke-all closes that again.
+    #[test]
+    fn a_client_the_roster_does_not_list_is_not_prompted() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let outstanding = Arc::new(AtomicUsize::new(0));
+        let noted = Arc::new(Noted {
+            connects: Mutex::new(Vec::new()),
+            prompts: AtomicUsize::new(0),
+        });
+        let bridge = CallbackBridge {
+            callbacks: Arc::clone(&noted) as Arc<dyn BunkerCallbacks>,
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::clone(&outstanding),
+            grant_scope: String::new(),
+            serving: Arc::new(AtomicBool::new(true)),
+        };
+        let client = nostr_sdk::Keys::generate().public_key();
+        let ask = |method: &str| {
+            ServerCallbacks::request_approval(
+                &bridge,
+                ApprovalRequest {
+                    app_pubkey: client,
+                    app_name: "an app".into(),
+                    method: method.into(),
+                    event_kind: None,
+                    event_content: None,
+                    requested_permissions: None,
+                    http_auth: None,
+                },
+            )
+        };
+
+        assert!(!ask("sign_event").approved);
+        assert_eq!(noted.prompts.load(Ordering::Acquire), 0);
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+
+        assert!(ask("connect").approved);
+        assert_eq!(noted.prompts.load(Ordering::Acquire), 1);
+
+        connect_as(
+            &bridge,
+            &client.to_hex(),
+            keep_nip46::types::ConnectAuthorization::SecretMatched,
+        );
+        assert!(ask("sign_event").approved);
+        assert_eq!(noted.prompts.load(Ordering::Acquire), 2);
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+
+        let mut stored = stored_config(&storage);
+        stored.pending_revoke_all = true;
+        persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
+        assert!(!ask("sign_event").approved);
+        assert_eq!(noted.prompts.load(Ordering::Acquire), 2);
+        assert_eq!(outstanding.load(Ordering::Acquire), 0);
+    }
+
     /// A client on `url` listening for the bunker at `bunker`'s answers.
     fn listening(
         mobile: &KeepMobile,
@@ -2571,10 +3660,11 @@ mod tests {
 
     // End to end over a relay with the production callback bridge: once the
     // platform lists the most clients it allows, a stranger holding the
-    // connect secret is refused and granted nothing, a listed client still
-    // connects, and a slot the platform frees admits the stranger.
+    // connect secret is admitted and the oldest client is dropped. A client
+    // who was already listed still connects, and the newcomer can read the
+    // signing key. A slot the platform then frees admits another stranger.
     #[test]
-    fn a_connect_past_the_listed_cap_is_refused_end_to_end() {
+    fn a_connect_past_the_listed_cap_drops_the_oldest_end_to_end() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
         let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
@@ -2613,7 +3703,10 @@ mod tests {
                 .block_on(ask_over_relay(client, keys, bunker, id, method, params))
         };
 
+        let oldest = clients[0].clone();
         let stranger = nostr_sdk::Keys::generate();
+        let stranger_hex = stranger.public_key().to_hex();
+        let listed_hex = listed.public_key().to_hex();
         let stranger_client = listening(&mobile, &url, &stranger, bunker);
         assert_eq!(
             error_of(ask(
@@ -2622,10 +3715,28 @@ mod tests {
                 "full",
                 "connect",
                 connect.clone()
-            ))
-            .as_deref(),
-            Some("Capacity exceeded"),
+            )),
+            None,
+            "a full roster admits the next explicit connect"
         );
+        let stored = stored_config(&storage);
+        assert_eq!(
+            stored.authorized_clients.len(),
+            keep_nip46::PermissionManager::MAX_CONNECTED_APPS
+        );
+        assert_eq!(
+            stored.authorized_clients.last().map(String::as_str),
+            Some(stranger_hex.as_str())
+        );
+        assert!(!stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &oldest));
+        assert!(stored
+            .authorized_clients
+            .iter()
+            .any(|client| client == &listed_hex));
+        assert_eq!(stored.connect_secret.as_deref(), Some(secret.as_str()));
         assert_eq!(
             error_of(ask(
                 &stranger_client,
@@ -2633,10 +3744,9 @@ mod tests {
                 "full-key",
                 "get_public_key",
                 serde_json::json!([])
-            ))
-            .as_deref(),
-            Some("Permission denied"),
-            "the refused connect granted nothing"
+            )),
+            None,
+            "the admitted connect granted the signing key"
         );
 
         let listed_client = listening(&mobile, &url, &listed, bunker);
@@ -2651,22 +3761,25 @@ mod tests {
             None
         );
 
-        clients.remove(0);
-        set_listed(&mobile, clients);
+        let mut current = stored_config(&storage).authorized_clients;
+        let freed = current.remove(0);
+        set_listed(&mobile, current.clone());
+        let other = nostr_sdk::Keys::generate();
+        let other_hex = other.public_key().to_hex();
+        let other_client = listening(&mobile, &url, &other, bunker);
         assert_eq!(
-            error_of(ask(
-                &stranger_client,
-                &stranger,
-                "freed",
-                "connect",
-                connect
-            )),
+            error_of(ask(&other_client, &other, "freed", "connect", connect)),
             None,
             "a freed slot admits the stranger"
         );
+        let after = stored_config(&storage).authorized_clients;
+        assert_eq!(after.len(), current.len() + 1);
+        assert!(!after.iter().any(|client| client == &freed));
+        assert_eq!(after.last().map(String::as_str), Some(other_hex.as_str()));
+        assert!(current.iter().all(|client| after.contains(client)));
         assert_eq!(prompts.load(Ordering::Acquire), 0, "nothing asked the user");
         starter.stop_bunker();
-        for c in [stranger_client, listed_client] {
+        for c in [stranger_client, listed_client, other_client] {
             mobile.runtime.block_on(c.disconnect());
         }
     }
@@ -2879,8 +3992,9 @@ mod tests {
         assert_eq!(*secret2, "preserved-secret");
     }
 
-    // Drive the real `KeepMobile::save_bunker_config`: persisted transport key +
-    // connect secret survive an unrelated config save (disable + add a client).
+    // Drive the real `KeepMobile::save_bunker_config`: it changes `enabled`
+    // only. The roster, transport key, connect secret and pending revokes
+    // survive a save that passes a different list, including an empty one.
     #[test]
     fn save_bunker_config_preserves_secrets() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
@@ -2891,14 +4005,27 @@ mod tests {
         let mut stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
             .unwrap()
             .unwrap();
+        stored.authorized_clients = vec!["kept".into()];
         stored.pending_revokes = vec!["p".into()];
         stored.pending_revoke_all = true;
         persist_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY, &stored).unwrap();
 
         mobile
             .save_bunker_config(crate::BunkerConfigInfo {
-                enabled: false,
+                enabled: true,
                 authorized_clients: vec!["c".into()],
+            })
+            .unwrap();
+        let enabled = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .expect("config persisted");
+        assert!(enabled.enabled);
+        assert_eq!(enabled.authorized_clients, vec!["kept".to_string()]);
+
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: false,
+                authorized_clients: Vec::new(),
             })
             .unwrap();
 
@@ -2906,7 +4033,7 @@ mod tests {
             .unwrap()
             .expect("config persisted");
         assert!(!reloaded.enabled);
-        assert_eq!(reloaded.authorized_clients, vec!["c".to_string()]);
+        assert_eq!(reloaded.authorized_clients, vec!["kept".to_string()]);
         assert_eq!(
             reloaded
                 .transport_secret
@@ -2920,26 +4047,25 @@ mod tests {
         assert!(reloaded.pending_revoke_all);
     }
 
+    // The platform list is not applied, so a save cannot install more clients
+    // than the engine holds, or any clients at all. The roster is written by
+    // an explicit connect and removed by revoke.
     #[test]
-    fn save_bunker_config_refuses_more_clients_than_the_engine_holds() {
+    fn save_bunker_config_does_not_install_a_client_list() {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
         let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
-        let save = |n: usize| {
-            mobile.save_bunker_config(crate::BunkerConfigInfo {
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
                 enabled: true,
-                authorized_clients: (0..n).map(|i| format!("{i:064x}")).collect(),
+                authorized_clients: (0..max + 1).map(|i| format!("{i:064x}")).collect(),
             })
-        };
-        save(max).unwrap();
-        assert!(matches!(
-            save(max + 1),
-            Err(KeepMobileError::TooManyAuthorizedClients { max: m }) if m as usize == max
-        ));
+            .unwrap();
         let stored = load_bunker_config(&storage, BUNKER_CONFIG_STORAGE_KEY)
             .unwrap()
             .unwrap();
-        assert_eq!(stored.authorized_clients.len(), max);
+        assert!(stored.enabled);
+        assert!(stored.authorized_clients.is_empty());
     }
 
     // Saving unrelated config (e.g. toggling enabled) must not rotate the keys.
