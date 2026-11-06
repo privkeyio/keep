@@ -442,6 +442,59 @@ fn lock_pre_approved(
     guard
 }
 
+/// This node's own sign requests still running, by the SHA-256 of the message,
+/// with how many identical requests are running at once.
+type OwnRequestsInFlight = Arc<std::sync::Mutex<HashMap<[u8; 32], usize>>>;
+
+fn message_hash(message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(message).into()
+}
+
+/// Spend the pre-approval recorded for `message`, if there is one.
+fn consume_pre_approval(hashes: &PreApprovedHashes, message: &[u8]) -> bool {
+    lock_pre_approved(hashes)
+        .remove(&message_hash(message))
+        .is_some()
+}
+
+/// Marks `message` as this node's own request for as long as it is held, so
+/// [`MobileSigningHooks::pre_sign`] lets every failover attempt of it through
+/// without a prompt. Hold it only once the request's approval is claimed: the
+/// NIP-55 sign path spends the event's pre-approval first and refuses an event
+/// that has none.
+pub(crate) struct OwnRequestGuard {
+    in_flight: OwnRequestsInFlight,
+    key: [u8; 32],
+}
+
+impl OwnRequestGuard {
+    pub(crate) fn hold(in_flight: &OwnRequestsInFlight, message: &[u8]) -> Self {
+        let key = message_hash(message);
+        *in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key)
+            .or_insert(0) += 1;
+        Self {
+            in_flight: Arc::clone(in_flight),
+            key,
+        }
+    }
+}
+
+impl Drop for OwnRequestGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = in_flight.get_mut(&self.key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(&self.key);
+            }
+        }
+    }
+}
+
 const POLICY_STORAGE_KEY: &str = "__keep_policy_v1";
 const VELOCITY_STORAGE_KEY: &str = "__keep_velocity_v1";
 const TRUSTED_WARDENS_KEY: &str = "__keep_trusted_wardens_v1";
@@ -599,18 +652,26 @@ pub trait KeepStateCallback: Send + Sync + 'static {
 struct MobileSigningHooks {
     request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
     pre_approved_hashes: PreApprovedHashes,
+    /// This node's share identifier, the `requester` of every session it starts.
+    own_identifier: u16,
+    own_requests_in_flight: OwnRequestsInFlight,
     /// Read on every round so the kill switch ("Signing Disabled") gates FROST
     /// co-signing too, not just the NIP-55/NIP-46 paths.
     storage: Arc<dyn SecureStorage>,
 }
 
 impl MobileSigningHooks {
+    fn is_own_request_in_flight(&self, session: &SessionInfo) -> bool {
+        session.requester == self.own_identifier
+            && self
+                .own_requests_in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&message_hash(&session.message))
+    }
+
     fn consume_pre_approval(&self, message: &[u8]) -> bool {
-        use sha2::{Digest, Sha256};
-        let msg_hash: [u8; 32] = Sha256::digest(message).into();
-        lock_pre_approved(&self.pre_approved_hashes)
-            .remove(&msg_hash)
-            .is_some()
+        consume_pre_approval(&self.pre_approved_hashes, message)
     }
 }
 
@@ -702,6 +763,13 @@ impl SigningHooks for MobileSigningHooks {
         // stands in for the prompt on a request that moves funds.
         let moves_funds = session.message_type == keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH
             || session.taproot_tweak.is_some();
+        // This node's own request, whose pre-approval the NIP-55 sign path
+        // claimed before sending it, is let through on every failover attempt.
+        // A NIP-46 network sign of the byte-identical event while it is in
+        // flight skips the second prompt too, which is accepted.
+        if !moves_funds && self.is_own_request_in_flight(session) {
+            return Ok(());
+        }
         if !moves_funds && self.consume_pre_approval(&session.message) {
             return Ok(());
         }
@@ -824,7 +892,8 @@ pub struct KeepMobile {
     pending_contributions: Arc<std::sync::Mutex<HashMap<[u8; 32], PendingContribution>>>,
     state_callback: Arc<RwLock<Option<Arc<dyn KeepStateCallback>>>>,
     state_rev: Arc<std::sync::atomic::AtomicU64>,
-    pre_approved_hashes: PreApprovedHashes,
+    pub(crate) pre_approved_hashes: PreApprovedHashes,
+    pub(crate) own_requests_in_flight: OwnRequestsInFlight,
     session_store_path: Arc<std::sync::Mutex<Option<String>>>,
     descriptor_write_lock: Arc<std::sync::Mutex<()>>,
     /// Advanced each time the live node is torn down, after it is gone. A
@@ -1260,6 +1329,7 @@ impl KeepMobile {
             state_callback: Arc::new(RwLock::new(None)),
             state_rev: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pre_approved_hashes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            own_requests_in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_store_path: Arc::new(std::sync::Mutex::new(None)),
             descriptor_write_lock: Arc::new(std::sync::Mutex::new(())),
             live_generation: tokio::sync::watch::Sender::new(0),
@@ -1396,8 +1466,7 @@ impl KeepMobile {
     /// Let the next co-sign request for `message` skip the prompt. A Bitcoin
     /// request is always prompted, pre-approved or not.
     pub fn set_signing_pre_approved(&self, message: Vec<u8>) {
-        use sha2::{Digest, Sha256};
-        let hash: [u8; 32] = Sha256::digest(&message).into();
+        let hash = message_hash(&message);
         let now = std::time::Instant::now();
         let mut guard = lock_pre_approved(&self.pre_approved_hashes);
         if guard.len() >= MAX_PRE_APPROVED_HASHES {
@@ -1411,6 +1480,8 @@ impl KeepMobile {
     /// Pre-approve a specific Nostr event (by its computed event id) so the next
     /// matching sign request auto-approves without prompting. Convenience wrapper
     /// over [`set_signing_pre_approved`] for NIP-55 callers holding event JSON.
+    /// The NIP-55 sign path claims this approval before it sends anything and
+    /// refuses an event that has none.
     pub fn pre_approve_nostr_event(&self, event_json: String) -> Result<(), KeepMobileError> {
         let event: serde_json::Value =
             serde_json::from_str(&event_json).map_err(|_| KeepMobileError::InvalidSession)?;
@@ -5188,6 +5259,8 @@ impl KeepMobile {
             let hooks = Arc::new(MobileSigningHooks {
                 request_tx,
                 pre_approved_hashes: self.pre_approved_hashes.clone(),
+                own_identifier: node.share_package().metadata.identifier,
+                own_requests_in_flight: self.own_requests_in_flight.clone(),
                 storage: self.storage.clone(),
             });
             node.set_hooks(hooks);
@@ -9181,6 +9254,8 @@ mod cosign_prompt_e2e_tests {
         nodes[0].set_hooks(Arc::new(MobileSigningHooks {
             request_tx,
             pre_approved_hashes: Arc::clone(&pre_approved),
+            own_identifier: nodes[0].share_package().metadata.identifier,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::clone(&storage),
         }));
         // What the event loop does with each request the hooks hand over:
@@ -9422,6 +9497,249 @@ mod cosign_prompt_e2e_tests {
             "the phone was never asked"
         );
     }
+
+    /// The phone as the requester of a NIP-55 event, with its prompt channel
+    /// closed: its own request goes through only while held in flight.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_phone_signs_its_own_request_in_flight_without_a_prompt() {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 2).unwrap());
+        let (shares, _) = dealer.generate("own-request-e2e").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let bus = MemoryBus::new();
+        let mut nodes: Vec<KfpNode> = shares
+            .into_iter()
+            .map(|share| {
+                KfpNode::with_transport(
+                    share,
+                    bus.transport() as Arc<dyn CosignTransport>,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let in_flight: OwnRequestsInFlight = Arc::new(StdMutex::new(HashMap::new()));
+        let own_identifier = nodes[0].share_package().metadata.identifier;
+        nodes[0].set_hooks(Arc::new(MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            own_identifier,
+            own_requests_in_flight: Arc::clone(&in_flight),
+            storage: Arc::new(
+                super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off(),
+            ),
+        }));
+        let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
+        let _shutdown: Vec<_> = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+        let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+        for node in &nodes {
+            let node = Arc::clone(node);
+            tokio::spawn(async move {
+                let _ = node.run().await;
+            });
+        }
+        for rx in &mut seen {
+            timeout(Duration::from_secs(30), async {
+                while !matches!(rx.recv().await, Ok(KfpNodeEvent::PeerDiscovered { .. })) {}
+            })
+            .await
+            .expect("the phone and its co-signer must discover each other");
+        }
+
+        let event = serde_json::json!({
+            "pubkey": hex::encode(group_pubkey),
+            "created_at": 1_700_000_000,
+            "kind": 1,
+            "tags": [],
+            "content": "own request",
+        });
+        let event_hash = crate::nip55::compute_nostr_event_id(&event).unwrap();
+        let structured = crate::nip55::build_structured_nostr_payload(&event).unwrap();
+        let sign = || {
+            timeout(
+                Duration::from_secs(30),
+                nodes[0].request_signature_structured(
+                    event_hash.to_vec(),
+                    keep_frost_net::MSG_TYPE_NOSTR_EVENT,
+                    Some(structured.clone()),
+                ),
+            )
+        };
+
+        let err = sign().await.expect("the request must finish").unwrap_err();
+        assert!(err.to_string().contains("Channel closed"), "{err}");
+
+        let held = OwnRequestGuard::hold(&in_flight, &event_hash);
+        sign()
+            .await
+            .expect("the request must finish")
+            .expect("the phone's own request in flight is signed without a prompt");
+        drop(held);
+        assert!(in_flight.lock().unwrap().is_empty());
+    }
+
+    /// A phone whose live node holds share 1 of a 2-of-2 group, as
+    /// `init_with_network` leaves it, with its co-signer on the same bus. Every
+    /// prompt the phone's hooks raise is recorded and refused.
+    struct Nip55Phone {
+        mobile: Arc<KeepMobile>,
+        group_pubkey: [u8; 32],
+        prompts: std::sync::mpsc::Receiver<SessionInfo>,
+        _shutdown: Vec<Option<mpsc::Sender<()>>>,
+    }
+
+    fn nip55_phone() -> Nip55Phone {
+        let dealer = TrustedDealer::new(ThresholdConfig::new(2, 2).unwrap());
+        let (shares, _) = dealer.generate("nip55-own-request").unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let storage: Arc<dyn SecureStorage> = Arc::new(
+            super::baseline_presign_policy_tests::KillSwitchOffStorage::holding(
+                crate::storage::ShareMetadataInfo {
+                    name: "phone".into(),
+                    identifier: shares[0].metadata.identifier,
+                    threshold: 2,
+                    total_shares: 2,
+                    group_pubkey: group_pubkey.to_vec(),
+                    did_backup: true,
+                },
+            ),
+        );
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (prompt_tx, prompts) = std::sync::mpsc::channel();
+        let shutdown = mobile.runtime.block_on(async {
+            let bus = MemoryBus::new();
+            let mut nodes: Vec<KfpNode> = shares
+                .into_iter()
+                .map(|share| {
+                    KfpNode::with_transport(
+                        share,
+                        bus.transport() as Arc<dyn CosignTransport>,
+                        None,
+                        None,
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let (request_tx, mut request_rx) = mpsc::channel(4);
+            nodes[0].set_hooks(Arc::new(MobileSigningHooks {
+                request_tx,
+                pre_approved_hashes: mobile.pre_approved_hashes.clone(),
+                own_identifier: nodes[0].share_package().metadata.identifier,
+                own_requests_in_flight: mobile.own_requests_in_flight.clone(),
+                storage: Arc::clone(&storage),
+            }));
+            tokio::spawn(async move {
+                while let Some((session, response_tx)) = request_rx.recv().await {
+                    let _ = prompt_tx.send(session);
+                    let _ = response_tx.send(false).await;
+                }
+            });
+            let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
+            let shutdown = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+            let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+            for node in &nodes {
+                let node = Arc::clone(node);
+                tokio::spawn(async move {
+                    let _ = node.run().await;
+                });
+            }
+            for rx in &mut seen {
+                timeout(Duration::from_secs(30), async {
+                    while !matches!(rx.recv().await, Ok(KfpNodeEvent::PeerDiscovered { .. })) {}
+                })
+                .await
+                .expect("the phone and its co-signer must discover each other");
+            }
+            *mobile.node.write().await = Some(Arc::clone(&nodes[0]));
+            shutdown
+        });
+        Nip55Phone {
+            mobile,
+            group_pubkey,
+            prompts,
+            _shutdown: shutdown,
+        }
+    }
+
+    fn nip55_event(phone: &Nip55Phone) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        serde_json::json!({
+            "pubkey": hex::encode(phone.group_pubkey),
+            "created_at": now,
+            "kind": 1,
+            "tags": [],
+            "content": "own request",
+        })
+        .to_string()
+    }
+
+    fn sign_event_request(event_json: String) -> Nip55Request {
+        Nip55Request {
+            request_type: Nip55RequestType::SignEvent,
+            content: event_json,
+            pubkey: None,
+            return_type: "signature".into(),
+            compression_type: "none".into(),
+            callback_url: None,
+            id: None,
+            current_user: None,
+            permissions: None,
+            kind: None,
+            scope: None,
+        }
+    }
+
+    #[test]
+    fn nip55_refuses_to_sign_an_event_that_was_not_approved() {
+        let phone = nip55_phone();
+        let handler = Nip55Handler::new(Arc::clone(&phone.mobile));
+        let err = handler
+            .handle_request(sign_event_request(nip55_event(&phone)), "caller".into())
+            .expect_err("an event with no pre-approval is not signed");
+        assert!(
+            matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("not approved")),
+            "{err:?}"
+        );
+        assert!(
+            phone.prompts.try_recv().is_err(),
+            "the phone was never asked"
+        );
+        assert!(phone
+            .mobile
+            .own_requests_in_flight
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn nip55_signs_a_pre_approved_event_without_a_prompt() {
+        let phone = nip55_phone();
+        let handler = Nip55Handler::new(Arc::clone(&phone.mobile));
+        let event_json = nip55_event(&phone);
+        phone
+            .mobile
+            .pre_approve_nostr_event(event_json.clone())
+            .unwrap();
+        let response = handler
+            .handle_request(sign_event_request(event_json), "caller".into())
+            .expect("a pre-approved event is signed");
+        assert_eq!(response.result.len(), 128, "{response:?}");
+        assert!(
+            phone.prompts.try_recv().is_err(),
+            "the phone was never asked"
+        );
+        assert!(phone.mobile.pre_approved_hashes.lock().unwrap().is_empty());
+        assert!(phone
+            .mobile
+            .own_requests_in_flight
+            .lock()
+            .unwrap()
+            .is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -9435,6 +9753,7 @@ mod baseline_presign_policy_tests {
     /// metadata that has nothing to do with a boolean.
     pub(super) struct KillSwitchOffStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
+        metadata: Option<ShareMetadataInfo>,
     }
 
     impl KillSwitchOffStorage {
@@ -9446,6 +9765,15 @@ mod baseline_presign_policy_tests {
             );
             Self {
                 data: StdMutex::new(data),
+                metadata: None,
+            }
+        }
+
+        /// As [`Self::with_switch_off`], reporting `metadata` as the share.
+        pub(super) fn holding(metadata: ShareMetadataInfo) -> Self {
+            Self {
+                metadata: Some(metadata),
+                ..Self::with_switch_off()
             }
         }
     }
@@ -9462,7 +9790,7 @@ mod baseline_presign_policy_tests {
             false
         }
         fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
-            None
+            self.metadata.clone()
         }
         fn delete_share(&self) -> Result<(), KeepMobileError> {
             Ok(())
@@ -9554,6 +9882,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx,
             pre_approved_hashes: pre_approved,
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
         };
 
@@ -9576,6 +9906,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx: mpsc::channel(1).0,
             pre_approved_hashes: Arc::clone(&pre_approved),
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
         };
         let approve = || {
@@ -9637,6 +9969,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx: mpsc::channel(1).0,
             pre_approved_hashes: Arc::clone(&pre_approved),
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
         };
         let err = hooks
@@ -9655,6 +9989,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx: mpsc::channel(1).0,
             pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
         };
         let session = |message_type: &str, payload: Option<Vec<u8>>| SessionInfo {
@@ -9687,6 +10023,8 @@ mod baseline_presign_policy_tests {
             let hooks = MobileSigningHooks {
                 request_tx,
                 pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+                own_identifier: 2,
+                own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
                 storage: Arc::new(storage),
             };
             let err = hooks
@@ -9710,6 +10048,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx,
             pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
         };
         let err = hooks
@@ -9733,6 +10073,8 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx,
             pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
         };
         hooks
@@ -9762,12 +10104,121 @@ mod baseline_presign_policy_tests {
         let hooks = MobileSigningHooks {
             request_tx,
             pre_approved_hashes: pre_approved,
+            own_identifier: 2,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
         };
 
         hooks
             .pre_sign(&session_with(keep_frost_net::MSG_TYPE_NOSTR_EVENT, message))
             .expect("a pre-approved request with an ordinary label must still pass");
+    }
+
+    /// Hooks for share 1, the requester `session_with` names, whose prompt
+    /// channel is closed so reaching the prompt fails at once.
+    fn own_request_hooks(storage: KillSwitchOffStorage) -> MobileSigningHooks {
+        MobileSigningHooks {
+            request_tx: mpsc::channel(1).0,
+            pre_approved_hashes: Arc::new(StdMutex::new(HashMap::new())),
+            own_identifier: 1,
+            own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
+            storage: Arc::new(storage),
+        }
+    }
+
+    fn nostr_session(requester: u16, message: &[u8]) -> SessionInfo {
+        SessionInfo {
+            requester,
+            ..session_with(keep_frost_net::MSG_TYPE_NOSTR_EVENT, message.to_vec())
+        }
+    }
+
+    #[test]
+    fn an_own_request_in_flight_is_approved_on_every_attempt() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let message = [5u8; 32];
+        let _held = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &message);
+        for attempt in 0..keep_frost_net::MAX_FAILOVER_ATTEMPTS {
+            hooks
+                .pre_sign(&nostr_session(1, &message))
+                .unwrap_or_else(|e| panic!("attempt {attempt} was prompted: {e}"));
+        }
+    }
+
+    fn assert_prompted_in_flight(session: SessionInfo) {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let _held = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &session.message);
+        let err = hooks
+            .pre_sign(&session)
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+    }
+
+    #[test]
+    fn an_own_bitcoin_request_in_flight_is_prompted() {
+        assert_prompted_in_flight(session_with(
+            keep_frost_net::MSG_TYPE_BITCOIN_SIGHASH,
+            vec![5u8; 32],
+        ));
+    }
+
+    #[test]
+    fn an_own_tweaked_request_in_flight_is_prompted() {
+        assert_prompted_in_flight(SessionInfo {
+            taproot_tweak: Some(Default::default()),
+            ..nostr_session(1, &[5u8; 32])
+        });
+    }
+
+    #[test]
+    fn a_peer_request_for_an_own_message_in_flight_is_prompted() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let message = [5u8; 32];
+        let _held = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &message);
+        let err = hooks
+            .pre_sign(&nostr_session(2, &message))
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+    }
+
+    #[test]
+    fn an_own_request_not_in_flight_is_prompted() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let _held = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &[6u8; 32]);
+        let err = hooks
+            .pre_sign(&nostr_session(1, &[5u8; 32]))
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
+    }
+
+    #[test]
+    fn the_kill_switch_refuses_an_own_request_in_flight() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        persistence::persist_kill_switch(&hooks.storage, KILL_SWITCH_STORAGE_KEY, true).unwrap();
+        let message = [5u8; 32];
+        let _held = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &message);
+        let err = hooks
+            .pre_sign(&nostr_session(1, &message))
+            .expect_err("the kill switch refuses before anything is approved");
+        assert!(format!("{err}").contains("disabled"), "{err}");
+    }
+
+    #[test]
+    fn an_own_request_leaves_the_in_flight_set_when_its_last_guard_drops() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let message = [5u8; 32];
+        let first = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &message);
+        let second = OwnRequestGuard::hold(&hooks.own_requests_in_flight, &message);
+        drop(first);
+        hooks
+            .pre_sign(&nostr_session(1, &message))
+            .expect("the identical request still running is let through");
+        drop(second);
+        assert!(hooks.own_requests_in_flight.lock().unwrap().is_empty());
+        let err = hooks
+            .pre_sign(&nostr_session(1, &message))
+            .expect_err("goes to the prompt, which is closed here");
+        assert!(format!("{err}").contains("Channel closed"), "{err}");
     }
 }
 
