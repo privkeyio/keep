@@ -1370,6 +1370,7 @@ mod descriptor_index_tests {
     }
 
     impl SecureStorage for FaultyStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
             unimplemented!()
         }

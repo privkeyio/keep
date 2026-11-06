@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use keep_mobile::{
     ApproverCallbacks, ApproverEvent, ApproverHandler, KeepMobile, KeepMobileError, SecureStorage,
-    ShareMetadataInfo,
+    ShareMetadataInfo, ShareProbe,
 };
 use p256::ecdsa::signature::Signer;
 
@@ -39,6 +39,22 @@ fn say(line: &str) {
 struct Memory(Mutex<HashMap<String, Vec<u8>>>);
 
 impl SecureStorage for Memory {
+    fn quarantine_share_by_key(&self, _: String) -> Result<(), KeepMobileError> {
+        Err(KeepMobileError::StorageError {
+            msg: "quarantine unsupported".into(),
+        })
+    }
+    fn restore_quarantined_share(&self, _: String) -> Result<(), KeepMobileError> {
+        Err(KeepMobileError::StorageError {
+            msg: "quarantine unsupported".into(),
+        })
+    }
+    fn list_quarantined_share_keys(&self) -> Result<Vec<String>, KeepMobileError> {
+        Ok(Vec::new())
+    }
+    fn probe_share_by_key(&self, _: String) -> Result<ShareProbe, KeepMobileError> {
+        Ok(ShareProbe::Unknown)
+    }
     fn store_share(&self, _: Vec<u8>, _: ShareMetadataInfo) -> Result<(), KeepMobileError> {
         Ok(())
     }

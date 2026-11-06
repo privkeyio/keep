@@ -1310,6 +1310,7 @@ mod tests {
     }
 
     impl SecureStorage for MemStorage {
+        crate::storage::quarantine_unsupported!();
         fn store_share(
             &self,
             _data: Vec<u8>,
