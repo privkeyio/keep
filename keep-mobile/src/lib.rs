@@ -1080,6 +1080,43 @@ fn held_groups(storage: &Arc<dyn SecureStorage>) -> Option<Vec<String>> {
     )
 }
 
+/// The relay config that stands in for one of `group`'s that cannot be read:
+/// default relays, no NIP-46 grants, and sending to and receiving from every
+/// share index not held blocked, since the lost record may have blocked any of
+/// them. `held` is each of the group's shares held here, as its identifier and
+/// total share count. Refused when it is empty, or for a share count no group
+/// can have, which only corrupt metadata carries.
+fn blocking_relay_config(
+    held: &[(u16, u16)],
+) -> Result<persistence::StoredRelayConfig, KeepMobileError> {
+    let Some(total) = held.iter().map(|&(_, total)| total).max() else {
+        return Err(KeepMobileError::InvalidInput {
+            msg: "no share of this group is listed".into(),
+        });
+    };
+    if usize::from(total) > keep_frost_net::MAX_PARTICIPANTS {
+        return Err(KeepMobileError::InvalidInput {
+            msg: format!(
+                "a share of this group claims {total} shares, over the {} a group can have",
+                keep_frost_net::MAX_PARTICIPANTS
+            ),
+        });
+    }
+    Ok(persistence::StoredRelayConfig {
+        frost_relays: keep_core::relay::default_frost_relays(),
+        bunker_relays: keep_core::relay::default_frost_relays(),
+        peer_policies: (1..=total)
+            .filter(|i| !held.iter().any(|&(identifier, _)| identifier == *i))
+            .map(|share_index| keep_core::relay::PeerPolicyEntry {
+                share_index,
+                allow_send: false,
+                allow_receive: false,
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
 fn descriptors_for_backup(
     storage: &Arc<dyn SecureStorage>,
     held: Vec<String>,
@@ -3492,30 +3529,14 @@ impl KeepMobile {
             Err(_) => {}
         }
         let group = group_pubkey.to_ascii_lowercase();
-        let held: Vec<ShareMetadataInfo> = self
+        let held: Vec<(u16, u16)> = self
             .storage
             .list_all_shares()
             .into_iter()
             .filter(|m| hex::encode(&m.group_pubkey) == group)
+            .map(|m| (m.identifier, m.total_shares))
             .collect();
-        let Some(total) = held.iter().map(|m| m.total_shares).max() else {
-            return Err(KeepMobileError::InvalidInput {
-                msg: "no share of this group is listed".into(),
-            });
-        };
-        let stored = persistence::StoredRelayConfig {
-            frost_relays: keep_core::relay::default_frost_relays(),
-            bunker_relays: keep_core::relay::default_frost_relays(),
-            peer_policies: (1..=total)
-                .filter(|i| !held.iter().any(|m| m.identifier == *i))
-                .map(|share_index| keep_core::relay::PeerPolicyEntry {
-                    share_index,
-                    allow_send: false,
-                    allow_receive: false,
-                })
-                .collect(),
-            ..Default::default()
-        };
+        let stored = blocking_relay_config(&held)?;
         persistence::persist_relay_config(&self.storage, &key, &stored)
     }
 
@@ -3817,10 +3838,30 @@ impl KeepMobile {
         }
 
         let mut relay_configs = Vec::new();
-        for meta in &all_share_meta {
+        // `backup_shares` holds one entry per `all_share_meta` entry, in order.
+        for (meta, share) in all_share_meta.iter().zip(&backup_shares) {
             let group_hex = hex::encode(&meta.group_pubkey);
             let key = relay_config_key(Some(&group_hex));
-            if let Ok(Some(stored)) = persistence::load_relay_config(&self.storage, &key) {
+            let stored = match persistence::load_relay_config(&self.storage, &key) {
+                Ok(stored) => stored,
+                // Left out, a restore would enforce no peer blocks for this
+                // group. The record that replaces it blocks every peer it
+                // could have blocked, as `reset_unreadable_relay_config`
+                // writes, and `backup_relay_config_gaps` reports it. Built from
+                // the backed-up share's own metadata, which bounds the peers
+                // after a restore.
+                Err(e) => {
+                    tracing::warn!(
+                        group = %group_hex,
+                        "backup blocks every peer of a group whose relay config cannot be read: {e}"
+                    );
+                    Some(
+                        blocking_relay_config(&[(share.identifier, share.total_shares)])
+                            .map_err(|e| KeepMobileError::BackupError { msg: e.to_string() })?,
+                    )
+                }
+            };
+            if let Some(stored) = stored {
                 let group_pubkey = bytes_to_32(&meta.group_pubkey, "relay group_pubkey")?;
                 relay_configs.push(keep_core::relay::RelayConfig {
                     group_pubkey,
@@ -3904,6 +3945,29 @@ impl KeepMobile {
             index_unreadable,
             unreadable_groups: load.unreadable,
         }
+    }
+
+    /// The groups whose relay config `create_backup` would replace right now,
+    /// because the stored record cannot be read.
+    ///
+    /// The backup carries default relays, no NIP-46 grants and every peer not
+    /// held here blocked in its place, so a restore from it never lifts a
+    /// block, but the relays and grants of the lost record are not in it. A
+    /// storage fault that clears up is worth retrying, otherwise
+    /// `reset_unreadable_relay_config` writes the same record on this device.
+    /// Call this before offering the backup and show any gap. Refused when
+    /// the share registry cannot be read, since the held groups are unknown.
+    pub fn backup_relay_config_gaps(&self) -> Result<Vec<String>, KeepMobileError> {
+        let mut groups =
+            held_groups(&self.storage).ok_or_else(|| KeepMobileError::StorageError {
+                msg: "The share registry cannot be read, so the held groups are unknown".into(),
+            })?;
+        groups.sort();
+        groups.dedup();
+        groups.retain(|group| {
+            persistence::load_relay_config(&self.storage, &relay_config_key(Some(group))).is_err()
+        });
+        Ok(groups)
     }
 
     pub fn verify_backup(
@@ -7886,6 +7950,158 @@ mod restore_backup_metadata_tests {
             "a share the listing missed may still be held, so its record stays"
         );
         assert!(mobile.reset_unreadable_relay_config("zz".into()).is_err());
+    }
+
+    #[test]
+    fn a_backup_blocks_every_peer_of_an_unreadable_relay_config() {
+        let pass = "correct horse battery staple";
+        let group = hex::encode([7u8; 32]);
+        let blocking = keep_core::relay::RelayConfig {
+            group_pubkey: [7u8; 32],
+            frost_relays: vec!["wss://relay.example.com/".into()],
+            profile_relays: vec![],
+            bunker_relays: vec![],
+            peer_policies: vec![keep_core::relay::PeerPolicyEntry {
+                share_index: 2,
+                allow_send: false,
+                allow_receive: false,
+            }],
+            kfp_v1_peer_policies: vec![],
+            bunker_permissions: vec![],
+            auto_approve_kinds: vec![],
+        };
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![],
+            vec![backup_share(true)],
+            vec![],
+            vec![blocking],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            pass,
+        )
+        .expect("backup should build");
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        mobile.restore_backup(bytes, pass.into()).unwrap();
+        let key = relay_config_key(Some(&group));
+
+        let policies = |backup: &[u8]| -> Vec<(u16, bool, bool)> {
+            let decrypted = decrypt_backup_data(backup, pass).unwrap();
+            assert_eq!(decrypted.relay_configs.len(), 1);
+            decrypted.relay_configs[0]
+                .peer_policies
+                .iter()
+                .map(|p| (p.share_index, p.allow_send, p.allow_receive))
+                .collect()
+        };
+        assert_eq!(
+            policies(&mobile.create_backup(pass.into()).unwrap()),
+            vec![(2, false, false)],
+            "a readable record is backed up as stored"
+        );
+        assert!(mobile.backup_relay_config_gaps().unwrap().is_empty());
+
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(key.clone(), b"not json".to_vec());
+        // A registry that undercounts the group does not narrow the blocks:
+        // the restored share's own metadata bounds its peers.
+        for meta in storage.metas.lock().unwrap().iter_mut() {
+            meta.total_shares = 2;
+        }
+        assert!(mobile
+            .storage
+            .list_all_shares()
+            .iter()
+            .all(|m| m.total_shares == 2));
+        let backup = mobile.create_backup(pass.into()).unwrap();
+        assert_eq!(
+            policies(&backup),
+            vec![(2, false, false), (3, false, false)],
+            "every peer the lost record could have blocked is blocked"
+        );
+        let decrypted = decrypt_backup_data(&backup, pass).unwrap();
+        let config = &decrypted.relay_configs[0];
+        assert_eq!(config.group_pubkey, [7u8; 32]);
+        assert_eq!(
+            config.frost_relays,
+            keep_core::relay::default_frost_relays()
+        );
+        assert!(config.bunker_permissions.is_empty());
+        assert_eq!(
+            storage.data.lock().unwrap().get(&key).map(Vec::as_slice),
+            Some(&b"not json"[..]),
+            "a backup does not rewrite the device's record"
+        );
+        assert!(mobile.get_relay_config(Some(group.clone())).is_err());
+        assert_eq!(mobile.backup_relay_config_gaps().unwrap(), vec![group]);
+
+        let restored = Arc::new(RecordingStorage::default());
+        let fresh = KeepMobile::new(Arc::clone(&restored) as Arc<dyn SecureStorage>).unwrap();
+        fresh.restore_backup(backup, pass.into()).unwrap();
+        let peer_blocks: Vec<_> = persistence::load_relay_config(&fresh.storage, &key)
+            .unwrap()
+            .expect("the restore carries the blocks")
+            .peer_policies
+            .iter()
+            .map(|p| (p.share_index, p.allow_send, p.allow_receive))
+            .collect();
+        assert_eq!(peer_blocks, vec![(2, false, false), (3, false, false)]);
+
+        // Share metadata no group can have refuses the backup rather than
+        // leaving the record out, and refuses the reset too.
+        for meta in storage.metas.lock().unwrap().iter_mut() {
+            meta.total_shares = 300;
+        }
+        assert!(matches!(
+            mobile.reset_unreadable_relay_config(hex::encode([7u8; 32])),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert_eq!(
+            storage.data.lock().unwrap().get(&key).map(Vec::as_slice),
+            Some(&b"not json"[..])
+        );
+        let share_key = hex::encode([7u8; 32]);
+        let mut stored: StoredShareData =
+            serde_json::from_slice(&storage.load_share_by_key(share_key.clone()).unwrap()).unwrap();
+        let mut share_meta: keep_core::frost::ShareMetadata =
+            serde_json::from_str(&stored.metadata_json).unwrap();
+        share_meta.total_shares = 300;
+        stored.metadata_json = serde_json::to_string(&share_meta).unwrap();
+        storage
+            .data
+            .lock()
+            .unwrap()
+            .insert(share_key, serde_json::to_vec(&stored).unwrap());
+        assert!(matches!(
+            mobile.create_backup(pass.into()),
+            Err(KeepMobileError::BackupError { .. })
+        ));
+    }
+
+    #[test]
+    fn a_blocking_relay_config_needs_a_share_count_a_group_can_have() {
+        let max = keep_frost_net::MAX_PARTICIPANTS as u16;
+        let config = blocking_relay_config(&[(1, max)]).unwrap();
+        assert_eq!(config.peer_policies.len(), usize::from(max) - 1);
+        assert!(matches!(
+            blocking_relay_config(&[(1, max + 1)]),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            blocking_relay_config(&[(1, u16::MAX)]),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            blocking_relay_config(&[]),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
     }
 
     // A restore while the active-share pointer cannot be read leaves it as it
@@ -13026,6 +13242,21 @@ mod share_registry_tests {
         let index: Vec<String> =
             serde_json::from_slice(&storage.raw(DESCRIPTOR_INDEX_KEY).unwrap()).unwrap();
         assert_eq!(index, vec![unreadable]);
+    }
+
+    #[test]
+    fn backup_relay_config_gaps_refuses_when_the_registry_is_unavailable() {
+        let (storage, mobile) = setup();
+        mobile
+            .store_share_package(&group_shares()[0], false)
+            .unwrap();
+        assert!(mobile.backup_relay_config_gaps().unwrap().is_empty());
+        storage.registry_unavailable.store(true, Ordering::SeqCst);
+        let result = mobile.backup_relay_config_gaps();
+        assert!(
+            matches!(&result, Err(KeepMobileError::StorageError { msg }) if msg.contains("registry cannot be read")),
+            "got {result:?}"
+        );
     }
 
     #[test]
