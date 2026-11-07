@@ -1380,8 +1380,12 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// Starts the signing node through the stored loopback proxy when it is
+    /// enabled. A proxy config that cannot be read is an error, never a
+    /// direct start.
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
-        self.do_initialize(relays, None)
+        let proxy = self.configured_proxy()?;
+        self.do_initialize(relays, proxy)
     }
 
     pub fn initialize_with_proxy(
@@ -15459,5 +15463,137 @@ mod relay_health_tests {
         assert!(last.record(&measured));
         assert!(last.record(&[]));
         assert!(!last.record(&[]));
+    }
+}
+
+#[cfg(test)]
+mod stored_proxy_tests {
+    use super::import_teardown_tests::MemStorage;
+    use super::*;
+    use crate::nip46::{
+        BunkerApprovalRequest, BunkerApprovalResult, BunkerCallbacks, BunkerHandler,
+        BunkerLogEvent, BunkerRememberDuration, BunkerStatus, ConnectAuthorization,
+    };
+    use crate::storage::SecureStorage;
+    use std::time::Duration;
+
+    const RELAY: &str = "wss://relay.example";
+
+    struct NoCallbacks;
+    impl BunkerCallbacks for NoCallbacks {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            BunkerApprovalResult {
+                approved: false,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+    }
+
+    fn mobile_with_share() -> Arc<KeepMobile> {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(storage).unwrap();
+        use nostr_sdk::prelude::{SecretKey, ToBech32};
+        let nsec = SecretKey::from_slice(&[1u8; 32])
+            .unwrap()
+            .to_bech32()
+            .unwrap();
+        mobile
+            .import_nsec(nsec.into_bytes(), "imported".into())
+            .unwrap();
+        Arc::new(mobile)
+    }
+
+    fn socks_listener() -> (u16, std::sync::mpsc::Receiver<u8>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (greetings, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut first = [0u8; 1];
+                if std::io::Read::read_exact(&mut stream, &mut first).is_ok()
+                    && greetings.send(first[0]).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    fn proxied(mobile: &KeepMobile) -> std::sync::mpsc::Receiver<u8> {
+        let (port, seen) = socks_listener();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port,
+            })
+            .unwrap();
+        seen
+    }
+
+    fn assert_through_proxy(seen: &std::sync::mpsc::Receiver<u8>) {
+        let first = seen
+            .recv_timeout(Duration::from_secs(6))
+            .expect("the start did not go through the proxy");
+        assert_eq!(first, 0x05, "the start opens with a SOCKS5 greeting");
+    }
+
+    fn corrupt_proxy_config(mobile: &KeepMobile) {
+        mobile
+            .storage
+            .store_share_by_key(
+                PROXY_CONFIG_STORAGE_KEY.into(),
+                b"not json".to_vec(),
+                persistence::storage_metadata("proxy_config"),
+            )
+            .unwrap();
+    }
+
+    // With the proxy on, a start that names no proxy still goes through it,
+    // so an app that loses track of the setting never connects from the
+    // phone's own address.
+    #[test]
+    fn initialize_goes_through_the_stored_proxy() {
+        let mobile = mobile_with_share();
+        let seen = proxied(&mobile);
+        let _ = mobile.initialize(vec![RELAY.into()]);
+        assert_through_proxy(&seen);
+    }
+
+    #[test]
+    fn start_bunker_goes_through_the_stored_proxy() {
+        let mobile = mobile_with_share();
+        let seen = proxied(&mobile);
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let _ = handler.start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks));
+        assert_through_proxy(&seen);
+        handler.stop_bunker();
+    }
+
+    // A proxy setting that cannot be read may be one that was on, so neither
+    // start falls back to a direct connection.
+    #[test]
+    fn an_unreadable_proxy_config_refuses_both_starts() {
+        let mobile = mobile_with_share();
+        corrupt_proxy_config(&mobile);
+
+        let err = mobile.initialize(vec![RELAY.into()]).unwrap_err();
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("proxy config")),
+            "{err:?}"
+        );
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let err = handler
+            .start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks))
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("proxy config")),
+            "{err:?}"
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
     }
 }

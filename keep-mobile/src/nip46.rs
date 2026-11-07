@@ -708,12 +708,16 @@ impl BunkerHandler {
         }
     }
 
+    /// Starts the bunker through the stored loopback proxy when it is
+    /// enabled. A proxy config that cannot be read is an error, never a
+    /// direct start.
     pub fn start_bunker(
         &self,
         relays: Vec<String>,
         callbacks: Arc<dyn BunkerCallbacks>,
     ) -> Result<(), KeepMobileError> {
-        self.do_start_bunker(relays, callbacks, None)
+        let proxy = self.mobile.configured_proxy()?;
+        self.do_start_bunker(relays, callbacks, proxy)
     }
 
     pub fn start_bunker_with_proxy(
