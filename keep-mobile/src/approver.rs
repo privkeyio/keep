@@ -518,6 +518,9 @@ fn no_relay() -> KeepMobileError {
     }
 }
 
+const PROXY_CHANGE_STOP: &str =
+    "Approvals stopped because the proxy setting changed. Start the approver again.";
+
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
 struct Effects {
@@ -625,20 +628,32 @@ impl ApproverHandler {
 
     /// Stop serving after the proxy setting changed: the socket was opened
     /// under the old one. Under `lifecycle`, so a start running alongside
-    /// either read the new setting or is stopped here. The app starts the
-    /// approver again, and `last_error` says why it stopped.
+    /// either read the new setting or is stopped here. `last_error` says why
+    /// it stopped, and an alert tells the owner and the app, which starts the
+    /// approver again. The alert is sent once `lifecycle` is released, so a
+    /// callback that starts it again does not wait on it.
     pub(crate) fn stop_for_proxy_change(&self) {
-        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        let was_running = self
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_some();
-        if was_running {
+        let mut fx = Effects::default();
+        {
+            let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let was_running = self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if !was_running {
+                return;
+            }
             self.halt();
             *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some("stopped because the proxy setting changed; start it again".into());
+                Some(PROXY_CHANGE_STOP.into());
+            let mut inner = self.lock();
+            if let Some(stored) = inner.stored.as_mut() {
+                stored.alert(PROXY_CHANGE_STOP.into(), &mut fx);
+                self.persist_or_log(stored);
+            }
         }
+        self.emit(fx.events);
     }
 
     fn open_check(&self) -> Result<(), KeepMobileError> {

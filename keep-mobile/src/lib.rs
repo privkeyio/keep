@@ -2230,7 +2230,7 @@ impl KeepMobile {
         // Route through the configured loopback SOCKS proxy when enabled (§7),
         // mirroring the signing path's proxy. Resolved before the probe below,
         // which dials through the same proxy.
-        let proxy = self.configured_proxy()?;
+        let proxy = self.pinnable_proxy()?;
 
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
@@ -3232,7 +3232,7 @@ impl KeepMobile {
         // The relay list comes from the device URI, so it is attacker-
         // influenceable: pin it before anything is sent. Resolved here, off the
         // async block, so the probe and the live socket get the same proxy.
-        let proxy = self.configured_proxy()?;
+        let proxy = self.pinnable_proxy()?;
         let (device_signer, uri_relays, uri_secret) = keep_nip46::parse_bunker_url(&device_uri)
             .map_err(|e| KeepMobileError::InvalidInput {
                 msg: format!("invalid device URI: {e}"),
@@ -4474,6 +4474,28 @@ impl KeepMobile {
             }
         }
 
+        // The proxy and kill switch govern every account on the device, so a
+        // restore onto a device already holding one keeps its own: otherwise
+        // restoring a backup could turn off the kill switch or the proxy the
+        // device's accounts run under. Written before the shares, so no node
+        // or bunker started from a restored share runs under the default, and
+        // a failure here leaves nothing for the retry to refuse.
+        if !had_shares {
+            if let Some(proxy) = &decrypted.config.proxy {
+                let stored_proxy = persistence::StoredProxyConfig {
+                    enabled: proxy.enabled,
+                    port: proxy.port,
+                };
+                self.store_proxy_config(&stored_proxy)?;
+            }
+
+            persistence::persist_kill_switch(
+                &self.storage,
+                KILL_SWITCH_STORAGE_KEY,
+                decrypted.config.kill_switch,
+            )?;
+        }
+
         // Descriptors before the shares and keys. Only the share and key writes
         // are covered by the duplicate guard above, so a failure after them is
         // terminal: the retry sees the shares it wrote and refuses. Running the
@@ -4525,26 +4547,6 @@ impl KeepMobile {
 
         for health_info in prepared_health {
             persistence::persist_health_status(&self.storage, &health_info)?;
-        }
-
-        // The proxy and kill switch govern every account on the device, so a
-        // restore onto a device already holding one keeps its own: otherwise
-        // restoring a backup could turn off the kill switch or the proxy the
-        // device's accounts run under.
-        if !had_shares {
-            if let Some(proxy) = &decrypted.config.proxy {
-                let stored_proxy = persistence::StoredProxyConfig {
-                    enabled: proxy.enabled,
-                    port: proxy.port,
-                };
-                self.store_proxy_config(&stored_proxy)?;
-            }
-
-            persistence::persist_kill_switch(
-                &self.storage,
-                KILL_SWITCH_STORAGE_KEY,
-                decrypted.config.kill_switch,
-            )?;
         }
 
         // The pointer is set only on a device that held no share: setting it
@@ -8833,7 +8835,7 @@ mod restore_backup_metadata_tests {
         assert_ne!(
             *mobile.live_generation.borrow(),
             generation,
-            "a node started from the restored share before the proxy landed is stopped"
+            "the restored proxy setting stops any live node, bunker or approver"
         );
         assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
         let proxy = persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
@@ -10785,6 +10787,49 @@ mod dkg_pending_share_tests {
 
         // The subkey survives the failed preflight, so a retry needs no re-mint.
         assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
+    }
+
+    // The pinned transport cannot pin a socket the proxy opens, so a DKG run
+    // under strict pinning and a proxy is refused before any relay is dialed.
+    #[test]
+    fn run_dkg_refuses_strict_pinning_behind_the_proxy() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        mobile.set_strict_cert_pinning(true).unwrap();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port: 9050,
+            })
+            .unwrap();
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+        let config = DkgConfig {
+            group_name: "group-a".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.example.com".into()],
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "group-a-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("strict pinning behind the proxy must be refused");
+        assert!(
+            matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("Strict certificate pinning")),
+            "{err:?}"
+        );
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.

@@ -1586,13 +1586,11 @@ fn a_proxy_change_stops_a_running_approver() {
         .unwrap();
     let status = phone.handler.status();
     assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(PROXY_CHANGE_STOP));
     assert!(
-        status
-            .last_error
-            .as_deref()
-            .is_some_and(|e| e.contains("proxy setting changed")),
+        status.alerts.iter().any(|a| a.message == PROXY_CHANGE_STOP),
         "{:?}",
-        status.last_error
+        status.alerts
     );
 
     phone.mobile.save_proxy_config(off()).unwrap();
