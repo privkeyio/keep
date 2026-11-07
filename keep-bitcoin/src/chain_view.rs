@@ -162,13 +162,35 @@ fn is_loopback_url(url: &url::Url) -> bool {
     }
 }
 
+/// A loopback address written as an IP, which no resolver can point
+/// elsewhere. Only these bypass a proxy.
+#[cfg(feature = "esplora-chain-view")]
+fn is_loopback_ip(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
 #[cfg(feature = "esplora-chain-view")]
 impl EsploraChainView {
     /// Construct an Esplora chain view against a base URL of the form
     /// `https://blockstream.info/api` (no trailing slash required). The
     /// resulting client blocks on each request; call it from a non-async
     /// thread or wrap with `tokio::task::block_in_place`.
-    pub fn new(base_url: impl AsRef<str>) -> Result<Self, ChainViewError> {
+    ///
+    /// With `proxy`, every request goes through that SOCKS5 proxy, names
+    /// resolved by the proxy, so the endpoint never sees this host's address.
+    /// A loopback IP endpoint (a self-hosted esplora) is reached direct, since
+    /// a proxy such as Tor refuses loopback and connecting to it exposes
+    /// nothing, and a redirect from it to any other host is refused. A
+    /// `localhost` name still goes through the proxy, so no resolver decides
+    /// where it points.
+    pub fn new(
+        base_url: impl AsRef<str>,
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<Self, ChainViewError> {
         // Normalize with a trailing slash so downstream `Url::join("tx/...")`
         // treats the base as a directory rather than dropping its final
         // segment. `blockstream.info/api` and `blockstream.info/api/` behave
@@ -192,7 +214,18 @@ impl EsploraChainView {
                  (127.0.0.1, ::1, localhost) for plaintext."
             )));
         }
-        let client = reqwest::blocking::Client::builder()
+        let direct_only = proxy.is_some() && is_loopback_ip(&base_url);
+        let mut builder = reqwest::blocking::Client::builder();
+        match proxy {
+            Some(_) if direct_only => builder = builder.no_proxy(),
+            Some(addr) => {
+                let proxy = reqwest::Proxy::all(format!("socks5h://{addr}"))
+                    .map_err(|e| ChainViewError::Config(format!("chain view proxy: {e}")))?;
+                builder = builder.proxy(proxy);
+            }
+            None => {}
+        }
+        let client = builder
             .user_agent(concat!(
                 "keep/",
                 env!("CARGO_PKG_VERSION"),
@@ -201,9 +234,11 @@ impl EsploraChainView {
             .timeout(std::time::Duration::from_secs(15))
             // Refuse redirects that downgrade https -> a non-https, non-loopback
             // next hop; a redirecting endpoint must not strip transport security.
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            .redirect(reqwest::redirect::Policy::custom(move |attempt| {
                 let next = attempt.url();
-                if next.scheme() == "https" || is_loopback_url(next) {
+                if direct_only && !is_loopback_ip(next) {
+                    attempt.stop()
+                } else if next.scheme() == "https" || is_loopback_url(next) {
                     if attempt.previous().len() >= 10 {
                         attempt.error("too many redirects")
                     } else {
@@ -225,7 +260,9 @@ impl EsploraChainView {
 /// without an authoritative amount check. Both the CLI and desktop responder
 /// paths call this so their behavior and error messages stay identical.
 #[cfg(feature = "esplora-chain-view")]
-pub fn esplora_chain_view_from_env() -> Result<EsploraChainView, String> {
+pub fn esplora_chain_view_from_env(
+    proxy: Option<std::net::SocketAddr>,
+) -> Result<EsploraChainView, String> {
     let chain_url = std::env::var(KEEP_CHAIN_URL_ENV).map_err(|_| {
         format!(
             "REFUSED: {KEEP_CHAIN_URL_ENV} is not set. Set it to an esplora / mempool.space \
@@ -233,7 +270,7 @@ pub fn esplora_chain_view_from_env() -> Result<EsploraChainView, String> {
              can run. Refusing to sign without an authoritative amount check."
         )
     })?;
-    EsploraChainView::new(&chain_url)
+    EsploraChainView::new(&chain_url, proxy)
         .map_err(|e| format!("REFUSED: invalid {KEEP_CHAIN_URL_ENV}={chain_url:?}: {e}"))
 }
 
@@ -583,8 +620,8 @@ mod tests {
     #[cfg(feature = "esplora-chain-view")]
     #[test]
     fn esplora_new_normalizes_trailing_slash() {
-        EsploraChainView::new("https://blockstream.info/api").expect("no trailing slash ok");
-        EsploraChainView::new("https://blockstream.info/api/").expect("trailing slash ok");
+        EsploraChainView::new("https://blockstream.info/api", None).expect("no trailing slash ok");
+        EsploraChainView::new("https://blockstream.info/api/", None).expect("trailing slash ok");
     }
 
     /// `EsploraChainView::new` refuses plaintext http except to loopback hosts.
@@ -592,9 +629,109 @@ mod tests {
     #[test]
     fn esplora_new_enforces_https_except_loopback() {
         assert!(
-            EsploraChainView::new("http://evil.example/api").is_err(),
+            EsploraChainView::new("http://evil.example/api", None).is_err(),
             "non-loopback http must be refused"
         );
-        EsploraChainView::new("http://127.0.0.1:3000/api").expect("loopback http ok");
+        EsploraChainView::new("http://127.0.0.1:3000/api", None).expect("loopback http ok");
+    }
+
+    /// A listener that answers one SOCKS5 greeting and returns the CONNECT
+    /// request's address type and host, then hangs up.
+    #[cfg(feature = "esplora-chain-view")]
+    fn socks_listener() -> (
+        std::net::SocketAddr,
+        std::sync::mpsc::Receiver<(u8, String)>,
+    ) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = [0u8; 2];
+            sock.read_exact(&mut head).unwrap();
+            let mut methods = vec![0u8; head[1] as usize];
+            sock.read_exact(&mut methods).unwrap();
+            sock.write_all(&[5, 0]).unwrap();
+            let mut req = [0u8; 4];
+            sock.read_exact(&mut req).unwrap();
+            let host = match req[3] {
+                3 => {
+                    let mut len = [0u8; 1];
+                    sock.read_exact(&mut len).unwrap();
+                    let mut name = vec![0u8; len[0] as usize];
+                    sock.read_exact(&mut name).unwrap();
+                    String::from_utf8(name).unwrap()
+                }
+                _ => String::new(),
+            };
+            let _ = tx.send((req[3], host));
+        });
+        (addr, rx)
+    }
+
+    /// With a proxy, the chain view's request goes to the proxy with the
+    /// endpoint's name, so neither the endpoint nor the local resolver sees it.
+    #[cfg(feature = "esplora-chain-view")]
+    #[test]
+    fn esplora_goes_through_the_proxy_with_remote_dns() {
+        let (proxy, seen) = socks_listener();
+        let view = EsploraChainView::new("https://chain.invalid/api", Some(proxy)).unwrap();
+        assert!(view.get_prevout(make_outpoint(1)).is_err());
+        let (atyp, host) = seen
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the request reached the proxy");
+        assert_eq!((atyp, host.as_str()), (3, "chain.invalid"));
+    }
+
+    /// With a proxy, a `localhost` endpoint is sent to the proxy by name,
+    /// not resolved here.
+    #[cfg(feature = "esplora-chain-view")]
+    #[test]
+    fn esplora_sends_a_localhost_name_to_the_proxy() {
+        let (proxy, seen) = socks_listener();
+        let view = EsploraChainView::new("http://localhost:3000/api", Some(proxy)).unwrap();
+        assert!(view.get_prevout(make_outpoint(3)).is_err());
+        let (atyp, host) = seen
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the request reached the proxy");
+        assert_eq!((atyp, host.as_str()), (3, "localhost"));
+    }
+
+    /// A loopback endpoint is reached direct with a proxy set, and a redirect
+    /// from it to another host is not followed.
+    #[cfg(feature = "esplora-chain-view")]
+    #[test]
+    fn esplora_reaches_a_loopback_endpoint_direct_and_refuses_its_redirect_out() {
+        use std::io::{Read, Write};
+        let (proxy, seen) = socks_listener();
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = server.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = sock.read(&mut buf).unwrap();
+            let _ = hit_tx.send(String::from_utf8_lossy(&buf[..n]).into_owned());
+            sock.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: https://chain.invalid/api/tx/x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        });
+        let view =
+            EsploraChainView::new(format!("http://127.0.0.1:{port}/api"), Some(proxy)).unwrap();
+        let err = view.get_prevout(make_outpoint(2)).unwrap_err();
+        let request = hit_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the loopback endpoint was reached direct");
+        assert!(request.starts_with("GET /api/tx/"), "{request}");
+        assert!(err.to_string().contains("302"), "{err}");
+        assert!(
+            seen.recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "nothing went to the proxy"
+        );
     }
 }

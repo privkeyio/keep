@@ -694,7 +694,7 @@ impl App {
                 // produces a valid signature that bypasses every fee cap.
                 // Operators configure the chain view via `KEEP_CHAIN_URL`; a
                 // missing / invalid endpoint refuses closed.
-                let chain = keep_bitcoin::esplora_chain_view_from_env()?;
+                let chain = keep_bitcoin::esplora_chain_view_from_env(net.proxy)?;
                 // The chain view HTTP client blocks; run it in spawn_blocking so
                 // it does not stall this async task, and hand the PSBT back for
                 // signing.
