@@ -43,7 +43,7 @@ pub(crate) struct StoredRelayConfig {
     pub(crate) bunker_permissions_scope: Option<String>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub(crate) struct StoredProxyConfig {
     pub(crate) enabled: bool,
     pub(crate) port: u16,

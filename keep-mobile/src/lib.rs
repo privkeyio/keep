@@ -581,6 +581,26 @@ const DKG_PENDING_MARKER_KEY: &str = "__keep_dkg_pending_v1";
 const DKG_PENDING_SECRET_KEY: &str = "__keep_dkg_secret_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Where a start's relay sockets go: through the stored proxy setting, read
+/// under the start's own locks so a change made meanwhile is never missed, or
+/// through the proxy the caller named.
+pub(crate) enum ProxyChoice {
+    Stored,
+    Given(std::net::SocketAddr),
+}
+
+impl ProxyChoice {
+    pub(crate) fn resolve(
+        self,
+        mobile: &KeepMobile,
+    ) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        match self {
+            Self::Stored => mobile.pinnable_proxy(),
+            Self::Given(proxy) => Ok(Some(proxy)),
+        }
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct CertificatePin {
     pub hostname: String,
@@ -1384,8 +1404,7 @@ impl KeepMobile {
     /// enabled. A proxy config that cannot be read is an error, never a
     /// direct start.
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
-        let proxy = self.configured_proxy()?;
-        self.do_initialize(relays, proxy)
+        self.do_initialize(relays, ProxyChoice::Stored)
     }
 
     pub fn initialize_with_proxy(
@@ -1395,7 +1414,7 @@ impl KeepMobile {
         proxy_port: u16,
     ) -> Result<(), KeepMobileError> {
         let proxy = parse_loopback_proxy(&proxy_host, proxy_port)?;
-        self.do_initialize(relays, Some(proxy))
+        self.do_initialize(relays, ProxyChoice::Given(proxy))
     }
 
     /// Import a share export. A share the registry lists under its group is
@@ -3779,7 +3798,19 @@ impl KeepMobile {
             enabled: config.enabled,
             port: config.port,
         };
-        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)
+        // An old setting that cannot be read may differ, so it counts as a change.
+        let changed = match persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)
+        {
+            Ok(old) => old.unwrap_or_default() != stored,
+            Err(_) => true,
+        };
+        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)?;
+        // A running node or bunker keeps the sockets it was started with, so a
+        // change stops both and the next start takes the new setting.
+        if changed {
+            self.invalidate_live_node();
+        }
+        Ok(())
     }
 
     /// Whether strict certificate pinning is enabled. When true, connecting to a
@@ -5106,6 +5137,19 @@ impl KeepMobile {
         }
     }
 
+    /// The stored proxy, refused under strict pinning: the pinned transport
+    /// cannot pin a socket the proxy opens and refuses every one, so a start
+    /// would wait out its relay timeout and carry nothing.
+    pub(crate) fn pinnable_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        let proxy = self.configured_proxy()?;
+        if proxy.is_some() && self.get_strict_cert_pinning()? {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
+            });
+        }
+        Ok(proxy)
+    }
+
     /// Pin configuration for the live relay sockets.
     ///
     /// The stored pin set is handed to the transport, which only ever reads it:
@@ -5219,7 +5263,7 @@ impl KeepMobile {
     fn do_initialize(
         &self,
         relays: Vec<String>,
-        proxy: Option<std::net::SocketAddr>,
+        proxy: ProxyChoice,
     ) -> Result<(), KeepMobileError> {
         // Serialize install against a concurrent teardown (invalidate_live_node)
         // so the (node, node_tasks) pair is swapped atomically. Held for the
@@ -5240,6 +5284,9 @@ impl KeepMobile {
             .cert_pin_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Read under the lifecycle lock, which a proxy change takes to tear
+        // the node down, so this start either sees the change or is torn down.
+        let proxy = proxy.resolve(self)?;
         for relay in &relays {
             network::validate_relay_url(relay)?;
         }
@@ -15595,5 +15642,66 @@ mod stored_proxy_tests {
             "{err:?}"
         );
         assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+    }
+
+    // Strict pinning cannot pin a socket the proxy opens, so both starts are
+    // refused before any relay is dialed rather than after the relay timeout.
+    #[test]
+    fn strict_pinning_with_the_stored_proxy_refuses_both_starts() {
+        let mobile = mobile_with_share();
+        mobile.set_strict_cert_pinning(true).unwrap();
+        let seen = proxied(&mobile);
+        let refused = |err: KeepMobileError| {
+            assert!(
+                matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("Strict certificate pinning")),
+                "{err:?}"
+            )
+        };
+
+        refused(mobile.initialize(vec![RELAY.into()]).unwrap_err());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        refused(
+            handler
+                .start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks))
+                .unwrap_err(),
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+        assert!(seen.try_recv().is_err(), "no relay was dialed");
+    }
+
+    // A running node or bunker keeps the sockets it was started with, so a
+    // proxy change moves the live generation, which stops both. Saving the
+    // same setting leaves them running, and an old setting that cannot be read
+    // counts as a change.
+    #[test]
+    fn a_proxy_change_stops_the_live_node_and_bunker() {
+        let mobile = mobile_with_share();
+        let generation = || *mobile.live_generation.borrow();
+        let on = || ProxyConfigInfo {
+            enabled: true,
+            port: 9050,
+        };
+
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_ne!(generation(), before, "turning the proxy on");
+
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_eq!(generation(), before, "saving the same setting");
+
+        let before = generation();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port: 9150,
+            })
+            .unwrap();
+        assert_ne!(generation(), before, "moving the port");
+
+        corrupt_proxy_config(&mobile);
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_ne!(generation(), before, "replacing an unreadable setting");
     }
 }

@@ -727,15 +727,7 @@ impl ApproverHandler {
     fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
         checked_relays(&relays)?;
         let transport = keys.public_key();
-        let proxy = self.mobile.configured_proxy()?;
-        if proxy.is_some() && self.mobile.get_strict_cert_pinning()? {
-            // The pinned transport cannot pin a socket the proxy opens, and
-            // refuses every one under strict pinning: the approver would
-            // report running while carrying nothing.
-            return Err(KeepMobileError::InvalidInput {
-                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
-            });
-        }
+        let proxy = self.mobile.pinnable_proxy()?;
         let (relays, pinning) = {
             let _cert = self
                 .mobile
