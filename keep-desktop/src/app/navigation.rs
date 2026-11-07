@@ -140,6 +140,9 @@ impl App {
                     self.cert_pin_display_entries(),
                     self.settings.strict_cert_pinning,
                 ));
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.proxy_unreadable = self.proxy_unreadable;
+                }
                 Task::none()
             }
             Message::Lock => self.do_lock(),

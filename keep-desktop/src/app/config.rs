@@ -84,14 +84,21 @@ pub(crate) fn save_settings(keep_path: &std::path::Path, settings: &Settings) {
     }
 }
 
-pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &std::path::Path) {
+/// Moves the legacy JSON settings into the vault. Returns true when a proxy
+/// the legacy file had turned on could not be moved, so the caller refuses
+/// to connect rather than go direct.
+pub(crate) fn migrate_json_config_to_vault(
+    keep: &keep_core::Keep,
+    keep_path: &std::path::Path,
+) -> bool {
     let mut migrated = false;
+    let mut proxy_lost = false;
     let global_exists = match keep.get_relay_config(&keep_core::GLOBAL_RELAY_KEY) {
         Ok(Some(_)) => true,
         Ok(None) => false,
         Err(e) => {
             tracing::warn!("Failed to check existing relay config, skipping migration: {e}");
-            return;
+            return false;
         }
     };
 
@@ -130,7 +137,7 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
 
     let settings_path = keep_path.join("settings.json");
     if let Ok(contents) = std::fs::read_to_string(&settings_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&contents) {
+        if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&contents) {
             let enabled = json
                 .get("proxy_enabled")
                 .and_then(|v| v.as_bool())
@@ -143,12 +150,31 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
             if enabled || port != DEFAULT_PROXY_PORT {
                 let proxy = keep_core::ProxyConfig { enabled, port };
                 match keep.set_proxy_config(&proxy) {
-                    Ok(()) => migrated = true,
-                    Err(e) => tracing::warn!(
-                        enabled,
-                        port,
-                        "Failed to migrate proxy config to vault: {e}"
-                    ),
+                    Ok(()) => {
+                        migrated = true;
+                        // Moved once: left in the file, it would overwrite the
+                        // vault's setting at every unlock.
+                        if let Some(map) = json.as_object_mut() {
+                            map.remove("proxy_enabled");
+                            map.remove("proxy_port");
+                        }
+                        match serde_json::to_string_pretty(&json) {
+                            Ok(text) => {
+                                if let Err(e) = write_private(&settings_path, &text) {
+                                    tracing::warn!("Failed to drop the migrated proxy keys: {e}");
+                                }
+                            }
+                            Err(e) => tracing::warn!("Failed to drop the migrated proxy keys: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        proxy_lost = enabled;
+                        tracing::warn!(
+                            enabled,
+                            port,
+                            "Failed to migrate proxy config to vault: {e}"
+                        );
+                    }
                 }
             }
         }
@@ -195,6 +221,7 @@ pub(crate) fn migrate_json_config_to_vault(keep: &keep_core::Keep, keep_path: &s
     if migrated {
         tracing::info!("Migrated relay/proxy config from JSON files to vault");
     }
+    proxy_lost
 }
 
 #[cfg(test)]

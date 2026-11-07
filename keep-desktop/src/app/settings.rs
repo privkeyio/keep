@@ -53,6 +53,7 @@ impl App {
                 self.save_proxy_config();
                 if let Screen::Settings(s) = &mut self.screen {
                     s.proxy_enabled = self.proxy_enabled;
+                    s.proxy_unreadable = self.proxy_unreadable;
                 }
                 let mut tasks = Vec::new();
                 if frost_active {
@@ -74,6 +75,15 @@ impl App {
             }
             Event::ProxyPortChanged(port) => {
                 self.proxy_port = port;
+                // A port alone does not say whether the proxy is on, so it
+                // cannot stand in for a setting that could not be read: that
+                // would save the default, off. Only the toggle sets it again.
+                if self.proxy_unreadable {
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.sync_proxy_port(self.proxy_port);
+                    }
+                    return Task::none();
+                }
                 self.save_proxy_config();
                 if let Screen::Settings(s) = &mut self.screen {
                     s.sync_proxy_port(self.proxy_port);

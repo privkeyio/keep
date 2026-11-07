@@ -1732,6 +1732,10 @@ impl App {
         self.frost_last_share = Some(share_entry.clone());
         self.frost_last_relay_urls = Some(relay_urls.clone());
 
+        let net = match self.network_config() {
+            Ok(net) => net,
+            Err(e) => return iced::Task::done(Message::ConnectRelayResult(Err(e.into()))),
+        };
         iced::Task::perform(
             spawn_frost_node(
                 self.keep.clone(),
@@ -1739,7 +1743,7 @@ impl App {
                 share_entry,
                 relay_urls,
                 self.frost_channels(),
-                self.network_config(),
+                net,
                 self.kill_switch.clone(),
                 self.frost_node.clone(),
             ),
@@ -1822,6 +1826,10 @@ impl App {
             s.pending_requests.clear();
         }
 
+        let net = match self.network_config() {
+            Ok(net) => net,
+            Err(e) => return iced::Task::done(Message::ConnectRelayResult(Err(e.into()))),
+        };
         iced::Task::perform(
             spawn_frost_node(
                 self.keep.clone(),
@@ -1829,7 +1837,7 @@ impl App {
                 share_entry,
                 relay_urls,
                 self.frost_channels(),
-                self.network_config(),
+                net,
                 self.kill_switch.clone(),
                 self.frost_node.clone(),
             ),

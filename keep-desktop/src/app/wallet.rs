@@ -375,7 +375,15 @@ impl App {
 
         let keep_arc = self.keep.clone();
         let group_hex = hex::encode(group_pubkey);
-        let net = self.network_config();
+        let net = match self.network_config() {
+            Ok(net) => net,
+            Err(e) => {
+                if let Screen::Wallet(s) = &mut self.screen {
+                    s.register_failed(e);
+                }
+                return Task::none();
+            }
+        };
 
         Task::perform(
             async move {
@@ -592,7 +600,10 @@ impl App {
             ));
         };
         let keep_arc = self.keep.clone();
-        let net = self.network_config();
+        let net = match self.network_config() {
+            Ok(net) => net,
+            Err(e) => return Task::done(Message::ApprovePsbtResult(session_id, Err(e))),
+        };
         Task::perform(
             async move {
                 let (initiator_pubkey, session_descriptor_hash, tier_index) = node
