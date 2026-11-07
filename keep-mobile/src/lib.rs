@@ -596,7 +596,10 @@ impl ProxyChoice {
     ) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
         match self {
             Self::Stored => mobile.pinnable_proxy(),
-            Self::Given(proxy) => Ok(Some(proxy)),
+            Self::Given(proxy) => {
+                mobile.refuse_strict_pinning_behind_proxy()?;
+                Ok(Some(proxy))
+            }
         }
     }
 }
@@ -953,6 +956,9 @@ pub struct KeepMobile {
     /// permission grants) so a relay edit and an engine grant/revoke write do
     /// not clobber each other's section.
     pub(crate) relay_config_lock: Arc<std::sync::Mutex<()>>,
+    /// Held across a proxy save's read, write and teardown, so two saves at
+    /// once cannot both judge the setting unchanged and skip the teardown.
+    proxy_config_lock: std::sync::Mutex<()>,
     /// Serializes load-modify-persist of the certificate-pin store so concurrent
     /// stage/remove/clear FFI calls and `do_initialize`'s trust-on-first-use
     /// auto-pin cannot lose each other's update (last-writer-wins).
@@ -1375,6 +1381,7 @@ impl KeepMobile {
             live_bunker: std::sync::Mutex::new(None),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
+            proxy_config_lock: std::sync::Mutex::new(()),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -3798,6 +3805,10 @@ impl KeepMobile {
             enabled: config.enabled,
             port: config.port,
         };
+        let _proxy = self
+            .proxy_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // An old setting that cannot be read may differ, so it counts as a change.
         let changed = match persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)
         {
@@ -5142,12 +5153,19 @@ impl KeepMobile {
     /// would wait out its relay timeout and carry nothing.
     pub(crate) fn pinnable_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
         let proxy = self.configured_proxy()?;
-        if proxy.is_some() && self.get_strict_cert_pinning()? {
+        if proxy.is_some() {
+            self.refuse_strict_pinning_behind_proxy()?;
+        }
+        Ok(proxy)
+    }
+
+    fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
+        if self.get_strict_cert_pinning()? {
             return Err(KeepMobileError::InvalidInput {
                 msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
             });
         }
-        Ok(proxy)
+        Ok(())
     }
 
     /// Pin configuration for the live relay sockets.
@@ -15644,10 +15662,11 @@ mod stored_proxy_tests {
         assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
     }
 
-    // Strict pinning cannot pin a socket the proxy opens, so both starts are
-    // refused before any relay is dialed rather than after the relay timeout.
+    // Strict pinning cannot pin a socket the proxy opens, so every start
+    // through a proxy, stored or named, is refused before any relay is dialed
+    // rather than after the relay timeout.
     #[test]
-    fn strict_pinning_with_the_stored_proxy_refuses_both_starts() {
+    fn strict_pinning_with_a_proxy_refuses_every_start() {
         let mobile = mobile_with_share();
         mobile.set_strict_cert_pinning(true).unwrap();
         let seen = proxied(&mobile);
@@ -15663,6 +15682,24 @@ mod stored_proxy_tests {
         refused(
             handler
                 .start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks))
+                .unwrap_err(),
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+
+        let port = mobile.get_proxy_config().unwrap().port;
+        refused(
+            mobile
+                .initialize_with_proxy(vec![RELAY.into()], "127.0.0.1".into(), port)
+                .unwrap_err(),
+        );
+        refused(
+            handler
+                .start_bunker_with_proxy(
+                    vec![RELAY.into()],
+                    Arc::new(NoCallbacks),
+                    "127.0.0.1".into(),
+                    port,
+                )
                 .unwrap_err(),
         );
         assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
