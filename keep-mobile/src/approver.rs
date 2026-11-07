@@ -630,9 +630,10 @@ impl ApproverHandler {
     /// under the old one. Under `lifecycle`, so a start running alongside
     /// either read the new setting or is stopped here. `last_error` says why
     /// it stopped, and an alert tells the owner and the app, which starts the
-    /// approver again. The alert is sent once `lifecycle` is released, so a
-    /// callback that starts it again does not wait on it.
-    pub(crate) fn stop_for_proxy_change(&self) {
+    /// approver again. The alert is sent from its own thread: the caller
+    /// holds the proxy and share write locks, which a callback that saves the
+    /// setting or starts the approver again must not wait on.
+    pub(crate) fn stop_for_proxy_change(self: &Arc<Self>) {
         let mut fx = Effects::default();
         {
             let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -653,7 +654,11 @@ impl ApproverHandler {
                 self.persist_or_log(stored);
             }
         }
-        self.emit(fx.events);
+        if !fx.events.is_empty() {
+            let this = Held::of(self);
+            let events = fx.events;
+            std::thread::spawn(move || this.emit(events));
+        }
     }
 
     fn open_check(&self) -> Result<(), KeepMobileError> {

@@ -1599,6 +1599,58 @@ fn a_proxy_change_stops_a_running_approver() {
     phone.handler.stop();
 }
 
+// The alert reaches the app while the save that raised it holds the proxy
+// lock, so a callback that saves the setting again must not wait on it.
+#[test]
+fn a_callback_can_save_the_proxy_from_the_stop_alert() {
+    struct SaveAgain {
+        mobile: std::sync::Weak<KeepMobile>,
+        done: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    }
+    impl ApproverCallbacks for SaveAgain {
+        fn on_event(&self, event: ApproverEvent) {
+            let ApproverEvent::Alert { message, .. } = event else {
+                return;
+            };
+            if message != PROXY_CHANGE_STOP {
+                return;
+            }
+            if let Some(mobile) = self.mobile.upgrade() {
+                mobile
+                    .save_proxy_config(crate::ProxyConfigInfo {
+                        enabled: false,
+                        port: 9050,
+                    })
+                    .unwrap();
+            }
+            let _ = self.done.lock().unwrap().send(());
+        }
+    }
+
+    let phone = paired();
+    let (tx, rx) = std::sync::mpsc::channel();
+    phone
+        .handler
+        .clone()
+        .start(Arc::new(SaveAgain {
+            mobile: Arc::downgrade(&phone.mobile),
+            done: std::sync::Mutex::new(tx),
+        }))
+        .unwrap();
+    let mobile = phone.mobile.clone();
+    std::thread::spawn(move || {
+        mobile
+            .save_proxy_config(crate::ProxyConfigInfo {
+                enabled: true,
+                port: 9050,
+            })
+            .unwrap();
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the callback saved the setting again");
+    assert!(!phone.handler.status().running);
+}
+
 // Strict pinning cannot pin a socket the proxy opens, so the approver refuses
 // the pair outright rather than report running and carry nothing.
 #[test]

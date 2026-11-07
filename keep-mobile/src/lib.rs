@@ -10830,6 +10830,7 @@ mod dkg_pending_share_tests {
             matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("Strict certificate pinning")),
             "{err:?}"
         );
+        assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
     }
 
     // A wrong passphrase must not clear the stash: the share stays recoverable.
