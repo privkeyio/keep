@@ -518,6 +518,9 @@ fn no_relay() -> KeepMobileError {
     }
 }
 
+const PROXY_CHANGE_STOP: &str =
+    "Approvals stopped because the proxy setting changed. Start the approver again.";
+
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
 struct Effects {
@@ -614,7 +617,47 @@ impl ApproverHandler {
     /// Give back the `KeepMobile`'s approver slot, once.
     fn release(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            *self
+                .mobile
+                .live_approver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Weak::new();
             self.mobile.approver_live.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop serving after the proxy setting changed: the socket was opened
+    /// under the old one. Under `lifecycle`, so a start running alongside
+    /// either read the new setting or is stopped here. `last_error` says why
+    /// it stopped, and an alert tells the owner and the app, which starts the
+    /// approver again. The alert is sent from its own thread: the caller
+    /// holds the proxy and share write locks, which a callback that saves the
+    /// setting or starts the approver again must not wait on.
+    pub(crate) fn stop_for_proxy_change(self: &Arc<Self>) {
+        let mut fx = Effects::default();
+        {
+            let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let was_running = self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            if !was_running {
+                return;
+            }
+            self.halt();
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(PROXY_CHANGE_STOP.into());
+            let mut inner = self.lock();
+            if let Some(stored) = inner.stored.as_mut() {
+                stored.alert(PROXY_CHANGE_STOP.into(), &mut fx);
+                self.persist_or_log(stored);
+            }
+        }
+        if !fx.events.is_empty() {
+            let this = Held::of(self);
+            let events = fx.events;
+            std::thread::spawn(move || this.emit(events));
         }
     }
 
@@ -727,15 +770,7 @@ impl ApproverHandler {
     fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
         checked_relays(&relays)?;
         let transport = keys.public_key();
-        let proxy = self.mobile.configured_proxy()?;
-        if proxy.is_some() && self.mobile.get_strict_cert_pinning()? {
-            // The pinned transport cannot pin a socket the proxy opens, and
-            // refuses every one under strict pinning: the approver would
-            // report running while carrying nothing.
-            return Err(KeepMobileError::InvalidInput {
-                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
-            });
-        }
+        let proxy = self.mobile.pinnable_proxy()?;
         let (relays, pinning) = {
             let _cert = self
                 .mobile
@@ -1258,7 +1293,7 @@ impl ApproverHandler {
         };
         let mut inner = Inner::default();
         inner.set(stored);
-        Ok(Arc::new(Self {
+        let handler = Arc::new(Self {
             mobile,
             inner: Mutex::new(inner),
             running: Mutex::new(None),
@@ -1267,7 +1302,13 @@ impl ApproverHandler {
             closed: AtomicBool::new(false),
             callbacks: Mutex::new(None),
             last_error: Mutex::new(None),
-        }))
+        });
+        *handler
+            .mobile
+            .live_approver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&handler);
+        Ok(handler)
     }
 
     pub fn status(&self) -> ApproverStatus {

@@ -708,12 +708,15 @@ impl BunkerHandler {
         }
     }
 
+    /// Starts the bunker through the stored loopback proxy when it is
+    /// enabled. A proxy config that cannot be read is an error, never a
+    /// direct start.
     pub fn start_bunker(
         &self,
         relays: Vec<String>,
         callbacks: Arc<dyn BunkerCallbacks>,
     ) -> Result<(), KeepMobileError> {
-        self.do_start_bunker(relays, callbacks, None)
+        self.do_start_bunker(relays, callbacks, crate::ProxyChoice::Stored)
     }
 
     pub fn start_bunker_with_proxy(
@@ -724,7 +727,7 @@ impl BunkerHandler {
         proxy_port: u16,
     ) -> Result<(), KeepMobileError> {
         let proxy = crate::network::parse_loopback_proxy(&proxy_host, proxy_port)?;
-        self.do_start_bunker(relays, callbacks, Some(proxy))
+        self.do_start_bunker(relays, callbacks, crate::ProxyChoice::Given(proxy))
     }
 
     pub fn stop_bunker(&self) {
@@ -1053,7 +1056,7 @@ impl BunkerHandler {
         &self,
         relays: Vec<String>,
         callbacks: Arc<dyn BunkerCallbacks>,
-        proxy: Option<std::net::SocketAddr>,
+        proxy: crate::ProxyChoice,
     ) -> Result<(), KeepMobileError> {
         if relays.is_empty() {
             return Err(KeepMobileError::InvalidRelayUrl {
@@ -1108,6 +1111,9 @@ impl BunkerHandler {
         let mut invalidated = self.mobile.live_generation.subscribe();
         let generation = *invalidated.borrow_and_update();
         let result = self.mobile.runtime.block_on(async {
+            // Read after the generation above, which a proxy change bumps, so
+            // this start either sees the change or is stopped by it.
+            let proxy = proxy.resolve(&self.mobile)?;
             let verified_relays = self.mobile.verify_and_pin_relays(&relays, proxy).await?;
 
             let node_guard = self.mobile.node.read().await;

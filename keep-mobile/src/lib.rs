@@ -581,6 +581,29 @@ const DKG_PENDING_MARKER_KEY: &str = "__keep_dkg_pending_v1";
 const DKG_PENDING_SECRET_KEY: &str = "__keep_dkg_secret_v1";
 const DESCRIPTOR_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Where a start's relay sockets go: through the stored proxy setting, read
+/// under the start's own locks so a change made meanwhile is never missed, or
+/// through the proxy the caller named.
+pub(crate) enum ProxyChoice {
+    Stored,
+    Given(std::net::SocketAddr),
+}
+
+impl ProxyChoice {
+    pub(crate) fn resolve(
+        self,
+        mobile: &KeepMobile,
+    ) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        match self {
+            Self::Stored => mobile.pinnable_proxy(),
+            Self::Given(proxy) => {
+                mobile.refuse_strict_pinning_behind_proxy()?;
+                Ok(Some(proxy))
+            }
+        }
+    }
+}
+
 #[derive(uniffi::Record)]
 pub struct CertificatePin {
     pub hostname: String,
@@ -933,6 +956,9 @@ pub struct KeepMobile {
     /// permission grants) so a relay edit and an engine grant/revoke write do
     /// not clobber each other's section.
     pub(crate) relay_config_lock: Arc<std::sync::Mutex<()>>,
+    /// Held across a proxy save's read, write and teardown, so two saves at
+    /// once cannot both judge the setting unchanged and skip the teardown.
+    proxy_config_lock: std::sync::Mutex<()>,
     /// Serializes load-modify-persist of the certificate-pin store so concurrent
     /// stage/remove/clear FFI calls and `do_initialize`'s trust-on-first-use
     /// auto-pin cannot lose each other's update (last-writer-wins).
@@ -946,6 +972,8 @@ pub struct KeepMobile {
     /// Whether an `ApproverHandler` holds this instance's approver state:
     /// two would overwrite each other's counters, request gate and anchors.
     pub(crate) approver_live: Arc<std::sync::atomic::AtomicBool>,
+    /// The open approver, so a proxy change can stop it.
+    pub(crate) live_approver: std::sync::Mutex<std::sync::Weak<crate::approver::ApproverHandler>>,
     /// Serializes active-share selection against deletion so the check-then-set
     /// in `set_active_share` (load a share, then mark it active) cannot
     /// interleave with a concurrent `delete_share_by_key`, which would leave the
@@ -1355,9 +1383,11 @@ impl KeepMobile {
             live_bunker: std::sync::Mutex::new(None),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
+            proxy_config_lock: std::sync::Mutex::new(()),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_approver: std::sync::Mutex::new(std::sync::Weak::new()),
             active_share_lock: Arc::new(std::sync::Mutex::new(())),
             share_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -1380,8 +1410,11 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// Starts the signing node through the stored loopback proxy when it is
+    /// enabled. A proxy config that cannot be read is an error, never a
+    /// direct start.
     pub fn initialize(&self, relays: Vec<String>) -> Result<(), KeepMobileError> {
-        self.do_initialize(relays, None)
+        self.do_initialize(relays, ProxyChoice::Stored)
     }
 
     pub fn initialize_with_proxy(
@@ -1391,7 +1424,7 @@ impl KeepMobile {
         proxy_port: u16,
     ) -> Result<(), KeepMobileError> {
         let proxy = parse_loopback_proxy(&proxy_host, proxy_port)?;
-        self.do_initialize(relays, Some(proxy))
+        self.do_initialize(relays, ProxyChoice::Given(proxy))
     }
 
     /// Import a share export. A share the registry lists under its group is
@@ -2197,7 +2230,7 @@ impl KeepMobile {
         // Route through the configured loopback SOCKS proxy when enabled (§7),
         // mirroring the signing path's proxy. Resolved before the probe below,
         // which dials through the same proxy.
-        let proxy = self.configured_proxy()?;
+        let proxy = self.pinnable_proxy()?;
 
         // Verify + pin each relay's TLS cert before connecting (§7), holding the
         // cert-pin lock only for that brief read-modify-write, not the whole run.
@@ -3199,7 +3232,7 @@ impl KeepMobile {
         // The relay list comes from the device URI, so it is attacker-
         // influenceable: pin it before anything is sent. Resolved here, off the
         // async block, so the probe and the live socket get the same proxy.
-        let proxy = self.configured_proxy()?;
+        let proxy = self.pinnable_proxy()?;
         let (device_signer, uri_relays, uri_secret) = keep_nip46::parse_bunker_url(&device_uri)
             .map_err(|e| KeepMobileError::InvalidInput {
                 msg: format!("invalid device URI: {e}"),
@@ -3775,7 +3808,7 @@ impl KeepMobile {
             enabled: config.enabled,
             port: config.port,
         };
-        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)
+        self.store_proxy_config(&stored)
     }
 
     /// Whether strict certificate pinning is enabled. When true, connecting to a
@@ -4441,6 +4474,28 @@ impl KeepMobile {
             }
         }
 
+        // The proxy and kill switch govern every account on the device, so a
+        // restore onto a device already holding one keeps its own: otherwise
+        // restoring a backup could turn off the kill switch or the proxy the
+        // device's accounts run under. Written before the shares, so no node
+        // or bunker started from a restored share runs under the default, and
+        // a failure here leaves nothing for the retry to refuse.
+        if !had_shares {
+            if let Some(proxy) = &decrypted.config.proxy {
+                let stored_proxy = persistence::StoredProxyConfig {
+                    enabled: proxy.enabled,
+                    port: proxy.port,
+                };
+                self.store_proxy_config(&stored_proxy)?;
+            }
+
+            persistence::persist_kill_switch(
+                &self.storage,
+                KILL_SWITCH_STORAGE_KEY,
+                decrypted.config.kill_switch,
+            )?;
+        }
+
         // Descriptors before the shares and keys. Only the share and key writes
         // are covered by the duplicate guard above, so a failure after them is
         // terminal: the retry sees the shares it wrote and refuses. Running the
@@ -4492,30 +4547,6 @@ impl KeepMobile {
 
         for health_info in prepared_health {
             persistence::persist_health_status(&self.storage, &health_info)?;
-        }
-
-        // The proxy and kill switch govern every account on the device, so a
-        // restore onto a device already holding one keeps its own: otherwise
-        // restoring a backup could turn off the kill switch or the proxy the
-        // device's accounts run under.
-        if !had_shares {
-            if let Some(proxy) = &decrypted.config.proxy {
-                let stored_proxy = persistence::StoredProxyConfig {
-                    enabled: proxy.enabled,
-                    port: proxy.port,
-                };
-                persistence::persist_proxy_config(
-                    &self.storage,
-                    PROXY_CONFIG_STORAGE_KEY,
-                    &stored_proxy,
-                )?;
-            }
-
-            persistence::persist_kill_switch(
-                &self.storage,
-                KILL_SWITCH_STORAGE_KEY,
-                decrypted.config.kill_switch,
-            )?;
         }
 
         // The pointer is set only on a device that held no share: setting it
@@ -5102,6 +5133,58 @@ impl KeepMobile {
         }
     }
 
+    /// The stored proxy, refused under strict pinning: the pinned transport
+    /// cannot pin a socket the proxy opens and refuses every one, so a start
+    /// would wait out its relay timeout and carry nothing.
+    pub(crate) fn pinnable_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
+        let proxy = self.configured_proxy()?;
+        if proxy.is_some() {
+            self.refuse_strict_pinning_behind_proxy()?;
+        }
+        Ok(proxy)
+    }
+
+    /// Write the proxy setting. A running node, bunker or approver keeps the
+    /// sockets it was started with, so a change stops all three and the next
+    /// start takes the new setting: the app starts them again. An old setting
+    /// that cannot be read may differ, so it counts as a change.
+    fn store_proxy_config(
+        &self,
+        stored: &persistence::StoredProxyConfig,
+    ) -> Result<(), KeepMobileError> {
+        let _proxy = self
+            .proxy_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let changed = match persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)
+        {
+            Ok(old) => old.unwrap_or_default() != *stored,
+            Err(_) => true,
+        };
+        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, stored)?;
+        if changed {
+            self.invalidate_live_node();
+            let approver = self
+                .live_approver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade();
+            if let Some(approver) = approver {
+                approver.stop_for_proxy_change();
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
+        if self.get_strict_cert_pinning()? {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
+            });
+        }
+        Ok(())
+    }
+
     /// Pin configuration for the live relay sockets.
     ///
     /// The stored pin set is handed to the transport, which only ever reads it:
@@ -5215,7 +5298,7 @@ impl KeepMobile {
     fn do_initialize(
         &self,
         relays: Vec<String>,
-        proxy: Option<std::net::SocketAddr>,
+        proxy: ProxyChoice,
     ) -> Result<(), KeepMobileError> {
         // Serialize install against a concurrent teardown (invalidate_live_node)
         // so the (node, node_tasks) pair is swapped atomically. Held for the
@@ -5236,6 +5319,9 @@ impl KeepMobile {
             .cert_pin_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Read under the lifecycle lock, which a proxy change takes to tear
+        // the node down, so this start either sees the change or is torn down.
+        let proxy = proxy.resolve(self)?;
         for relay in &relays {
             network::validate_relay_url(relay)?;
         }
@@ -8742,9 +8828,15 @@ mod restore_backup_metadata_tests {
         let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
         let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
         let bytes = settings_backup(vec![backup_share(true)], &[[7u8; 32]], true, 9050);
+        let generation = *mobile.live_generation.borrow();
         mobile
             .restore_backup(bytes, "correct horse battery staple".into())
             .expect("restore should succeed");
+        assert_ne!(
+            *mobile.live_generation.borrow(),
+            generation,
+            "the restored proxy setting stops any live node, bunker or approver"
+        );
         assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
         let proxy = persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
             .unwrap()
@@ -10694,6 +10786,50 @@ mod dkg_pending_share_tests {
         );
 
         // The subkey survives the failed preflight, so a retry needs no re-mint.
+        assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
+    }
+
+    // The pinned transport cannot pin a socket the proxy opens, so a DKG run
+    // under strict pinning and a proxy is refused before any relay is dialed.
+    #[test]
+    fn run_dkg_refuses_strict_pinning_behind_the_proxy() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        mobile.set_strict_cert_pinning(true).unwrap();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port: 9050,
+            })
+            .unwrap();
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+        let config = DkgConfig {
+            group_name: "group-a".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.example.com".into()],
+            roster: Vec::new(),
+        };
+        let err = mobile
+            .frost_run_dkg(
+                config,
+                "group-a-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
+            .expect_err("strict pinning behind the proxy must be refused");
+        assert!(
+            matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("Strict certificate pinning")),
+            "{err:?}"
+        );
         assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
     }
 
@@ -15459,5 +15595,217 @@ mod relay_health_tests {
         assert!(last.record(&measured));
         assert!(last.record(&[]));
         assert!(!last.record(&[]));
+    }
+}
+
+#[cfg(test)]
+mod stored_proxy_tests {
+    use super::import_teardown_tests::MemStorage;
+    use super::*;
+    use crate::nip46::{
+        BunkerApprovalRequest, BunkerApprovalResult, BunkerCallbacks, BunkerHandler,
+        BunkerLogEvent, BunkerRememberDuration, BunkerStatus, ConnectAuthorization,
+    };
+    use crate::storage::SecureStorage;
+    use std::time::Duration;
+
+    const RELAY: &str = "wss://relay.example";
+
+    struct NoCallbacks;
+    impl BunkerCallbacks for NoCallbacks {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            BunkerApprovalResult {
+                approved: false,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+    }
+
+    fn mobile_with_share() -> Arc<KeepMobile> {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(storage).unwrap();
+        use nostr_sdk::prelude::{SecretKey, ToBech32};
+        let nsec = SecretKey::from_slice(&[1u8; 32])
+            .unwrap()
+            .to_bech32()
+            .unwrap();
+        mobile
+            .import_nsec(nsec.into_bytes(), "imported".into())
+            .unwrap();
+        Arc::new(mobile)
+    }
+
+    fn socks_listener() -> (u16, std::sync::mpsc::Receiver<u8>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (greetings, seen) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut first = [0u8; 1];
+                if std::io::Read::read_exact(&mut stream, &mut first).is_ok()
+                    && greetings.send(first[0]).is_err()
+                {
+                    return;
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    fn proxied(mobile: &KeepMobile) -> std::sync::mpsc::Receiver<u8> {
+        let (port, seen) = socks_listener();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port,
+            })
+            .unwrap();
+        seen
+    }
+
+    fn assert_through_proxy(seen: &std::sync::mpsc::Receiver<u8>) {
+        let first = seen
+            .recv_timeout(Duration::from_secs(6))
+            .expect("the start did not go through the proxy");
+        assert_eq!(first, 0x05, "the start opens with a SOCKS5 greeting");
+    }
+
+    fn corrupt_proxy_config(mobile: &KeepMobile) {
+        mobile
+            .storage
+            .store_share_by_key(
+                PROXY_CONFIG_STORAGE_KEY.into(),
+                b"not json".to_vec(),
+                persistence::storage_metadata("proxy_config"),
+            )
+            .unwrap();
+    }
+
+    // With the proxy on, a start that names no proxy still goes through it,
+    // so an app that loses track of the setting never connects from the
+    // phone's own address.
+    #[test]
+    fn initialize_goes_through_the_stored_proxy() {
+        let mobile = mobile_with_share();
+        let seen = proxied(&mobile);
+        let _ = mobile.initialize(vec![RELAY.into()]);
+        assert_through_proxy(&seen);
+    }
+
+    #[test]
+    fn start_bunker_goes_through_the_stored_proxy() {
+        let mobile = mobile_with_share();
+        let seen = proxied(&mobile);
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let _ = handler.start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks));
+        assert_through_proxy(&seen);
+        handler.stop_bunker();
+    }
+
+    // A proxy setting that cannot be read may be one that was on, so neither
+    // start falls back to a direct connection.
+    #[test]
+    fn an_unreadable_proxy_config_refuses_both_starts() {
+        let mobile = mobile_with_share();
+        corrupt_proxy_config(&mobile);
+
+        let err = mobile.initialize(vec![RELAY.into()]).unwrap_err();
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("proxy config")),
+            "{err:?}"
+        );
+
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let err = handler
+            .start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks))
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeepMobileError::StorageError { msg } if msg.contains("proxy config")),
+            "{err:?}"
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+    }
+
+    // Strict pinning cannot pin a socket the proxy opens, so every start
+    // through a proxy, stored or named, is refused before any relay is dialed
+    // rather than after the relay timeout.
+    #[test]
+    fn strict_pinning_with_a_proxy_refuses_every_start() {
+        let mobile = mobile_with_share();
+        mobile.set_strict_cert_pinning(true).unwrap();
+        let seen = proxied(&mobile);
+        let refused = |err: KeepMobileError| {
+            assert!(
+                matches!(&err, KeepMobileError::InvalidInput { msg } if msg.contains("Strict certificate pinning")),
+                "{err:?}"
+            )
+        };
+
+        refused(mobile.initialize(vec![RELAY.into()]).unwrap_err());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        refused(
+            handler
+                .start_bunker(vec![RELAY.into()], Arc::new(NoCallbacks))
+                .unwrap_err(),
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+
+        let port = mobile.get_proxy_config().unwrap().port;
+        refused(
+            mobile
+                .initialize_with_proxy(vec![RELAY.into()], "127.0.0.1".into(), port)
+                .unwrap_err(),
+        );
+        refused(
+            handler
+                .start_bunker_with_proxy(
+                    vec![RELAY.into()],
+                    Arc::new(NoCallbacks),
+                    "127.0.0.1".into(),
+                    port,
+                )
+                .unwrap_err(),
+        );
+        assert!(matches!(handler.get_bunker_status(), BunkerStatus::Stopped));
+        assert!(seen.try_recv().is_err(), "no relay was dialed");
+    }
+
+    // A running node or bunker keeps the sockets it was started with, so a
+    // proxy change moves the live generation, which stops both. Saving the
+    // same setting leaves them running, and an old setting that cannot be read
+    // counts as a change.
+    #[test]
+    fn a_proxy_change_stops_the_live_node_and_bunker() {
+        let mobile = mobile_with_share();
+        let generation = || *mobile.live_generation.borrow();
+        let on = || ProxyConfigInfo {
+            enabled: true,
+            port: 9050,
+        };
+
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_ne!(generation(), before, "turning the proxy on");
+
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_eq!(generation(), before, "saving the same setting");
+
+        let before = generation();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port: 9150,
+            })
+            .unwrap();
+        assert_ne!(generation(), before, "moving the port");
+
+        corrupt_proxy_config(&mobile);
+        let before = generation();
+        mobile.save_proxy_config(on()).unwrap();
+        assert_ne!(generation(), before, "replacing an unreadable setting");
     }
 }
