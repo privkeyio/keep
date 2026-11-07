@@ -150,6 +150,9 @@ pub const KEEP_CHAIN_URL_ENV: &str = "KEEP_CHAIN_URL";
 pub struct EsploraChainView {
     base_url: url::Url,
     client: reqwest::blocking::Client,
+    /// A loopback name sent through the proxy, which a proxy such as Tor
+    /// refuses: named in the error, since the fix is the IP.
+    proxied_localhost: bool,
 }
 
 #[cfg(feature = "esplora-chain-view")]
@@ -231,7 +234,16 @@ impl EsploraChainView {
                 env!("CARGO_PKG_VERSION"),
                 " esplora-chain-view"
             ))
-            .timeout(std::time::Duration::from_secs(15))
+            // A proxied request also builds a circuit and handshakes over it,
+            // which routinely takes longer than a direct one; the budget
+            // matches the proxied relay probe in keep-frost-net.
+            .timeout(std::time::Duration::from_secs(
+                if proxy.is_some() && !direct_only {
+                    60
+                } else {
+                    15
+                },
+            ))
             // Refuse redirects that downgrade https -> a non-https, non-loopback
             // next hop; a redirecting endpoint must not strip transport security.
             .redirect(reqwest::redirect::Policy::custom(move |attempt| {
@@ -250,7 +262,12 @@ impl EsploraChainView {
             }))
             .build()
             .map_err(|e| ChainViewError::Config(format!("build reqwest client: {e}")))?;
-        Ok(Self { base_url, client })
+        let proxied_localhost = proxy.is_some() && !direct_only && is_loopback_url(&base_url);
+        Ok(Self {
+            base_url,
+            client,
+            proxied_localhost,
+        })
     }
 }
 
@@ -296,11 +313,16 @@ impl ChainView for EsploraChainView {
             .base_url
             .join(&path)
             .map_err(|e| ChainViewError::Config(format!("join path {path}: {e}")))?;
-        let resp = self
-            .client
-            .get(url)
-            .send()
-            .map_err(|e| ChainViewError::Transport(e.to_string()))?;
+        let resp = self.client.get(url).send().map_err(|e| {
+            ChainViewError::Transport(if self.proxied_localhost {
+                format!(
+                    "{e} (the chain view URL names localhost, which goes through the \
+                         proxy: use 127.0.0.1 or ::1 to reach a local endpoint direct)"
+                )
+            } else {
+                e.to_string()
+            })
+        })?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(ChainViewError::NotFound {
                 txid: outpoint.txid,
@@ -698,6 +720,8 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the request reached the proxy");
         assert_eq!((atyp, host.as_str()), (3, "localhost"));
+        let err = view.get_prevout(make_outpoint(4)).unwrap_err();
+        assert!(err.to_string().contains("use 127.0.0.1"), "{err}");
     }
 
     /// A loopback endpoint is reached direct with a proxy set, and a redirect
