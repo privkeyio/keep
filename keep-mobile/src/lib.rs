@@ -972,6 +972,8 @@ pub struct KeepMobile {
     /// Whether an `ApproverHandler` holds this instance's approver state:
     /// two would overwrite each other's counters, request gate and anchors.
     pub(crate) approver_live: Arc<std::sync::atomic::AtomicBool>,
+    /// The open approver, so a proxy change can stop it.
+    pub(crate) live_approver: std::sync::Mutex<std::sync::Weak<crate::approver::ApproverHandler>>,
     /// Serializes active-share selection against deletion so the check-then-set
     /// in `set_active_share` (load a share, then mark it active) cannot
     /// interleave with a concurrent `delete_share_by_key`, which would leave the
@@ -1385,6 +1387,7 @@ impl KeepMobile {
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            live_approver: std::sync::Mutex::new(std::sync::Weak::new()),
             active_share_lock: Arc::new(std::sync::Mutex::new(())),
             share_write_lock: Arc::new(std::sync::Mutex::new(())),
         })
@@ -3805,23 +3808,7 @@ impl KeepMobile {
             enabled: config.enabled,
             port: config.port,
         };
-        let _proxy = self
-            .proxy_config_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        // An old setting that cannot be read may differ, so it counts as a change.
-        let changed = match persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)
-        {
-            Ok(old) => old.unwrap_or_default() != stored,
-            Err(_) => true,
-        };
-        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, &stored)?;
-        // A running node or bunker keeps the sockets it was started with, so a
-        // change stops both and the next start takes the new setting.
-        if changed {
-            self.invalidate_live_node();
-        }
-        Ok(())
+        self.store_proxy_config(&stored)
     }
 
     /// Whether strict certificate pinning is enabled. When true, connecting to a
@@ -4550,11 +4537,7 @@ impl KeepMobile {
                     enabled: proxy.enabled,
                     port: proxy.port,
                 };
-                persistence::persist_proxy_config(
-                    &self.storage,
-                    PROXY_CONFIG_STORAGE_KEY,
-                    &stored_proxy,
-                )?;
+                self.store_proxy_config(&stored_proxy)?;
             }
 
             persistence::persist_kill_switch(
@@ -5157,6 +5140,38 @@ impl KeepMobile {
             self.refuse_strict_pinning_behind_proxy()?;
         }
         Ok(proxy)
+    }
+
+    /// Write the proxy setting. A running node, bunker or approver keeps the
+    /// sockets it was started with, so a change stops all three and the next
+    /// start takes the new setting: the app starts them again. An old setting
+    /// that cannot be read may differ, so it counts as a change.
+    fn store_proxy_config(
+        &self,
+        stored: &persistence::StoredProxyConfig,
+    ) -> Result<(), KeepMobileError> {
+        let _proxy = self
+            .proxy_config_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let changed = match persistence::load_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY)
+        {
+            Ok(old) => old.unwrap_or_default() != *stored,
+            Err(_) => true,
+        };
+        persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, stored)?;
+        if changed {
+            self.invalidate_live_node();
+            let approver = self
+                .live_approver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .upgrade();
+            if let Some(approver) = approver {
+                approver.stop_for_proxy_change();
+            }
+        }
+        Ok(())
     }
 
     fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
@@ -8811,9 +8826,15 @@ mod restore_backup_metadata_tests {
         let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
         let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
         let bytes = settings_backup(vec![backup_share(true)], &[[7u8; 32]], true, 9050);
+        let generation = *mobile.live_generation.borrow();
         mobile
             .restore_backup(bytes, "correct horse battery staple".into())
             .expect("restore should succeed");
+        assert_ne!(
+            *mobile.live_generation.borrow(),
+            generation,
+            "a node started from the restored share before the proxy landed is stopped"
+        );
         assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
         let proxy = persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
             .unwrap()

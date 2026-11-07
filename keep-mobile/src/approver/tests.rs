@@ -1560,6 +1560,47 @@ fn the_approver_reaches_its_relays_through_the_proxy() {
     phone.handler.stop();
 }
 
+// A running approver opened its socket under the old proxy setting, so a
+// change stops it and says why, and the app starts it again. Saving the same
+// setting leaves it running.
+#[test]
+fn a_proxy_change_stops_a_running_approver() {
+    let phone = paired();
+    let off = || crate::ProxyConfigInfo {
+        enabled: false,
+        port: 9050,
+    };
+    phone.mobile.save_proxy_config(off()).unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running);
+
+    phone.mobile.save_proxy_config(off()).unwrap();
+    assert!(phone.handler.status().running, "the same setting");
+
+    phone
+        .mobile
+        .save_proxy_config(crate::ProxyConfigInfo {
+            enabled: true,
+            port: 9050,
+        })
+        .unwrap();
+    let status = phone.handler.status();
+    assert!(!status.running);
+    assert!(
+        status
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("proxy setting changed")),
+        "{:?}",
+        status.last_error
+    );
+
+    phone.mobile.save_proxy_config(off()).unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running, "started again");
+    phone.handler.stop();
+}
+
 // Strict pinning cannot pin a socket the proxy opens, so the approver refuses
 // the pair outright rather than report running and carry nothing.
 #[test]

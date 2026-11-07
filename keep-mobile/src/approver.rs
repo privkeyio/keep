@@ -614,7 +614,30 @@ impl ApproverHandler {
     /// Give back the `KeepMobile`'s approver slot, once.
     fn release(&self) {
         if !self.closed.swap(true, Ordering::SeqCst) {
+            *self
+                .mobile
+                .live_approver
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Weak::new();
             self.mobile.approver_live.store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Stop serving after the proxy setting changed: the socket was opened
+    /// under the old one. Under `lifecycle`, so a start running alongside
+    /// either read the new setting or is stopped here. The app starts the
+    /// approver again, and `last_error` says why it stopped.
+    pub(crate) fn stop_for_proxy_change(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        let was_running = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        if was_running {
+            self.halt();
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some("stopped because the proxy setting changed; start it again".into());
         }
     }
 
@@ -1250,7 +1273,7 @@ impl ApproverHandler {
         };
         let mut inner = Inner::default();
         inner.set(stored);
-        Ok(Arc::new(Self {
+        let handler = Arc::new(Self {
             mobile,
             inner: Mutex::new(inner),
             running: Mutex::new(None),
@@ -1259,7 +1282,13 @@ impl ApproverHandler {
             closed: AtomicBool::new(false),
             callbacks: Mutex::new(None),
             last_error: Mutex::new(None),
-        }))
+        });
+        *handler
+            .mobile
+            .live_approver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&handler);
+        Ok(handler)
     }
 
     pub fn status(&self) -> ApproverStatus {
