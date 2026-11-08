@@ -20,6 +20,7 @@ use super::{App, Toast, ToastKind, PROXY_SESSION_TIMEOUT, TOAST_DURATION_SECS};
 
 impl App {
     pub(super) fn do_lock(&mut self) -> Task<Message> {
+        self.proxy_unreadable = true;
         self.stop_scanner();
         self.handle_disconnect_relay();
         self.stop_bunker();
@@ -166,11 +167,24 @@ impl App {
         self.toast_dismiss_at = Some(Instant::now() + Duration::from_secs(TOAST_DURATION_SECS));
     }
 
-    pub(crate) fn proxy_addr(&self) -> Option<SocketAddr> {
-        if self.proxy_enabled && self.proxy_port > 0 {
-            Some(SocketAddr::from((Ipv4Addr::LOCALHOST, self.proxy_port)))
-        } else {
-            None
+    /// Where relay sockets go: through the proxy, direct, or nowhere when the
+    /// setting cannot be trusted. An unreadable setting, or a proxy turned on
+    /// with no port, refuses rather than connecting direct.
+    pub(crate) fn proxy_addr(&self) -> Result<Option<SocketAddr>, String> {
+        if self.proxy_unreadable {
+            return Err(
+                "The proxy setting is not loaded or could not be read. Turn the proxy on or off \
+                 in Settings to set it again."
+                    .into(),
+            );
+        }
+        match (self.proxy_enabled, self.proxy_port) {
+            (false, _) => Ok(None),
+            (true, 0) => Err(
+                "The proxy is on but has no port. Set its port in Settings before connecting."
+                    .into(),
+            ),
+            (true, port) => Ok(Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))),
         }
     }
 
@@ -182,9 +196,9 @@ impl App {
         }
     }
 
-    pub(crate) fn network_config(&self) -> crate::frost::NetworkConfig {
-        crate::frost::NetworkConfig {
-            proxy: self.proxy_addr(),
+    pub(crate) fn network_config(&self) -> Result<crate::frost::NetworkConfig, String> {
+        Ok(crate::frost::NetworkConfig {
+            proxy: self.proxy_addr()?,
             session_timeout: if self.proxy_enabled {
                 Some(PROXY_SESSION_TIMEOUT)
             } else {
@@ -193,7 +207,7 @@ impl App {
             certificate_pins: self.certificate_pins.clone(),
             keep_path: self.keep_path.clone(),
             require_pinned: self.settings.strict_cert_pinning,
-        }
+        })
     }
 
     pub(crate) fn active_group_pubkey_bytes(&self) -> Option<[u8; 32]> {
@@ -249,15 +263,24 @@ impl App {
         self.update_relay_config(|config| config.bunker_relays = relays);
     }
 
-    pub(super) fn save_proxy_config(&self) {
+    /// Whether the setting in memory is now the one stored.
+    pub(super) fn save_proxy_config(&mut self) -> bool {
         let guard = lock_keep(&self.keep);
-        if let Some(keep) = guard.as_ref() {
-            let proxy = keep_core::ProxyConfig {
-                enabled: self.proxy_enabled,
-                port: self.proxy_port,
-            };
-            if let Err(e) = keep.set_proxy_config(&proxy) {
+        let Some(keep) = guard.as_ref() else {
+            return false;
+        };
+        let proxy = keep_core::ProxyConfig {
+            enabled: self.proxy_enabled,
+            port: self.proxy_port,
+        };
+        match keep.set_proxy_config(&proxy) {
+            Ok(()) => {
+                self.proxy_unreadable = false;
+                true
+            }
+            Err(e) => {
                 tracing::error!("Failed to save proxy config: {e}");
+                false
             }
         }
     }
@@ -282,13 +305,13 @@ impl App {
     }
 
     pub(super) fn load_config_from_vault(&mut self) {
-        let (relay_config, proxy) = {
+        let (relay_config, proxy, proxy_lost) = {
             let guard = lock_keep(&self.keep);
             let Some(keep) = guard.as_ref() else {
                 return;
             };
 
-            migrate_json_config_to_vault(keep, &self.keep_path);
+            let proxy_lost = migrate_json_config_to_vault(keep, &self.keep_path);
 
             let key = self
                 .active_group_pubkey_bytes()
@@ -296,12 +319,21 @@ impl App {
             let relay_config = keep
                 .get_relay_config_or_default(&key)
                 .unwrap_or_else(|_| keep_core::RelayConfig::with_defaults(key));
-            let proxy = keep.get_proxy_config().unwrap_or_default();
-            (relay_config, proxy)
+            let proxy = keep.get_proxy_config();
+            (relay_config, proxy, proxy_lost)
         };
         self.apply_relay_config(relay_config);
-        self.proxy_enabled = proxy.enabled;
-        self.proxy_port = proxy.port;
+        match proxy {
+            Ok(proxy) => {
+                self.proxy_enabled = proxy.enabled;
+                self.proxy_port = proxy.port;
+                self.proxy_unreadable = proxy_lost;
+            }
+            Err(e) => {
+                tracing::error!("Failed to read proxy config: {e}");
+                self.proxy_unreadable = true;
+            }
+        }
     }
 
     pub(super) fn reconcile_kill_switch(&mut self) {

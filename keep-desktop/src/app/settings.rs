@@ -15,6 +15,8 @@ const CERT_PIN_WRITE_BLOCKED: &str =
     "Could not update pins. The certificate pin store may be corrupt; resolve or delete \
      cert-pins.json, then retry.";
 
+const PROXY_SAVE_FAILED: &str = "The proxy setting could not be saved and is unchanged.";
+
 impl App {
     pub(crate) fn handle_settings_message_new(
         &mut self,
@@ -44,15 +46,26 @@ impl App {
                 }
             }
             Event::ProxyToggled(enabled) => {
+                let previous = self.proxy_enabled;
                 self.proxy_enabled = enabled;
                 let frost_active = matches!(
                     self.frost_status,
                     ConnectionStatus::Connected | ConnectionStatus::Connecting
                 );
                 let bunker_active = self.bunker.is_some();
-                self.save_proxy_config();
+                // Unsaved, the next launch would read the old setting back:
+                // keep running on it, so what runs is what is stored.
+                if !self.save_proxy_config() {
+                    self.proxy_enabled = previous;
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.proxy_enabled = previous;
+                    }
+                    self.set_toast(PROXY_SAVE_FAILED.into(), ToastKind::Error);
+                    return Task::none();
+                }
                 if let Screen::Settings(s) = &mut self.screen {
                     s.proxy_enabled = self.proxy_enabled;
+                    s.proxy_unreadable = self.proxy_unreadable;
                 }
                 let mut tasks = Vec::new();
                 if frost_active {
@@ -73,8 +86,25 @@ impl App {
                 return Task::batch(tasks);
             }
             Event::ProxyPortChanged(port) => {
+                let previous = self.proxy_port;
                 self.proxy_port = port;
-                self.save_proxy_config();
+                // A port alone does not say whether the proxy is on, so it
+                // cannot stand in for a setting that could not be read: that
+                // would save the default, off. Only the toggle sets it again.
+                if self.proxy_unreadable {
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.sync_proxy_port(self.proxy_port);
+                    }
+                    return Task::none();
+                }
+                if !self.save_proxy_config() {
+                    self.proxy_port = previous;
+                    if let Screen::Settings(s) = &mut self.screen {
+                        s.sync_proxy_port(previous);
+                    }
+                    self.set_toast(PROXY_SAVE_FAILED.into(), ToastKind::Error);
+                    return Task::none();
+                }
                 if let Screen::Settings(s) = &mut self.screen {
                     s.sync_proxy_port(self.proxy_port);
                 }

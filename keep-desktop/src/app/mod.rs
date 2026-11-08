@@ -138,6 +138,9 @@ pub struct App {
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) proxy_enabled: bool,
     pub(crate) proxy_port: u16,
+    /// The stored proxy setting could not be read, so no relay socket may
+    /// open until it is set again.
+    pub(crate) proxy_unreadable: bool,
     pub(crate) settings: Settings,
     pub(crate) kill_switch: Arc<AtomicBool>,
     pub(crate) tray: Option<TrayState>,
@@ -227,6 +230,7 @@ impl App {
             nostrconnect_pending: None,
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
+            proxy_unreadable: true,
             has_tray: tray.is_some(),
             window_visible: tray.is_none()
                 || !settings.start_minimized
@@ -847,6 +851,7 @@ impl App {
             nostrconnect_pending: None,
             proxy_enabled: false,
             proxy_port: DEFAULT_PROXY_PORT,
+            proxy_unreadable: false,
             has_tray,
             window_visible: !has_tray || !settings.start_minimized || !settings.minimize_to_tray,
             tray_last_connected: false,
@@ -881,9 +886,176 @@ impl App {
 mod tests {
     use super::*;
     use crate::screen::bunker::PendingApprovalDisplay;
+    use std::net::{Ipv4Addr, SocketAddr};
 
     fn default_settings() -> Settings {
         Settings::default()
+    }
+
+    #[test]
+    fn proxy_addr_refuses_a_setting_it_cannot_use() {
+        let mut app = App::test_new(default_settings(), false);
+        assert_eq!(app.proxy_addr(), Ok(None));
+
+        app.proxy_enabled = true;
+        app.proxy_port = 9050;
+        assert_eq!(
+            app.proxy_addr(),
+            Ok(Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9050))))
+        );
+
+        app.proxy_port = 0;
+        assert!(app.proxy_addr().unwrap_err().contains("no port"));
+        assert!(app.network_config().is_err());
+
+        app.proxy_enabled = false;
+        app.proxy_unreadable = true;
+        assert!(app.proxy_addr().unwrap_err().contains("could not be read"));
+        assert!(app.network_config().is_err());
+    }
+
+    #[test]
+    fn an_unreadable_proxy_setting_refuses_until_it_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault");
+        let mut keep = Keep::create(&path, "correct horse battery staple").unwrap();
+        keep.set_proxy_config(&keep_core::ProxyConfig {
+            enabled: true,
+            port: 9050,
+        })
+        .unwrap();
+        keep.lock();
+        let mut app = App::test_new(default_settings(), false);
+        app.keep_path = dir.path().to_path_buf();
+        *app.keep.lock().unwrap() = Some(keep);
+
+        app.load_config_from_vault();
+        assert!(app.proxy_unreadable);
+        assert!(app.proxy_addr().is_err());
+
+        app.save_proxy_config();
+        assert!(app.proxy_unreadable, "a failed save keeps refusing");
+
+        app.keep
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .unlock("correct horse battery staple")
+            .unwrap();
+        app.proxy_enabled = true;
+        app.proxy_port = 9050;
+        app.save_proxy_config();
+        assert!(!app.proxy_unreadable, "setting it again clears the refusal");
+        app.proxy_unreadable = true;
+        app.load_config_from_vault();
+        assert!(!app.proxy_unreadable);
+        assert_eq!(
+            app.proxy_addr(),
+            Ok(Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9050))))
+        );
+    }
+
+    fn app_with_vault(proxy: keep_core::ProxyConfig) -> (App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = Keep::create(&dir.path().join("vault"), "correct horse battery staple").unwrap();
+        keep.set_proxy_config(&proxy).unwrap();
+        let mut app = App::test_new(default_settings(), false);
+        app.keep_path = dir.path().to_path_buf();
+        *app.keep.lock().unwrap() = Some(keep);
+        (app, dir)
+    }
+
+    #[test]
+    fn a_port_edit_does_not_stand_in_for_an_unreadable_proxy_setting() {
+        use crate::screen::settings;
+        let (mut app, _dir) = app_with_vault(keep_core::ProxyConfig {
+            enabled: true,
+            port: 9050,
+        });
+        app.proxy_unreadable = true;
+        set_settings_screen(&mut app);
+        let _ = app.handle_settings_message_new(settings::Message::ProxyPortChanged("9150".into()));
+        assert!(app.proxy_unreadable, "still refusing");
+        let stored = app
+            .keep
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_proxy_config()
+            .unwrap();
+        assert!(stored.enabled && stored.port == 9050, "{stored:?}");
+
+        let _ = app.handle_settings_message_new(settings::Message::ProxyToggled(true));
+        assert!(!app.proxy_unreadable, "the toggle sets it again");
+        let stored = app
+            .keep
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_proxy_config()
+            .unwrap();
+        assert!(stored.enabled && stored.port == 9150, "{stored:?}");
+    }
+
+    #[test]
+    fn a_legacy_proxy_moves_once_and_one_that_cannot_move_refuses() {
+        let (mut app, dir) = app_with_vault(keep_core::ProxyConfig::default());
+        let settings_json = dir.path().join("settings.json");
+        std::fs::write(
+            &settings_json,
+            r#"{"minimize_to_tray":false,"proxy_enabled":true,"proxy_port":9150}"#,
+        )
+        .unwrap();
+        app.load_config_from_vault();
+        assert!(!app.proxy_unreadable);
+        assert_eq!(
+            app.proxy_addr(),
+            Ok(Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9150))))
+        );
+        let left = std::fs::read_to_string(&settings_json).unwrap();
+        assert!(!left.contains("proxy_"), "{left}");
+        assert!(left.contains("minimize_to_tray"), "{left}");
+
+        std::fs::write(
+            &settings_json,
+            r#"{"minimize_to_tray":false,"proxy_enabled":true,"proxy_port":0}"#,
+        )
+        .unwrap();
+        app.load_config_from_vault();
+        assert!(
+            app.proxy_unreadable,
+            "an on proxy that could not move refuses"
+        );
+        assert!(app.proxy_addr().is_err());
+    }
+
+    #[test]
+    fn a_proxy_change_that_cannot_be_saved_is_not_applied() {
+        use crate::screen::settings;
+        let (mut app, _dir) = app_with_vault(keep_core::ProxyConfig::default());
+        app.load_config_from_vault();
+        set_settings_screen(&mut app);
+        app.keep.lock().unwrap().as_mut().unwrap().lock();
+
+        let _ = app.handle_settings_message_new(settings::Message::ProxyToggled(true));
+        assert!(!app.proxy_enabled, "the stored setting is still off");
+
+        app.proxy_enabled = true;
+        let _ = app.handle_settings_message_new(settings::Message::ProxyPortChanged("9150".into()));
+        assert_eq!(app.proxy_port, DEFAULT_PROXY_PORT);
+    }
+
+    #[test]
+    fn locking_forgets_the_proxy_setting_until_the_next_read() {
+        let (mut app, _dir) = app_with_vault(keep_core::ProxyConfig::default());
+        app.load_config_from_vault();
+        assert!(!app.proxy_unreadable);
+        let _ = app.do_lock();
+        assert!(app.proxy_unreadable);
+        assert!(app.proxy_addr().is_err());
     }
 
     #[test]

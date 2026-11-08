@@ -465,6 +465,7 @@ impl App {
         Task::perform(
             async move {
                 use crate::message::ConnectionError;
+                let proxy = proxy?;
                 crate::frost::verify_relay_certificates(
                     &relay_urls,
                     &cert_pins,

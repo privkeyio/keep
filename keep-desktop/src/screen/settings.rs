@@ -128,6 +128,7 @@ pub struct SettingsScreen {
     pub vault_path: String,
     pub proxy_enabled: bool,
     pub proxy_port: u16,
+    pub proxy_unreadable: bool,
     proxy_port_input: String,
     pub kill_switch_active: bool,
     kill_switch_confirm: bool,
@@ -178,6 +179,7 @@ impl SettingsScreen {
             vault_path,
             proxy_enabled,
             proxy_port,
+            proxy_unreadable: false,
             proxy_port_input: proxy_port.to_string(),
             kill_switch_active,
             kill_switch_confirm: false,
@@ -719,7 +721,16 @@ impl SettingsScreen {
         ]
         .spacing(theme::space::SM);
 
-        if self.proxy_enabled && self.proxy_port > 0 {
+        if self.proxy_unreadable {
+            col = col.push(
+                text(
+                    "The proxy setting could not be read, so nothing connects. Turn the proxy \
+                     on or off to set it again.",
+                )
+                .size(theme::size::BODY)
+                .color(theme::color::ERROR),
+            );
+        } else if self.proxy_enabled && self.proxy_port > 0 {
             col = col.push(
                 text(format!("Proxy active on port {}", self.proxy_port))
                     .size(theme::size::BODY)

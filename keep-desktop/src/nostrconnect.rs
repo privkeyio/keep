@@ -101,6 +101,7 @@ impl App {
                 // Propagate the `ConnectionError` unchanged (via `?`) so a
                 // `PinMismatch` keeps its structured variant and reaches the
                 // dedicated cert-failure UI, matching the interactive path.
+                let proxy = proxy?;
                 crate::frost::verify_relay_certificates(
                     &valid_relays,
                     &cert_pins,
