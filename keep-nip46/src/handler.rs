@@ -120,11 +120,15 @@ fn reject_ambiguous_nip98(event: &UnsignedEvent) -> Result<()> {
         let count = event
             .tags
             .iter()
-            .filter(|t| t.as_slice().first().map(String::as_str) == Some(name))
+            .filter(|t| {
+                t.as_slice()
+                    .first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
             .count();
         if count > 1 {
             return Err(KeepError::InvalidInput(format!(
-                "NIP-98 event has {count} '{name}' tags; exactly one is allowed"
+                "NIP-98 event has {count} '{name}' tags; at most one is allowed"
             )));
         }
     }
@@ -1489,6 +1493,8 @@ mod tests {
         for tags in [
             vec![shown, ["u", "https://evil.example/"], get],
             vec![shown, get, ["method", "DELETE"]],
+            vec![shown, ["U", "https://evil.example/"], get],
+            vec![["u", "not a url"], ["u", "https://evil.example/"], get],
         ] {
             let err = handler.handle_sign_event(app, event(tags)).await;
             assert!(matches!(err, Err(KeepError::InvalidInput(_))), "{err:?}");
@@ -1508,6 +1514,20 @@ mod tests {
             .await
             .expect("a single target still signs under the remembered window");
         assert_eq!(prompts(), after_connect);
+
+        let denied = Keys::generate().public_key();
+        handler
+            .handle_connect(denied, None, None, None)
+            .await
+            .unwrap();
+        permissions
+            .lock()
+            .await
+            .deny_kind_for(&denied, NIP98_HTTP_AUTH, 300);
+        let err = handler
+            .handle_sign_event(denied, event(vec![shown, get, ["method", "DELETE"]]))
+            .await;
+        assert!(matches!(err, Err(KeepError::InvalidInput(_))), "{err:?}");
     }
 
     #[test]
