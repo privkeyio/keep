@@ -9279,12 +9279,38 @@ mod sign_request_mapping_tests {
             content: "gm".into(),
         };
         let described = |kind: u16| {
-            let body = serde_json::to_vec(&keep_frost_net::NostrEventPayload {
+            use sha2::Digest;
+            let event = keep_frost_net::NostrEventPayload {
                 kind,
                 ..event.clone()
-            })
-            .unwrap();
-            sign_request_from_session(&session_with_payload("nostr-event", 1, Some(body)), None)
+            };
+            let id = sha2::Sha256::digest(
+                serde_json::json!([
+                    0,
+                    hex::encode(event.pubkey),
+                    event.created_at,
+                    event.kind,
+                    event.tags,
+                    event.content
+                ])
+                .to_string(),
+            )
+            .to_vec();
+            let body = serde_json::to_vec(&event).unwrap();
+            keep_frost_net::verify_structured_payload("nostr-event", &id, &body)
+                .expect("the responder admits this body");
+            assert!(
+                keep_frost_net::verify_structured_payload("nostr-event", &[0xab; 32], &body)
+                    .is_err(),
+                "the responder refuses it under another digest"
+            );
+            sign_request_from_session(
+                &keep_frost_net::SessionInfo {
+                    message: id,
+                    ..session_with_payload("nostr-event", 1, Some(body))
+                },
+                None,
+            )
         };
         assert!(!described(1).needs_fresh_auth);
         for kind in [
