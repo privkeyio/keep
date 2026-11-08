@@ -1033,6 +1033,22 @@ mod tests {
     }
 
     #[test]
+    fn a_proxy_change_that_cannot_be_saved_is_not_applied() {
+        use crate::screen::settings;
+        let (mut app, _dir) = app_with_vault(keep_core::ProxyConfig::default());
+        app.load_config_from_vault();
+        set_settings_screen(&mut app);
+        app.keep.lock().unwrap().as_mut().unwrap().lock();
+
+        let _ = app.handle_settings_message_new(settings::Message::ProxyToggled(true));
+        assert!(!app.proxy_enabled, "the stored setting is still off");
+
+        app.proxy_enabled = true;
+        let _ = app.handle_settings_message_new(settings::Message::ProxyPortChanged("9150".into()));
+        assert_eq!(app.proxy_port, DEFAULT_PROXY_PORT);
+    }
+
+    #[test]
     fn locking_forgets_the_proxy_setting_until_the_next_read() {
         let (mut app, _dir) = app_with_vault(keep_core::ProxyConfig::default());
         app.load_config_from_vault();

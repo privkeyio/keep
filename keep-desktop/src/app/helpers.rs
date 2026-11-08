@@ -263,16 +263,24 @@ impl App {
         self.update_relay_config(|config| config.bunker_relays = relays);
     }
 
-    pub(super) fn save_proxy_config(&mut self) {
+    /// Whether the setting in memory is now the one stored.
+    pub(super) fn save_proxy_config(&mut self) -> bool {
         let guard = lock_keep(&self.keep);
-        if let Some(keep) = guard.as_ref() {
-            let proxy = keep_core::ProxyConfig {
-                enabled: self.proxy_enabled,
-                port: self.proxy_port,
-            };
-            match keep.set_proxy_config(&proxy) {
-                Ok(()) => self.proxy_unreadable = false,
-                Err(e) => tracing::error!("Failed to save proxy config: {e}"),
+        let Some(keep) = guard.as_ref() else {
+            return false;
+        };
+        let proxy = keep_core::ProxyConfig {
+            enabled: self.proxy_enabled,
+            port: self.proxy_port,
+        };
+        match keep.set_proxy_config(&proxy) {
+            Ok(()) => {
+                self.proxy_unreadable = false;
+                true
+            }
+            Err(e) => {
+                tracing::error!("Failed to save proxy config: {e}");
+                false
             }
         }
     }
