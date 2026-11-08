@@ -27,6 +27,9 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::CapacityExceeded(_) => "Capacity exceeded",
         KeepError::PermissionDenied(_) => "Permission denied",
         KeepError::UserRejected => "User rejected",
+        KeepError::InvalidInput(m) if m == crate::handler::NIP98_AMBIGUOUS_TARGET => {
+            crate::handler::NIP98_AMBIGUOUS_TARGET
+        }
         KeepError::InvalidInput(_) => "Invalid input",
         KeepError::NotImplemented(_) => "Not supported",
         KeepError::Runtime(_) => "Internal error",
@@ -35,5 +38,19 @@ pub(crate) fn sanitize_error_for_client(e: &KeepError) -> &'static str {
         KeepError::Serialization(_) => "Data format error",
         KeepError::Io(_) => "IO error",
         _ => "Unknown error",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::NIP98_AMBIGUOUS_TARGET;
+
+    #[test]
+    fn only_the_fixed_nip98_refusal_reaches_the_client_verbatim() {
+        let fixed = KeepError::InvalidInput(NIP98_AMBIGUOUS_TARGET.into());
+        assert_eq!(sanitize_error_for_client(&fixed), NIP98_AMBIGUOUS_TARGET);
+        let other = KeepError::InvalidInput("attacker text".into());
+        assert_eq!(sanitize_error_for_client(&other), "Invalid input");
     }
 }

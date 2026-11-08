@@ -112,6 +112,9 @@ fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
 
 /// A verifier may read any occurrence of a repeated `u` or `method` tag, so an
 /// event carrying two would authenticate a target the prompt never showed.
+pub(crate) const NIP98_AMBIGUOUS_TARGET: &str =
+    "NIP-98 event must have at most one u tag and one method tag";
+
 fn reject_ambiguous_nip98(event: &UnsignedEvent) -> Result<()> {
     if event.kind != NIP98_HTTP_AUTH {
         return Ok(());
@@ -127,9 +130,7 @@ fn reject_ambiguous_nip98(event: &UnsignedEvent) -> Result<()> {
             })
             .count();
         if count > 1 {
-            return Err(KeepError::InvalidInput(format!(
-                "NIP-98 event has {count} '{name}' tags; at most one is allowed"
-            )));
+            return Err(KeepError::InvalidInput(NIP98_AMBIGUOUS_TARGET.into()));
         }
     }
     Ok(())
