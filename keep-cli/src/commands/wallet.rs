@@ -2005,7 +2005,7 @@ async fn approve_psbt_session(
     // mempool.space compatible endpoint). The check is REQUIRED on the
     // recovery-sign path because that is where the fee-caps live; a
     // missing endpoint refuses closed rather than proceeding blind.
-    let chain = keep_bitcoin::esplora_chain_view_from_env().map_err(KeepError::InvalidInput)?;
+    let chain = keep_bitcoin::esplora_chain_view_from_env(None).map_err(KeepError::InvalidInput)?;
     // `approve_psbt_session` is async and awaited under `rt.block_on` on a
     // multi-thread runtime, concurrently with the spawned FROST node task.
     // block_in_place moves the blocking HTTP validation off the async driver

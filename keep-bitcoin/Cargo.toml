@@ -24,7 +24,7 @@ miniscript = "=13.2.0"
 # Optional HTTP client for the built-in Esplora chain view (#502). Gated
 # behind a feature so downstream crates that only need the ChainView trait
 # do not pull reqwest + rustls + tokio into their build graph.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "socks"], optional = true }
 url = { version = "2", optional = true }
 
 [features]
