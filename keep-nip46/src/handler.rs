@@ -1495,6 +1495,7 @@ mod tests {
             vec![shown, ["u", "https://evil.example/"], get],
             vec![shown, get, ["method", "DELETE"]],
             vec![shown, ["U", "https://evil.example/"], get],
+            vec![shown, get, ["METHOD", "DELETE"]],
             vec![["u", "not a url"], ["u", "https://evil.example/"], get],
         ] {
             let err = handler.handle_sign_event(app, event(tags)).await;
@@ -1525,10 +1526,12 @@ mod tests {
             .lock()
             .await
             .deny_kind_for(&denied, NIP98_HTTP_AUTH, 300);
+        let before_sign = prompts();
         let err = handler
             .handle_sign_event(denied, event(vec![shown, get, ["method", "DELETE"]]))
             .await;
         assert!(matches!(err, Err(KeepError::InvalidInput(_))), "{err:?}");
+        assert_eq!(prompts(), before_sign);
     }
 
     #[test]
