@@ -329,10 +329,21 @@ fn sign_request_from_session(
             .unwrap_or_default()
             .as_secs(),
         needs_fresh_auth: !metadata.as_ref().is_some_and(|m| {
-            session.structured_payload.is_some() && m.event_kind.is_some() && m.spend.is_none()
+            session.structured_payload.is_some()
+                && m.spend.is_none()
+                && m.event_kind
+                    .is_some_and(|kind| !needs_fresh_auth_kind(kind))
         }),
         metadata,
     }
+}
+
+/// A Nostr event kind that is sensitive, or that moves or authorizes value:
+/// NIP-47 wallet requests, NIP-60 and NIP-61 cashu tokens and nutzaps, NIP-46
+/// messages. Their content is often encrypted, so the prompt cannot show what
+/// they do.
+fn needs_fresh_auth_kind(kind: u32) -> bool {
+    is_sensitive_kind(kind) || matches!(kind, 7375 | 7376 | 9321 | 23194 | 24133)
 }
 
 /// What the request signs, from its structured body. Present only with one:
@@ -9267,10 +9278,20 @@ mod sign_request_mapping_tests {
             tags: vec![],
             content: "gm".into(),
         };
-        let body = serde_json::to_vec(&event).unwrap();
-        let described =
-            sign_request_from_session(&session_with_payload("nostr-event", 1, Some(body)), None);
-        assert!(!described.needs_fresh_auth);
+        let described = |kind: u16| {
+            let body = serde_json::to_vec(&keep_frost_net::NostrEventPayload {
+                kind,
+                ..event.clone()
+            })
+            .unwrap();
+            sign_request_from_session(&session_with_payload("nostr-event", 1, Some(body)), None)
+        };
+        assert!(!described(1).needs_fresh_auth);
+        for kind in [
+            0, 3, 4, 10002, 22242, 27235, 30023, 7375, 9321, 23194, 24133,
+        ] {
+            assert!(described(kind).needs_fresh_auth, "kind {kind}");
+        }
 
         for req in [
             sign_request_from_session(&session("nostr-event", 1), None),
