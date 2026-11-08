@@ -110,6 +110,27 @@ fn nip98_http_auth(event: &UnsignedEvent) -> Option<HttpAuthDetails> {
     Some(HttpAuthDetails { url, method })
 }
 
+/// A verifier may read any occurrence of a repeated `u` or `method` tag, so an
+/// event carrying two would authenticate a target the prompt never showed.
+fn reject_ambiguous_nip98(event: &UnsignedEvent) -> Result<()> {
+    if event.kind != NIP98_HTTP_AUTH {
+        return Ok(());
+    }
+    for name in ["u", "method"] {
+        let count = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(String::as_str) == Some(name))
+            .count();
+        if count > 1 {
+            return Err(KeepError::InvalidInput(format!(
+                "NIP-98 event has {count} '{name}' tags; exactly one is allowed"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn clamp_nip98_remember(remember: RememberDuration) -> RememberDuration {
     match remember.as_seconds() {
         None if remember == RememberDuration::JustThisTime => RememberDuration::JustThisTime,
@@ -596,6 +617,7 @@ impl SignerHandler {
 
         self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
             .await?;
+        reject_ambiguous_nip98(&unsigned_event)?;
 
         // A refusal the user already gave is consulted before prompting. Without
         // this, saying no decides one request and nothing more: a client that
@@ -1439,6 +1461,53 @@ mod tests {
             }),
             "kind 27235 approval must surface the NIP-98 url/method"
         );
+    }
+
+    #[tokio::test]
+    async fn nip98_with_a_repeated_target_tag_is_refused_without_a_prompt() {
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        let cb = Arc::new(RecordingCallbacks::new());
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::clone(&permissions),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let prompts = || cb.methods.lock().unwrap().len();
+        let after_connect = prompts();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let event = |tags: Vec<[&str; 2]>| {
+            let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
+            UnsignedEvent::new(signer_pk, Timestamp::now(), NIP98_HTTP_AUTH, tags, "")
+        };
+        let shown = ["u", "https://ok.example/"];
+        let get = ["method", "GET"];
+
+        for tags in [
+            vec![shown, ["u", "https://evil.example/"], get],
+            vec![shown, get, ["method", "DELETE"]],
+        ] {
+            let err = handler.handle_sign_event(app, event(tags)).await;
+            assert!(matches!(err, Err(KeepError::InvalidInput(_))), "{err:?}");
+        }
+        assert_eq!(prompts(), after_connect);
+
+        assert!(permissions
+            .lock()
+            .await
+            .grant_kind_for(&app, NIP98_HTTP_AUTH, 300));
+        let err = handler
+            .handle_sign_event(app, event(vec![shown, ["u", "https://evil.example/"], get]))
+            .await;
+        assert!(matches!(err, Err(KeepError::InvalidInput(_))), "{err:?}");
+        handler
+            .handle_sign_event(app, event(vec![shown, get]))
+            .await
+            .expect("a single target still signs under the remembered window");
+        assert_eq!(prompts(), after_connect);
     }
 
     #[test]
