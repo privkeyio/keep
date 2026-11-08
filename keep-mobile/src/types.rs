@@ -23,6 +23,13 @@ pub struct SignRequest {
     pub from_peer: u16,
     pub timestamp: u64,
     pub metadata: Option<SignRequestMetadata>,
+    /// Whether approving needs a fresh strong authentication in the app, never
+    /// a notification action or an earlier unlock. False only for a Nostr event
+    /// the core rebuilt from its body and matched against the bytes being
+    /// signed. A peer chooses whether to send a body, so anything it leaves
+    /// undescribed may be a Bitcoin spend and is treated as one.
+    #[uniffi(default = true)]
+    pub needs_fresh_auth: bool,
 }
 
 /// What a request signs, read from the structured body the responder has

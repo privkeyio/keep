@@ -307,6 +307,7 @@ fn sign_request_from_session(
     session: &keep_frost_net::SessionInfo,
     network: Option<bitcoin::Network>,
 ) -> SignRequest {
+    let metadata = request_metadata(session, network);
     SignRequest {
         id: hex::encode(session.session_id),
         session_id: session.session_id.to_vec(),
@@ -327,7 +328,10 @@ fn sign_request_from_session(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
-        metadata: request_metadata(session, network),
+        needs_fresh_auth: !metadata.as_ref().is_some_and(|m| {
+            session.structured_payload.is_some() && m.event_kind.is_some() && m.spend.is_none()
+        }),
+        metadata,
     }
 }
 
@@ -7063,6 +7067,7 @@ mod import_teardown_tests {
                     from_peer: 0,
                     timestamp: 0,
                     metadata: None,
+                    needs_fresh_auth: true,
                 },
                 response_tx: tx,
             });
@@ -9248,6 +9253,34 @@ mod sign_request_mapping_tests {
         assert!(!preview.contains('\n') && !preview.contains('\u{202E}'));
         assert!(preview.chars().count() <= CONTENT_PREVIEW_DISPLAY_MAX + 3);
         assert!(meta.spend.is_none() && meta.amount_sats.is_none());
+    }
+
+    // Only a Nostr event the core rebuilt from its body keeps the usual
+    // approval. A peer omits the body at will, so a bare claim, bare bytes or a
+    // spend asks for a fresh strong authentication.
+    #[test]
+    fn only_a_described_nostr_event_skips_fresh_auth() {
+        let event = keep_frost_net::NostrEventPayload {
+            pubkey: [1u8; 32],
+            created_at: 1_700_000_000,
+            kind: 1,
+            tags: vec![],
+            content: "gm".into(),
+        };
+        let body = serde_json::to_vec(&event).unwrap();
+        let described =
+            sign_request_from_session(&session_with_payload("nostr-event", 1, Some(body)), None);
+        assert!(!described.needs_fresh_auth);
+
+        for req in [
+            sign_request_from_session(&session("nostr-event", 1), None),
+            sign_request_from_session(&session("bitcoin-sighash", 1), None),
+            sign_request_from_session(&session("raw", 1), None),
+            spend_request(spend_payload(&[(5_000, p2wsh(2))], &[6_000], 0), None),
+            spend_request(spend_payload(&[(5_000, p2wsh(2))], &[1_000], 0), None),
+        ] {
+            assert!(req.needs_fresh_auth, "{:?}", req.message_type);
+        }
     }
 
     // A body under a label it does not belong to is refused before this runs,
