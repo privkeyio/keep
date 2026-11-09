@@ -2109,6 +2109,11 @@ impl KeepMobile {
                 msg: format!("group name must be 1..={MAX_SHARE_NAME_LENGTH} characters"),
             });
         }
+        if group_name.chars().any(keep_core::display::is_invisible) {
+            return Err(KeepMobileError::FrostError {
+                msg: "group name contains a hidden or control character".into(),
+            });
+        }
         let keys = nostr_sdk::Keys::generate();
         let secret = Zeroizing::new(keys.secret_key().secret_bytes());
         self.dkg_subkeys
@@ -6135,6 +6140,12 @@ impl KeepMobile {
                 msg: format!(
                     "Share name exceeds maximum length of {MAX_SHARE_NAME_LENGTH} characters"
                 ),
+            });
+        }
+        // A hidden character lets a name display as another account's.
+        if name.chars().any(keep_core::display::is_invisible) {
+            return Err(KeepMobileError::InvalidShare {
+                msg: "Share name contains a hidden or control character".into(),
             });
         }
         Ok(())
@@ -10811,6 +10822,46 @@ mod dkg_pending_share_tests {
         // With no active run, a cancel is a harmless no-op.
         *mobile.dkg_active.lock().unwrap() = None;
         mobile.frost_cancel_dkg(2);
+    }
+
+    // A group or share name that holds a hidden character can display as
+    // another account in the switcher, so every name path refuses one while
+    // visible non-ASCII stays allowed.
+    #[test]
+    fn a_name_with_a_hidden_character_is_refused() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        for name in [
+            "Vault\u{200B}",
+            "\u{202E}tluaV",
+            "Va\u{061C}ult",
+            "\u{FEFF}Vault",
+            "Vault\u{E0041}",
+            "Vault\u{2028}2",
+            "Vault\n",
+        ] {
+            assert!(
+                matches!(
+                    KeepMobile::validate_share_name(name),
+                    Err(KeepMobileError::InvalidShare { .. })
+                ),
+                "{name:?}"
+            );
+            assert!(
+                matches!(
+                    mobile.frost_dkg_begin(name.into()),
+                    Err(KeepMobileError::FrostError { .. })
+                ),
+                "{name:?}"
+            );
+        }
+        assert!(mobile.dkg_subkeys.lock().unwrap().is_empty());
+
+        for name in ["Familie Müller", "家族の金庫", "🔑 Vault"] {
+            KeepMobile::validate_share_name(name).unwrap();
+            mobile.frost_dkg_begin(name.into()).unwrap();
+        }
     }
 
     // `frost_dkg_begin` stashes a per-group subkey secret; an abandoned begin
