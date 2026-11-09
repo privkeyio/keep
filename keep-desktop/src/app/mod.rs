@@ -134,7 +134,7 @@ pub struct App {
     pub(crate) frost_last_relay_urls: Option<Vec<String>>,
     pub(crate) bunker: Option<RunningBunker>,
     pub(crate) bunker_relays: Vec<String>,
-    pub(crate) bunker_approval_tx: Option<std::sync::mpsc::Sender<bool>>,
+    pub(crate) bunker_approval_tx: Option<crate::bunker_service::ApprovalReply>,
     pub(crate) bunker_pending_approval: Option<PendingApprovalDisplay>,
     pub(crate) bunker_approval_shown_at: Option<std::time::Instant>,
     pub(crate) bunker_pending_setup: Option<Arc<Mutex<Option<BunkerSetup>>>>,
@@ -1325,6 +1325,8 @@ mod tests {
         app.notify_bunker_approval(&display);
     }
 
+    use crate::bunker_service::ApprovalReply;
+
     fn bunker_prompt(id: u64) -> PendingApprovalDisplay {
         PendingApprovalDisplay {
             id,
@@ -1357,7 +1359,7 @@ mod tests {
         use crate::screen::bunker::Message as B;
         let mut app = bunker_app();
         let (tx, rx) = std::sync::mpsc::channel();
-        app.show_bunker_approval(bunker_prompt(2), tx);
+        app.show_bunker_approval(bunker_prompt(2), ApprovalReply::new(tx));
         settle_bunker_prompt(&mut app);
 
         let _ = app.handle_bunker_message(B::Approve(1));
@@ -1379,7 +1381,7 @@ mod tests {
         use crate::screen::bunker::Message as B;
         let mut app = bunker_app();
         let (tx, rx) = std::sync::mpsc::channel();
-        app.show_bunker_approval(bunker_prompt(7), tx);
+        app.show_bunker_approval(bunker_prompt(7), ApprovalReply::new(tx));
 
         let _ = app.handle_bunker_message(B::Approve(7));
         assert!(rx.try_recv().is_err());
@@ -1393,7 +1395,7 @@ mod tests {
     fn a_bunker_timeout_clears_its_own_prompt() {
         let mut app = bunker_app();
         let (tx, _rx) = std::sync::mpsc::channel();
-        app.show_bunker_approval(bunker_prompt(3), tx);
+        app.show_bunker_approval(bunker_prompt(3), ApprovalReply::new(tx));
         app.bunker_approval_timed_out(3);
         assert!(app.bunker_pending_approval.is_none());
         assert!(app.bunker_approval_tx.is_none());
@@ -1408,7 +1410,7 @@ mod tests {
     fn an_approval_nobody_receives_is_reported_undelivered() {
         let mut app = bunker_app();
         let (tx, rx) = std::sync::mpsc::channel();
-        app.show_bunker_approval(bunker_prompt(4), tx);
+        app.show_bunker_approval(bunker_prompt(4), ApprovalReply::new(tx));
         settle_bunker_prompt(&mut app);
         drop(rx);
         assert_eq!(app.resolve_bunker_approval(4, true), Some(false));
@@ -1422,8 +1424,9 @@ mod tests {
         use crate::screen::bunker::{Event, Message as B};
         let mut state = crate::screen::bunker::State::new(vec![]);
         state.approval_shown(bunker_prompt(1));
-        assert!(state.update(B::SetApprovalDuration(4)).is_none());
+        assert!(state.update(B::SetApprovalDuration(1, 4)).is_none());
         state.approval_shown(bunker_prompt(2));
+        assert!(state.update(B::SetApprovalDuration(1, 3)).is_none());
         assert!(matches!(
             state.update(B::Approve(2)),
             Some(Event::Approve {
@@ -1431,6 +1434,52 @@ mod tests {
                 duration_index: 0
             })
         ));
+    }
+
+    // Once a request stops waiting, an answer clicked after that reaches
+    // nobody and is reported undelivered, so it grants nothing.
+    #[test]
+    fn an_answer_after_the_request_gave_up_is_undelivered() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(tx);
+        assert_eq!(
+            crate::bunker_service::wait_for_answer(
+                &rx,
+                &reply,
+                std::time::Duration::from_millis(10)
+            ),
+            None
+        );
+        assert!(!reply.answer(true));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_answer_given_in_time_is_delivered() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(tx);
+        assert!(reply.answer(true));
+        assert_eq!(
+            crate::bunker_service::wait_for_answer(
+                &rx,
+                &reply,
+                std::time::Duration::from_millis(10)
+            ),
+            Some(true)
+        );
+    }
+
+    // Stopping the bunker refuses the request on the card and takes it down.
+    #[test]
+    fn stopping_the_bunker_refuses_and_clears_the_prompt() {
+        let mut app = bunker_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.show_bunker_approval(bunker_prompt(5), ApprovalReply::new(tx));
+        app.stop_bunker();
+        assert_eq!(rx.try_recv(), Ok(false));
+        assert!(app.bunker_pending_approval.is_none());
+        assert!(app.bunker_approval_shown_at.is_none());
+        assert!(app.bunker_approval_tx.is_none());
     }
 
     // Showing a bunker request takes the card from a pending nostrconnect
@@ -1445,8 +1494,16 @@ mod tests {
         let request = keep_nip46::parse_nostrconnect_uri(&uri).unwrap();
         let _ = app.process_pending_nostrconnect(request);
         assert!(app.nostrconnect_pending.is_some());
+        let Screen::Bunker(s) = &app.screen else {
+            panic!("the nostrconnect request did not open the bunker screen");
+        };
+        assert_eq!(
+            s.pending_approval.as_ref().map(|p| p.id),
+            app.bunker_pending_approval.as_ref().map(|p| p.id),
+            "the nostrconnect card is not on screen"
+        );
         let (tx, _rx) = std::sync::mpsc::channel();
-        app.show_bunker_approval(bunker_prompt(9), tx);
+        app.show_bunker_approval(bunker_prompt(9), ApprovalReply::new(tx));
         assert!(app.nostrconnect_pending.is_none());
         assert_eq!(app.bunker_pending_approval.as_ref().map(|p| p.id), Some(9));
     }

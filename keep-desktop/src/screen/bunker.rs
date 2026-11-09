@@ -135,7 +135,7 @@ pub enum Message {
     CopyUrl,
     ToggleClient(usize),
     TogglePermission(usize, u32),
-    SetApprovalDuration(usize),
+    SetApprovalDuration(u64, usize),
     KindInputChanged(String, String),
     AddKind(String),
     RemoveKind(usize, u16),
@@ -268,8 +268,12 @@ impl State {
             Message::TogglePermission(client_idx, flag) => {
                 Some(Event::TogglePermission(client_idx, flag))
             }
-            Message::SetApprovalDuration(i) => {
-                self.approval_duration = i;
+            Message::SetApprovalDuration(id, i) => {
+                // A pick made on a card the next request replaced is dropped
+                // rather than applied to the new card.
+                if self.pending_approval.as_ref().map(|p| p.id) == Some(id) {
+                    self.approval_duration = i;
+                }
                 None
             }
             Message::KindInputChanged(pubkey, input) => {
@@ -868,7 +872,7 @@ impl State {
             };
             duration_row = duration_row.push(
                 button(text(*label).size(theme::size::TINY))
-                    .on_press(Message::SetApprovalDuration(idx))
+                    .on_press(Message::SetApprovalDuration(approval.id, idx))
                     .style(style)
                     .padding([2.0, theme::space::SM]),
             );

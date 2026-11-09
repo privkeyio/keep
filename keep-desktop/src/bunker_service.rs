@@ -53,7 +53,7 @@ pub(crate) enum BunkerEvent {
     },
     Approval {
         display: PendingApprovalDisplay,
-        response_tx: std::sync::mpsc::Sender<bool>,
+        response_tx: ApprovalReply,
     },
     ApprovalTimeout {
         id: u64,
@@ -61,6 +61,44 @@ pub(crate) enum BunkerEvent {
     Connected {
         pubkey: String,
     },
+}
+
+// The answer slot one bunker prompt shares with the request waiting on it.
+// Whichever side takes the sender first decides: the screen to answer, or
+// the waiting request when it gives up. An answer therefore counts as
+// delivered only when the request acts on it.
+#[derive(Clone)]
+pub(crate) struct ApprovalReply(Arc<Mutex<Option<std::sync::mpsc::Sender<bool>>>>);
+
+impl ApprovalReply {
+    pub(crate) fn new(tx: std::sync::mpsc::Sender<bool>) -> Self {
+        Self(Arc::new(Mutex::new(Some(tx))))
+    }
+
+    pub(crate) fn answer(&self, approved: bool) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take().is_some_and(|tx| tx.send(approved).is_ok())
+    }
+
+    fn close(&self) -> bool {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot.take().is_some()
+    }
+}
+
+// The owner's answer, or `None` once the request stops waiting. An answer the
+// screen sent while this gave up is still taken: the screen sends with the
+// slot held, so if the slot is already empty the answer is in the channel.
+pub(crate) fn wait_for_answer(
+    rx: &std::sync::mpsc::Receiver<bool>,
+    reply: &ApprovalReply,
+    timeout: std::time::Duration,
+) -> Option<bool> {
+    match rx.recv_timeout(timeout) {
+        Ok(approved) => Some(approved),
+        Err(_) if reply.close() => None,
+        Err(_) => rx.try_recv().ok(),
+    }
 }
 
 pub(crate) struct DesktopCallbacks {
@@ -81,6 +119,7 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
         request: keep_nip46::types::ApprovalRequest,
     ) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(response_tx);
         let id = crate::app::next_approval_id();
         let display = PendingApprovalDisplay {
             id,
@@ -96,19 +135,18 @@ impl keep_nip46::types::ServerCallbacks for DesktopCallbacks {
             .tx
             .send(BunkerEvent::Approval {
                 display,
-                response_tx,
+                response_tx: reply.clone(),
             })
             .is_err()
         {
             return false.into();
         }
         let tx = self.tx.clone();
-        tokio::task::block_in_place(|| match response_rx.recv_timeout(BUNKER_APPROVAL_TIMEOUT) {
-            Ok(approved) => approved,
-            Err(_) => {
+        tokio::task::block_in_place(|| {
+            wait_for_answer(&response_rx, &reply, BUNKER_APPROVAL_TIMEOUT).unwrap_or_else(|| {
                 let _ = tx.send(BunkerEvent::ApprovalTimeout { id });
                 false
-            }
+            })
         })
         .into()
     }
@@ -416,7 +454,9 @@ impl App {
                 self.bunker_pending_approval.clone(),
             )
         } else {
-            bunker::State::new(self.bunker_relays.clone())
+            let mut state = bunker::State::new(self.bunker_relays.clone());
+            state.pending_approval = self.bunker_pending_approval.clone();
+            state
         }
     }
 
@@ -637,7 +677,7 @@ impl App {
         let delivered = self
             .bunker_approval_tx
             .take()
-            .is_some_and(|tx| tx.send(approved).is_ok());
+            .is_some_and(|reply| reply.answer(approved));
         self.clear_bunker_approval();
         Some(delivered)
     }
@@ -645,10 +685,10 @@ impl App {
     pub(crate) fn show_bunker_approval(
         &mut self,
         display: PendingApprovalDisplay,
-        response_tx: std::sync::mpsc::Sender<bool>,
+        response_tx: ApprovalReply,
     ) {
-        if let Some(prev_tx) = self.bunker_approval_tx.take() {
-            let _ = prev_tx.send(false);
+        if let Some(prev) = self.bunker_approval_tx.take() {
+            prev.answer(false);
         }
         // A pending nostrconnect request shares the card. It cannot be
         // approved while the bunker runs, and an answer to the new card must
@@ -681,11 +721,12 @@ impl App {
     }
 
     pub(crate) fn stop_bunker(&mut self) {
-        if let Some(tx) = self.bunker_approval_tx.take() {
-            let _ = tx.send(false);
+        if let Some(reply) = self.bunker_approval_tx.take() {
+            reply.answer(false);
         }
         self.bunker_pending_approval = None;
         self.bunker_approval_shown_at = None;
+        self.nostrconnect_pending = None;
 
         if let Some(bunker) = self.bunker.take() {
             bunker.handle.abort();
