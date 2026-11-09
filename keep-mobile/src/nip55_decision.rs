@@ -133,8 +133,10 @@ pub enum Nip55Outcome {
     /// (pre-approval and, for `GetPublicKey`, pubkey verification).
     AutoApprove,
     /// Reject the request (NIP-55 `rejected = true`). `reason` is the audit action
-    /// label, matching the Android audit log.
-    Reject { reason: String },
+    /// label, matching the Android audit log. `retire_caller` asks the app to
+    /// also retire the caller's grants, opt-in and tier, which it does only for
+    /// an expired app. The app acts on this flag, never on the reason text.
+    Reject { reason: String, retire_caller: bool },
     /// A hard error (a distinct error cursor, not a rejection).
     Error { message: String },
     /// No auto-decision: prompt the user. Carries the risk assessment and the
@@ -212,11 +214,13 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         Nip55VelocityCheck::TimedOut => {
             return Nip55Outcome::Reject {
                 reason: "deny_velocity_timeout".to_string(),
+                retire_caller: false,
             }
         }
         Nip55VelocityCheck::Blocked => {
             return Nip55Outcome::Reject {
                 reason: "velocity_blocked".to_string(),
+                retire_caller: false,
             }
         }
         Nip55VelocityCheck::Allowed => {}
@@ -232,6 +236,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
             None => {
                 return Nip55Outcome::Reject {
                     reason: "invalid_event_kind".to_string(),
+                    retire_caller: false,
                 }
             }
         }
@@ -264,6 +269,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         Some(Nip55RelayAuthGate::AutoReject) => {
             return Nip55Outcome::Reject {
                 reason: "deny_relay_whitelist".to_string(),
+                retire_caller: false,
             };
         }
         Some(Nip55RelayAuthGate::Whitelisted | Nip55RelayAuthGate::Defer) | None => {}
@@ -277,11 +283,13 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         None => {
             return Nip55Outcome::Reject {
                 reason: "deny_timeout".to_string(),
+                retire_caller: false,
             }
         }
         Some(true) => {
             return Nip55Outcome::Reject {
                 reason: "deny_expired".to_string(),
+                retire_caller: true,
             }
         }
         Some(false) => {}
@@ -289,6 +297,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     if !inputs.permission_lookup_ok {
         return Nip55Outcome::Reject {
             reason: "lookup_timeout".to_string(),
+            retire_caller: false,
         };
     }
     // `event_kind` is bounded to u16 at derivation, so the i32 cast never wraps.
@@ -302,6 +311,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     if decision == Some(Nip55PermissionDecision::Deny) {
         return Nip55Outcome::Reject {
             reason: "deny".to_string(),
+            retire_caller: false,
         };
     }
 
@@ -396,6 +406,7 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
         Some(Nip55PermissionDecision::Allow) => Nip55Outcome::AutoApprove,
         Some(Nip55PermissionDecision::Deny) => Nip55Outcome::Reject {
             reason: "deny".to_string(),
+            retire_caller: false,
         },
         Some(Nip55PermissionDecision::Ask) | None => {
             let risk = assess_signing_risk(ctx, recent_count, inputs.current_hour);
@@ -465,7 +476,13 @@ mod tests {
 
     fn reject_reason(outcome: &Nip55Outcome) -> &str {
         match outcome {
-            Nip55Outcome::Reject { reason } => reason,
+            Nip55Outcome::Reject {
+                reason,
+                retire_caller,
+            } => {
+                assert_eq!(*retire_caller, reason == "deny_expired", "{reason}");
+                reason
+            }
             other => panic!("expected Reject, got {other:?}"),
         }
     }
