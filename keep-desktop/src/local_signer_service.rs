@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iced::Task;
@@ -28,12 +28,21 @@ pub(crate) enum LocalSignerEvent {
         display: PendingApprovalDisplay,
         response_tx: std::sync::mpsc::Sender<bool>,
     },
-    ApprovalTimeout,
+    ApprovalTimeout {
+        id: u64,
+    },
     Connected {
         client_id: String,
         name: String,
     },
 }
+
+static NEXT_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How long a new prompt is on screen before Approve takes effect. Prompts
+/// open one at a time, but the next one can replace an answered or timed out
+/// card within the same poll, under a click aimed at the card it replaced.
+const APPROVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub(crate) struct LocalSignerCallbacks {
     pub tx: std::sync::mpsc::Sender<LocalSignerEvent>,
@@ -53,7 +62,9 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         request: keep_nip46::types::ApprovalRequest,
     ) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let id = NEXT_APPROVAL_ID.fetch_add(1, Ordering::Relaxed);
         let display = PendingApprovalDisplay {
+            id,
             app_name: request.app_name,
             method: request.method,
             event_kind: request.event_kind.map(|k| u32::from(k.as_u16())),
@@ -74,7 +85,7 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         tokio::task::block_in_place(|| match response_rx.recv_timeout(BUNKER_APPROVAL_TIMEOUT) {
             Ok(approved) => approved,
             Err(_) => {
-                let _ = tx.send(LocalSignerEvent::ApprovalTimeout);
+                let _ = tx.send(LocalSignerEvent::ApprovalTimeout { id });
                 false
             }
         })
@@ -260,6 +271,7 @@ impl App {
             let _ = tx.send(false);
         }
         self.local_signer_pending_approval = None;
+        self.local_signer_approval_shown_at = None;
 
         if let Some(ls) = self.local_signer.take() {
             ls.handle.abort();
@@ -267,14 +279,62 @@ impl App {
         }
     }
 
-    fn resolve_local_signer_approval(&mut self, approved: bool) {
-        if let Some(tx) = self.local_signer_approval_tx.take() {
-            let _ = tx.send(approved);
+    pub(crate) fn show_local_signer_approval(
+        &mut self,
+        display: PendingApprovalDisplay,
+        response_tx: std::sync::mpsc::Sender<bool>,
+    ) {
+        if let Some(prev_tx) = self.local_signer_approval_tx.take() {
+            let _ = prev_tx.send(false);
         }
+        if !self.window_visible {
+            let tx = self.tray.as_ref().map(|t| &t.event_tx);
+            crate::tray::send_approval_notification(&display.app_name, &display.method, tx);
+        }
+        self.local_signer_pending_approval = Some(display.clone());
+        self.local_signer_approval_tx = Some(response_tx);
+        self.local_signer_approval_shown_at = Some(std::time::Instant::now());
+        if let Screen::LocalSigner(s) = &mut self.screen {
+            s.pending_approval = Some(display);
+        }
+    }
+
+    /// A timeout clears only the prompt it belongs to: by the time it is
+    /// handled the next request's prompt may already be on screen.
+    pub(crate) fn local_signer_approval_timed_out(&mut self, id: u64) {
+        if self.local_signer_pending_approval.as_ref().map(|p| p.id) == Some(id) {
+            self.clear_local_signer_approval();
+        }
+    }
+
+    fn clear_local_signer_approval(&mut self) {
+        self.local_signer_approval_tx = None;
         self.local_signer_pending_approval = None;
+        self.local_signer_approval_shown_at = None;
         if let Screen::LocalSigner(s) = &mut self.screen {
             s.approval_cleared();
         }
+    }
+
+    // Answers the prompt `id` names, and only while it is the one pending.
+    // An approval also waits until the prompt has been on screen for
+    // `APPROVE_SETTLE`, so a click aimed at the card it replaced does not
+    // approve it. Returns whether the answer was taken.
+    pub(crate) fn resolve_local_signer_approval(&mut self, id: u64, approved: bool) -> bool {
+        if self.local_signer_pending_approval.as_ref().map(|p| p.id) != Some(id) {
+            return false;
+        }
+        let settled = self
+            .local_signer_approval_shown_at
+            .is_some_and(|shown| shown.elapsed() >= APPROVE_SETTLE);
+        if approved && !settled {
+            return false;
+        }
+        if let Some(tx) = self.local_signer_approval_tx.take() {
+            let _ = tx.send(approved);
+        }
+        self.clear_local_signer_approval();
+        true
     }
 
     pub(crate) fn handle_local_signer_revoke_result(
@@ -367,30 +427,9 @@ impl App {
                 LocalSignerEvent::Approval {
                     display,
                     response_tx,
-                } => {
-                    if let Some(prev_tx) = self.local_signer_approval_tx.take() {
-                        let _ = prev_tx.send(false);
-                    }
-                    if !self.window_visible {
-                        let tx = self.tray.as_ref().map(|t| &t.event_tx);
-                        crate::tray::send_approval_notification(
-                            &display.app_name,
-                            &display.method,
-                            tx,
-                        );
-                    }
-                    self.local_signer_pending_approval = Some(display.clone());
-                    self.local_signer_approval_tx = Some(response_tx);
-                    if let Screen::LocalSigner(s) = &mut self.screen {
-                        s.pending_approval = Some(display);
-                    }
-                }
-                LocalSignerEvent::ApprovalTimeout => {
-                    self.local_signer_approval_tx = None;
-                    self.local_signer_pending_approval = None;
-                    if let Screen::LocalSigner(s) = &mut self.screen {
-                        s.approval_cleared();
-                    }
+                } => self.show_local_signer_approval(display, response_tx),
+                LocalSignerEvent::ApprovalTimeout { id } => {
+                    self.local_signer_approval_timed_out(id)
                 }
             }
         }
@@ -410,7 +449,7 @@ impl App {
         match event {
             Event::Start => self.handle_local_signer_start(),
             Event::Stop => self.handle_local_signer_stop(),
-            Event::Approve => {
+            Event::Approve(id) => {
                 if self.is_kill_switch_active() {
                     self.set_toast(
                         "Kill switch is active - signing blocked".into(),
@@ -418,11 +457,11 @@ impl App {
                     );
                     return Task::none();
                 }
-                self.resolve_local_signer_approval(true);
+                self.resolve_local_signer_approval(id, true);
                 Task::none()
             }
-            Event::Reject => {
-                self.resolve_local_signer_approval(false);
+            Event::Reject(id) => {
+                self.resolve_local_signer_approval(id, false);
                 Task::none()
             }
             Event::RevokeClient(client_id) => {
