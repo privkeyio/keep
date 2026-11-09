@@ -14,38 +14,6 @@ pub fn truncate_str(s: &str, prefix: usize, suffix: usize) -> String {
     format!("{}...{}", &s[..prefix], &s[s.len() - suffix..])
 }
 
-/// Whether `c` renders as nothing or rearranges the text around it: a control
-/// character (Cc), a format character (Cf, which covers zero-width, bidi and
-/// tag characters), or a line or paragraph separator (Zl, Zp). Ranges are the
-/// Unicode 16.0 categories. A name holding one can display as another name.
-pub fn is_invisible(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{0600}'..='\u{0605}'
-                | '\u{061C}'
-                | '\u{06DD}'
-                | '\u{070F}'
-                | '\u{0890}'..='\u{0891}'
-                | '\u{08E2}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
-                | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
-                | '\u{110BD}'
-                | '\u{110CD}'
-                | '\u{13430}'..='\u{1343F}'
-                | '\u{1BCA0}'..='\u{1BCA3}'
-                | '\u{1D173}'..='\u{1D17A}'
-                | '\u{E0001}'
-                | '\u{E0020}'..='\u{E007F}'
-        )
-}
-
 /// Format a Unix timestamp as `"2024-01-15 10:30 UTC"`.
 pub fn format_timestamp(ts: i64) -> String {
     DateTime::<Utc>::from_timestamp(ts, 0)
@@ -63,44 +31,6 @@ pub fn format_timestamp_detailed(ts: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hidden_characters_are_invisible_and_visible_text_is_not() {
-        for c in [
-            '\u{0000}',
-            '\n',
-            '\u{007F}',
-            '\u{0085}',
-            '\u{00AD}',
-            '\u{061C}',
-            '\u{180E}',
-            '\u{200B}',
-            '\u{200D}',
-            '\u{200E}',
-            '\u{200F}',
-            '\u{2028}',
-            '\u{2029}',
-            '\u{202E}',
-            '\u{2060}',
-            '\u{2066}',
-            '\u{2069}',
-            '\u{FEFF}',
-            '\u{E0001}',
-            '\u{E0041}',
-            '\u{E007F}',
-        ] {
-            assert!(is_invisible(c), "U+{:04X}", c as u32);
-        }
-        for s in [
-            "Familie Müller",
-            "家族の金庫",
-            "🔑 Vault",
-            "group-a_1",
-            "Ünïcödé",
-        ] {
-            assert!(!s.chars().any(is_invisible), "{s}");
-        }
-    }
 
     #[test]
     fn truncate_short_string_unchanged() {

@@ -445,6 +445,75 @@ const MAX_PRE_APPROVED_HASHES: usize = 100;
 const PRE_APPROVAL_TTL: Duration = Duration::from_secs(300);
 const MAX_SHARE_NAME_LENGTH: usize = 64;
 
+/// A character that changes how an account name renders without showing:
+/// everything the approver hides, every space but U+0020, private-use code
+/// points and the braille blank. ZWJ and ZWNJ stay, as emoji sequences and
+/// several scripts need them and they reorder nothing, and so do the emoji
+/// presentation selectors.
+fn is_hidden_in_name(c: char) -> bool {
+    match c {
+        c if is_blank_in_name(c) => false,
+        _ => {
+            keep_approval::approver::is_hidden(c)
+                || c.is_whitespace()
+                || matches!(
+                    c,
+                    '\u{2800}'
+                        | '\u{E000}'..='\u{F8FF}'
+                        | '\u{F0000}'..='\u{FFFFD}'
+                        | '\u{100000}'..='\u{10FFFD}'
+                )
+        }
+    }
+}
+
+/// A character a name may hold that shows nothing on its own, so a name made
+/// only of these renders blank.
+fn is_blank_in_name(c: char) -> bool {
+    matches!(c, ' ' | '\u{200C}' | '\u{200D}' | '\u{FE0E}' | '\u{FE0F}')
+}
+
+fn recovered_name(name: &str, group_pubkey_hex: &str) -> String {
+    cleaned_name(name, || fallback_name("Recovered", group_pubkey_hex))
+}
+
+/// A stored name as the switcher shows it. Names saved before names were
+/// checked may hold hidden characters, and a valid name comes back unchanged.
+fn shown_name(name: &str, group_pubkey: &[u8]) -> String {
+    cleaned_name(name, || {
+        fallback_name("Account", &hex::encode(group_pubkey))
+    })
+}
+
+fn fallback_name(label: &str, group_pubkey_hex: &str) -> String {
+    let prefix: String = group_pubkey_hex
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    if prefix.is_empty() {
+        label.to_string()
+    } else {
+        format!("{label} {prefix}")
+    }
+}
+
+/// A name from a backup or a stash written before names were checked, made
+/// valid rather than refused: refusing would strand the account it labels.
+fn cleaned_name(name: &str, fallback: impl FnOnce() -> String) -> String {
+    let kept: String = name
+        .chars()
+        .filter(|c| !is_hidden_in_name(*c))
+        .take(MAX_SHARE_NAME_LENGTH)
+        .collect();
+    let trimmed = kept.trim();
+    if trimmed.chars().all(is_blank_in_name) {
+        fallback()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 type PreApprovedHashes =
     Arc<std::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>>;
 
@@ -1193,7 +1262,7 @@ impl StateContext {
 impl From<&ShareMetadata> for ShareMetadataInfo {
     fn from(metadata: &ShareMetadata) -> Self {
         ShareMetadataInfo {
-            name: metadata.name.clone(),
+            name: shown_name(&metadata.name, &metadata.group_pubkey),
             identifier: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
@@ -1616,7 +1685,7 @@ impl KeepMobile {
 
     pub fn get_share_info(&self) -> Option<ShareInfo> {
         self.storage.get_share_metadata().map(|m| ShareInfo {
-            name: m.name,
+            name: shown_name(&m.name, &m.group_pubkey),
             share_index: m.identifier,
             threshold: m.threshold,
             total_shares: m.total_shares,
@@ -2109,11 +2178,9 @@ impl KeepMobile {
                 msg: format!("group name must be 1..={MAX_SHARE_NAME_LENGTH} characters"),
             });
         }
-        if group_name.chars().any(keep_core::display::is_invisible) {
-            return Err(KeepMobileError::FrostError {
-                msg: "group name contains a hidden or control character".into(),
-            });
-        }
+        Self::validate_share_name(&group_name).map_err(|_| KeepMobileError::FrostError {
+            msg: "group name contains a hidden character or surrounding space".into(),
+        })?;
         let keys = nostr_sdk::Keys::generate();
         let secret = Zeroizing::new(keys.secret_key().secret_bytes());
         self.dkg_subkeys
@@ -2397,7 +2464,7 @@ impl KeepMobile {
         Ok(
             persistence::load_pending_dkg_marker(&self.storage, DKG_PENDING_MARKER_KEY)?.map(
                 |marker| PendingShareInfo {
-                    name: marker.name,
+                    name: recovered_name(&marker.name, &marker.group_pubkey_hex),
                     group_pubkey: marker.group_pubkey_hex,
                     vault_protected: marker.vault_protected,
                 },
@@ -2447,10 +2514,11 @@ impl KeepMobile {
 
         // Only a ceremony's own stash is vault-protected, so only it may find
         // its import already landed before the stash was cleared.
+        let name = recovered_name(&marker.name, &marker.group_pubkey_hex);
         let info = self.import_share_export(
             secret.share_export.to_string(),
             passphrase.to_string(),
-            marker.name,
+            name,
             marker.vault_protected,
         )?;
 
@@ -4287,9 +4355,10 @@ impl KeepMobile {
             if first_group_hex.is_none() {
                 first_group_hex = Some(group_hex.clone());
             }
+            let name = cleaned_name(&bs.name, || fallback_name("Restored", &group_hex));
 
             let metadata = ShareMetadataInfo {
-                name: bs.name.clone(),
+                name: name.clone(),
                 identifier: bs.identifier,
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
@@ -4306,7 +4375,7 @@ impl KeepMobile {
                 threshold: bs.threshold,
                 total_shares: bs.total_shares,
                 group_pubkey: group_pubkey_32,
-                name: bs.name.clone(),
+                name: name.clone(),
                 created_at: bs.created_at,
                 last_used: bs.last_used,
                 sign_count: bs.sign_count,
@@ -4349,11 +4418,14 @@ impl KeepMobile {
                     msg: format!("nsec conversion: {e}"),
                 })?;
 
+            let name = cleaned_name(&bk.name, || {
+                fallback_name("Restored", &hex::encode(&vk_bytes[1..5]))
+            });
             let (metadata_info, stored) = Self::build_nsec_share_data(
                 key_package,
                 pubkey_package,
                 vk_bytes,
-                bk.name.clone(),
+                name,
                 None,
                 // Keys carry no recorded flag to preserve, so this is a choice
                 // rather than a restoration. It matches `import_nsec`, and it is
@@ -6142,10 +6214,15 @@ impl KeepMobile {
                 ),
             });
         }
-        // A hidden character lets a name display as another account's.
-        if name.chars().any(keep_core::display::is_invisible) {
+        // A hidden character, or a space at either end, lets a name display
+        // as another account's.
+        if name.chars().any(is_hidden_in_name)
+            || name != name.trim()
+            || name.chars().all(is_blank_in_name)
+        {
             return Err(KeepMobileError::InvalidShare {
-                msg: "Share name contains a hidden or control character".into(),
+                msg: "Share name is blank or contains a hidden character or surrounding space"
+                    .into(),
             });
         }
         Ok(())
@@ -6929,7 +7006,7 @@ impl KeepMobile {
 
         Some(StoredShareInfo {
             group_pubkey: key,
-            name: metadata.name.clone(),
+            name: shown_name(&metadata.name, &metadata.group_pubkey),
             share_index: metadata.identifier,
             threshold: metadata.threshold,
             total_shares: metadata.total_shares,
@@ -8918,9 +8995,13 @@ mod restore_backup_metadata_tests {
     }
 
     fn restore_one(did_backup: bool) -> (Arc<RecordingStorage>, String) {
+        restore_share(backup_share(did_backup))
+    }
+
+    fn restore_share(share: keep_core::backup::BackupShare) -> (Arc<RecordingStorage>, String) {
         let bytes = keep_core::backup::create_backup_from_data(
             vec![],
-            vec![backup_share(did_backup)],
+            vec![share],
             vec![],
             vec![],
             vec![],
@@ -8943,6 +9024,95 @@ mod restore_backup_metadata_tests {
         let raw = storage.load_share_by_key(key).expect("share stored");
         let stored: StoredShareData = serde_json::from_slice(&raw).expect("record parses");
         (Arc::clone(&storage), stored.metadata_json)
+    }
+
+    // A backup written before names were checked restores with its hidden
+    // characters dropped rather than being refused, so the share is not lost.
+    #[test]
+    fn a_restored_name_loses_its_hidden_characters() {
+        for (name, expected) in [
+            ("\u{202E}Va\u{200B}ult\u{3000} ", "Vault"),
+            ("\u{200B}\u{2066}", "Restored 07070707"),
+        ] {
+            let mut share = backup_share(false);
+            share.name = name.into();
+            let (storage, metadata_json) = restore_share(share);
+            let recorded: keep_core::frost::ShareMetadata =
+                serde_json::from_str(&metadata_json).expect("record parses");
+            assert_eq!(recorded.name, expected);
+            assert_eq!(restored_share_meta(&storage).name, expected);
+        }
+    }
+
+    // A name saved before names were checked shows without its hidden
+    // characters.
+    #[test]
+    fn a_stored_name_shows_without_its_hidden_characters() {
+        let (storage, _) = restore_share(backup_share(false));
+        let key = hex::encode([7u8; 32]);
+        {
+            let mut data = storage.data.lock().unwrap();
+            let mut stored: StoredShareData =
+                serde_json::from_slice(&data[&key]).expect("record parses");
+            let mut meta: keep_core::frost::ShareMetadata =
+                serde_json::from_str(&stored.metadata_json).expect("metadata parses");
+            meta.name = "\u{202E}tluaV".into();
+            stored.metadata_json = serde_json::to_string(&meta).unwrap();
+            data.insert(key.clone(), serde_json::to_vec(&stored).unwrap());
+        }
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let shown = mobile.list_shares();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].name, "tluaV");
+    }
+
+    fn restore_key_named(name: &str) -> Vec<ShareMetadataInfo> {
+        let bytes = keep_core::backup::create_backup_from_data(
+            vec![keep_core::backup::BackupKey {
+                pubkey: String::new(),
+                key_type: "Nostr".into(),
+                name: name.into(),
+                created_at: 1_700_000_000,
+                last_used: None,
+                sign_count: 0,
+                secret: hex::encode([3u8; 32]),
+            }],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            keep_core::backup::BackupConfig {
+                kill_switch: false,
+                proxy: None,
+            },
+            vec![],
+            "correct horse battery staple",
+        )
+        .expect("backup should build");
+
+        let storage = Arc::new(RecordingStorage::default());
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        let metas = storage.metas.lock().unwrap().clone();
+        metas
+    }
+
+    #[test]
+    fn a_restored_key_name_loses_its_hidden_characters() {
+        let metas = restore_key_named("\u{2066}Key\u{200B}");
+        assert!(metas.iter().any(|m| m.name == "Key"));
+
+        let metas = restore_key_named("\u{200B}");
+        let key = metas
+            .iter()
+            .find(|m| m.name.starts_with("Restored"))
+            .expect("the key should restore under a fallback name");
+        assert_eq!(
+            key.name,
+            format!("Restored {}", hex::encode(&key.group_pubkey[..4]))
+        );
     }
 
     /// Selects by group key rather than name: non-share records such as the
@@ -10676,6 +10846,48 @@ mod dkg_pending_share_tests {
         .unwrap();
     }
 
+    // A stash written before names were checked recovers under the cleaned
+    // name, and shows that name while pending, rather than strand the share.
+    #[test]
+    fn a_stashed_name_recovers_without_its_hidden_characters() {
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage.clone() as Arc<dyn SecureStorage>).unwrap();
+
+        let passphrase = "f00dbabe".repeat(8);
+        let name = "\u{202E}vault-share\u{200B}";
+        let export = share_export(&passphrase, name);
+
+        persistence::persist_pending_dkg_secret(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_SECRET_KEY,
+            &persistence::PendingDkgSecret {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                share_export: Zeroizing::new(export),
+                vault_passphrase: Some(Zeroizing::new(passphrase)),
+            },
+        )
+        .unwrap();
+        persistence::persist_pending_dkg_marker(
+            &(storage.clone() as Arc<dyn SecureStorage>),
+            DKG_PENDING_MARKER_KEY,
+            &persistence::PendingDkgMarker {
+                schema_version: persistence::DKG_STASH_SCHEMA_VERSION,
+                name: name.into(),
+                group_pubkey_hex: "cafe".into(),
+                vault_protected: true,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            mobile.pending_dkg_share().unwrap().unwrap().name,
+            "vault-share"
+        );
+        let info = mobile.recover_dkg_share(None).unwrap();
+        assert_eq!(info.name, "vault-share");
+        assert!(mobile.pending_dkg_share().unwrap().is_none());
+    }
+
     // The DKG path stashes its ephemeral passphrase inside the auth-gated secret
     // and marks the stash vault-protected. Recovery must then complete from the
     // vault alone — `recover_dkg_share(None)` — with no user-supplied passphrase,
@@ -10840,6 +11052,17 @@ mod dkg_pending_share_tests {
             "Vault\u{E0041}",
             "Vault\u{2028}2",
             "Vault\n",
+            "Vault\u{034F}",
+            "Vault\u{115F}",
+            "Vault\u{180E}",
+            "Va\u{3000}ult",
+            "Va\u{00A0}ult",
+            "\u{E000}Vault",
+            "Vault\u{2800}",
+            "Vault ",
+            " Vault",
+            "\u{200D}",
+            "\u{200C}\u{FE0F}",
         ] {
             assert!(
                 matches!(
@@ -10858,9 +11081,53 @@ mod dkg_pending_share_tests {
         }
         assert!(mobile.dkg_subkeys.lock().unwrap().is_empty());
 
-        for name in ["Familie Müller", "家族の金庫", "🔑 Vault"] {
+        for name in [
+            "Familie Müller",
+            "家族の金庫",
+            "🔑 Vault",
+            "👨\u{200D}👩\u{200D}👧 Family",
+            "می\u{200C}خواهم",
+            "❤\u{FE0F} Vault",
+        ] {
             KeepMobile::validate_share_name(name).unwrap();
             mobile.frost_dkg_begin(name.into()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_cleaned_name_is_always_a_valid_name() {
+        assert_eq!(
+            recovered_name("\u{FEFF} Vault\u{E0041}\n", "abcdef0123"),
+            "Vault"
+        );
+        assert_eq!(
+            recovered_name("\u{200B}", "abcdef0123"),
+            "Recovered abcdef01"
+        );
+        assert_eq!(
+            recovered_name("\u{200B}\u{200D}", "abcdef0123"),
+            "Recovered abcdef01"
+        );
+        assert_eq!(recovered_name("\u{200B}", ""), "Recovered");
+        assert_eq!(recovered_name("\u{200B}", "\u{202E}zz"), "Recovered");
+        assert_eq!(shown_name("\u{202E}tluaV", &[0xab; 32]), "tluaV");
+        assert_eq!(shown_name("\u{200B}", &[0xab; 32]), "Account abababab");
+        assert_eq!(shown_name("Familie Müller", &[0xab; 32]), "Familie Müller");
+        let long = format!("{}\u{200B}{}", "a".repeat(40), "b".repeat(40));
+        assert_eq!(
+            recovered_name(&long, "ab").chars().count(),
+            MAX_SHARE_NAME_LENGTH
+        );
+        for name in [
+            "\u{202E} x \u{3000}",
+            "  ",
+            "\u{E000}",
+            "\u{200D} \u{FE0F}",
+            &long,
+        ] {
+            for hex in ["abcdef0123", "", "\u{202E}"] {
+                KeepMobile::validate_share_name(&recovered_name(name, hex)).unwrap();
+            }
         }
     }
 
