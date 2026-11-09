@@ -380,6 +380,110 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
+    struct HeldPrompts {
+        prompts: std::sync::atomic::AtomicUsize,
+        open: std::sync::atomic::AtomicUsize,
+        most_open: std::sync::atomic::AtomicUsize,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl ServerCallbacks for HeldPrompts {
+        fn on_log(&self, _event: LogEvent) {}
+        fn request_approval(
+            &self,
+            _request: crate::types::ApprovalRequest,
+        ) -> crate::types::ApprovalResult {
+            use std::sync::atomic::Ordering::SeqCst;
+            self.prompts.fetch_add(1, SeqCst);
+            let open = self.open.fetch_add(1, SeqCst) + 1;
+            self.most_open.fetch_max(open, SeqCst);
+            // As every surface does: the wait parks this thread, not the
+            // runtime worker the other connection needs.
+            tokio::task::block_in_place(|| {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+            });
+            self.open.fetch_sub(1, SeqCst);
+            crate::types::ApprovalResult::rejected()
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    }
+
+    // Two local clients served at once each ask for approval. The desktop
+    // prompt holds one pending request and its answer names none, so the
+    // second prompt must not open until the first is answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_local_clients_get_one_prompt_at_a_time() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let mut keyring = Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".to_string(),
+            )
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cb = Arc::new(HeldPrompts {
+            prompts: Default::default(),
+            open: Default::default(),
+            most_open: Default::default(),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let server = LocalServer::new(
+            Arc::new(Mutex::new(keyring)),
+            PathBuf::from("unused"),
+            Some(cb.clone()),
+            LocalServerConfig::default(),
+        )
+        .unwrap();
+        let signer = server.handler().our_pubkey().await.unwrap().to_hex();
+
+        let mut clients = Vec::new();
+        for i in 0..2 {
+            let (client, served) = UnixStream::pair().unwrap();
+            let handler = server.handler();
+            let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(cb.clone());
+            tokio::spawn(handle_connection(served, handler, callbacks, 64 * 1024));
+            let (read, mut write) = client.into_split();
+            let line = format!(
+                "{{\"id\":\"r{i}\",\"method\":\"connect\",\"params\":[\"{signer}\",\"\",\"sign_event\"]}}\n"
+            );
+            write.write_all(line.as_bytes()).await.unwrap();
+            clients.push((BufReader::new(read), write));
+        }
+
+        for _ in 0..200 {
+            if cb.prompts.load(SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(cb.prompts.load(SeqCst), 1, "both prompts opened at once");
+
+        release_tx.send(()).unwrap();
+        release_tx.send(()).unwrap();
+        for (reader, _write) in &mut clients {
+            let mut reply = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_line(&mut reply),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(reply.contains("\"error\""), "{reply}");
+        }
+        assert_eq!(cb.prompts.load(SeqCst), 2);
+        assert_eq!(cb.most_open.load(SeqCst), 1);
+    }
+
     // Feed `data` through a duplex stream (writer dropped to signal EOF) and read a
     // single frame, returning the outcome and whatever was buffered.
     async fn read_one(data: &[u8], max_size: usize) -> (FrameOutcome, Vec<u8>) {

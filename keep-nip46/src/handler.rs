@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ::base64::Engine;
 use nostr_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
@@ -248,6 +248,30 @@ pub struct SignerHandler {
     /// `connect` handshake must validate the client's target against this, not
     /// the signing pubkey.
     transport_pubkey: Option<PublicKey>,
+    /// Lets one approval prompt be open at a time. Requests can reach the
+    /// handler concurrently (the local server serves each connection on its
+    /// own task), and the desktop and CLI prompts hold one pending request
+    /// with no id on the answer, so a second prompt arriving just before a
+    /// click would take the answer meant for the first.
+    prompt_gate: Semaphore,
+    prompt_waiters: AtomicUsize,
+}
+
+/// Requests that may wait for the open prompt to close before more are
+/// refused outright, so a flood of prompting requests cannot park unbounded
+/// tasks behind the gate.
+const MAX_PROMPT_WAITERS: usize = 4;
+
+/// How long a request waits for the open prompt to close: one prompt's own
+/// timeout, so a waiter gets the next turn unless a later prompt took it.
+const PROMPT_GATE_WAIT: Duration = Duration::from_secs(60);
+
+struct PromptWaiter<'a>(&'a AtomicUsize);
+
+impl Drop for PromptWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl SignerHandler {
@@ -274,6 +298,8 @@ impl SignerHandler {
             relay_urls: Vec::new(),
             kill_switch: Arc::new(AtomicBool::new(false)),
             transport_pubkey: None,
+            prompt_gate: Semaphore::new(1),
+            prompt_waiters: AtomicUsize::new(0),
         }
     }
 
@@ -500,7 +526,7 @@ impl SignerHandler {
                     requested_permissions: permissions.clone(),
                     http_auth: None,
                 })
-                .await;
+                .await?;
             if !result.approved {
                 return Err(KeepError::UserRejected);
             }
@@ -668,7 +694,7 @@ impl SignerHandler {
                     requested_permissions: None,
                     http_auth: nip98_http_auth(&unsigned_event),
                 })
-                .await;
+                .await?;
 
             if !result.approved {
                 // The result already carried a duration; nothing read it on this
@@ -848,7 +874,7 @@ impl SignerHandler {
             requested_permissions: None,
             http_auth: None,
         };
-        if self.request_approval(request).await.approved {
+        if self.request_approval(request).await?.approved {
             self.require_permission(&app_pubkey, perm).await
         } else {
             self.audit
@@ -1169,7 +1195,7 @@ impl SignerHandler {
             .unwrap_or_else(|| pubkey.to_hex()[..8].to_string())
     }
 
-    async fn request_approval(&self, mut request: ApprovalRequest) -> ApprovalResult {
+    async fn request_approval(&self, mut request: ApprovalRequest) -> Result<ApprovalResult> {
         // Sanitize the client-declared app name and method at this single choke point, which every
         // approval path funnels through before any surface callback. Without this, an app name or
         // method carrying bidi overrides (U+202E) or control characters would render raw in the
@@ -1179,14 +1205,27 @@ impl SignerHandler {
         request.app_name = sanitize_prompt_field(&request.app_name, APP_NAME_DISPLAY_MAX);
         request.method = sanitize_prompt_field(&request.method, METHOD_DISPLAY_MAX);
         if let Some(ref callbacks) = self.callbacks {
-            return callbacks.request_approval(request);
+            // Refused as busy rather than as rejected: nobody said no, so
+            // nothing may be remembered or audited as the user's answer.
+            let busy = || KeepError::CapacityExceeded("another approval prompt is open".into());
+            if self.prompt_waiters.fetch_add(1, Ordering::SeqCst) >= MAX_PROMPT_WAITERS {
+                self.prompt_waiters.fetch_sub(1, Ordering::SeqCst);
+                return Err(busy());
+            }
+            let waiter = PromptWaiter(&self.prompt_waiters);
+            let _permit = tokio::time::timeout(PROMPT_GATE_WAIT, self.prompt_gate.acquire())
+                .await
+                .map_err(|_| busy())?
+                .map_err(|_| busy())?;
+            drop(waiter);
+            return Ok(callbacks.request_approval(request));
         }
         if self.auto_approve {
             warn!(method = %request.method, "auto-approving in headless mode");
-            return ApprovalResult::approved_once();
+            return Ok(ApprovalResult::approved_once());
         }
         warn!(method = %request.method, "denying request: no approval callbacks configured");
-        ApprovalResult::rejected()
+        Ok(ApprovalResult::rejected())
     }
 }
 
@@ -1374,7 +1413,7 @@ mod tests {
             requested_permissions: None,
             http_auth: None,
         };
-        handler.request_approval(request).await;
+        handler.request_approval(request).await.unwrap();
 
         let app = cb.app_names.lock().unwrap().last().cloned().unwrap();
         let method = cb.methods.lock().unwrap().last().cloned().unwrap();
@@ -2494,6 +2533,170 @@ mod tests {
         handler.handle_connect(app, None, None, None).await.unwrap();
         let signer_pk = handler.our_pubkey().await.unwrap();
         (handler, cb, app, signer_pk)
+    }
+
+    /// Holds each signing prompt open until released, recording how many are
+    /// open at once, and answers with a remembered refusal so a busy refusal
+    /// mistaken for the user's would show up as a remembered denial.
+    struct HeldCallbacks {
+        prompts: std::sync::atomic::AtomicUsize,
+        open: std::sync::atomic::AtomicUsize,
+        most_open: std::sync::atomic::AtomicUsize,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl crate::types::ServerCallbacks for HeldCallbacks {
+        fn on_log(&self, _event: crate::types::LogEvent) {}
+        fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+            use std::sync::atomic::Ordering::SeqCst;
+            if request.method != "sign_event" {
+                return ApprovalResult::approved_once();
+            }
+            self.prompts.fetch_add(1, SeqCst);
+            let open = self.open.fetch_add(1, SeqCst) + 1;
+            self.most_open.fetch_max(open, SeqCst);
+            tokio::task::block_in_place(|| {
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+            });
+            self.open.fetch_sub(1, SeqCst);
+            ApprovalResult {
+                approved: false,
+                remember: RememberDuration::OneHour,
+            }
+        }
+        fn on_connect(&self, _pubkey: &str, _name: &str, _authorization: ConnectAuthorization) {}
+    }
+
+    async fn held_handler(
+        apps: usize,
+    ) -> (
+        Arc<SignerHandler>,
+        Arc<HeldCallbacks>,
+        std::sync::mpsc::Sender<()>,
+        Vec<PublicKey>,
+        PublicKey,
+    ) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let cb = Arc::new(HeldCallbacks {
+            prompts: Default::default(),
+            open: Default::default(),
+            most_open: Default::default(),
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            Some(cb.clone()),
+        )
+        .with_connect_grant(Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT);
+        let mut keys = Vec::new();
+        for _ in 0..apps {
+            let app = Keys::generate().public_key();
+            handler.handle_connect(app, None, None, None).await.unwrap();
+            keys.push(app);
+        }
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        (Arc::new(handler), cb, release_tx, keys, signer_pk)
+    }
+
+    fn spawn_sign(
+        handler: &Arc<SignerHandler>,
+        app: PublicKey,
+        signer_pk: PublicKey,
+    ) -> tokio::task::JoinHandle<Result<Event>> {
+        let handler = Arc::clone(handler);
+        tokio::spawn(async move {
+            let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
+            handler.handle_sign_event(app, ev).await
+        })
+    }
+
+    async fn until(what: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if what() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    // A second prompt waits for the first to close: the desktop and CLI
+    // prompts hold one pending request with no id on the answer, so two open
+    // at once would let a click meant for one answer the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_one_approval_prompt_is_open_at_a_time() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(2).await;
+
+        let first = spawn_sign(&handler, apps[0], signer_pk);
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        let second = spawn_sign(&handler, apps[1], signer_pk);
+        until(|| handler.prompt_waiters.load(SeqCst) == 1).await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(cb.prompts.load(SeqCst), 1, "the second prompt opened early");
+
+        release.send(()).unwrap();
+        until(|| cb.prompts.load(SeqCst) == 2).await;
+        release.send(()).unwrap();
+        assert!(matches!(first.await.unwrap(), Err(KeepError::UserRejected)));
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(KeepError::UserRejected)
+        ));
+        assert_eq!(cb.most_open.load(SeqCst), 1);
+    }
+
+    // Past the waiting room a prompting request is refused as busy, without
+    // asking, and nothing is remembered or audited as the user's refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prompt_past_the_waiting_room_is_refused_as_busy() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(MAX_PROMPT_WAITERS + 2).await;
+
+        let mut tasks = vec![spawn_sign(&handler, apps[0], signer_pk)];
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        for app in &apps[1..=MAX_PROMPT_WAITERS] {
+            tasks.push(spawn_sign(&handler, *app, signer_pk));
+        }
+        until(|| handler.prompt_waiters.load(SeqCst) == MAX_PROMPT_WAITERS).await;
+
+        let late = apps[MAX_PROMPT_WAITERS + 1];
+        let ev = UnsignedEvent::new(signer_pk, Timestamp::now(), Kind::TextNote, vec![], "x");
+        assert!(matches!(
+            handler.handle_sign_event(late, ev).await,
+            Err(KeepError::CapacityExceeded(_))
+        ));
+        assert_eq!(cb.prompts.load(SeqCst), 1, "the late request was asked");
+        assert_eq!(
+            handler
+                .permissions
+                .lock()
+                .await
+                .decide(&late, Kind::TextNote),
+            ApprovalDecision::Ask,
+            "a busy refusal was remembered as the user's"
+        );
+        let late_hex = late.to_hex();
+        assert!(!handler
+            .audit
+            .lock()
+            .await
+            .by_app(&late_hex)
+            .any(|e| matches!(e.action, AuditAction::UserRejected)));
+
+        for _ in 0..tasks.len() {
+            release.send(()).unwrap();
+        }
+        for task in tasks {
+            assert!(matches!(task.await.unwrap(), Err(KeepError::UserRejected)));
+        }
+        assert_eq!(cb.most_open.load(SeqCst), 1);
+        assert_eq!(handler.prompt_waiters.load(SeqCst), 0);
     }
 
     /// The wiring, end to end through the handler rather than the permission
