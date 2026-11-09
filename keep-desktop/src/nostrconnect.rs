@@ -21,6 +21,7 @@ impl App {
         request: NostrConnectRequest,
     ) -> Task<Message> {
         let display = PendingApprovalDisplay {
+            id: crate::app::next_approval_id(),
             app_pubkey: request.client_pubkey.to_hex(),
             app_name: request.name.clone().unwrap_or_else(|| "Unknown App".into()),
             method: "connect".into(),
@@ -30,6 +31,7 @@ impl App {
             http_auth: None,
         };
         self.bunker_pending_approval = Some(display);
+        self.bunker_approval_shown_at = Some(std::time::Instant::now());
 
         self.nostrconnect_pending = Some(request);
 
@@ -42,10 +44,7 @@ impl App {
             return Task::none();
         };
 
-        self.bunker_pending_approval = None;
-        if let Screen::Bunker(s) = &mut self.screen {
-            s.pending_approval = None;
-        }
+        self.clear_bunker_approval();
 
         if self.bunker.is_some() {
             self.set_toast(
@@ -208,10 +207,7 @@ impl App {
 
     pub(crate) fn handle_nostrconnect_reject(&mut self) -> Task<Message> {
         self.nostrconnect_pending = None;
-        self.bunker_pending_approval = None;
-        if let Screen::Bunker(s) = &mut self.screen {
-            s.pending_approval = None;
-        }
+        self.clear_bunker_approval();
         self.set_toast("Connection request rejected".into(), ToastKind::Success);
         Task::none()
     }
