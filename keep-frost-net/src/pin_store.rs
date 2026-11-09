@@ -76,6 +76,10 @@ impl RelayPinStore {
     /// pinning is on, in which case it is refused before anything is dialed.
     pub async fn probe(&self, relays: &[String], proxy: Option<SocketAddr>) -> Result<()> {
         crate::install_default_crypto_provider();
+        // Every relay the probe dials is checked before any is: it connects and
+        // saves a pin, so a URL whose userinfo hides another host would reach
+        // that host first. Internal hosts stay allowed for an operator's own
+        // relay, and a direct dial still refuses an internal address.
         for relay in relays {
             if !relay.starts_with("wss://") {
                 if self.require_pinned {
@@ -85,6 +89,11 @@ impl RelayPinStore {
                 }
                 continue;
             }
+            keep_core::relay::validate_relay_url_allow_internal(relay).map_err(|e| {
+                FrostNetError::Transport(format!("Rejected relay URL {relay}: {e}"))
+            })?;
+        }
+        for relay in relays.iter().filter(|r| r.starts_with("wss://")) {
             let snapshot = self.lock()?.clone();
             let (_hash, learned) =
                 verify_relay_certificate(relay, &snapshot, self.require_pinned, proxy).await?;
@@ -224,6 +233,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relay_with_userinfo_is_refused_before_it_is_dialed_or_pinned() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dir = dir();
+        let store = RelayPinStore::open(dir.path(), false).unwrap();
+        let relays = vec![
+            "wss://relay.example.com".to_string(),
+            "wss://relay.damus.io@evil.example".to_string(),
+        ];
+        let err = store
+            .probe(&relays, Some(listener.local_addr().unwrap()))
+            .await
+            .expect_err("a relay URL with userinfo must be refused");
+        assert!(err.to_string().contains("Rejected relay URL"), "{err}");
+        assert_eq!(
+            listener.accept().map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "the probe must not reach the proxy for the host the userinfo hides"
+        );
+        assert!(!store.is_pinned("evil.example").unwrap());
+    }
+
+    #[tokio::test]
     async fn strict_pinning_refuses_a_cleartext_relay_before_dialing() {
         let dir = dir();
         let store = RelayPinStore::open(dir.path(), true).unwrap();
@@ -233,6 +265,27 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("non-wss"), "{err}");
         assert!(!dir.path().join(FILE_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn strict_pinning_refuses_a_cleartext_relay_before_dialing_an_earlier_one() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let dir = dir();
+        let store = RelayPinStore::open(dir.path(), true).unwrap();
+        let relays = vec![
+            "wss://relay.example.com?token=abc".to_string(),
+            "ws://relay.example.com".to_string(),
+        ];
+        let err = store
+            .probe(&relays, Some(listener.local_addr().unwrap()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-wss"), "{err}");
+        assert_eq!(
+            listener.accept().map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]

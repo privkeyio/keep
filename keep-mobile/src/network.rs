@@ -9,6 +9,21 @@ pub(crate) fn validate_relay_url(relay_url: &str) -> Result<(), KeepMobileError>
         .map_err(|msg| KeepMobileError::InvalidRelayUrl { msg })
 }
 
+/// Relays held to the rules every other relay here is: `wss://`, no userinfo,
+/// and not an internal address, which the pinned transport would refuse anyway
+/// with an error that does not say why. Internal addresses pass only where the
+/// transport lets them through too, in test builds.
+pub(crate) fn validate_relay_urls(relays: &[String]) -> Result<(), KeepMobileError> {
+    let validate = if keep_core::relay::ALLOW_INTERNAL_HOSTS {
+        keep_core::relay::validate_relay_url_allow_internal
+    } else {
+        keep_core::relay::validate_relay_url
+    };
+    relays
+        .iter()
+        .try_for_each(|r| validate(r).map_err(|msg| KeepMobileError::InvalidRelayUrl { msg }))
+}
+
 pub(crate) fn convert_peer_status(status: keep_frost_net::PeerStatus) -> PeerStatus {
     match status {
         keep_frost_net::PeerStatus::Online => PeerStatus::Online,

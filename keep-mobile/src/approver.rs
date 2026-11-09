@@ -497,21 +497,6 @@ fn signed_freeze(
     Ok(wire::to_text(&freeze))
 }
 
-/// The gateway's relays, held to the rules every other relay here is: `wss://`,
-/// and not an internal address, which the pinned transport would refuse anyway
-/// with an error that does not say why. Internal addresses pass only where the
-/// transport lets them through too, in test builds.
-fn checked_relays(relays: &[String]) -> Result<(), KeepMobileError> {
-    let validate = if keep_core::relay::ALLOW_INTERNAL_HOSTS {
-        keep_core::relay::validate_relay_url_allow_internal
-    } else {
-        keep_core::relay::validate_relay_url
-    };
-    relays
-        .iter()
-        .try_for_each(|r| validate(r).map_err(|msg| KeepMobileError::InvalidRelayUrl { msg }))
-}
-
 fn no_relay() -> KeepMobileError {
     KeepMobileError::NetworkError {
         msg: "no relay accepted the message".into(),
@@ -768,7 +753,7 @@ impl ApproverHandler {
     }
 
     fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
-        checked_relays(&relays)?;
+        crate::network::validate_relay_urls(&relays)?;
         let transport = keys.public_key();
         let proxy = self.mobile.pinnable_proxy()?;
         let (relays, pinning) = {
@@ -1001,7 +986,7 @@ impl ApproverHandler {
                                 // Kept once the approver is serving them, by
                                 // `move_relays`, so a move that fails leaves
                                 // stored what still runs.
-                                match checked_relays(&paired.relays) {
+                                match crate::network::validate_relay_urls(&paired.relays) {
                                     Ok(()) => fx.reconnect = Some(paired.relays.clone()),
                                     Err(e) => tracing::warn!(
                                         error = %e,
@@ -1415,7 +1400,7 @@ impl ApproverHandler {
         let mut inner = self.lock();
         not_pairing(&inner)?;
         let uri = PairingUri::parse(&uri).map_err(|e| invalid(e.to_string()))?;
-        checked_relays(&uri.relays)?;
+        crate::network::validate_relay_urls(&uri.relays)?;
         keep_approval::change::check_label(&label, "label").map_err(|e| invalid(e.to_string()))?;
         let approver = Hex33(
             approver_key

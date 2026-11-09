@@ -405,7 +405,7 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
         return Err("Missing host".into());
     }
 
-    let host_port = rest.split('/').next().unwrap_or(rest);
+    let host_port = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if host_port.contains('@') {
         return Err("Userinfo not allowed in relay URLs".into());
     }
@@ -925,6 +925,16 @@ mod tests {
         assert!(is_internal_ip(
             &"2001:db8:ffff::1".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    #[test]
+    fn a_query_or_fragment_ends_the_host() {
+        assert!(validate_relay_url("wss://relay.example.com?token=abc").is_ok());
+        assert!(validate_relay_url("wss://relay.example.com/?token=abc").is_ok());
+        assert!(validate_relay_url("wss://relay.example.com#x").is_ok());
+        assert!(validate_relay_url("wss://user@relay.example.com?token=abc").is_err());
+        assert!(validate_relay_url("wss://relay.example.com\\@evil.example").is_err());
+        assert!(validate_relay_url("wss://?@evil.example").is_err());
     }
 
     #[test]
