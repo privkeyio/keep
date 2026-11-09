@@ -5236,6 +5236,10 @@ impl KeepMobile {
         relays: &[String],
         proxy: Option<std::net::SocketAddr>,
     ) -> Result<Vec<String>, KeepMobileError> {
+        // Every relay is checked before any is dialed: the probe connects and
+        // saves a pin, so a URL refused later would already have reached the
+        // host it names.
+        network::validate_relay_urls(relays)?;
         // Opt-in strict pinning: when enabled, an un-pinned relay is not
         // trusted-on-first-use; it is skipped (see the per-relay handling
         // below) rather than pinned. Disabled by default.
@@ -10871,6 +10875,34 @@ mod dkg_pending_share_tests {
 
     // The pinned transport cannot pin a socket the proxy opens, so a DKG run
     // under strict pinning and a proxy is refused before any relay is dialed.
+    #[test]
+    fn a_relay_with_userinfo_is_refused_before_it_is_dialed_or_pinned() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let storage = Arc::new(FailingShareStorage::default());
+        let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
+
+        let relays = vec!["wss://relay.damus.io@evil.example".to_string()];
+        let err = mobile
+            .runtime
+            .block_on(mobile.verify_and_pin_relays(&relays, Some(proxy)))
+            .expect_err("a relay URL with userinfo must be refused");
+        assert!(
+            matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            listener.accept().map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "the probe must not reach the proxy for the host the userinfo hides"
+        );
+        assert!(persistence::load_cert_pins(&mobile.storage)
+            .unwrap()
+            .unwrap_or_default()
+            .is_empty());
+    }
+
     #[test]
     fn run_dkg_refuses_strict_pinning_behind_the_proxy() {
         let storage = Arc::new(FailingShareStorage::default());
