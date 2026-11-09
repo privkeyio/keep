@@ -79,6 +79,7 @@ dictionary SignRequest {
     u16 from_peer;
     u64 timestamp;
     SignRequestMetadata? metadata;
+    boolean needs_fresh_auth = true;
 };
 
 dictionary SignRequestMetadata {
