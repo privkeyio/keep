@@ -135,7 +135,8 @@ pub enum Nip55Outcome {
     /// Reject the request (NIP-55 `rejected = true`). `reason` is the audit action
     /// label, matching the Android audit log. `retire_caller` asks the app to
     /// also retire the caller's grants, opt-in and tier, which it does only for
-    /// an expired app. The app acts on this flag, never on the reason text.
+    /// an expired app. The flag, not the reason text, is what the app should act
+    /// on, since the reason is an audit label free to change.
     Reject { reason: String, retire_caller: bool },
     /// A hard error (a distinct error cursor, not a rejection).
     Error { message: String },
