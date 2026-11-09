@@ -10909,7 +10909,10 @@ mod dkg_pending_share_tests {
             threshold: 2,
             participants: 3,
             our_index: 1,
-            relays: vec!["wss://relay.damus.io@evil.example".into()],
+            relays: vec![
+                "wss://relay.example.com".into(),
+                "wss://relay.damus.io@evil.example".into(),
+            ],
             roster: Vec::new(),
         };
         let err = mobile

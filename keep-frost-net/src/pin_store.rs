@@ -238,7 +238,10 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let dir = dir();
         let store = RelayPinStore::open(dir.path(), false).unwrap();
-        let relays = vec!["wss://relay.damus.io@evil.example".to_string()];
+        let relays = vec![
+            "wss://relay.example.com".to_string(),
+            "wss://relay.damus.io@evil.example".to_string(),
+        ];
         let err = store
             .probe(&relays, Some(listener.local_addr().unwrap()))
             .await
