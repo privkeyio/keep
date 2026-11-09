@@ -167,69 +167,194 @@ pub fn nip55_verify_audit_chain(
     entries: Vec<Nip55AuditEntry>,
     hmac_key: Vec<u8>,
 ) -> Nip55ChainStatus {
-    use std::collections::HashSet;
+    let verifier = Nip55AuditChainVerifier::new(hmac_key);
+    verifier.feed(entries);
+    verifier.finish(None)
+}
 
-    // Fail closed on a missing key, matching keep-android `verifyAuditChain`.
-    assert!(
-        !hmac_key.is_empty(),
-        "HMAC key not initialized - cannot verify audit chain"
-    );
-    let hmac_key = zeroize::Zeroizing::new(hmac_key);
+// A legitimate log has at most a small run of leading empty-hash ("legacy") rows,
+// from the pre-hash-chain migration (v0.1.0..v0.4.0 rows, the oldest, and time-pruned
+// at 30 days). Bound that run so an attacker with audit-DB write access cannot prepend
+// an unbounded number of unauthenticated leading rows to mask the genesis or downgrade
+// the verdict. The bound is generous (no real early-adopter chain approaches it) so it
+// never false-flags a legitimate legacy prefix; exceeding it is treated as tampering.
+const MAX_LEADING_LEGACY: u32 = 1024;
 
-    let known_hashes: HashSet<&str> = entries
-        .iter()
-        .map(|e| e.entry_hash.as_str())
-        .filter(|h| !h.is_empty())
-        .collect();
+/// The first chained entry. A `previous_hash` on it names a predecessor the
+/// log no longer holds (a truncated head), unless some entry in the log has
+/// that hash, which means the rows are out of order (a broken link). Only the
+/// whole log can tell the two apart, so the verdict waits for `finish`.
+struct ChainHead {
+    id: i64,
+    previous_hash: Option<String>,
+    previous_hash_seen: bool,
+}
 
-    // A legitimate log has at most a small run of leading empty-hash ("legacy") rows,
-    // from the pre-hash-chain migration (v0.1.0..v0.4.0 rows, the oldest, and time-pruned
-    // at 30 days). Bound that run so an attacker with audit-DB write access cannot prepend
-    // an unbounded number of unauthenticated leading rows to mask the genesis or downgrade
-    // the verdict. The bound is generous (no real early-adopter chain approaches it) so it
-    // never false-flags a legitimate legacy prefix; exceeding it is treated as tampering.
-    const MAX_LEADING_LEGACY: u32 = 1024;
+struct ChainState {
+    in_legacy: bool,
+    legacy_skipped: u32,
+    head: Option<ChainHead>,
+    failure: Option<Nip55ChainStatus>,
+    expected_prev: Option<String>,
+    chained_count: u64,
+    last_chained: Option<(i64, String)>,
+}
 
-    let mut in_legacy = true;
-    let mut legacy_skipped: u32 = 0;
-    let mut truncated = false;
-    let mut expected_prev: Option<String> = None;
+/// Verifies the audit chain a page at a time, so the log never has to be held
+/// in memory at once. Feed every row in id order, in as many pages as needed,
+/// then call `finish`. The verdict is the one `nip55_verify_audit_chain_with_tip`
+/// gives for the same rows in one list.
+///
+/// Every page and the expected tip MAC must come from one consistent snapshot
+/// (one read transaction): a row appended or pruned between pages reads as a
+/// truncated or broken chain. Page by id (`id > last id`), not by offset, stop
+/// only on an empty page, and treat a failed read as a failed verification: a
+/// page left out at the tail goes unnoticed without a tip MAC. The object holds
+/// the HMAC key until it is closed, so close it when done.
+#[derive(uniffi::Object)]
+pub struct Nip55AuditChainVerifier {
+    hmac_key: zeroize::Zeroizing<Vec<u8>>,
+    state: std::sync::Mutex<ChainState>,
+}
 
-    for entry in &entries {
-        if in_legacy {
+#[uniffi::export]
+impl Nip55AuditChainVerifier {
+    #[uniffi::constructor]
+    pub fn new(hmac_key: Vec<u8>) -> Self {
+        // Fail closed on a missing key, matching keep-android `verifyAuditChain`.
+        assert!(
+            !hmac_key.is_empty(),
+            "HMAC key not initialized - cannot verify audit chain"
+        );
+        Self {
+            hmac_key: zeroize::Zeroizing::new(hmac_key),
+            state: std::sync::Mutex::new(ChainState {
+                in_legacy: true,
+                legacy_skipped: 0,
+                head: None,
+                failure: None,
+                expected_prev: None,
+                chained_count: 0,
+                last_chained: None,
+            }),
+        }
+    }
+
+    /// The next rows of the log, continuing in id order from the last page.
+    pub fn feed(&self, entries: Vec<Nip55AuditEntry>) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in &entries {
+            state.step(entry, &self.hmac_key);
+        }
+    }
+
+    /// The verdict for every row fed so far. With `expected_tip_mac`, an
+    /// otherwise intact chain is also checked against its separately stored
+    /// tip record, as in `nip55_verify_audit_chain_with_tip`.
+    pub fn finish(&self, expected_tip_mac: Option<String>) -> Nip55ChainStatus {
+        // A feed that panicked part way left a row counted but unchecked.
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                return Nip55ChainStatus::Broken {
+                    entry_id: state.last_chained.as_ref().map_or(0, |(id, _)| *id),
+                };
+            }
+        };
+        if let Some(head) = &state.head {
+            if head.previous_hash_seen {
+                return Nip55ChainStatus::Broken { entry_id: head.id };
+            }
+        }
+        if let Some(failure) = &state.failure {
+            return failure.clone();
+        }
+        if let Some(head) = &state.head {
+            if head.previous_hash.is_some() {
+                return Nip55ChainStatus::Truncated { entry_id: head.id };
+            }
+        }
+        let base = if state.legacy_skipped > 0 {
+            Nip55ChainStatus::PartiallyVerified {
+                legacy_entries_skipped: state.legacy_skipped,
+            }
+        } else {
+            Nip55ChainStatus::Valid
+        };
+        let Some(expected) = expected_tip_mac else {
+            return base;
+        };
+        let actual = nip55_audit_tip_mac(
+            state.chained_count,
+            state.last_chained.as_ref().map(|(_, hash)| hash.clone()),
+            self.hmac_key.to_vec(),
+        );
+        if ct_eq(&actual, &expected) {
+            base
+        } else {
+            Nip55ChainStatus::Truncated {
+                entry_id: state.last_chained.as_ref().map_or(0, |(id, _)| *id),
+            }
+        }
+    }
+}
+
+impl ChainState {
+    fn step(&mut self, entry: &Nip55AuditEntry, hmac_key: &[u8]) {
+        if !entry.entry_hash.is_empty() {
+            if let Some(head) = &mut self.head {
+                if head.previous_hash.as_deref() == Some(entry.entry_hash.as_str()) {
+                    head.previous_hash_seen = true;
+                }
+            }
+            self.chained_count += 1;
+            self.last_chained = Some((entry.id, entry.entry_hash.clone()));
+        }
+        if self.failure.is_none() {
+            if let Err(failure) = self.check(entry, hmac_key) {
+                self.failure = Some(failure);
+            }
+        }
+    }
+
+    fn check(&mut self, entry: &Nip55AuditEntry, hmac_key: &[u8]) -> Result<(), Nip55ChainStatus> {
+        let tampered = Nip55ChainStatus::Tampered { entry_id: entry.id };
+        let broken = Nip55ChainStatus::Broken { entry_id: entry.id };
+        if self.in_legacy {
             if entry.entry_hash.is_empty() {
                 // Legacy rows predate request ids, so one that carries an id
                 // was written by someone without the key.
                 if entry.request_id.is_some() {
-                    return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                    return Err(tampered);
                 }
-                legacy_skipped += 1;
-                if legacy_skipped > MAX_LEADING_LEGACY {
-                    return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                self.legacy_skipped += 1;
+                if self.legacy_skipped > MAX_LEADING_LEGACY {
+                    return Err(tampered);
                 }
-                continue;
+                return Ok(());
             }
-            in_legacy = false;
-            if let Some(prev) = entry.previous_hash.as_deref() {
-                if !prev.is_empty() {
-                    if !known_hashes.contains(prev) {
-                        truncated = true;
-                    } else {
-                        return Nip55ChainStatus::Broken { entry_id: entry.id };
-                    }
-                }
-            }
+            self.in_legacy = false;
+            let previous_hash = entry.previous_hash.clone().filter(|p| !p.is_empty());
+            self.head = Some(ChainHead {
+                id: entry.id,
+                previous_hash_seen: previous_hash.as_deref() == Some(entry.entry_hash.as_str()),
+                previous_hash,
+            });
         } else {
             if entry.entry_hash.is_empty() {
-                return Nip55ChainStatus::Broken { entry_id: entry.id };
+                return Err(broken);
             }
-            if !ct_eq_opt(entry.previous_hash.as_deref(), expected_prev.as_deref()) {
-                return Nip55ChainStatus::Broken { entry_id: entry.id };
+            if !ct_eq_opt(
+                entry.previous_hash.as_deref(),
+                self.expected_prev.as_deref(),
+            ) {
+                return Err(broken);
             }
         }
 
         if !entry.request_id.as_deref().is_none_or(is_request_id) {
-            return Nip55ChainStatus::Tampered { entry_id: entry.id };
+            return Err(tampered);
         }
         let calculated = audit_entry_hash_inner(
             entry.previous_hash.as_deref(),
@@ -240,28 +365,13 @@ pub fn nip55_verify_audit_chain(
             entry.timestamp,
             entry.was_automatic,
             entry.request_id.as_deref(),
-            hmac_key.as_slice(),
+            hmac_key,
         );
         if !ct_eq(&calculated, &entry.entry_hash) {
-            return Nip55ChainStatus::Tampered { entry_id: entry.id };
+            return Err(tampered);
         }
-
-        expected_prev = Some(entry.entry_hash.clone());
-    }
-
-    if truncated {
-        let head_id = entries
-            .iter()
-            .find(|e| !e.entry_hash.is_empty())
-            .map(|e| e.id)
-            .unwrap_or(0);
-        Nip55ChainStatus::Truncated { entry_id: head_id }
-    } else if legacy_skipped > 0 {
-        Nip55ChainStatus::PartiallyVerified {
-            legacy_entries_skipped: legacy_skipped,
-        }
-    } else {
-        Nip55ChainStatus::Valid
+        self.expected_prev = Some(entry.entry_hash.clone());
+        Ok(())
     }
 }
 
@@ -319,31 +429,9 @@ pub fn nip55_verify_audit_chain_with_tip(
     hmac_key: Vec<u8>,
     expected_tip_mac: Option<String>,
 ) -> Nip55ChainStatus {
-    let base = nip55_verify_audit_chain(entries.clone(), hmac_key.clone());
-    // A link/hash failure is already conclusive; only add the tip check to an
-    // otherwise-intact chain.
-    match base {
-        Nip55ChainStatus::Valid | Nip55ChainStatus::PartiallyVerified { .. } => {}
-        other => return other,
-    }
-    let Some(expected) = expected_tip_mac else {
-        return base;
-    };
-
-    let chained: Vec<&Nip55AuditEntry> = entries
-        .iter()
-        .filter(|e| !e.entry_hash.is_empty())
-        .collect();
-    let count = chained.len() as u64;
-    let last_hash = chained.last().map(|e| e.entry_hash.clone());
-    let actual = nip55_audit_tip_mac(count, last_hash, hmac_key);
-    if ct_eq(&actual, &expected) {
-        base
-    } else {
-        Nip55ChainStatus::Truncated {
-            entry_id: chained.last().map(|e| e.id).unwrap_or(0),
-        }
-    }
+    let verifier = Nip55AuditChainVerifier::new(hmac_key);
+    verifier.feed(entries);
+    verifier.finish(expected_tip_mac)
 }
 
 #[cfg(test)]
@@ -846,6 +934,261 @@ mod tests {
         assert_eq!(
             nip55_verify_audit_chain(vec![e2, e3], KEY.to_vec()),
             Nip55ChainStatus::Truncated { entry_id: 2 }
+        );
+    }
+
+    // The one-list verifier as it was before the paged one replaced it, kept
+    // to prove the paged verifier gives the same verdict.
+    fn reference_verify(entries: Vec<Nip55AuditEntry>, hmac_key: Vec<u8>) -> Nip55ChainStatus {
+        use std::collections::HashSet;
+
+        // Fail closed on a missing key, matching keep-android `verifyAuditChain`.
+        assert!(
+            !hmac_key.is_empty(),
+            "HMAC key not initialized - cannot verify audit chain"
+        );
+        let hmac_key = zeroize::Zeroizing::new(hmac_key);
+
+        let known_hashes: HashSet<&str> = entries
+            .iter()
+            .map(|e| e.entry_hash.as_str())
+            .filter(|h| !h.is_empty())
+            .collect();
+
+        // A legitimate log has at most a small run of leading empty-hash ("legacy") rows,
+        // from the pre-hash-chain migration (v0.1.0..v0.4.0 rows, the oldest, and time-pruned
+        // at 30 days). Bound that run so an attacker with audit-DB write access cannot prepend
+        // an unbounded number of unauthenticated leading rows to mask the genesis or downgrade
+        // the verdict. The bound is generous (no real early-adopter chain approaches it) so it
+        // never false-flags a legitimate legacy prefix; exceeding it is treated as tampering.
+        const MAX_LEADING_LEGACY: u32 = 1024;
+
+        let mut in_legacy = true;
+        let mut legacy_skipped: u32 = 0;
+        let mut truncated = false;
+        let mut expected_prev: Option<String> = None;
+
+        for entry in &entries {
+            if in_legacy {
+                if entry.entry_hash.is_empty() {
+                    // Legacy rows predate request ids, so one that carries an id
+                    // was written by someone without the key.
+                    if entry.request_id.is_some() {
+                        return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                    }
+                    legacy_skipped += 1;
+                    if legacy_skipped > MAX_LEADING_LEGACY {
+                        return Nip55ChainStatus::Tampered { entry_id: entry.id };
+                    }
+                    continue;
+                }
+                in_legacy = false;
+                if let Some(prev) = entry.previous_hash.as_deref() {
+                    if !prev.is_empty() {
+                        if !known_hashes.contains(prev) {
+                            truncated = true;
+                        } else {
+                            return Nip55ChainStatus::Broken { entry_id: entry.id };
+                        }
+                    }
+                }
+            } else {
+                if entry.entry_hash.is_empty() {
+                    return Nip55ChainStatus::Broken { entry_id: entry.id };
+                }
+                if !ct_eq_opt(entry.previous_hash.as_deref(), expected_prev.as_deref()) {
+                    return Nip55ChainStatus::Broken { entry_id: entry.id };
+                }
+            }
+
+            if !entry.request_id.as_deref().is_none_or(is_request_id) {
+                return Nip55ChainStatus::Tampered { entry_id: entry.id };
+            }
+            let calculated = audit_entry_hash_inner(
+                entry.previous_hash.as_deref(),
+                &entry.caller,
+                &entry.request_type,
+                entry.event_kind,
+                &entry.decision,
+                entry.timestamp,
+                entry.was_automatic,
+                entry.request_id.as_deref(),
+                hmac_key.as_slice(),
+            );
+            if !ct_eq(&calculated, &entry.entry_hash) {
+                return Nip55ChainStatus::Tampered { entry_id: entry.id };
+            }
+
+            expected_prev = Some(entry.entry_hash.clone());
+        }
+
+        if truncated {
+            let head_id = entries
+                .iter()
+                .find(|e| !e.entry_hash.is_empty())
+                .map(|e| e.id)
+                .unwrap_or(0);
+            Nip55ChainStatus::Truncated { entry_id: head_id }
+        } else if legacy_skipped > 0 {
+            Nip55ChainStatus::PartiallyVerified {
+                legacy_entries_skipped: legacy_skipped,
+            }
+        } else {
+            Nip55ChainStatus::Valid
+        }
+    }
+
+    fn reference_verify_with_tip(
+        entries: Vec<Nip55AuditEntry>,
+        hmac_key: Vec<u8>,
+        expected_tip_mac: Option<String>,
+    ) -> Nip55ChainStatus {
+        let base = reference_verify(entries.clone(), hmac_key.clone());
+        // A link/hash failure is already conclusive; only add the tip check to an
+        // otherwise-intact chain.
+        match base {
+            Nip55ChainStatus::Valid | Nip55ChainStatus::PartiallyVerified { .. } => {}
+            other => return other,
+        }
+        let Some(expected) = expected_tip_mac else {
+            return base;
+        };
+
+        let chained: Vec<&Nip55AuditEntry> = entries
+            .iter()
+            .filter(|e| !e.entry_hash.is_empty())
+            .collect();
+        let count = chained.len() as u64;
+        let last_hash = chained.last().map(|e| e.entry_hash.clone());
+        let actual = nip55_audit_tip_mac(count, last_hash, hmac_key);
+        if ct_eq(&actual, &expected) {
+            base
+        } else {
+            Nip55ChainStatus::Truncated {
+                entry_id: chained.last().map(|e| e.id).unwrap_or(0),
+            }
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n as u64) as usize
+        }
+    }
+
+    fn mutated_log(rng: &mut Rng) -> Vec<Nip55AuditEntry> {
+        let mut rows: Vec<Nip55AuditEntry> = (0..rng.below(4))
+            .map(|i| legacy_entry(i as i64 - 10))
+            .collect();
+        let mut prev: Option<String> = None;
+        for i in 0..rng.below(8) {
+            let e = if rng.below(3) == 0 {
+                with_request(prev.as_deref(), i as i64 + 1, REQUEST)
+            } else {
+                entry(
+                    i as i64 + 1,
+                    prev.as_deref(),
+                    "com.app",
+                    Some(1),
+                    "allow",
+                    100 + i as i64,
+                    false,
+                )
+            };
+            prev = Some(e.entry_hash.clone());
+            rows.push(e);
+        }
+        for _ in 0..rng.below(3) {
+            if rows.is_empty() {
+                break;
+            }
+            let i = rng.below(rows.len());
+            let j = rng.below(rows.len());
+            match rng.below(10) {
+                0 => {
+                    rows.remove(i);
+                }
+                1 => rows.swap(i, j),
+                2 => rows[i].decision = "deny".into(),
+                3 => rows[i].previous_hash = Some(rows[j].entry_hash.clone()),
+                4 => rows[i].previous_hash = Some("00ff00ff".into()),
+                5 => rows[i].entry_hash = String::new(),
+                6 => {
+                    let dup = rows[i].clone();
+                    rows.insert(j, dup);
+                }
+                7 => rows.insert(i, legacy_entry(0)),
+                8 => rows[i].request_id = Some(REQUEST.into()),
+                _ => rows[i].previous_hash = None,
+            }
+        }
+        rows
+    }
+
+    fn paged(rows: &[Nip55AuditEntry], tip: Option<String>, rng: &mut Rng) -> Nip55ChainStatus {
+        let verifier = Nip55AuditChainVerifier::new(KEY.to_vec());
+        let mut rest = rows;
+        while !rest.is_empty() || rng.below(4) == 0 {
+            let take = rng.below(rest.len() + 1);
+            verifier.feed(rest[..take].to_vec());
+            rest = &rest[take..];
+        }
+        verifier.finish(tip)
+    }
+
+    #[test]
+    fn the_paged_verifier_agrees_with_the_one_list_verifier() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..20_000 {
+            let rows = mutated_log(&mut rng);
+            let tip = match rng.below(4) {
+                0 => None,
+                1 => Some(tip_of(&rows)),
+                2 => Some(tip_of(&rows[..rows.len().saturating_sub(1)])),
+                _ => Some("00".into()),
+            };
+            let want = reference_verify_with_tip(rows.clone(), KEY.to_vec(), tip.clone());
+            seen.insert(std::mem::discriminant(&want));
+            assert_eq!(
+                paged(&rows, tip, &mut rng),
+                want,
+                "{:?}",
+                rows.iter().map(|e| e.id).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(seen.len(), 5, "every verdict should be reached");
+    }
+
+    #[test]
+    fn the_paged_verifier_agrees_past_the_legacy_cap() {
+        for extra in [0, 1] {
+            let mut rows: Vec<Nip55AuditEntry> = (0..MAX_LEADING_LEGACY as i64 + extra)
+                .map(legacy_entry)
+                .collect();
+            rows.extend(chain(3));
+            let want = reference_verify_with_tip(rows.clone(), KEY.to_vec(), Some(tip_of(&rows)));
+            assert_eq!(paged(&rows, Some(tip_of(&rows)), &mut Rng(7)), want);
+        }
+    }
+
+    #[test]
+    fn a_verifier_poisoned_mid_feed_is_not_intact() {
+        let verifier = std::sync::Arc::new(Nip55AuditChainVerifier::new(KEY.to_vec()));
+        verifier.feed(chain(2));
+        let held = std::sync::Arc::clone(&verifier);
+        let _ = std::thread::spawn(move || {
+            let _guard = held.state.lock().unwrap();
+            panic!("feed failed part way");
+        })
+        .join();
+        assert_eq!(
+            verifier.finish(None),
+            Nip55ChainStatus::Broken { entry_id: 2 }
         );
     }
 }
