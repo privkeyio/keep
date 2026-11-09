@@ -529,11 +529,14 @@ impl SignerHandler {
                     http_auth: None,
                 })
                 .await
-                // A busy refusal would tell an unapproved key that another
-                // prompt is open. It is told it was rejected, as when the
-                // owner says no, and nothing is recorded as that answer.
+                // A busy refusal, or the kill switch found after waiting,
+                // would tell an unapproved key that another prompt is open.
+                // It is told it was rejected, as when the owner says no, and
+                // nothing is recorded as that answer.
                 .map_err(|e| match e {
-                    KeepError::CapacityExceeded(_) => KeepError::UserRejected,
+                    KeepError::CapacityExceeded(_) | KeepError::PermissionDenied(_) => {
+                        KeepError::UserRejected
+                    }
                     other => other,
                 })?;
             if !result.approved {
@@ -2751,6 +2754,31 @@ mod tests {
             Err(KeepError::PermissionDenied(_))
         ));
         assert_eq!(cb.prompts.load(SeqCst), 1, "the waiter was asked");
+    }
+
+    // A connect that waited and then met the kill switch is told rejected,
+    // like any refused connect, rather than learning the switch is on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiting_connect_meeting_the_kill_switch_is_told_rejected() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(1).await;
+
+        let first = spawn_sign(&handler, apps[0], signer_pk);
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        let stranger = Keys::generate().public_key();
+        let connect = {
+            let handler = Arc::clone(&handler);
+            tokio::spawn(async move { handler.handle_connect(stranger, None, None, None).await })
+        };
+        until(|| handler.prompt_waiters.load(SeqCst) == 1).await;
+        handler.set_kill_switch(true);
+
+        release.send(()).unwrap();
+        assert!(matches!(first.await.unwrap(), Err(KeepError::UserRejected)));
+        assert!(matches!(
+            connect.await.unwrap(),
+            Err(KeepError::UserRejected)
+        ));
     }
 
     // A connect turned away as busy reads to the client like a refusal, so an
