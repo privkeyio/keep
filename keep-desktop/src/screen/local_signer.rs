@@ -17,6 +17,9 @@ pub struct ConnectedClient {
 
 #[derive(Debug, Clone)]
 pub struct PendingApprovalDisplay {
+    /// Names the request this prompt answers, so a click on a card that was
+    /// replaced before the click was handled cannot answer its replacement.
+    pub id: u64,
     pub app_name: String,
     pub method: String,
     pub event_kind: Option<u32>,
@@ -37,8 +40,8 @@ pub struct LogDisplayEntry {
 pub enum Message {
     Start,
     Stop,
-    Approve,
-    Reject,
+    Approve(u64),
+    Reject(u64),
     RevokeClient(String),
     CopyPath,
 }
@@ -46,8 +49,8 @@ pub enum Message {
 pub enum Event {
     Start,
     Stop,
-    Approve,
-    Reject,
+    Approve(u64),
+    Reject(u64),
     RevokeClient(String),
     CopyPath,
 }
@@ -97,8 +100,8 @@ impl State {
         match message {
             Message::Start => Some(Event::Start),
             Message::Stop => Some(Event::Stop),
-            Message::Approve => Some(Event::Approve),
-            Message::Reject => Some(Event::Reject),
+            Message::Approve(id) => Some(Event::Approve(id)),
+            Message::Reject(id) => Some(Event::Reject(id)),
             Message::RevokeClient(i) => Some(Event::RevokeClient(i)),
             Message::CopyPath => Some(Event::CopyPath),
         }
@@ -329,7 +332,7 @@ impl State {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::Approve)
+            .on_press(Message::Approve(approval.id))
             .style(theme::primary_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),
@@ -338,7 +341,7 @@ impl State {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::Reject)
+            .on_press(Message::Reject(approval.id))
             .style(theme::danger_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),

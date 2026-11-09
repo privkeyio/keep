@@ -134,6 +134,8 @@ pub struct App {
     pub(crate) local_signer_pending_approval:
         Option<crate::screen::local_signer::PendingApprovalDisplay>,
     #[cfg(unix)]
+    pub(crate) local_signer_approval_shown_at: Option<std::time::Instant>,
+    #[cfg(unix)]
     pub(crate) local_signer_pending_setup: Option<crate::local_signer_service::PendingSetup>,
     pub(crate) nostrconnect_pending: Option<NostrConnectRequest>,
     pub(crate) proxy_enabled: bool,
@@ -225,6 +227,8 @@ impl App {
             local_signer_approval_tx: None,
             #[cfg(unix)]
             local_signer_pending_approval: None,
+            #[cfg(unix)]
+            local_signer_approval_shown_at: None,
             #[cfg(unix)]
             local_signer_pending_setup: None,
             nostrconnect_pending: None,
@@ -847,6 +851,8 @@ impl App {
             #[cfg(unix)]
             local_signer_pending_approval: None,
             #[cfg(unix)]
+            local_signer_approval_shown_at: None,
+            #[cfg(unix)]
             local_signer_pending_setup: None,
             nostrconnect_pending: None,
             proxy_enabled: false,
@@ -1302,6 +1308,74 @@ mod tests {
             http_auth: None,
         };
         app.notify_bunker_approval(&display);
+    }
+
+    #[cfg(unix)]
+    fn local_prompt(id: u64) -> crate::screen::local_signer::PendingApprovalDisplay {
+        crate::screen::local_signer::PendingApprovalDisplay {
+            id,
+            app_name: format!("client-{id}"),
+            method: "sign_event".into(),
+            event_kind: None,
+            event_content: None,
+            http_auth: None,
+        }
+    }
+
+    // A click on a card the next prompt has already replaced names the card
+    // it was made on, and the replacement does not take it.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_signer_answer_reaches_only_the_prompt_it_names() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.show_local_signer_approval(local_prompt(2), tx);
+        app.local_signer_approval_shown_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+
+        assert!(!app.resolve_local_signer_approval(1, true));
+        assert!(!app.resolve_local_signer_approval(1, false));
+        assert!(rx.try_recv().is_err(), "an answer for 1 reached 2");
+
+        app.local_signer_approval_timed_out(1);
+        assert_eq!(
+            app.local_signer_pending_approval.as_ref().map(|p| p.id),
+            Some(2)
+        );
+
+        assert!(app.resolve_local_signer_approval(2, true));
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert!(app.local_signer_pending_approval.is_none());
+    }
+
+    // Approve does nothing until the prompt has been on screen long enough
+    // to have been read, so a second click aimed at the previous card cannot
+    // approve the one that replaced it. Reject is taken at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_local_signer_prompt_ignores_approve_until_it_settles() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.show_local_signer_approval(local_prompt(7), tx);
+
+        assert!(!app.resolve_local_signer_approval(7, true));
+        assert!(rx.try_recv().is_err());
+        assert!(app.resolve_local_signer_approval(7, false));
+        assert_eq!(rx.try_recv(), Ok(false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_local_signer_timeout_clears_its_own_prompt() {
+        let mut app = App::test_new(default_settings(), true);
+        app.window_visible = true;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.show_local_signer_approval(local_prompt(3), tx);
+        app.local_signer_approval_timed_out(3);
+        assert!(app.local_signer_pending_approval.is_none());
+        assert!(app.local_signer_approval_tx.is_none());
     }
 
     #[test]

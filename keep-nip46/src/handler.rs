@@ -264,6 +264,8 @@ const MAX_PROMPT_WAITERS: usize = 4;
 
 /// How long a request waits for the open prompt to close: one prompt's own
 /// timeout, so a waiter gets the next turn unless a later prompt took it.
+/// With nobody at the screen each prompt runs its full timeout, so only the
+/// first waiter is served before the rest give up as busy.
 const PROMPT_GATE_WAIT: Duration = Duration::from_secs(60);
 
 struct PromptWaiter<'a>(&'a AtomicUsize);
@@ -526,7 +528,14 @@ impl SignerHandler {
                     requested_permissions: permissions.clone(),
                     http_auth: None,
                 })
-                .await?;
+                .await
+                // A busy refusal would tell an unapproved key that another
+                // prompt is open. It is told it was rejected, as when the
+                // owner says no, and nothing is recorded as that answer.
+                .map_err(|e| match e {
+                    KeepError::CapacityExceeded(_) => KeepError::UserRejected,
+                    other => other,
+                })?;
             if !result.approved {
                 return Err(KeepError::UserRejected);
             }
@@ -1218,6 +1227,10 @@ impl SignerHandler {
                 .map_err(|_| busy())?
                 .map_err(|_| busy())?;
             drop(waiter);
+            // The wait can be most of a minute, in which the kill switch may
+            // have been thrown. Nobody should be asked about a request that
+            // would be refused anyway.
+            self.check_kill_switch()?;
             return Ok(callbacks.request_approval(request));
         }
         if self.auto_approve {
@@ -2697,6 +2710,84 @@ mod tests {
         }
         assert_eq!(cb.most_open.load(SeqCst), 1);
         assert_eq!(handler.prompt_waiters.load(SeqCst), 0);
+    }
+
+    // A client that goes away while its request waits gives its place back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_waiter_gives_its_place_back() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(2).await;
+
+        let first = spawn_sign(&handler, apps[0], signer_pk);
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        let parked = spawn_sign(&handler, apps[1], signer_pk);
+        until(|| handler.prompt_waiters.load(SeqCst) == 1).await;
+        parked.abort();
+        assert!(parked.await.unwrap_err().is_cancelled());
+        assert_eq!(handler.prompt_waiters.load(SeqCst), 0);
+
+        release.send(()).unwrap();
+        assert!(matches!(first.await.unwrap(), Err(KeepError::UserRejected)));
+        assert_eq!(cb.prompts.load(SeqCst), 1);
+    }
+
+    // The kill switch thrown while a request waits for the prompt stops it
+    // before the owner is asked about it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_waiter_is_not_asked_once_the_kill_switch_is_thrown() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(2).await;
+
+        let first = spawn_sign(&handler, apps[0], signer_pk);
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        let second = spawn_sign(&handler, apps[1], signer_pk);
+        until(|| handler.prompt_waiters.load(SeqCst) == 1).await;
+        handler.set_kill_switch(true);
+
+        release.send(()).unwrap();
+        assert!(matches!(first.await.unwrap(), Err(KeepError::UserRejected)));
+        assert!(matches!(
+            second.await.unwrap(),
+            Err(KeepError::PermissionDenied(_))
+        ));
+        assert_eq!(cb.prompts.load(SeqCst), 1, "the waiter was asked");
+    }
+
+    // A connect turned away as busy reads to the client like a refusal, so an
+    // unapproved key learns nothing about other prompts, and it is not
+    // remembered or audited as the owner's answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_busy_connect_is_told_rejected() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let (handler, cb, release, apps, signer_pk) = held_handler(MAX_PROMPT_WAITERS + 1).await;
+
+        let mut tasks = vec![spawn_sign(&handler, apps[0], signer_pk)];
+        until(|| cb.prompts.load(SeqCst) == 1).await;
+        for app in &apps[1..=MAX_PROMPT_WAITERS] {
+            tasks.push(spawn_sign(&handler, *app, signer_pk));
+        }
+        until(|| handler.prompt_waiters.load(SeqCst) == MAX_PROMPT_WAITERS).await;
+
+        let stranger = Keys::generate().public_key();
+        assert!(matches!(
+            handler.handle_connect(stranger, None, None, None).await,
+            Err(KeepError::UserRejected)
+        ));
+        assert_eq!(cb.prompts.load(SeqCst), 1, "the stranger was asked");
+        let stranger_hex = stranger.to_hex();
+        assert!(!handler
+            .audit
+            .lock()
+            .await
+            .by_app(&stranger_hex)
+            .any(|e| matches!(e.action, AuditAction::UserRejected)));
+
+        for _ in 0..tasks.len() {
+            release.send(()).unwrap();
+        }
+        for task in tasks {
+            assert!(matches!(task.await.unwrap(), Err(KeepError::UserRejected)));
+        }
     }
 
     /// The wiring, end to end through the handler rather than the permission
