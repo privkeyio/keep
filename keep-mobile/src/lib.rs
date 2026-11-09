@@ -5240,6 +5240,14 @@ impl KeepMobile {
         // saves a pin, so a URL refused later would already have reached the
         // host it names.
         network::validate_relay_urls(relays)?;
+        if relays.len() > keep_core::relay::MAX_RELAYS {
+            return Err(KeepMobileError::InvalidRelayUrl {
+                msg: format!(
+                    "At most {} relays can be used",
+                    keep_core::relay::MAX_RELAYS
+                ),
+            });
+        }
         // Opt-in strict pinning: when enabled, an un-pinned relay is not
         // trusted-on-first-use; it is skipped (see the per-relay handling
         // below) rather than pinned. Disabled by default.
@@ -10873,20 +10881,45 @@ mod dkg_pending_share_tests {
         assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
     }
 
-    // The pinned transport cannot pin a socket the proxy opens, so a DKG run
-    // under strict pinning and a proxy is refused before any relay is dialed.
+    // A scanned relay is checked before the certificate probe dials it: one
+    // whose userinfo hides another host reaches neither that host nor the
+    // proxy, saves no pin, and leaves the subkey for a retry.
     #[test]
-    fn a_relay_with_userinfo_is_refused_before_it_is_dialed_or_pinned() {
+    fn a_dkg_relay_with_userinfo_is_refused_before_it_is_dialed_or_pinned() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let proxy = listener.local_addr().unwrap();
         let storage = Arc::new(FailingShareStorage::default());
         let mobile = KeepMobile::new(storage as Arc<dyn SecureStorage>).unwrap();
 
-        let relays = vec!["wss://relay.damus.io@evil.example".to_string()];
+        struct NoopProgress;
+        impl dkg::DkgProgressCallback for NoopProgress {
+            fn on_progress(&self, _: DkgProgressUpdate) {}
+        }
+
+        let proxy = listener.local_addr().unwrap();
+        mobile
+            .save_proxy_config(ProxyConfigInfo {
+                enabled: true,
+                port: proxy.port(),
+            })
+            .unwrap();
+        mobile.frost_dkg_begin("group-a".into()).unwrap();
+        let config = DkgConfig {
+            group_name: "group-a".into(),
+            threshold: 2,
+            participants: 3,
+            our_index: 1,
+            relays: vec!["wss://relay.damus.io@evil.example".into()],
+            roster: Vec::new(),
+        };
         let err = mobile
-            .runtime
-            .block_on(mobile.verify_and_pin_relays(&relays, Some(proxy)))
+            .frost_run_dkg(
+                config,
+                "group-a-share".into(),
+                "pass".into(),
+                30,
+                Arc::new(NoopProgress),
+            )
             .expect_err("a relay URL with userinfo must be refused");
         assert!(
             matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
@@ -10901,8 +10934,28 @@ mod dkg_pending_share_tests {
             .unwrap()
             .unwrap_or_default()
             .is_empty());
+        assert!(mobile.dkg_subkeys.lock().unwrap().contains_key("group-a"));
+
+        let too_many = (0..=keep_core::relay::MAX_RELAYS)
+            .map(|i| format!("wss://relay{i}.example.com"))
+            .collect::<Vec<_>>();
+        let err = mobile
+            .runtime
+            .block_on(mobile.verify_and_pin_relays(&too_many, Some(proxy)))
+            .expect_err("more relays than the cap must be refused");
+        assert!(
+            matches!(err, KeepMobileError::InvalidRelayUrl { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            listener.accept().map_err(|e| e.kind()).err(),
+            Some(std::io::ErrorKind::WouldBlock),
+            "nothing is dialed when the set is over the cap"
+        );
     }
 
+    // The pinned transport cannot pin a socket the proxy opens, so a DKG run
+    // under strict pinning and a proxy is refused before any relay is dialed.
     #[test]
     fn run_dkg_refuses_strict_pinning_behind_the_proxy() {
         let storage = Arc::new(FailingShareStorage::default());
