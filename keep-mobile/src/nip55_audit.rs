@@ -206,8 +206,9 @@ struct ChainState {
 /// gives for the same rows in one list.
 ///
 /// Every page and the expected tip MAC must come from one consistent snapshot
-/// (one read transaction): a row appended or pruned between pages reads as a
-/// truncated or broken chain. Page by id (`id > last id`), not by offset, stop
+/// (one read transaction). A row appended or pruned between pages can read as
+/// a truncated or broken chain, or go unnoticed, so a verdict over pages from
+/// different snapshots says nothing. Page by id (`id > last id`), not by offset, stop
 /// only on an empty page, and treat a failed read as a failed verification: a
 /// page left out at the tail goes unnoticed without a tip MAC. The object holds
 /// the HMAC key until it is closed, so close it when done.
