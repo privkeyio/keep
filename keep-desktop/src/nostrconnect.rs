@@ -30,6 +30,9 @@ impl App {
             requested_permissions: request.perms.clone(),
             http_auth: None,
         };
+        if let Some(prev) = self.bunker_approval_tx.take() {
+            prev.answer(false);
+        }
         self.bunker_pending_approval = Some(display);
         self.bunker_approval_shown_at = Some(std::time::Instant::now());
 

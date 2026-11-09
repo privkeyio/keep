@@ -1454,6 +1454,49 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    // The screen sending as the request gives up: the request waits for the
+    // send to finish and takes the answer, so the two never disagree.
+    #[test]
+    fn an_answer_sent_as_the_request_gives_up_is_taken() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(tx);
+        let screen = reply.clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            let mut slot = screen.0.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            slot.take().unwrap().send(true).unwrap();
+        });
+        locked_rx.recv().unwrap();
+        assert_eq!(
+            crate::bunker_service::wait_for_answer(
+                &rx,
+                &reply,
+                std::time::Duration::from_millis(10)
+            ),
+            Some(true)
+        );
+        sender.join().unwrap();
+    }
+
+    // A request whose card can no longer be shown, its event dropped unread
+    // when the bunker stopped, stops waiting at once instead of holding a
+    // worker for the whole timeout.
+    #[test]
+    fn a_request_nobody_can_answer_stops_waiting() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(tx);
+        let event = reply.clone();
+        drop(event);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            crate::bunker_service::wait_for_answer(&rx, &reply, std::time::Duration::from_secs(30)),
+            None
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn an_answer_given_in_time_is_delivered() {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1480,6 +1523,19 @@ mod tests {
         assert!(app.bunker_pending_approval.is_none());
         assert!(app.bunker_approval_shown_at.is_none());
         assert!(app.bunker_approval_tx.is_none());
+    }
+
+    #[test]
+    fn stopping_the_bunker_drops_a_pending_nostrconnect_request() {
+        let mut app = bunker_app();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=0123456789abcdef",
+            nostr_sdk::Keys::generate().public_key().to_hex()
+        );
+        let _ = app.process_pending_nostrconnect(keep_nip46::parse_nostrconnect_uri(&uri).unwrap());
+        app.stop_bunker();
+        assert!(app.nostrconnect_pending.is_none());
+        assert!(app.bunker_pending_approval.is_none());
     }
 
     // Showing a bunker request takes the card from a pending nostrconnect

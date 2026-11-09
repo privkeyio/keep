@@ -68,7 +68,7 @@ pub(crate) enum BunkerEvent {
 // the waiting request when it gives up. An answer therefore counts as
 // delivered only when the request acts on it.
 #[derive(Clone)]
-pub(crate) struct ApprovalReply(Arc<Mutex<Option<std::sync::mpsc::Sender<bool>>>>);
+pub(crate) struct ApprovalReply(pub(crate) Arc<Mutex<Option<std::sync::mpsc::Sender<bool>>>>);
 
 impl ApprovalReply {
     pub(crate) fn new(tx: std::sync::mpsc::Sender<bool>) -> Self {
@@ -86,18 +86,34 @@ impl ApprovalReply {
     }
 }
 
-// The owner's answer, or `None` once the request stops waiting. An answer the
-// screen sent while this gave up is still taken: the screen sends with the
-// slot held, so if the slot is already empty the answer is in the channel.
+// The owner's answer, or `None` once the request stops waiting: at the
+// timeout, or as soon as no card can answer it because its event was dropped
+// unread when the bunker stopped. An answer the screen sent while this gave
+// up is still taken: the screen sends with the slot held, so if the slot is
+// already empty the answer is in the channel.
 pub(crate) fn wait_for_answer(
     rx: &std::sync::mpsc::Receiver<bool>,
     reply: &ApprovalReply,
     timeout: std::time::Duration,
 ) -> Option<bool> {
-    match rx.recv_timeout(timeout) {
-        Ok(approved) => Some(approved),
-        Err(_) if reply.close() => None,
-        Err(_) => rx.try_recv().ok(),
+    const SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left.min(SLICE)) {
+            Ok(approved) => return Some(approved),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                if !left.is_zero() && Arc::strong_count(&reply.0) > 1 =>
+            {
+                continue
+            }
+            Err(_) => break,
+        }
+    }
+    if reply.close() {
+        None
+    } else {
+        rx.try_recv().ok()
     }
 }
 
