@@ -20,7 +20,7 @@ use keep_nip46::types::{ApprovalRequest, LogEvent, ServerCallbacks};
 use keep_nip46::{FrostSigner, NetworkFrostSigner, Server, ServerConfig};
 
 use crate::output::Output;
-use crate::tui::{ApprovalRequest as TuiApprovalRequest, LogEntry, TuiEvent};
+use crate::tui::{ApprovalReply, ApprovalRequest as TuiApprovalRequest, LogEntry, TuiEvent};
 
 use super::{get_password, is_hidden_vault};
 
@@ -30,6 +30,7 @@ static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 struct TuiCallbacks {
     tx: Sender<TuiEvent>,
+    timeout: Duration,
 }
 
 impl ServerCallbacks for TuiCallbacks {
@@ -42,6 +43,7 @@ impl ServerCallbacks for TuiCallbacks {
 
     fn request_approval(&self, request: ApprovalRequest) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let reply = ApprovalReply::new(response_tx);
         let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tui_req = TuiApprovalRequest {
             id,
@@ -50,7 +52,7 @@ impl ServerCallbacks for TuiCallbacks {
             kind: request.event_kind.map(|k| k.as_u16()),
             content_preview: request.event_content,
             http_auth: request.http_auth,
-            response_tx,
+            response_tx: reply.clone(),
         };
 
         if self.tx.send(TuiEvent::Approval(tui_req)).is_err() {
@@ -60,15 +62,11 @@ impl ServerCallbacks for TuiCallbacks {
         // response is one-shot. The new persistent-grant semantics (#575)
         // only apply to bunkers whose callback returns a non-`JustThisTime`
         // `RememberDuration` (today: keep-mobile).
-        tokio::task::block_in_place(|| match response_rx.recv_timeout(APPROVAL_TIMEOUT) {
-            Ok(approved) => approved,
-            Err(_) => {
-                // Closed first, so a late [Y] finds nobody waiting and is
-                // logged as timed out rather than approved.
-                drop(response_rx);
+        tokio::task::block_in_place(|| {
+            reply.wait(&response_rx, self.timeout).unwrap_or_else(|| {
                 let _ = self.tx.send(TuiEvent::ApprovalTimeout(id));
                 false
-            }
+            })
         })
         .into()
     }
@@ -361,6 +359,7 @@ pub fn cmd_serve(
         rt.block_on(async {
             let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
                 tx: tui_tx_clone.clone(),
+                timeout: APPROVAL_TIMEOUT,
             }));
 
             // Carry the persisted global auto-approve kinds so the interactive
@@ -467,6 +466,7 @@ fn spawn_tui_server(
         rt.block_on(async {
             let callbacks: Option<Arc<dyn ServerCallbacks>> = Some(Arc::new(TuiCallbacks {
                 tx: tui_tx_clone.clone(),
+                timeout: APPROVAL_TIMEOUT,
             }));
 
             // Carry the persisted global auto-approve kinds so the interactive
@@ -704,4 +704,62 @@ fn map_stored_to_pregrants(
         .iter()
         .filter_map(keep_nip46::PreGrantedApp::from_stored)
         .collect()
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest {
+            app_pubkey: nostr_sdk::Keys::generate().public_key(),
+            app_name: "client".into(),
+            method: "sign_event".into(),
+            event_kind: None,
+            event_content: None,
+            requested_permissions: None,
+            http_auth: None,
+        }
+    }
+
+    // A request nobody answers is refused, the TUI is told which prompt timed
+    // out, and a [Y] pressed after that reaches nobody.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_request_names_its_prompt_and_takes_no_late_answer() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let callbacks = TuiCallbacks {
+            tx,
+            timeout: Duration::from_millis(20),
+        };
+        assert!(!callbacks.request_approval(request()).approved);
+
+        let TuiEvent::Approval(prompt) = rx.recv().unwrap() else {
+            panic!("no prompt was shown");
+        };
+        let Ok(TuiEvent::ApprovalTimeout(id)) = rx.recv_timeout(Duration::from_secs(5)) else {
+            panic!("no timeout was sent");
+        };
+        assert_eq!(id, prompt.id);
+        assert!(!prompt.response_tx.answer(true));
+    }
+
+    // Racing an answer against the request giving up, the screen and the
+    // request always agree on whether the answer was taken.
+    #[test]
+    fn the_screen_and_the_request_agree_on_a_racing_answer() {
+        for _ in 0..200 {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reply = ApprovalReply::new(tx);
+            let screen = reply.clone();
+            let (go_tx, go_rx) = std::sync::mpsc::channel();
+            let answering = std::thread::spawn(move || {
+                go_rx.recv().unwrap();
+                screen.answer(true)
+            });
+            go_tx.send(()).unwrap();
+            let got = reply.wait(&rx, Duration::from_micros(50));
+            let delivered = answering.join().unwrap();
+            assert_eq!(got == Some(true), delivered);
+        }
+    }
 }
