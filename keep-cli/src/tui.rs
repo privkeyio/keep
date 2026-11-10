@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::io::{self, stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -70,7 +70,11 @@ impl LogEntry {
     }
 }
 
-#[allow(dead_code)]
+// How long an approval prompt is on screen before [Y] takes effect. Keys
+// typed before it was drawn, or aimed at the prompt it replaced, land in
+// this window and are dropped rather than approving a request nobody read.
+const APPROVE_SETTLE: Duration = Duration::from_secs(1);
+
 pub struct ApprovalRequest {
     pub id: u64,
     pub app: String,
@@ -87,6 +91,7 @@ pub struct ApprovalRequest {
 pub enum TuiEvent {
     Log(LogEntry),
     Approval(ApprovalRequest),
+    ApprovalTimeout(u64),
     Quit,
 }
 
@@ -96,6 +101,7 @@ pub struct Tui {
     relay: String,
     logs: Vec<LogEntry>,
     pending_approval: Option<ApprovalRequest>,
+    approval_drawn_at: Option<Instant>,
     event_rx: Receiver<TuiEvent>,
     should_quit: bool,
 }
@@ -110,6 +116,7 @@ impl Tui {
                 relay,
                 logs: Vec::new(),
                 pending_approval: None,
+                approval_drawn_at: None,
                 event_rx: rx,
                 should_quit: false,
             },
@@ -129,6 +136,7 @@ impl Tui {
 
         while !self.should_quit {
             terminal.draw(|f| self.draw(f))?;
+            self.approval_drawn();
             self.handle_events()?;
         }
 
@@ -138,7 +146,28 @@ impl Tui {
         Ok(())
     }
 
+    // The settle time runs from the first frame that shows the prompt.
+    fn approval_drawn(&mut self) {
+        if self.pending_approval.is_some() && self.approval_drawn_at.is_none() {
+            self.approval_drawn_at = Some(Instant::now());
+        }
+    }
+
     fn handle_events(&mut self) -> io::Result<()> {
+        self.drain_events();
+
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    self.handle_key(key.code);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drain_events(&mut self) {
         while let Ok(evt) = self.event_rx.try_recv() {
             match evt {
                 TuiEvent::Log(entry) => {
@@ -149,44 +178,68 @@ impl Tui {
                 }
                 TuiEvent::Approval(req) => {
                     self.pending_approval = Some(req);
+                    self.approval_drawn_at = None;
+                }
+                TuiEvent::ApprovalTimeout(id) => {
+                    // Only the prompt that timed out: the next request's prompt
+                    // may already be pending.
+                    if self.pending_approval.as_ref().map(|r| r.id) == Some(id) {
+                        if let Some(req) = self.take_approval() {
+                            self.logs.push(
+                                LogEntry::new(&req.app, &req.action, false)
+                                    .with_detail("timed out"),
+                            );
+                        }
+                    }
                 }
                 TuiEvent::Quit => {
                     self.should_quit = true;
                 }
             }
         }
+    }
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            if self.pending_approval.is_none() {
-                                self.should_quit = true;
-                            }
-                        }
-                        KeyCode::Char('y') | KeyCode::Enter => {
-                            if let Some(req) = self.pending_approval.take() {
-                                let _ = req.response_tx.send(true);
-                                self.logs.push(LogEntry::new(&req.app, &req.action, true));
-                            }
-                        }
-                        KeyCode::Char('n') => {
-                            if let Some(req) = self.pending_approval.take() {
-                                let _ = req.response_tx.send(false);
-                                self.logs.push(
-                                    LogEntry::new(&req.app, &req.action, false)
-                                        .with_detail("rejected"),
-                                );
-                            }
-                        }
-                        _ => {}
-                    }
+    fn take_approval(&mut self) -> Option<ApprovalRequest> {
+        self.approval_drawn_at = None;
+        self.pending_approval.take()
+    }
+
+    // Only [Y] approves, and only once the prompt has been on screen for
+    // `APPROVE_SETTLE`. Enter is not an answer: it is the key most likely to
+    // be typed for something else just as a prompt appears.
+    fn handle_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.pending_approval.is_none() {
+                    self.should_quit = true;
                 }
             }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let settled = self
+                    .approval_drawn_at
+                    .is_some_and(|drawn| drawn.elapsed() >= APPROVE_SETTLE);
+                if !settled {
+                    return;
+                }
+                if let Some(req) = self.take_approval() {
+                    let delivered = req.response_tx.send(true).is_ok();
+                    let entry = LogEntry::new(&req.app, &req.action, delivered);
+                    self.logs.push(if delivered {
+                        entry
+                    } else {
+                        entry.with_detail("timed out")
+                    });
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                if let Some(req) = self.take_approval() {
+                    let _ = req.response_tx.send(false);
+                    self.logs
+                        .push(LogEntry::new(&req.app, &req.action, false).with_detail("rejected"));
+                }
+            }
+            _ => {}
         }
-
-        Ok(())
     }
 
     fn draw(&self, frame: &mut Frame) {
@@ -412,5 +465,125 @@ mod terminal_restore_tests {
             buf, b"\x1b[?1049l",
             "active alt-screen must emit LeaveAlternateScreen"
         );
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    fn prompt(id: u64) -> (super::ApprovalRequest, std::sync::mpsc::Receiver<bool>) {
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        (
+            super::ApprovalRequest {
+                id,
+                app: format!("client-{id}"),
+                action: "sign_event".into(),
+                kind: Some(1),
+                content_preview: None,
+                http_auth: None,
+                response_tx,
+            },
+            response_rx,
+        )
+    }
+
+    fn tui() -> (super::Tui, std::sync::mpsc::Sender<super::TuiEvent>) {
+        super::Tui::new("bunker://x".into(), "npub".into(), "wss://r".into())
+    }
+
+    fn settle(t: &mut super::Tui) {
+        t.approval_drawn_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    }
+
+    // A [Y] read before the prompt is drawn, or within the settle time after,
+    // is dropped. [N] is taken at once.
+    #[test]
+    fn approve_waits_until_the_prompt_has_been_on_screen() {
+        use crossterm::event::KeyCode;
+        let (mut t, tx) = tui();
+        let (req, rx) = prompt(1);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+
+        t.handle_key(KeyCode::Char('y'));
+        assert!(rx.try_recv().is_err(), "approved before it was drawn");
+        t.approval_drawn();
+        t.handle_key(KeyCode::Char('y'));
+        assert!(rx.try_recv().is_err(), "approved within the settle time");
+
+        settle(&mut t);
+        t.handle_key(KeyCode::Char('y'));
+        assert_eq!(rx.try_recv(), Ok(true));
+        assert!(t.pending_approval.is_none());
+
+        let (req, rx) = prompt(2);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+        t.handle_key(KeyCode::Char('n'));
+        assert_eq!(rx.try_recv(), Ok(false));
+    }
+
+    // A prompt that replaces another starts its own settle time, so keys
+    // aimed at the old one do not approve it.
+    #[test]
+    fn a_replacing_prompt_starts_its_own_settle_time() {
+        use crossterm::event::KeyCode;
+        let (mut t, tx) = tui();
+        let (first, _first_rx) = prompt(1);
+        tx.send(super::TuiEvent::Approval(first)).unwrap();
+        t.drain_events();
+        t.approval_drawn();
+        settle(&mut t);
+
+        let (second, rx) = prompt(2);
+        tx.send(super::TuiEvent::Approval(second)).unwrap();
+        t.drain_events();
+        t.handle_key(KeyCode::Char('y'));
+        assert!(rx.try_recv().is_err(), "a key aimed at 1 approved 2");
+    }
+
+    #[test]
+    fn enter_does_not_approve() {
+        use crossterm::event::KeyCode;
+        let (mut t, tx) = tui();
+        let (req, rx) = prompt(1);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+        t.approval_drawn();
+        settle(&mut t);
+        t.handle_key(KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(t.pending_approval.is_some());
+    }
+
+    // A timeout takes down only its own prompt.
+    #[test]
+    fn a_timeout_clears_only_its_own_prompt() {
+        let (mut t, tx) = tui();
+        let (req, _rx) = prompt(2);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        tx.send(super::TuiEvent::ApprovalTimeout(1)).unwrap();
+        t.drain_events();
+        assert_eq!(t.pending_approval.as_ref().map(|r| r.id), Some(2));
+        tx.send(super::TuiEvent::ApprovalTimeout(2)).unwrap();
+        t.drain_events();
+        assert!(t.pending_approval.is_none());
+        assert!(t.approval_drawn_at.is_none());
+    }
+
+    // A [Y] that reaches nobody is logged as timed out, not as approved.
+    #[test]
+    fn an_approval_nobody_receives_is_not_logged_as_approved() {
+        use crossterm::event::KeyCode;
+        let (mut t, tx) = tui();
+        let (req, rx) = prompt(1);
+        drop(rx);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+        t.approval_drawn();
+        settle(&mut t);
+        t.handle_key(KeyCode::Char('y'));
+        let last = t.logs.last().unwrap();
+        assert!(!last.success);
+        assert_eq!(last.detail.as_deref(), Some("timed out"));
     }
 }

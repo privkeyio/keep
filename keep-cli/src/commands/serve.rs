@@ -26,6 +26,8 @@ use super::{get_password, is_hidden_vault};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
 
+static NEXT_APPROVAL_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 struct TuiCallbacks {
     tx: Sender<TuiEvent>,
 }
@@ -40,8 +42,9 @@ impl ServerCallbacks for TuiCallbacks {
 
     fn request_approval(&self, request: ApprovalRequest) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
+        let id = NEXT_APPROVAL_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tui_req = TuiApprovalRequest {
-            id: 0,
+            id,
             app: request.app_name,
             action: request.method,
             kind: request.event_kind.map(|k| k.as_u16()),
@@ -57,8 +60,17 @@ impl ServerCallbacks for TuiCallbacks {
         // response is one-shot. The new persistent-grant semantics (#575)
         // only apply to bunkers whose callback returns a non-`JustThisTime`
         // `RememberDuration` (today: keep-mobile).
-        tokio::task::block_in_place(|| response_rx.recv_timeout(APPROVAL_TIMEOUT).unwrap_or(false))
-            .into()
+        tokio::task::block_in_place(|| match response_rx.recv_timeout(APPROVAL_TIMEOUT) {
+            Ok(approved) => approved,
+            Err(_) => {
+                // Closed first, so a late [Y] finds nobody waiting and is
+                // logged as timed out rather than approved.
+                drop(response_rx);
+                let _ = self.tx.send(TuiEvent::ApprovalTimeout(id));
+                false
+            }
+        })
+        .into()
     }
 }
 
