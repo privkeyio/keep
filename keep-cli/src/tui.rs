@@ -221,9 +221,13 @@ impl Tui {
                 }
                 TuiEvent::Approval(req) => {
                     if let Some(prev) = self.take_approval() {
-                        prev.response_tx.answer(false);
+                        let detail = if prev.response_tx.answer(false) {
+                            "superseded"
+                        } else {
+                            "timed out"
+                        };
                         self.logs.push(
-                            LogEntry::new(&prev.app, &prev.action, false).with_detail("superseded"),
+                            LogEntry::new(&prev.app, &prev.action, false).with_detail(detail),
                         );
                     }
                     self.pending_approval = Some(req);
@@ -290,9 +294,15 @@ impl Tui {
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 if let Some(req) = self.take_approval() {
-                    req.response_tx.answer(false);
+                    // A refusal the request never took was the timeout's, not
+                    // the operator's.
+                    let detail = if req.response_tx.answer(false) {
+                        "rejected"
+                    } else {
+                        "timed out"
+                    };
                     self.logs
-                        .push(LogEntry::new(&req.app, &req.action, false).with_detail("rejected"));
+                        .push(LogEntry::new(&req.app, &req.action, false).with_detail(detail));
                 }
             }
             _ => {}
@@ -669,6 +679,25 @@ mod approval_tests {
         assert_eq!(first_rx.try_recv(), Ok(false));
         assert_eq!(t.logs.last().unwrap().detail.as_deref(), Some("superseded"));
         assert_eq!(t.pending_approval.as_ref().map(|r| r.id), Some(2));
+    }
+
+    // A refusal the request never took is logged as the timeout's.
+    #[test]
+    fn a_reject_nobody_receives_is_logged_as_timed_out() {
+        use crossterm::event::KeyCode;
+        let (mut t, tx) = tui();
+        let (req, rx) = prompt(1);
+        drop(rx);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+        t.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(t.logs.last().unwrap().detail.as_deref(), Some("timed out"));
+
+        let (req, _rx) = prompt(2);
+        tx.send(super::TuiEvent::Approval(req)).unwrap();
+        t.drain_events();
+        t.handle_key(key(KeyCode::Char('n')));
+        assert_eq!(t.logs.last().unwrap().detail.as_deref(), Some("rejected"));
     }
 
     // A timeout takes down only its own prompt.
