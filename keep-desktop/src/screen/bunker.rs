@@ -74,6 +74,7 @@ impl ConnectedClient {
 
 #[derive(Debug, Clone)]
 pub struct PendingApprovalDisplay {
+    pub id: u64,
     pub app_pubkey: String,
     pub app_name: String,
     pub method: String,
@@ -125,8 +126,8 @@ pub enum Message {
     RemoveRelay(usize),
     Start,
     Stop,
-    Approve,
-    Reject,
+    Approve(u64),
+    Reject(u64),
     RevokeClient(usize),
     ConfirmRevokeAll,
     CancelRevokeAll,
@@ -134,7 +135,7 @@ pub enum Message {
     CopyUrl,
     ToggleClient(usize),
     TogglePermission(usize, u32),
-    SetApprovalDuration(usize),
+    SetApprovalDuration(u64, usize),
     KindInputChanged(String, String),
     AddKind(String),
     RemoveKind(usize, u16),
@@ -146,8 +147,8 @@ pub enum Event {
     RemoveRelay(usize),
     Start,
     Stop,
-    Approve { duration_index: usize },
-    Reject,
+    Approve { id: u64, duration_index: usize },
+    Reject(u64),
     RevokeClient(usize),
     RevokeAll,
     CopyUrl,
@@ -233,10 +234,11 @@ impl State {
             Message::RemoveRelay(i) => Some(Event::RemoveRelay(i)),
             Message::Start => Some(Event::Start),
             Message::Stop => Some(Event::Stop),
-            Message::Approve => Some(Event::Approve {
+            Message::Approve(id) => Some(Event::Approve {
+                id,
                 duration_index: self.approval_duration,
             }),
-            Message::Reject => Some(Event::Reject),
+            Message::Reject(id) => Some(Event::Reject(id)),
             Message::RevokeClient(i) => Some(Event::RevokeClient(i)),
             Message::ConfirmRevokeAll => {
                 self.revoke_all_confirm = true;
@@ -266,8 +268,12 @@ impl State {
             Message::TogglePermission(client_idx, flag) => {
                 Some(Event::TogglePermission(client_idx, flag))
             }
-            Message::SetApprovalDuration(i) => {
-                self.approval_duration = i;
+            Message::SetApprovalDuration(id, i) => {
+                // A pick made on a card the next request replaced is dropped
+                // rather than applied to the new card.
+                if self.pending_approval.as_ref().map(|p| p.id) == Some(id) {
+                    self.approval_duration = i;
+                }
                 None
             }
             Message::KindInputChanged(pubkey, input) => {
@@ -307,6 +313,13 @@ impl State {
     pub fn relay_added(&mut self, normalized: String) {
         self.relays.push(normalized);
         self.relay_input.clear();
+    }
+
+    // A new prompt starts from the default duration, never one picked for
+    // the card it replaced.
+    pub fn approval_shown(&mut self, display: PendingApprovalDisplay) {
+        self.pending_approval = Some(display);
+        self.approval_duration = 0;
     }
 
     pub fn approval_cleared(&mut self) {
@@ -859,7 +872,7 @@ impl State {
             };
             duration_row = duration_row.push(
                 button(text(*label).size(theme::size::TINY))
-                    .on_press(Message::SetApprovalDuration(idx))
+                    .on_press(Message::SetApprovalDuration(approval.id, idx))
                     .style(style)
                     .padding([2.0, theme::space::SM]),
             );
@@ -872,7 +885,7 @@ impl State {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::Approve)
+            .on_press(Message::Approve(approval.id))
             .style(theme::primary_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),
@@ -881,7 +894,7 @@ impl State {
                     .width(Length::Fill)
                     .align_x(Alignment::Center),
             )
-            .on_press(Message::Reject)
+            .on_press(Message::Reject(approval.id))
             .style(theme::danger_button)
             .padding([theme::space::SM, theme::space::LG])
             .width(Length::FillPortion(1)),

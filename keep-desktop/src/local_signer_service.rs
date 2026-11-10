@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use iced::Task;
@@ -37,13 +37,6 @@ pub(crate) enum LocalSignerEvent {
     },
 }
 
-static NEXT_APPROVAL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// How long a new prompt is on screen before Approve takes effect. Prompts
-/// open one at a time, but the next one can replace an answered or timed out
-/// card within the same poll, under a click aimed at the card it replaced.
-const APPROVE_SETTLE: std::time::Duration = std::time::Duration::from_secs(1);
-
 pub(crate) struct LocalSignerCallbacks {
     pub tx: std::sync::mpsc::Sender<LocalSignerEvent>,
 }
@@ -62,7 +55,7 @@ impl keep_nip46::types::ServerCallbacks for LocalSignerCallbacks {
         request: keep_nip46::types::ApprovalRequest,
     ) -> keep_nip46::types::ApprovalResult {
         let (response_tx, response_rx) = std::sync::mpsc::channel();
-        let id = NEXT_APPROVAL_ID.fetch_add(1, Ordering::Relaxed);
+        let id = crate::app::next_approval_id();
         let display = PendingApprovalDisplay {
             id,
             app_name: request.app_name,
@@ -326,7 +319,7 @@ impl App {
         }
         let settled = self
             .local_signer_approval_shown_at
-            .is_some_and(|shown| shown.elapsed() >= APPROVE_SETTLE);
+            .is_some_and(|shown| shown.elapsed() >= crate::app::APPROVE_SETTLE);
         if approved && !settled {
             return false;
         }
