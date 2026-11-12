@@ -1279,7 +1279,7 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
         let client = Client::new(keys.clone());
         client.add_relay(relay_url.clone()).await.unwrap();
         client.connect().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        client.wait_for_connection(Duration::from_secs(5)).await;
         client
             .subscribe(
                 Filter::new()
@@ -1320,10 +1320,11 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
         if !perms.is_empty() {
             params.push(perms.to_string());
         }
-        client
+        let sent = client
             .send_event(&ask(keys, "connect", "connect", serde_json::json!(params)))
             .await
             .unwrap();
+        assert!(!sent.success.is_empty(), "no relay took the connect");
         let response = await_nip46_response(
             notifications,
             keys,
@@ -1338,7 +1339,7 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
 
     {
         let (keys, client, _) = &apps[0];
-        client
+        let sent = client
             .send_event(&ask(
                 keys,
                 "held",
@@ -1347,6 +1348,7 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
             ))
             .await
             .unwrap();
+        assert!(!sent.success.is_empty(), "no relay took the held request");
     }
     for _ in 0..100 {
         if prompt.open.load(std::sync::atomic::Ordering::SeqCst) == 1 {
@@ -1357,7 +1359,7 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
     assert_eq!(prompt.open.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     let (keys, client, notifications) = &mut apps[1];
-    client
+    let sent = client
         .send_event(&ask(
             keys,
             "free",
@@ -1366,6 +1368,7 @@ async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
         ))
         .await
         .unwrap();
+    assert!(!sent.success.is_empty(), "no relay took the free request");
     let response = await_nip46_response(
         notifications,
         keys,

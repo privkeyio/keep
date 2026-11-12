@@ -62,9 +62,10 @@ impl AppScheduler {
         let mut queues = self.queues.lock().unwrap_or_else(|e| e.into_inner());
         let mut event = event;
         if let Some(tx) = queues.get(&app) {
-            // A worker leaves only with its queue empty and under this lock, so
-            // a closed queue means its worker died (a panic in `serve`), and the
-            // app gets a new one rather than having every request dropped.
+            // A worker leaves only with its queue empty and under this lock, and
+            // a panic in `serve` does not end it, so a closed queue is not
+            // expected. Should one appear, the app gets a new worker rather
+            // than having every request dropped.
             match tx.try_send(event) {
                 Ok(()) => return,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -81,9 +82,6 @@ impl AppScheduler {
             }
         }
         if queues.len() >= MAX_QUEUED_APPS {
-            queues.retain(|_, tx| !tx.is_closed());
-        }
-        if queues.len() >= MAX_QUEUED_APPS {
             warn!(
                 app_id,
                 "dropping a NIP-46 request: too many apps have requests waiting"
@@ -95,11 +93,7 @@ impl AppScheduler {
         queues.insert(app, tx);
         drop(queues);
 
-        while let Some(done) = self.workers.try_join_next() {
-            if let Err(e) = done {
-                error!(error = %e, "a NIP-46 request handler failed");
-            }
-        }
+        while self.workers.try_join_next().is_some() {}
         self.workers.spawn(worker(
             app,
             rx,
@@ -107,6 +101,14 @@ impl AppScheduler {
             Arc::clone(&self.permits),
             Arc::clone(&self.serve),
         ));
+    }
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -123,7 +125,16 @@ async fn worker(
             let Ok(_permit) = permits.acquire().await else {
                 return;
             };
-            serve(event).await;
+            // Run on its own task so a panic ends that request and not this
+            // worker, whose queued requests would otherwise be lost. Aborted
+            // with the worker, so dropping the scheduler still cancels it.
+            let request = tokio::spawn(serve(event));
+            let _cancel = AbortOnDrop(request.abort_handle());
+            if let Err(e) = request.await {
+                if e.is_panic() {
+                    error!("a NIP-46 request handler panicked");
+                }
+            }
         }
         // Checked under the lock `dispatch` sends under, so nothing can be
         // queued between finding the queue empty and leaving.
@@ -264,36 +275,12 @@ mod tests {
         until(|| started.load(SeqCst) == APP_QUEUE_DEPTH + MAX_QUEUED_APPS).await;
     }
 
-    // A worker that dies mid-request does not leave its app unserved.
+    // A request whose handler panics ends alone: the requests its app queued
+    // behind it are still served, in order.
     #[tokio::test]
-    async fn an_app_whose_worker_died_is_served_again() {
-        let served = Arc::new(AtomicUsize::new(0));
-        let serve: Serve = {
-            let served = Arc::clone(&served);
-            Arc::new(move |event: Event| {
-                let served = Arc::clone(&served);
-                Box::pin(async move {
-                    if event.content == "0" {
-                        panic!("handler failed");
-                    }
-                    served.fetch_add(1, SeqCst);
-                })
-            })
-        };
-        let mut scheduler = AppScheduler::new(serve);
-        let app = Keys::generate();
-        scheduler.dispatch(request(&app, 0));
-        until(|| scheduler.queues.lock().unwrap()[&app.public_key()].is_closed()).await;
-        scheduler.dispatch(request(&app, 1));
-        until(|| served.load(SeqCst) == 1).await;
-    }
-
-    // When every slot is taken, ones left by workers that died are reclaimed
-    // before a new app is turned away.
-    #[tokio::test]
-    async fn dead_workers_slots_are_reclaimed() {
-        let held = Arc::new(tokio::sync::Semaphore::new(0));
-        let served = Arc::new(AtomicUsize::new(0));
+    async fn a_panicking_request_does_not_lose_the_apps_queued_requests() {
+        let held = Arc::new(tokio::sync::Notify::new());
+        let served = Arc::new(Mutex::new(Vec::<String>::new()));
         let serve: Serve = {
             let held = Arc::clone(&held);
             let served = Arc::clone(&served);
@@ -301,37 +288,54 @@ mod tests {
                 let held = Arc::clone(&held);
                 let served = Arc::clone(&served);
                 Box::pin(async move {
-                    match event.content.as_str() {
-                        "die" => panic!("handler failed"),
-                        "hold" => drop(held.acquire().await.unwrap()),
-                        _ => {}
+                    if event.content == "0" {
+                        held.notified().await;
+                        panic!("handler failed");
                     }
-                    served.fetch_add(1, SeqCst);
+                    served.lock().unwrap().push(event.content.clone());
                 })
             })
         };
         let mut scheduler = AppScheduler::new(serve);
-        let dead = Keys::generate();
-        let sign = |keys: &Keys, content: &str| {
-            EventBuilder::new(Kind::NostrConnect, content)
-                .sign_with_keys(keys)
-                .unwrap()
-        };
-        scheduler.dispatch(sign(&dead, "die"));
-        until(|| scheduler.queues.lock().unwrap()[&dead.public_key()].is_closed()).await;
-        for _ in 1..MAX_QUEUED_APPS {
-            scheduler.dispatch(sign(&Keys::generate(), "hold"));
+        let app = Keys::generate();
+        for n in 0..3 {
+            scheduler.dispatch(request(&app, n));
         }
-        assert_eq!(scheduler.queues.lock().unwrap().len(), MAX_QUEUED_APPS);
-        let late = Keys::generate();
-        scheduler.dispatch(sign(&late, "go"));
-        assert!(scheduler
-            .queues
-            .lock()
-            .unwrap()
-            .contains_key(&late.public_key()));
-        held.add_permits(10_000);
-        until(|| served.load(SeqCst) == MAX_QUEUED_APPS).await;
+        held.notify_one();
+        until(|| served.lock().unwrap().len() == 2).await;
+        assert_eq!(*served.lock().unwrap(), ["1", "2"]);
+        until(|| scheduler.queues.lock().unwrap().is_empty()).await;
+    }
+
+    // Dropping the scheduler cancels a request still being handled.
+    #[tokio::test]
+    async fn dropping_the_scheduler_cancels_requests_in_flight() {
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, SeqCst);
+            }
+        }
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let serve: Serve = {
+            let started = Arc::clone(&started);
+            let dropped = Arc::clone(&dropped);
+            Arc::new(move |_event: Event| {
+                let started = Arc::clone(&started);
+                let guard = Dropped(Arc::clone(&dropped));
+                Box::pin(async move {
+                    let _guard = guard;
+                    started.fetch_add(1, SeqCst);
+                    std::future::pending::<()>().await;
+                })
+            })
+        };
+        let mut scheduler = AppScheduler::new(serve);
+        scheduler.dispatch(request(&Keys::generate(), 0));
+        until(|| started.load(SeqCst) == 1).await;
+        drop(scheduler);
+        until(|| dropped.load(SeqCst) == 1).await;
     }
 
     // An app's slot is freed once its requests are handled, so apps whose

@@ -842,8 +842,10 @@ impl SignerHandler {
                 KeepError::CapacityExceeded("another FROST signature is underway".into())
             })
             .await?;
-            // The wait can be long; a kill switch thrown meanwhile still
-            // stops this signature.
+            // The wait can be long, and an app revoked or a kill switch thrown
+            // meanwhile still stops this signature.
+            self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
+                .await?;
             self.check_kill_switch()?;
             let sig_bytes = net_frost
                 .sign_nostr_event(event_id.as_bytes(), &frost_event)
