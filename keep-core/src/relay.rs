@@ -450,6 +450,12 @@ fn validate_relay_url_inner(url: &str, allow_internal: bool) -> Result<(), Strin
         return Err("Invalid host characters".into());
     }
 
+    // An empty label slips past the suffix checks below, and a host the url
+    // parser relay clients dial with cannot read would only fail later.
+    if host.starts_with('.') || host.contains("..") || url::Host::parse(host).is_err() {
+        return Err("Invalid host".into());
+    }
+
     if !allow_internal && is_internal_host(host) {
         return Err("Internal addresses not allowed".into());
     }
@@ -477,6 +483,7 @@ fn is_internal_v6(addr: &Ipv6Addr) -> bool {
         || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
         || (s[0] & 0xffc0) == 0xfec0 // site-local fec0::/10 (deprecated)
         || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation 2001:db8::/32
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // NAT64 local-use 64:ff9b:1::/48 (RFC 8215)
         || addr.is_loopback()
         || addr.is_unspecified()
         || addr.is_multicast()
@@ -491,6 +498,10 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     let tail_v4 = || Ipv4Addr::new(o[12], o[13], o[14], o[15]);
     // IPv4-compatible (::x.x.x.x): deprecated but still exploitable
     if s[..6] == [0, 0, 0, 0, 0, 0] {
+        return Some(tail_v4());
+    }
+    // SIIT IPv4-translated (::ffff:0:x.x.x.x, RFC 2765)
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
         return Some(tail_v4());
     }
     // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
@@ -536,12 +547,13 @@ fn is_internal_host(host: &str) -> bool {
     // Strip trailing dot (FQDN bypass)
     let bare = bare.strip_suffix('.').unwrap_or(bare);
 
-    if let Ok(addr) = bare.parse::<Ipv6Addr>() {
-        return is_internal_v6(&addr);
-    }
-
-    if let Ok(addr) = bare.parse::<Ipv4Addr>() {
-        return is_internal_v4(addr);
+    // Judged by the url parser relay clients dial with, which also reads hex,
+    // octal and shortened IPv4 such as 0x7f.1 or 127.1.
+    match url::Host::parse(&host) {
+        Ok(url::Host::Ipv4(addr)) => return is_internal_v4(addr),
+        Ok(url::Host::Ipv6(addr)) => return is_internal_v6(&addr),
+        Ok(url::Host::Domain(_)) => {}
+        Err(_) => return true,
     }
 
     const FORBIDDEN: &[&str] = &["localhost"];
@@ -549,6 +561,8 @@ fn is_internal_host(host: &str) -> bool {
     if FORBIDDEN.contains(&bare)
         || bare.ends_with(".local")
         || bare.ends_with(".localhost")
+        || bare.ends_with(".localdomain")
+        || bare.ends_with(".internal")
         || bare.ends_with(".arpa")
         || bare.ends_with(".onion")
     {
@@ -566,8 +580,9 @@ fn is_cgn(addr: Ipv4Addr) -> bool {
 
 fn is_special_purpose_v4(addr: Ipv4Addr) -> bool {
     let o = addr.octets();
-    // TEST-NET-1 192.0.2.0/24 (RFC 5737)
-    (o[0] == 192 && o[1] == 0 && o[2] == 2)
+    // IETF protocol assignments 192.0.0.0/24 (RFC 6890), including DS-Lite,
+    // and TEST-NET-1 192.0.2.0/24 (RFC 5737)
+    (o[0] == 192 && o[1] == 0 && (o[2] == 0 || o[2] == 2))
     // TEST-NET-2 198.51.100.0/24 (RFC 5737)
     || (o[0] == 198 && o[1] == 51 && o[2] == 100)
     // TEST-NET-3 203.0.113.0/24 (RFC 5737)
@@ -626,6 +641,86 @@ mod tests {
         assert!(validate_relay_url("wss://172.31.255.255/").is_err());
         assert!(validate_relay_url("wss://169.254.169.254/").is_err());
         assert!(validate_relay_url("wss://0.0.0.0/").is_err());
+    }
+
+    // The url parser that relay clients dial with reads these as IPv4, so they
+    // must be judged by the address it will reach.
+    #[test]
+    fn rejects_internal_ipv4_in_forms_the_url_parser_accepts() {
+        for (url, reaches) in [
+            ("wss://0x7f.1/", "127.0.0.1"),
+            ("wss://127.1/", "127.0.0.1"),
+            ("wss://2130706433/", "127.0.0.1"),
+            ("wss://0x7f000001/", "127.0.0.1"),
+            ("wss://012.0.0.1/", "10.0.0.1"),
+            ("wss://0177.0.0.1/", "127.0.0.1"),
+            ("wss://0xa9.0xfe.0xa9.0xfe/", "169.254.169.254"),
+            ("wss://192.168.257/", "192.168.1.1"),
+            ("wss://10.0.0.1./", "10.0.0.1"),
+            ("wss://0x0a.0.0.1:443/", "10.0.0.1"),
+        ] {
+            let parsed = url::Url::parse(url).unwrap();
+            assert_eq!(parsed.host_str(), Some(reaches), "{url}");
+            assert!(validate_relay_url(url).is_err(), "{url} was allowed");
+        }
+        assert!(validate_relay_url("wss://0x08.0x08.0x08.0x08/").is_ok());
+        assert!(validate_relay_url("wss://010.010.010.010/").is_ok());
+        assert!(validate_relay_url("wss://134744072/").is_ok());
+    }
+
+    // A host the url parser cannot read is refused, rather than left to
+    // whatever the relay client makes of it.
+    #[test]
+    fn rejects_hosts_the_url_parser_refuses() {
+        for url in [
+            "wss://1.2.3.256/",
+            "wss://0x7f000001.x.0/",
+            "wss://relay.example.0x/",
+            "wss://relay.example.99999999999/",
+        ] {
+            assert_eq!(validate_relay_url(url), Err("Invalid host".into()), "{url}");
+            assert!(validate_relay_url_allow_internal(url).is_err(), "{url}");
+        }
+    }
+
+    // Names that resolve to the machine itself or to cloud metadata, and
+    // address ranges that only reach a local network.
+    #[test]
+    fn rejects_local_names_and_ranges() {
+        for url in [
+            "wss://localhost.localdomain/",
+            "wss://relay.localhost.localdomain/",
+            "wss://metadata.google.internal/",
+            "wss://ip-10-0-0-1.ec2.internal/",
+            "wss://192.0.0.1/",
+            "wss://192.0.0.170/",
+            "wss://[64:ff9b:1::a00:1]/",
+            "wss://[::ffff:0:7f00:1]/",
+            "wss://[::ffff:0:a9fe:a9fe]/",
+        ] {
+            assert!(validate_relay_url(url).is_err(), "{url} was allowed");
+        }
+        assert!(validate_relay_url("wss://internal.example.com/").is_ok());
+        assert!(validate_relay_url("wss://relay.localdomain.example.com/").is_ok());
+        assert!(validate_relay_url("wss://192.0.1.1/").is_ok());
+        assert!(validate_relay_url("wss://[64:ff9b:2::a00:1]/").is_ok());
+        assert!(validate_relay_url("wss://[::ffff:0:808:808]/").is_ok());
+    }
+
+    // An empty label would let a host past the suffix checks.
+    #[test]
+    fn rejects_empty_labels() {
+        for url in [
+            "wss://relay.local../",
+            "wss://foo.localhost../",
+            "wss://10.0.0.1../",
+            "wss://relay..example.com/",
+            "wss://.relay.example.com/",
+            "wss://./",
+        ] {
+            assert_eq!(validate_relay_url(url), Err("Invalid host".into()), "{url}");
+        }
+        assert!(validate_relay_url("wss://relay.example.com./").is_ok());
     }
 
     #[test]
