@@ -500,6 +500,10 @@ fn to_embedded_v4(addr: &Ipv6Addr) -> Option<Ipv4Addr> {
     if s[..6] == [0, 0, 0, 0, 0, 0] {
         return Some(tail_v4());
     }
+    // SIIT IPv4-translated (::ffff:0:x.x.x.x, RFC 2765)
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return Some(tail_v4());
+    }
     // NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
     if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0, 0, 0, 0] {
         return Some(tail_v4());
@@ -691,6 +695,8 @@ mod tests {
             "wss://192.0.0.1/",
             "wss://192.0.0.170/",
             "wss://[64:ff9b:1::a00:1]/",
+            "wss://[::ffff:0:7f00:1]/",
+            "wss://[::ffff:0:a9fe:a9fe]/",
         ] {
             assert!(validate_relay_url(url).is_err(), "{url} was allowed");
         }
@@ -698,6 +704,7 @@ mod tests {
         assert!(validate_relay_url("wss://relay.localdomain.example.com/").is_ok());
         assert!(validate_relay_url("wss://192.0.1.1/").is_ok());
         assert!(validate_relay_url("wss://[64:ff9b:2::a00:1]/").is_ok());
+        assert!(validate_relay_url("wss://[::ffff:0:808:808]/").is_ok());
     }
 
     // An empty label would let a host past the suffix checks.
