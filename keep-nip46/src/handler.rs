@@ -846,6 +846,17 @@ impl SignerHandler {
             // meanwhile still stops this signature.
             self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
                 .await?;
+            // So does a refusal recorded for this kind, or, for a request that
+            // was signing without a prompt, the kind no longer being approved.
+            match self.permissions.lock().await.decide(&app_pubkey, kind) {
+                ApprovalDecision::Deny => return Err(KeepError::UserRejected),
+                ApprovalDecision::Ask if !ask => {
+                    return Err(KeepError::PermissionDenied(
+                        "this kind now needs approval".into(),
+                    ))
+                }
+                ApprovalDecision::Ask | ApprovalDecision::Allow => {}
+            }
             self.check_kill_switch()?;
             let sig_bytes = net_frost
                 .sign_nostr_event(event_id.as_bytes(), &frost_event)
