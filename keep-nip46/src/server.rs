@@ -294,8 +294,7 @@ enum NotificationsEnded {
 /// answers `Err(Lagged)`, and that loop treats it exactly like a clean stop:
 /// it returns `Ok(())`, so the bunker stopped answering and reported a
 /// successful, intentional exit with nothing logged. Requests are handled one
-/// at a time and an approval can hold one for a minute, which is long enough
-/// to fall that far behind on a busy relay.
+/// at a time per app, and an approval can hold an app's queue for a minute.
 ///
 /// A lag now costs only what it skipped: the receiver resumes from the oldest
 /// notification still held, the count is logged, and clients whose requests
@@ -672,47 +671,54 @@ impl Server {
         let max_event_json_size = self.config.max_event_json_size;
         let since = self.serving_since;
 
-        let ended = drive_notifications(self.client.notifications(), |notification| {
+        let serve: crate::scheduler::Serve = Arc::new(move |event: Event| {
             let handler = handler.clone();
             let keys = keys.clone();
             let client = client.clone();
             let callbacks = callbacks.clone();
+            Box::pin(async move {
+                if let Err(e) = Self::handle_nip46_event(
+                    &handler,
+                    &keys,
+                    &client,
+                    &event,
+                    callbacks.as_deref(),
+                    max_event_json_size,
+                )
+                .await
+                {
+                    warn!(error = %e, "error handling NIP-46 event");
+                }
+            })
+        });
+        // Dropped when serving ends, which aborts the requests still queued.
+        let mut scheduler = crate::scheduler::AppScheduler::new(serve);
 
-            async move {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    // `since` is checked here as well as in the filter: the pool
-                    // does not hold a relay to it.
-                    let now = Timestamp::now();
-                    if event.kind == Kind::NostrConnect && is_out_of_window(&event, since, now) {
-                        let app_id = &event.pubkey.to_hex()[..8];
-                        if is_too_far_ahead(&event, now) {
-                            // Most likely a client whose clock is set ahead,
-                            // which otherwise just sees every request hang.
-                            warn!(app_id, "ignoring a NIP-46 request dated too far ahead");
-                        } else {
-                            debug!(
-                                app_id,
-                                "ignoring a NIP-46 request from before this bunker started"
-                            );
-                        }
-                    } else if event.kind == Kind::NostrConnect {
-                        if let Err(e) = Self::handle_nip46_event(
-                            &handler,
-                            &keys,
-                            &client,
-                            &event,
-                            callbacks.as_deref(),
-                            max_event_json_size,
-                        )
-                        .await
-                        {
-                            warn!(error = %e, "error handling NIP-46 event");
-                        }
+        let ended = drive_notifications(self.client.notifications(), |notification| {
+            if let RelayPoolNotification::Event { event, .. } = notification {
+                // `since` is checked here as well as in the filter: the pool
+                // does not hold a relay to it.
+                let now = Timestamp::now();
+                if event.kind == Kind::NostrConnect && is_out_of_window(&event, since, now) {
+                    let app_id = &event.pubkey.to_hex()[..8];
+                    if is_too_far_ahead(&event, now) {
+                        // Most likely a client whose clock is set ahead,
+                        // which otherwise just sees every request hang.
+                        warn!(app_id, "ignoring a NIP-46 request dated too far ahead");
+                    } else {
+                        debug!(
+                            app_id,
+                            "ignoring a NIP-46 request from before this bunker started"
+                        );
                     }
+                } else if event.kind == Kind::NostrConnect {
+                    scheduler.dispatch(*event);
                 }
             }
+            std::future::ready(())
         })
         .await;
+        drop(scheduler);
 
         self.running = false;
         match ended {

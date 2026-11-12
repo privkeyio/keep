@@ -13,6 +13,7 @@ pub mod handler;
 pub mod local_server;
 pub mod permissions;
 pub mod rate_limit;
+mod scheduler;
 pub mod server;
 pub mod types;
 

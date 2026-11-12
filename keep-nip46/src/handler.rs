@@ -255,6 +255,14 @@ pub struct SignerHandler {
     /// click would take the answer meant for the first.
     prompt_gate: Semaphore,
     prompt_waiters: AtomicUsize,
+    /// Lets one network FROST signature be requested at a time. Relay
+    /// requests from different apps are now served concurrently, and each
+    /// co-sign can open an approval prompt on a co-signing device, whose
+    /// prompts are built to show one request at a time. Waiters are capped
+    /// and bounded like the prompt gate's, so a slow co-sign cannot pile up
+    /// requests that each hold one of the server's concurrent slots.
+    frost_sign_gate: Semaphore,
+    frost_sign_waiters: AtomicUsize,
 }
 
 /// Requests that may wait for the open prompt to close before more are
@@ -274,6 +282,24 @@ impl Drop for PromptWaiter<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+// Waits for `gate`, refusing with `busy` once MAX_PROMPT_WAITERS are already
+// waiting or after PROMPT_GATE_WAIT.
+async fn bounded_turn<'a>(
+    gate: &'a Semaphore,
+    waiters: &AtomicUsize,
+    busy: impl Fn() -> KeepError,
+) -> Result<tokio::sync::SemaphorePermit<'a>> {
+    if waiters.fetch_add(1, Ordering::SeqCst) >= MAX_PROMPT_WAITERS {
+        waiters.fetch_sub(1, Ordering::SeqCst);
+        return Err(busy());
+    }
+    let _waiter = PromptWaiter(waiters);
+    tokio::time::timeout(PROMPT_GATE_WAIT, gate.acquire())
+        .await
+        .map_err(|_| busy())?
+        .map_err(|_| busy())
 }
 
 impl SignerHandler {
@@ -301,6 +327,8 @@ impl SignerHandler {
             kill_switch: Arc::new(AtomicBool::new(false)),
             transport_pubkey: None,
             prompt_gate: Semaphore::new(1),
+            frost_sign_gate: Semaphore::new(1),
+            frost_sign_waiters: AtomicUsize::new(0),
             prompt_waiters: AtomicUsize::new(0),
         }
     }
@@ -810,6 +838,13 @@ impl SignerHandler {
             // #529: pass the full unsigned event as a structured payload so
             // co-signers can recompute the id and reject a cross-domain
             // label spoof (e.g. a Bitcoin sighash relabeled as nostr-event).
+            let _one_cosign = bounded_turn(&self.frost_sign_gate, &self.frost_sign_waiters, || {
+                KeepError::CapacityExceeded("another FROST signature is underway".into())
+            })
+            .await?;
+            // The wait can be long; a kill switch thrown meanwhile still
+            // stops this signature.
+            self.check_kill_switch()?;
             let sig_bytes = net_frost
                 .sign_nostr_event(event_id.as_bytes(), &frost_event)
                 .await?;
@@ -1220,16 +1255,7 @@ impl SignerHandler {
             // Refused as busy rather than as rejected: nobody said no, so
             // nothing may be remembered or audited as the user's answer.
             let busy = || KeepError::CapacityExceeded("another approval prompt is open".into());
-            if self.prompt_waiters.fetch_add(1, Ordering::SeqCst) >= MAX_PROMPT_WAITERS {
-                self.prompt_waiters.fetch_sub(1, Ordering::SeqCst);
-                return Err(busy());
-            }
-            let waiter = PromptWaiter(&self.prompt_waiters);
-            let _permit = tokio::time::timeout(PROMPT_GATE_WAIT, self.prompt_gate.acquire())
-                .await
-                .map_err(|_| busy())?
-                .map_err(|_| busy())?;
-            drop(waiter);
+            let _permit = bounded_turn(&self.prompt_gate, &self.prompt_waiters, busy).await?;
             // The wait can be most of a minute, in which the kill switch may
             // have been thrown. Nobody should be asked about a request that
             // would be refused anyway.
