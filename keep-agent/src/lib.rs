@@ -14,6 +14,7 @@ pub mod inject;
 pub mod manager;
 pub mod policy;
 pub mod rate_limit;
+mod relay_transport;
 pub mod scope;
 pub mod session;
 pub mod ssh;

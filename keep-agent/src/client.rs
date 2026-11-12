@@ -40,7 +40,7 @@ impl PendingSession {
         let (signer_pubkey, relay_url, _) = AgentClient::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
-        let client = Client::new(client_keys.clone());
+        let client = relay_client(&client_keys);
 
         client
             .pool()
@@ -227,7 +227,7 @@ impl AgentClient {
         let (signer_pubkey, relay_url, secret) = Self::parse_bunker_url(bunker_url)?;
 
         let client_keys = Keys::generate();
-        let client = Client::new(client_keys.clone());
+        let client = relay_client(&client_keys);
 
         client
             .pool()
@@ -621,6 +621,13 @@ pub fn loopback_proxy(port: u16) -> Result<SocketAddr> {
         return Err(AgentError::Connection("Invalid proxy port".into()));
     }
     Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port))
+}
+
+fn relay_client(keys: &Keys) -> Client {
+    Client::builder()
+        .signer(keys.clone())
+        .websocket_transport(crate::relay_transport::ScreenedTransport::default())
+        .build()
 }
 
 fn relay_opts(proxy: Option<SocketAddr>) -> RelayOptions {

@@ -22,6 +22,10 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 nostr-sdk = { workspace = true }
+# The relay stack's own socket crates, at the versions nostr-sdk resolves, so
+# the screened transport hands back the stream type the pool expects.
+async-wsocket = "0.13"
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 hex = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }
