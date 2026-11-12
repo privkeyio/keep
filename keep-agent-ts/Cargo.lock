@@ -1563,6 +1563,7 @@ dependencies = [
 name = "keep-agent"
 version = "0.14.0"
 dependencies = [
+ "async-wsocket",
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek",
@@ -1583,6 +1584,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "url",
  "urlencoding",
