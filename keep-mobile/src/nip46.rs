@@ -860,6 +860,46 @@ impl BunkerHandler {
 /// Global event kinds the bunker signs without a per-request prompt for any
 /// client. Kept to the safe engine default (kind 7 reactions) only. NIP-98 is
 /// NOT global; see `bunker_connect_auto_approve_kinds`.
+fn bunker_server_config(
+    mobile: &KeepMobile,
+    connect_secret: &str,
+    pre_grants: Vec<PreGrantedApp>,
+) -> Result<ServerConfig, KeepMobileError> {
+    Ok(ServerConfig {
+        rate_limit: Some(RateLimitConfig::default()),
+        expected_secret: Some(connect_secret.to_owned()),
+        pre_grants,
+        // Approving the bunker connection (the secret in the bunker URL
+        // is the grant) must let the client sign, mirroring the
+        // always-on bunker in keep-web. Without this the client only
+        // gets get_public_key and every sign_event is denied — the
+        // client logs in but its signed-request calls all fail.
+        //
+        // TRUST MODEL: this connect grant authorizes signing, but
+        // NIP-98 (kind 27235) is NEVER auto-approved. Per #575 it always
+        // falls through to the per-request approval prompt and is never
+        // remembered (see `bunker_connect_auto_approve_kinds`, now
+        // empty), so a shared connect secret cannot silently mint NIP-98
+        // HTTP-auth tokens. The connect secret is still a shared bearer
+        // credential for non-NIP-98 signing; a per-app/URL-method
+        // allowlist is follow-up work.
+        connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+        auto_approve_kinds: bunker_auto_approve_kinds(),
+        connect_auto_approve_kinds: bunker_connect_auto_approve_kinds(),
+        // Enforce the SPKI pin inside the handshake of the socket that
+        // carries remote-signing traffic, not only on the
+        // `verify_and_pin_relays` probe a start runs. Read-only: the live
+        // handshake never records a pin, so a bunker reconnect cannot
+        // write trust into the pin store.
+        tls_pinning: Some(mobile.live_pinning()?),
+        // The handler checks this before every sign and every encrypt or
+        // decrypt. A 1-of-1 bunker signs locally and never reaches the FROST
+        // hook that also checks the switch.
+        kill_switch: Some(Arc::clone(&mobile.kill_switch)),
+        ..ServerConfig::default()
+    })
+}
+
 fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
     std::collections::HashSet::from([Kind::Reaction])
 }
@@ -1152,35 +1192,7 @@ impl BunkerHandler {
             // grant/revoke via the `persist_permissions` callback below.
             let pre_grants = self.grants_to_restore(&grant_scope)?;
 
-            let config = ServerConfig {
-                rate_limit: Some(RateLimitConfig::default()),
-                expected_secret: Some(connect_secret.as_str().to_owned()),
-                pre_grants,
-                // Approving the bunker connection (the secret in the bunker URL
-                // is the grant) must let the client sign, mirroring the
-                // always-on bunker in keep-web. Without this the client only
-                // gets get_public_key and every sign_event is denied — the
-                // client logs in but its signed-request calls all fail.
-                //
-                // TRUST MODEL: this connect grant authorizes signing, but
-                // NIP-98 (kind 27235) is NEVER auto-approved. Per #575 it always
-                // falls through to the per-request approval prompt and is never
-                // remembered (see `bunker_connect_auto_approve_kinds`, now
-                // empty), so a shared connect secret cannot silently mint NIP-98
-                // HTTP-auth tokens. The connect secret is still a shared bearer
-                // credential for non-NIP-98 signing; a per-app/URL-method
-                // allowlist is follow-up work.
-                connect_grant: Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
-                auto_approve_kinds: bunker_auto_approve_kinds(),
-                connect_auto_approve_kinds: bunker_connect_auto_approve_kinds(),
-                // Enforce the SPKI pin inside the handshake of the socket that
-                // carries remote-signing traffic, not only on the
-                // `verify_and_pin_relays` probe above. Read-only: the live
-                // handshake never records a pin, so a bunker reconnect cannot
-                // write trust into the pin store.
-                tls_pinning: Some(self.mobile.live_pinning()?),
-                ..ServerConfig::default()
-            };
+            let config = bunker_server_config(&self.mobile, connect_secret.as_str(), pre_grants)?;
 
             let serving = Arc::new(AtomicBool::new(true));
             let server_callbacks = Some(Arc::new(CallbackBridge {
@@ -2436,6 +2448,128 @@ mod tests {
             .get("error")
             .and_then(|v| v.as_str())
             .map(str::to_owned)
+    }
+
+    // End to end over a relay under the production bunker config, signing
+    // locally as a 1-of-1 bunker does. The kill switch thrown while the bunker
+    // runs refuses a kind it signs without a prompt, and released lets it sign
+    // again. Nothing asks the user either way.
+    #[test]
+    fn the_kill_switch_stops_a_running_bunker_end_to_end() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let (transport, secret) = load_or_create_bunker_keys(&mobile).unwrap();
+        let scope = grant_scope(&transport, &GROUP).unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let relay = mobile
+            .runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let url = mobile.runtime.block_on(relay.url()).to_string();
+        let keyring = {
+            let mut keyring = keep_core::keyring::Keyring::new();
+            let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+            keyring
+                .load_key(
+                    *keypair.public_bytes(),
+                    *keypair.secret_bytes(),
+                    keep_core::keys::KeyType::Nostr,
+                    "test".into(),
+                )
+                .unwrap();
+            Arc::new(tokio::sync::Mutex::new(keyring))
+        };
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(RefusesAndCounts(Arc::clone(&prompts))),
+            mobile: Arc::clone(&mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: scope,
+            serving: Arc::new(AtomicBool::new(true)),
+        };
+        let config = bunker_server_config(&mobile, secret.as_str(), Vec::new()).unwrap();
+        let mut server = mobile
+            .runtime
+            .block_on(Server::new_with_config(
+                keyring,
+                None,
+                None,
+                std::slice::from_ref(&url),
+                Some(Arc::new(bridge) as Arc<dyn ServerCallbacks>),
+                config,
+            ))
+            .unwrap();
+        let bunker = server.pubkey();
+        let running = mobile.runtime.spawn(async move {
+            let _ = server.run().await;
+        });
+        std::thread::sleep(Duration::from_millis(500));
+
+        let app = nostr_sdk::Keys::generate();
+        let client = listening(&mobile, &url, &app, bunker);
+        let ask = |id: &str, method: &str, params: serde_json::Value| {
+            mobile
+                .runtime
+                .block_on(ask_over_relay(&client, &app, bunker, id, method, params))
+        };
+        let connect = serde_json::json!([bunker.to_hex(), secret.as_str()]);
+        assert_eq!(error_of(ask("connect", "connect", connect)), None);
+        let reaction = |id: &str| {
+            let unsigned = serde_json::json!({
+                "kind": 7, "content": "+", "tags": [],
+                "created_at": nostr_sdk::Timestamp::now().as_secs(),
+            });
+            ask(id, "sign_event", serde_json::json!([unsigned.to_string()]))
+        };
+        assert_eq!(
+            error_of(reaction("before")),
+            None,
+            "kind 7 signs unprompted"
+        );
+
+        mobile.set_kill_switch(true).unwrap();
+        assert_eq!(
+            error_of(reaction("engaged")).as_deref(),
+            Some("Permission denied"),
+            "the engaged switch refuses it"
+        );
+
+        mobile.set_kill_switch(false).unwrap();
+        assert_eq!(
+            error_of(reaction("released")),
+            None,
+            "released, it signs again"
+        );
+        assert_eq!(prompts.load(Ordering::Acquire), 0, "nothing asked the user");
+        running.abort();
+        mobile.runtime.block_on(client.disconnect());
+    }
+
+    // The bunker's flag starts from the persisted switch, and engaged when
+    // the switch cannot be read.
+    #[test]
+    fn the_bunker_flag_starts_from_the_persisted_switch() {
+        let flag = |stored: Option<&[u8]>| {
+            let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+            if let Some(bytes) = stored {
+                storage
+                    .store_share_by_key(
+                        crate::KILL_SWITCH_STORAGE_KEY.into(),
+                        bytes.to_vec(),
+                        crate::persistence::storage_metadata("kill_switch"),
+                    )
+                    .unwrap();
+            }
+            KeepMobile::new(storage)
+                .unwrap()
+                .kill_switch
+                .load(Ordering::Acquire)
+        };
+        assert!(!flag(None), "never set reads as released");
+        assert!(!flag(Some(b"false")));
+        assert!(flag(Some(b"true")));
+        assert!(flag(Some(b"not json")), "unreadable reads as engaged");
     }
 
     // End to end over a relay, with the production callback bridge and grants
