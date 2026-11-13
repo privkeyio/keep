@@ -441,6 +441,14 @@ impl Nip55Handler {
             Nip55RequestType::DecryptZapEvent => self.handle_decrypt_zap_event(request.content),
         };
 
+        // The switch may have been engaged while the request was served,
+        // during a FROST round for one: return nothing it produced.
+        if result.is_ok() && self.signing_killed() {
+            result = Err(KeepMobileError::PolicyViolation {
+                reason: KILL_SWITCH_MESSAGE.into(),
+            });
+        }
+
         if let Ok(ref mut response) = result {
             response.id = request_id;
         }
