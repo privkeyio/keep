@@ -10637,6 +10637,18 @@ mod baseline_presign_policy_tests {
             .approve_ecdh(&peer)
             .expect_err("the kill switch refuses ECDH");
         assert!(format!("{err}").contains("disabled"), "{err}");
+        hooks
+            .storage
+            .store_share_by_key(
+                KILL_SWITCH_STORAGE_KEY.into(),
+                b"not json".to_vec(),
+                persistence::storage_metadata("kill_switch"),
+            )
+            .unwrap();
+        assert!(
+            hooks.approve_ecdh(&peer).is_err(),
+            "an unreadable switch refuses"
+        );
     }
 
     /// Hooks for share 1 wired to `mobile` the way the live node's are, with a

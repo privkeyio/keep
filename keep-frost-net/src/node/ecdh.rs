@@ -24,6 +24,15 @@ impl KfpNode {
             return Ok(());
         }
 
+        // A duress-frozen holder answers no ECDH, as it signs nothing: a quorum
+        // of partials decrypts the group's messages for whoever asks.
+        if self.is_duress_frozen() {
+            debug!("Refusing ECDH request: holder is duress-frozen");
+            return Err(FrostNetError::PolicyViolation(
+                "holder is duress-frozen; ECDH refused".into(),
+            ));
+        }
+
         if !request
             .participants
             .contains(&self.share.metadata.identifier)
@@ -50,12 +59,6 @@ impl KfpNode {
             )));
         }
 
-        let hooks = self.hooks.read().clone();
-        if let Err(e) = hooks.approve_ecdh(&from) {
-            debug!(from = %from, "Rejecting ECDH request: refused by hook");
-            return Err(e);
-        }
-
         // Attestation gate, matching the OPRF/enroll oracles (the #621 ship-gate
         // this responder was missing): a quorum of these partials combines to
         // the group's ECDH shared secret with an attacker-chosen recipient, so
@@ -75,6 +78,12 @@ impl KfpNode {
                     peer.attestation_status
                 )));
             }
+        }
+
+        let hooks = self.hooks.read().clone();
+        if let Err(e) = hooks.approve_ecdh(&from) {
+            debug!(from = %from, "Rejecting ECDH request: refused by hook");
+            return Err(e);
         }
 
         info!(
@@ -233,6 +242,11 @@ impl KfpNode {
     }
 
     pub async fn request_ecdh(&self, recipient_pubkey: &[u8; 33]) -> Result<Zeroizing<[u8; 32]>> {
+        // Our own partial is as much a part of the secret as a peer's, so the
+        // hook that refuses a peer refuses this node's own request too.
+        let hooks = self.hooks.read().clone();
+        hooks.approve_ecdh(&self.keys.public_key())?;
+
         let threshold = self.share.metadata.threshold;
 
         let (participants, participant_peers) =
@@ -589,25 +603,26 @@ mod gate_tests {
         ));
     }
 
-    /// A requester that is not a known peer at all is refused: the ECDH oracle
-    /// exposes the group's shared secret, so an unannounced pubkey cannot invoke
-    /// it. Fresh `created_at` passes the replay gate so the attestation gate is
-    /// what trips.
+    struct RefusesEcdh;
+    impl crate::SigningHooks for RefusesEcdh {
+        fn pre_sign(&self, _session: &crate::SessionInfo) -> Result<()> {
+            Ok(())
+        }
+        fn post_sign(&self, _session: &crate::SessionInfo, _signature: &[u8; 64]) {}
+        fn approve_ecdh(&self, _requester: &PublicKey) -> Result<()> {
+            Err(FrostNetError::PolicyViolation("kill switch".into()))
+        }
+    }
+
     #[tokio::test]
     async fn handle_ecdh_request_refused_by_the_hook() {
-        struct RefusesEcdh;
-        impl crate::SigningHooks for RefusesEcdh {
-            fn pre_sign(&self, _session: &crate::SessionInfo) -> Result<()> {
-                Ok(())
-            }
-            fn post_sign(&self, _session: &crate::SessionInfo, _signature: &[u8; 64]) {}
-            fn approve_ecdh(&self, _requester: &PublicKey) -> Result<()> {
-                Err(FrostNetError::PolicyViolation("kill switch".into()))
-            }
-        }
         let (node, _relay) = test_node().await;
         node.set_hooks(std::sync::Arc::new(RefusesEcdh));
         let from = Keys::generate().public_key();
+        node.test_inject_peer(
+            crate::peer::Peer::new(from, 2)
+                .with_attestation_status(crate::peer::AttestationStatus::Verified),
+        );
         let group = *node.group_pubkey();
         let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
         assert!(matches!(
@@ -616,6 +631,44 @@ mod gate_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn handle_ecdh_request_refused_when_duress_frozen() {
+        let (mut node, _relay) = test_node().await;
+        let group = *node.group_pubkey();
+        let beacon = Keys::generate();
+        node.set_duress_beacon_pins(vec![beacon.public_key()]);
+        let ev =
+            KfpEventBuilder::duress_beacon(&beacon, &group, &[8u8; 32], &node.keys.public_key())
+                .await
+                .unwrap();
+        node.handle_gift_wrap(&ev).await.unwrap();
+        assert!(node.is_duress_frozen(), "node must be frozen");
+        let from = Keys::generate().public_key();
+        node.test_inject_peer(
+            crate::peer::Peer::new(from, 2)
+                .with_attestation_status(crate::peer::AttestationStatus::Verified),
+        );
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn our_own_ecdh_request_is_refused_by_the_hook() {
+        let (node, _relay) = test_node().await;
+        node.set_hooks(std::sync::Arc::new(RefusesEcdh));
+        assert!(matches!(
+            node.request_ecdh(&BAD_RECIPIENT).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
+    /// A requester that is not a known peer at all is refused: the ECDH oracle
+    /// exposes the group's shared secret, so an unannounced pubkey cannot invoke
+    /// it. Fresh `created_at` passes the replay gate so the attestation gate is
+    /// what trips.
     #[tokio::test]
     async fn handle_ecdh_request_rejects_unannounced_requester() {
         let (node, _relay) = test_node().await;
