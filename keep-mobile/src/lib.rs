@@ -339,11 +339,16 @@ fn sign_request_from_session(
 }
 
 /// A Nostr event kind that is sensitive, or that moves or authorizes value:
-/// NIP-47 wallet requests, NIP-60 and NIP-61 cashu tokens and nutzaps, NIP-46
-/// messages. Their content is often encrypted, so the prompt cannot show what
-/// they do.
+/// NIP-47 wallet requests, the NIP-60 wallet and its tokens, NIP-61 nutzaps and
+/// nutzap info, NIP-46 messages, Blossom authorization and NIP-09 deletions,
+/// which can delete wallet tokens. Their content is often encrypted, so the
+/// prompt cannot show what they do.
 fn needs_fresh_auth_kind(kind: u32) -> bool {
-    is_sensitive_kind(kind) || matches!(kind, 7375 | 7376 | 9321 | 23194 | 24133)
+    is_sensitive_kind(kind)
+        || matches!(
+            kind,
+            5 | 7374 | 7375 | 7376 | 9321 | 10019 | 17375 | 23194 | 24133 | 24242
+        )
 }
 
 /// What the request signs, from its structured body. Present only with one:
@@ -9507,7 +9512,8 @@ mod sign_request_mapping_tests {
         };
         assert!(!described(1).needs_fresh_auth);
         for kind in [
-            0, 3, 4, 10002, 22242, 27235, 30023, 7375, 9321, 23194, 24133,
+            0, 3, 4, 5, 10002, 22242, 27235, 30023, 7374, 7375, 7376, 9321, 10019, 17375, 23194,
+            24133, 24242,
         ] {
             assert!(described(kind).needs_fresh_auth, "kind {kind}");
         }
