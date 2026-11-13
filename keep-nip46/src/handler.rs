@@ -843,12 +843,28 @@ impl SignerHandler {
             })
             .await?;
             // The wait can be long, and an app revoked or a kill switch thrown
-            // meanwhile still stops this signature.
-            self.require_permission(&app_pubkey, Permission::SIGN_EVENT)
-                .await?;
-            // So does a refusal recorded for this kind, or, for a request that
-            // was signing without a prompt, the kind no longer being approved.
-            match self.permissions.lock().await.decide(&app_pubkey, kind) {
+            // meanwhile still stops this signature. So does a refusal recorded
+            // for this kind, or, for a request that was signing without a
+            // prompt, the kind no longer being approved. Both are read under
+            // one guard, since decide() alone says Ask for a revoked app.
+            let (permitted, decision) = {
+                let pm = self.permissions.lock().await;
+                (
+                    pm.has_permission(&app_pubkey, Permission::SIGN_EVENT),
+                    pm.decide(&app_pubkey, kind),
+                )
+            };
+            if !permitted {
+                self.audit.lock().await.log(
+                    AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
+                        .with_success(false)
+                        .with_reason("SIGN_EVENT revoked while waiting to co-sign"),
+                );
+                return Err(KeepError::PermissionDenied(
+                    "operation not permitted".into(),
+                ));
+            }
+            match decision {
                 ApprovalDecision::Deny => return Err(KeepError::UserRejected),
                 ApprovalDecision::Ask if !ask => {
                     return Err(KeepError::PermissionDenied(
