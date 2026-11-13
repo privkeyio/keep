@@ -857,14 +857,12 @@ impl BunkerHandler {
     }
 }
 
-/// Global event kinds the bunker signs without a per-request prompt for any
-/// client. Kept to the safe engine default (kind 7 reactions) only. NIP-98 is
-/// NOT global; see `bunker_connect_auto_approve_kinds`.
 fn bunker_server_config(
     mobile: &KeepMobile,
     connect_secret: &str,
     pre_grants: Vec<PreGrantedApp>,
 ) -> Result<ServerConfig, KeepMobileError> {
+    mobile.reload_kill_switch();
     Ok(ServerConfig {
         rate_limit: Some(RateLimitConfig::default()),
         expected_secret: Some(connect_secret.to_owned()),
@@ -900,6 +898,9 @@ fn bunker_server_config(
     })
 }
 
+/// Global event kinds the bunker signs without a per-request prompt for any
+/// client. Kept to the safe engine default (kind 7 reactions) only. NIP-98 is
+/// NOT global; see `bunker_connect_auto_approve_kinds`.
 fn bunker_auto_approve_kinds() -> std::collections::HashSet<Kind> {
     std::collections::HashSet::from([Kind::Reaction])
 }
@@ -2570,6 +2571,51 @@ mod tests {
         assert!(!flag(Some(b"false")));
         assert!(flag(Some(b"true")));
         assert!(flag(Some(b"not json")), "unreadable reads as engaged");
+    }
+
+    // A write that fails leaves the bunker refusing: engaging takes effect
+    // anyway, and releasing does not.
+    #[test]
+    fn a_failed_switch_write_leaves_the_bunker_flag_engaged() {
+        let mem = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(mem.clone() as Arc<dyn SecureStorage>).unwrap();
+        let engaged = || mobile.kill_switch.load(Ordering::Acquire);
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::KILL_SWITCH_STORAGE_KEY.into());
+        assert!(mobile.set_kill_switch(true).is_err());
+        assert!(engaged(), "engaging holds without the write");
+        *mem.fail_writes_to.lock().unwrap() = None;
+        mobile.set_kill_switch(true).unwrap();
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::KILL_SWITCH_STORAGE_KEY.into());
+        assert!(mobile.set_kill_switch(false).is_err());
+        assert!(engaged(), "releasing needs the write");
+    }
+
+    // A switch that could not be read at startup is read again when the bunker
+    // starts, so the flag follows storage once it reads.
+    #[test]
+    fn a_bunker_start_rereads_the_switch() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let put = |bytes: &[u8]| {
+            storage
+                .store_share_by_key(
+                    crate::KILL_SWITCH_STORAGE_KEY.into(),
+                    bytes.to_vec(),
+                    crate::persistence::storage_metadata("kill_switch"),
+                )
+                .unwrap()
+        };
+        put(b"not json");
+        let mobile = KeepMobile::new(Arc::clone(&storage)).unwrap();
+        assert!(mobile.kill_switch.load(Ordering::Acquire));
+        put(b"false");
+        bunker_server_config(&mobile, "secret", Vec::new()).unwrap();
+        assert!(!mobile.kill_switch.load(Ordering::Acquire));
+        put(b"not json");
+        bunker_server_config(&mobile, "secret", Vec::new()).unwrap();
+        assert!(
+            mobile.kill_switch.load(Ordering::Acquire),
+            "unreadable reads as engaged"
+        );
     }
 
     // End to end over a relay, with the production callback bridge and grants

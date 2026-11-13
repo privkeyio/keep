@@ -986,6 +986,9 @@ pub struct KeepMobile {
     /// reads a flag rather than storage. Seeded engaged when unreadable and
     /// written with every change, so the bunker sees a change while it runs.
     pub(crate) kill_switch: Arc<std::sync::atomic::AtomicBool>,
+    /// Held across each write of the switch and the flag together, so two
+    /// writes cannot leave storage engaged and the flag released.
+    kill_switch_write: std::sync::Mutex<()>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
     /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
@@ -1451,6 +1454,7 @@ impl KeepMobile {
             node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
             kill_switch,
+            kill_switch_write: std::sync::Mutex::new(()),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dkg_active: Arc::new(std::sync::Mutex::new(None)),
@@ -3889,12 +3893,29 @@ impl KeepMobile {
     /// still stops the bunker. Releasing waits for the write to succeed.
     fn write_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
         use std::sync::atomic::Ordering;
+        let _write = self
+            .kill_switch_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if enabled {
             self.kill_switch.store(true, Ordering::Release);
         }
         persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)?;
         self.kill_switch.store(enabled, Ordering::Release);
         Ok(())
+    }
+
+    /// Reread the stored switch into the flag, engaged when unreadable, so a
+    /// read that failed at startup does not hold the flag engaged for good.
+    pub(crate) fn reload_kill_switch(&self) {
+        let _write = self
+            .kill_switch_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engaged =
+            persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true);
+        self.kill_switch
+            .store(engaged, std::sync::atomic::Ordering::Release);
     }
 
     pub fn get_proxy_config(&self) -> Result<ProxyConfigInfo, KeepMobileError> {
@@ -8984,6 +9005,27 @@ mod restore_backup_metadata_tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    // A device engaged with no share takes a released switch from the backup,
+    // and the bunker's flag follows it.
+    #[test]
+    fn a_restore_onto_an_empty_device_releases_the_bunker_flag() {
+        let storage = Arc::new(RecordingStorage::default());
+        let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
+        persistence::persist_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY, true).unwrap();
+        let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
+        assert!(mobile
+            .kill_switch
+            .load(std::sync::atomic::Ordering::Acquire));
+        let bytes = settings_backup(vec![backup_share(true)], &[[7u8; 32]], false, 9050);
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert!(!persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        assert!(!mobile
+            .kill_switch
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     // A pointer that cannot be read does not leave the node to be built on the
