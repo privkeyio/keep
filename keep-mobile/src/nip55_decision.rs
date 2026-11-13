@@ -21,11 +21,13 @@
 //!   a relay that is not on it and approves nothing.
 //!
 //! The function is pure: the Android layer gathers the platform inputs (verified
-//! caller, kill-switch/lock flags, the stateful front-door and opt-in rate-limit
+//! caller, lock flag, the stateful front-door and opt-in rate-limit
 //! results, velocity window counts, stored permission rows, and the current
 //! clock readings) and this function makes the decision. Availability failures
 //! (no signing handler, no permission store) are caller-side plumbing errors and
-//! are handled by the caller before it invokes this function.
+//! are handled by the caller before it invokes this function. The kill switch is
+//! the one input read from the core: `Nip55Handler::evaluate_request` reads it
+//! and passes it in, so the platform cannot report it released.
 
 use crate::nip55::{
     nip55_extract_relay_host, nip55_relay_auth_gate, signable_event_kind_from_json,
@@ -69,8 +71,6 @@ pub struct Nip55DecisionInputs {
     pub package_name: String,
     /// Whether the caller passed Android package-signature verification.
     pub caller_verified: bool,
-    /// Kill switch: signing globally disabled.
-    pub signing_killed: bool,
     /// Keep is locked (PIN store requires authentication).
     pub is_locked: bool,
 
@@ -178,9 +178,12 @@ fn recent_count_of(rate_check: &AutoSignDecision) -> u32 {
 }
 
 /// Evaluate a NIP-55 signing request against the full policy gate sequence and
-/// return the decision. See the module docs for the gate order.
-#[uniffi::export]
-pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
+/// return the decision. See the module docs for the gate order. The kill
+/// switch is read by the caller from the core, never taken from the platform.
+pub(crate) fn evaluate_nip55_request(
+    inputs: Nip55DecisionInputs,
+    signing_killed: bool,
+) -> Nip55Outcome {
     // Gate 0: caller must be a verified, non-blank package.
     if !inputs.caller_verified || inputs.package_name.trim().is_empty() {
         return Nip55Outcome::Error {
@@ -189,9 +192,9 @@ pub fn evaluate_nip55_request(inputs: Nip55DecisionInputs) -> Nip55Outcome {
     }
 
     // Gate 1: kill switch.
-    if inputs.signing_killed {
+    if signing_killed {
         return Nip55Outcome::Error {
-            message: "Signing is disabled (kill switch is active)".to_string(),
+            message: crate::nip55::KILL_SWITCH_MESSAGE.to_string(),
         };
     }
 
@@ -432,7 +435,6 @@ mod tests {
         Nip55DecisionInputs {
             package_name: "com.example.client".to_string(),
             caller_verified: true,
-            signing_killed: false,
             is_locked: false,
             request_type: Nip55RequestType::SignEvent,
             event_json: r#"{"kind":1}"#.to_string(),
@@ -504,25 +506,106 @@ mod tests {
     fn unverified_caller_is_denied() {
         let mut i = base();
         i.caller_verified = false;
-        assert_eq!(error_message(&evaluate_nip55_request(i)), "Request denied");
+        assert_eq!(
+            error_message(&evaluate_nip55_request(i, false)),
+            "Request denied"
+        );
     }
 
     #[test]
     fn blank_package_is_denied() {
         let mut i = base();
         i.package_name = "   ".to_string();
-        assert_eq!(error_message(&evaluate_nip55_request(i)), "Request denied");
+        assert_eq!(
+            error_message(&evaluate_nip55_request(i, false)),
+            "Request denied"
+        );
     }
 
     // Gate 1: kill switch.
     #[test]
     fn kill_switch_errors() {
-        let mut i = base();
-        i.signing_killed = true;
+        let i = base();
         assert_eq!(
-            error_message(&evaluate_nip55_request(i)),
+            error_message(&evaluate_nip55_request(i, true)),
             "Signing is disabled (kill switch is active)"
         );
+    }
+
+    // The handler reads the switch from the core: released lets the request
+    // through to the later gates, and engaged or unreadable refuses both the
+    // decision and the request itself.
+    #[test]
+    fn the_handler_reads_the_kill_switch_from_the_core() {
+        use crate::baseline_presign_policy_tests::KillSwitchOffStorage;
+        use crate::storage::SecureStorage;
+        use std::sync::Arc;
+        let storage = Arc::new(KillSwitchOffStorage::with_switch_off());
+        let mobile = Arc::new(crate::KeepMobile::new(storage.clone()).unwrap());
+        let handler = crate::nip55::Nip55Handler::new(Arc::clone(&mobile));
+        let request = || crate::nip55::Nip55Request {
+            request_type: Nip55RequestType::GetPublicKey,
+            content: String::new(),
+            pubkey: None,
+            return_type: "signature".into(),
+            compression_type: "none".into(),
+            callback_url: None,
+            id: None,
+            current_user: None,
+            permissions: None,
+            kind: None,
+            scope: None,
+        };
+        let refused = |result: Result<_, crate::KeepMobileError>| {
+            matches!(result, Err(crate::KeepMobileError::PolicyViolation { reason })
+                if reason == crate::nip55::KILL_SWITCH_MESSAGE)
+        };
+        assert!(is_require_ui(&handler.evaluate_request(base())));
+        assert!(
+            matches!(
+                handler.handle_request(request(), "c".into()),
+                Err(crate::KeepMobileError::NotInitialized)
+            ),
+            "released, the request reaches its handler"
+        );
+
+        mobile
+            .kill_switch_unsaved
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            error_message(&handler.evaluate_request(base())),
+            crate::nip55::KILL_SWITCH_MESSAGE,
+            "an engagement that has not saved refuses"
+        );
+        assert!(refused(handler.handle_request(request(), "c".into())));
+        mobile
+            .kill_switch_unsaved
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        mobile.set_kill_switch(true).unwrap();
+        assert_eq!(
+            error_message(&handler.evaluate_request(base())),
+            crate::nip55::KILL_SWITCH_MESSAGE
+        );
+        assert!(refused(handler.handle_request(request(), "c".into())));
+        for response in handler.handle_batch_request(vec![request(), request()], "c".into()) {
+            assert!(response.result.is_empty() && response.event.is_none());
+            assert_eq!(response.error.as_deref(), Some("request failed"));
+        }
+
+        storage
+            .store_share_by_key(
+                crate::KILL_SWITCH_STORAGE_KEY.into(),
+                b"not json".to_vec(),
+                crate::persistence::storage_metadata("kill_switch"),
+            )
+            .unwrap();
+        assert_eq!(
+            error_message(&handler.evaluate_request(base())),
+            crate::nip55::KILL_SWITCH_MESSAGE,
+            "an unreadable switch refuses"
+        );
+        assert!(refused(handler.handle_request(request(), "c".into())));
     }
 
     // Gate 2: lock.
@@ -531,7 +614,7 @@ mod tests {
         let mut i = base();
         i.is_locked = true;
         assert_eq!(
-            error_message(&evaluate_nip55_request(i)),
+            error_message(&evaluate_nip55_request(i, false)),
             "Keep is locked, please unlock it first"
         );
     }
@@ -542,7 +625,7 @@ mod tests {
         let mut i = base();
         i.front_door_within_limit = false;
         assert_eq!(
-            error_message(&evaluate_nip55_request(i)),
+            error_message(&evaluate_nip55_request(i, false)),
             "Too many requests, please try again later"
         );
     }
@@ -552,17 +635,18 @@ mod tests {
     fn caller_verification_precedes_kill_switch() {
         let mut i = base();
         i.caller_verified = false;
-        i.signing_killed = true;
-        assert_eq!(error_message(&evaluate_nip55_request(i)), "Request denied");
+        assert_eq!(
+            error_message(&evaluate_nip55_request(i, true)),
+            "Request denied"
+        );
     }
 
     #[test]
     fn kill_switch_precedes_front_door() {
         let mut i = base();
-        i.signing_killed = true;
         i.front_door_within_limit = false;
         assert_eq!(
-            error_message(&evaluate_nip55_request(i)),
+            error_message(&evaluate_nip55_request(i, true)),
             "Signing is disabled (kill switch is active)"
         );
     }
@@ -573,7 +657,7 @@ mod tests {
         let mut i = base();
         i.velocity_check = Nip55VelocityCheck::TimedOut;
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "deny_velocity_timeout"
         );
     }
@@ -583,7 +667,7 @@ mod tests {
         let mut i = base();
         i.velocity_check = Nip55VelocityCheck::Blocked;
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "velocity_blocked"
         );
     }
@@ -594,7 +678,7 @@ mod tests {
         i.front_door_within_limit = false;
         i.velocity_check = Nip55VelocityCheck::TimedOut;
         assert_eq!(
-            error_message(&evaluate_nip55_request(i)),
+            error_message(&evaluate_nip55_request(i, false)),
             "Too many requests, please try again later"
         );
     }
@@ -613,7 +697,7 @@ mod tests {
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "deny_relay_whitelist"
         );
     }
@@ -625,7 +709,7 @@ mod tests {
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.relay_whitelist_read_failed = true;
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "deny_relay_whitelist"
         );
     }
@@ -637,7 +721,7 @@ mod tests {
         let mut i = base();
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.relay_whitelist_read_failed = true;
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     // The relay-auth gate and the sensitive-kind gate key off the kind derived
@@ -653,7 +737,7 @@ mod tests {
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "deny_relay_whitelist"
         );
     }
@@ -664,7 +748,7 @@ mod tests {
         let mut i = base();
         i.event_json = r#"{"tags":[]}"#.to_string();
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "invalid_event_kind"
         );
     }
@@ -674,7 +758,7 @@ mod tests {
         let mut i = base();
         i.event_json = r#"{"kind":70000}"#.to_string(); // > u16::MAX
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "invalid_event_kind"
         );
     }
@@ -684,7 +768,7 @@ mod tests {
         let mut i = base();
         i.event_json = "not json".to_string();
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "invalid_event_kind"
         );
     }
@@ -698,7 +782,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     // Gate 7: sign policy.
@@ -708,7 +792,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     #[test]
@@ -717,7 +801,7 @@ mod tests {
         i.is_opted_in = false;
         i.policy_selection = SignPolicySelection::Auto;
         // Falls through to gate 8; no stored grant -> RequireUi (not AutoApprove).
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     #[test]
@@ -727,7 +811,7 @@ mod tests {
         i.policy_selection = SignPolicySelection::Auto;
         i.event_json = r#"{"kind":4}"#.to_string(); // sensitive (NIP-04 DM)
         i.opt_in_rate_check = Some(allowed());
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     #[test]
@@ -736,7 +820,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = None;
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     #[test]
@@ -745,7 +829,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(AutoSignDecision::HourlyLimitExceeded);
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     #[test]
@@ -757,7 +841,7 @@ mod tests {
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = None;
         i.stored_exact_permission = Some(perm("allow"));
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     // Gate 7: the Basic tier is a strictly stricter auto-approval band than Auto.
@@ -782,14 +866,14 @@ mod tests {
     fn mid_band_risk_auto_approves_under_auto() {
         let mut i = mid_band_risk_base();
         i.policy_selection = SignPolicySelection::Auto;
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     #[test]
     fn mid_band_risk_falls_to_ui_under_basic() {
         let mut i = mid_band_risk_base();
         i.policy_selection = SignPolicySelection::Basic;
-        match evaluate_nip55_request(i) {
+        match evaluate_nip55_request(i, false) {
             Nip55Outcome::RequireUi { risk, .. } => {
                 assert_eq!(
                     risk.score, 25,
@@ -806,7 +890,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Manual;
         i.opt_in_rate_check = Some(allowed());
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     // Gate 7 must score against `inputs.current_hour` (the caller's LOCAL hour),
@@ -828,14 +912,14 @@ mod tests {
     fn basic_auto_approves_a_new_app_at_a_normal_local_hour() {
         let mut i = new_app_basic_base();
         i.current_hour = 12;
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     #[test]
     fn basic_falls_to_ui_for_the_same_request_at_an_unusual_local_hour() {
         let mut i = new_app_basic_base();
         i.current_hour = 3;
-        match evaluate_nip55_request(i) {
+        match evaluate_nip55_request(i, false) {
             Nip55Outcome::RequireUi { risk, .. } => {
                 assert_eq!(
                     risk.score, 25,
@@ -854,7 +938,7 @@ mod tests {
             i.policy_selection = selection;
             i.opt_in_rate_check = Some(allowed());
             assert_eq!(
-                evaluate_nip55_request(i),
+                evaluate_nip55_request(i, false),
                 Nip55Outcome::AutoApprove,
                 "{selection:?} should auto-approve a low-risk request"
             );
@@ -866,14 +950,20 @@ mod tests {
     fn app_expiry_timeout_rejects() {
         let mut i = base();
         i.app_expired = None;
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_timeout");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "deny_timeout"
+        );
     }
 
     #[test]
     fn app_expired_rejects() {
         let mut i = base();
         i.app_expired = Some(true);
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_expired");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "deny_expired"
+        );
     }
 
     // An expired app, or one whose expiry could not be looked up, is rejected
@@ -886,10 +976,13 @@ mod tests {
                 i.is_opted_in = true;
                 i.policy_selection = selection;
                 i.opt_in_rate_check = Some(allowed());
-                assert_eq!(evaluate_nip55_request(i.clone()), Nip55Outcome::AutoApprove);
+                assert_eq!(
+                    evaluate_nip55_request(i.clone(), false),
+                    Nip55Outcome::AutoApprove
+                );
                 i.app_expired = expired;
                 assert_eq!(
-                    reject_reason(&evaluate_nip55_request(i)),
+                    reject_reason(&evaluate_nip55_request(i, false)),
                     reason,
                     "{selection:?} with app_expired {expired:?}"
                 );
@@ -906,18 +999,21 @@ mod tests {
             i.is_opted_in = true;
             i.policy_selection = selection;
             i.opt_in_rate_check = Some(allowed());
-            assert_eq!(evaluate_nip55_request(i.clone()), Nip55Outcome::AutoApprove);
+            assert_eq!(
+                evaluate_nip55_request(i.clone(), false),
+                Nip55Outcome::AutoApprove
+            );
             let mut denied = i.clone();
             denied.stored_exact_permission = Some(perm("deny"));
             assert_eq!(
-                reject_reason(&evaluate_nip55_request(denied)),
+                reject_reason(&evaluate_nip55_request(denied, false)),
                 "deny",
                 "{selection:?}"
             );
             let mut unreadable = i;
             unreadable.permission_lookup_ok = false;
             assert_eq!(
-                reject_reason(&evaluate_nip55_request(unreadable)),
+                reject_reason(&evaluate_nip55_request(unreadable, false)),
                 "lookup_timeout",
                 "{selection:?}"
             );
@@ -935,13 +1031,16 @@ mod tests {
         i.opt_in_rate_check = Some(allowed());
         let mut generic = i.clone();
         generic.stored_generic_permission = Some(perm("deny"));
-        assert_eq!(reject_reason(&evaluate_nip55_request(generic)), "deny");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(generic, false)),
+            "deny"
+        );
         for (exact, generic) in [(Some(perm("ask")), None), (None, Some(perm("ask")))] {
             let mut ask = i.clone();
             ask.stored_exact_permission = exact;
             ask.stored_generic_permission = generic;
             assert!(matches!(
-                evaluate_nip55_request(ask),
+                evaluate_nip55_request(ask, false),
                 Nip55Outcome::RequireUi { .. }
             ));
         }
@@ -952,17 +1051,20 @@ mod tests {
         };
         let mut live = i.clone();
         live.stored_exact_permission = Some(monotonic(DAY_MS as i64));
-        assert_eq!(reject_reason(&evaluate_nip55_request(live)), "deny");
+        assert_eq!(reject_reason(&evaluate_nip55_request(live, false)), "deny");
         let mut lapsed = i.clone();
         lapsed.stored_exact_permission = Some(monotonic(1_000));
-        assert_eq!(evaluate_nip55_request(lapsed), Nip55Outcome::AutoApprove);
+        assert_eq!(
+            evaluate_nip55_request(lapsed, false),
+            Nip55Outcome::AutoApprove
+        );
         let mut lapsed_wall = i;
         lapsed_wall.stored_exact_permission = Some(Nip55StoredPermission {
             expires_at: Some(1),
             ..perm("deny")
         });
         assert_eq!(
-            evaluate_nip55_request(lapsed_wall),
+            evaluate_nip55_request(lapsed_wall, false),
             Nip55Outcome::AutoApprove
         );
     }
@@ -971,33 +1073,36 @@ mod tests {
     fn permission_lookup_timeout_rejects() {
         let mut i = base();
         i.permission_lookup_ok = false;
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "lookup_timeout");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "lookup_timeout"
+        );
     }
 
     #[test]
     fn stored_allow_auto_approves() {
         let mut i = base();
         i.stored_exact_permission = Some(perm("allow"));
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     #[test]
     fn stored_deny_rejects() {
         let mut i = base();
         i.stored_exact_permission = Some(perm("deny"));
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny");
+        assert_eq!(reject_reason(&evaluate_nip55_request(i, false)), "deny");
     }
 
     #[test]
     fn stored_ask_requires_ui() {
         let mut i = base();
         i.stored_exact_permission = Some(perm("ask"));
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     #[test]
     fn no_stored_decision_requires_ui() {
-        assert!(is_require_ui(&evaluate_nip55_request(base())));
+        assert!(is_require_ui(&evaluate_nip55_request(base(), false)));
     }
 
     // Gate 8: the relay whitelist constrains which relays may be signed for; it
@@ -1010,7 +1115,7 @@ mod tests {
         // Same inputs as `no_stored_decision_requires_ui` plus the whitelist,
         // so this pins that adding the whitelist changes nothing about
         // authorization.
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     /// The granted path still works: a whitelisted relay and a standing ALLOW
@@ -1022,7 +1127,7 @@ mod tests {
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_exact_permission = Some(perm("allow"));
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     /// A relay outside a configured whitelist is still refused, so the
@@ -1037,7 +1142,7 @@ mod tests {
         // variant match, including a malformed event, and what this pins is that
         // gate 5 refuses even over a standing ALLOW.
         assert_eq!(
-            reject_reason(&evaluate_nip55_request(i)),
+            reject_reason(&evaluate_nip55_request(i, false)),
             "deny_relay_whitelist"
         );
     }
@@ -1048,7 +1153,7 @@ mod tests {
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_exact_permission = Some(perm("deny"));
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny");
+        assert_eq!(reject_reason(&evaluate_nip55_request(i, false)), "deny");
     }
 
     #[test]
@@ -1058,7 +1163,7 @@ mod tests {
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_exact_permission = Some(perm("ask"));
         assert!(matches!(
-            evaluate_nip55_request(i),
+            evaluate_nip55_request(i, false),
             Nip55Outcome::RequireUi { .. }
         ));
     }
@@ -1072,7 +1177,7 @@ mod tests {
         i.event_json = relay_auth_event("relay.allowed.com");
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.stored_generic_permission = Some(perm("deny"));
-        assert!(is_require_ui(&evaluate_nip55_request(i)));
+        assert!(is_require_ui(&evaluate_nip55_request(i, false)));
     }
 
     // A whitelisted relay must not bypass the gate-6 fail-closed checks (expiry
@@ -1088,21 +1193,30 @@ mod tests {
     fn whitelisted_relay_app_expiry_timeout_still_rejects() {
         let mut i = whitelisted_relay_base();
         i.app_expired = None;
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_timeout");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "deny_timeout"
+        );
     }
 
     #[test]
     fn whitelisted_relay_expired_app_still_rejects() {
         let mut i = whitelisted_relay_base();
         i.app_expired = Some(true);
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "deny_expired");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "deny_expired"
+        );
     }
 
     #[test]
     fn whitelisted_relay_lookup_timeout_still_rejects() {
         let mut i = whitelisted_relay_base();
         i.permission_lookup_ok = false;
-        assert_eq!(reject_reason(&evaluate_nip55_request(i)), "lookup_timeout");
+        assert_eq!(
+            reject_reason(&evaluate_nip55_request(i, false)),
+            "lookup_timeout"
+        );
     }
 
     // Non-SignEvent operations: gate 7 always falls to UI; gates 6 and 8 resolve.
@@ -1111,7 +1225,7 @@ mod tests {
         let mut i = base();
         i.request_type = Nip55RequestType::GetPublicKey;
         i.stored_exact_permission = Some(perm("allow"));
-        assert_eq!(evaluate_nip55_request(i), Nip55Outcome::AutoApprove);
+        assert_eq!(evaluate_nip55_request(i, false), Nip55Outcome::AutoApprove);
     }
 
     #[test]
@@ -1121,7 +1235,7 @@ mod tests {
         i.is_opted_in = true;
         i.policy_selection = SignPolicySelection::Auto;
         i.opt_in_rate_check = Some(allowed());
-        match evaluate_nip55_request(i) {
+        match evaluate_nip55_request(i, false) {
             Nip55Outcome::RequireUi { risk, .. } => {
                 assert!(risk
                     .factors
@@ -1136,7 +1250,7 @@ mod tests {
     fn require_ui_sensitive_kind_escalates_auth() {
         let mut i = base();
         i.event_json = r#"{"kind":4}"#.to_string(); // sensitive -> risk >= 40 -> Biometric
-        match evaluate_nip55_request(i) {
+        match evaluate_nip55_request(i, false) {
             Nip55Outcome::RequireUi {
                 required_auth,
                 risk,

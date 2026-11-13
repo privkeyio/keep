@@ -344,6 +344,8 @@ const FROST_OP_TIMEOUT: Duration = Duration::from_secs(65);
 const FROST_SIGN_TIMEOUT: Duration =
     Duration::from_secs(keep_frost_net::MAX_SIGNING_REQUEST_DURATION.as_secs() + 5);
 
+pub(crate) const KILL_SWITCH_MESSAGE: &str = "Signing is disabled (kill switch is active)";
+
 #[derive(uniffi::Object)]
 pub struct Nip55Handler {
     mobile: Arc<KeepMobile>,
@@ -360,11 +362,25 @@ impl Nip55Handler {
         }
     }
 
+    /// Decide a NIP-55 request against the full policy gate sequence, reading
+    /// the kill switch from the core (engaged when unreadable).
+    pub fn evaluate_request(
+        &self,
+        inputs: crate::nip55_decision::Nip55DecisionInputs,
+    ) -> crate::nip55_decision::Nip55Outcome {
+        crate::nip55_decision::evaluate_nip55_request(inputs, self.signing_killed())
+    }
+
     pub fn handle_request(
         &self,
         request: Nip55Request,
         caller_id: String,
     ) -> Result<Nip55Response, KeepMobileError> {
+        if self.signing_killed() {
+            return Err(KeepMobileError::PolicyViolation {
+                reason: KILL_SWITCH_MESSAGE.into(),
+            });
+        }
         if is_rate_limited_type(&request.request_type) {
             self.check_rate_limit(&caller_id)?;
         }
@@ -524,6 +540,10 @@ impl Nip55Handler {
 }
 
 impl Nip55Handler {
+    fn signing_killed(&self) -> bool {
+        self.mobile.get_kill_switch().unwrap_or(true)
+    }
+
     fn validate_current_user(&self, current_user: &str) -> Result<(), KeepMobileError> {
         let info = self
             .mobile
