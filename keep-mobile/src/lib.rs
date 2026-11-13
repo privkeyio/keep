@@ -998,6 +998,14 @@ pub struct KeepMobile {
     /// invalidate_live_node can abort them.
     node_tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     pub(crate) storage: Arc<dyn SecureStorage>,
+    /// The persisted kill switch, mirrored for the NIP-46 bunker, whose handler
+    /// reads a flag rather than storage. Seeded engaged when unreadable and
+    /// written with every change, so the bunker sees a change while it runs.
+    pub(crate) kill_switch: Arc<std::sync::atomic::AtomicBool>,
+    /// Held across each write of the switch and the flag together, so two
+    /// writes cannot leave storage engaged and the flag released. Holds
+    /// whether an engagement failed to save, which a reread must not undo.
+    kill_switch_write: std::sync::Mutex<bool>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
     /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
@@ -1454,11 +1462,16 @@ impl KeepMobile {
         }
 
         let policy = Arc::new(std::sync::RwLock::new(evaluator));
+        let kill_switch = Arc::new(std::sync::atomic::AtomicBool::new(
+            persistence::load_kill_switch(&storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true),
+        ));
 
         Ok(Self {
             node: Arc::new(RwLock::new(None)),
             node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
+            kill_switch,
+            kill_switch_write: std::sync::Mutex::new(false),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dkg_active: Arc::new(std::sync::Mutex::new(None)),
@@ -3890,7 +3903,46 @@ impl KeepMobile {
     }
 
     pub fn set_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
-        persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
+        self.write_kill_switch(enabled)
+    }
+
+    /// Engaging takes effect in memory before the write, so a failed write
+    /// still stops the bunker. Releasing waits for the write to succeed.
+    fn write_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
+        use std::sync::atomic::Ordering;
+        let mut unsaved_engagement = self
+            .kill_switch_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if enabled {
+            self.kill_switch.store(true, Ordering::Release);
+        }
+        if let Err(e) =
+            persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
+        {
+            if enabled {
+                *unsaved_engagement = true;
+            }
+            return Err(e);
+        }
+        *unsaved_engagement = false;
+        self.kill_switch.store(enabled, Ordering::Release);
+        Ok(())
+    }
+
+    /// Reread the stored switch into the flag, engaged when unreadable, so a
+    /// read that failed at startup does not hold the flag engaged for good. An
+    /// engagement that failed to save holds until a release saves.
+    pub(crate) fn reload_kill_switch(&self) {
+        let unsaved_engagement = self
+            .kill_switch_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let engaged = *unsaved_engagement
+            || persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
+                .unwrap_or(true);
+        self.kill_switch
+            .store(engaged, std::sync::atomic::Ordering::Release);
     }
 
     pub fn get_proxy_config(&self) -> Result<ProxyConfigInfo, KeepMobileError> {
@@ -4597,11 +4649,7 @@ impl KeepMobile {
                 self.store_proxy_config(&stored_proxy)?;
             }
 
-            persistence::persist_kill_switch(
-                &self.storage,
-                KILL_SWITCH_STORAGE_KEY,
-                decrypted.config.kill_switch,
-            )?;
+            self.write_kill_switch(decrypted.config.kill_switch)?;
         }
 
         // Descriptors before the shares and keys. Only the share and key writes
@@ -8970,6 +9018,9 @@ mod restore_backup_metadata_tests {
             "the restored proxy setting stops any live node, bunker or approver"
         );
         assert!(persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        assert!(mobile
+            .kill_switch
+            .load(std::sync::atomic::Ordering::Acquire));
         let proxy = persistence::load_proxy_config(&dyn_storage, PROXY_CONFIG_STORAGE_KEY)
             .unwrap()
             .expect("proxy restored");
@@ -8981,6 +9032,27 @@ mod restore_backup_metadata_tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    // A device engaged with no share takes a released switch from the backup,
+    // and the bunker's flag follows it.
+    #[test]
+    fn a_restore_onto_an_empty_device_releases_the_bunker_flag() {
+        let storage = Arc::new(RecordingStorage::default());
+        let dyn_storage = Arc::clone(&storage) as Arc<dyn SecureStorage>;
+        persistence::persist_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY, true).unwrap();
+        let mobile = KeepMobile::new(Arc::clone(&dyn_storage)).unwrap();
+        assert!(mobile
+            .kill_switch
+            .load(std::sync::atomic::Ordering::Acquire));
+        let bytes = settings_backup(vec![backup_share(true)], &[[7u8; 32]], false, 9050);
+        mobile
+            .restore_backup(bytes, "correct horse battery staple".into())
+            .expect("restore should succeed");
+        assert!(!persistence::load_kill_switch(&dyn_storage, KILL_SWITCH_STORAGE_KEY).unwrap());
+        assert!(!mobile
+            .kill_switch
+            .load(std::sync::atomic::Ordering::Acquire));
     }
 
     // A pointer that cannot be read does not leave the node to be built on the
