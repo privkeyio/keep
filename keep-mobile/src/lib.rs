@@ -958,6 +958,17 @@ impl SigningHooks for MobileSigningHooks {
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
 
+    /// The kill switch stops ECDH as it stops signing, failing closed when the
+    /// switch cannot be read: a quorum of partials decrypts the group's DMs.
+    fn approve_ecdh(&self, _requester: &nostr_sdk::PublicKey) -> keep_frost_net::Result<()> {
+        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true) {
+            return Err(keep_frost_net::FrostNetError::PolicyViolation(
+                "co-signing is disabled".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Approves only a spend whose prompt carries every output and the fee in
     /// `SignRequest.metadata.spend`, and leaves the decision to that prompt in
     /// `pre_sign`. A client must render that summary before it ships this.
@@ -10613,6 +10624,18 @@ mod baseline_presign_policy_tests {
         let err = hooks
             .pre_sign(&nostr_session(1, &message))
             .expect_err("the kill switch refuses before anything is approved");
+        assert!(format!("{err}").contains("disabled"), "{err}");
+    }
+
+    #[test]
+    fn the_kill_switch_refuses_a_peer_ecdh_request() {
+        let hooks = own_request_hooks(KillSwitchOffStorage::with_switch_off());
+        let peer = nostr_sdk::Keys::generate().public_key();
+        assert!(hooks.approve_ecdh(&peer).is_ok());
+        persistence::persist_kill_switch(&hooks.storage, KILL_SWITCH_STORAGE_KEY, true).unwrap();
+        let err = hooks
+            .approve_ecdh(&peer)
+            .expect_err("the kill switch refuses ECDH");
         assert!(format!("{err}").contains("disabled"), "{err}");
     }
 

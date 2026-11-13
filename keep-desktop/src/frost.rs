@@ -313,6 +313,15 @@ impl SigningHooks for DesktopSigningHooks {
     }
 
     fn post_sign(&self, _session: &SessionInfo, _signature: &[u8; 64]) {}
+
+    fn approve_ecdh(&self, _requester: &nostr_sdk::PublicKey) -> keep_frost_net::Result<()> {
+        if self.kill_switch.load(Ordering::Acquire) {
+            return Err(keep_frost_net::FrostNetError::Session(
+                "Kill switch active".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub(crate) struct PendingRequestEntry {
@@ -1979,6 +1988,21 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::validate_wallet_descriptors;
+
+    #[test]
+    fn approve_ecdh_respects_kill_switch() {
+        use keep_frost_net::SigningHooks;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let kill_switch = std::sync::Arc::new(AtomicBool::new(false));
+        let hooks = super::DesktopSigningHooks {
+            request_tx: tokio::sync::mpsc::channel(1).0,
+            kill_switch: kill_switch.clone(),
+        };
+        let peer = nostr_sdk::Keys::generate().public_key();
+        assert!(hooks.approve_ecdh(&peer).is_ok());
+        kill_switch.store(true, Ordering::Release);
+        assert!(hooks.approve_ecdh(&peer).is_err());
+    }
 
     // A valid ranged BIP-86 taproot descriptor (mainnet xpub).
     const VALID: &str = "tr(xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz/0/*)";

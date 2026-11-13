@@ -189,6 +189,21 @@ impl SigningHooks for CoSignerPolicy {
             detail: Some(format!("session {}", short_id(&session.session_id))),
         });
     }
+
+    fn approve_ecdh(&self, _requester: &nostr_sdk::PublicKey) -> keep_frost_net::Result<()> {
+        if self.enabled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _ = self.events.send(Event::Log {
+            app: "frost".into(),
+            action: "refused ECDH (co-signing disabled)".into(),
+            success: false,
+            detail: None,
+        });
+        Err(keep_frost_net::FrostNetError::PolicyViolation(
+            "co-signing disabled".into(),
+        ))
+    }
 }
 
 /// Maps a node lifecycle event to a web activity entry, or `None` for events
@@ -592,6 +607,20 @@ mod tests {
         // Each decision is streamed for observability (co-signing, then refused).
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn approve_ecdh_respects_kill_switch() {
+        let (tx, _rx) = broadcast::channel(8);
+        let enabled = Arc::new(AtomicBool::new(true));
+        let policy = CoSignerPolicy {
+            events: tx,
+            enabled: enabled.clone(),
+        };
+        let peer = nostr_sdk::Keys::generate().public_key();
+        assert!(policy.approve_ecdh(&peer).is_ok());
+        enabled.store(false, Ordering::SeqCst);
+        assert!(policy.approve_ecdh(&peer).is_err());
     }
 
     #[test]

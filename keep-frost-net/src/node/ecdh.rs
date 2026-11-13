@@ -50,6 +50,12 @@ impl KfpNode {
             )));
         }
 
+        let hooks = self.hooks.read().clone();
+        if let Err(e) = hooks.approve_ecdh(&from) {
+            debug!(from = %from, "Rejecting ECDH request: refused by hook");
+            return Err(e);
+        }
+
         // Attestation gate, matching the OPRF/enroll oracles (the #621 ship-gate
         // this responder was missing): a quorum of these partials combines to
         // the group's ECDH shared secret with an attacker-chosen recipient, so
@@ -587,6 +593,29 @@ mod gate_tests {
     /// exposes the group's shared secret, so an unannounced pubkey cannot invoke
     /// it. Fresh `created_at` passes the replay gate so the attestation gate is
     /// what trips.
+    #[tokio::test]
+    async fn handle_ecdh_request_refused_by_the_hook() {
+        struct RefusesEcdh;
+        impl crate::SigningHooks for RefusesEcdh {
+            fn pre_sign(&self, _session: &crate::SessionInfo) -> Result<()> {
+                Ok(())
+            }
+            fn post_sign(&self, _session: &crate::SessionInfo, _signature: &[u8; 64]) {}
+            fn approve_ecdh(&self, _requester: &PublicKey) -> Result<()> {
+                Err(FrostNetError::PolicyViolation("kill switch".into()))
+            }
+        }
+        let (node, _relay) = test_node().await;
+        node.set_hooks(std::sync::Arc::new(RefusesEcdh));
+        let from = Keys::generate().public_key();
+        let group = *node.group_pubkey();
+        let req = EcdhRequestPayload::new([1u8; 32], group, BAD_RECIPIENT, vec![1]);
+        assert!(matches!(
+            node.handle_ecdh_request(from, req).await,
+            Err(FrostNetError::PolicyViolation(_))
+        ));
+    }
+
     #[tokio::test]
     async fn handle_ecdh_request_rejects_unannounced_requester() {
         let (node, _relay) = test_node().await;
