@@ -173,10 +173,12 @@ pub enum Nip55RelayAuthGate {
 
 // Canonicalizes a relay URL to `host[:port]`: strips the ws/wss scheme
 // (case-insensitively), any path and trailing slash, drops default ports
-// (:443/:80) and a trailing FQDN dot, and lowercases. Returns None for blank
-// input and for a host holding anything but ASCII letters, digits and
-// `._-:[]`, which keeps control characters, userinfo and the `*` wildcard
-// scope out of a host. The SAME normalization is
+// (:443/:80) and a trailing FQDN dot, and lowercases. Returns None unless
+// what is left is a host name of ASCII letters, digits and `._-`, or an IPv6
+// literal in brackets, with at most a numeric port. That keeps control
+// characters, userinfo, the `*` wildcard scope and the leftovers of another
+// scheme (`https:`, `wss:` from `wss:/x`) out of a host, any of which could
+// match more relays than the one named. The SAME normalization is
 // used on whitelist entries and on the extracted relay host before gating so
 // they compare consistently.
 #[uniffi::export]
@@ -190,26 +192,43 @@ pub fn nip55_normalize_relay_host(url: String) -> Option<String> {
         .strip_prefix("wss://")
         .or_else(|| lower.strip_prefix("ws://"))
         .unwrap_or(lower.as_str());
-    let host = without_scheme
-        .split('/')
-        .next()
-        .unwrap_or(without_scheme)
-        .trim_end_matches('/');
-    if !host
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"._-:[]".contains(&b))
-    {
-        return None;
-    }
-    let host = host
-        .strip_suffix(":443")
-        .or_else(|| host.strip_suffix(":80"))
-        .unwrap_or(host)
-        .trim_end_matches('.');
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
+    let authority = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (name, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (v6, rest) = bracketed.split_once(']')?;
+            let v6: std::net::Ipv6Addr = v6.parse().ok()?;
+            let port = match rest {
+                "" => None,
+                _ => Some(rest.strip_prefix(':')?),
+            };
+            (format!("[{v6}]"), port)
+        }
+        None => {
+            let (name, port) = match authority.split_once(':') {
+                Some((name, port)) => (name, Some(port)),
+                None => (authority, None),
+            };
+            let name = name.trim_end_matches('.');
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return None;
+            }
+            (name.to_string(), port)
+        }
+    };
+    let port = match port {
+        None => None,
+        Some(port) if port.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(port.parse::<u16>().ok().filter(|p| *p != 0)?)
+        }
+        Some(_) => return None,
+    };
+    match port {
+        None | Some(443) | Some(80) => Some(name),
+        Some(port) => Some(format!("{name}:{port}")),
     }
 }
 
@@ -1506,7 +1525,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_relay_host_rejects_characters_no_host_has() {
+    fn normalize_relay_host_returns_only_a_host_and_port() {
         for url in [
             "wss://evil\u{0}relay.example.com",
             "wss://relay.example.com\u{0}",
@@ -1520,6 +1539,28 @@ mod tests {
             "wss://relay%2eexample.com",
             "wss://evil.com\\@relay.example.com",
             "wss://*",
+            "https://relay.example.com",
+            "http://relay.example.com",
+            "nostr://relay.example.com",
+            "wss:/relay.example.com",
+            "wss://wss://relay.example.com",
+            "wss://relay.example.com]",
+            "wss://[relay.example.com]",
+            "wss://[::1",
+            "wss://[::1]x",
+            "wss://relay.example.com:",
+            "wss://relay.example.com:443.",
+            "wss://relay.example.com:8080:443",
+            "wss://relay.example.com:123456",
+            "wss://2001:db8::1",
+            "wss://[]",
+            "wss://[:]",
+            "wss://[1.2.3.4]",
+            "wss://[::1]:",
+            "wss://[::1]:abc",
+            "wss://[fe80::1%25eth0]",
+            "wss://relay.example.com:0",
+            "wss://relay.example.com:65536",
         ] {
             assert_eq!(nip55_normalize_relay_host(url.into()), None, "{url:?}");
         }
@@ -1530,6 +1571,14 @@ mod tests {
             ("wss://[::1]:443", "[::1]"),
             ("relay.com.:443", "relay.com"),
             ("wss://xn--bcher-kva.example", "xn--bcher-kva.example"),
+            ("wss://[2001:db8::1]", "[2001:db8::1]"),
+            ("ws://relay.com.:7777/path", "relay.com:7777"),
+            ("wss://[2001:DB8::1]", "[2001:db8::1]"),
+            ("wss://[0:0::1]:7777", "[::1]:7777"),
+            ("ws://[::1]:80", "[::1]"),
+            ("wss://127.0.0.1:7777", "127.0.0.1:7777"),
+            ("wss://relay.example.com:65535", "relay.example.com:65535"),
+            ("wss://relay.example.com:07777", "relay.example.com:7777"),
         ] {
             assert_eq!(nip55_normalize_relay_host(url.into()), Some(host.into()));
         }
