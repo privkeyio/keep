@@ -484,6 +484,18 @@ pub trait SigningHooks: Send + Sync {
         let _ = (session, deadline);
         Approval::Decided(Ok(()))
     }
+
+    /// Called before a node answers a peer's ECDH request with its partial,
+    /// with the peer, and before it starts its own, with its own key.
+    /// Returning an `Err` refuses. A quorum of partials combines to the group's
+    /// ECDH secret with a recipient the requester picks, which decrypts the
+    /// group's NIP-04 and NIP-44 messages, so a hook with a kill switch must
+    /// refuse here as it does in [`Self::pre_sign`]. The default answers, as
+    /// nodes did before this hook existed.
+    fn approve_ecdh(&self, requester: &PublicKey) -> Result<()> {
+        let _ = requester;
+        Ok(())
+    }
 }
 
 pub struct NoOpHooks;
