@@ -173,8 +173,10 @@ pub enum Nip55RelayAuthGate {
 
 // Canonicalizes a relay URL to `host[:port]`: strips the ws/wss scheme
 // (case-insensitively), any path and trailing slash, drops default ports
-// (:443/:80) and a trailing FQDN dot, and lowercases (ASCII-only). Rejects
-// non-ASCII hosts and blank input (returns None). The SAME normalization is
+// (:443/:80) and a trailing FQDN dot, and lowercases. Returns None for blank
+// input and for a host holding anything but ASCII letters, digits and
+// `._-:[]`, which keeps control characters, userinfo and the `*` wildcard
+// scope out of a host. The SAME normalization is
 // used on whitelist entries and on the extracted relay host before gating so
 // they compare consistently.
 #[uniffi::export]
@@ -193,7 +195,10 @@ pub fn nip55_normalize_relay_host(url: String) -> Option<String> {
         .next()
         .unwrap_or(without_scheme)
         .trim_end_matches('/');
-    if !host.is_ascii() {
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"._-:[]".contains(&b))
+    {
         return None;
     }
     let host = host
@@ -1490,6 +1495,48 @@ mod tests {
             nip55_normalize_relay_host("wss://\u{212a}raken-relay.com".into()),
             None
         );
+    }
+
+    #[test]
+    fn normalize_relay_host_rejects_characters_no_host_has() {
+        for url in [
+            "wss://evil\u{0}relay.example.com",
+            "wss://relay.example.com\u{0}",
+            "wss://relay\u{7f}.example.com",
+            "wss://relay\u{1b}.example.com",
+            "wss://relay .example.com",
+            "wss://relay\t.example.com",
+            "wss://evil.com@relay.example.com",
+            "wss://relay.example.com?x=1",
+            "wss://relay.example.com#frag",
+            "wss://relay%2eexample.com",
+            "wss://evil.com\\@relay.example.com",
+            "wss://*",
+        ] {
+            assert_eq!(nip55_normalize_relay_host(url.into()), None, "{url:?}");
+        }
+        for (url, host) in [
+            ("wss://relay-1.example.com", "relay-1.example.com"),
+            ("wss://relay_x.example.com:7777", "relay_x.example.com:7777"),
+            ("wss://[::1]:7777", "[::1]:7777"),
+            ("wss://[::1]:443", "[::1]"),
+            ("relay.com.:443", "relay.com"),
+            ("wss://xn--bcher-kva.example", "xn--bcher-kva.example"),
+        ] {
+            assert_eq!(nip55_normalize_relay_host(url.into()), Some(host.into()));
+        }
+        let whitelist = vec!["relay.example.com".to_string()];
+        for url in [
+            "wss://relay.example.com]",
+            "https://relay.example.com",
+            "wss://relay.example.com:443.",
+        ] {
+            assert_eq!(
+                nip55_relay_auth_gate(nip55_normalize_relay_host(url.into()), whitelist.clone()),
+                Nip55RelayAuthGate::AutoReject,
+                "{url:?}"
+            );
+        }
     }
 
     #[test]
