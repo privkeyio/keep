@@ -1014,6 +1014,8 @@ pub struct KeepMobile {
     /// The persisted kill switch, mirrored for the NIP-46 bunker, whose handler
     /// reads a flag rather than storage. Seeded engaged when unreadable and
     /// written with every change, so the bunker sees a change while it runs.
+    /// Only this instance's writes reach it, so one storage must back only one
+    /// `KeepMobile`.
     pub(crate) kill_switch: Arc<std::sync::atomic::AtomicBool>,
     /// Held across each write of the switch and the flag together, so two
     /// writes cannot leave storage engaged and the flag released.
@@ -10283,6 +10285,9 @@ mod baseline_presign_policy_tests {
     pub(super) struct KillSwitchOffStorage {
         data: StdMutex<HashMap<String, Vec<u8>>>,
         metadata: Option<ShareMetadataInfo>,
+        /// Engages the switch on the next share metadata read, to throw it
+        /// while a request is being served.
+        pub(super) engage_on_metadata_read: std::sync::atomic::AtomicBool,
     }
 
     impl KillSwitchOffStorage {
@@ -10295,6 +10300,7 @@ mod baseline_presign_policy_tests {
             Self {
                 data: StdMutex::new(data),
                 metadata: None,
+                engage_on_metadata_read: Default::default(),
             }
         }
 
@@ -10319,6 +10325,15 @@ mod baseline_presign_policy_tests {
             false
         }
         fn get_share_metadata(&self) -> Option<ShareMetadataInfo> {
+            if self
+                .engage_on_metadata_read
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.data.lock().unwrap().insert(
+                    KILL_SWITCH_STORAGE_KEY.to_string(),
+                    serde_json::to_vec(&true).expect("bool serialises"),
+                );
+            }
             self.metadata.clone()
         }
         fn delete_share(&self) -> Result<(), KeepMobileError> {

@@ -608,6 +608,49 @@ mod tests {
         assert!(refused(handler.handle_request(request(), "c".into())));
     }
 
+    // A switch engaged while a request is served withholds what it produced.
+    #[test]
+    fn a_switch_engaged_mid_request_withholds_the_result() {
+        use crate::baseline_presign_policy_tests::KillSwitchOffStorage;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+        let storage = Arc::new(KillSwitchOffStorage::holding(crate::ShareMetadataInfo {
+            name: "share".into(),
+            identifier: 1,
+            threshold: 2,
+            total_shares: 3,
+            group_pubkey: vec![7u8; 32],
+            did_backup: true,
+        }));
+        let mobile = Arc::new(crate::KeepMobile::new(storage.clone()).unwrap());
+        let handler = crate::nip55::Nip55Handler::new(mobile);
+        let request = || crate::nip55::Nip55Request {
+            request_type: Nip55RequestType::GetPublicKey,
+            content: String::new(),
+            pubkey: None,
+            return_type: "signature".into(),
+            compression_type: "none".into(),
+            callback_url: None,
+            id: None,
+            current_user: None,
+            permissions: None,
+            kind: None,
+            scope: None,
+        };
+        let response = handler.handle_request(request(), "c".into()).unwrap();
+        assert_eq!(response.result, hex::encode([7u8; 32]));
+
+        storage
+            .engage_on_metadata_read
+            .store(true, Ordering::SeqCst);
+        let withheld = handler.handle_request(request(), "c".into());
+        assert!(
+            matches!(&withheld, Err(crate::KeepMobileError::PolicyViolation { reason })
+                if reason == crate::nip55::KILL_SWITCH_MESSAGE),
+            "{withheld:?}"
+        );
+    }
+
     // Gate 2: lock.
     #[test]
     fn lock_errors() {
