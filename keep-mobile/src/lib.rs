@@ -783,9 +783,19 @@ struct MobileSigningHooks {
     /// Read on every round so the kill switch ("Signing Disabled") gates FROST
     /// co-signing too, not just the NIP-55/NIP-46 paths.
     storage: Arc<dyn SecureStorage>,
+    /// Set while an engagement of the switch failed to save, so the hooks
+    /// refuse as the user asked although storage still reads released.
+    kill_switch_unsaved: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MobileSigningHooks {
+    /// Engaged when unsaved, stored engaged, or unreadable.
+    fn kill_switch_engaged(&self) -> bool {
+        self.kill_switch_unsaved
+            .load(std::sync::atomic::Ordering::Acquire)
+            || persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true)
+    }
+
     fn is_own_request_in_flight(&self, session: &SessionInfo) -> bool {
         session.requester == self.own_identifier
             && self
@@ -806,7 +816,7 @@ impl SigningHooks for MobileSigningHooks {
         // signing round, including pre-approved requests, without prompting.
         // Fail-closed (an unreadable switch is treated as engaged), mirroring
         // keep-web's bunker.
-        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true) {
+        if self.kill_switch_engaged() {
             return Err(keep_frost_net::FrostNetError::PolicyViolation(
                 "co-signing is disabled".into(),
             ));
@@ -947,6 +957,10 @@ impl SigningHooks for MobileSigningHooks {
         };
 
         match result {
+            // The switch may have been engaged while the prompt was open.
+            Ok(Some(true)) if self.kill_switch_engaged() => Err(
+                keep_frost_net::FrostNetError::PolicyViolation("co-signing is disabled".into()),
+            ),
             Ok(Some(true)) => Ok(()),
             Ok(Some(false)) => Err(keep_frost_net::FrostNetError::Session(
                 "Request rejected".into(),
@@ -961,7 +975,7 @@ impl SigningHooks for MobileSigningHooks {
     /// The kill switch stops ECDH as it stops signing, failing closed when the
     /// switch cannot be read: a quorum of partials decrypts the group's DMs.
     fn approve_ecdh(&self, _requester: &nostr_sdk::PublicKey) -> keep_frost_net::Result<()> {
-        if persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true) {
+        if self.kill_switch_engaged() {
             return Err(keep_frost_net::FrostNetError::PolicyViolation(
                 "co-signing is disabled".into(),
             ));
@@ -1003,9 +1017,12 @@ pub struct KeepMobile {
     /// written with every change, so the bunker sees a change while it runs.
     pub(crate) kill_switch: Arc<std::sync::atomic::AtomicBool>,
     /// Held across each write of the switch and the flag together, so two
-    /// writes cannot leave storage engaged and the flag released. Holds
-    /// whether an engagement failed to save, which a reread must not undo.
-    kill_switch_write: std::sync::Mutex<bool>,
+    /// writes cannot leave storage engaged and the flag released.
+    kill_switch_write: std::sync::Mutex<()>,
+    /// Set from the start of an engagement until a write saves, so it covers
+    /// a write in flight and one that failed. Every reader of the switch
+    /// treats it as engaged, as the user asked.
+    pub(crate) kill_switch_unsaved: Arc<std::sync::atomic::AtomicBool>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
     /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
@@ -1471,7 +1488,8 @@ impl KeepMobile {
             node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
             kill_switch,
-            kill_switch_write: std::sync::Mutex::new(false),
+            kill_switch_write: std::sync::Mutex::new(()),
+            kill_switch_unsaved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dkg_active: Arc::new(std::sync::Mutex::new(None)),
@@ -3899,6 +3917,12 @@ impl KeepMobile {
     }
 
     pub fn get_kill_switch(&self) -> Result<bool, KeepMobileError> {
+        if self
+            .kill_switch_unsaved
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(true);
+        }
         persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
     }
 
@@ -3906,26 +3930,21 @@ impl KeepMobile {
         self.write_kill_switch(enabled)
     }
 
-    /// Engaging takes effect in memory before the write, so a failed write
-    /// still stops the bunker. Releasing waits for the write to succeed.
+    /// Engaging takes effect in memory before the write, so every signing
+    /// path stops while it runs and after it fails. Releasing waits for the
+    /// write to succeed.
     fn write_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
         use std::sync::atomic::Ordering;
-        let mut unsaved_engagement = self
+        let _write = self
             .kill_switch_write
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if enabled {
+            self.kill_switch_unsaved.store(true, Ordering::Release);
             self.kill_switch.store(true, Ordering::Release);
         }
-        if let Err(e) =
-            persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
-        {
-            if enabled {
-                *unsaved_engagement = true;
-            }
-            return Err(e);
-        }
-        *unsaved_engagement = false;
+        persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)?;
+        self.kill_switch_unsaved.store(false, Ordering::Release);
         self.kill_switch.store(enabled, Ordering::Release);
         Ok(())
     }
@@ -3934,11 +3953,13 @@ impl KeepMobile {
     /// read that failed at startup does not hold the flag engaged for good. An
     /// engagement that failed to save holds until a release saves.
     pub(crate) fn reload_kill_switch(&self) {
-        let unsaved_engagement = self
+        let _write = self
             .kill_switch_write
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let engaged = *unsaved_engagement
+        let engaged = self
+            .kill_switch_unsaved
+            .load(std::sync::atomic::Ordering::Acquire)
             || persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
                 .unwrap_or(true);
         self.kill_switch
@@ -4298,7 +4319,7 @@ impl KeepMobile {
             None
         };
 
-        let kill_switch = persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)?;
+        let kill_switch = self.get_kill_switch()?;
 
         let config = BackupConfig {
             kill_switch,
@@ -4921,6 +4942,21 @@ fn build_wallet_policy(
 }
 
 impl KeepMobile {
+    fn signing_hooks(
+        &self,
+        request_tx: mpsc::Sender<(SessionInfo, mpsc::Sender<bool>)>,
+        own_identifier: u16,
+    ) -> MobileSigningHooks {
+        MobileSigningHooks {
+            request_tx,
+            pre_approved_hashes: self.pre_approved_hashes.clone(),
+            own_identifier,
+            own_requests_in_flight: self.own_requests_in_flight.clone(),
+            storage: self.storage.clone(),
+            kill_switch_unsaved: self.kill_switch_unsaved.clone(),
+        }
+    }
+
     /// The one implementation of both warden mutations, because the ordering is
     /// what is being protected and it was written out twice.
     ///
@@ -5531,13 +5567,8 @@ impl KeepMobile {
             };
 
             let (request_tx, request_rx) = mpsc::channel(32);
-            let hooks = Arc::new(MobileSigningHooks {
-                request_tx,
-                pre_approved_hashes: self.pre_approved_hashes.clone(),
-                own_identifier: node.share_package().metadata.identifier,
-                own_requests_in_flight: self.own_requests_in_flight.clone(),
-                storage: self.storage.clone(),
-            });
+            let hooks =
+                Arc::new(self.signing_hooks(request_tx, node.share_package().metadata.identifier));
             node.set_hooks(hooks);
 
             let event_rx = node.subscribe();
@@ -9734,6 +9765,7 @@ mod cosign_prompt_e2e_tests {
             own_identifier: nodes[0].share_package().metadata.identifier,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::clone(&storage),
+            kill_switch_unsaved: Default::default(),
         }));
         // What the event loop does with each request the hooks hand over:
         // build its prompt, then wait on the user.
@@ -10005,6 +10037,7 @@ mod cosign_prompt_e2e_tests {
             storage: Arc::new(
                 super::baseline_presign_policy_tests::KillSwitchOffStorage::with_switch_off(),
             ),
+            kill_switch_unsaved: Default::default(),
         }));
         let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
         let _shutdown: Vec<_> = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
@@ -10104,6 +10137,7 @@ mod cosign_prompt_e2e_tests {
                 own_identifier: nodes[0].share_package().metadata.identifier,
                 own_requests_in_flight: mobile.own_requests_in_flight.clone(),
                 storage: Arc::clone(&storage),
+                kill_switch_unsaved: Default::default(),
             }));
             tokio::spawn(async move {
                 while let Some((session, response_tx)) = request_rx.recv().await {
@@ -10381,6 +10415,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
+            kill_switch_unsaved: Default::default(),
         };
 
         let err = hooks
@@ -10405,6 +10440,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+            kill_switch_unsaved: Default::default(),
         };
         let approve = || {
             use sha2::{Digest, Sha256};
@@ -10468,6 +10504,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+            kill_switch_unsaved: Default::default(),
         };
         let err = hooks
             .pre_sign(&SessionInfo {
@@ -10488,6 +10525,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+            kill_switch_unsaved: Default::default(),
         };
         let session = |message_type: &str, payload: Option<Vec<u8>>| SessionInfo {
             structured_payload: payload,
@@ -10522,6 +10560,7 @@ mod baseline_presign_policy_tests {
                 own_identifier: 2,
                 own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
                 storage: Arc::new(storage),
+                kill_switch_unsaved: Default::default(),
             };
             let err = hooks
                 .pre_sign(&session_with(label, vec![1u8; 32]))
@@ -10547,6 +10586,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
+            kill_switch_unsaved: Default::default(),
         };
         let err = hooks
             .pre_sign(&session_with("raw\u{200b}", vec![2u8; 32]))
@@ -10572,6 +10612,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
+            kill_switch_unsaved: Default::default(),
         };
         hooks
             .pre_sign(&session_with("raw", vec![4u8; 32]))
@@ -10603,6 +10644,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 2,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
+            kill_switch_unsaved: Default::default(),
         };
 
         hooks
@@ -10619,6 +10661,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 1,
             own_requests_in_flight: Arc::new(StdMutex::new(HashMap::new())),
             storage: Arc::new(storage),
+            kill_switch_unsaved: Default::default(),
         }
     }
 
@@ -10732,6 +10775,7 @@ mod baseline_presign_policy_tests {
             own_identifier: 1,
             own_requests_in_flight: mobile.own_requests_in_flight.clone(),
             storage: Arc::new(KillSwitchOffStorage::with_switch_off()),
+            kill_switch_unsaved: Default::default(),
         }
     }
 

@@ -208,9 +208,10 @@ pub trait BunkerCallbacks: Send + Sync {
     /// answered.
     ///
     /// The implementation must bound that wait and reject when it expires,
-    /// sooner than [`nip46_approval_timeout_secs`]. The NIP-46 handler reads
-    /// one request at a time, so a wait that never ends stops every later
-    /// request from every client, not just this one.
+    /// sooner than [`nip46_approval_timeout_secs`]. The NIP-46 handler opens
+    /// one approval at a time and handles each client's requests in order, so
+    /// a wait that never ends stops every later request from this client and
+    /// every later approval from any client.
     ///
     /// That requirement is backed rather than merely stated: an answer that
     /// does not arrive within [`APPROVAL_TIMEOUT`] is treated as a refusal, and
@@ -1326,6 +1327,8 @@ mod tests {
         data: Mutex<HashMap<String, Vec<u8>>>,
         /// A key whose writes fail, as a platform write can.
         fail_writes_to: Mutex<Option<String>>,
+        /// Run at the start of every write, to observe state mid-write.
+        on_write: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
 
     impl SecureStorage for MemStorage {
@@ -1355,6 +1358,9 @@ mod tests {
             data: Vec<u8>,
             _metadata: ShareMetadataInfo,
         ) -> Result<(), KeepMobileError> {
+            if let Some(on_write) = self.on_write.lock().unwrap().as_ref() {
+                on_write();
+            }
             if self.fail_writes_to.lock().unwrap().as_deref() == Some(key.as_str()) {
                 return Err(KeepMobileError::StorageError {
                     msg: "write failed".into(),
@@ -2605,6 +2611,124 @@ mod tests {
         mobile.set_kill_switch(false).unwrap();
         bunker_server_config(&mobile, "secret", Vec::new()).unwrap();
         assert!(!engaged(), "a saved release clears it");
+    }
+
+    // An engagement that failed to save reads as engaged everywhere, the app's
+    // read, a backup, and the co-sign and ECDH hooks, until a release saves.
+    #[test]
+    fn an_unsaved_engagement_reads_as_engaged_everywhere() {
+        use keep_frost_net::SigningHooks;
+        let mem = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(mem.clone() as Arc<dyn SecureStorage>).unwrap();
+        let hooks = mobile.signing_hooks(tokio::sync::mpsc::channel(1).0, 1);
+        let message = [5u8; 32];
+        let _held = crate::OwnRequestGuard::hold(&mobile.own_requests_in_flight, &message);
+        let session = keep_frost_net::SessionInfo {
+            session_id: [9u8; 32],
+            message: message.to_vec(),
+            threshold: 2,
+            participants: vec![1, 2],
+            requester: 1,
+            message_type: keep_frost_net::MSG_TYPE_NOSTR_EVENT.to_string(),
+            structured_payload: None,
+            derivation_path: Vec::new(),
+            taproot_tweak: None,
+        };
+        let peer = nostr_sdk::Keys::generate().public_key();
+        hooks.pre_sign(&session).unwrap();
+        hooks.approve_ecdh(&peer).unwrap();
+
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::KILL_SWITCH_STORAGE_KEY.into());
+        assert!(mobile.set_kill_switch(true).is_err());
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(
+            mobile.get_kill_switch().unwrap(),
+            "the app reads it engaged"
+        );
+        assert!(hooks.pre_sign(&session).is_err(), "co-signing refuses");
+        assert!(hooks.approve_ecdh(&peer).is_err(), "ECDH refuses");
+        let pass = "a-sufficiently-long-passphrase";
+        let backup = mobile.create_backup(pass.into()).unwrap();
+        let decrypted = crate::decrypt_backup_data(&backup, pass).unwrap();
+        assert!(decrypted.config.kill_switch, "a backup carries it engaged");
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::KILL_SWITCH_STORAGE_KEY.into());
+        assert!(mobile.set_kill_switch(false).is_err());
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(
+            mobile.get_kill_switch().unwrap(),
+            "a release that fails to save leaves it engaged"
+        );
+        assert!(hooks.approve_ecdh(&peer).is_err());
+
+        mobile.set_kill_switch(false).unwrap();
+        assert!(!mobile.get_kill_switch().unwrap());
+        hooks.pre_sign(&session).unwrap();
+        hooks.approve_ecdh(&peer).unwrap();
+    }
+
+    // The hooks refuse while an engagement is still being written, before
+    // storage reads engaged.
+    #[test]
+    fn the_hooks_refuse_while_an_engagement_is_written() {
+        use keep_frost_net::SigningHooks;
+        let mem = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(mem.clone() as Arc<dyn SecureStorage>).unwrap();
+        let hooks = Arc::new(mobile.signing_hooks(tokio::sync::mpsc::channel(1).0, 1));
+        let peer = nostr_sdk::Keys::generate().public_key();
+        hooks.approve_ecdh(&peer).unwrap();
+        let refused_mid_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (seen, observer) = (Arc::clone(&refused_mid_write), Arc::clone(&hooks));
+        *mem.on_write.lock().unwrap() = Some(Box::new(move || {
+            seen.store(observer.approve_ecdh(&peer).is_err(), Ordering::Release);
+        }));
+        mobile.set_kill_switch(true).unwrap();
+        assert!(refused_mid_write.load(Ordering::Acquire));
+    }
+
+    // A co-sign prompt approved after the switch was engaged is refused.
+    #[test]
+    fn an_approval_given_after_engaging_is_refused() {
+        use keep_frost_net::SigningHooks;
+        let mobile = Arc::new(
+            KeepMobile::new(Arc::new(MemStorage::default()) as Arc<dyn SecureStorage>).unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let hooks = mobile.signing_hooks(tx, 1);
+        let session = keep_frost_net::SessionInfo {
+            session_id: [9u8; 32],
+            message: vec![5u8; 32],
+            threshold: 2,
+            participants: vec![1, 2],
+            requester: 1,
+            message_type: keep_frost_net::MSG_TYPE_NOSTR_EVENT.to_string(),
+            structured_payload: None,
+            derivation_path: Vec::new(),
+            taproot_tweak: None,
+        };
+        let mut answer = |engage: bool| {
+            let mobile = Arc::clone(&mobile);
+            let prompt = rx.blocking_recv();
+            std::thread::spawn(move || {
+                let (_, respond) = prompt.unwrap();
+                if engage {
+                    mobile.set_kill_switch(true).unwrap();
+                }
+                respond.blocking_send(true).unwrap();
+            })
+        };
+        let signer = std::thread::scope(|scope| {
+            let signed = scope.spawn(|| hooks.pre_sign(&session));
+            answer(false).join().unwrap();
+            signed.join().unwrap()
+        });
+        signer.unwrap();
+        let refused = std::thread::scope(|scope| {
+            let signed = scope.spawn(|| hooks.pre_sign(&session));
+            answer(true).join().unwrap();
+            signed.join().unwrap()
+        });
+        let err = refused.expect_err("engaged while the prompt was open");
+        assert!(format!("{err}").contains("disabled"), "{err}");
     }
 
     // A switch that could not be read at startup is read again when the bunker
