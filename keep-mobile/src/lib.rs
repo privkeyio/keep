@@ -987,8 +987,9 @@ pub struct KeepMobile {
     /// written with every change, so the bunker sees a change while it runs.
     pub(crate) kill_switch: Arc<std::sync::atomic::AtomicBool>,
     /// Held across each write of the switch and the flag together, so two
-    /// writes cannot leave storage engaged and the flag released.
-    kill_switch_write: std::sync::Mutex<()>,
+    /// writes cannot leave storage engaged and the flag released. Holds
+    /// whether an engagement failed to save, which a reread must not undo.
+    kill_switch_write: std::sync::Mutex<bool>,
     pending_requests: Arc<Mutex<Vec<PendingRequest>>>,
     /// Per-group DKG signing subkey secrets minted by `frost_dkg_begin` and held
     /// in memory (never crossing the Kotlin boundary, §8) until `frost_run_dkg`
@@ -1454,7 +1455,7 @@ impl KeepMobile {
             node_tasks: Arc::new(std::sync::Mutex::new(Vec::new())),
             storage,
             kill_switch,
-            kill_switch_write: std::sync::Mutex::new(()),
+            kill_switch_write: std::sync::Mutex::new(false),
             pending_requests: Arc::new(Mutex::new(Vec::new())),
             dkg_subkeys: Arc::new(std::sync::Mutex::new(HashMap::new())),
             dkg_active: Arc::new(std::sync::Mutex::new(None)),
@@ -3893,27 +3894,37 @@ impl KeepMobile {
     /// still stops the bunker. Releasing waits for the write to succeed.
     fn write_kill_switch(&self, enabled: bool) -> Result<(), KeepMobileError> {
         use std::sync::atomic::Ordering;
-        let _write = self
+        let mut unsaved_engagement = self
             .kill_switch_write
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if enabled {
             self.kill_switch.store(true, Ordering::Release);
         }
-        persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)?;
+        if let Err(e) =
+            persistence::persist_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY, enabled)
+        {
+            if enabled {
+                *unsaved_engagement = true;
+            }
+            return Err(e);
+        }
+        *unsaved_engagement = false;
         self.kill_switch.store(enabled, Ordering::Release);
         Ok(())
     }
 
     /// Reread the stored switch into the flag, engaged when unreadable, so a
-    /// read that failed at startup does not hold the flag engaged for good.
+    /// read that failed at startup does not hold the flag engaged for good. An
+    /// engagement that failed to save holds until a release saves.
     pub(crate) fn reload_kill_switch(&self) {
-        let _write = self
+        let unsaved_engagement = self
             .kill_switch_write
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let engaged =
-            persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY).unwrap_or(true);
+        let engaged = *unsaved_engagement
+            || persistence::load_kill_switch(&self.storage, KILL_SWITCH_STORAGE_KEY)
+                .unwrap_or(true);
         self.kill_switch
             .store(engaged, std::sync::atomic::Ordering::Release);
     }

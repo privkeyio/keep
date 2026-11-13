@@ -2590,6 +2590,23 @@ mod tests {
         assert!(engaged(), "releasing needs the write");
     }
 
+    // An engagement that failed to save survives the reread at a bunker start,
+    // and only a release that saves clears it.
+    #[test]
+    fn an_unsaved_engagement_survives_a_bunker_start() {
+        let mem = Arc::new(MemStorage::default());
+        let mobile = KeepMobile::new(mem.clone() as Arc<dyn SecureStorage>).unwrap();
+        let engaged = || mobile.kill_switch.load(Ordering::Acquire);
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::KILL_SWITCH_STORAGE_KEY.into());
+        assert!(mobile.set_kill_switch(true).is_err());
+        *mem.fail_writes_to.lock().unwrap() = None;
+        bunker_server_config(&mobile, "secret", Vec::new()).unwrap();
+        assert!(engaged(), "the reread keeps the unsaved engagement");
+        mobile.set_kill_switch(false).unwrap();
+        bunker_server_config(&mobile, "secret", Vec::new()).unwrap();
+        assert!(!engaged(), "a saved release clears it");
+    }
+
     // A switch that could not be read at startup is read again when the bunker
     // starts, so the flag follows storage once it reads.
     #[test]
