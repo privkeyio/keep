@@ -26,8 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 /// [`BunkerCallbacks::request_approval`] still requires the implementation to
 /// bound its own wait, and keep-android does. This is the backstop for one that
 /// does not: without it the contract is unenforceable from here, and an
-/// implementation that waits forever stops every later request from every
-/// client, because the handler reads one at a time.
+/// implementation that waits forever keeps the handler's one approval prompt
+/// open for good, and no later request from any client can be asked about.
 ///
 /// The platform's own wait has to end before this one. Two timers of the same
 /// length started at nearly the same moment let an approval land on the
@@ -46,7 +46,7 @@ pub fn nip46_approval_timeout_secs() -> u64 {
 
 /// How many prompts may be waiting on the platform at once.
 ///
-/// The handler reads one request at a time, so more than one is outstanding
+/// The handler opens one prompt at a time, so more than one is outstanding
 /// only when earlier prompts timed out and their threads are still parked in a
 /// platform call that never returned. Against such an implementation the
 /// threads accumulate at roughly one per [`APPROVAL_TIMEOUT`], each holding a
@@ -358,9 +358,9 @@ impl ServerCallbacks for CallbackBridge {
         // way; what `block_in_place` adds is moving the one task in the LIFO
         // slot back to the run queue and sending the core to another thread, so
         // the worker's work keeps draining instead of waiting out the prompt.
-        // Later NIP-46 requests stall regardless, since the handler's
-        // notification loop reads one at a time; what the timeout changes is
-        // that the stall is now bounded.
+        // Later requests that need a prompt wait behind this one regardless,
+        // since the handler opens one prompt at a time. What the timeout
+        // changes is that the wait is now bounded.
         //
         // It also leaves the runtime for the duration of the wait, so a foreign
         // callback that re-enters an exported method built on

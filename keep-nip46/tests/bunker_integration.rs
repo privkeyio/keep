@@ -1213,3 +1213,185 @@ async fn test_e2e_requests_dated_outside_the_run_are_not_handled() {
     task.abort();
     client.disconnect().await;
 }
+
+// Approves connects at once and holds every sign prompt open until released.
+struct HeldSignPrompt {
+    open: std::sync::atomic::AtomicUsize,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl ServerCallbacks for HeldSignPrompt {
+    fn on_log(&self, _event: LogEvent) {}
+    fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        if request.method != "sign_event" {
+            return ApprovalResult::approved_once();
+        }
+        self.open.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::task::block_in_place(|| {
+            let _ = self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(30));
+        });
+        ApprovalResult::rejected()
+    }
+}
+
+// Over the relay, one app's request waiting on an open approval prompt does
+// not hold up another app's request that needs no prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_e2e_an_open_prompt_does_not_stall_another_app() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let mock_relay = common::start_mock_relay().await;
+    let relay_url = mock_relay.url().await.to_string();
+    let (keyring, signer_pubkey) = setup_keyring();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let prompt = Arc::new(HeldSignPrompt {
+        open: Default::default(),
+        release: std::sync::Mutex::new(release_rx),
+    });
+    let mut server = Server::new_with_config(
+        keyring,
+        None,
+        None,
+        std::slice::from_ref(&relay_url),
+        Some(prompt.clone()),
+        ServerConfig {
+            connect_grant: keep_nip46::Permission::GET_PUBLIC_KEY
+                | keep_nip46::Permission::SIGN_EVENT,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("server creation");
+    let server_pubkey = server.pubkey();
+    let server_handle = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let mut apps = Vec::new();
+    for _ in 0..2 {
+        let keys = Keys::generate();
+        let client = Client::new(keys.clone());
+        client.add_relay(relay_url.clone()).await.unwrap();
+        client.connect().await;
+        client.wait_for_connection(Duration::from_secs(5)).await;
+        client
+            .subscribe(
+                Filter::new()
+                    .kind(Kind::NostrConnect)
+                    .author(server_pubkey)
+                    .pubkey(keys.public_key()),
+                None,
+            )
+            .await
+            .expect("subscribe to bunker responses");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let notifications = client.notifications();
+        apps.push((keys, client, notifications));
+    }
+    let ask = |keys: &Keys, id: &str, method: &str, params: serde_json::Value| {
+        let request = serde_json::json!({ "id": id, "method": method, "params": params });
+        build_nip46_request(
+            keys,
+            &server_pubkey,
+            &serde_json::to_string(&request).unwrap(),
+        )
+    };
+    let unsigned = |kind: u16| {
+        serde_json::to_string(&serde_json::json!({
+            "kind": kind,
+            "content": "e2e",
+            "tags": [],
+            "created_at": Timestamp::now().as_secs(),
+        }))
+        .unwrap()
+    };
+
+    // The first app names kind 1, so signing it prompts. The second names
+    // nothing, so its reaction signs without a prompt.
+    for (i, perms) in ["sign_event:1", ""].into_iter().enumerate() {
+        let (keys, client, notifications) = &mut apps[i];
+        let mut params = vec![signer_pubkey.to_hex(), String::new()];
+        if !perms.is_empty() {
+            params.push(perms.to_string());
+        }
+        let sent = client
+            .send_event(&ask(keys, "connect", "connect", serde_json::json!(params)))
+            .await
+            .unwrap();
+        assert!(!sent.success.is_empty(), "no relay took the connect");
+        let response = await_nip46_response(
+            notifications,
+            keys,
+            &server_pubkey,
+            "connect",
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("connect must respond");
+        assert_eq!(response.get("result").and_then(|v| v.as_str()), Some("ack"));
+    }
+
+    {
+        let (keys, client, _) = &apps[0];
+        let sent = client
+            .send_event(&ask(
+                keys,
+                "held",
+                "sign_event",
+                serde_json::json!([unsigned(1)]),
+            ))
+            .await
+            .unwrap();
+        assert!(!sent.success.is_empty(), "no relay took the held request");
+    }
+    for _ in 0..100 {
+        if prompt.open.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(prompt.open.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let (keys, client, notifications) = &mut apps[1];
+    let sent = client
+        .send_event(&ask(
+            keys,
+            "free",
+            "sign_event",
+            serde_json::json!([unsigned(7)]),
+        ))
+        .await
+        .unwrap();
+    assert!(!sent.success.is_empty(), "no relay took the free request");
+    let response = await_nip46_response(
+        notifications,
+        keys,
+        &server_pubkey,
+        "free",
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("the second app was held up by the first app's open prompt");
+    let signed = response
+        .get("result")
+        .and_then(|v| v.as_str())
+        .expect("the reaction is signed");
+    Event::from_json(signed).unwrap().verify().unwrap();
+    assert_eq!(
+        prompt.open.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first app's prompt was still open"
+    );
+
+    let _ = release_tx.send(());
+    server_handle.abort();
+    for (_, client, _) in apps {
+        client.disconnect().await;
+    }
+}
