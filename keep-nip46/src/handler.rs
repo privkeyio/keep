@@ -387,6 +387,57 @@ impl SignerHandler {
         self.kill_switch.store(active, Ordering::Release);
     }
 
+    /// An app revoked, a kill switch thrown, a refusal recorded for this kind
+    /// or, for a request that was signing without a prompt, the kind no longer
+    /// being approved, during `stage`, stops a co-signature. Each refusal is
+    /// audited, since peers may already hold the signature. The permission
+    /// and the decision are read under one guard, since decide() alone says
+    /// Ask for a revoked app.
+    async fn still_allowed_to_cosign(
+        &self,
+        app_pubkey: PublicKey,
+        kind: Kind,
+        ask: bool,
+        stage: &str,
+    ) -> Result<()> {
+        let (permitted, decision) = {
+            let pm = self.permissions.lock().await;
+            (
+                pm.has_permission(&app_pubkey, Permission::SIGN_EVENT),
+                pm.decide(&app_pubkey, kind),
+            )
+        };
+        let refusal = if !permitted {
+            Some((
+                "SIGN_EVENT revoked",
+                KeepError::PermissionDenied("operation not permitted".into()),
+            ))
+        } else if self.kill_switch.load(Ordering::Acquire) {
+            Some((
+                "kill switch engaged",
+                KeepError::PermissionDenied("kill switch active: all signing blocked".into()),
+            ))
+        } else {
+            match decision {
+                ApprovalDecision::Deny => Some(("kind refused", KeepError::UserRejected)),
+                ApprovalDecision::Ask if !ask => Some((
+                    "kind now needs approval",
+                    KeepError::PermissionDenied("this kind now needs approval".into()),
+                )),
+                ApprovalDecision::Ask | ApprovalDecision::Allow => None,
+            }
+        };
+        let Some((why, error)) = refusal else {
+            return Ok(());
+        };
+        self.audit.lock().await.log(
+            AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
+                .with_success(false)
+                .with_reason(format!("{why} during {stage}")),
+        );
+        Err(error)
+    }
+
     fn check_kill_switch(&self) -> Result<()> {
         if self.kill_switch.load(Ordering::Acquire) {
             Err(KeepError::PermissionDenied(
@@ -842,40 +893,13 @@ impl SignerHandler {
                 KeepError::CapacityExceeded("another FROST signature is underway".into())
             })
             .await?;
-            // The wait can be long, and an app revoked or a kill switch thrown
-            // meanwhile still stops this signature. So does a refusal recorded
-            // for this kind, or, for a request that was signing without a
-            // prompt, the kind no longer being approved. Both are read under
-            // one guard, since decide() alone says Ask for a revoked app.
-            let (permitted, decision) = {
-                let pm = self.permissions.lock().await;
-                (
-                    pm.has_permission(&app_pubkey, Permission::SIGN_EVENT),
-                    pm.decide(&app_pubkey, kind),
-                )
-            };
-            if !permitted {
-                self.audit.lock().await.log(
-                    AuditEntry::new(AuditAction::PermissionDenied, app_pubkey)
-                        .with_success(false)
-                        .with_reason("SIGN_EVENT revoked while waiting to co-sign"),
-                );
-                return Err(KeepError::PermissionDenied(
-                    "operation not permitted".into(),
-                ));
-            }
-            match decision {
-                ApprovalDecision::Deny => return Err(KeepError::UserRejected),
-                ApprovalDecision::Ask if !ask => {
-                    return Err(KeepError::PermissionDenied(
-                        "this kind now needs approval".into(),
-                    ))
-                }
-                ApprovalDecision::Ask | ApprovalDecision::Allow => {}
-            }
-            self.check_kill_switch()?;
+            // The wait for the turn and the round itself can each be long.
+            self.still_allowed_to_cosign(app_pubkey, kind, ask, "waiting to co-sign")
+                .await?;
             let sig_bytes = net_frost
                 .sign_nostr_event(event_id.as_bytes(), &frost_event)
+                .await?;
+            self.still_allowed_to_cosign(app_pubkey, kind, ask, "the co-sign round")
                 .await?;
             assemble_signed_event(event_id, pubkey, frost_event, &sig_bytes)?
         } else if let Some(ref frost) = self.frost_signer {
@@ -1902,6 +1926,131 @@ mod tests {
         assert!(pm.has_permission(&app, Permission::SIGN_EVENT));
         assert!(pm.needs_approval(&app, Kind::TextNote));
         assert!(pm.needs_approval(&app, Kind::EncryptedDirectMessage));
+    }
+
+    struct EngagesTheSwitch {
+        switch: Arc<AtomicBool>,
+        armed: AtomicBool,
+    }
+
+    impl keep_frost_net::SigningHooks for EngagesTheSwitch {
+        fn pre_sign(&self, _: &keep_frost_net::SessionInfo) -> keep_frost_net::Result<()> {
+            if self.armed.load(Ordering::SeqCst) {
+                self.switch.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn post_sign(&self, _: &keep_frost_net::SessionInfo, _: &[u8; 64]) {}
+    }
+
+    // A kill switch thrown while the co-signer works on the round keeps the
+    // signature from the app.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_kill_switch_thrown_during_the_frost_round_withholds_the_signature() {
+        use keep_core::frost::{ThresholdConfig, TrustedDealer};
+        use keep_frost_net::test_support::MemoryBus;
+        use keep_frost_net::{CosignTransport, KfpNode, KfpNodeEvent};
+
+        let (shares, _) = TrustedDealer::new(ThresholdConfig::new(2, 2).unwrap())
+            .generate("bunker-switch")
+            .unwrap();
+        let group_pubkey = *shares[0].group_pubkey();
+        let bus = MemoryBus::new();
+        let mut nodes: Vec<KfpNode> = shares
+            .into_iter()
+            .map(|share| {
+                KfpNode::with_transport(
+                    share,
+                    bus.transport() as Arc<dyn CosignTransport>,
+                    None,
+                    None,
+                )
+                .unwrap()
+            })
+            .collect();
+        let switch = Arc::new(AtomicBool::new(false));
+        let hook = Arc::new(EngagesTheSwitch {
+            switch: Arc::clone(&switch),
+            armed: AtomicBool::new(false),
+        });
+        nodes[1].set_hooks(Arc::clone(&hook) as Arc<dyn keep_frost_net::SigningHooks>);
+        let mut seen: Vec<_> = nodes.iter().map(|n| n.subscribe()).collect();
+        let _shutdown: Vec<_> = nodes.iter_mut().map(|n| n.take_shutdown_handle()).collect();
+        let nodes: Vec<Arc<KfpNode>> = nodes.into_iter().map(Arc::new).collect();
+        for node in &nodes {
+            let node = Arc::clone(node);
+            tokio::spawn(async move {
+                let _ = node.run().await;
+            });
+        }
+        for rx in &mut seen {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    match rx.recv().await {
+                        Ok(KfpNodeEvent::PeerDiscovered { .. }) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            panic!("a node stopped before discovering its peer")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .expect("the nodes must discover each other");
+        }
+
+        let permissions = Arc::new(Mutex::new(PermissionManager::new()));
+        permissions
+            .lock()
+            .await
+            .set_auto_approve_kinds(HashSet::from([Kind::TextNote]));
+        let handler = SignerHandler::new(
+            Arc::new(Mutex::new(Keyring::new())),
+            permissions,
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            None,
+        )
+        .with_network_frost_signer(NetworkFrostSigner::with_shared_node(
+            group_pubkey,
+            Arc::clone(&nodes[0]),
+        ))
+        .with_auto_approve(true)
+        .with_kill_switch(Arc::clone(&switch));
+        let app = Keys::generate().public_key();
+        handler.handle_connect(app, None, None, None).await.unwrap();
+        let signer_pk = handler.our_pubkey().await.unwrap();
+        let event = |content: &str| {
+            UnsignedEvent::new(
+                signer_pk,
+                Timestamp::now(),
+                Kind::TextNote,
+                Vec::<Tag>::new(),
+                content,
+            )
+        };
+
+        let signed = handler
+            .handle_sign_event(app, event("released"))
+            .await
+            .unwrap();
+        assert!(signed.verify().is_ok());
+
+        hook.armed.store(true, Ordering::SeqCst);
+        let withheld = handler
+            .handle_sign_event(app, event("engaged mid-round"))
+            .await;
+        assert!(
+            switch.load(Ordering::SeqCst),
+            "the co-signer threw the switch"
+        );
+        assert!(
+            matches!(&withheld, Err(KeepError::PermissionDenied(m)) if m.contains("kill switch")),
+            "{withheld:?}"
+        );
+        assert_eq!(
+            last_reason(&handler).await.as_deref(),
+            Some("kill switch engaged during the co-sign round")
+        );
     }
 
     // Requirement 3: the signer must sign the event EXACTLY as received —
