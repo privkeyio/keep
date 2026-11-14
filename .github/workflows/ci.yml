@@ -49,8 +49,9 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* /etc/apt/sources.list.d/*google*
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo fmt -- --check
@@ -103,7 +104,9 @@ jobs:
       - name: Install Xcode tools (macOS)
         if: matrix.os == 'macos-latest'
         run: xcode-select --install || true
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.os }}
@@ -209,7 +212,9 @@ jobs:
     if: github.event.pull_request.draft != true && github.event_name != 'schedule'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: windows-latest
@@ -253,7 +258,7 @@ jobs:
         run: sdkmanager --install "ndk;$NDK_VERSION"
       # rust-toolchain.toml pins the channel, so the Android target has to be added
       # to that exact toolchain rather than to whatever `stable` resolves to.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.89.0"
           targets: aarch64-linux-android
@@ -312,7 +317,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* /etc/apt/sources.list.d/*google*
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -416,7 +421,7 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/*microsoft* /etc/apt/sources.list.d/*azure* /etc/apt/sources.list.d/*google*
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libgtk-3-dev libxdo-dev
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: nightly
       - run: cargo +nightly install cargo-fuzz --locked
