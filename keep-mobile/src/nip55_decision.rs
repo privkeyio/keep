@@ -252,12 +252,16 @@ pub(crate) fn evaluate_nip55_request(
     // and only gate 5 reads it.
     let is_relay_auth =
         inputs.request_type == Nip55RequestType::SignEvent && event_kind == Some(KIND_NIP42_AUTH);
+    let relay_host = if is_relay_auth {
+        nip55_extract_relay_host(inputs.event_json.clone())
+    } else {
+        None
+    };
     let relay_gate: Option<Nip55RelayAuthGate> = if is_relay_auth {
         Some(if inputs.relay_whitelist_read_failed {
             Nip55RelayAuthGate::AutoReject
         } else {
-            let host = nip55_extract_relay_host(inputs.event_json.clone());
-            nip55_relay_auth_gate(host, inputs.relay_whitelist.clone())
+            nip55_relay_auth_gate(relay_host.clone(), inputs.relay_whitelist.clone())
         })
     } else {
         None
@@ -406,7 +410,17 @@ pub(crate) fn evaluate_nip55_request(
     // grant. AUTO_REJECT at gate 5 is what it is for: a non-whitelisted relay
     // is refused. Membership removes that refusal and nothing more, so a
     // request still needs a requester-scoped permission or a prompt.
+    //
+    // A relay auth whose relay cannot be read has no relay to scope a grant
+    // to, so every such event would share one. It is always asked.
     match decision {
+        Some(Nip55PermissionDecision::Allow) if is_relay_auth && relay_host.is_none() => {
+            let risk = assess_signing_risk(ctx, recent_count, inputs.current_hour);
+            Nip55Outcome::RequireUi {
+                required_auth: risk.required_auth.clone(),
+                risk,
+            }
+        }
         Some(Nip55PermissionDecision::Allow) => Nip55Outcome::AutoApprove,
         Some(Nip55PermissionDecision::Deny) => Nip55Outcome::Reject {
             reason: "deny".to_string(),
@@ -765,6 +779,29 @@ mod tests {
         i.relay_whitelist = vec!["relay.allowed.com".to_string()];
         i.relay_whitelist_read_failed = true;
         assert!(is_require_ui(&evaluate_nip55_request(i, false)));
+    }
+
+    // A remembered grant answers a relay auth only when its relay can be read.
+    // Every unreadable relay would otherwise share one grant.
+    #[test]
+    fn a_relay_auth_without_a_readable_relay_is_always_asked() {
+        let decide = |relay: &str, stored: &str| {
+            let mut i = base();
+            i.event_json = format!(r#"{{"kind":22242,"tags":[["relay","{relay}"]]}}"#);
+            i.stored_exact_permission = Some(perm(stored));
+            evaluate_nip55_request(i, false)
+        };
+        assert_eq!(
+            decide("wss://relay.example.com", "allow"),
+            Nip55Outcome::AutoApprove
+        );
+        for unreadable in ["https://relay.example.com", "wss:/relay.example.com", ""] {
+            assert!(
+                is_require_ui(&decide(unreadable, "allow")),
+                "{unreadable:?}"
+            );
+            assert_eq!(reject_reason(&decide(unreadable, "deny")), "deny");
+        }
     }
 
     // The relay-auth gate and the sensitive-kind gate key off the kind derived
