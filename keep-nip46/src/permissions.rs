@@ -94,7 +94,7 @@ impl PermissionDuration {
         match self {
             Self::Session | Self::Forever => false,
             Self::Seconds(secs) => {
-                let now = Timestamp::now().as_secs();
+                let now = now_unix_secs();
                 let expires = connected_at.as_secs().saturating_add(*secs);
                 now > expires
             }
@@ -203,7 +203,7 @@ impl AppPermission {
     pub fn has_unexpired_denial(&self, kind: Kind) -> bool {
         self.timed_kind_denials
             .get(&kind)
-            .is_some_and(|&expiry| Timestamp::now().as_secs() < expiry)
+            .is_some_and(|&expiry| now_unix_secs() < expiry)
     }
 
     /// Whether the app currently holds a live remember-grant: a Forever per-kind
@@ -476,7 +476,9 @@ impl PermissionManager {
     /// Clears any grant for the same kind: a refusal that leaves an existing
     /// grant standing would be overridden by it the moment the decision is next
     /// taken, so the user's most recent answer has to be the one that holds.
-    /// Returns whether anything was written, so callers only audit real changes.
+    /// The grant is cleared even when the refusal itself cannot be remembered
+    /// (clock error, or the per-app cap on remembered refusals). Returns
+    /// whether the refusal was remembered.
     pub fn deny_kind_for(&mut self, pubkey: &PublicKey, kind: Kind, secs: u64) -> bool {
         if secs == 0 {
             return false;
@@ -493,10 +495,25 @@ impl PermissionManager {
         } else {
             secs
         };
-        let expiry = Timestamp::now().as_secs().saturating_add(secs);
         app.auto_approve_kinds.remove(&kind);
         app.timed_kind_grants.remove(&kind);
-        app.timed_kind_denials.insert(kind, expiry);
+        let now = now_unix_secs();
+        if now == u64::MAX {
+            return false;
+        }
+        app.timed_kind_denials.retain(|_, expiry| now < *expiry);
+        if !app.timed_kind_denials.contains_key(&kind)
+            && app.timed_kind_denials.len() >= MAX_AUTO_KINDS
+        {
+            warn!(
+                app_id = &pubkey.to_hex()[..8],
+                kind = kind.as_u16(),
+                "remembered-refusal cap reached, this refusal is not remembered"
+            );
+            return false;
+        }
+        app.timed_kind_denials
+            .insert(kind, now.saturating_add(secs));
         true
     }
 
@@ -1669,6 +1686,47 @@ mod tests {
             ApprovalDecision::Ask,
             "refusing one kind must not silently refuse the others"
         );
+    }
+
+    #[test]
+    fn refusals_are_pruned_and_capped() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        pm.connect(pubkey, "agent".into());
+
+        for k in 0..MAX_AUTO_KINDS as u16 {
+            assert!(pm.deny_kind_for(&pubkey, Kind::from(20_000 + k), 3600));
+        }
+        let over = Kind::from(30_000u16);
+        assert!(
+            !pm.deny_kind_for(&pubkey, over, 3600),
+            "a refusal past the cap must not be remembered"
+        );
+        assert_eq!(pm.decide(&pubkey, over), ApprovalDecision::Ask);
+        assert!(pm.grant_kind_for(&pubkey, over, 3600));
+        assert_eq!(pm.decide(&pubkey, over), ApprovalDecision::Allow);
+        assert!(!pm.deny_kind_for(&pubkey, over, 3600));
+        assert_eq!(
+            pm.decide(&pubkey, over),
+            ApprovalDecision::Ask,
+            "a refusal past the cap must still clear the grant it answers"
+        );
+        assert!(
+            pm.deny_kind_for(&pubkey, Kind::from(20_000u16), 60),
+            "re-refusing a kind already on record is not a new entry"
+        );
+
+        if let Some(app) = pm.apps.get_mut(&pubkey) {
+            for expiry in app.timed_kind_denials.values_mut() {
+                *expiry = 1;
+            }
+        }
+        assert!(
+            pm.deny_kind_for(&pubkey, over, 3600),
+            "elapsed refusals must be pruned to make room"
+        );
+        assert_eq!(pm.apps[&pubkey].timed_kind_denials.len(), 1);
+        assert_eq!(pm.decide(&pubkey, over), ApprovalDecision::Deny);
     }
 
     #[test]
