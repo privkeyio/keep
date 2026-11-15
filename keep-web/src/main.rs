@@ -560,7 +560,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/events", get(ws::events))
         .with_state(state);
 
-    let app = public.merge(authed).fallback_service(static_files);
+    let app = with_security_headers(public.merge(authed).fallback_service(static_files));
 
     tracing::info!(%listen, "serving web admin");
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -568,11 +568,89 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// The UI loads only its own bundled script, stylesheet and images and talks
+/// only to this origin. The policy refuses inline and injected script and
+/// framing, and limits where the page can fetch or connect. It does not stop a
+/// script that does run from navigating away with the token, so keeping script
+/// out is what it is for.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; object-src 'none'; \
+     base-uri 'none'; frame-ancestors 'none'; form-action 'self'";
+
+fn with_security_headers(app: Router) -> Router {
+    use axum::http::{header, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    app.layer(SetResponseHeaderLayer::overriding(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    ))
+    .layer(SetResponseHeaderLayer::overriding(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    ))
+    .layer(SetResponseHeaderLayer::overriding(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use keep_core::Keep;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn every_response_carries_the_security_headers() {
+        use axum::body::Body;
+        use axum::http::{header, Request, StatusCode};
+        use tower::ServiceExt;
+
+        let ui = tempdir().unwrap();
+        std::fs::write(ui.path().join("index.html"), "<html></html>").unwrap();
+        let authed = Router::new()
+            .route("/api/shares", get(|| async { "shares" }))
+            .layer(axum::middleware::from_fn_with_state(
+                auth::AuthToken::new("a-token-for-the-header-test"),
+                auth::require_auth,
+            ));
+        let app = with_security_headers(
+            Router::new()
+                .route("/api/health", get(|| async { "ok" }))
+                .merge(authed)
+                .fallback_service(
+                    ServeDir::new(ui.path()).fallback(ServeFile::new(ui.path().join("index.html"))),
+                ),
+        );
+        for (method, path, status) in [
+            ("GET", "/api/health", StatusCode::OK),
+            ("GET", "/", StatusCode::OK),
+            ("GET", "/some/client/route", StatusCode::OK),
+            ("GET", "/missing.js", StatusCode::OK),
+            ("GET", "/api/shares", StatusCode::UNAUTHORIZED),
+            ("DELETE", "/api/health", StatusCode::METHOD_NOT_ALLOWED),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), status, "{method} {path}");
+            let h = resp.headers();
+            assert_eq!(
+                h[header::CONTENT_SECURITY_POLICY],
+                CONTENT_SECURITY_POLICY,
+                "{path}"
+            );
+            assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff", "{path}");
+            assert_eq!(h[header::REFERRER_POLICY], "no-referrer", "{path}");
+        }
+    }
 
     #[test]
     fn configured_token_enforces_a_minimum_length_floor() {
