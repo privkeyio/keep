@@ -2614,6 +2614,7 @@ impl KeepMobile {
         let bundle = PolicyBundle::from_bytes(&bundle_bytes)?;
         bundle.verify_signature()?;
         bundle.verify_hash()?;
+        bundle.parse_rules()?;
         // Held for the whole install, so a revocation or a warden change cannot
         // land between the stored record being checked and this one replacing
         // it.
@@ -12427,6 +12428,72 @@ mod velocity_fault_tests {
             storage.raw(POLICY_HIGH_WATER_STORAGE_KEY).unwrap(),
             b"not json".to_vec()
         );
+    }
+
+    #[test]
+    fn a_signed_policy_with_an_unknown_rule_is_refused_at_import() {
+        use sha2::Digest;
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden))]).expect("serialize wardens"),
+        );
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        for rules_json in [
+            r#"{"max_ammount":1000}"#,
+            r#"{"allowed_hours":{"start":9,"end":17,"tz":"local"}}"#,
+        ] {
+            let mut bundle = create_test_bundle_with(&warden, &PolicyRules::default(), now);
+            bundle.rules_json = rules_json.to_string();
+            bundle.policy_hash = sha2::Sha256::digest(rules_json.as_bytes()).into();
+            crate::policy::resign_test_bundle(&warden, &mut bundle);
+            assert!(
+                matches!(
+                    mobile.import_policy(hex::encode(bundle.to_bytes())),
+                    Err(KeepMobileError::InvalidPolicy { .. })
+                ),
+                "{rules_json} must not install as a policy that enforces nothing"
+            );
+        }
+        assert!(!storage
+            .records
+            .lock()
+            .unwrap()
+            .contains_key(POLICY_STORAGE_KEY));
+        let bundle = create_test_bundle_with(&warden, &capped_rules(), now);
+        mobile
+            .import_policy(hex::encode(bundle.to_bytes()))
+            .expect("known rules install");
+    }
+
+    // A bundle stored before unknown keys were refused still loads, and has to
+    // refuse rather than hand the caller an error to interpret.
+    #[test]
+    fn a_stored_policy_whose_rules_do_not_parse_refuses_every_spend() {
+        use sha2::Digest;
+        let storage = Arc::new(FaultingStorage::default());
+        let warden = new_warden();
+        storage.plant(
+            TRUSTED_WARDENS_KEY,
+            serde_json::to_vec(&vec![hex::encode(pubkey_of(&warden))]).expect("serialize wardens"),
+        );
+        let rules_json = r#"{"max_ammount":1000}"#;
+        let mut bundle = create_test_bundle_with(
+            &warden,
+            &PolicyRules::default(),
+            Utc::now().timestamp() as u64,
+        );
+        bundle.rules_json = rules_json.to_string();
+        bundle.policy_hash = sha2::Sha256::digest(rules_json.as_bytes()).into();
+        crate::policy::resign_test_bundle(&warden, &mut bundle);
+        plant_bundle(&storage, &bundle);
+        let mobile = KeepMobile::new(Arc::clone(&storage) as Arc<dyn SecureStorage>).unwrap();
+        match mobile.evaluate_policy(a_spend(), None).unwrap() {
+            PolicyDecision::Deny { reason } => assert!(!reason.contains("max_ammount")),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     // A first install whose record failed to store after the mark rose leaves

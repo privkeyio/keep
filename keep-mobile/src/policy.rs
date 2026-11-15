@@ -99,7 +99,10 @@ pub struct PolicyInfo {
     pub created_at: u64,
 }
 
+/// Unknown keys are refused: a misspelled rule would otherwise parse as absent
+/// and the policy would enforce nothing while reading as installed.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRules {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_amount: Option<u64>,
@@ -193,6 +196,7 @@ impl<'de> Deserialize<'de> for HourRange {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct RawHourRange {
             start: u8,
             end: u8,
@@ -786,7 +790,14 @@ impl PolicyEvaluator {
             });
         }
 
-        let rules = bundle.parse_rules()?;
+        // A refusal, not an error, so the guarantee does not rest on the
+        // foreign caller treating an error as one. The message is fixed so no
+        // parser text from the rules reaches the caller.
+        let Ok(rules) = bundle.parse_rules() else {
+            return Ok(PolicyDecision::Deny {
+                reason: "Cannot evaluate the spending policy: its rules do not parse".into(),
+            });
+        };
 
         if let Some(max_amount) = rules.max_amount {
             if ctx.amount_sats > max_amount {
