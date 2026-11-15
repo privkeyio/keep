@@ -100,9 +100,9 @@ pub(crate) async fn verify_relay_certificates(
             if !guard.is_pinned(&hostname) {
                 guard.add_pin(hostname, hash);
             }
-            let pins_snapshot = guard.clone();
-            drop(guard);
-            crate::app::save_cert_pins(keep_path, &pins_snapshot);
+            // Saved under the lock, as Settings does, so a pin cleared there
+            // in the meantime is not written back from a stale copy.
+            crate::app::save_cert_pins(keep_path, &guard);
         }
     }
     Ok(())
