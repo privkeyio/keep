@@ -15,8 +15,8 @@ use crate::types::{DeviceRegistrationInfo, KeyHealthStatusInfo, WalletDescriptor
 use crate::velocity::{VelocityTracker, MAX_TRACKED_TRANSACTIONS};
 use crate::{
     CERT_PINS_STORAGE_KEY, CLOCK_FLOOR_STORAGE_KEY, DESCRIPTOR_INDEX_KEY, DESCRIPTOR_KEY_PREFIX,
-    HEALTH_STATUS_INDEX_KEY, HEALTH_STATUS_KEY_PREFIX, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY,
-    VELOCITY_STORAGE_KEY,
+    HEALTH_STATUS_INDEX_KEY, HEALTH_STATUS_KEY_PREFIX, PIN_HOLDS_STORAGE_KEY,
+    PIN_STORE_STORAGE_KEY, POLICY_STORAGE_KEY, TRUSTED_WARDENS_KEY, VELOCITY_STORAGE_KEY,
 };
 
 #[derive(Serialize, Deserialize, Default)]
@@ -438,43 +438,26 @@ pub(crate) fn persist_warden_set(
 pub(crate) fn load_cert_pins(
     storage: &Arc<dyn SecureStorage>,
 ) -> Result<Option<keep_frost_net::CertificatePinSet>, KeepMobileError> {
-    let data = match storage.load_share_by_key(CERT_PINS_STORAGE_KEY.into()) {
-        Ok(data) => data,
-        Err(KeepMobileError::StorageNotFound) => return Ok(None),
-        Err(e) => return Err(e),
-    };
+    Ok(Some(load_pin_store(storage)?.pins))
+}
+
+fn parse_cert_pins(
+    data: &[u8],
+    key: &str,
+) -> Result<keep_frost_net::CertificatePinSet, KeepMobileError> {
     let (pins, malformed) =
-        keep_frost_net::CertificatePinSet::from_json_bytes(&data).map_err(|e| {
+        keep_frost_net::CertificatePinSet::from_json_bytes(data).map_err(|e| {
             KeepMobileError::StorageError {
                 msg: format!("Failed to deserialize cert pins: {e}"),
             }
         })?;
     if malformed.is_empty() {
-        Ok(Some(pins))
+        Ok(pins)
     } else {
         Err(KeepMobileError::StorageError {
-            msg: format!(
-                "{}: malformed pins: {}",
-                CERT_PINS_STORAGE_KEY,
-                malformed.join(", ")
-            ),
+            msg: format!("{}: malformed pins: {}", key, malformed.join(", ")),
         })
     }
-}
-
-pub(crate) fn persist_cert_pins(
-    storage: &Arc<dyn SecureStorage>,
-    pins: &keep_frost_net::CertificatePinSet,
-) -> Result<(), KeepMobileError> {
-    let data =
-        serde_json::to_vec(&pins.to_hex_map()).map_err(|e| KeepMobileError::StorageError {
-            msg: format!("Failed to serialize cert pins: {e}"),
-        })?;
-    storage.store_share_by_key(
-        CERT_PINS_STORAGE_KEY.into(),
-        data,
-        storage_metadata("cert_pins"),
-    )
 }
 
 /// At-rest schema for a persisted wallet descriptor.
@@ -1108,16 +1091,18 @@ pub(crate) fn persist_strict_pin_config(
 /// Hosts whose certificate pin the user removed. None is trusted on first
 /// use again until the user stages a new pin or releases the hold.
 ///
-/// `every_unpinned_host` holds every host but those in `released`. It stands
-/// in when the hosts to hold could not be read, so that loss fails closed
-/// while the user can still release hosts one at a time.
+/// `every_unpinned_host` holds every host. It stands in when the hosts to
+/// hold could not be read, so that loss fails closed while the user can
+/// still release hosts one at a time.
+///
+/// Releases are not stored: a stored one could be revived by setting the
+/// clock back into its window long after it lapsed. Earlier builds wrote a
+/// `released` field here, which is ignored.
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct StoredPinHolds {
     pub(crate) hosts: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub(crate) every_unpinned_host: bool,
-    #[serde(default)]
-    pub(crate) released: std::collections::BTreeSet<String>,
 }
 
 impl StoredPinHolds {
@@ -1129,66 +1114,133 @@ impl StoredPinHolds {
     }
 
     pub(crate) fn holds(&self, host: &str) -> bool {
-        self.hosts.contains(host) || (self.every_unpinned_host && !self.released.contains(host))
-    }
-
-    /// Whether anything changed.
-    pub(crate) fn hold(&mut self, host: String) -> bool {
-        let unreleased = self.released.remove(&host);
-        self.hosts.insert(host) | unreleased
-    }
-
-    /// Whether anything changed.
-    pub(crate) fn release(&mut self, host: &str) -> bool {
-        let removed = self.hosts.remove(host);
-        removed | (self.every_unpinned_host && self.released.insert(host.to_string()))
+        self.every_unpinned_host || self.hosts.contains(host)
     }
 }
 
-/// An unreadable record is read as holding every unpinned host rather than
-/// refused: refusing would fail every connection and every pin edit until the
-/// app's data is wiped, while this stays closed and repairs on the next write.
-/// A storage error other than a missing record is still returned.
-pub(crate) fn load_pin_holds(
+/// Certificate pins and the holds on hosts that lost theirs, kept in one
+/// record so a pin removal and its hold land together or not at all.
+#[derive(Default)]
+pub(crate) struct PinStore {
+    pub(crate) pins: keep_frost_net::CertificatePinSet,
+    pub(crate) holds: StoredPinHolds,
+}
+
+fn read_holds(value: Option<serde_json::Value>) -> StoredPinHolds {
+    value
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_else(|| {
+            tracing::warn!("unreadable certificate pin holds, holding every unpinned host");
+            StoredPinHolds::every_unpinned_host()
+        })
+}
+
+fn load_optional(
     storage: &Arc<dyn SecureStorage>,
     key: &str,
-) -> Result<StoredPinHolds, KeepMobileError> {
+) -> Result<Option<Vec<u8>>, KeepMobileError> {
     match storage.load_share_by_key(key.into()) {
-        Ok(data) => Ok(serde_json::from_slice(&data).unwrap_or_else(|e| {
-            tracing::warn!("unreadable certificate pin holds, holding every unpinned host: {e}");
-            StoredPinHolds::every_unpinned_host()
-        })),
-        Err(KeepMobileError::StorageNotFound) => Ok(StoredPinHolds::default()),
+        Ok(data) => Ok(Some(data)),
+        Err(KeepMobileError::StorageNotFound) => Ok(None),
         Err(e) => Err(e),
     }
 }
 
-/// The hosts a stored pin record names, read even when its pins are
-/// malformed. None when not even that much can be read.
-pub(crate) fn stored_pin_hosts(
+/// The record's pins and holds, or where none has been written yet, the two
+/// separate records earlier builds kept. Malformed pins are refused, as they
+/// always were. Unreadable holds read as holding every unpinned host, which
+/// stays closed and is repaired on the next write.
+pub(crate) fn load_pin_store(
     storage: &Arc<dyn SecureStorage>,
-) -> Result<Option<Vec<String>>, KeepMobileError> {
-    let data = match storage.load_share_by_key(CERT_PINS_STORAGE_KEY.into()) {
-        Ok(data) => data,
-        Err(KeepMobileError::StorageNotFound) => return Ok(Some(Vec::new())),
-        Err(e) => return Err(e),
+) -> Result<PinStore, KeepMobileError> {
+    if let Some(data) = load_optional(storage, PIN_STORE_STORAGE_KEY)? {
+        let mut record: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&data)
+            .map_err(|e| KeepMobileError::StorageError {
+                msg: format!("Failed to deserialize the certificate pin store: {e}"),
+            })?;
+        let pins = record
+            .remove("pins")
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "the certificate pin store has no pins".into(),
+            })?;
+        let pins = serde_json::to_vec(&pins).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("Failed to read cert pins: {e}"),
+        })?;
+        return Ok(PinStore {
+            pins: parse_cert_pins(&pins, PIN_STORE_STORAGE_KEY)?,
+            holds: read_holds(record.remove("holds")),
+        });
+    }
+    let pins = match load_optional(storage, CERT_PINS_STORAGE_KEY)? {
+        Some(data) => parse_cert_pins(&data, CERT_PINS_STORAGE_KEY)?,
+        None => keep_frost_net::CertificatePinSet::default(),
     };
-    Ok(
-        serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&data)
-            .ok()
-            .map(|map| map.into_keys().collect()),
-    )
+    let holds = match load_optional(storage, PIN_HOLDS_STORAGE_KEY)? {
+        Some(data) => read_holds(serde_json::from_slice(&data).ok()),
+        None => StoredPinHolds::default(),
+    };
+    Ok(PinStore { pins, holds })
 }
 
-pub(crate) fn persist_pin_holds(
+/// The hosts the stored pins name, read even when the pins are malformed,
+/// and the holds. Hosts are None when not even that much can be read.
+pub(crate) fn load_pin_store_leniently(
     storage: &Arc<dyn SecureStorage>,
-    key: &str,
-    holds: &StoredPinHolds,
+) -> Result<(Option<Vec<String>>, StoredPinHolds), KeepMobileError> {
+    fn hosts_of(pins: Option<serde_json::Value>) -> Option<Vec<String>> {
+        match pins? {
+            serde_json::Value::Object(map) => Some(map.into_iter().map(|(k, _)| k).collect()),
+            _ => None,
+        }
+    }
+    if let Some(data) = load_optional(storage, PIN_STORE_STORAGE_KEY)? {
+        return Ok(
+            match serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&data) {
+                Ok(mut record) => (
+                    hosts_of(record.remove("pins")),
+                    read_holds(record.remove("holds")),
+                ),
+                Err(_) => (None, StoredPinHolds::every_unpinned_host()),
+            },
+        );
+    }
+    let hosts = match load_optional(storage, CERT_PINS_STORAGE_KEY)? {
+        Some(data) => hosts_of(serde_json::from_slice(&data).ok()),
+        None => Some(Vec::new()),
+    };
+    let holds = match load_optional(storage, PIN_HOLDS_STORAGE_KEY)? {
+        Some(data) => read_holds(serde_json::from_slice(&data).ok()),
+        None => StoredPinHolds::default(),
+    };
+    Ok((hosts, holds))
+}
+
+/// Write pins and holds as one record. The records earlier builds kept are
+/// then removed. One left behind is never read again, since this record
+/// takes precedence.
+pub(crate) fn persist_pin_store(
+    storage: &Arc<dyn SecureStorage>,
+    store: &PinStore,
 ) -> Result<(), KeepMobileError> {
-    let data = serde_json::to_vec(holds).map_err(|e| KeepMobileError::StorageError {
-        msg: format!("failed to serialize certificate pin holds: {e}"),
+    let data = serde_json::to_vec(&serde_json::json!({
+        "pins": store.pins.to_hex_map(),
+        "holds": store.holds,
+    }))
+    .map_err(|e| KeepMobileError::StorageError {
+        msg: format!("Failed to serialize the certificate pin store: {e}"),
     })?;
-    storage.store_share_by_key(key.into(), data, storage_metadata("cert_pin_holds"))
+    storage.store_share_by_key(
+        PIN_STORE_STORAGE_KEY.into(),
+        data,
+        storage_metadata("cert_pin_store"),
+    )?;
+    for key in [CERT_PINS_STORAGE_KEY, PIN_HOLDS_STORAGE_KEY] {
+        match storage.delete_share_by_key(key.into()) {
+            Ok(()) | Err(KeepMobileError::StorageNotFound) => {}
+            Err(e) => tracing::warn!("an earlier certificate pin record was not removed: {e}"),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Default)]

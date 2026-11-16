@@ -1730,8 +1730,9 @@ fn a_restart_does_not_learn_a_pin_the_user_removed() {
 
 // A start nobody asked for, such as the app's launch after the process was
 // killed, does not connect to a relay whose pin the user removed either, even
-// though its probe failed and it would otherwise connect anyway. The user
-// releasing the hold lets it start again.
+// though its probe failed and it would otherwise connect anyway. A release
+// does not change that: it lets a probe learn the key, and this relay could
+// not be probed, so its socket would take any key. A staged pin lets it start.
 #[test]
 fn a_start_does_not_connect_to_a_relay_whose_pin_the_user_removed() {
     let phone = paired();
@@ -1747,6 +1748,10 @@ fn a_start_does_not_connect_to_a_relay_whose_pin_the_user_removed() {
         .mobile
         .release_certificate_pin_hold(RELAY_HOST.into())
         .unwrap();
+    assert!(phone.handler.clone().start(Arc::new(Nobody)).is_err());
+    assert!(!phone.handler.status().running);
+
+    pin_the_relay(&phone, 2);
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
     phone.handler.stop();
