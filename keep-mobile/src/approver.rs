@@ -645,6 +645,79 @@ impl ApproverHandler {
         std::thread::spawn(move || this.restart_after_setting_change(generation, reason));
     }
 
+    /// After the user released `host`'s pin hold or staged a pin for it,
+    /// start again an approver that wanted to run but could not, when `host`
+    /// is one of its relays. One the user stopped stays stopped: a stop clears
+    /// `last_error`, and only a failed start or restart sets it. On a thread of
+    /// its own, since the probe crosses the network.
+    pub(crate) fn resume_after_pin_change(self: &Arc<Self>, host: String) {
+        let this = Held::of(self);
+        std::thread::spawn(move || this.resume_if_waiting_on(&host));
+    }
+
+    fn resume_if_waiting_on(self: &Arc<Self>, host: &str) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::SeqCst)
+            || self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            || self
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+        {
+            return;
+        }
+        let stored = self
+            .lock()
+            .stored
+            .as_ref()
+            .map(|s| (s.relays.clone(), s.keys()));
+        let Some((relays, keys)) = stored else {
+            return;
+        };
+        if !relays
+            .iter()
+            .any(|r| crate::relay_host(r).as_deref() == Some(host))
+        {
+            return;
+        }
+        match keys.and_then(|keys| self.serve(relays, keys, false)) {
+            Ok(()) => {
+                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                if self.lock().stored.is_none() {
+                    self.halt();
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the approver could not start again after a pin change")
+            }
+        }
+    }
+
+    /// Once serving again, an alert that it stopped over a setting change and
+    /// asks the owner to start it is moot.
+    fn clear_setting_stop_alerts(&self) {
+        let mut inner = self.lock();
+        if let Some(stored) = inner.stored.as_mut() {
+            let before = stored.alerts.len();
+            stored.alerts.retain(|a| {
+                ![
+                    PROXY_CHANGE_STOP,
+                    STRICT_PIN_CHANGE_STOP,
+                    CERT_PIN_CHANGE_STOP,
+                ]
+                .contains(&a.message.as_str())
+            });
+            if stored.alerts.len() != before {
+                self.persist_or_log(stored);
+            }
+        }
+    }
+
     /// Start serving again after `stop_for_setting_change` at `generation`,
     /// unless a stop or start since then decided otherwise. A relay left with
     /// no pin is not trusted on first use here: that is for the user to do by
@@ -816,7 +889,12 @@ impl ApproverHandler {
             if !first_use && !self.mobile.get_strict_cert_pinning()? {
                 let pins =
                     crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
-                if relays.iter().any(|r| crate::wss_relay_lacks_pin(r, &pins)) {
+                // A host the user just released may learn its pin: that
+                // release is the user's say for this host.
+                if relays
+                    .iter()
+                    .any(|r| crate::wss_relay_lacks_pin(r, &pins) && !self.mobile.relay_released(r))
+                {
                     return Err(invalid(
                         "a relay has no certificate pin, which only a start by hand may learn",
                     ));
@@ -918,6 +996,7 @@ impl ApproverHandler {
         if let Some(old) = old {
             old.end(&self.mobile.runtime);
         }
+        self.clear_setting_stop_alerts();
         Ok(())
     }
 

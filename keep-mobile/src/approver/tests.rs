@@ -1757,6 +1757,73 @@ fn a_start_does_not_connect_to_a_relay_whose_pin_the_user_removed() {
     phone.handler.stop();
 }
 
+// An approver a pin removal stopped starts again once the user pins the
+// relay, with no start by the app, and the alert asking for one goes.
+#[test]
+fn pinning_the_relay_again_resumes_an_approver_a_removal_stopped() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    let status = settled(&phone.handler, |s| !s.alerts.is_empty());
+    assert!(!status.running);
+
+    pin_the_relay(&phone, 2);
+    let status = settled(&phone.handler, |s| s.running);
+    assert!(status.running);
+    assert!(status.last_error.is_none());
+    assert!(
+        !status
+            .alerts
+            .iter()
+            .any(|a| a.message == CERT_PIN_CHANGE_STOP),
+        "{:?}",
+        status.alerts
+    );
+    phone.handler.stop();
+}
+
+// One the user stopped stays stopped when the relay is pinned.
+#[test]
+fn pinning_the_relay_does_not_start_an_approver_the_user_stopped() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    phone.handler.stop();
+    pin_the_relay(&phone, 2);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!phone.handler.status().running);
+}
+
+// Releasing a host the approver does not use leaves it serving, untouched.
+#[test]
+fn releasing_another_host_leaves_a_running_approver_alone() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone
+        .mobile
+        .stage_certificate_pin("other.example".into(), hex::encode([9u8; 32]))
+        .unwrap();
+    phone
+        .mobile
+        .clear_certificate_pin("other.example".into())
+        .unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    let before = stops(&phone.handler);
+
+    phone
+        .mobile
+        .release_certificate_pin_hold("other.example".into())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(phone.handler.status().running);
+    assert_eq!(stops(&phone.handler), before);
+    phone.handler.stop();
+}
+
 const RELAY_HOST: &str = "relay.example";
 
 fn pin_the_relay(phone: &Phone, byte: u8) {

@@ -1107,6 +1107,9 @@ pub struct KeepMobile {
     /// Held hosts the user released, which a probe may learn a key for until
     /// the release lapses. Kept only in memory, see `PinReleases`.
     pin_releases: PinReleases,
+    /// The relays the live node was built for, so lifting a hold on a host
+    /// tears it down only when it is one of them.
+    node_relays: std::sync::Mutex<Vec<String>>,
     /// Serializes the live-node lifecycle so the `(node, node_tasks)` pair is
     /// always swapped atomically. `do_initialize` (install) and
     /// `invalidate_live_node` (teardown) each hold this for their whole run, so
@@ -1536,6 +1539,7 @@ impl KeepMobile {
             proxy_config_lock: std::sync::Mutex::new(()),
             cert_pin_lock: Arc::new(std::sync::Mutex::new(())),
             pin_releases: PinReleases::default(),
+            node_relays: std::sync::Mutex::new(Vec::new()),
             node_lifecycle_lock: Arc::new(std::sync::Mutex::new(())),
             approver_live: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             live_approver: std::sync::Mutex::new(std::sync::Weak::new()),
@@ -3163,17 +3167,81 @@ impl KeepMobile {
         hostname: String,
     ) -> Result<String, KeepMobileError> {
         let hostname = normalize_pin_host(&hostname)?;
-        let _guard = self
-            .cert_pin_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if persistence::load_pin_store(&self.storage)?
-            .holds
-            .holds(&hostname)
-        {
-            self.pin_releases.release(hostname.clone());
+        let released = {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let held = persistence::load_pin_store(&self.storage)?
+                .holds
+                .holds(&hostname);
+            if held {
+                self.pin_releases.release(hostname.clone());
+            }
+            held
+        };
+        if released {
+            self.restart_for_lifted_hold(&hostname);
         }
         Ok(hostname)
+    }
+
+    /// Clear every pin for `hostname` and release its hold at once, for when
+    /// the user chose to trust the key the relay shows now, such as after a
+    /// pin mismatch. One step, so no restart can fall between the clear and
+    /// the release and find the host held. Gate it behind explicit user
+    /// confirmation, as for `release_certificate_pin_hold`. Returns the host
+    /// as it is held.
+    pub fn clear_certificate_pin_and_release(
+        &self,
+        hostname: String,
+    ) -> Result<String, KeepMobileError> {
+        let hostname = normalize_pin_host(&hostname)?;
+        {
+            let _guard = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut store = persistence::load_pin_store(&self.storage)?;
+            if store.pins.remove_pin(&hostname).is_some() {
+                store.holds.hosts.insert(hostname.clone());
+                persistence::persist_pin_store(&self.storage, &store)?;
+            }
+            if store.holds.holds(&hostname) {
+                self.pin_releases.release(hostname.clone());
+            }
+        }
+        // See `clear_certificate_pins`.
+        self.restart_for_pin_change();
+        self.resume_live_approver(&hostname);
+        Ok(hostname)
+    }
+
+    /// Which of `relays` wait on the user for a pin: held and with no pin.
+    /// A host whose release is still live is not listed.
+    pub fn held_relays(&self, relays: Vec<String>) -> Result<Vec<String>, KeepMobileError> {
+        let persistence::PinStore { pins, holds } = persistence::load_pin_store(&self.storage)?;
+        Ok(relays
+            .into_iter()
+            .filter(|r| {
+                wss_relay_lacks_pin(r, &pins)
+                    && relay_host_held(r, &holds)
+                    && !self.relay_released(r)
+            })
+            .collect())
+    }
+
+    /// Whether removing `spki_hash` from `hostname` would leave it with no
+    /// pin, which holds it.
+    pub fn pin_removal_would_hold(
+        &self,
+        hostname: String,
+        spki_hash: String,
+    ) -> Result<bool, KeepMobileError> {
+        let hostname = normalize_pin_host(&hostname)?;
+        let hash = parse_spki_hash(&spki_hash)?;
+        let pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        Ok(pins.get_pins(&hostname) == [hash])
     }
 
     pub fn get_certificate_pins(&self) -> Result<Vec<CertificatePin>, KeepMobileError> {
@@ -3281,6 +3349,7 @@ impl KeepMobile {
         }
         // See `clear_certificate_pins`.
         self.restart_for_pin_change();
+        self.resume_live_approver(&hostname);
         Ok(())
     }
 
@@ -5547,6 +5616,38 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// A hold on `host` was released: rebuild a live node that uses it, so
+    /// its next start probes the host, and start an approver that waited on
+    /// it. Anything that does not use the host is left alone.
+    fn restart_for_lifted_hold(&self, host: &str) {
+        let node_uses_host = self
+            .node_relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|r| relay_host(r).as_deref() == Some(host));
+        if node_uses_host {
+            self.invalidate_live_node();
+        }
+        self.resume_live_approver(host);
+    }
+
+    fn resume_live_approver(&self, host: &str) {
+        let approver = self
+            .live_approver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(approver) = approver {
+            approver.resume_after_pin_change(host.to_string());
+        }
+    }
+
+    /// Whether `relay`'s host has a release the user made that is still live.
+    pub(crate) fn relay_released(&self, relay: &str) -> bool {
+        relay_host(relay).is_some_and(|host| self.pin_releases.live(&host))
+    }
+
     fn stop_live_approver(&self, reason: &'static str) {
         let approver = self
             .live_approver
@@ -5844,6 +5945,10 @@ impl KeepMobile {
                 .extend([listener_handle, run_handle]);
 
             *self.node.write().await = Some(node);
+            *self
+                .node_relays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = relays.clone();
             // A bunker started on a different share holds a copy of it, or the
             // node built from it, so it stops as on any other teardown, after
             // the write as there. A re-init on the same share, which the app
@@ -8445,6 +8550,73 @@ mod cert_pin_ffi_tests {
 
     fn stored(keep: &KeepMobile, key: &str) -> bool {
         keep.storage.load_share_by_key(key.into()).is_ok()
+    }
+
+    /// Clearing and releasing at once leaves the host unpinned, held and
+    /// released, with no moment where it is held but not released.
+    #[test]
+    fn clear_and_release_unpins_and_releases_in_one_step() {
+        let keep = keep();
+        let host = "relay.example.com";
+        keep.stage_certificate_pin(host.into(), hex::encode([1u8; 32]))
+            .unwrap();
+        assert_eq!(
+            keep.clear_certificate_pin_and_release("Relay.Example.com".into())
+                .unwrap(),
+            host
+        );
+        assert_eq!(pins_for(&keep, host), 0);
+        let holds = keep.certificate_pin_holds().unwrap();
+        assert_eq!(holds.hosts, vec![host.to_string()]);
+        assert_eq!(holds.released, vec![host.to_string()]);
+        let relay = format!("wss://{host}");
+        assert!(keep.held_relays(vec![relay]).unwrap().is_empty());
+    }
+
+    /// Of the relays given, those held with no pin and no live release.
+    #[test]
+    fn held_relays_lists_the_given_relays_waiting_on_the_user() {
+        let keep = keep();
+        let (a, b, c) = (
+            "wss://a.example.com",
+            "wss://b.example.com",
+            "wss://c.example.com",
+        );
+        for host in ["a.example.com", "b.example.com"] {
+            keep.stage_certificate_pin(host.into(), hex::encode([1u8; 32]))
+                .unwrap();
+        }
+        keep.clear_certificate_pin("a.example.com".into()).unwrap();
+        let all = || vec![a.to_string(), b.to_string(), c.to_string()];
+        assert_eq!(keep.held_relays(all()).unwrap(), vec![a.to_string()]);
+
+        write_pin_store(
+            &keep,
+            &format!(
+                r#"{{"pins":{{"b.example.com":["{}"]}},"holds":"unreadable"}}"#,
+                hex::encode([1u8; 32])
+            ),
+        );
+        assert_eq!(
+            keep.held_relays(all()).unwrap(),
+            vec![a.to_string(), c.to_string()],
+            "every unpinned host, but not a pinned one"
+        );
+        keep.release_certificate_pin_hold("c.example.com".into())
+            .unwrap();
+        assert_eq!(keep.held_relays(all()).unwrap(), vec![a.to_string()]);
+    }
+
+    #[test]
+    fn pin_removal_would_hold_only_for_the_last_pin() {
+        let keep = keep();
+        let host = "relay.example.com";
+        let pin = |b: u8| hex::encode([b; 32]);
+        keep.stage_certificate_pin(host.into(), pin(1)).unwrap();
+        assert!(keep.pin_removal_would_hold(host.into(), pin(1)).unwrap());
+        assert!(!keep.pin_removal_would_hold(host.into(), pin(2)).unwrap());
+        keep.stage_certificate_pin(host.into(), pin(2)).unwrap();
+        assert!(!keep.pin_removal_would_hold(host.into(), pin(1)).unwrap());
     }
 
     /// A release is live for ten minutes on both the monotonic and the wall
