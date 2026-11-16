@@ -504,13 +504,13 @@ fn no_relay() -> KeepMobileError {
 }
 
 pub(crate) const PROXY_CHANGE_STOP: &str =
-    "Approvals stopped because the proxy setting changed. Start the approver again.";
+    "Approvals stopped because the proxy setting changed and the approver could not start again under it. Start the approver again.";
 
 pub(crate) const STRICT_PIN_CHANGE_STOP: &str =
-    "Approvals stopped because strict certificate pinning changed. Start the approver again.";
+    "Approvals stopped because strict certificate pinning changed and the approver could not start again under it. Start the approver again.";
 
 pub(crate) const CERT_PIN_CHANGE_STOP: &str =
-    "Approvals stopped because the certificate pins changed. Start the approver again.";
+    "Approvals stopped because the certificate pins changed and the approver could not start again under them. Start the approver again.";
 
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
@@ -618,16 +618,17 @@ impl ApproverHandler {
     }
 
     /// Stop serving after the proxy, strict pinning or certificate pin
-    /// setting changed: the socket was opened under the old one. Under
-    /// `lifecycle`, so a start running alongside either read the new setting
-    /// or is stopped here. `last_error` says why it stopped, and an alert
-    /// tells the owner and the app, which starts the approver again. The alert
-    /// is sent from its own thread: a caller may hold the proxy and share
-    /// write locks, which a callback that saves the setting or starts the
-    /// approver again must not wait on.
-    pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &str) {
-        let mut fx = Effects::default();
-        {
+    /// setting changed: the socket was opened under the old one, so before
+    /// this returns its tasks are aborted and its client is sent to shut
+    /// down, which finishes on the runtime. Under `lifecycle`, so a start running
+    /// alongside either read the new setting or is stopped here.
+    ///
+    /// The approver then starts again under the new setting on a thread of
+    /// its own, so apps need not mirror every setting that stops it: a caller
+    /// may hold the proxy and share write locks, which neither the relay
+    /// probe nor a callback that saves the setting again must wait on.
+    pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &'static str) {
+        let generation = {
             let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             let was_running = self
                 .running
@@ -638,6 +639,45 @@ impl ApproverHandler {
                 return;
             }
             self.halt();
+            self.generation.load(Ordering::SeqCst)
+        };
+        let this = Held::of(self);
+        std::thread::spawn(move || this.restart_after_setting_change(generation, reason));
+    }
+
+    /// Start serving again after `stop_for_setting_change` at `generation`,
+    /// unless a stop or start since then decided otherwise. A relay left with
+    /// no pin is not trusted on first use here: that is for the user to do by
+    /// starting the approver, not for a restart nobody asked for, which would
+    /// learn whatever key it is shown in place of a pin just removed. Only a
+    /// failure is reported: `last_error` says why it stopped, and an alert
+    /// tells the owner and the app.
+    fn restart_after_setting_change(self: &Arc<Self>, generation: u64, reason: &str) {
+        let mut fx = Effects::default();
+        {
+            let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if self.generation.load(Ordering::SeqCst) != generation
+                || self.closed.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let stored = self
+                .lock()
+                .stored
+                .as_ref()
+                .map(|s| (s.relays.clone(), s.keys()));
+            let Some((relays, keys)) = stored else {
+                return;
+            };
+            let Err(e) = keys.and_then(|keys| self.serve(relays, keys, false)) else {
+                // A refused pairing handled by a task the stop aborted clears
+                // the pairing without the halt that task would have run.
+                if self.lock().stored.is_none() {
+                    self.halt();
+                }
+                return;
+            };
+            tracing::warn!(error = %e, "the approver could not start again after a setting change");
             *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
             let mut inner = self.lock();
             if let Some(stored) = inner.stored.as_mut() {
@@ -645,11 +685,7 @@ impl ApproverHandler {
                 self.persist_or_log(stored);
             }
         }
-        if !fx.events.is_empty() {
-            let this = Held::of(self);
-            let events = fx.events;
-            std::thread::spawn(move || this.emit(events));
-        }
+        self.emit(fx.events);
     }
 
     fn open_check(&self) -> Result<(), KeepMobileError> {
@@ -752,13 +788,22 @@ impl ApproverHandler {
     /// still enforces every recorded pin, and a mismatch stops it here. Relays
     /// that never connect are reported by the gateway-silence alert.
     fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
-        let result = self.serve(relays, keys);
+        let result = self.serve(relays, keys, true);
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
             result.as_ref().err().map(|e| e.to_string());
         result
     }
 
-    fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
+    /// `first_use` lets the probe learn a pin for a relay that has none.
+    /// Without it such a relay is refused, under the same lock the pins are
+    /// edited under, so a start nobody asked for cannot learn a pin in place
+    /// of one the user just removed.
+    fn serve(
+        self: &Arc<Self>,
+        relays: Vec<String>,
+        keys: Keys,
+        first_use: bool,
+    ) -> Result<(), KeepMobileError> {
         crate::network::validate_relay_urls(&relays)?;
         let transport = keys.public_key();
         let proxy = self.mobile.pinnable_proxy()?;
@@ -768,6 +813,15 @@ impl ApproverHandler {
                 .cert_pin_lock
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            if !first_use && !self.mobile.get_strict_cert_pinning()? {
+                let pins =
+                    crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
+                if relays.iter().any(|r| crate::wss_relay_lacks_pin(r, &pins)) {
+                    return Err(invalid(
+                        "a relay has no certificate pin, which only a start by hand may learn",
+                    ));
+                }
+            }
             let relays = match self
                 .mobile
                 .runtime

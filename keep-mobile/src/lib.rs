@@ -5370,8 +5370,9 @@ impl KeepMobile {
 
     /// Write the proxy setting. A running node, bunker or approver keeps the
     /// sockets it was started with, so a change stops all three and the next
-    /// start takes the new setting: the app starts them again. An old setting
-    /// that cannot be read may differ, so it counts as a change.
+    /// start takes the new setting: the app starts the node and bunker again,
+    /// and the approver starts itself again. An old setting that cannot be
+    /// read may differ, so it counts as a change.
     fn store_proxy_config(
         &self,
         stored: &persistence::StoredProxyConfig,
@@ -5393,7 +5394,7 @@ impl KeepMobile {
         Ok(())
     }
 
-    fn stop_live_approver(&self, reason: &str) {
+    fn stop_live_approver(&self, reason: &'static str) {
         let approver = self
             .live_approver
             .lock()
