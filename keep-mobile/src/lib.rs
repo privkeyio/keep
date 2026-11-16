@@ -4010,12 +4010,23 @@ impl KeepMobile {
     /// down here rather than left running with the previous policy until the
     /// next re-init.
     pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
-        let config = persistence::StoredStrictPinConfig { enabled };
-        persistence::persist_strict_pin_config(
-            &self.storage,
-            STRICT_PIN_CONFIG_STORAGE_KEY,
-            &config,
-        )?;
+        {
+            // Every relay probe and live pin read runs under this lock, so
+            // taking it waits out one in flight. Once this returns, no probe
+            // that read the old setting can still trust a relay on first use.
+            // Released before the teardown below, which takes the lifecycle
+            // lock, to keep the order node_lifecycle_lock -> cert_pin_lock.
+            let _cert = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let config = persistence::StoredStrictPinConfig { enabled };
+            persistence::persist_strict_pin_config(
+                &self.storage,
+                STRICT_PIN_CONFIG_STORAGE_KEY,
+                &config,
+            )?;
+        }
         self.invalidate_live_node();
         Ok(())
     }
@@ -8162,6 +8173,31 @@ mod cert_pin_ffi_tests {
         assert!(keep.get_strict_cert_pinning().unwrap());
         keep.set_strict_cert_pinning(false).unwrap();
         assert!(!keep.get_strict_cert_pinning().unwrap());
+    }
+
+    #[test]
+    fn strict_cert_pinning_waits_out_a_probe_in_flight() {
+        let keep = keep();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let probe = keep.cert_pin_lock.lock().unwrap();
+            scope.spawn(|| {
+                keep.set_strict_cert_pinning(true).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the setting must not change under a probe that read the old one"
+            );
+            assert!(!keep.get_strict_cert_pinning().unwrap());
+            drop(probe);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the setter completes once the probe ends");
+        });
+        assert!(keep.get_strict_cert_pinning().unwrap());
     }
 
     #[test]
