@@ -1105,6 +1105,37 @@ pub(crate) fn persist_strict_pin_config(
     storage.store_share_by_key(key.into(), data, storage_metadata("strict_pin_config"))
 }
 
+/// Hosts whose certificate pin the user removed. None is trusted on first
+/// use again until the user stages a new pin or releases the hold.
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct StoredPinHolds {
+    pub(crate) hosts: std::collections::BTreeSet<String>,
+}
+
+pub(crate) fn load_pin_holds(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+) -> Result<StoredPinHolds, KeepMobileError> {
+    match storage.load_share_by_key(key.into()) {
+        Ok(data) => serde_json::from_slice(&data).map_err(|e| KeepMobileError::StorageError {
+            msg: format!("failed to deserialize certificate pin holds: {e}"),
+        }),
+        Err(KeepMobileError::StorageNotFound) => Ok(StoredPinHolds::default()),
+        Err(e) => Err(e),
+    }
+}
+
+pub(crate) fn persist_pin_holds(
+    storage: &Arc<dyn SecureStorage>,
+    key: &str,
+    holds: &StoredPinHolds,
+) -> Result<(), KeepMobileError> {
+    let data = serde_json::to_vec(holds).map_err(|e| KeepMobileError::StorageError {
+        msg: format!("failed to serialize certificate pin holds: {e}"),
+    })?;
+    storage.store_share_by_key(key.into(), data, storage_metadata("cert_pin_holds"))
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct StoredBunkerConfig {
     pub(crate) enabled: bool,

@@ -831,6 +831,12 @@ impl ApproverHandler {
                 Err(e @ KeepMobileError::CertificatePinMismatch { .. }) => return Err(e),
                 Err(e) if self.mobile.get_strict_cert_pinning()? => return Err(e),
                 Err(e) => {
+                    // Not a relay whose pin the user removed: the live socket
+                    // would take whatever key it shows.
+                    let relays = self.mobile.without_held_relays(relays)?;
+                    if relays.is_empty() {
+                        return Err(e);
+                    }
                     tracing::warn!(error = %e, "approver relays not probed; connecting to them anyway");
                     relays
                 }

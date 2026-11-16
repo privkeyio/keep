@@ -658,6 +658,7 @@ const RELAY_CONFIG_KEY_PREFIX: &str = "__keep_relay_config_";
 const RELAY_CONFIG_GLOBAL_KEY: &str = "__keep_relay_config_global";
 const PROXY_CONFIG_STORAGE_KEY: &str = "__keep_proxy_config_v1";
 const STRICT_PIN_CONFIG_STORAGE_KEY: &str = "__keep_strict_pin_config_v1";
+const PIN_HOLDS_STORAGE_KEY: &str = "__keep_cert_pin_holds_v1";
 const BUNKER_CONFIG_STORAGE_KEY: &str = "__keep_bunker_config_v1";
 const KILL_SWITCH_STORAGE_KEY: &str = "__keep_kill_switch_v1";
 /// Non-sensitive pending-DKG marker (name/group/protection). Under the `__keep_`
@@ -3119,6 +3120,30 @@ impl KeepMobile {
         Ok(policy.trusted_wardens().iter().map(hex::encode).collect())
     }
 
+    /// Hosts whose last certificate pin the user removed. No connection
+    /// learns a key for one of them on first use, whoever makes it, until the
+    /// user stages a new pin for it or calls `release_certificate_pin_hold`.
+    pub fn held_certificate_pin_hosts(&self) -> Result<Vec<String>, KeepMobileError> {
+        Ok(
+            persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?
+                .hosts
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Let the next connection to `hostname` learn its key on first use
+    /// again. Releasing a hold trusts whatever key the relay shows next, so
+    /// the caller MUST gate it behind explicit user confirmation.
+    pub fn release_certificate_pin_hold(&self, hostname: String) -> Result<(), KeepMobileError> {
+        let hostname = normalize_pin_host(&hostname)?;
+        let _guard = self
+            .cert_pin_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.release_pin_holds(&hostname)
+    }
+
     pub fn get_certificate_pins(&self) -> Result<Vec<CertificatePin>, KeepMobileError> {
         Ok(persistence::load_cert_pins(&self.storage)?
             .unwrap_or_default()
@@ -3139,6 +3164,8 @@ impl KeepMobile {
                 .cert_pin_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+            self.hold_pin_hosts(pins.pins().keys().cloned())?;
             self.storage
                 .delete_share_by_key(CERT_PINS_STORAGE_KEY.into())?;
         }
@@ -3169,7 +3196,9 @@ impl KeepMobile {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-            pins.remove_pin(&hostname);
+            if pins.remove_pin(&hostname).is_some() {
+                self.hold_pin_hosts([hostname])?;
+            }
             persistence::persist_cert_pins(&self.storage, &pins)?;
         }
         // See `clear_certificate_pins`.
@@ -3195,8 +3224,10 @@ impl KeepMobile {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
-            pins.add_pin(hostname, hash);
+            pins.add_pin(hostname.clone(), hash);
             persistence::persist_cert_pins(&self.storage, &pins)?;
+            // The user supplied the key, so the host no longer waits on them.
+            self.release_pin_holds(&hostname)?;
         }
         // See `clear_certificate_pins`.
         self.restart_for_pin_change();
@@ -3223,6 +3254,9 @@ impl KeepMobile {
             let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
             let pin_removed = pins.remove_specific_pin(&hostname, &hash);
             let host_now_unpinned = !pins.is_pinned(&hostname);
+            if pin_removed && host_now_unpinned {
+                self.hold_pin_hosts([hostname.clone()])?;
+            }
             persistence::persist_cert_pins(&self.storage, &pins)?;
             CertPinRemovalResult {
                 pin_removed,
@@ -4864,6 +4898,17 @@ fn normalize_pin_host(hostname: &str) -> Result<String, KeepMobileError> {
 /// Uses the same host key as the verified-relay filter so strict mode skips
 /// exactly the relays that filter would exclude. Non-`wss` or unparseable relays
 /// are left to the normal verification path.
+/// Whether `relay`'s host waits on the user for a new pin.
+fn relay_host_held(relay: &str, holds: &persistence::StoredPinHolds) -> bool {
+    url::Url::parse(relay)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .and_then(keep_frost_net::normalize_pin_hostname)
+        })
+        .is_some_and(|host| holds.hosts.contains(&host))
+}
+
 fn wss_relay_lacks_pin(relay: &str, pins: &keep_frost_net::CertificatePinSet) -> bool {
     match url::Url::parse(relay) {
         Ok(u) if u.scheme() == "wss" => u.host_str().map(|h| !pins.is_pinned(h)).unwrap_or(true),
@@ -5423,6 +5468,42 @@ impl KeepMobile {
     /// the handshake records nothing, there is nothing to write back after
     /// connecting, and so no way for a connection to clobber a pin staged or
     /// cleared through the FFI while it was coming up.
+    /// Hold `hosts`, written before the pins they lose so a failure leaves
+    /// the pins in place. Callers hold `cert_pin_lock`.
+    fn hold_pin_hosts(
+        &self,
+        hosts: impl IntoIterator<Item = String>,
+    ) -> Result<(), KeepMobileError> {
+        let mut holds = persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?;
+        let before = holds.hosts.len();
+        holds.hosts.extend(hosts);
+        if holds.hosts.len() == before {
+            return Ok(());
+        }
+        persistence::persist_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY, &holds)
+    }
+
+    /// Callers hold `cert_pin_lock`.
+    fn release_pin_holds(&self, hostname: &str) -> Result<(), KeepMobileError> {
+        let mut holds = persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?;
+        if !holds.hosts.remove(hostname) {
+            return Ok(());
+        }
+        persistence::persist_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY, &holds)
+    }
+
+    /// `relays` without any whose host is held. Callers hold `cert_pin_lock`.
+    pub(crate) fn without_held_relays(
+        &self,
+        relays: Vec<String>,
+    ) -> Result<Vec<String>, KeepMobileError> {
+        let holds = persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?;
+        Ok(relays
+            .into_iter()
+            .filter(|r| !relay_host_held(r, &holds))
+            .collect())
+    }
+
     fn live_pinning(&self) -> Result<keep_frost_net::TlsPinning, KeepMobileError> {
         let require_pinned =
             persistence::load_strict_pin_config(&self.storage, STRICT_PIN_CONFIG_STORAGE_KEY)?
@@ -5470,8 +5551,18 @@ impl KeepMobile {
                 .unwrap_or_default()
                 .enabled;
         let mut pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
+        let holds = persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?;
         let mut pins_changed = false;
         for relay in relays {
+            // The user removed this host's pin: whatever key it shows now is
+            // not learned, nor dialed, until they stage one or release it.
+            if wss_relay_lacks_pin(relay, &pins) && relay_host_held(relay, &holds) {
+                tracing::warn!(
+                    relay = %relay,
+                    "skipping relay whose pin the user removed until they supply or release one"
+                );
+                continue;
+            }
             // Strict mode: skip an un-pinned relay rather than aborting for the
             // whole set. It is excluded from `verified_relays` below, and the
             // empty-set check there fails closed if none are pinned. A pinned
@@ -8184,6 +8275,79 @@ mod cert_pin_ffi_tests {
         assert!(keep
             .stage_certificate_pin("relay.example.com".into(), "not-a-hash".into())
             .is_err());
+    }
+
+    #[test]
+    fn removing_a_hosts_last_pin_holds_it_until_the_user_supplies_or_releases_one() {
+        let keep = keep();
+        let host = "relay.example.com";
+        let pin = |b: u8| hex::encode([b; 32]);
+        let held = |keep: &KeepMobile| keep.held_certificate_pin_hosts().unwrap();
+
+        keep.clear_certificate_pin(host.into()).unwrap();
+        assert!(
+            held(&keep).is_empty(),
+            "nothing was pinned, nothing to hold"
+        );
+
+        keep.stage_certificate_pin(host.into(), pin(1)).unwrap();
+        keep.stage_certificate_pin(host.into(), pin(2)).unwrap();
+        keep.remove_certificate_pin(host.into(), pin(1)).unwrap();
+        assert!(held(&keep).is_empty(), "a pin is left");
+        keep.remove_certificate_pin(host.into(), pin(2)).unwrap();
+        assert_eq!(held(&keep), vec![host.to_string()]);
+
+        keep.stage_certificate_pin(host.into(), pin(3)).unwrap();
+        assert!(held(&keep).is_empty(), "the user supplied a key");
+
+        keep.clear_certificate_pin(host.into()).unwrap();
+        assert_eq!(held(&keep), vec![host.to_string()]);
+        keep.release_certificate_pin_hold(host.into()).unwrap();
+        assert!(held(&keep).is_empty());
+
+        keep.stage_certificate_pin(host.into(), pin(4)).unwrap();
+        keep.stage_certificate_pin("other.example.com".into(), pin(5))
+            .unwrap();
+        keep.clear_certificate_pins().unwrap();
+        assert_eq!(
+            held(&keep),
+            vec!["other.example.com".to_string(), host.to_string()]
+        );
+    }
+
+    /// A held host is not dialed by the probe at all, so nothing it shows can
+    /// be learned; released, it is dialed again. The probe reaches the relay
+    /// through a stand-in SOCKS proxy, which records every dial.
+    #[test]
+    fn the_probe_does_not_reach_a_held_host() {
+        let keep = keep();
+        let host = "relay.example.com";
+        let relay = format!("wss://{host}");
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in proxy.incoming() {
+                let _ = tx.send(());
+                drop(stream);
+            }
+        });
+        keep.stage_certificate_pin(host.into(), hex::encode([1u8; 32]))
+            .unwrap();
+        keep.clear_certificate_pin(host.into()).unwrap();
+
+        let probe = || {
+            keep.runtime.block_on(
+                keep.verify_and_pin_relays(std::slice::from_ref(&relay), Some(proxy_addr)),
+            )
+        };
+        assert!(probe().is_err());
+        assert!(rx.try_recv().is_err(), "a held host was dialed");
+
+        keep.release_certificate_pin_hold(host.into()).unwrap();
+        assert!(probe().is_err(), "the stand-in proxy serves nothing");
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a released host is dialed");
     }
 
     #[test]
