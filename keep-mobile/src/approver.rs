@@ -685,7 +685,7 @@ impl ApproverHandler {
         {
             return;
         }
-        match keys.and_then(|keys| self.serve(relays, keys, false, Some(host))) {
+        match keys.and_then(|keys| self.serve(relays, keys, false, true)) {
             Ok(()) => {
                 *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 if self.lock().stored.is_none() {
@@ -743,7 +743,7 @@ impl ApproverHandler {
             let Some((relays, keys)) = stored else {
                 return;
             };
-            let Err(e) = keys.and_then(|keys| self.serve(relays, keys, false, None)) else {
+            let Err(e) = keys.and_then(|keys| self.serve(relays, keys, false, false)) else {
                 // A refused pairing handled by a task the stop aborted clears
                 // the pairing without the halt that task would have run.
                 if self.lock().stored.is_none() {
@@ -862,7 +862,7 @@ impl ApproverHandler {
     /// still enforces every recorded pin, and a mismatch stops it here. Relays
     /// that never connect are reported by the gateway-silence alert.
     fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
-        let result = self.serve(relays, keys, true, None);
+        let result = self.serve(relays, keys, true, false);
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
             result.as_ref().err().map(|e| e.to_string());
         result
@@ -871,14 +871,15 @@ impl ApproverHandler {
     /// `first_use` lets the probe learn a pin for a relay that has none.
     /// Without it such a relay is refused, under the same lock the pins are
     /// edited under, so a start nobody asked for cannot learn a pin in place
-    /// of one the user just removed. The one exception is `released`, a host
-    /// whose live release asked for this restart.
+    /// of one the user just removed. A restart a release asked for, with
+    /// `by_release`, may learn a pin for any host whose release is still
+    /// live: each one is the user's say for that host.
     fn serve(
         self: &Arc<Self>,
         relays: Vec<String>,
         keys: Keys,
         first_use: bool,
-        released: Option<&str>,
+        by_release: bool,
     ) -> Result<(), KeepMobileError> {
         crate::network::validate_relay_urls(&relays)?;
         let transport = keys.public_key();
@@ -892,12 +893,7 @@ impl ApproverHandler {
             if !first_use && !self.mobile.get_strict_cert_pinning()? {
                 let pins =
                     crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
-                // Only the restart the user's release of `released` asked
-                // for may learn that host's pin, while the release is live.
-                let may_learn = |r: &String| {
-                    released.is_some_and(|host| crate::relay_host(r).as_deref() == Some(host))
-                        && self.mobile.relay_released(r)
-                };
+                let may_learn = |r: &String| by_release && self.mobile.relay_released(r);
                 if relays
                     .iter()
                     .any(|r| crate::wss_relay_lacks_pin(r, &pins) && !may_learn(r))
