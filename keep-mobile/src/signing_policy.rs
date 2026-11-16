@@ -99,10 +99,13 @@ pub enum AutoSignDecision {
     /// last so the existing variants keep their wire ordinals.
     StorageUnavailable,
     /// The package's limit state could not be read, so it was rewritten as at
-    /// both ceilings from now, with cooling-off until `until_ms`. Nothing is
-    /// loosened: every real window began no later than now. Auto-signing for
-    /// the package pauses through cooling-off and the daily window, then
-    /// resumes without repair. Appended last for the same reason.
+    /// both ceilings from now, with cooling-off begun. Nothing is loosened:
+    /// every real window began no later than now. Auto-signing for the package
+    /// pauses through cooling-off and the daily window, then resumes without
+    /// repair, and `until_ms` is the earliest wall time it can. A read that
+    /// failed only once costs the same day, since unknown usage is never taken
+    /// for less.
+    /// Appended last for the same reason.
     LimitStateUnreadable {
         until_ms: u64,
     },
@@ -967,15 +970,15 @@ impl SigningRateLimiter {
         })
     }
 
-    /// Returns whether both deadlines durably persisted.
-    fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> bool {
+    fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) {
         self.storage.save(
             key(COOLED_OFF_KEY_PREFIX, package_name),
             (now_wall_ms + COOLING_OFF_PERIOD_MS).to_string(),
-        ) & self.storage.save(
+        );
+        self.storage.save(
             key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name),
             (now_elapsed_ms + COOLING_OFF_PERIOD_MS).to_string(),
-        )
+        );
     }
 
     /// Some of the package's limit state could not be read. Rather than
@@ -994,6 +997,12 @@ impl SigningRateLimiter {
             count,
             start_elapsed: now_elapsed_ms,
         };
+        // A readable wall deadline later than a fresh cooling-off is kept: it
+        // would still refuse, and the rewrite must not shorten anything.
+        let wall_until = match self.load_u64(&key(COOLED_OFF_KEY_PREFIX, package_name)) {
+            Ok(Some(until)) => until.max(now_wall_ms + COOLING_OFF_PERIOD_MS),
+            _ => now_wall_ms + COOLING_OFF_PERIOD_MS,
+        };
         let saved = self.save_window(
             HOURLY_KEY_PREFIX,
             package_name,
@@ -1004,12 +1013,18 @@ impl SigningRateLimiter {
             package_name,
             &full(DAILY_LIMIT),
             now_wall_ms,
-        ) & self.set_cooled_off(package_name, now_elapsed_ms, now_wall_ms);
+        ) & self.storage.save(
+            key(COOLED_OFF_KEY_PREFIX, package_name),
+            wall_until.to_string(),
+        ) & self.storage.save(
+            key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name),
+            (now_elapsed_ms + COOLING_OFF_PERIOD_MS).to_string(),
+        );
         if !saved {
             return AutoSignDecision::StorageUnavailable;
         }
         AutoSignDecision::LimitStateUnreadable {
-            until_ms: now_wall_ms + COOLING_OFF_PERIOD_MS,
+            until_ms: wall_until.max(now_wall_ms + DAY_MS),
         }
     }
 
@@ -1405,7 +1420,7 @@ mod tests {
             assert_eq!(
                 result,
                 AutoSignDecision::LimitStateUnreadable {
-                    until_ms: 1000 + i as u64 + COOLING_OFF_PERIOD_MS
+                    until_ms: 1000 + i as u64 + DAY_MS
                 },
                 "unknown prior usage must not be treated as no prior usage"
             );
@@ -1444,7 +1459,7 @@ mod tests {
         assert_eq!(
             limiter.check_and_record("com.test".to_string(), 1000, 1000),
             AutoSignDecision::LimitStateUnreadable {
-                until_ms: 1000 + COOLING_OFF_PERIOD_MS
+                until_ms: 1000 + DAY_MS
             }
         );
     }
@@ -1479,7 +1494,7 @@ mod tests {
         assert_eq!(
             limiter.check_and_record("com.test".to_string(), 1000, 1000),
             AutoSignDecision::LimitStateUnreadable {
-                until_ms: 1000 + COOLING_OFF_PERIOD_MS
+                until_ms: 1000 + DAY_MS
             }
         );
     }
@@ -1505,7 +1520,7 @@ mod tests {
         assert_eq!(
             at(0),
             AutoSignDecision::LimitStateUnreadable {
-                until_ms: w0 + COOLING_OFF_PERIOD_MS
+                until_ms: w0 + DAY_MS
             }
         );
         let stats = limiter.get_usage_stats(pkg.into(), e0, w0);
@@ -1526,6 +1541,40 @@ mod tests {
         assert!(matches!(
             at(DAY_MS + 3 * COOLING_OFF_PERIOD_MS),
             AutoSignDecision::Allowed { .. }
+        ));
+    }
+
+    /// A readable wall deadline beyond a fresh cooling-off survives the
+    /// rewrite: the state it replaces would still refuse until then.
+    #[test]
+    fn a_rewrite_keeps_a_later_readable_cooling_off() {
+        let storage = MockStorage::new();
+        let pkg = "com.test";
+        let (e0, w0) = (1_000u64, 1_000_000u64);
+        let far = w0 + 10 * DAY_MS;
+        {
+            let mut map = storage.map.lock().unwrap();
+            map.insert(key(COOLED_OFF_KEY_PREFIX, pkg), far.to_string());
+            map.insert(key(COOLED_OFF_ELAPSED_KEY_PREFIX, pkg), "garbage".into());
+        }
+        let limiter = SigningRateLimiter::new(storage.clone());
+        assert_eq!(
+            limiter.check_and_record(pkg.into(), e0, w0),
+            AutoSignDecision::LimitStateUnreadable { until_ms: far }
+        );
+        assert_eq!(
+            storage
+                .map
+                .lock()
+                .unwrap()
+                .get(&key(COOLED_OFF_KEY_PREFIX, pkg))
+                .cloned(),
+            Some(far.to_string())
+        );
+        let later = DAY_MS + 3 * COOLING_OFF_PERIOD_MS;
+        assert!(matches!(
+            limiter.check_and_record(pkg.into(), e0 + later, w0 + later),
+            AutoSignDecision::CoolingOff { .. }
         ));
     }
 
