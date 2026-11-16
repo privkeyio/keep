@@ -1588,6 +1588,7 @@ fn a_proxy_change_restarts_a_running_approver() {
         port: 9050,
     };
     phone.mobile.save_proxy_config(off()).unwrap();
+    pin_the_relay(&phone, 1);
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
 
@@ -1622,7 +1623,7 @@ fn a_failed_restart_after_a_setting_change_is_reported() {
 
     // The relay has no pin, so strict pinning refuses it.
     phone.mobile.set_strict_cert_pinning(true).unwrap();
-    let status = settled(&phone.handler, |s| s.last_error.is_some());
+    let status = settled(&phone.handler, |s| !s.alerts.is_empty());
     assert!(!status.running);
     assert_eq!(status.last_error.as_deref(), Some(STRICT_PIN_CHANGE_STOP));
     assert!(
@@ -1679,24 +1680,16 @@ fn a_strict_pinning_change_stops_a_running_approver() {
 // and it starts itself again under the pins left.
 #[test]
 fn a_certificate_pin_change_restarts_a_running_approver() {
-    let host = "relay.example.com";
-    let pin = |b: u8| hex::encode([b; 32]);
     let phone = paired();
-    phone
-        .mobile
-        .stage_certificate_pin(host.into(), pin(1))
-        .unwrap();
-    phone
-        .mobile
-        .stage_certificate_pin(host.into(), pin(2))
-        .unwrap();
+    pin_the_relay(&phone, 1);
+    pin_the_relay(&phone, 2);
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
 
     let before = stops(&phone.handler);
     phone
         .mobile
-        .remove_certificate_pin(host.into(), pin(1))
+        .remove_certificate_pin(RELAY_HOST.into(), hex::encode([1u8; 32]))
         .unwrap();
     assert!(
         stops(&phone.handler) > before,
@@ -1706,6 +1699,42 @@ fn a_certificate_pin_change_restarts_a_running_approver() {
     assert!(status.running, "{:?}", status.last_error);
     assert!(status.alerts.is_empty(), "{:?}", status.alerts);
     phone.handler.stop();
+}
+
+// Removing a relay's last pin, often a compromised key, does not start the
+// approver again on its own: that would learn whatever key the relay shows
+// in its place. It stays stopped until the user starts it.
+#[test]
+fn a_restart_does_not_learn_a_pin_the_user_removed() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running);
+
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    let status = settled(&phone.handler, |s| !s.alerts.is_empty());
+    assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(CERT_PIN_CHANGE_STOP));
+    assert!(
+        status
+            .alerts
+            .iter()
+            .any(|a| a.message == CERT_PIN_CHANGE_STOP),
+        "{:?}",
+        status.alerts
+    );
+}
+
+const RELAY_HOST: &str = "relay.example";
+
+fn pin_the_relay(phone: &Phone, byte: u8) {
+    phone
+        .mobile
+        .stage_certificate_pin(RELAY_HOST.into(), hex::encode([byte; 32]))
+        .unwrap();
 }
 
 // A failed restart's alert reaches the app from a thread that holds no lock,

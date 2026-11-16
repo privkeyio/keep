@@ -618,8 +618,9 @@ impl ApproverHandler {
     }
 
     /// Stop serving after the proxy, strict pinning or certificate pin
-    /// setting changed: the socket was opened under the old one, so it is
-    /// closed before this returns. Under `lifecycle`, so a start running
+    /// setting changed: the socket was opened under the old one, so before
+    /// this returns its tasks are aborted and its client is sent to shut
+    /// down, which finishes on the runtime. Under `lifecycle`, so a start running
     /// alongside either read the new setting or is stopped here.
     ///
     /// The approver then starts again under the new setting on a thread of
@@ -645,9 +646,12 @@ impl ApproverHandler {
     }
 
     /// Start serving again after `stop_for_setting_change` at `generation`,
-    /// unless a stop or start since then decided otherwise. Only a failure
-    /// is reported: `last_error` says why it stopped, and an alert tells the
-    /// owner and the app.
+    /// unless a stop or start since then decided otherwise. A relay left with
+    /// no pin is not trusted on first use here: that is for the user to do by
+    /// starting the approver, not for a restart nobody asked for, which would
+    /// learn whatever key it is shown in place of a pin just removed. Only a
+    /// failure is reported: `last_error` says why it stopped, and an alert
+    /// tells the owner and the app.
     fn restart_after_setting_change(self: &Arc<Self>, generation: u64, reason: &str) {
         let mut fx = Effects::default();
         {
@@ -665,7 +669,12 @@ impl ApproverHandler {
             let Some((relays, keys)) = stored else {
                 return;
             };
-            let Err(e) = keys.and_then(|keys| self.run(relays, keys)) else {
+            let Err(e) = keys.and_then(|keys| self.serve(relays, keys, false)) else {
+                // A refused pairing handled by a task the stop aborted clears
+                // the pairing without the halt that task would have run.
+                if self.lock().stored.is_none() {
+                    self.halt();
+                }
                 return;
             };
             tracing::warn!(error = %e, "the approver could not start again after a setting change");
@@ -779,13 +788,22 @@ impl ApproverHandler {
     /// still enforces every recorded pin, and a mismatch stops it here. Relays
     /// that never connect are reported by the gateway-silence alert.
     fn run(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
-        let result = self.serve(relays, keys);
+        let result = self.serve(relays, keys, true);
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
             result.as_ref().err().map(|e| e.to_string());
         result
     }
 
-    fn serve(self: &Arc<Self>, relays: Vec<String>, keys: Keys) -> Result<(), KeepMobileError> {
+    /// `first_use` lets the probe learn a pin for a relay that has none.
+    /// Without it such a relay is refused, under the same lock the pins are
+    /// edited under, so a start nobody asked for cannot learn a pin in place
+    /// of one the user just removed.
+    fn serve(
+        self: &Arc<Self>,
+        relays: Vec<String>,
+        keys: Keys,
+        first_use: bool,
+    ) -> Result<(), KeepMobileError> {
         crate::network::validate_relay_urls(&relays)?;
         let transport = keys.public_key();
         let proxy = self.mobile.pinnable_proxy()?;
@@ -795,6 +813,15 @@ impl ApproverHandler {
                 .cert_pin_lock
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            if !first_use && !self.mobile.get_strict_cert_pinning()? {
+                let pins =
+                    crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
+                if relays.iter().any(|r| crate::wss_relay_lacks_pin(r, &pins)) {
+                    return Err(invalid(
+                        "a relay has no certificate pin, which only a start by hand may learn",
+                    ));
+                }
+            }
             let relays = match self
                 .mobile
                 .runtime
