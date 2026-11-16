@@ -98,6 +98,14 @@ pub enum AutoSignDecision {
     /// the same un-incremented window and bypass the limits entirely. Appended
     /// last so the existing variants keep their wire ordinals.
     StorageUnavailable,
+    /// The package's limit state could not be read, so it was rewritten as at
+    /// both ceilings from now, with cooling-off until `until_ms`. Nothing is
+    /// loosened: every real window began no later than now. Auto-signing for
+    /// the package pauses through cooling-off and the daily window, then
+    /// resumes without repair. Appended last for the same reason.
+    LimitStateUnreadable {
+        until_ms: u64,
+    },
 }
 
 #[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
@@ -495,6 +503,9 @@ pub struct UsageStats {
     pub daily_count: u32,
     pub hourly_limit: u32,
     pub daily_limit: u32,
+    /// False when any of the package's stored limit state could not be read
+    /// or decoded. The counts above then show zero and mean nothing.
+    pub readable: bool,
 }
 
 #[uniffi::export]
@@ -693,7 +704,7 @@ impl SigningRateLimiter {
         // and make the ceilings unreachable, which is the same bypass a lost
         // write produces.
         let Some(cooled) = self.cooled_off_state(&package_name, now_elapsed_ms, now_wall_ms) else {
-            return AutoSignDecision::StorageUnavailable;
+            return self.reset_unreadable(&package_name, now_elapsed_ms, now_wall_ms);
         };
         if cooled.active() {
             return AutoSignDecision::CoolingOff {
@@ -711,7 +722,7 @@ impl SigningRateLimiter {
             now_elapsed_ms,
             now_wall_ms,
         ) else {
-            return AutoSignDecision::StorageUnavailable;
+            return self.reset_unreadable(&package_name, now_elapsed_ms, now_wall_ms);
         };
         if hourly.count > HOURLY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
@@ -725,7 +736,7 @@ impl SigningRateLimiter {
             now_elapsed_ms,
             now_wall_ms,
         ) else {
-            return AutoSignDecision::StorageUnavailable;
+            return self.reset_unreadable(&package_name, now_elapsed_ms, now_wall_ms);
         };
         if daily.count > DAILY_LIMIT {
             self.set_cooled_off(&package_name, now_elapsed_ms, now_wall_ms);
@@ -758,16 +769,20 @@ impl SigningRateLimiter {
         }
     }
 
-    pub fn clear_cooling_off(&self, package_name: String) {
+    /// Returns whether every removal reached the durable store. On `false`
+    /// some of the package's state may remain, readable or not.
+    pub fn clear_cooling_off(&self, package_name: String) -> bool {
         let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        // Every removal is attempted even after one fails.
         self.storage
-            .remove(key(COOLED_OFF_KEY_PREFIX, &package_name));
-        self.storage
-            .remove(key(COOLED_OFF_ELAPSED_KEY_PREFIX, &package_name));
-        // Also drop the velocity counters; leaving an over-limit counter in
-        // place would immediately re-trip cooling-off on the next request.
-        self.storage.remove(key(HOURLY_KEY_PREFIX, &package_name));
-        self.storage.remove(key(DAILY_KEY_PREFIX, &package_name));
+            .remove(key(COOLED_OFF_KEY_PREFIX, &package_name))
+            & self
+                .storage
+                .remove(key(COOLED_OFF_ELAPSED_KEY_PREFIX, &package_name))
+            // Also drop the velocity counters; leaving an over-limit counter in
+            // place would immediately re-trip cooling-off on the next request.
+            & self.storage.remove(key(HOURLY_KEY_PREFIX, &package_name))
+            & self.storage.remove(key(DAILY_KEY_PREFIX, &package_name))
     }
 
     pub fn clear_all(&self) {
@@ -786,29 +801,31 @@ impl SigningRateLimiter {
         now_wall_ms: u64,
     ) -> UsageStats {
         let _guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
-        let hourly_count = self
-            .read_window(
-                HOURLY_KEY_PREFIX,
-                &package_name,
-                HOUR_MS,
-                now_elapsed_ms,
-                now_wall_ms,
-            )
-            .display_count();
-        let daily_count = self
-            .read_window(
-                DAILY_KEY_PREFIX,
-                &package_name,
-                DAY_MS,
-                now_elapsed_ms,
-                now_wall_ms,
-            )
-            .display_count();
+        let hourly = self.read_window(
+            HOURLY_KEY_PREFIX,
+            &package_name,
+            HOUR_MS,
+            now_elapsed_ms,
+            now_wall_ms,
+        );
+        let daily = self.read_window(
+            DAILY_KEY_PREFIX,
+            &package_name,
+            DAY_MS,
+            now_elapsed_ms,
+            now_wall_ms,
+        );
+        let readable = !matches!(hourly, WindowRead::Unavailable)
+            && !matches!(daily, WindowRead::Unavailable)
+            && self
+                .cooled_off_state(&package_name, now_elapsed_ms, now_wall_ms)
+                .is_some();
         UsageStats {
-            hourly_count,
-            daily_count,
+            hourly_count: hourly.display_count(),
+            daily_count: daily.display_count(),
             hourly_limit: HOURLY_LIMIT,
             daily_limit: DAILY_LIMIT,
+            readable,
         }
     }
 }
@@ -950,15 +967,50 @@ impl SigningRateLimiter {
         })
     }
 
-    fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) {
+    /// Returns whether both deadlines durably persisted.
+    fn set_cooled_off(&self, package_name: &str, now_elapsed_ms: u64, now_wall_ms: u64) -> bool {
         self.storage.save(
             key(COOLED_OFF_KEY_PREFIX, package_name),
             (now_wall_ms + COOLING_OFF_PERIOD_MS).to_string(),
-        );
-        self.storage.save(
+        ) & self.storage.save(
             key(COOLED_OFF_ELAPSED_KEY_PREFIX, package_name),
             (now_elapsed_ms + COOLING_OFF_PERIOD_MS).to_string(),
-        );
+        )
+    }
+
+    /// Some of the package's limit state could not be read. Rather than
+    /// refuse forever, or start fresh and lift the ceilings, write it as full
+    /// from now: both windows at their limits and cooling-off begun. Every
+    /// real window started no later than now, so this is at least as strict
+    /// as whatever was there. Every write is attempted even after one fails,
+    /// and unless all of them land the package stays refused as unavailable.
+    fn reset_unreadable(
+        &self,
+        package_name: &str,
+        now_elapsed_ms: u64,
+        now_wall_ms: u64,
+    ) -> AutoSignDecision {
+        let full = |count| UsageWindow {
+            count,
+            start_elapsed: now_elapsed_ms,
+        };
+        let saved = self.save_window(
+            HOURLY_KEY_PREFIX,
+            package_name,
+            &full(HOURLY_LIMIT),
+            now_wall_ms,
+        ) & self.save_window(
+            DAILY_KEY_PREFIX,
+            package_name,
+            &full(DAILY_LIMIT),
+            now_wall_ms,
+        ) & self.set_cooled_off(package_name, now_elapsed_ms, now_wall_ms);
+        if !saved {
+            return AutoSignDecision::StorageUnavailable;
+        }
+        AutoSignDecision::LimitStateUnreadable {
+            until_ms: now_wall_ms + COOLING_OFF_PERIOD_MS,
+        }
     }
 
     /// `Ok(None)` is a genuinely unset key; `Err(())` is a read that failed or a
@@ -1352,7 +1404,9 @@ mod tests {
                 limiter.check_and_record("com.test".to_string(), 1000 + i as u64, 1000 + i as u64);
             assert_eq!(
                 result,
-                AutoSignDecision::StorageUnavailable,
+                AutoSignDecision::LimitStateUnreadable {
+                    until_ms: 1000 + i as u64 + COOLING_OFF_PERIOD_MS
+                },
                 "unknown prior usage must not be treated as no prior usage"
             );
         }
@@ -1389,7 +1443,9 @@ mod tests {
         let limiter = SigningRateLimiter::new(Arc::new(CorruptStorage));
         assert_eq!(
             limiter.check_and_record("com.test".to_string(), 1000, 1000),
-            AutoSignDecision::StorageUnavailable
+            AutoSignDecision::LimitStateUnreadable {
+                until_ms: 1000 + COOLING_OFF_PERIOD_MS
+            }
         );
     }
 
@@ -1422,8 +1478,111 @@ mod tests {
         let limiter = SigningRateLimiter::new(Arc::new(CorruptCoolingOffStorage));
         assert_eq!(
             limiter.check_and_record("com.test".to_string(), 1000, 1000),
+            AutoSignDecision::LimitStateUnreadable {
+                until_ms: 1000 + COOLING_OFF_PERIOD_MS
+            }
+        );
+    }
+
+    /// A corrupt counter in an otherwise working store: the state is rewritten
+    /// as full from the fault, so the package pauses through cooling-off and
+    /// both ceilings and only then auto-signs again, with no repair and with
+    /// nothing allowed that the real state could have refused.
+    #[test]
+    fn unreadable_state_is_rewritten_as_full_and_recovers() {
+        let storage = MockStorage::new();
+        let pkg = "com.test";
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .insert(key(DAILY_KEY_PREFIX, pkg), "not-a-window".into());
+        let limiter = SigningRateLimiter::new(storage.clone());
+        let (e0, w0) = (1_000u64, 1_000_000u64);
+        let at = |offset: u64| limiter.check_and_record(pkg.into(), e0 + offset, w0 + offset);
+
+        assert!(!limiter.get_usage_stats(pkg.into(), e0, w0).readable);
+        assert_eq!(
+            at(0),
+            AutoSignDecision::LimitStateUnreadable {
+                until_ms: w0 + COOLING_OFF_PERIOD_MS
+            }
+        );
+        let stats = limiter.get_usage_stats(pkg.into(), e0, w0);
+        assert!(stats.readable);
+        assert_eq!(
+            (stats.hourly_count, stats.daily_count),
+            (HOURLY_LIMIT, DAILY_LIMIT)
+        );
+        assert!(matches!(at(60_000), AutoSignDecision::CoolingOff { .. }));
+        assert_eq!(
+            at(COOLING_OFF_PERIOD_MS + 1),
+            AutoSignDecision::HourlyLimitExceeded
+        );
+        assert_eq!(
+            at(HOUR_MS + 2 * COOLING_OFF_PERIOD_MS),
+            AutoSignDecision::DailyLimitExceeded
+        );
+        assert!(matches!(
+            at(DAY_MS + 3 * COOLING_OFF_PERIOD_MS),
+            AutoSignDecision::Allowed { .. }
+        ));
+    }
+
+    /// Reads fail and so do some writes: the rewrite did not land, so the
+    /// package stays refused rather than reported as reset.
+    struct CorruptUnwritableStorage;
+    impl SigningRateLimiterStorage for CorruptUnwritableStorage {
+        fn load(&self, key: String) -> StorageRead {
+            if key.starts_with(HOURLY_KEY_PREFIX) {
+                StorageRead::Unavailable
+            } else {
+                StorageRead::Absent
+            }
+        }
+        fn save(&self, key: String, _value: String) -> bool {
+            !key.starts_with(DAILY_KEY_PREFIX)
+        }
+        fn remove(&self, key: String) -> bool {
+            !key.starts_with(HOURLY_KEY_PREFIX)
+        }
+        fn clear(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_rewrite_that_does_not_land_stays_unavailable() {
+        let limiter = SigningRateLimiter::new(Arc::new(CorruptUnwritableStorage));
+        assert_eq!(
+            limiter.check_and_record("com.test".to_string(), 1000, 1000),
             AutoSignDecision::StorageUnavailable
         );
+    }
+
+    #[test]
+    fn clearing_reports_whether_every_removal_landed() {
+        let storage = MockStorage::new();
+        storage
+            .map
+            .lock()
+            .unwrap()
+            .insert(key(HOURLY_KEY_PREFIX, "com.test"), "not-a-window".into());
+        let limiter = SigningRateLimiter::new(storage);
+        assert!(
+            !limiter
+                .get_usage_stats("com.test".into(), 1000, 1000)
+                .readable
+        );
+        assert!(limiter.clear_cooling_off("com.test".into()));
+        assert!(
+            limiter
+                .get_usage_stats("com.test".into(), 1000, 1000)
+                .readable
+        );
+
+        let failing = SigningRateLimiter::new(Arc::new(CorruptUnwritableStorage));
+        assert!(!failing.clear_cooling_off("com.test".into()));
     }
 
     #[test]
@@ -1440,6 +1599,21 @@ mod tests {
                 "an uncounted request must not be reported as allowed"
             );
         }
+    }
+
+    #[test]
+    fn unreadable_limit_state_does_not_auto_approve() {
+        let ctx = test_ctx(Nip55RequestType::SignEvent, Some(1));
+        assert_eq!(
+            evaluate_sign_policy_selection(
+                SignPolicySelection::Auto,
+                ctx,
+                true,
+                AutoSignDecision::LimitStateUnreadable { until_ms: 1 },
+                12,
+            ),
+            SignPolicyEvaluation::FallToUi
+        );
     }
 
     #[test]
