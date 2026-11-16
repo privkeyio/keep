@@ -136,7 +136,7 @@ pub fn nip55_timestamp_expired(
             }
         } else {
             let wall_expiry = created_at.saturating_add(duration_ms);
-            if now_wall_ms >= wall_expiry {
+            if now_wall_ms < created_at || now_wall_ms >= wall_expiry {
                 return true;
             }
         }
@@ -242,6 +242,13 @@ mod tests {
         let p = perm("allow", 1_000, 0, Some(HOUR_MS));
         assert!(!is_expired(&p, 0, 1_000 + HOUR_MS - 1));
         assert!(is_expired(&p, 0, 1_000 + HOUR_MS));
+    }
+
+    #[test]
+    fn wall_clock_fallback_set_back_before_created_fails_closed() {
+        let p = perm("allow", 5_000, 0, Some(HOUR_MS));
+        assert!(!is_expired(&p, 0, 5_000));
+        assert!(is_expired(&p, 0, 4_999));
     }
 
     #[test]
