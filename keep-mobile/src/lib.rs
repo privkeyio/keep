@@ -3148,11 +3148,18 @@ impl KeepMobile {
         // staged one would not be honored until re-init. Tearing the node down is
         // also the right answer for a removal specifically, since the existing
         // socket was authenticated with a pin the user no longer trusts.
+        // The approver holds its own copy of the pin set for the same reason,
+        // so it is stopped too: a removed pin is often a compromised key.
         // Called after the cert-pin guard drops: lock order is
         // node_lifecycle_lock -> cert_pin_lock, so taking them the other way
         // round here would deadlock against `do_initialize`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
+    }
+
+    fn restart_for_pin_change(&self) {
+        self.invalidate_live_node();
+        self.stop_live_approver(approver::CERT_PIN_CHANGE_STOP);
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
@@ -3166,7 +3173,7 @@ impl KeepMobile {
             persistence::persist_cert_pins(&self.storage, &pins)?;
         }
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
     }
 
@@ -3192,7 +3199,7 @@ impl KeepMobile {
             persistence::persist_cert_pins(&self.storage, &pins)?;
         }
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
     }
 
@@ -3223,7 +3230,7 @@ impl KeepMobile {
             }
         };
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(result)
     }
 
@@ -4006,17 +4013,40 @@ impl KeepMobile {
 
     /// Enable or disable strict certificate pinning (see `get_strict_cert_pinning`).
     ///
-    /// A live node captured the old setting when it was built, so it is torn
-    /// down here rather than left running with the previous policy until the
-    /// next re-init.
+    /// A live node or approver captured the old setting when it was built, so
+    /// a change tears it down here rather than leaving it running with the
+    /// previous policy until the next start. An old setting that cannot be
+    /// read may differ, so it counts as a change.
     pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
-        let config = persistence::StoredStrictPinConfig { enabled };
-        persistence::persist_strict_pin_config(
-            &self.storage,
-            STRICT_PIN_CONFIG_STORAGE_KEY,
-            &config,
-        )?;
+        let changed = {
+            // Every relay probe and live pin read runs under this lock, so
+            // taking it waits out one in flight. Once this returns, no probe
+            // that read the old setting can still trust a relay on first use.
+            // Released before the teardown below, which takes the lifecycle
+            // lock, to keep the order node_lifecycle_lock -> cert_pin_lock.
+            let _cert = self
+                .cert_pin_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = match persistence::load_strict_pin_config(
+                &self.storage,
+                STRICT_PIN_CONFIG_STORAGE_KEY,
+            ) {
+                Ok(old) => old.unwrap_or_default().enabled != enabled,
+                Err(_) => true,
+            };
+            let config = persistence::StoredStrictPinConfig { enabled };
+            persistence::persist_strict_pin_config(
+                &self.storage,
+                STRICT_PIN_CONFIG_STORAGE_KEY,
+                &config,
+            )?;
+            changed
+        };
         self.invalidate_live_node();
+        if changed {
+            self.stop_live_approver(approver::STRICT_PIN_CHANGE_STOP);
+        }
         Ok(())
     }
 
@@ -5358,16 +5388,20 @@ impl KeepMobile {
         persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, stored)?;
         if changed {
             self.invalidate_live_node();
-            let approver = self
-                .live_approver
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upgrade();
-            if let Some(approver) = approver {
-                approver.stop_for_proxy_change();
-            }
+            self.stop_live_approver(approver::PROXY_CHANGE_STOP);
         }
         Ok(())
+    }
+
+    fn stop_live_approver(&self, reason: &str) {
+        let approver = self
+            .live_approver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(approver) = approver {
+            approver.stop_for_setting_change(reason);
+        }
     }
 
     fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
@@ -8162,6 +8196,31 @@ mod cert_pin_ffi_tests {
         assert!(keep.get_strict_cert_pinning().unwrap());
         keep.set_strict_cert_pinning(false).unwrap();
         assert!(!keep.get_strict_cert_pinning().unwrap());
+    }
+
+    #[test]
+    fn strict_cert_pinning_waits_out_a_probe_in_flight() {
+        let keep = keep();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            let probe = keep.cert_pin_lock.lock().unwrap();
+            scope.spawn(|| {
+                keep.set_strict_cert_pinning(true).unwrap();
+                done_tx.send(()).unwrap();
+            });
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(300))
+                    .is_err(),
+                "the setting must not change under a probe that read the old one"
+            );
+            assert!(!keep.get_strict_cert_pinning().unwrap());
+            drop(probe);
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the setter completes once the probe ends");
+        });
+        assert!(keep.get_strict_cert_pinning().unwrap());
     }
 
     #[test]
