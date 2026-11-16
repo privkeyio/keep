@@ -1824,6 +1824,41 @@ fn releasing_another_host_leaves_a_running_approver_alone() {
     phone.handler.stop();
 }
 
+// A restart a release asked for gets past the no-first-use check for that
+// host, to fail at the probe here with no network. A restart for a setting
+// change, or a release of another host, is still refused there.
+#[test]
+fn only_the_restart_a_release_asked_for_may_learn_its_pin() {
+    const REFUSED: &str = "only a start by hand may learn";
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    phone
+        .mobile
+        .release_certificate_pin_hold(RELAY_HOST.into())
+        .unwrap();
+    let serve = |released: Option<&str>| {
+        let (relays, keys) = {
+            let inner = phone.handler.lock();
+            let stored = inner.stored.as_ref().unwrap();
+            (stored.relays.clone(), stored.keys().unwrap())
+        };
+        let _lifecycle = phone.handler.lifecycle.lock().unwrap();
+        phone
+            .handler
+            .serve(relays, keys, false, released)
+            .unwrap_err()
+            .to_string()
+    };
+    let asked = serve(Some(RELAY_HOST));
+    assert!(!asked.contains(REFUSED), "{asked}");
+    assert!(serve(None).contains(REFUSED));
+    assert!(serve(Some("other.example")).contains(REFUSED));
+}
+
 const RELAY_HOST: &str = "relay.example";
 
 fn pin_the_relay(phone: &Phone, byte: u8) {
