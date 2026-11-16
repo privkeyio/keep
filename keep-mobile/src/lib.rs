@@ -1894,30 +1894,11 @@ impl KeepMobile {
     fn invalidate_live_node(&self) {
         // Serialize teardown against a concurrent `do_initialize` so the
         // (node, node_tasks) pair is swapped atomically. Held for the whole fn.
-        let _lifecycle = self
+        let lifecycle = self
             .node_lifecycle_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for handle in self
-            .node_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-        {
-            handle.abort();
-        }
-        self.runtime.block_on(async {
-            self.pending_requests.lock().await.clear();
-            *self.node.write().await = None;
-        });
-        self.node_relays
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        // After the node is gone, so a bunker start that read the old node
-        // subscribed before this and sees it.
-        self.live_generation
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        self.invalidate_live_node_locked(&lifecycle);
     }
 
     pub fn set_active_share(&self, group_pubkey: String) -> Result<(), KeepMobileError> {
@@ -5624,18 +5605,51 @@ impl KeepMobile {
         Ok(())
     }
 
+    /// `invalidate_live_node` for a caller already holding
+    /// `node_lifecycle_lock`.
+    fn invalidate_live_node_locked(&self, _lifecycle: &std::sync::MutexGuard<'_, ()>) {
+        for handle in self
+            .node_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+        {
+            handle.abort();
+        }
+        self.runtime.block_on(async {
+            self.pending_requests.lock().await.clear();
+            *self.node.write().await = None;
+        });
+        self.node_relays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        // After the node is gone, so a bunker start that read the old node
+        // subscribed before this and sees it.
+        self.live_generation
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
     /// A hold on `host` was released: rebuild a live node that uses it, so
     /// its next start probes the host, and start an approver that waited on
     /// it. Anything that does not use the host is left alone.
     fn restart_for_lifted_hold(&self, host: &str) {
-        let node_uses_host = self
-            .node_relays
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|r| relay_host(r).as_deref() == Some(host));
-        if node_uses_host {
-            self.invalidate_live_node();
+        {
+            // Under the lock an init installs a node under, so the node
+            // checked is the node torn down.
+            let lifecycle = self
+                .node_lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let node_uses_host = self
+                .node_relays
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|r| relay_host(r).as_deref() == Some(host));
+            if node_uses_host {
+                self.invalidate_live_node_locked(&lifecycle);
+            }
         }
         self.resume_live_approver(host);
     }

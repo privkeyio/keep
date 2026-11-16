@@ -1772,7 +1772,11 @@ fn pinning_the_relay_again_resumes_an_approver_a_removal_stopped() {
     assert!(!status.running);
 
     pin_the_relay(&phone, 2);
-    let status = settled(&phone.handler, |s| s.running);
+    let status = settled(&phone.handler, |s| {
+        s.running
+            && s.last_error.is_none()
+            && !s.alerts.iter().any(|a| a.message == CERT_PIN_CHANGE_STOP)
+    });
     assert!(status.running);
     assert!(status.last_error.is_none());
     assert!(
