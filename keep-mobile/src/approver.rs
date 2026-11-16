@@ -504,13 +504,13 @@ fn no_relay() -> KeepMobileError {
 }
 
 pub(crate) const PROXY_CHANGE_STOP: &str =
-    "Approvals stopped because the proxy setting changed. Start the approver again.";
+    "Approvals stopped because the proxy setting changed and the approver could not start again under it. Start the approver again.";
 
 pub(crate) const STRICT_PIN_CHANGE_STOP: &str =
-    "Approvals stopped because strict certificate pinning changed. Start the approver again.";
+    "Approvals stopped because strict certificate pinning changed and the approver could not start again under it. Start the approver again.";
 
 pub(crate) const CERT_PIN_CHANGE_STOP: &str =
-    "Approvals stopped because the certificate pins changed. Start the approver again.";
+    "Approvals stopped because the certificate pins changed and the approver could not start again under them. Start the approver again.";
 
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
@@ -618,16 +618,16 @@ impl ApproverHandler {
     }
 
     /// Stop serving after the proxy, strict pinning or certificate pin
-    /// setting changed: the socket was opened under the old one. Under
-    /// `lifecycle`, so a start running alongside either read the new setting
-    /// or is stopped here. `last_error` says why it stopped, and an alert
-    /// tells the owner and the app, which starts the approver again. The alert
-    /// is sent from its own thread: a caller may hold the proxy and share
-    /// write locks, which a callback that saves the setting or starts the
-    /// approver again must not wait on.
-    pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &str) {
-        let mut fx = Effects::default();
-        {
+    /// setting changed: the socket was opened under the old one, so it is
+    /// closed before this returns. Under `lifecycle`, so a start running
+    /// alongside either read the new setting or is stopped here.
+    ///
+    /// The approver then starts again under the new setting on a thread of
+    /// its own, so apps need not mirror every setting that stops it: a caller
+    /// may hold the proxy and share write locks, which neither the relay
+    /// probe nor a callback that saves the setting again must wait on.
+    pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &'static str) {
+        let generation = {
             let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
             let was_running = self
                 .running
@@ -638,6 +638,37 @@ impl ApproverHandler {
                 return;
             }
             self.halt();
+            self.generation.load(Ordering::SeqCst)
+        };
+        let this = Held::of(self);
+        std::thread::spawn(move || this.restart_after_setting_change(generation, reason));
+    }
+
+    /// Start serving again after `stop_for_setting_change` at `generation`,
+    /// unless a stop or start since then decided otherwise. Only a failure
+    /// is reported: `last_error` says why it stopped, and an alert tells the
+    /// owner and the app.
+    fn restart_after_setting_change(self: &Arc<Self>, generation: u64, reason: &str) {
+        let mut fx = Effects::default();
+        {
+            let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            if self.generation.load(Ordering::SeqCst) != generation
+                || self.closed.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            let stored = self
+                .lock()
+                .stored
+                .as_ref()
+                .map(|s| (s.relays.clone(), s.keys()));
+            let Some((relays, keys)) = stored else {
+                return;
+            };
+            let Err(e) = keys.and_then(|keys| self.run(relays, keys)) else {
+                return;
+            };
+            tracing::warn!(error = %e, "the approver could not start again after a setting change");
             *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
             let mut inner = self.lock();
             if let Some(stored) = inner.stored.as_mut() {
@@ -645,11 +676,7 @@ impl ApproverHandler {
                 self.persist_or_log(stored);
             }
         }
-        if !fx.events.is_empty() {
-            let this = Held::of(self);
-            let events = fx.events;
-            std::thread::spawn(move || this.emit(events));
-        }
+        self.emit(fx.events);
     }
 
     fn open_check(&self) -> Result<(), KeepMobileError> {

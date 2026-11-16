@@ -1560,11 +1560,28 @@ fn the_approver_reaches_its_relays_through_the_proxy() {
     phone.handler.stop();
 }
 
+/// Waits for the thread a setting change starts the approver again on.
+fn settled(handler: &ApproverHandler, done: impl Fn(&ApproverStatus) -> bool) -> ApproverStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = handler.status();
+        if done(&status) || std::time::Instant::now() > deadline {
+            return status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn stops(handler: &ApproverHandler) -> u64 {
+    handler.generation.load(Ordering::SeqCst)
+}
+
 // A running approver opened its socket under the old proxy setting, so a
-// change stops it and says why, and the app starts it again. Saving the same
-// setting leaves it running.
+// change closes it before the save returns and the approver starts itself
+// again under the new one, with nothing to report. Saving the same setting
+// leaves it running.
 #[test]
-fn a_proxy_change_stops_a_running_approver() {
+fn a_proxy_change_restarts_a_running_approver() {
     let phone = paired();
     let off = || crate::ProxyConfigInfo {
         enabled: false,
@@ -1574,8 +1591,9 @@ fn a_proxy_change_stops_a_running_approver() {
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
 
+    let before = stops(&phone.handler);
     phone.mobile.save_proxy_config(off()).unwrap();
-    assert!(phone.handler.status().running, "the same setting");
+    assert_eq!(stops(&phone.handler), before, "the same setting");
 
     phone
         .mobile
@@ -1584,35 +1602,27 @@ fn a_proxy_change_stops_a_running_approver() {
             port: 9050,
         })
         .unwrap();
-    let status = phone.handler.status();
-    assert!(!status.running);
-    assert_eq!(status.last_error.as_deref(), Some(PROXY_CHANGE_STOP));
     assert!(
-        status.alerts.iter().any(|a| a.message == PROXY_CHANGE_STOP),
-        "{:?}",
-        status.alerts
+        stops(&phone.handler) > before,
+        "stopped before the save returned"
     );
-
-    phone.mobile.save_proxy_config(off()).unwrap();
-    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
-    assert!(phone.handler.status().running, "started again");
+    let status = settled(&phone.handler, |s| s.running);
+    assert!(status.running, "started again");
+    assert_eq!(status.last_error, None);
+    assert!(status.alerts.is_empty(), "{:?}", status.alerts);
     phone.handler.stop();
 }
 
-// A running approver probed its relays under the old strict pinning setting,
-// so turning it on stops it rather than leaving it on pins it learned on
-// first use. Saving the same setting leaves it running.
+// A setting the approver cannot start under leaves it stopped, and says why.
 #[test]
-fn a_strict_pinning_change_stops_a_running_approver() {
+fn a_failed_restart_after_a_setting_change_is_reported() {
     let phone = paired();
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
 
-    phone.mobile.set_strict_cert_pinning(false).unwrap();
-    assert!(phone.handler.status().running, "the same setting");
-
+    // The relay has no pin, so strict pinning refuses it.
     phone.mobile.set_strict_cert_pinning(true).unwrap();
-    let status = phone.handler.status();
+    let status = settled(&phone.handler, |s| s.last_error.is_some());
     assert!(!status.running);
     assert_eq!(status.last_error.as_deref(), Some(STRICT_PIN_CHANGE_STOP));
     assert!(
@@ -1623,17 +1633,52 @@ fn a_strict_pinning_change_stops_a_running_approver() {
         "{:?}",
         status.alerts
     );
+}
 
-    phone.mobile.set_strict_cert_pinning(false).unwrap();
+// A stop the app asks for after a setting change wins over the restart.
+#[test]
+fn a_stop_after_a_setting_change_is_not_undone() {
+    let phone = paired();
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
-    assert!(phone.handler.status().running, "started again");
+    let generation = {
+        let _lifecycle = phone.handler.lifecycle.lock().unwrap();
+        phone.handler.halt();
+        stops(&phone.handler)
+    };
+    phone.handler.stop();
+    phone
+        .handler
+        .restart_after_setting_change(generation, PROXY_CHANGE_STOP);
+    let status = phone.handler.status();
+    assert!(!status.running, "the restart undid the stop");
+    assert_eq!(status.last_error, None);
+}
+
+// A running approver probed its relays under the old strict pinning setting,
+// so a change stops it before the setter returns rather than leaving it on
+// pins it learned on first use. Saving the same setting leaves it running.
+#[test]
+fn a_strict_pinning_change_stops_a_running_approver() {
+    let phone = paired();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    let before = stops(&phone.handler);
+    phone.mobile.set_strict_cert_pinning(false).unwrap();
+    assert_eq!(stops(&phone.handler), before, "the same setting");
+    assert!(phone.handler.status().running);
+
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    assert!(
+        stops(&phone.handler) > before,
+        "stopped before the setter returned"
+    );
     phone.handler.stop();
 }
 
 // A running approver holds the pin set it started with, so removing a pin,
-// often a compromised key, stops it rather than leaving that key accepted.
+// often a compromised key, stops it rather than leaving that key accepted,
+// and it starts itself again under the pins left.
 #[test]
-fn a_certificate_pin_change_stops_a_running_approver() {
+fn a_certificate_pin_change_restarts_a_running_approver() {
     let host = "relay.example.com";
     let pin = |b: u8| hex::encode([b; 32]);
     let phone = paired();
@@ -1648,26 +1693,24 @@ fn a_certificate_pin_change_stops_a_running_approver() {
     phone.handler.clone().start(Arc::new(Nobody)).unwrap();
     assert!(phone.handler.status().running);
 
+    let before = stops(&phone.handler);
     phone
         .mobile
         .remove_certificate_pin(host.into(), pin(1))
         .unwrap();
-    let status = phone.handler.status();
-    assert!(!status.running);
-    assert_eq!(status.last_error.as_deref(), Some(CERT_PIN_CHANGE_STOP));
     assert!(
-        status
-            .alerts
-            .iter()
-            .any(|a| a.message == CERT_PIN_CHANGE_STOP),
-        "{:?}",
-        status.alerts
+        stops(&phone.handler) > before,
+        "stopped before the edit returned"
     );
+    let status = settled(&phone.handler, |s| s.running);
+    assert!(status.running, "{:?}", status.last_error);
+    assert!(status.alerts.is_empty(), "{:?}", status.alerts);
     phone.handler.stop();
 }
 
-// The alert reaches the app while the save that raised it holds the proxy
-// lock, so a callback that saves the setting again must not wait on it.
+// A failed restart's alert reaches the app from a thread that holds no lock,
+// so a callback that saves the setting again does not wait on the save that
+// stopped the approver.
 #[test]
 fn a_callback_can_save_the_proxy_from_the_stop_alert() {
     struct SaveAgain {
@@ -1704,6 +1747,14 @@ fn a_callback_can_save_the_proxy_from_the_stop_alert() {
             done: std::sync::Mutex::new(tx),
         }))
         .unwrap();
+    // Strict pinning written behind the approver's back, so the restart
+    // under the proxy fails and raises the alert.
+    crate::persistence::persist_strict_pin_config(
+        &phone.mobile.storage,
+        crate::STRICT_PIN_CONFIG_STORAGE_KEY,
+        &crate::persistence::StoredStrictPinConfig { enabled: true },
+    )
+    .unwrap();
     let mobile = phone.mobile.clone();
     std::thread::spawn(move || {
         mobile
