@@ -1088,17 +1088,6 @@ pub(crate) fn persist_strict_pin_config(
     storage.store_share_by_key(key.into(), data, storage_metadata("strict_pin_config"))
 }
 
-/// How long a released hold lets a host learn its key on first use before
-/// it is held again.
-pub(crate) const PIN_RELEASE_MS: u64 = 10 * 60 * 1000;
-
-pub(crate) fn wall_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
 /// Hosts whose certificate pin the user removed. None is trusted on first
 /// use again until the user stages a new pin or releases the hold.
 ///
@@ -1106,16 +1095,14 @@ pub(crate) fn wall_now_ms() -> u64 {
 /// hold could not be read, so that loss fails closed while the user can
 /// still release hosts one at a time.
 ///
-/// `released` maps a host to the wall time the user released it. A release
-/// lasts `PIN_RELEASE_MS`, and one whose time lies ahead of the clock counts
-/// as lapsed, so neither waiting nor setting the clock back stretches it.
+/// Releases are not stored: a stored one could be revived by setting the
+/// clock back into its window long after it lapsed. Earlier builds wrote a
+/// `released` field here, which is ignored.
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct StoredPinHolds {
     pub(crate) hosts: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub(crate) every_unpinned_host: bool,
-    #[serde(default)]
-    pub(crate) released: std::collections::BTreeMap<String, u64>,
 }
 
 impl StoredPinHolds {
@@ -1126,34 +1113,8 @@ impl StoredPinHolds {
         }
     }
 
-    fn release_live(&self, host: &str, now_ms: u64) -> bool {
-        self.released
-            .get(host)
-            .is_some_and(|&at| now_ms >= at && now_ms - at < PIN_RELEASE_MS)
-    }
-
-    pub(crate) fn holds(&self, host: &str, now_ms: u64) -> bool {
-        (self.every_unpinned_host || self.hosts.contains(host)) && !self.release_live(host, now_ms)
-    }
-
-    pub(crate) fn hold(&mut self, host: String) {
-        self.released.remove(&host);
-        self.hosts.insert(host);
-    }
-
-    /// Whether `host` was held. A host that was not needs no release.
-    pub(crate) fn release(&mut self, host: &str, now_ms: u64) -> bool {
-        if !(self.every_unpinned_host || self.hosts.contains(host)) {
-            return false;
-        }
-        self.released.insert(host.to_string(), now_ms);
-        true
-    }
-
-    /// The host has a pin again, so nothing about it waits on the user.
-    pub(crate) fn forget(&mut self, host: &str) {
-        self.hosts.remove(host);
-        self.released.remove(host);
+    pub(crate) fn holds(&self, host: &str) -> bool {
+        self.every_unpinned_host || self.hosts.contains(host)
     }
 }
 
@@ -1199,7 +1160,9 @@ pub(crate) fn load_pin_store(
             })?;
         let pins = record
             .remove("pins")
-            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+            .ok_or_else(|| KeepMobileError::StorageError {
+                msg: "the certificate pin store has no pins".into(),
+            })?;
         let pins = serde_json::to_vec(&pins).map_err(|e| KeepMobileError::StorageError {
             msg: format!("Failed to read cert pins: {e}"),
         })?;
