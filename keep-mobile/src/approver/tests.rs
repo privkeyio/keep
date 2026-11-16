@@ -1599,6 +1599,37 @@ fn a_proxy_change_stops_a_running_approver() {
     phone.handler.stop();
 }
 
+// A running approver probed its relays under the old strict pinning setting,
+// so turning it on stops it rather than leaving it on pins it learned on
+// first use. Saving the same setting leaves it running.
+#[test]
+fn a_strict_pinning_change_stops_a_running_approver() {
+    let phone = paired();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running);
+
+    phone.mobile.set_strict_cert_pinning(false).unwrap();
+    assert!(phone.handler.status().running, "the same setting");
+
+    phone.mobile.set_strict_cert_pinning(true).unwrap();
+    let status = phone.handler.status();
+    assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(STRICT_PIN_CHANGE_STOP));
+    assert!(
+        status
+            .alerts
+            .iter()
+            .any(|a| a.message == STRICT_PIN_CHANGE_STOP),
+        "{:?}",
+        status.alerts
+    );
+
+    phone.mobile.set_strict_cert_pinning(false).unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running, "started again");
+    phone.handler.stop();
+}
+
 // The alert reaches the app while the save that raised it holds the proxy
 // lock, so a callback that saves the setting again must not wait on it.
 #[test]

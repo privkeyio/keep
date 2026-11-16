@@ -503,8 +503,11 @@ fn no_relay() -> KeepMobileError {
     }
 }
 
-const PROXY_CHANGE_STOP: &str =
+pub(crate) const PROXY_CHANGE_STOP: &str =
     "Approvals stopped because the proxy setting changed. Start the approver again.";
+
+pub(crate) const STRICT_PIN_CHANGE_STOP: &str =
+    "Approvals stopped because strict certificate pinning changed. Start the approver again.";
 
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
@@ -611,14 +614,15 @@ impl ApproverHandler {
         }
     }
 
-    /// Stop serving after the proxy setting changed: the socket was opened
-    /// under the old one. Under `lifecycle`, so a start running alongside
-    /// either read the new setting or is stopped here. `last_error` says why
-    /// it stopped, and an alert tells the owner and the app, which starts the
-    /// approver again. The alert is sent from its own thread: the caller
-    /// holds the proxy and share write locks, which a callback that saves the
-    /// setting or starts the approver again must not wait on.
-    pub(crate) fn stop_for_proxy_change(self: &Arc<Self>) {
+    /// Stop serving after the proxy or strict pinning setting changed: the
+    /// socket was opened under the old one. Under `lifecycle`, so a start
+    /// running alongside either read the new setting or is stopped here.
+    /// `last_error` says why it stopped, and an alert tells the owner and the
+    /// app, which starts the approver again. The alert is sent from its own
+    /// thread: the caller holds the proxy and share write locks, which a
+    /// callback that saves the setting or starts the approver again must not
+    /// wait on.
+    pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &str) {
         let mut fx = Effects::default();
         {
             let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
@@ -631,11 +635,10 @@ impl ApproverHandler {
                 return;
             }
             self.halt();
-            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(PROXY_CHANGE_STOP.into());
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.into());
             let mut inner = self.lock();
             if let Some(stored) = inner.stored.as_mut() {
-                stored.alert(PROXY_CHANGE_STOP.into(), &mut fx);
+                stored.alert(reason.into(), &mut fx);
                 self.persist_or_log(stored);
             }
         }

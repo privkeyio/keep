@@ -4006,11 +4006,12 @@ impl KeepMobile {
 
     /// Enable or disable strict certificate pinning (see `get_strict_cert_pinning`).
     ///
-    /// A live node captured the old setting when it was built, so it is torn
-    /// down here rather than left running with the previous policy until the
-    /// next re-init.
+    /// A live node or approver captured the old setting when it was built, so
+    /// a change tears it down here rather than leaving it running with the
+    /// previous policy until the next start. An old setting that cannot be
+    /// read may differ, so it counts as a change.
     pub fn set_strict_cert_pinning(&self, enabled: bool) -> Result<(), KeepMobileError> {
-        {
+        let changed = {
             // Every relay probe and live pin read runs under this lock, so
             // taking it waits out one in flight. Once this returns, no probe
             // that read the old setting can still trust a relay on first use.
@@ -4020,14 +4021,25 @@ impl KeepMobile {
                 .cert_pin_lock
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = match persistence::load_strict_pin_config(
+                &self.storage,
+                STRICT_PIN_CONFIG_STORAGE_KEY,
+            ) {
+                Ok(old) => old.unwrap_or_default().enabled != enabled,
+                Err(_) => true,
+            };
             let config = persistence::StoredStrictPinConfig { enabled };
             persistence::persist_strict_pin_config(
                 &self.storage,
                 STRICT_PIN_CONFIG_STORAGE_KEY,
                 &config,
             )?;
-        }
+            changed
+        };
         self.invalidate_live_node();
+        if changed {
+            self.stop_live_approver(approver::STRICT_PIN_CHANGE_STOP);
+        }
         Ok(())
     }
 
@@ -5369,16 +5381,20 @@ impl KeepMobile {
         persistence::persist_proxy_config(&self.storage, PROXY_CONFIG_STORAGE_KEY, stored)?;
         if changed {
             self.invalidate_live_node();
-            let approver = self
-                .live_approver
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .upgrade();
-            if let Some(approver) = approver {
-                approver.stop_for_proxy_change();
-            }
+            self.stop_live_approver(approver::PROXY_CHANGE_STOP);
         }
         Ok(())
+    }
+
+    fn stop_live_approver(&self, reason: &str) {
+        let approver = self
+            .live_approver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(approver) = approver {
+            approver.stop_for_setting_change(reason);
+        }
     }
 
     fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
