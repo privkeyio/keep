@@ -509,6 +509,9 @@ pub(crate) const PROXY_CHANGE_STOP: &str =
 pub(crate) const STRICT_PIN_CHANGE_STOP: &str =
     "Approvals stopped because strict certificate pinning changed. Start the approver again.";
 
+pub(crate) const CERT_PIN_CHANGE_STOP: &str =
+    "Approvals stopped because the certificate pins changed. Start the approver again.";
+
 /// What happens after a state change, outside the lock.
 #[derive(Default)]
 struct Effects {
@@ -614,14 +617,14 @@ impl ApproverHandler {
         }
     }
 
-    /// Stop serving after the proxy or strict pinning setting changed: the
-    /// socket was opened under the old one. Under `lifecycle`, so a start
-    /// running alongside either read the new setting or is stopped here.
-    /// `last_error` says why it stopped, and an alert tells the owner and the
-    /// app, which starts the approver again. The alert is sent from its own
-    /// thread: the caller holds the proxy and share write locks, which a
-    /// callback that saves the setting or starts the approver again must not
-    /// wait on.
+    /// Stop serving after the proxy, strict pinning or certificate pin
+    /// setting changed: the socket was opened under the old one. Under
+    /// `lifecycle`, so a start running alongside either read the new setting
+    /// or is stopped here. `last_error` says why it stopped, and an alert
+    /// tells the owner and the app, which starts the approver again. The alert
+    /// is sent from its own thread: a caller may hold the proxy and share
+    /// write locks, which a callback that saves the setting or starts the
+    /// approver again must not wait on.
     pub(crate) fn stop_for_setting_change(self: &Arc<Self>, reason: &str) {
         let mut fx = Effects::default();
         {

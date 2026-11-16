@@ -1630,6 +1630,42 @@ fn a_strict_pinning_change_stops_a_running_approver() {
     phone.handler.stop();
 }
 
+// A running approver holds the pin set it started with, so removing a pin,
+// often a compromised key, stops it rather than leaving that key accepted.
+#[test]
+fn a_certificate_pin_change_stops_a_running_approver() {
+    let host = "relay.example.com";
+    let pin = |b: u8| hex::encode([b; 32]);
+    let phone = paired();
+    phone
+        .mobile
+        .stage_certificate_pin(host.into(), pin(1))
+        .unwrap();
+    phone
+        .mobile
+        .stage_certificate_pin(host.into(), pin(2))
+        .unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    assert!(phone.handler.status().running);
+
+    phone
+        .mobile
+        .remove_certificate_pin(host.into(), pin(1))
+        .unwrap();
+    let status = phone.handler.status();
+    assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(CERT_PIN_CHANGE_STOP));
+    assert!(
+        status
+            .alerts
+            .iter()
+            .any(|a| a.message == CERT_PIN_CHANGE_STOP),
+        "{:?}",
+        status.alerts
+    );
+    phone.handler.stop();
+}
+
 // The alert reaches the app while the save that raised it holds the proxy
 // lock, so a callback that saves the setting again must not wait on it.
 #[test]

@@ -3148,11 +3148,18 @@ impl KeepMobile {
         // staged one would not be honored until re-init. Tearing the node down is
         // also the right answer for a removal specifically, since the existing
         // socket was authenticated with a pin the user no longer trusts.
+        // The approver holds its own copy of the pin set for the same reason,
+        // so it is stopped too: a removed pin is often a compromised key.
         // Called after the cert-pin guard drops: lock order is
         // node_lifecycle_lock -> cert_pin_lock, so taking them the other way
         // round here would deadlock against `do_initialize`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
+    }
+
+    fn restart_for_pin_change(&self) {
+        self.invalidate_live_node();
+        self.stop_live_approver(approver::CERT_PIN_CHANGE_STOP);
     }
 
     pub fn clear_certificate_pin(&self, hostname: String) -> Result<(), KeepMobileError> {
@@ -3166,7 +3173,7 @@ impl KeepMobile {
             persistence::persist_cert_pins(&self.storage, &pins)?;
         }
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
     }
 
@@ -3192,7 +3199,7 @@ impl KeepMobile {
             persistence::persist_cert_pins(&self.storage, &pins)?;
         }
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(())
     }
 
@@ -3223,7 +3230,7 @@ impl KeepMobile {
             }
         };
         // See `clear_certificate_pins`.
-        self.invalidate_live_node();
+        self.restart_for_pin_change();
         Ok(result)
     }
 
