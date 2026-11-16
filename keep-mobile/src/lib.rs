@@ -5511,15 +5511,17 @@ impl KeepMobile {
         persistence::persist_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY, &holds)
     }
 
-    /// `relays` without any whose host is held. Callers hold `cert_pin_lock`.
+    /// `relays` without any whose host is held and unpinned, the ones the
+    /// probe skips. Callers hold `cert_pin_lock`.
     pub(crate) fn without_held_relays(
         &self,
         relays: Vec<String>,
     ) -> Result<Vec<String>, KeepMobileError> {
+        let pins = persistence::load_cert_pins(&self.storage)?.unwrap_or_default();
         let holds = persistence::load_pin_holds(&self.storage, PIN_HOLDS_STORAGE_KEY)?;
         Ok(relays
             .into_iter()
-            .filter(|r| !relay_host_held(r, &holds))
+            .filter(|r| !(wss_relay_lacks_pin(r, &pins) && relay_host_held(r, &holds)))
             .collect())
     }
 
@@ -8365,6 +8367,9 @@ mod cert_pin_ffi_tests {
     #[test]
     fn an_unreadable_hold_record_holds_every_unpinned_host_and_recovers() {
         let keep = keep();
+        let pinned = "wss://pinned.example.com";
+        keep.stage_certificate_pin("pinned.example.com".into(), hex::encode([2u8; 32]))
+            .unwrap();
         keep.storage
             .store_share_by_key(
                 PIN_HOLDS_STORAGE_KEY.into(),
@@ -8374,7 +8379,11 @@ mod cert_pin_ffi_tests {
             .unwrap();
         let (a, b) = ("wss://a.example.com", "wss://b.example.com");
         assert!(keep.certificate_pin_holds().unwrap().every_unpinned_host);
-        assert!(reachable(&keep, &[a, b]).is_empty());
+        assert_eq!(
+            reachable(&keep, &[a, b, pinned]),
+            vec![pinned.to_string()],
+            "a pinned host is enforced by its pin, not held"
+        );
 
         keep.release_certificate_pin_hold("a.example.com".into())
             .unwrap();
