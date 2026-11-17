@@ -4130,7 +4130,10 @@ impl KeepMobile {
         })
     }
 
-    pub fn save_proxy_config(&self, config: ProxyConfigInfo) -> Result<(), KeepMobileError> {
+    /// Save the proxy setting. Returns whether it differs from the one
+    /// stored, which is when the live node is torn down and the approver
+    /// restarted under it. An unreadable stored setting counts as changed.
+    pub fn save_proxy_config(&self, config: ProxyConfigInfo) -> Result<bool, KeepMobileError> {
         if config.port == 0 {
             return Err(KeepMobileError::InvalidInput {
                 msg: "proxy port must be non-zero".into(),
@@ -5587,7 +5590,7 @@ impl KeepMobile {
     fn store_proxy_config(
         &self,
         stored: &persistence::StoredProxyConfig,
-    ) -> Result<(), KeepMobileError> {
+    ) -> Result<bool, KeepMobileError> {
         let _proxy = self
             .proxy_config_lock
             .lock()
@@ -5602,7 +5605,7 @@ impl KeepMobile {
             self.invalidate_live_node();
             self.stop_live_approver(approver::PROXY_CHANGE_STOP);
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// `invalidate_live_node` for a caller already holding
@@ -17328,25 +17331,25 @@ mod stored_proxy_tests {
         };
 
         let before = generation();
-        mobile.save_proxy_config(on()).unwrap();
+        assert!(mobile.save_proxy_config(on()).unwrap());
         assert_ne!(generation(), before, "turning the proxy on");
 
         let before = generation();
-        mobile.save_proxy_config(on()).unwrap();
+        assert!(!mobile.save_proxy_config(on()).unwrap());
         assert_eq!(generation(), before, "saving the same setting");
 
         let before = generation();
-        mobile
+        assert!(mobile
             .save_proxy_config(ProxyConfigInfo {
                 enabled: true,
                 port: 9150,
             })
-            .unwrap();
+            .unwrap());
         assert_ne!(generation(), before, "moving the port");
 
         corrupt_proxy_config(&mobile);
         let before = generation();
-        mobile.save_proxy_config(on()).unwrap();
+        assert!(mobile.save_proxy_config(on()).unwrap());
         assert_ne!(generation(), before, "replacing an unreadable setting");
     }
 }
