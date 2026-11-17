@@ -1757,6 +1757,114 @@ fn a_start_does_not_connect_to_a_relay_whose_pin_the_user_removed() {
     phone.handler.stop();
 }
 
+// An approver a pin removal stopped starts again once the user pins the
+// relay, with no start by the app, and the alert asking for one goes.
+#[test]
+fn pinning_the_relay_again_resumes_an_approver_a_removal_stopped() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    let status = settled(&phone.handler, |s| !s.alerts.is_empty());
+    assert!(!status.running);
+
+    pin_the_relay(&phone, 2);
+    let status = settled(&phone.handler, |s| {
+        s.running
+            && s.last_error.is_none()
+            && !s.alerts.iter().any(|a| a.message == CERT_PIN_CHANGE_STOP)
+    });
+    assert!(status.running);
+    assert!(status.last_error.is_none());
+    assert!(
+        !status
+            .alerts
+            .iter()
+            .any(|a| a.message == CERT_PIN_CHANGE_STOP),
+        "{:?}",
+        status.alerts
+    );
+    phone.handler.stop();
+}
+
+// One the user stopped stays stopped when the relay is pinned.
+#[test]
+fn pinning_the_relay_does_not_start_an_approver_the_user_stopped() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    phone.handler.stop();
+    pin_the_relay(&phone, 2);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!phone.handler.status().running);
+}
+
+// Releasing a host the approver does not use leaves it serving, untouched.
+#[test]
+fn releasing_another_host_leaves_a_running_approver_alone() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone
+        .mobile
+        .stage_certificate_pin("other.example".into(), hex::encode([9u8; 32]))
+        .unwrap();
+    phone
+        .mobile
+        .clear_certificate_pin("other.example".into())
+        .unwrap();
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    let before = stops(&phone.handler);
+
+    phone
+        .mobile
+        .release_certificate_pin_hold("other.example".into())
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(phone.handler.status().running);
+    assert_eq!(stops(&phone.handler), before);
+    phone.handler.stop();
+}
+
+// A restart a release asked for gets past the no-first-use check for a
+// released host, to fail at the probe here with no network. A restart for a
+// setting change is still refused there, and so is one after the release
+// ended.
+#[test]
+fn only_a_restart_a_release_asked_for_may_learn_a_released_pin() {
+    const REFUSED: &str = "only a start by hand may learn";
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    phone
+        .mobile
+        .release_certificate_pin_hold(RELAY_HOST.into())
+        .unwrap();
+    let serve = |by_release: bool| {
+        let (relays, keys) = {
+            let inner = phone.handler.lock();
+            let stored = inner.stored.as_ref().unwrap();
+            (stored.relays.clone(), stored.keys().unwrap())
+        };
+        let _lifecycle = phone.handler.lifecycle.lock().unwrap();
+        phone
+            .handler
+            .serve(relays, keys, false, by_release)
+            .unwrap_err()
+            .to_string()
+    };
+    let asked = serve(true);
+    assert!(!asked.contains(REFUSED), "{asked}");
+    assert!(serve(false).contains(REFUSED));
+    phone.mobile.pin_releases.end(RELAY_HOST);
+    assert!(serve(true).contains(REFUSED));
+}
+
 const RELAY_HOST: &str = "relay.example";
 
 fn pin_the_relay(phone: &Phone, byte: u8) {
