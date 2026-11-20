@@ -1728,6 +1728,28 @@ fn a_restart_does_not_learn_a_pin_the_user_removed() {
     );
 }
 
+// A resume that fails, such as the one staging the first pin spawned and that
+// ran only after the pin was removed again, keeps the reason the approver
+// stopped rather than putting its own error in its place.
+#[test]
+fn a_late_resume_that_fails_keeps_the_stop_reason() {
+    let phone = paired();
+    pin_the_relay(&phone, 1);
+    phone.handler.clone().start(Arc::new(Nobody)).unwrap();
+    phone
+        .mobile
+        .clear_certificate_pin(RELAY_HOST.into())
+        .unwrap();
+    let status = settled(&phone.handler, |s| !s.alerts.is_empty());
+    assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(CERT_PIN_CHANGE_STOP));
+
+    phone.handler.resume_if_waiting_on(RELAY_HOST);
+    let status = phone.handler.status();
+    assert!(!status.running);
+    assert_eq!(status.last_error.as_deref(), Some(CERT_PIN_CHANGE_STOP));
+}
+
 // A start nobody asked for, such as the app's launch after the process was
 // killed, does not connect to a relay whose pin the user removed either, even
 // though its probe failed and it would otherwise connect anyway. A release
