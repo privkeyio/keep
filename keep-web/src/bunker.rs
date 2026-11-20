@@ -281,26 +281,120 @@ pub struct NetworkHandle {
     pub node: Arc<KfpNode>,
 }
 
-/// Probe every relay, record a first-use pin, and return the handle the live
-/// handshake enforces. A corrupt pin file, or a cleartext relay while strict
-/// pinning is on, refuses to connect.
+/// How often a relay skipped as unreachable at startup is probed again, so it
+/// gets its first-use pin from a verified probe once it is back.
+const PIN_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The pin handle the live handshake enforces, and the relays left once any
+/// whose certificate did not match its pin are refused.
+struct RelayPins {
+    pinning: keep_frost_net::TlsPinning,
+    frost_relays: Vec<String>,
+    bunker_relays: Vec<String>,
+    rejected_hosts: Vec<String>,
+}
+
+/// Probe every relay once, record a first-use pin, and return the handle the
+/// live handshake enforces. A relay that cannot be reached is skipped so one
+/// relay down at startup does not stop the service. The live handshake still
+/// enforces its pin, and without strict pinning it is probed again until it
+/// answers. A relay whose certificate does not match its pin is refused. A
+/// corrupt pin file, a cleartext or unpinned relay while strict pinning is on,
+/// or no usable relay left in a set, refuses to start.
 async fn relay_pinning(
     pin_dir: &std::path::Path,
     require_pinned: bool,
     frost_relays: &[String],
     bunker_relays: &[String],
-) -> Result<keep_frost_net::TlsPinning, String> {
+) -> Result<RelayPins, String> {
     let store = keep_frost_net::RelayPinStore::open(pin_dir, require_pinned)
         .map_err(|e| format!("certificate pins: {e}"))?;
-    store
-        .probe(frost_relays, None)
+    let mut relays = frost_relays.to_vec();
+    for relay in bunker_relays {
+        if !relays.contains(relay) {
+            relays.push(relay.clone());
+        }
+    }
+    let skipped = store
+        .probe_tolerant(&relays, None)
         .await
         .map_err(|e| format!("certificate pins: {e}"))?;
-    store
-        .probe(bunker_relays, None)
-        .await
-        .map_err(|e| format!("certificate pins: {e}"))?;
-    Ok(store.pinning())
+    let pins = settle_relays(store.pinning(), frost_relays, bunker_relays, &skipped)?;
+    for host in &pins.rejected_hosts {
+        tracing::error!(relay_host = %host, "relay pin rejected at startup, the relay is not used");
+    }
+    let unreachable: Vec<String> = skipped
+        .into_iter()
+        .filter_map(|skip| match skip {
+            keep_frost_net::ProbeSkip::Unreachable { relay, .. } => Some(relay),
+            keep_frost_net::ProbeSkip::PinMismatch { .. } => None,
+        })
+        .collect();
+    if !require_pinned && !unreachable.is_empty() {
+        tokio::spawn(async move {
+            if let Err(e) = store
+                .pin_when_reachable(unreachable, None, PIN_RETRY_INTERVAL)
+                .await
+            {
+                tracing::error!(error = %e, "stopped probing relays that were unreachable at startup");
+            }
+        });
+    }
+    Ok(pins)
+}
+
+/// Drop every relay whose certificate did not match its pin from both sets,
+/// and refuse a set left with no relay the probe did not skip.
+fn settle_relays(
+    pinning: keep_frost_net::TlsPinning,
+    frost_relays: &[String],
+    bunker_relays: &[String],
+    skipped: &[keep_frost_net::ProbeSkip],
+) -> Result<RelayPins, String> {
+    let mut refused: Vec<&str> = Vec::new();
+    let mut failed: Vec<&str> = Vec::new();
+    let mut rejected_hosts: Vec<String> = Vec::new();
+    for skip in skipped {
+        match skip {
+            keep_frost_net::ProbeSkip::PinMismatch { relay, hostname } => {
+                refused.push(relay);
+                failed.push(relay);
+                if !rejected_hosts.contains(hostname) {
+                    rejected_hosts.push(hostname.clone());
+                }
+            }
+            keep_frost_net::ProbeSkip::Unreachable { relay, .. } => failed.push(relay),
+        }
+    }
+    for (name, set) in [("FROST", frost_relays), ("bunker", bunker_relays)] {
+        if !set.is_empty() && set.iter().all(|r| failed.contains(&r.as_str())) {
+            let reasons: Vec<String> = skipped
+                .iter()
+                .filter(|skip| match skip {
+                    keep_frost_net::ProbeSkip::PinMismatch { relay, .. }
+                    | keep_frost_net::ProbeSkip::Unreachable { relay, .. } => set.contains(relay),
+                })
+                .map(ToString::to_string)
+                .collect();
+            return Err(format!(
+                "certificate pins: no {name} relay passed the certificate probe ({})",
+                reasons.join("; ")
+            ));
+        }
+    }
+    let keep = |relays: &[String]| -> Vec<String> {
+        relays
+            .iter()
+            .filter(|r| !refused.contains(&r.as_str()))
+            .cloned()
+            .collect()
+    };
+    Ok(RelayPins {
+        pinning,
+        frost_relays: keep(frost_relays),
+        bunker_relays: keep(bunker_relays),
+        rejected_hosts,
+    })
 }
 
 /// Spawns the always-on network-FROST co-signer: a long-lived `KfpNode` that
@@ -326,7 +420,12 @@ pub fn spawn_network_frost(
             let threshold = cfg.share.metadata.threshold;
             let total = cfg.share.metadata.total_shares;
 
-            let pinning = match relay_pinning(
+            let RelayPins {
+                pinning,
+                frost_relays,
+                bunker_relays,
+                rejected_hosts,
+            } = match relay_pinning(
                 &cfg.pin_dir,
                 cfg.require_pinned,
                 &cfg.frost_relays,
@@ -334,26 +433,26 @@ pub fn spawn_network_frost(
             )
             .await
             {
-                Ok(pinning) => pinning,
+                Ok(pins) => pins,
                 Err(e) => {
                     let _ = info_tx.send(Err(e));
                     return;
                 }
             };
-            let node = match KfpNode::new_pinned(
-                cfg.share,
-                cfg.frost_relays.clone(),
-                None,
-                pinning.clone(),
-            )
-            .await
-            {
-                Ok(n) => Arc::new(n),
-                Err(e) => {
-                    let _ = info_tx.send(Err(format!("frost node: {e}")));
-                    return;
-                }
-            };
+            let node =
+                match KfpNode::new_pinned(cfg.share, frost_relays.clone(), None, pinning.clone())
+                    .await
+                {
+                    Ok(n) => Arc::new(n),
+                    Err(e) => {
+                        let _ = info_tx.send(Err(format!("frost node: {e}")));
+                        return;
+                    }
+                };
+            for host in &rejected_hosts {
+                node.audit_log()
+                    .log_relay_pin_rejection(host, keep_frost_net::PinRejection::Mismatch);
+            }
 
             node.set_hooks(Arc::new(CoSignerPolicy {
                 events: events.clone(),
@@ -411,7 +510,7 @@ pub fn spawn_network_frost(
             let mut server = match Server::new_network_frost_with_config(
                 signer,
                 transport_key,
-                &cfg.bunker_relays,
+                &bunker_relays,
                 Some(callbacks),
                 ServerConfig {
                     tls_pinning: Some(pinning),
@@ -440,8 +539,8 @@ pub fn spawn_network_frost(
                 mode: "network-frost".into(),
                 url: server.bunker_url(),
                 npub: server.pubkey().to_bech32().unwrap_or_default(),
-                bunker_relays: cfg.bunker_relays,
-                frost_relays: cfg.frost_relays,
+                bunker_relays,
+                frost_relays,
                 group: Some(cfg.group_npub),
                 threshold: Some(format!("{threshold}-of-{total}")),
             };
@@ -482,18 +581,22 @@ pub fn spawn_single_key(
             }
         };
         rt.block_on(async move {
-            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
-                events,
-                approvals,
-                signing_enabled: None,
-            });
-            let pinning = match relay_pinning(&pin_dir, require_pinned, &[], &relays).await {
-                Ok(pinning) => pinning,
+            let RelayPins {
+                pinning,
+                bunker_relays: relays,
+                ..
+            } = match relay_pinning(&pin_dir, require_pinned, &[], &relays).await {
+                Ok(pins) => pins,
                 Err(e) => {
                     let _ = info_tx.send(Err(e));
                     return;
                 }
             };
+            let callbacks: Arc<dyn ServerCallbacks> = Arc::new(WebCallbacks {
+                events,
+                approvals,
+                signing_enabled: None,
+            });
             let mut server = match Server::new_with_config(
                 keyring,
                 None,
@@ -542,6 +645,149 @@ pub fn spawn_single_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use keep_frost_net::ProbeSkip;
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    const DOWN: &str = "wss://relay.keep-probe-test.invalid";
+    const DOWN2: &str = "wss://other.keep-probe-test.invalid";
+
+    fn pinning() -> keep_frost_net::TlsPinning {
+        keep_frost_net::RelayPinStore::open(tempfile::tempdir().unwrap().path(), false)
+            .unwrap()
+            .pinning()
+    }
+
+    fn mismatch(relay: &str) -> ProbeSkip {
+        ProbeSkip::PinMismatch {
+            relay: relay.into(),
+            hostname: url_host(relay),
+        }
+    }
+
+    fn down(relay: &str) -> ProbeSkip {
+        ProbeSkip::Unreachable {
+            relay: relay.into(),
+            error: "DNS".into(),
+        }
+    }
+
+    fn url_host(relay: &str) -> String {
+        relay.trim_start_matches("wss://").to_string()
+    }
+
+    #[test]
+    fn a_mismatched_relay_is_refused_in_both_sets_and_an_unreachable_one_kept() {
+        let pins = settle_relays(
+            pinning(),
+            &strings(&[
+                "wss://a.example.com",
+                "wss://bad.example.com",
+                "wss://down.example.com",
+            ]),
+            &strings(&["wss://bad.example.com", "wss://c.example.com"]),
+            &[
+                down("wss://down.example.com"),
+                mismatch("wss://bad.example.com"),
+            ],
+        )
+        .expect("each set keeps a usable relay");
+        assert_eq!(
+            pins.frost_relays,
+            strings(&["wss://a.example.com", "wss://down.example.com"])
+        );
+        assert_eq!(pins.bunker_relays, strings(&["wss://c.example.com"]));
+        assert_eq!(pins.rejected_hosts, strings(&["bad.example.com"]));
+    }
+
+    #[test]
+    fn a_set_emptied_by_a_refusal_in_the_other_set_refuses_to_start() {
+        let err = settle_relays(
+            pinning(),
+            &strings(&["wss://x.example.com"]),
+            &strings(&["wss://x.example.com", "wss://w.example.com"]),
+            &[mismatch("wss://x.example.com")],
+        )
+        .err()
+        .expect("the FROST set has no relay left");
+        assert!(err.contains("no FROST relay passed"), "{err}");
+        assert!(err.contains("x.example.com"), "{err}");
+    }
+
+    #[test]
+    fn a_set_whose_relays_are_all_down_refuses_while_the_other_set_is_fine() {
+        let err = settle_relays(
+            pinning(),
+            &strings(&["wss://a.example.com"]),
+            &strings(&["wss://b.example.com", "wss://c.example.com"]),
+            &[down("wss://b.example.com"), down("wss://c.example.com")],
+        )
+        .err()
+        .expect("the bunker set has no relay up");
+        assert!(err.contains("no bunker relay passed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn startup_pinning_skips_an_unreachable_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let frost = strings(&[DOWN, "ws://127.0.0.1:2"]);
+        let bunker = strings(&["ws://127.0.0.1:3", DOWN]);
+        let pins = relay_pinning(dir.path(), false, &frost, &bunker)
+            .await
+            .expect("one relay down does not stop startup");
+        assert_eq!(pins.frost_relays, frost);
+        assert_eq!(pins.bunker_relays, bunker);
+        assert!(pins.rejected_hosts.is_empty());
+        assert!(!dir.path().join("cert-pins.json").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_pinning_still_refuses_when_every_relay_of_a_set_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = relay_pinning(
+            dir.path(),
+            false,
+            &strings(&[DOWN]),
+            &strings(&["ws://127.0.0.1:3"]),
+        )
+        .await
+        .err()
+        .expect("every FROST relay down refuses");
+        assert!(err.contains("no FROST relay passed"), "{err}");
+        let err = relay_pinning(dir.path(), false, &[], &strings(&[DOWN, DOWN2]))
+            .await
+            .err()
+            .expect("every bunker relay down refuses");
+        assert!(err.contains("relay passed the certificate probe"), "{err}");
+        assert!(!dir.path().join("cert-pins.json").exists());
+    }
+
+    #[tokio::test]
+    async fn startup_pinning_still_refuses_a_corrupt_pin_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cert-pins.json"), b"not json").unwrap();
+        let err = relay_pinning(dir.path(), false, &strings(&["ws://127.0.0.1:2"]), &[])
+            .await
+            .err()
+            .expect("a corrupt pin file refuses");
+        assert!(err.contains("certificate pin store"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.path().join("cert-pins.json")).unwrap(),
+            b"not json"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pinning_still_refuses_cleartext_under_strict_pinning() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = relay_pinning(dir.path(), true, &[], &strings(&["ws://127.0.0.1:2"]))
+            .await
+            .err()
+            .expect("strict pinning refuses a cleartext relay");
+        assert!(err.contains("non-wss"), "{err}");
+    }
 
     #[test]
     fn a_relay_pin_rejection_is_an_activity_failure() {
