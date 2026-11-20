@@ -191,9 +191,10 @@ impl PinningServerCertVerifier {
             // the observed key: recording trust from inside a handshake is how
             // an on-path attacker holding any CA-valid certificate would get
             // itself pinned, and it would silently re-add a pin the user had
-            // just cleared. Both shipped callers pre-pin every `wss` host on
-            // the probe, so reaching this arm means the probe did not cover
-            // this host, which is worth saying out loud.
+            // just cleared. Callers pre-pin every `wss` host on the probe, so
+            // reaching this arm means the probe did not cover this host, for
+            // example because it was unreachable when keep-web started, which
+            // is worth saying out loud.
             Ok((_, Some(_))) => {
                 self.await_proof(hostname, spki_hash);
                 self.warn_once_unpinned(hostname);
