@@ -692,9 +692,11 @@ impl ApproverHandler {
                     self.halt();
                 }
             }
+            // `last_error` keeps the reason it stopped, which tells the owner
+            // what to do. A resume can also run late, after a later pin
+            // change stopped it again, and must not replace that reason.
             Err(e) => {
                 tracing::warn!(error = %e, "the approver could not start again after a pin change");
-                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e.to_string());
             }
         }
     }
