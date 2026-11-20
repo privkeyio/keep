@@ -291,6 +291,22 @@ impl RelayPinStore {
                 FrostNetError::Transport(format!("Rejected relay URL {relay}: {e}"))
             })?;
         }
+        // Checked before dialing so strict pinning refuses an unpinned relay
+        // even when it cannot be reached. Keyed the way
+        // `verify_relay_certificate` keys pins.
+        if self.require_pinned {
+            for relay in relays {
+                let hostname = url::Url::parse(relay)
+                    .ok()
+                    .and_then(|u| u.host_str().map(str::to_string))
+                    .ok_or_else(|| {
+                        FrostNetError::Transport(format!("Rejected relay URL {relay}: no host"))
+                    })?;
+                if !self.lock()?.is_pinned(&hostname) {
+                    return Err(FrostNetError::CertificatePinMissing { hostname });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -631,6 +647,61 @@ mod tests {
         assert!(
             matches!(err, FrostNetError::CertificatePinMissing { .. }),
             "{err}"
+        );
+    }
+
+    fn pinned_store(dir: &Path, hosts: &[&str], strict: bool) -> RelayPinStore {
+        let map: std::collections::BTreeMap<&str, Vec<String>> = hosts
+            .iter()
+            .map(|h| (*h, vec![hex::encode([1u8; 32])]))
+            .collect();
+        std::fs::write(dir.join(FILE_NAME), serde_json::to_vec(&map).unwrap()).unwrap();
+        RelayPinStore::open(dir, strict).unwrap()
+    }
+
+    #[tokio::test]
+    async fn strict_pinning_refuses_an_unreachable_unpinned_relay_before_dialing() {
+        let dir = dir();
+        let store = pinned_store(dir.path(), &["good.example.com"], true);
+        let dialed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = dialed.clone();
+        let err = store
+            .probe_tolerant_with(
+                &[
+                    "wss://good.example.com".to_string(),
+                    "wss://down.example.com".to_string(),
+                ],
+                move |relay: String, pins: CertificatePinSet| {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    fake(relay, pins)
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, FrostNetError::CertificatePinMissing { hostname } if hostname == "down.example.com"),
+            "{err}"
+        );
+        assert_eq!(dialed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn strict_pinning_skips_an_unreachable_pinned_relay() {
+        let dir = dir();
+        let store = pinned_store(dir.path(), &["good.example.com", "down.example.com"], true);
+        let skipped = store
+            .probe_tolerant_with(
+                &[
+                    "wss://good.example.com".to_string(),
+                    "wss://down.example.com".to_string(),
+                ],
+                fake,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&skipped[..], [ProbeSkip::Unreachable { relay, .. }] if relay == "wss://down.example.com"),
+            "{skipped:?}"
         );
     }
 
