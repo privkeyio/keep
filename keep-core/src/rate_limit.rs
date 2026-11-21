@@ -11,6 +11,8 @@ use blake2::Blake2bMac;
 use fs4::FileExt;
 use subtle::ConstantTimeEq;
 
+use crate::error::{KeepError, StorageError};
+
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_DELAY_SECS: u64 = 1;
 const MAX_DELAY_SECS: u64 = 300;
@@ -134,67 +136,68 @@ fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> RateLimitRecor
     }
 }
 
-pub(crate) fn check_rate_limit(path: &Path, hmac_key: &[u8; 32]) -> Result<(), Duration> {
+/// Count an unlock attempt before its password is tried, or refuse it.
+///
+/// Refuses while the record says to wait, and when the record cannot be
+/// opened, locked, written or synced: an attempt that is not on disk before
+/// the password check could go uncounted, through a full disk, a crash during
+/// key derivation, or several attempts reading the same count at once. A
+/// success then removes the record, so only attempts that did not succeed
+/// stay counted.
+pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), KeepError> {
     let rl_path = rate_limit_path(path);
-
-    let Ok(mut file) = File::open(&rl_path) else {
-        return Ok(());
+    let unusable = |e: std::io::Error| {
+        tracing::error!(error = %e, path = %rl_path.display(), "the unlock rate limit cannot be used, refusing the attempt");
+        KeepError::StorageErr(StorageError::io(format!(
+            "the unlock attempt counter {} cannot be used ({e}). It must be a file this user can read and write",
+            rl_path.display()
+        )))
     };
 
-    if FileExt::lock_shared(&file).is_err() {
-        return Err(Duration::from_secs(MAX_DELAY_SECS));
-    }
+    let mut file = open_rate_limit_file(&rl_path).map_err(unusable)?;
+    FileExt::lock(&file).map_err(unusable)?;
 
-    let record = read_record_from_file(&mut file, hmac_key);
+    let mut record = read_record_from_file(&mut file, hmac_key);
     let remaining = record.remaining_delay();
-
     if remaining > Duration::ZERO {
-        Err(remaining)
-    } else {
-        Ok(())
+        return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
     }
+
+    let (prior, prior_time) = (record.failed_attempts, record.last_failure);
+    record.failed_attempts = record.failed_attempts.saturating_add(1);
+    record.last_failure = now_secs();
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(&record.to_bytes(hmac_key)))
+        .and_then(|()| file.sync_all())
+        .map_err(unusable)?;
+
+    // A success removes the record, so `prior` attempts all failed or never
+    // finished. Queued here, under the lock, the trip is recorded once per
+    // cycle and cannot be skipped by abandoning an attempt.
+    if prior == MAX_ATTEMPTS {
+        record_trip(path, hmac_key, prior, prior_time);
+    }
+    drop(file);
+    Ok(())
 }
 
 fn open_rate_limit_file(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    no_follow(&mut opts);
     opts.open(path)
 }
 
-pub(crate) fn record_failure(path: &Path, hmac_key: &[u8; 32]) {
-    let rl_path = rate_limit_path(path);
-
-    let Ok(mut file) = open_rate_limit_file(&rl_path) else {
-        return;
-    };
-
-    if FileExt::lock(&file).is_err() {
-        return;
+// The record's path is fixed inside the vault folder, and a link planted there
+// would have its target overwritten with a record.
+fn no_follow(opts: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-
-    let mut record = read_record_from_file(&mut file, hmac_key);
-    let prior_attempts = record.failed_attempts;
-    record.failed_attempts = record.failed_attempts.saturating_add(1);
-    record.last_failure = now_secs();
-
-    let _ = file.seek(SeekFrom::Start(0));
-    let _ = file.write_all(&record.to_bytes(hmac_key));
-    let _ = file.sync_all();
-
-    // Queue a trip event the first time this failure crosses the rate-limit
-    // threshold. Successive failures while already tripped do not enqueue
-    // additional events. The trip log persists across the failed-attempt
-    // cycle and is drained by the next successful unlock when the audit log
-    // is available (the data key required to write encrypted audit entries
-    // is not available at this point in the flow, see #495).
-    if prior_attempts < MAX_ATTEMPTS && record.failed_attempts >= MAX_ATTEMPTS {
-        record_trip(path, hmac_key, record.failed_attempts, record.last_failure);
-    }
+    #[cfg(not(unix))]
+    let _ = opts;
 }
 
 pub(crate) fn record_success(path: &Path) {
@@ -258,11 +261,7 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
 
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).append(true).create(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    no_follow(&mut opts);
     let Ok(file) = opts.open(&trip_path) else {
         return;
     };
@@ -291,6 +290,25 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
     let _ = file.sync_all();
 }
 
+/// Set the record to `failed_attempts`, the last one now.
+#[cfg(test)]
+pub(crate) fn set_attempts_for_tests(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32) {
+    let record = RateLimitRecord {
+        failed_attempts,
+        last_failure: now_secs(),
+    };
+    fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
+}
+
+/// Let the current back-off run out, keeping the count, as waiting would.
+#[cfg(test)]
+pub(crate) fn expire_delay_for_tests(path: &Path, hmac_key: &[u8; 32]) {
+    let mut file = File::open(rate_limit_path(path)).unwrap();
+    let mut record = read_record_from_file(&mut file, hmac_key);
+    record.last_failure = 0;
+    fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
+}
+
 /// Write a trip record with any `timestamp`, as someone who can write the
 /// vault folder can.
 #[cfg(test)]
@@ -308,7 +326,10 @@ pub(crate) fn forge_trip_for_tests(path: &Path, hmac_key: &[u8; 32], timestamp: 
 pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<PendingTrip> {
     let trip_path = trip_log_path(path);
 
-    let Ok(mut file) = OpenOptions::new().read(true).write(true).open(&trip_path) else {
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    no_follow(&mut opts);
+    let Ok(mut file) = opts.open(&trip_path) else {
         return Vec::new();
     };
 
@@ -363,8 +384,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
 
         for _ in 0..MAX_ATTEMPTS {
-            assert!(check_rate_limit(&path, &TEST_KEY).is_ok());
-            record_failure(&path, &TEST_KEY);
+            fail(&path);
         }
     }
 
@@ -374,14 +394,22 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        for _ in 0..=MAX_ATTEMPTS {
-            let _ = check_rate_limit(&path, &TEST_KEY);
-            record_failure(&path, &TEST_KEY);
+        for _ in 0..MAX_ATTEMPTS {
+            fail(&path);
         }
+        assert_eq!(attempts(&path), MAX_ATTEMPTS);
 
-        let result = check_rate_limit(&path, &TEST_KEY);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().as_secs() >= BASE_DELAY_SECS);
+        // Past the 1s step, so a second boundary cannot end the wait.
+        set_attempts_for_tests(&path, &TEST_KEY, MAX_ATTEMPTS + 2);
+        assert!(matches!(
+            count_attempt(&path, &TEST_KEY),
+            Err(KeepError::RateLimited(secs)) if secs >= BASE_DELAY_SECS
+        ));
+        assert_eq!(
+            attempts(&path),
+            MAX_ATTEMPTS + 2,
+            "a refused attempt is not counted"
+        );
     }
 
     #[test]
@@ -420,12 +448,11 @@ mod tests {
         fs::create_dir(&path).unwrap();
 
         for _ in 0..MAX_ATTEMPTS + 2 {
-            let _ = check_rate_limit(&path, &TEST_KEY);
-            record_failure(&path, &TEST_KEY);
+            fail(&path);
         }
 
         record_success(&path);
-        assert!(check_rate_limit(&path, &TEST_KEY).is_ok());
+        assert!(count_attempt(&path, &TEST_KEY).is_ok());
     }
 
     #[test]
@@ -434,13 +461,113 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        for _ in 0..=MAX_ATTEMPTS {
-            record_failure(&path, &TEST_KEY);
+        set_attempts_for_tests(&path, &TEST_KEY, MAX_ATTEMPTS + 2);
+        assert!(count_attempt(&path, &TEST_KEY).is_err());
+        assert!(count_attempt(&path, &TEST_KEY).is_err());
+    }
+
+    // A wrong password, as an unlock sees it.
+    fn fail(path: &Path) {
+        let _ = count_attempt(path, &TEST_KEY);
+    }
+
+    fn attempts(path: &Path) -> u32 {
+        let mut file = File::open(rate_limit_path(path)).unwrap();
+        read_record_from_file(&mut file, &TEST_KEY).failed_attempts
+    }
+
+    // Five attempts on disk, the back-off over, and a sixth started: the
+    // point at which the limiter has tripped.
+    fn trip(path: &Path) {
+        for _ in 0..MAX_ATTEMPTS {
+            assert!(count_attempt(path, &TEST_KEY).is_ok());
+        }
+        expire_delay_for_tests(path, &TEST_KEY);
+        assert!(count_attempt(path, &TEST_KEY).is_ok());
+    }
+
+    // Attempts whose outcome never came back, as after a crash during key
+    // derivation, still count.
+    #[test]
+    fn an_attempt_counts_before_its_password_is_tried() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        for n in 1..=MAX_ATTEMPTS {
+            assert!(count_attempt(&path, &TEST_KEY).is_ok());
+            assert_eq!(attempts(&path), n);
         }
 
-        assert!(check_rate_limit(&path, &TEST_KEY).is_err());
+        record_success(&path);
+        assert!(!rate_limit_path(&path).exists());
+        assert!(count_attempt(&path, &TEST_KEY).is_ok());
+        assert_eq!(attempts(&path), 1);
+    }
 
-        drop(dir);
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_record_is_refused_and_its_target_left_alone() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+        let target = dir.path().join("other");
+        fs::write(&target, b"keep me").unwrap();
+        std::os::unix::fs::symlink(&target, path.join(".ratelimit")).unwrap();
+
+        assert!(matches!(
+            count_attempt(&path, &TEST_KEY),
+            Err(KeepError::StorageErr(StorageError::Io { .. }))
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"keep me");
+
+        std::os::unix::fs::symlink(&target, trip_log_path(&path)).unwrap();
+        assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+        assert_eq!(fs::read(&target).unwrap(), b"keep me");
+    }
+
+    // Root ignores the permission bits these tests rely on.
+    #[cfg(unix)]
+    fn permissions_apply(dir: &Path) -> bool {
+        let applies = File::create(dir.join(".probe")).is_err();
+        if !applies {
+            eprintln!(
+                "permission bits are not enforced for this user, skipping the refusal checks"
+            );
+        }
+        applies
+    }
+
+    // An attempt that could not be counted is refused, whether the folder
+    // cannot take a new record or the record cannot be written.
+    #[cfg(unix)]
+    #[test]
+    fn an_attempt_that_cannot_be_counted_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        if permissions_apply(&path) {
+            assert!(matches!(
+                count_attempt(&path, &TEST_KEY),
+                Err(KeepError::StorageErr(StorageError::Io { .. }))
+            ));
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+
+        fail(&path);
+        let record = path.join(".ratelimit");
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o400)).unwrap();
+        if OpenOptions::new().write(true).open(&record).is_err() {
+            assert!(matches!(
+                count_attempt(&path, &TEST_KEY),
+                Err(KeepError::StorageErr(StorageError::Io { .. }))
+            ));
+        }
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(count_attempt(&path, &TEST_KEY).is_ok());
     }
 
     #[test]
@@ -449,7 +576,7 @@ mod tests {
         let path = dir.path().join("volume.keep");
         File::create(&path).unwrap();
 
-        record_failure(&path, &TEST_KEY);
+        fail(&path);
 
         let expected = dir.path().join(".volume.keep.ratelimit");
         assert!(expected.exists());
@@ -461,7 +588,7 @@ mod tests {
         let path = dir.path().join("storage");
         fs::create_dir(&path).unwrap();
 
-        record_failure(&path, &TEST_KEY);
+        fail(&path);
 
         let expected = path.join(".ratelimit");
         assert!(expected.exists());
@@ -495,19 +622,20 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        // Drive the counter up to MAX_ATTEMPTS - 1 with no trip recorded.
-        for _ in 0..(MAX_ATTEMPTS - 1) {
-            record_failure(&path, &TEST_KEY);
+        for _ in 0..MAX_ATTEMPTS {
+            fail(&path);
         }
         assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
 
-        // This failure crosses the threshold and must queue exactly one trip.
-        record_failure(&path, &TEST_KEY);
+        // The next attempt finds five that did not succeed and trips, even
+        // though none of the five ever reported back.
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
         let trips = drain_pending_trips(&path, &TEST_KEY);
         assert_eq!(trips.len(), 1);
         assert_eq!(trips[0].failed_attempts, MAX_ATTEMPTS);
+        assert_eq!(trips[0].timestamp, 0, "dated at the fifth attempt");
 
-        // After draining, the trip file is empty and drains to nothing.
         assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
     }
 
@@ -517,12 +645,12 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        for _ in 0..=MAX_ATTEMPTS {
-            record_failure(&path, &TEST_KEY);
+        trip(&path);
+        for _ in 0..3 {
+            expire_delay_for_tests(&path, &TEST_KEY);
+            fail(&path);
         }
 
-        // We expect exactly one trip (the first to cross), regardless of how
-        // many failures piled on after.
         let trips = drain_pending_trips(&path, &TEST_KEY);
         assert_eq!(trips.len(), 1);
     }
@@ -536,9 +664,7 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        for _ in 0..=MAX_ATTEMPTS {
-            record_failure(&path, &TEST_KEY);
-        }
+        trip(&path);
         record_success(&path);
 
         let trips = drain_pending_trips(&path, &TEST_KEY);
@@ -551,9 +677,7 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        for _ in 0..=MAX_ATTEMPTS {
-            record_failure(&path, &TEST_KEY);
-        }
+        trip(&path);
 
         let trip_path = trip_log_path(&path);
         let mut bytes = fs::read(&trip_path).unwrap();
@@ -572,18 +696,9 @@ mod tests {
         let path = dir.path().join("test-storage");
         fs::create_dir(&path).unwrap();
 
-        // Synthesize MAX_TRIP_RECORDS valid records by repeatedly tripping
-        // and resetting the counter so each call crosses the threshold.
-        for _ in 0..MAX_TRIP_RECORDS {
-            // Drive up to MAX_ATTEMPTS then reset.
-            for _ in 0..MAX_ATTEMPTS {
-                record_failure(&path, &TEST_KEY);
-            }
+        for _ in 0..=MAX_TRIP_RECORDS {
+            trip(&path);
             record_success(&path);
-        }
-        // One more cycle must not push the file past the cap.
-        for _ in 0..MAX_ATTEMPTS {
-            record_failure(&path, &TEST_KEY);
         }
 
         let trip_path = trip_log_path(&path);

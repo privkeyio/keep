@@ -860,9 +860,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         let master_key = crypto::derive_key(
             password.as_bytes(),
@@ -874,18 +872,9 @@ impl Storage {
             nonce: self.header.nonce,
             ciphertext: self.header.encrypted_data_key.to_vec(),
         };
-        match crypto::decrypt(&encrypted, &header_key) {
-            Ok(_) => {
-                rate_limit::record_success(&self.path);
-                Ok(())
-            }
-            Err(e) => {
-                if matches!(e, KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                Err(e)
-            }
-        }
+        crypto::decrypt(&encrypted, &header_key)?;
+        rate_limit::record_success(&self.path);
+        Ok(())
     }
 
     /// Check whether `password` decrypts the vault header, WITHOUT touching the
@@ -924,9 +913,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         debug!("deriving master key");
         let master_key = crypto::derive_key(
@@ -943,15 +930,7 @@ impl Storage {
         };
 
         debug!("decrypting data key");
-        let decrypted = match crypto::decrypt(&encrypted, &header_key) {
-            Ok(d) => d,
-            Err(e) => {
-                if matches!(e, KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                return Err(e);
-            }
-        };
+        let decrypted = crypto::decrypt(&encrypted, &header_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
@@ -3137,15 +3116,13 @@ mod tests {
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
 
-        // Bump failure count higher so the delay (4s) won't expire during test
-        // execution. Without this, the 1s delay at exactly 5 failures can expire
-        // on slow CI (Windows) between record_failure and check_rate_limit.
+        // Bump the count higher so the delay (4s) won't expire during test
+        // execution. Without this, the 1s delay at exactly 5 failures can
+        // expire on slow CI (Windows) before the next attempt is counted.
         {
             let storage = Storage::open(&path).unwrap();
             let hmac_key = rate_limit::derive_hmac_key(&storage.header.salt);
-            for _ in 0..2 {
-                rate_limit::record_failure(&path, &hmac_key);
-            }
+            rate_limit::set_attempts_for_tests(&path, &hmac_key, 7);
         }
 
         let mut storage = Storage::open(&path).unwrap();

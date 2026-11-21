@@ -330,27 +330,16 @@ impl HiddenStorage {
         }
 
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        rate_limit::count_attempt(&self.path, &hmac_key)?;
 
-        match self.try_unlock_outer(password) {
-            Ok(()) => {
-                rate_limit::record_success(&self.path);
-                // #520: open the audit log under the outer data key and flush
-                // any queued rate-limit trip events. Mirrors `Keep::unlock` so
-                // hidden-init vaults get the same `RateLimitTripped` audit
-                // surfacing that regular vaults do.
-                self.attach_outer_audit(&hmac_key)?;
-                Ok(())
-            }
-            Err(e) => {
-                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                Err(e)
-            }
-        }
+        self.try_unlock_outer(password)?;
+        rate_limit::record_success(&self.path);
+        // #520: open the audit log under the outer data key and flush
+        // any queued rate-limit trip events. Mirrors `Keep::unlock` so
+        // hidden-init vaults get the same `RateLimitTripped` audit
+        // surfacing that regular vaults do.
+        self.attach_outer_audit(&hmac_key)?;
+        Ok(())
     }
 
     /// Open the outer-volume audit log and drain pending trip events. Called
@@ -458,31 +447,18 @@ impl HiddenStorage {
         }
 
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        rate_limit::count_attempt(&self.path, &hmac_key)?;
 
-        match self.try_unlock_hidden(password) {
-            Ok(()) => {
-                rate_limit::record_success(&self.path);
-                Ok(())
-            }
-            Err(e) => {
-                if matches!(e, KeepError::InvalidPassword | KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                Err(e)
-            }
-        }
+        self.try_unlock_hidden(password)?;
+        rate_limit::record_success(&self.path);
+        Ok(())
     }
 
     /// Unlock whichever volume the password matches.
     /// Returns the type that was unlocked.
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         let outer_result = self.try_unlock_outer(password);
         let hidden_result = self.try_unlock_hidden(password);
@@ -514,7 +490,6 @@ impl HiddenStorage {
                     return Err(hidden_err);
                 }
 
-                rate_limit::record_failure(&self.path, &hmac_key);
                 Err(KeepError::InvalidPassword)
             }
         }
@@ -1629,16 +1604,18 @@ mod tests {
         )
         .unwrap();
 
-        // Five failed attempts trip the limiter.
+        // Five failed attempts.
         for _ in 0..5 {
             let mut storage = HiddenStorage::open(&path).unwrap();
             let _ = storage.unlock_outer("wrong-password");
         }
 
-        // Clear the rate-limit counter so the next attempt isn't gated by the
-        // active back-off. The trip queue lives in a separate file the rate
-        // limiter deliberately does NOT clear on success.
-        crate::rate_limit::record_success(&path);
+        // Wait out the back-off. The next attempt finds five that did not
+        // succeed and trips the limiter.
+        let hmac_key = crate::rate_limit::derive_hmac_key(
+            &HiddenStorage::open(&path).unwrap().outer_header.salt,
+        );
+        crate::rate_limit::expire_delay_for_tests(&path, &hmac_key);
 
         let mut storage = HiddenStorage::open(&path).unwrap();
         storage.unlock_outer("outer-password").unwrap();
@@ -1805,7 +1782,12 @@ mod tests {
             let _ = storage.unlock_outer("wrong-password");
         }
 
-        crate::rate_limit::record_success(&path);
+        // Wait out the back-off. The next attempt finds five that did not
+        // succeed and trips the limiter.
+        let hmac_key = crate::rate_limit::derive_hmac_key(
+            &HiddenStorage::open(&path).unwrap().outer_header.salt,
+        );
+        crate::rate_limit::expire_delay_for_tests(&path, &hmac_key);
 
         let mut storage = HiddenStorage::open(&path).unwrap();
         assert_eq!(storage.unlock("outer-password").unwrap(), VolumeType::Outer);
