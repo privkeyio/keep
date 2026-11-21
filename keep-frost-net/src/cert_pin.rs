@@ -46,6 +46,14 @@ pub struct CertificatePinSet {
     pins: HashMap<String, Vec<SpkiHash>>,
 }
 
+/// The key a pin is stored under: `hostname` without one trailing dot. A
+/// relay URL may name the absolute form (`relay.example.com.`), which
+/// `url::host_str` keeps but the TLS server name drops, so both spellings of a
+/// host must find the same pins.
+fn pin_key(hostname: &str) -> &str {
+    hostname.strip_suffix('.').unwrap_or(hostname)
+}
+
 impl CertificatePinSet {
     pub fn new() -> Self {
         Self::default()
@@ -57,7 +65,7 @@ impl CertificatePinSet {
     /// a no-op. Capped at `MAX_PINS_PER_HOST`; further pins for a full host are
     /// ignored so the bounded invariant holds for every caller, not just loads.
     pub fn add_pin(&mut self, hostname: String, hash: SpkiHash) {
-        let entry = self.pins.entry(hostname).or_default();
+        let entry = self.pins.entry(pin_key(&hostname).to_string()).or_default();
         if entry.len() < MAX_PINS_PER_HOST && !entry.contains(&hash) {
             entry.push(hash);
         }
@@ -65,16 +73,18 @@ impl CertificatePinSet {
 
     /// All accepted pins for `hostname` (empty slice if none).
     pub fn get_pins(&self, hostname: &str) -> &[SpkiHash] {
-        self.pins.get(hostname).map_or(&[], Vec::as_slice)
+        self.pins.get(pin_key(hostname)).map_or(&[], Vec::as_slice)
     }
 
     /// Whether `hostname` has at least one pin (used to gate TOFU).
     pub fn is_pinned(&self, hostname: &str) -> bool {
-        self.pins.get(hostname).is_some_and(|v| !v.is_empty())
+        self.pins
+            .get(pin_key(hostname))
+            .is_some_and(|v| !v.is_empty())
     }
 
     pub fn remove_pin(&mut self, hostname: &str) -> Option<Vec<SpkiHash>> {
-        self.pins.remove(hostname)
+        self.pins.remove(pin_key(hostname))
     }
 
     /// Remove a single `hash` from `hostname`, leaving the host's other pins in
@@ -83,6 +93,7 @@ impl CertificatePinSet {
     /// Returns whether a pin was removed. Used to retire a rotated-out key while
     /// keeping the current one active.
     pub fn remove_specific_pin(&mut self, hostname: &str, hash: &SpkiHash) -> bool {
+        let hostname = pin_key(hostname);
         let Some(entry) = self.pins.get_mut(hostname) else {
             return false;
         };
@@ -144,7 +155,16 @@ impl CertificatePinSet {
                 }
                 match hex::decode(hash_hex) {
                     Ok(raw) => match <[u8; 32]>::try_from(raw) {
-                        Ok(hash) => set.add_pin(hostname.clone(), hash),
+                        // `host` and `host.` load under one key, so together
+                        // they can pass the cap that each one alone is under.
+                        Ok(hash) => {
+                            let held = set.get_pins(&hostname);
+                            if held.len() >= MAX_PINS_PER_HOST && !held.contains(&hash) {
+                                malformed.push(format!("{hostname}: too many pins"));
+                            } else {
+                                set.add_pin(hostname.clone(), hash);
+                            }
+                        }
                         Err(raw) => {
                             malformed.push(format!("{hostname}: invalid length {}", raw.len()))
                         }
@@ -186,7 +206,7 @@ pub fn normalize_pin_hostname(input: &str) -> Option<String> {
     } else {
         format!("wss://{trimmed}")
     };
-    let host = url::Url::parse(&candidate).ok()?.host_str()?.to_string();
+    let host = pin_key(url::Url::parse(&candidate).ok()?.host_str()?).to_string();
     (!host.is_empty()).then_some(host)
 }
 
@@ -338,6 +358,9 @@ pub(crate) fn evaluate_pin(
     expected: &[SpkiHash],
     require_pinned: bool,
 ) -> Result<(SpkiHash, Option<(String, SpkiHash)>)> {
+    // Named the way the pin set keys it, so a pin learned here and the host
+    // in an error match the holds and releases callers keep by that name.
+    let hostname = pin_key(hostname);
     if expected.is_empty() {
         if require_pinned {
             // Strict mode: refuse to trust an un-pre-provisioned host, closing
@@ -386,6 +409,23 @@ mod tests {
     use super::*;
 
     // --- keep-y8v: opt-in strict mode closes the first-use TOFU MitM window ---
+
+    #[test]
+    fn a_learned_pin_and_its_errors_name_the_host_without_a_trailing_dot() {
+        let (_, to_pin) = evaluate_pin("relay.example.com.", [7u8; 32], &[], false).unwrap();
+        assert_eq!(to_pin, Some(("relay.example.com".to_string(), [7u8; 32])));
+        let missing = evaluate_pin("relay.example.com.", [7u8; 32], &[], true).unwrap_err();
+        assert!(
+            matches!(&missing, FrostNetError::CertificatePinMissing { hostname } if hostname == "relay.example.com"),
+            "{missing:?}"
+        );
+        let mismatch =
+            evaluate_pin("relay.example.com.", [7u8; 32], &[[8u8; 32]], false).unwrap_err();
+        assert!(
+            matches!(&mismatch, FrostNetError::CertificatePinMismatch { hostname, .. } if hostname == "relay.example.com"),
+            "{mismatch:?}"
+        );
+    }
 
     #[test]
     fn tofu_default_pins_unknown_host_on_first_use() {
@@ -478,8 +518,58 @@ mod tests {
             normalize_pin_hostname("  relay.example.com  ").as_deref(),
             Some("relay.example.com")
         );
+        assert_eq!(
+            normalize_pin_hostname("wss://relay.example.com./").as_deref(),
+            Some("relay.example.com")
+        );
         assert_eq!(normalize_pin_hostname(""), None);
         assert_eq!(normalize_pin_hostname("wss://"), None);
+        assert_eq!(normalize_pin_hostname("."), None);
+    }
+
+    #[test]
+    fn both_spellings_over_the_cap_together_are_malformed() {
+        let hashes =
+            |from: u8| -> Vec<String> { (from..from + 5).map(|b| hex::encode([b; 32])).collect() };
+        let json = serde_json::json!({
+            "relay.example.com": hashes(1),
+            "relay.example.com.": hashes(10),
+        });
+        let (set, malformed) =
+            CertificatePinSet::from_json_bytes(json.to_string().as_bytes()).unwrap();
+        assert_eq!(set.get_pins("relay.example.com").len(), MAX_PINS_PER_HOST);
+        assert_eq!(malformed.len(), 2, "{malformed:?}");
+    }
+
+    // A relay URL keeps a trailing dot in `url::host_str`, which keys the probe
+    // and the stored pins, while the TLS server name the live verifier keys by
+    // drops it. Each spelling has to find, and remove, the same pins.
+    #[test]
+    fn a_trailing_dot_names_the_same_pins() {
+        let hash = [7u8; 32];
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("relay.example.com.".into(), hash);
+        assert_eq!(pins.get_pins("relay.example.com"), &[hash]);
+        assert!(pins.is_pinned("relay.example.com"));
+        assert!(pins.is_pinned("relay.example.com."));
+        assert_eq!(
+            pins.pins().keys().collect::<Vec<_>>(),
+            ["relay.example.com"]
+        );
+
+        let mut loaded = CertificatePinSet::from_json_bytes(
+            br#"{"relay.example.com.": ["0707070707070707070707070707070707070707070707070707070707070707"]}"#,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(loaded.get_pins("relay.example.com"), &[hash]);
+        assert!(loaded.remove_specific_pin("relay.example.com", &hash));
+        assert!(!loaded.is_pinned("relay.example.com."));
+
+        pins.add_pin("relay.example.com".into(), [8u8; 32]);
+        assert_eq!(pins.get_pins("relay.example.com.").len(), 2);
+        assert!(pins.remove_pin("relay.example.com.").is_some());
+        assert!(!pins.is_pinned("relay.example.com"));
     }
 
     #[test]

@@ -1128,7 +1128,19 @@ pub(crate) struct PinStore {
 
 fn read_holds(value: Option<serde_json::Value>) -> StoredPinHolds {
     value
-        .and_then(|v| serde_json::from_value(v).ok())
+        .and_then(|v| serde_json::from_value::<StoredPinHolds>(v).ok())
+        // Earlier builds kept a relay URL's trailing dot in the host they held,
+        // and hosts are now named without it, so a hold saved as
+        // `relay.example.com.` must still hold, and be releasable as,
+        // `relay.example.com`.
+        .map(|mut holds| {
+            holds.hosts = holds
+                .hosts
+                .into_iter()
+                .map(|h| h.strip_suffix('.').map(str::to_string).unwrap_or(h))
+                .collect();
+            holds
+        })
         .unwrap_or_else(|| {
             tracing::warn!("unreadable certificate pin holds, holding every unpinned host");
             StoredPinHolds::every_unpinned_host()

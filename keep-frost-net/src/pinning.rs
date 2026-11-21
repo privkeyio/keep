@@ -598,6 +598,25 @@ mod tests {
         assert!(run(&v, "Relay.EXAMPLE.com").is_ok());
     }
 
+    // A relay URL with a trailing dot pins under `relay.example.com.`, and the
+    // TLS server name may or may not keep the dot, depending on the
+    // rustls-pki-types release. Either way the pin holds: the right key passes
+    // strict mode, and a wrong one is refused rather than left to the CA.
+    #[test]
+    fn a_trailing_dot_host_keeps_its_pin() {
+        let mut pins = CertificatePinSet::new();
+        pins.add_pin("relay.example.com.".into(), cert_spki_hash());
+        let v = verifier(true, pins, true);
+        assert!(run(&v, "relay.example.com.").is_ok());
+        assert!(run(&v, "relay.example.com").is_ok());
+
+        let mut wrong = CertificatePinSet::new();
+        wrong.add_pin("relay.example.com.".into(), [0xAAu8; 32]);
+        let v = verifier(true, wrong, false);
+        assert!(run(&v, "relay.example.com").is_err());
+        assert!(run(&v, "relay.example.com.").is_err());
+    }
+
     #[test]
     fn ip_address_server_name_is_keyed_under_its_literal() {
         // The IpAddress arm must key the pin under the address literal (IPv4
