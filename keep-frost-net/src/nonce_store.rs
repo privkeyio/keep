@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use fs2::FileExt;
+use fs4::FileExt;
 use parking_lot::RwLock;
 use tracing::{debug, warn};
 
@@ -76,8 +76,7 @@ impl FileNonceStore {
                     FrostNetError::Session(format!("Failed to open nonce lock: {e}"))
                 })?
             };
-            lock_file
-                .lock_exclusive()
+            FileExt::lock(&lock_file)
                 .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 
             let file = match File::open(path) {
@@ -168,8 +167,7 @@ impl NonceStore for FileNonceStore {
             opts.open(&lock_path)
                 .map_err(|e| FrostNetError::Session(format!("Failed to open nonce lock: {e}")))?
         };
-        lock_file
-            .lock_exclusive()
+        FileExt::lock(&lock_file)
             .map_err(|e| FrostNetError::Session(format!("Failed to lock nonce store: {e}")))?;
 
         let mut opts = OpenOptions::new();
@@ -266,7 +264,7 @@ fn rewrite_nonce_file<'a>(
         }
         opts.open(&lock_path)?
     };
-    lock_file.lock_exclusive()?;
+    FileExt::lock(&lock_file)?;
 
     let tmp_path = path.with_extension("tmp");
 
@@ -525,7 +523,7 @@ mod tests {
 
         // Assert the lock is HELD, not merely that the lock file exists: that
         // file is created by `open`, so an existence check stays green even if
-        // the `lock_exclusive` call is deleted outright.
+        // the lock call is deleted outright.
         //
         // flock follows the open file description, so a second handle on the
         // same path contends even within a single process.
@@ -536,7 +534,7 @@ mod tests {
                 .truncate(false)
                 .open(path.with_extension("lock"))
                 .unwrap();
-            f.lock_exclusive().unwrap();
+            FileExt::lock(&f).unwrap();
             f
         };
 

@@ -46,7 +46,7 @@ sha2 = "0.10.9"
 
 serialport = "4.9.0"
 
-fs2 = "0.4"
+fs4 = "1"
 
 shellexpand = "3.1"
 
