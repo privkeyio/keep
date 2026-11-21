@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use blake2::digest::consts::U8;
 use blake2::digest::{KeyInit, Mac};
 use blake2::Blake2bMac;
-use fs2::FileExt;
+use fs4::FileExt;
 use subtle::ConstantTimeEq;
 
 const MAX_ATTEMPTS: u32 = 5;
@@ -173,7 +173,7 @@ pub(crate) fn record_failure(path: &Path, hmac_key: &[u8; 32]) {
         return;
     };
 
-    if FileExt::lock_exclusive(&file).is_err() {
+    if FileExt::lock(&file).is_err() {
         return;
     }
 
@@ -267,7 +267,7 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
         return;
     };
 
-    if FileExt::lock_exclusive(&file).is_err() {
+    if FileExt::lock(&file).is_err() {
         return;
     }
 
@@ -312,7 +312,7 @@ pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<Pendi
         return Vec::new();
     };
 
-    if FileExt::lock_exclusive(&file).is_err() {
+    if FileExt::lock(&file).is_err() {
         return Vec::new();
     }
 

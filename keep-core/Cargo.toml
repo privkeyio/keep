@@ -59,7 +59,7 @@ bech32 = "0.12"
 hex = "0.4"
 base64 = "0.23"
 thiserror = "2.0"
-fs2 = "0.4"
+fs4 = "1"
 chrono = { version = "0.4.45", features = ["serde"] }
 dirs = "7.0"
 tracing = "0.1"

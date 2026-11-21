@@ -6,7 +6,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use bincode::Options;
-use fs2::FileExt;
+use fs4::FileExt;
 use subtle::ConstantTimeEq;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -151,7 +151,7 @@ fn acquire_rotation_lock(path: &Path) -> Result<File> {
         .create(true)
         .truncate(false)
         .open(&lock_path)?;
-    lock_file.lock_exclusive()?;
+    FileExt::lock(&lock_file)?;
     Ok(lock_file)
 }
 
@@ -168,7 +168,7 @@ fn try_acquire_rotation_lock(path: &Path) -> Option<File> {
         .truncate(false)
         .open(&lock_path)
         .ok()?;
-    lock_file.try_lock_exclusive().ok()?;
+    FileExt::try_lock(&lock_file).ok()?;
     Some(lock_file)
 }
 
@@ -1732,7 +1732,7 @@ mod tests {
     /// It proves mutual exclusion (a rotation cannot proceed while the lock is
     /// held), not two-way convergence of two concurrent rotations.
     ///
-    /// Depends on fs2 using flock(2), which is per-open-file-description on
+    /// Depends on fs4 using flock(2), which is per-open-file-description on
     /// Unix: the test's handle and rotate_password's own handle contend even
     /// within this single process. If the lock ever moved to fcntl(2) record
     /// locks (per-process), same-process calls would stop blocking and this
@@ -1754,7 +1754,7 @@ mod tests {
             .truncate(false)
             .open(&lock_path)
             .unwrap();
-        holder.lock_exclusive().unwrap();
+        FileExt::lock(&holder).unwrap();
 
         let path_bg = path.clone();
         let handle = std::thread::spawn(move || {
@@ -1764,7 +1764,7 @@ mod tests {
                 .map(|_| ())
         });
 
-        // Give the background thread time to reach `lock_exclusive()` inside
+        // Give the background thread time to reach the lock inside
         // rotate_password and block. If the flock were not serializing us it
         // would race to completion here.
         std::thread::sleep(std::time::Duration::from_millis(200));

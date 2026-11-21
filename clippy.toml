@@ -23,6 +23,11 @@ disallowed-methods = [
     { path = "frost_ed25519::keys::refresh::refresh_dkg_part1", reason = "draw the refresh polynomial through keep_core::frost::checked_draw" },
     { path = "frost_secp256k1_tr::keys::repairable::repair_share_part1", reason = "draw the repair deltas through keep_core::frost::checked_draw" },
     { path = "frost_ed25519::keys::repairable::repair_share_part1", reason = "draw the repair deltas through keep_core::frost::checked_draw" },
+    { path = "std::fs::File::lock", reason = "use fs4::FileExt::lock: std returns Unsupported on Android before Rust 1.98, and a lock that fails skips the rate limit and nonce store writes" },
+    { path = "std::fs::File::lock_shared", reason = "use fs4::FileExt::lock_shared: std returns Unsupported on Android before Rust 1.98, and a lock that fails skips the rate limit and nonce store writes" },
+    { path = "std::fs::File::try_lock", reason = "use fs4::FileExt::try_lock: std returns Unsupported on Android before Rust 1.98, and a lock that fails skips the rate limit and nonce store writes" },
+    { path = "std::fs::File::try_lock_shared", reason = "use fs4::FileExt::try_lock_shared: std returns Unsupported on Android before Rust 1.98, and a lock that fails skips the rate limit and nonce store writes" },
+    { path = "std::fs::File::unlock", reason = "use fs4::FileExt::unlock: std returns Unsupported on Android before Rust 1.98, and a lock that fails skips the rate limit and nonce store writes" },
 ]
 # Not listed, because the path does not resolve through the ciphersuite crates'
 # type aliases and clippy warns on an entry it cannot reach:
