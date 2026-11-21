@@ -3035,13 +3035,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
+name = "fs4"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
 dependencies = [
- "libc",
- "winapi",
+ "rustix 1.1.6",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4665,7 +4665,7 @@ dependencies = [
  "dialoguer",
  "dirs 7.0.0",
  "frost-secp256k1-tr",
- "fs2",
+ "fs4",
  "hex",
  "indicatif",
  "k256",
@@ -4722,7 +4722,7 @@ dependencies = [
  "dirs 7.0.0",
  "frost-ed25519",
  "frost-secp256k1-tr",
- "fs2",
+ "fs4",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",
@@ -4834,7 +4834,7 @@ dependencies = [
  "bitcoin",
  "chrono",
  "frost-secp256k1-tr",
- "fs2",
+ "fs4",
  "hex",
  "hmac 0.13.0",
  "k256",
