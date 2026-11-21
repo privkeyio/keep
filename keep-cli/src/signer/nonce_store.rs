@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 use anyhow::{Context, Result};
-use fs2::FileExt;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -118,9 +118,7 @@ impl NonceStore {
             opts.open(&lock_path)
                 .context("Failed to open nonce store lock")?
         };
-        lock_file
-            .lock_exclusive()
-            .context("Failed to acquire nonce store lock")?;
+        FileExt::lock(&lock_file).context("Failed to acquire nonce store lock")?;
 
         // Opened inside the critical section, so this always resolves to the
         // file the previous holder left behind rather than one captured before
