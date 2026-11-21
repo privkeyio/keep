@@ -8573,6 +8573,33 @@ mod cert_pin_ffi_tests {
             .unwrap();
     }
 
+    // A hold an earlier build saved with the relay URL's trailing dot still
+    // holds the host, which is now named without it, and it can be released.
+    #[test]
+    fn a_hold_saved_with_a_trailing_dot_still_holds() {
+        let keep = keep();
+        write_pin_store(
+            &keep,
+            r#"{"pins": {}, "holds": {"hosts": ["relay.example.com."]}}"#,
+        );
+        assert_eq!(
+            keep.certificate_pin_holds().unwrap().hosts,
+            vec!["relay.example.com".to_string()]
+        );
+        assert_eq!(
+            keep.held_relays(vec!["wss://relay.example.com./".into()])
+                .unwrap(),
+            vec!["wss://relay.example.com./".to_string()]
+        );
+        keep.release_certificate_pin_hold("relay.example.com.".into())
+            .unwrap();
+        assert!(keep
+            .certificate_pin_holds()
+            .unwrap()
+            .released
+            .contains(&"relay.example.com".to_string()));
+    }
+
     fn stored(keep: &KeepMobile, key: &str) -> bool {
         keep.storage.load_share_by_key(key.into()).is_ok()
     }
