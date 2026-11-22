@@ -860,7 +860,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        rate_limit::count_attempt(&self.path, &hmac_key)?;
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         let master_key = crypto::derive_key(
             password.as_bytes(),
@@ -873,7 +873,7 @@ impl Storage {
             ciphertext: self.header.encrypted_data_key.to_vec(),
         };
         crypto::decrypt(&encrypted, &header_key)?;
-        rate_limit::record_success(&self.path);
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
         Ok(())
     }
 
@@ -913,7 +913,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        rate_limit::count_attempt(&self.path, &hmac_key)?;
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         debug!("deriving master key");
         let master_key = crypto::derive_key(
@@ -934,7 +934,7 @@ impl Storage {
         let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
-        rate_limit::record_success(&self.path);
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
         debug!("storage unlocked");
         Ok(())
     }

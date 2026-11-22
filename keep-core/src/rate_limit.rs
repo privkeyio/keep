@@ -145,9 +145,10 @@ fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> std::io::Resul
 /// opened, locked, written or synced: an attempt that is not on disk before
 /// the password check could go uncounted, through a full disk, a crash during
 /// key derivation, or several attempts reading the same count at once. A
-/// success then empties the record, so only attempts that did not succeed
-/// stay counted.
-pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), KeepError> {
+/// success then clears the attempts counted up to its own, so only attempts
+/// that did not succeed stay counted.
+/// Returns the count this attempt wrote, for `record_success`.
+pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<u32, KeepError> {
     let rl_path = rate_limit_path(path);
     let unusable = |e: std::io::Error| {
         tracing::error!(error = %e, path = %rl_path.display(), "the unlock rate limit cannot be used, refusing the attempt");
@@ -174,26 +175,25 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), Keep
         .and_then(|()| file.sync_all())
         .map_err(unusable)?;
 
-    // A success empties the record, so `prior` attempts all failed or never
+    // A success clears its own count, so `prior` attempts all failed or never
     // finished. Queued here, under the lock, the trip is recorded once per
     // cycle and cannot be skipped by abandoning an attempt.
     if prior == MAX_ATTEMPTS {
         record_trip(path, hmac_key, prior, prior_time);
     }
-    drop(file);
-    Ok(())
+    Ok(record.failed_attempts)
 }
 
 fn open_rate_limit_file(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
-    no_follow(&mut opts);
+    private_no_follow(&mut opts);
     opts.open(path)
 }
 
-// The record's path is fixed inside the vault folder, and a link planted there
-// would have its target overwritten with a record.
-fn no_follow(opts: &mut OpenOptions) {
+// Owner-only, and never through a link: the record's path is fixed inside the
+// vault folder, and a link planted there would have its target overwritten.
+fn private_no_follow(opts: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -203,21 +203,33 @@ fn no_follow(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
-/// Reset the count by emptying the record in place under its lock. Removing
-/// it instead would let an attempt that opened it first count on a file no
-/// later attempt can find.
-pub(crate) fn record_success(path: &Path) {
+/// After the attempt `count_attempt` numbered `attempt` succeeded, clear it
+/// and every attempt counted before it, under the record's lock. Attempts
+/// counted after it are still in flight and stay counted, except that two
+/// successes running at once each clear their own count, so together they can
+/// clear one later attempt. The record is emptied or rewritten in place, never
+/// removed, so an attempt that opened it first cannot count on a file no later
+/// attempt can find.
+pub(crate) fn record_success(path: &Path, hmac_key: &[u8; 32], attempt: u32) {
     let rl_path = rate_limit_path(path);
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
-    no_follow(&mut opts);
-    let Ok(file) = opts.open(&rl_path) else {
+    private_no_follow(&mut opts);
+    let Ok(mut file) = opts.open(&rl_path) else {
         return;
     };
-    if let Err(e) = FileExt::lock(&file)
-        .and_then(|()| file.set_len(0))
-        .and_then(|()| file.sync_all())
-    {
+    let reset = FileExt::lock(&file).and_then(|()| {
+        let mut record = read_record_from_file(&mut file, hmac_key)?;
+        record.failed_attempts = record.failed_attempts.saturating_sub(attempt);
+        if record.failed_attempts == 0 {
+            file.set_len(0)?;
+        } else {
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&record.to_bytes(hmac_key))?;
+        }
+        file.sync_all()
+    });
+    if let Err(e) = reset {
         tracing::error!(error = %e, "the unlock rate limit could not be reset");
     }
 }
@@ -278,7 +290,7 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
 
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).append(true).create(true);
-    no_follow(&mut opts);
+    private_no_follow(&mut opts);
     let Ok(file) = opts.open(&trip_path) else {
         return;
     };
@@ -345,7 +357,7 @@ pub(crate) fn drain_pending_trips(path: &Path, hmac_key: &[u8; 32]) -> Vec<Pendi
 
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
-    no_follow(&mut opts);
+    private_no_follow(&mut opts);
     let Ok(mut file) = opts.open(&trip_path) else {
         return Vec::new();
     };
@@ -468,7 +480,7 @@ mod tests {
             fail(&path);
         }
 
-        record_success(&path);
+        record_success(&path, &TEST_KEY, u32::MAX);
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
     }
 
@@ -518,7 +530,7 @@ mod tests {
             assert_eq!(attempts(&path), n);
         }
 
-        record_success(&path);
+        record_success(&path, &TEST_KEY, u32::MAX);
         assert_eq!(attempts(&path), 0);
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
         assert_eq!(attempts(&path), 1);
@@ -622,13 +634,32 @@ mod tests {
         set_attempts_for_tests(&path, &TEST_KEY, 3);
 
         let mut opened_before = File::open(rate_limit_path(&path)).unwrap();
-        record_success(&path);
+        record_success(&path, &TEST_KEY, u32::MAX);
         assert_eq!(
             read_record_from_file(&mut opened_before, &TEST_KEY)
                 .unwrap()
                 .failed_attempts,
             0
         );
+    }
+
+    // A success clears what was counted up to it, not an attempt counted after
+    // it that is still running.
+    #[test]
+    fn a_success_keeps_attempts_counted_after_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        fail(&path);
+        let mine = count_attempt(&path, &TEST_KEY).unwrap();
+        let later = count_attempt(&path, &TEST_KEY).unwrap();
+        assert_eq!((mine, later), (2, 3));
+
+        record_success(&path, &TEST_KEY, mine);
+        assert_eq!(attempts(&path), 1);
+        record_success(&path, &TEST_KEY, later);
+        assert_eq!(attempts(&path), 0);
     }
 
     #[test]
@@ -726,7 +757,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
 
         trip(&path);
-        record_success(&path);
+        record_success(&path, &TEST_KEY, u32::MAX);
 
         let trips = drain_pending_trips(&path, &TEST_KEY);
         assert_eq!(trips.len(), 1);
@@ -759,7 +790,7 @@ mod tests {
 
         for _ in 0..=MAX_TRIP_RECORDS {
             trip(&path);
-            record_success(&path);
+            record_success(&path, &TEST_KEY, u32::MAX);
         }
 
         let trip_path = trip_log_path(&path);

@@ -330,10 +330,10 @@ impl HiddenStorage {
         }
 
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        rate_limit::count_attempt(&self.path, &hmac_key)?;
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         self.try_unlock_outer(password)?;
-        rate_limit::record_success(&self.path);
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
         // #520: open the audit log under the outer data key and flush
         // any queued rate-limit trip events. Mirrors `Keep::unlock` so
         // hidden-init vaults get the same `RateLimitTripped` audit
@@ -447,10 +447,10 @@ impl HiddenStorage {
         }
 
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        rate_limit::count_attempt(&self.path, &hmac_key)?;
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         self.try_unlock_hidden(password)?;
-        rate_limit::record_success(&self.path);
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
         Ok(())
     }
 
@@ -458,7 +458,7 @@ impl HiddenStorage {
     /// Returns the type that was unlocked.
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
-        rate_limit::count_attempt(&self.path, &hmac_key)?;
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         let outer_result = self.try_unlock_outer(password);
         let hidden_result = self.try_unlock_hidden(password);
@@ -466,7 +466,7 @@ impl HiddenStorage {
         match (outer_result, hidden_result) {
             (Ok(()), _) => {
                 self.active_volume = Some(VolumeType::Outer);
-                rate_limit::record_success(&self.path);
+                rate_limit::record_success(&self.path, &hmac_key, attempt);
                 // #520: the auto-detect path must flush trips and attach the
                 // outer audit log too, otherwise `audit_*` accessors see an
                 // unlocked vault with `outer_audit == None`. Mirror `unlock_outer`.
@@ -475,7 +475,7 @@ impl HiddenStorage {
             }
             (Err(_), Ok(())) => {
                 self.active_volume = Some(VolumeType::Hidden);
-                rate_limit::record_success(&self.path);
+                rate_limit::record_success(&self.path, &hmac_key, attempt);
                 Ok(VolumeType::Hidden)
             }
             (Err(outer_err), Err(hidden_err)) => {
