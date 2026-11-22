@@ -22,16 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
       # The agent bindings are excluded from the workspace and keep their own
       # lockfiles, which the step above never reads. Dependabot updates only the
       # root lockfile: when one of these fails, reseed the binding's lockfile
       # from the root Cargo.lock so the crates they share stay in step.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: keep-agent-py/Cargo.toml
           arguments: --all-features --locked --config deny.toml
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
         with:
           manifest-path: keep-agent-ts/Cargo.toml
           arguments: --all-features --locked --config deny.toml
@@ -247,7 +247,7 @@ jobs:
           # aws-lc-sys (via rustls) compiles bundled C through the NDK's cmake
           # toolchain, which only reliably supports the Ninja generator.
           sudo apt-get install -y ninja-build
-      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: "21"
@@ -265,7 +265,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: android
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2
         with:
           tool: cargo-ndk@${{ env.CARGO_NDK_VERSION }}
       - name: Cross-compile keep-mobile for Android
