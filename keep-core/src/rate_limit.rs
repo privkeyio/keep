@@ -237,13 +237,15 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<Attempt,
     if trips {
         record.tripped = prior_counted;
     }
+    // The directory entry is made durable before the first count is written,
+    // so a failed sync leaves nothing that would let a retry skip it.
+    if prior_counted == 0 {
+        crate::rotation::fsync_dir(&rl_path).map_err(unusable)?;
+    }
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&record.to_bytes(hmac_key)))
         .and_then(|()| file.sync_all())
         .map_err(unusable)?;
-    if prior_counted == 0 {
-        crate::rotation::fsync_dir(&rl_path).map_err(unusable)?;
-    }
 
     if trips {
         record_trip(path, hmac_key, prior, prior_time);
@@ -814,6 +816,29 @@ mod tests {
         expire_delay_for_tests(&path, &TEST_KEY);
         fail(&path);
         assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+    }
+
+    // An attempt whose counter directory cannot be synced is refused, and so is
+    // its retry: the failed sync leaves no count that would skip it.
+    #[cfg(unix)]
+    #[test]
+    fn an_attempt_whose_directory_cannot_be_synced_stays_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o300)).unwrap();
+        if fs::read_dir(&path).is_ok() {
+            eprintln!("skipping: permissions are not enforced for this user");
+            return;
+        }
+
+        let first = count_attempt(&path, &TEST_KEY);
+        let retry = count_attempt(&path, &TEST_KEY);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(first, Err(KeepError::StorageErr(_))));
+        assert!(matches!(retry, Err(KeepError::StorageErr(_))));
+        assert_eq!(attempts(&path), 0);
     }
 
     // A success that clears every attempt a trip covered lets the next run of
