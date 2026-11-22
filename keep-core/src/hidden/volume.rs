@@ -297,7 +297,7 @@ impl HiddenStorage {
 
         let decrypted = crypto::decrypt(&encrypted, &header_key)?;
         let decrypted_slice = decrypted.as_slice()?;
-        self.outer_key = Some(SecretKey::from_slice(&decrypted_slice)?);
+        let outer_key = SecretKey::from_slice(&decrypted_slice)?;
 
         let db_path = self.path.join("keep.db");
         let db = match crate::backend::open_database_with_retry(&db_path) {
@@ -317,6 +317,7 @@ impl HiddenStorage {
             }
         };
 
+        self.outer_key = Some(outer_key);
         self.outer_db = Some(db);
         self.active_volume = Some(VolumeType::Outer);
 
@@ -367,7 +368,7 @@ impl HiddenStorage {
         for trip in trips {
             let trip_ts = trip.audit_time();
             let reason = format!(
-                "rate limit threshold reached after {} failed attempts",
+                "rate limit threshold reached after {} counted attempts with no recorded success",
                 trip.failed_attempts
             );
             let mut entry = AuditEntry::new(AuditEventType::RateLimitTripped, audit.last_hash())
@@ -968,6 +969,39 @@ mod tests {
             storage.unlock_outer("outer_password").unwrap();
             assert!(storage.active_volume() == Some(VolumeType::Outer));
         }
+    }
+
+    // A database that fails to open after a correct outer password leaves the
+    // outer volume locked, so the next unlock opens it rather than returning
+    // early with no database.
+    #[test]
+    fn a_failed_outer_database_open_leaves_the_volume_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-hidden-db");
+        HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+        let db = path.join("keep.db");
+        let aside = dir.path().join("keep.db.aside");
+        std::fs::rename(&db, &aside).unwrap();
+        std::fs::create_dir(&db).unwrap();
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        assert!(storage.unlock_outer("outer").is_err());
+        assert!(storage.outer_key.is_none());
+        assert!(storage.active_volume().is_none());
+
+        std::fs::remove_dir(&db).unwrap();
+        std::fs::rename(&aside, &db).unwrap();
+        storage.unlock_outer("outer").unwrap();
+        assert!(storage.outer_db.is_some());
+        assert!(storage.active_volume() == Some(VolumeType::Outer));
     }
 
     #[test]

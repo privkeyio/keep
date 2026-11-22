@@ -86,8 +86,8 @@ struct RateLimitRecord {
     counted: u64,
     cleared: u64,
     last_attempt: u64,
-    // The attempt that queued this cycle's trip; a cycle ends when `cleared`
-    // passes it.
+    // The last attempt this cycle's trip covers; a cycle ends when `cleared`
+    // reaches it.
     tripped: u64,
 }
 
@@ -222,23 +222,28 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<Attempt,
         return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
     }
 
-    let (prior, prior_time) = (record.live(), record.last_attempt);
-    if record.counted == 0 {
+    let (prior, prior_time, prior_counted) = (record.live(), record.last_attempt, record.counted);
+    if prior_counted == 0 {
         record.epoch = crate::crypto::try_random_bytes()?;
     }
     record.counted = record.counted.saturating_add(1);
     record.last_attempt = now_secs();
     // `prior` attempts are on disk with no success after them. The first
     // attempt past the limit in a cycle queues the trip, under the lock, so it
-    // is recorded once and cannot be skipped by abandoning an attempt.
+    // is recorded once and cannot be skipped by abandoning an attempt. It
+    // covers the attempts before this one, so a success that clears them all
+    // lets the next group trip.
     let trips = prior >= MAX_ATTEMPTS && record.tripped <= record.cleared;
     if trips {
-        record.tripped = record.counted;
+        record.tripped = prior_counted;
     }
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&record.to_bytes(hmac_key)))
         .and_then(|()| file.sync_all())
         .map_err(unusable)?;
+    if prior_counted == 0 {
+        crate::rotation::fsync_dir(&rl_path).map_err(unusable)?;
+    }
 
     if trips {
         record_trip(path, hmac_key, prior, prior_time);
@@ -806,6 +811,35 @@ mod tests {
         assert_eq!(drain_pending_trips(&path, &TEST_KEY).len(), 1);
 
         record_success(&path, &TEST_KEY, slow);
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
+        assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+    }
+
+    // A success that clears every attempt a trip covered lets the next run of
+    // failures trip.
+    #[test]
+    fn a_success_clearing_a_trips_attempts_lets_the_next_run_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        for _ in 1..MAX_ATTEMPTS {
+            fail(&path);
+        }
+        let last_covered = count_attempt(&path, &TEST_KEY).unwrap();
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
+        assert_eq!(drain_pending_trips(&path, &TEST_KEY).len(), 1);
+
+        record_success(&path, &TEST_KEY, last_covered);
+        for _ in 0..MAX_ATTEMPTS {
+            expire_delay_for_tests(&path, &TEST_KEY);
+            fail(&path);
+        }
+        assert_eq!(attempts(&path), MAX_ATTEMPTS + 1);
+        assert_eq!(drain_pending_trips(&path, &TEST_KEY).len(), 1);
+
         expire_delay_for_tests(&path, &TEST_KEY);
         fail(&path);
         assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());

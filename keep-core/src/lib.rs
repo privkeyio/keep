@@ -305,7 +305,7 @@ impl Keep {
         for trip in trips {
             let trip_ts = trip.audit_time();
             let reason = format!(
-                "rate limit threshold reached after {} failed attempts",
+                "rate limit threshold reached after {} counted attempts with no recorded success",
                 trip.failed_attempts
             );
             self.audit_event(AuditEventType::RateLimitTripped, |mut e| {

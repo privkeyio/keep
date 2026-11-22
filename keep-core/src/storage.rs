@@ -829,13 +829,15 @@ impl Storage {
 
     /// Unlock with the given password.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
-        if self.data_key.is_some() {
+        if self.data_key.is_some() && self.backend.is_some() {
             return Ok(());
         }
 
         self.unlock_inner(password)?;
 
-        let backend = RedbBackend::open(&self.path.join("keep.db"))?;
+        let backend = RedbBackend::open(&self.path.join("keep.db")).inspect_err(|_| {
+            self.data_key = None;
+        })?;
         self.backend = Some(Box::new(backend));
         Ok(())
     }
@@ -2734,6 +2736,33 @@ mod tests {
             storage.unlock("password").unwrap();
             assert!(storage.is_unlocked());
         }
+    }
+
+    // A backend that fails to open after a correct password leaves the vault
+    // locked, so the next unlock opens it rather than reporting success.
+    #[test]
+    fn a_failed_backend_open_leaves_the_vault_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+        let db = path.join("keep.db");
+        let aside = dir.path().join("keep.db.aside");
+        std::fs::rename(&db, &aside).unwrap();
+        std::fs::create_dir(&db).unwrap();
+
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.unlock("password").is_err());
+        assert!(!storage.is_unlocked());
+
+        std::fs::remove_dir(&db).unwrap();
+        std::fs::rename(&aside, &db).unwrap();
+        storage.unlock("password").unwrap();
+        assert!(storage.is_unlocked());
+        assert!(storage.backend.is_some());
+
+        storage.backend = None;
+        storage.unlock("password").unwrap();
+        assert!(storage.backend.is_some());
     }
 
     #[test]
