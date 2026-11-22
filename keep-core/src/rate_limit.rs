@@ -127,13 +127,14 @@ impl RateLimitRecord {
     }
 }
 
-fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> RateLimitRecord {
-    let mut data = [0u8; RECORD_SIZE];
-    if file.read_exact(&mut data).is_ok() {
-        RateLimitRecord::from_bytes(&data, hmac_key).unwrap_or_else(RateLimitRecord::new)
-    } else {
-        RateLimitRecord::new()
-    }
+/// A short or unauthenticated record reads as new, but a failed read is an
+/// error: treating it as new would reset an active delay.
+fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> std::io::Result<RateLimitRecord> {
+    let mut data = Vec::with_capacity(RECORD_SIZE);
+    Read::by_ref(file)
+        .take(RECORD_SIZE as u64)
+        .read_to_end(&mut data)?;
+    Ok(RateLimitRecord::from_bytes(&data, hmac_key).unwrap_or_else(RateLimitRecord::new))
 }
 
 /// Count an unlock attempt before its password is tried, or refuse it.
@@ -157,7 +158,7 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), Keep
     let mut file = open_rate_limit_file(&rl_path).map_err(unusable)?;
     FileExt::lock(&file).map_err(unusable)?;
 
-    let mut record = read_record_from_file(&mut file, hmac_key);
+    let mut record = read_record_from_file(&mut file, hmac_key).map_err(unusable)?;
     let remaining = record.remaining_delay();
     if remaining > Duration::ZERO {
         return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
@@ -304,7 +305,7 @@ pub(crate) fn set_attempts_for_tests(path: &Path, hmac_key: &[u8; 32], failed_at
 #[cfg(test)]
 pub(crate) fn expire_delay_for_tests(path: &Path, hmac_key: &[u8; 32]) {
     let mut file = File::open(rate_limit_path(path)).unwrap();
-    let mut record = read_record_from_file(&mut file, hmac_key);
+    let mut record = read_record_from_file(&mut file, hmac_key).unwrap();
     record.last_failure = 0;
     fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
 }
@@ -473,7 +474,9 @@ mod tests {
 
     fn attempts(path: &Path) -> u32 {
         let mut file = File::open(rate_limit_path(path)).unwrap();
-        read_record_from_file(&mut file, &TEST_KEY).failed_attempts
+        read_record_from_file(&mut file, &TEST_KEY)
+            .unwrap()
+            .failed_attempts
     }
 
     // Five attempts on disk, the back-off over, and a sixth started: the
@@ -568,6 +571,29 @@ mod tests {
         }
         fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_is_an_error_not_a_new_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+        set_attempts_for_tests(&path, &TEST_KEY, MAX_ATTEMPTS + 2);
+
+        let mut write_only = OpenOptions::new()
+            .write(true)
+            .open(rate_limit_path(&path))
+            .unwrap();
+        assert!(read_record_from_file(&mut write_only, &TEST_KEY).is_err());
+
+        fs::write(rate_limit_path(&path), [0u8; 3]).unwrap();
+        let mut short = File::open(rate_limit_path(&path)).unwrap();
+        assert_eq!(
+            read_record_from_file(&mut short, &TEST_KEY)
+                .unwrap()
+                .failed_attempts,
+            0
+        );
     }
 
     #[test]
