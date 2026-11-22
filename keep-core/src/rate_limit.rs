@@ -18,7 +18,8 @@ use crate::error::{KeepError, StorageError};
 const MAX_ATTEMPTS: u32 = 5;
 const BASE_DELAY_SECS: u64 = 1;
 const MAX_DELAY_SECS: u64 = 300;
-const RECORD_SIZE: usize = 20;
+const RECORD_SIZE: usize = 48;
+const OLD_RECORD_SIZE: usize = 20;
 
 fn rate_limit_path(storage_path: &Path) -> PathBuf {
     if storage_path.is_dir() {
@@ -74,56 +75,104 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+// Attempts are numbered within an epoch: `counted` only grows, and a success
+// raises `cleared` to its own number. The live count is the difference, so
+// successes finishing in any order clear only what was counted up to them.
+// Once nothing is outstanding the record is emptied, leaving no count or time
+// behind, and the next attempt starts a new random epoch, so a success still
+// holding the old one clears nothing.
 struct RateLimitRecord {
-    failed_attempts: u32,
-    last_failure: u64,
+    epoch: [u8; 8],
+    counted: u64,
+    cleared: u64,
+    last_attempt: u64,
+    // The attempt that queued this cycle's trip; a cycle ends when `cleared`
+    // passes it.
+    tripped: u64,
 }
 
 impl RateLimitRecord {
     fn new() -> Self {
         Self {
-            failed_attempts: 0,
-            last_failure: 0,
+            epoch: [0; 8],
+            counted: 0,
+            cleared: 0,
+            last_attempt: 0,
+            tripped: 0,
         }
+    }
+
+    fn live(&self) -> u32 {
+        u32::try_from(self.counted.saturating_sub(self.cleared)).unwrap_or(u32::MAX)
     }
 
     fn to_bytes(&self, hmac_key: &[u8; 32]) -> [u8; RECORD_SIZE] {
         let mut data = [0u8; RECORD_SIZE];
-        data[0..4].copy_from_slice(&self.failed_attempts.to_le_bytes());
-        data[4..12].copy_from_slice(&self.last_failure.to_le_bytes());
-        let tag = compute_hmac(&data[0..12], hmac_key);
-        data[12..20].copy_from_slice(&tag);
+        data[0..8].copy_from_slice(&self.epoch);
+        data[8..16].copy_from_slice(&self.counted.to_le_bytes());
+        data[16..24].copy_from_slice(&self.cleared.to_le_bytes());
+        data[24..32].copy_from_slice(&self.last_attempt.to_le_bytes());
+        data[32..40].copy_from_slice(&self.tripped.to_le_bytes());
+        let tag = compute_hmac(&data[0..40], hmac_key);
+        data[40..48].copy_from_slice(&tag);
         data
     }
 
     fn from_bytes(data: &[u8], hmac_key: &[u8; 32]) -> Option<Self> {
-        if data.len() != RECORD_SIZE {
-            return None;
+        let u64_at = |i: usize| data[i..i + 8].try_into().ok().map(u64::from_le_bytes);
+        match data.len() {
+            RECORD_SIZE => {
+                let tag = compute_hmac(&data[0..40], hmac_key);
+                if !bool::from(data[40..48].ct_eq(&tag)) {
+                    return None;
+                }
+                Some(Self {
+                    epoch: data[0..8].try_into().ok()?,
+                    counted: u64_at(8)?,
+                    cleared: u64_at(16)?,
+                    last_attempt: u64_at(24)?,
+                    tripped: u64_at(32)?,
+                })
+            }
+            // Written by an earlier release, whose failures queued their own
+            // trip on reaching the limit.
+            OLD_RECORD_SIZE => {
+                let tag = compute_hmac(&data[0..12], hmac_key);
+                if !bool::from(data[12..20].ct_eq(&tag)) {
+                    return None;
+                }
+                let counted = u64::from(u32::from_le_bytes(data[0..4].try_into().ok()?));
+                Some(Self {
+                    epoch: [0; 8],
+                    counted,
+                    cleared: 0,
+                    last_attempt: u64_at(4)?,
+                    tripped: if counted >= u64::from(MAX_ATTEMPTS) {
+                        counted
+                    } else {
+                        0
+                    },
+                })
+            }
+            _ => None,
         }
-        let tag = compute_hmac(&data[0..12], hmac_key);
-        if !bool::from(data[12..20].ct_eq(&tag)) {
-            return None;
-        }
-        Some(Self {
-            failed_attempts: u32::from_le_bytes(data[0..4].try_into().ok()?),
-            last_failure: u64::from_le_bytes(data[4..12].try_into().ok()?),
-        })
     }
 
     fn delay_duration(&self) -> Duration {
-        if self.failed_attempts < MAX_ATTEMPTS {
+        let live = self.live();
+        if live < MAX_ATTEMPTS {
             return Duration::ZERO;
         }
-        let excess = self.failed_attempts - MAX_ATTEMPTS;
+        let excess = live - MAX_ATTEMPTS;
         let delay_secs = BASE_DELAY_SECS.saturating_mul(1u64 << excess.min(8));
         Duration::from_secs(delay_secs.min(MAX_DELAY_SECS))
     }
 
     fn remaining_delay(&self) -> Duration {
-        if self.last_failure == 0 {
+        if self.last_attempt == 0 {
             return Duration::ZERO;
         }
-        let elapsed = now_secs().saturating_sub(self.last_failure);
+        let elapsed = now_secs().saturating_sub(self.last_attempt);
         let required = self.delay_duration().as_secs();
         Duration::from_secs(required.saturating_sub(elapsed))
     }
@@ -139,6 +188,13 @@ fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> std::io::Resul
     Ok(RateLimitRecord::from_bytes(&data, hmac_key).unwrap_or_else(RateLimitRecord::new))
 }
 
+/// An attempt's place in the record, for `record_success`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Attempt {
+    epoch: [u8; 8],
+    number: u64,
+}
+
 /// Count an unlock attempt before its password is tried, or refuse it.
 ///
 /// Refuses while the record says to wait, and when the record cannot be
@@ -147,8 +203,7 @@ fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> std::io::Resul
 /// key derivation, or several attempts reading the same count at once. A
 /// success then clears the attempts counted up to its own, so only attempts
 /// that did not succeed stay counted.
-/// Returns the count this attempt wrote, for `record_success`.
-pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<u32, KeepError> {
+pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<Attempt, KeepError> {
     let rl_path = rate_limit_path(path);
     let unusable = |e: std::io::Error| {
         tracing::error!(error = %e, path = %rl_path.display(), "the unlock rate limit cannot be used, refusing the attempt");
@@ -167,21 +222,31 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<u32, Kee
         return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
     }
 
-    let (prior, prior_time) = (record.failed_attempts, record.last_failure);
-    record.failed_attempts = record.failed_attempts.saturating_add(1);
-    record.last_failure = now_secs();
+    let (prior, prior_time) = (record.live(), record.last_attempt);
+    if record.counted == 0 {
+        record.epoch = crate::crypto::try_random_bytes()?;
+    }
+    record.counted = record.counted.saturating_add(1);
+    record.last_attempt = now_secs();
+    // `prior` attempts are on disk with no success after them. The first
+    // attempt past the limit in a cycle queues the trip, under the lock, so it
+    // is recorded once and cannot be skipped by abandoning an attempt.
+    let trips = prior >= MAX_ATTEMPTS && record.tripped <= record.cleared;
+    if trips {
+        record.tripped = record.counted;
+    }
     file.seek(SeekFrom::Start(0))
         .and_then(|_| file.write_all(&record.to_bytes(hmac_key)))
         .and_then(|()| file.sync_all())
         .map_err(unusable)?;
 
-    // A success clears its own count, so `prior` attempts all failed or never
-    // finished. Queued here, under the lock, the trip is recorded once per
-    // cycle and cannot be skipped by abandoning an attempt.
-    if prior == MAX_ATTEMPTS {
+    if trips {
         record_trip(path, hmac_key, prior, prior_time);
     }
-    Ok(record.failed_attempts)
+    Ok(Attempt {
+        epoch: record.epoch,
+        number: record.counted,
+    })
 }
 
 fn open_rate_limit_file(path: &Path) -> std::io::Result<File> {
@@ -203,14 +268,13 @@ fn private_no_follow(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
-/// After the attempt `count_attempt` numbered `attempt` succeeded, clear it
-/// and every attempt counted before it, under the record's lock. Attempts
-/// counted after it are still in flight and stay counted, except that two
-/// successes running at once each clear their own count, so together they can
-/// clear one later attempt. The record is emptied or rewritten in place, never
-/// removed, so an attempt that opened it first cannot count on a file no later
-/// attempt can find.
-pub(crate) fn record_success(path: &Path, hmac_key: &[u8; 32], attempt: u32) {
+/// After `attempt` succeeded, clear it and every attempt numbered before it,
+/// under the record's lock. Attempts numbered after it stay counted, whatever
+/// order successes finish in. When that leaves nothing outstanding, the record
+/// is emptied, so a successful unlock leaves no count or time behind. The
+/// record is changed in place, never removed, so an attempt that opened it
+/// first counts where later ones look.
+pub(crate) fn record_success(path: &Path, hmac_key: &[u8; 32], attempt: Attempt) {
     let rl_path = rate_limit_path(path);
     let mut opts = OpenOptions::new();
     opts.read(true).write(true);
@@ -220,8 +284,11 @@ pub(crate) fn record_success(path: &Path, hmac_key: &[u8; 32], attempt: u32) {
     };
     let reset = FileExt::lock(&file).and_then(|()| {
         let mut record = read_record_from_file(&mut file, hmac_key)?;
-        record.failed_attempts = record.failed_attempts.saturating_sub(attempt);
-        if record.failed_attempts == 0 {
+        if record.epoch != attempt.epoch || record.counted == 0 {
+            return Ok(());
+        }
+        record.cleared = record.cleared.max(attempt.number.min(record.counted));
+        if record.live() == 0 {
             file.set_len(0)?;
         } else {
             file.seek(SeekFrom::Start(0))?;
@@ -232,6 +299,21 @@ pub(crate) fn record_success(path: &Path, hmac_key: &[u8; 32], attempt: u32) {
     if let Err(e) = reset {
         tracing::error!(error = %e, "the unlock rate limit could not be reset");
     }
+}
+
+/// Clear every attempt on the record.
+#[cfg(test)]
+pub(crate) fn reset_for_tests(path: &Path, hmac_key: &[u8; 32]) {
+    let Ok(mut file) = File::open(rate_limit_path(path)) else {
+        return;
+    };
+    let record = read_record_from_file(&mut file, hmac_key).unwrap();
+    drop(file);
+    let all = Attempt {
+        epoch: record.epoch,
+        number: u64::MAX,
+    };
+    record_success(path, hmac_key, all);
 }
 
 /// A persisted rate-limit trip event awaiting flush to the audit log.
@@ -323,8 +405,11 @@ fn record_trip(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32, timestamp
 #[cfg(test)]
 pub(crate) fn set_attempts_for_tests(path: &Path, hmac_key: &[u8; 32], failed_attempts: u32) {
     let record = RateLimitRecord {
-        failed_attempts,
-        last_failure: now_secs(),
+        epoch: [1; 8],
+        counted: u64::from(failed_attempts),
+        cleared: 0,
+        tripped: 0,
+        last_attempt: now_secs(),
     };
     fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
 }
@@ -334,7 +419,7 @@ pub(crate) fn set_attempts_for_tests(path: &Path, hmac_key: &[u8; 32], failed_at
 pub(crate) fn expire_delay_for_tests(path: &Path, hmac_key: &[u8; 32]) {
     let mut file = File::open(rate_limit_path(path)).unwrap();
     let mut record = read_record_from_file(&mut file, hmac_key).unwrap();
-    record.last_failure = 0;
+    record.last_attempt = 0;
     fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
 }
 
@@ -446,27 +531,27 @@ mod tests {
         let mut record = RateLimitRecord::new();
 
         for _ in 0..(MAX_ATTEMPTS - 1) {
-            record.failed_attempts += 1;
+            record.counted += 1;
         }
         assert_eq!(record.delay_duration(), Duration::ZERO);
 
-        record.failed_attempts += 1;
+        record.counted += 1;
         assert_eq!(record.delay_duration(), Duration::from_secs(1));
 
-        record.failed_attempts += 1;
+        record.counted += 1;
         assert_eq!(record.delay_duration(), Duration::from_secs(2));
 
-        record.failed_attempts += 1;
+        record.counted += 1;
         assert_eq!(record.delay_duration(), Duration::from_secs(4));
 
-        record.failed_attempts += 1;
+        record.counted += 1;
         assert_eq!(record.delay_duration(), Duration::from_secs(8));
     }
 
     #[test]
     fn test_max_delay_cap() {
         let mut record = RateLimitRecord::new();
-        record.failed_attempts = 50;
+        record.counted = 50;
         assert!(record.delay_duration().as_secs() <= MAX_DELAY_SECS);
     }
 
@@ -480,7 +565,7 @@ mod tests {
             fail(&path);
         }
 
-        record_success(&path, &TEST_KEY, u32::MAX);
+        reset_for_tests(&path, &TEST_KEY);
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
     }
 
@@ -502,9 +587,7 @@ mod tests {
 
     fn attempts(path: &Path) -> u32 {
         let mut file = File::open(rate_limit_path(path)).unwrap();
-        read_record_from_file(&mut file, &TEST_KEY)
-            .unwrap()
-            .failed_attempts
+        read_record_from_file(&mut file, &TEST_KEY).unwrap().live()
     }
 
     // Five attempts on disk, the back-off over, and a sixth started: the
@@ -530,7 +613,7 @@ mod tests {
             assert_eq!(attempts(&path), n);
         }
 
-        record_success(&path, &TEST_KEY, u32::MAX);
+        reset_for_tests(&path, &TEST_KEY);
         assert_eq!(attempts(&path), 0);
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
         assert_eq!(attempts(&path), 1);
@@ -617,9 +700,7 @@ mod tests {
         fs::write(rate_limit_path(&path), [0u8; 3]).unwrap();
         let mut short = File::open(rate_limit_path(&path)).unwrap();
         assert_eq!(
-            read_record_from_file(&mut short, &TEST_KEY)
-                .unwrap()
-                .failed_attempts,
+            read_record_from_file(&mut short, &TEST_KEY).unwrap().live(),
             0
         );
     }
@@ -634,11 +715,11 @@ mod tests {
         set_attempts_for_tests(&path, &TEST_KEY, 3);
 
         let mut opened_before = File::open(rate_limit_path(&path)).unwrap();
-        record_success(&path, &TEST_KEY, u32::MAX);
+        reset_for_tests(&path, &TEST_KEY);
         assert_eq!(
             read_record_from_file(&mut opened_before, &TEST_KEY)
                 .unwrap()
-                .failed_attempts,
+                .live(),
             0
         );
     }
@@ -654,12 +735,107 @@ mod tests {
         fail(&path);
         let mine = count_attempt(&path, &TEST_KEY).unwrap();
         let later = count_attempt(&path, &TEST_KEY).unwrap();
-        assert_eq!((mine, later), (2, 3));
+        assert_eq!((mine.number, later.number), (2, 3));
 
         record_success(&path, &TEST_KEY, mine);
         assert_eq!(attempts(&path), 1);
         record_success(&path, &TEST_KEY, later);
         assert_eq!(attempts(&path), 0);
+        assert_eq!(
+            fs::metadata(rate_limit_path(&path)).unwrap().len(),
+            0,
+            "a success with nothing outstanding leaves no count or time"
+        );
+    }
+
+    // A success still holding an epoch that has since been emptied clears
+    // nothing counted in the new one.
+    #[test]
+    fn a_success_from_an_ended_epoch_clears_nothing() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        let slow = count_attempt(&path, &TEST_KEY).unwrap();
+        let fast = count_attempt(&path, &TEST_KEY).unwrap();
+        record_success(&path, &TEST_KEY, fast);
+        fail(&path);
+        fail(&path);
+        record_success(&path, &TEST_KEY, slow);
+        assert_eq!(attempts(&path), 2);
+    }
+
+    // Two successes running at once, finishing in either order, still leave
+    // an attempt counted after both.
+    #[test]
+    fn overlapping_successes_keep_a_later_attempt() {
+        for first_finishes_first in [true, false] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("test-storage");
+            fs::create_dir(&path).unwrap();
+
+            let first = count_attempt(&path, &TEST_KEY).unwrap();
+            let second = count_attempt(&path, &TEST_KEY).unwrap();
+            fail(&path);
+            let order = if first_finishes_first {
+                [first, second]
+            } else {
+                [second, first]
+            };
+            for attempt in order {
+                record_success(&path, &TEST_KEY, attempt);
+            }
+            assert_eq!(attempts(&path), 1);
+        }
+    }
+
+    // A success finishing late, after the limit tripped, does not let the
+    // same run of failures trip again.
+    #[test]
+    fn a_late_success_does_not_trip_the_same_failures_twice() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        let slow = count_attempt(&path, &TEST_KEY).unwrap();
+        for _ in 0..MAX_ATTEMPTS {
+            fail(&path);
+        }
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
+        assert_eq!(drain_pending_trips(&path, &TEST_KEY).len(), 1);
+
+        record_success(&path, &TEST_KEY, slow);
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
+        assert!(drain_pending_trips(&path, &TEST_KEY).is_empty());
+    }
+
+    // A record from an earlier release keeps its count and its trip.
+    #[test]
+    fn an_earlier_releases_record_keeps_its_count() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+
+        let mut old = [0u8; OLD_RECORD_SIZE];
+        old[0..4].copy_from_slice(&(MAX_ATTEMPTS + 2).to_le_bytes());
+        old[4..12].copy_from_slice(&now_secs().to_le_bytes());
+        let tag = compute_hmac(&old[0..12], &TEST_KEY);
+        old[12..20].copy_from_slice(&tag);
+        fs::write(rate_limit_path(&path), old).unwrap();
+
+        assert_eq!(attempts(&path), MAX_ATTEMPTS + 2);
+        assert!(matches!(
+            count_attempt(&path, &TEST_KEY),
+            Err(KeepError::RateLimited(_))
+        ));
+        expire_delay_for_tests(&path, &TEST_KEY);
+        fail(&path);
+        assert!(
+            drain_pending_trips(&path, &TEST_KEY).is_empty(),
+            "the earlier release already queued this trip"
+        );
     }
 
     #[test]
@@ -689,8 +865,11 @@ mod tests {
     #[test]
     fn test_hmac_detects_corruption() {
         let record = RateLimitRecord {
-            failed_attempts: 10,
-            last_failure: 12345,
+            epoch: [1; 8],
+            counted: 10,
+            cleared: 0,
+            last_attempt: 12345,
+            tripped: 0,
         };
         let mut bytes = record.to_bytes(&TEST_KEY);
         bytes[0] ^= 0xFF;
@@ -700,8 +879,11 @@ mod tests {
     #[test]
     fn test_wrong_key_rejects_record() {
         let record = RateLimitRecord {
-            failed_attempts: 10,
-            last_failure: 12345,
+            epoch: [1; 8],
+            counted: 10,
+            cleared: 0,
+            last_attempt: 12345,
+            tripped: 0,
         };
         let bytes = record.to_bytes(&TEST_KEY);
         let wrong_key = [0xCD; 32];
@@ -757,7 +939,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
 
         trip(&path);
-        record_success(&path, &TEST_KEY, u32::MAX);
+        reset_for_tests(&path, &TEST_KEY);
 
         let trips = drain_pending_trips(&path, &TEST_KEY);
         assert_eq!(trips.len(), 1);
@@ -790,7 +972,7 @@ mod tests {
 
         for _ in 0..=MAX_TRIP_RECORDS {
             trip(&path);
-            record_success(&path, &TEST_KEY, u32::MAX);
+            reset_for_tests(&path, &TEST_KEY);
         }
 
         let trip_path = trip_log_path(&path);
