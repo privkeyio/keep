@@ -829,13 +829,15 @@ impl Storage {
 
     /// Unlock with the given password.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
-        if self.data_key.is_some() {
+        if self.data_key.is_some() && self.backend.is_some() {
             return Ok(());
         }
 
         self.unlock_inner(password)?;
 
-        let backend = RedbBackend::open(&self.path.join("keep.db"))?;
+        let backend = RedbBackend::open(&self.path.join("keep.db")).inspect_err(|_| {
+            self.data_key = None;
+        })?;
         self.backend = Some(Box::new(backend));
         Ok(())
     }
@@ -860,9 +862,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         let master_key = crypto::derive_key(
             password.as_bytes(),
@@ -874,18 +874,9 @@ impl Storage {
             nonce: self.header.nonce,
             ciphertext: self.header.encrypted_data_key.to_vec(),
         };
-        match crypto::decrypt(&encrypted, &header_key) {
-            Ok(_) => {
-                rate_limit::record_success(&self.path);
-                Ok(())
-            }
-            Err(e) => {
-                if matches!(e, KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                Err(e)
-            }
-        }
+        crypto::decrypt(&encrypted, &header_key)?;
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
+        Ok(())
     }
 
     /// Check whether `password` decrypts the vault header, WITHOUT touching the
@@ -924,9 +915,7 @@ impl Storage {
         validate_password_max_len(password)?;
 
         let hmac_key = rate_limit::derive_hmac_key(&self.header.salt);
-        if let Err(remaining) = rate_limit::check_rate_limit(&self.path, &hmac_key) {
-            return Err(KeepError::RateLimited(remaining.as_secs().max(1)));
-        }
+        let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
         debug!("deriving master key");
         let master_key = crypto::derive_key(
@@ -943,19 +932,11 @@ impl Storage {
         };
 
         debug!("decrypting data key");
-        let decrypted = match crypto::decrypt(&encrypted, &header_key) {
-            Ok(d) => d,
-            Err(e) => {
-                if matches!(e, KeepError::DecryptionFailed) {
-                    rate_limit::record_failure(&self.path, &hmac_key);
-                }
-                return Err(e);
-            }
-        };
+        let decrypted = crypto::decrypt(&encrypted, &header_key)?;
         let decrypted_bytes = decrypted.as_slice()?;
         self.data_key = Some(SecretKey::from_slice(&decrypted_bytes)?);
 
-        rate_limit::record_success(&self.path);
+        rate_limit::record_success(&self.path, &hmac_key, attempt);
         debug!("storage unlocked");
         Ok(())
     }
@@ -2757,6 +2738,33 @@ mod tests {
         }
     }
 
+    // A backend that fails to open after a correct password leaves the vault
+    // locked, so the next unlock opens it rather than reporting success.
+    #[test]
+    fn a_failed_backend_open_leaves_the_vault_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-keep");
+        Storage::create(&path, "password", Argon2Params::TESTING).unwrap();
+        let db = path.join("keep.db");
+        let aside = dir.path().join("keep.db.aside");
+        std::fs::rename(&db, &aside).unwrap();
+        std::fs::create_dir(&db).unwrap();
+
+        let mut storage = Storage::open(&path).unwrap();
+        assert!(storage.unlock("password").is_err());
+        assert!(!storage.is_unlocked());
+
+        std::fs::remove_dir(&db).unwrap();
+        std::fs::rename(&aside, &db).unwrap();
+        storage.unlock("password").unwrap();
+        assert!(storage.is_unlocked());
+        assert!(storage.backend.is_some());
+
+        storage.backend = None;
+        storage.unlock("password").unwrap();
+        assert!(storage.backend.is_some());
+    }
+
     #[test]
     fn open_missing_directory_reports_not_found() {
         let dir = tempdir().unwrap();
@@ -3137,15 +3145,13 @@ mod tests {
             assert!(matches!(result, Err(KeepError::DecryptionFailed)));
         }
 
-        // Bump failure count higher so the delay (4s) won't expire during test
-        // execution. Without this, the 1s delay at exactly 5 failures can expire
-        // on slow CI (Windows) between record_failure and check_rate_limit.
+        // Bump the count higher so the delay (4s) won't expire during test
+        // execution. Without this, the 1s delay at exactly 5 failures can
+        // expire on slow CI (Windows) before the next attempt is counted.
         {
             let storage = Storage::open(&path).unwrap();
             let hmac_key = rate_limit::derive_hmac_key(&storage.header.salt);
-            for _ in 0..2 {
-                rate_limit::record_failure(&path, &hmac_key);
-            }
+            rate_limit::set_attempts_for_tests(&path, &hmac_key, 7);
         }
 
         let mut storage = Storage::open(&path).unwrap();

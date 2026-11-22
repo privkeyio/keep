@@ -75,6 +75,7 @@ pub(crate) fn friendly_err(e: keep_core::error::KeepError) -> String {
         KeepError::HomeNotFound => "Home directory not found".into(),
         KeepError::UserRejected => "Operation cancelled".into(),
         KeepError::Io(_) => "File system error".into(),
+        KeepError::StorageErr(io @ keep_core::error::StorageError::Io { .. }) => io.to_string(),
         _ => {
             tracing::warn!("Unmapped keep error: {e}");
             "Operation failed".into()
@@ -275,6 +276,14 @@ pub(crate) fn default_bunker_relays() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_storage_io_error_shows_its_message() {
+        let e = keep_core::error::KeepError::StorageErr(keep_core::error::StorageError::io(
+            "the unlock attempt counter /v/.ratelimit cannot be used",
+        ));
+        assert!(friendly_err(e).contains("/v/.ratelimit"));
+    }
 
     fn write_store(dir: &std::path::Path, json: &str) {
         std::fs::write(cert_pins_path(dir), json).unwrap();

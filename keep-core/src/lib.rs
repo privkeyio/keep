@@ -305,7 +305,7 @@ impl Keep {
         for trip in trips {
             let trip_ts = trip.audit_time();
             let reason = format!(
-                "rate limit threshold reached after {} failed attempts",
+                "rate limit threshold reached after {} counted attempts with no recorded success",
                 trip.failed_attempts
             );
             self.audit_event(AuditEventType::RateLimitTripped, |mut e| {
@@ -3848,16 +3848,17 @@ mod tests {
 
         Storage::create(&path, "right-password", crypto::Argon2Params::TESTING).unwrap();
 
-        // Five failed attempts trips the limiter.
+        // Five failed attempts.
         for _ in 0..5 {
             let mut keep = Keep::open(&path).unwrap();
             let _ = keep.unlock("wrong-password");
         }
 
-        // The sixth attempt would hit the back-off; wait it out by clearing
-        // the active rate-limit counter (the trip event lives in a separate
-        // file that record_success deliberately does NOT touch).
-        crate::rate_limit::record_success(&path);
+        // Wait out the back-off. The next attempt finds five that did not
+        // succeed and trips the limiter.
+        let hmac_key =
+            crate::rate_limit::derive_hmac_key(&Storage::open(&path).unwrap().header.salt);
+        crate::rate_limit::expire_delay_for_tests(&path, &hmac_key);
 
         let mut keep = Keep::open(&path).unwrap();
         keep.unlock("right-password").unwrap();
