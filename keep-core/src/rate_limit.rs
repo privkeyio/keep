@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
-use std::fs::{self, File, OpenOptions};
+#[cfg(test)]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -201,9 +203,23 @@ fn no_follow(opts: &mut OpenOptions) {
     let _ = opts;
 }
 
+/// Reset the count by emptying the record in place under its lock. Removing
+/// it instead would let an attempt that opened it first count on a file no
+/// later attempt can find.
 pub(crate) fn record_success(path: &Path) {
     let rl_path = rate_limit_path(path);
-    let _ = fs::remove_file(rl_path);
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true);
+    no_follow(&mut opts);
+    let Ok(file) = opts.open(&rl_path) else {
+        return;
+    };
+    if let Err(e) = FileExt::lock(&file)
+        .and_then(|()| file.set_len(0))
+        .and_then(|()| file.sync_all())
+    {
+        tracing::error!(error = %e, "the unlock rate limit could not be reset");
+    }
 }
 
 /// A persisted rate-limit trip event awaiting flush to the audit log.
@@ -503,7 +519,7 @@ mod tests {
         }
 
         record_success(&path);
-        assert!(!rate_limit_path(&path).exists());
+        assert_eq!(attempts(&path), 0);
         assert!(count_attempt(&path, &TEST_KEY).is_ok());
         assert_eq!(attempts(&path), 1);
     }
@@ -590,6 +606,25 @@ mod tests {
         let mut short = File::open(rate_limit_path(&path)).unwrap();
         assert_eq!(
             read_record_from_file(&mut short, &TEST_KEY)
+                .unwrap()
+                .failed_attempts,
+            0
+        );
+    }
+
+    // An attempt that opened the record before a reset counts on the record
+    // every later attempt reads, not on a detached copy.
+    #[test]
+    fn a_reset_keeps_the_record_an_earlier_open_sees() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-storage");
+        fs::create_dir(&path).unwrap();
+        set_attempts_for_tests(&path, &TEST_KEY, 3);
+
+        let mut opened_before = File::open(rate_limit_path(&path)).unwrap();
+        record_success(&path);
+        assert_eq!(
+            read_record_from_file(&mut opened_before, &TEST_KEY)
                 .unwrap()
                 .failed_attempts,
             0
