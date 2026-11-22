@@ -145,7 +145,7 @@ fn read_record_from_file(file: &mut File, hmac_key: &[u8; 32]) -> std::io::Resul
 /// opened, locked, written or synced: an attempt that is not on disk before
 /// the password check could go uncounted, through a full disk, a crash during
 /// key derivation, or several attempts reading the same count at once. A
-/// success then removes the record, so only attempts that did not succeed
+/// success then empties the record, so only attempts that did not succeed
 /// stay counted.
 pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), KeepError> {
     let rl_path = rate_limit_path(path);
@@ -174,7 +174,7 @@ pub(crate) fn count_attempt(path: &Path, hmac_key: &[u8; 32]) -> Result<(), Keep
         .and_then(|()| file.sync_all())
         .map_err(unusable)?;
 
-    // A success removes the record, so `prior` attempts all failed or never
+    // A success empties the record, so `prior` attempts all failed or never
     // finished. Queued here, under the lock, the trip is recorded once per
     // cycle and cannot be skipped by abandoning an attempt.
     if prior == MAX_ATTEMPTS {
