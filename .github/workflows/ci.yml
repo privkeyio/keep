@@ -58,7 +58,7 @@ jobs:
       # --all-targets so test code is linted too, and the features named
       # explicitly rather than arriving through workspace feature unification,
       # which silently decided whether the ed25519 module was linted at all.
-      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519 -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519,keep-desktop/test-approver -- -D warnings
       # The reproducible and Debian builds run only on pushes and tags, so a
       # workspace member missing from their Dockerfiles is caught here instead.
       - run: scripts/check-dockerfile-members.sh
@@ -116,6 +116,7 @@ jobs:
       # tests were type-checked by clippy and never run. That is the ciphersuite
       # whose 64-byte scalar fill the draw criteria are written around.
       - run: cargo test -p keep-core --features ed25519 --lib
+      - run: cargo test -p keep-desktop --features test-approver --bins
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
       - run: cargo test -p keep-frost-net --features testing --test taproot_key_spend_memory_test
