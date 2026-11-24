@@ -197,17 +197,21 @@ fn is_too_far_ahead(event: &Event, now: Timestamp) -> bool {
     event.created_at > now + std::time::Duration::from_secs(REQUEST_FUTURE_SKEW_SECS)
 }
 
-async fn add_relays(
-    client: &Client,
-    relay_urls: &[String],
-    proxy: Option<SocketAddr>,
-) -> Result<()> {
+fn relay_options(proxy: Option<SocketAddr>) -> nostr_sdk::RelayOptions {
     let opts = nostr_sdk::RelayOptions::default()
         .reconnect(true)
         .ping(true)
         .retry_interval(std::time::Duration::from_secs(10))
         .adjust_retry_interval(true);
-    let opts = keep_frost_net::with_proxy(opts, proxy);
+    keep_frost_net::with_proxy(opts, proxy)
+}
+
+async fn add_relays(
+    client: &Client,
+    relay_urls: &[String],
+    proxy: Option<SocketAddr>,
+) -> Result<()> {
+    let opts = relay_options(proxy);
 
     for relay_url in relay_urls {
         client
@@ -1017,9 +1021,103 @@ pub(crate) async fn dispatch_request(
     }
 }
 
+/// A handle on a bunker's relay pool and transport key that stays usable
+/// after the server itself has moved into the task that runs it. It lets a
+/// caller reach a `nostrconnect://` client on relays the client picked
+/// without replacing the bunker's own.
+///
+/// Added relays inherit the bunker's subscription and dial through the same
+/// transport, so the TLS pinning the server was built with applies to them.
+#[derive(Clone)]
+pub struct ServerRelays {
+    client: Client,
+    keys: Keys,
+}
+
+impl ServerRelays {
+    /// Adds `relay_urls` to the pool and connects to each, returning those it
+    /// reached within `timeout`. A relay added here that cannot be reached is
+    /// removed again; one the pool already held is left as it was.
+    pub async fn connect_additional(
+        &self,
+        relay_urls: &[String],
+        proxy: Option<SocketAddr>,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<String>> {
+        let opts = relay_options(proxy);
+        let mut connected = Vec::new();
+        for url in relay_urls {
+            let added = self
+                .client
+                .pool()
+                .add_relay(url, opts.clone())
+                .await
+                .map_err(|e| NetworkError::relay(e.to_string()))?;
+            match self.client.try_connect_relay(url, timeout).await {
+                Ok(()) => connected.push(url.clone()),
+                Err(e) => {
+                    warn!(relay = %url, error = %e, "could not reach a nostrconnect relay");
+                    if added {
+                        let _ = self.client.force_remove_relay(url).await;
+                    }
+                }
+            }
+        }
+        Ok(connected)
+    }
+
+    /// Answers a `nostrconnect://` request on `relay_urls`: a kind 24133
+    /// event signed with the transport key and NIP-44 encrypted to the
+    /// client, whose `result` is the client's own secret. Succeeds only when
+    /// at least one relay accepted it.
+    pub async fn send_nostrconnect_response(
+        &self,
+        request: &crate::bunker::NostrConnectRequest,
+        relay_urls: &[String],
+    ) -> Result<()> {
+        let response_id = keep_core::crypto::try_random_bytes::<16>()?;
+        let response = serde_json::json!({
+            "id": hex::encode(response_id),
+            "result": request.secret,
+        });
+        let response_json = Zeroizing::new(
+            serde_json::to_string(&response)
+                .map_err(|e| StorageError::serialization(e.to_string()))?,
+        );
+        let encrypted = nip44::encrypt(
+            self.keys.secret_key(),
+            &request.client_pubkey,
+            response_json.as_str(),
+            nip44::Version::V2,
+        )
+        .map_err(|e| CryptoError::encryption(e.to_string()))?;
+        let event = EventBuilder::new(Kind::NostrConnect, encrypted)
+            .tag(Tag::public_key(request.client_pubkey))
+            .sign_with_keys(&self.keys)
+            .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
+
+        let output = self
+            .client
+            .send_event_to(relay_urls, &event)
+            .await
+            .map_err(|e| NetworkError::relay(format!("send event: {e}")))?;
+        if output.success.is_empty() {
+            return Err(NetworkError::relay("no relay accepted the connect response").into());
+        }
+        Ok(())
+    }
+}
+
 impl Server {
     pub fn handler(&self) -> Arc<SignerHandler> {
         self.handler.clone()
+    }
+
+    pub fn relays(&self) -> ServerRelays {
+        ServerRelays {
+            client: self.client.clone(),
+            keys: self.keys.clone(),
+        }
     }
 
     #[allow(dead_code)]
