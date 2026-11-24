@@ -421,6 +421,13 @@ pub(crate) fn set_attempts_for_tests(path: &Path, hmac_key: &[u8; 32], failed_at
     fs::write(rate_limit_path(path), record.to_bytes(hmac_key)).unwrap();
 }
 
+/// The attempts counted with no success after them.
+#[cfg(test)]
+pub(crate) fn live_attempts_for_tests(path: &Path, hmac_key: &[u8; 32]) -> u32 {
+    let mut file = File::open(rate_limit_path(path)).unwrap();
+    read_record_from_file(&mut file, hmac_key).unwrap().live()
+}
+
 /// Let the current back-off run out, keeping the count, as waiting would.
 #[cfg(test)]
 pub(crate) fn expire_delay_for_tests(path: &Path, hmac_key: &[u8; 32]) {
