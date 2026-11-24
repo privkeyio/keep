@@ -210,6 +210,15 @@ impl TestApprover {
     /// Pairs with a fresh approver key, as the Keystore makes one per
     /// pairing, and returns the fingerprint to compare with the gateway's.
     pub fn pair(&self, uri: &str) -> Result<String, String> {
+        self.pair_with(uri, Arc::new(Log(self.log.clone())))
+    }
+
+    /// [`Self::pair`], with events going to `callbacks` instead of the log.
+    pub fn pair_with(
+        &self,
+        uri: &str,
+        callbacks: Arc<dyn ApproverCallbacks>,
+    ) -> Result<String, String> {
         let challenge = self
             .handler
             .pairing_attestation_challenge(uri.to_string())
@@ -235,7 +244,7 @@ impl TestApprover {
         let signature = self.sign(&start.digest);
         self.handler
             .clone()
-            .finish_pairing(signature, attestation.0, Arc::new(Log(self.log.clone())))
+            .finish_pairing(signature, attestation.0, callbacks)
             .map_err(err)?;
         Ok(start.fingerprint)
     }
