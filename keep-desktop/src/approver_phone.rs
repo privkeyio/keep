@@ -3,8 +3,9 @@
 
 //! `keep-desktop phone <uri>`: the test approver without a window, for
 //! `scripts/gateway-approvals-e2e.sh` with `KEEP_E2E_PHONE` naming this
-//! binary. It takes and prints the lines keep-mobile's `mobile_approver`
-//! example does, driving the same approver the Test Approver screen does.
+//! binary. It prints the lines keep-mobile's `mobile_approver` example
+//! does and takes its commands, with freezes for `all` only, driving the
+//! same approver the Test Approver screen does.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -38,11 +39,12 @@ impl ApproverCallbacks for Printer {
                 say(&format!("refused {reason} ended={ended}"))
             }
             ApproverEvent::Request { request } => {
+                // Queued before it is reported, so an answer to the line finds it.
+                self.requests().push_back(request.request_id.clone());
                 say(&format!(
                     "request {} \"{}\" {}",
                     request.request_id, request.op, request.reason
                 ));
-                self.requests().push_back(request.request_id);
             }
             ApproverEvent::RequestRefused { reason } => say(&format!("bad-request {reason}")),
             ApproverEvent::RequestExpired { request_id } => {
