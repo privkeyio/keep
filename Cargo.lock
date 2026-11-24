@@ -4670,7 +4670,7 @@ dependencies = [
  "nostr-relay-builder",
  "nostr-sdk",
  "p256",
- "qrcode 0.14.1",
+ "qrcode 0.15.0",
  "ratatui",
  "reqwest",
  "rustls",
@@ -7280,9 +7280,9 @@ checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
 
 [[package]]
 name = "qrcode"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+checksum = "ace1a365f55004297f2cf24acfd96d02966246ca423385273b58a7dc873ee14d"
 
 [[package]]
 name = "quick-error"
