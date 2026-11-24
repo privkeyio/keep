@@ -31,7 +31,7 @@ pub fn generate_bunker_url(
     url
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NostrConnectRequest {
     pub client_pubkey: PublicKey,
     pub relays: Vec<String>,
@@ -40,6 +40,20 @@ pub struct NostrConnectRequest {
     pub url: Option<String>,
     pub image: Option<String>,
     pub perms: Option<String>,
+}
+
+impl std::fmt::Debug for NostrConnectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NostrConnectRequest")
+            .field("client_pubkey", &self.client_pubkey)
+            .field("relays", &self.relays)
+            .field("secret", &"<redacted>")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("image", &self.image)
+            .field("perms", &self.perms)
+            .finish()
+    }
 }
 
 const MAX_NOSTRCONNECT_RELAYS: usize = 10;
@@ -53,6 +67,19 @@ fn validate_metadata_url(value: &str) -> Result<String, String> {
         "https" => Ok(parsed.to_string()),
         _ => Err("only https:// URLs are allowed".into()),
     }
+}
+
+/// A `nostrconnect://` relay as it is dialed, or `None` when it is unusable.
+/// One carrying a control character is refused rather than cleaned, and the
+/// default port is dropped, so spellings of one relay compare equal.
+fn nostrconnect_relay(value: &str, validate: fn(&str) -> Result<(), String>) -> Option<String> {
+    if value.chars().any(char::is_control) || validate(value).is_err() {
+        return None;
+    }
+    let normalized = normalize_relay_url(value);
+    ::url::Url::parse(&normalized)
+        .ok()
+        .map(|url| url.to_string())
 }
 
 fn sanitize_display_name(name: &str) -> String {
@@ -93,8 +120,12 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     for (key, value) in parsed.query_pairs() {
         match key.as_ref() {
             "relay" => {
-                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate(&value).is_ok() {
-                    relays.push(normalize_relay_url(&value));
+                if relays.len() < MAX_NOSTRCONNECT_RELAYS {
+                    if let Some(relay) = nostrconnect_relay(&value, validate) {
+                        if !relays.contains(&relay) {
+                            relays.push(relay);
+                        }
+                    }
                 }
             }
             "secret" => secret = Some(value.to_string()),
@@ -433,6 +464,50 @@ mod tests {
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.relays.len(), MAX_NOSTRCONNECT_RELAYS);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_joins_one_relay_once() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2FR.EXAMPLE.COM&relay=wss%3A%2F%2Fr.example.com%2F&relay=wss%3A%2F%2Fr.example.com%3A443%2F&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://r.example.com/"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_drops_a_relay_with_control_chars() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com%2F%00x&relay=wss%3A%2F%2Fr.example.com%2Fa%0Ab&relay=wss%3A%2F%2Fok.example.com&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://ok.example.com/"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_keeps_a_relay_query_last() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com%3Fauth%3D1&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://r.example.com/?auth=1"]);
+    }
+
+    #[test]
+    fn test_nostrconnect_request_debug_hides_the_secret() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert!(!format!("{req:?}").contains("abcdef0123456789"));
     }
 
     #[test]

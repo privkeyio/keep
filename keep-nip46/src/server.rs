@@ -163,6 +163,10 @@ pub struct Server {
     relay_url: String,
     relay_urls: Vec<String>,
     client: Client,
+    /// `relay_urls`, as the pool keys them.
+    own_relays: Arc<[RelayUrl]>,
+    routes: ClientRoutes,
+    joining: Arc<Mutex<()>>,
     handler: Arc<SignerHandler>,
     running: bool,
     callbacks: Option<Arc<dyn ServerCallbacks>>,
@@ -344,6 +348,12 @@ impl Server {
             keys,
             relay_url: relay_urls[0].clone(),
             relay_urls: relay_urls.to_vec(),
+            own_relays: relay_urls
+                .iter()
+                .filter_map(|url| RelayUrl::parse(url).ok())
+                .collect(),
+            routes: ClientRoutes::default(),
+            joining: Arc::new(Mutex::new(())),
             client,
             handler: Arc::new(handler),
             running: false,
@@ -610,9 +620,11 @@ impl Server {
         self.keys.secret_key().clone()
     }
 
+    /// Sends `event` to the bunker's own relays, not to any a
+    /// `nostrconnect://` client added.
     pub async fn send_event(&self, event: &Event) -> Result<()> {
         self.client
-            .send_event(event)
+            .send_event_to(self.own_relays.iter(), event)
             .await
             .map_err(|e| NetworkError::relay(format!("send event: {e}")))?;
         Ok(())
@@ -671,6 +683,8 @@ impl Server {
         let handler = self.handler.clone();
         let keys = self.keys.clone();
         let client = self.client.clone();
+        let own_relays = Arc::clone(&self.own_relays);
+        let routes = Arc::clone(&self.routes);
         let callbacks = self.callbacks.clone();
         let max_event_json_size = self.config.max_event_json_size;
         let since = self.serving_since;
@@ -679,12 +693,16 @@ impl Server {
             let handler = handler.clone();
             let keys = keys.clone();
             let client = client.clone();
+            let own_relays = Arc::clone(&own_relays);
+            let routes = Arc::clone(&routes);
             let callbacks = callbacks.clone();
             Box::pin(async move {
+                let relays = response_relays(&own_relays, &routes, &event.pubkey);
                 if let Err(e) = Self::handle_nip46_event(
                     &handler,
                     &keys,
                     &client,
+                    &relays,
                     &event,
                     callbacks.as_deref(),
                     max_event_json_size,
@@ -738,6 +756,7 @@ impl Server {
         handler: &SignerHandler,
         keys: &Keys,
         client: &Client,
+        relays: &[RelayUrl],
         event: &Event,
         callbacks: Option<&dyn ServerCallbacks>,
         max_event_json_size: usize,
@@ -816,8 +835,8 @@ impl Server {
             .sign_with_keys(keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
 
-        if let Err(e) = client.send_event(&response_event).await {
-            error!(error = %e, "failed to send response");
+        if send_to_relays(client, relays, &response_event).await == 0 {
+            error!("failed to send response: no relay accepted it");
         }
 
         Ok(())
@@ -1021,60 +1040,218 @@ pub(crate) async fn dispatch_request(
     }
 }
 
+/// The relays each `nostrconnect://` client picked, keyed by the client. Its
+/// responses go to these as well as the bunker's own relays; no other
+/// client's response is sent to them.
+type ClientRoutes = Arc<std::sync::RwLock<std::collections::HashMap<PublicKey, Vec<RelayUrl>>>>;
+
+/// Sends `event` to each of `urls` the pool holds, all at once and without the
+/// pool's lock held while a relay is awaited, so a relay slow to answer holds
+/// up only the send that went to it. Returns how many relays accepted it.
+async fn send_to_relays(client: &Client, urls: &[RelayUrl], event: &Event) -> usize {
+    let mut sends = tokio::task::JoinSet::new();
+    for url in urls {
+        match client.relay(url).await {
+            Ok(relay) => {
+                let event = event.clone();
+                sends.spawn(async move { relay.send_event(&event).await.is_ok() });
+            }
+            Err(e) => debug!(relay = %url, error = %e, "relay left the pool before a send"),
+        }
+    }
+    let mut accepted = 0;
+    while let Some(sent) = sends.join_next().await {
+        if matches!(sent, Ok(true)) {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+/// The relays a response to `app` goes to: the bunker's own and, for a
+/// `nostrconnect://` client, the ones it picked.
+fn response_relays(own: &[RelayUrl], routes: &ClientRoutes, app: &PublicKey) -> Vec<RelayUrl> {
+    let mut urls = own.to_vec();
+    let routes = routes.read().unwrap_or_else(|e| e.into_inner());
+    for url in routes.get(app).into_iter().flatten() {
+        if !urls.contains(url) {
+            urls.push(url.clone());
+        }
+    }
+    urls
+}
+
+/// Parses `relay_urls` and drops any naming a relay listed earlier, however
+/// it was spelled.
+fn distinct_relay_urls(relay_urls: &[String]) -> Result<Vec<RelayUrl>> {
+    let mut urls: Vec<RelayUrl> = Vec::with_capacity(relay_urls.len());
+    for url in relay_urls {
+        let url = RelayUrl::parse(url).map_err(|e| NetworkError::relay(e.to_string()))?;
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    Ok(urls)
+}
+
 /// A handle on a bunker's relay pool and transport key that stays usable
 /// after the server itself has moved into the task that runs it. It lets a
 /// caller reach a `nostrconnect://` client on relays the client picked
 /// without replacing the bunker's own.
 ///
 /// Added relays inherit the bunker's subscription and dial through the same
-/// transport, so the TLS pinning the server was built with applies to them.
+/// transport, so the TLS pinning the server was built with is enforced on
+/// their handshakes against the pin set it holds. That set is the one
+/// [`ServerRelays::tls_pinning`] returns: a pin the caller learns for a new
+/// host must be added to it before the host is joined, or the handshake gets
+/// only standard certificate validation.
+///
+/// A client's relays only carry that client's responses: every response goes
+/// to the bunker's own relays and the requester's own ones, never to relays
+/// another client picked.
 #[derive(Clone)]
 pub struct ServerRelays {
     client: Client,
     keys: Keys,
+    routes: ClientRoutes,
+    joining: Arc<Mutex<()>>,
+    tls_pinning: Option<keep_frost_net::TlsPinning>,
+}
+
+/// Relays a [`ServerRelays::join`] reached for one client. Joins are taken
+/// one at a time until this is handed to [`ServerRelays::route`] or
+/// [`ServerRelays::abandon`], so a relay one join added is never one another
+/// counts on.
+pub struct JoinedRelays {
+    reached: Vec<RelayUrl>,
+    added: Vec<RelayUrl>,
+    _one_at_a_time: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl JoinedRelays {
+    pub fn reached(&self) -> Vec<String> {
+        self.reached.iter().map(ToString::to_string).collect()
+    }
 }
 
 impl ServerRelays {
-    /// Adds `relay_urls` to the pool and connects to each, returning those it
-    /// reached within `timeout`. A relay added here that cannot be reached is
-    /// removed again; one the pool already held is left as it was.
-    pub async fn connect_additional(
+    /// The pinning the bunker's transport enforces, when it was built with
+    /// one.
+    pub fn tls_pinning(&self) -> Option<&keep_frost_net::TlsPinning> {
+        self.tls_pinning.as_ref()
+    }
+
+    /// Adds `relay_urls` to the pool and connects to them all at once, each
+    /// given `timeout`, keeping those reached. Equivalent spellings of one
+    /// relay are joined once. A relay added here that cannot be reached is
+    /// removed again, as is every one added when the call fails; one the pool
+    /// already held is left as it was. Fails when none is reached.
+    pub async fn join(
         &self,
         relay_urls: &[String],
         proxy: Option<SocketAddr>,
         timeout: std::time::Duration,
-    ) -> Result<Vec<String>> {
+    ) -> Result<JoinedRelays> {
+        debug_assert!(relay_urls.len() <= keep_core::relay::MAX_RELAYS);
+        let urls = distinct_relay_urls(relay_urls)?;
+        // Waiting on another join counts against `timeout`, so the call as a
+        // whole never runs past it.
+        let started = tokio::time::Instant::now();
+        let one_at_a_time = tokio::time::timeout(timeout, Arc::clone(&self.joining).lock_owned())
+            .await
+            .map_err(|_| NetworkError::timeout("waiting on another nostrconnect join"))?;
+        let timeout = timeout.saturating_sub(started.elapsed());
+        let mut joined = JoinedRelays {
+            reached: Vec::new(),
+            added: Vec::new(),
+            _one_at_a_time: one_at_a_time,
+        };
         let opts = relay_options(proxy);
-        let mut connected = Vec::new();
-        for url in relay_urls {
-            let added = self
-                .client
-                .pool()
-                .add_relay(url, opts.clone())
-                .await
-                .map_err(|e| NetworkError::relay(e.to_string()))?;
-            match self.client.try_connect_relay(url, timeout).await {
-                Ok(()) => connected.push(url.clone()),
+        for url in &urls {
+            match self.client.pool().add_relay(url, opts.clone()).await {
+                Ok(true) => joined.added.push(url.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    self.remove_relays(&joined.added).await;
+                    return Err(NetworkError::relay(e.to_string()).into());
+                }
+            }
+        }
+        let mut attempts = tokio::task::JoinSet::new();
+        for url in urls {
+            let client = self.client.clone();
+            attempts.spawn(async move {
+                let result = client.try_connect_relay(&url, timeout).await;
+                (url, result)
+            });
+        }
+        let mut unreached = Vec::new();
+        while let Some(attempt) = attempts.join_next().await {
+            let Ok((url, result)) = attempt else { continue };
+            match result {
+                Ok(()) => joined.reached.push(url),
                 Err(e) => {
                     warn!(relay = %url, error = %e, "could not reach a nostrconnect relay");
-                    if added {
-                        let _ = self.client.force_remove_relay(url).await;
+                    if joined.added.contains(&url) {
+                        unreached.push(url);
                     }
                 }
             }
         }
-        Ok(connected)
+        joined.added.retain(|url| !unreached.contains(url));
+        self.remove_relays(&unreached).await;
+        if joined.reached.is_empty() {
+            self.abandon(joined, None).await;
+            return Err(NetworkError::relay("none of the client's relays could be reached").into());
+        }
+        Ok(joined)
     }
 
-    /// Answers a `nostrconnect://` request on `relay_urls`: a kind 24133
-    /// event signed with the transport key and NIP-44 encrypted to the
-    /// client, whose `result` is the client's own secret. Succeeds only when
-    /// at least one relay accepted it.
+    /// Sends `client`'s responses to the relays `joined` reached as well as
+    /// the bunker's own, from now until the server stops or
+    /// [`ServerRelays::abandon`] is called for it.
+    pub fn route(&self, joined: &JoinedRelays, client: PublicKey) {
+        self.routes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(client, joined.reached.clone());
+    }
+
+    /// Undoes a join: `client`'s route is dropped and the relays the join
+    /// added are removed from the pool.
+    pub async fn abandon(&self, joined: JoinedRelays, client: Option<PublicKey>) {
+        if let Some(client) = client {
+            self.routes
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&client);
+        }
+        self.remove_relays(&joined.added).await;
+    }
+
+    /// Whether the pool holds `url`.
+    pub async fn holds(&self, url: &str) -> bool {
+        self.client.relay(url).await.is_ok()
+    }
+
+    async fn remove_relays(&self, urls: &[RelayUrl]) {
+        for url in urls {
+            if let Err(e) = self.client.force_remove_relay(url).await {
+                warn!(relay = %url, error = %e, "could not remove a nostrconnect relay");
+            }
+        }
+    }
+
+    /// Answers a `nostrconnect://` request on the relays `joined` reached: a
+    /// kind 24133 event signed with the transport key and NIP-44 encrypted to
+    /// the client, whose `result` is the client's own secret. Succeeds only
+    /// when at least one relay accepted it.
     pub async fn send_nostrconnect_response(
         &self,
         request: &crate::bunker::NostrConnectRequest,
-        relay_urls: &[String],
+        joined: &JoinedRelays,
     ) -> Result<()> {
+        debug_assert!(!joined.reached.is_empty());
         let response_id = keep_core::crypto::try_random_bytes::<16>()?;
         let response = serde_json::json!({
             "id": hex::encode(response_id),
@@ -1092,16 +1269,12 @@ impl ServerRelays {
         )
         .map_err(|e| CryptoError::encryption(e.to_string()))?;
         let event = EventBuilder::new(Kind::NostrConnect, encrypted)
+            .custom_created_at(Timestamp::tweaked(TIMESTAMP_TWEAK_RANGE))
             .tag(Tag::public_key(request.client_pubkey))
             .sign_with_keys(&self.keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
 
-        let output = self
-            .client
-            .send_event_to(relay_urls, &event)
-            .await
-            .map_err(|e| NetworkError::relay(format!("send event: {e}")))?;
-        if output.success.is_empty() {
+        if send_to_relays(&self.client, &joined.reached, &event).await == 0 {
             return Err(NetworkError::relay("no relay accepted the connect response").into());
         }
         Ok(())
@@ -1117,14 +1290,24 @@ impl Server {
         ServerRelays {
             client: self.client.clone(),
             keys: self.keys.clone(),
+            routes: Arc::clone(&self.routes),
+            joining: Arc::clone(&self.joining),
+            tls_pinning: self.config.tls_pinning.clone(),
         }
     }
 
+    /// Stops serving and shuts the relay pool down, dropping every relay a
+    /// `nostrconnect://` client added. The server cannot be started again,
+    /// and a [`ServerRelays`] taken from it can no longer join a relay.
     #[allow(dead_code)]
     pub async fn stop(&mut self) {
         self.handler.revoke_session_apps().await;
         self.running = false;
-        self.client.disconnect().await;
+        self.client.shutdown().await;
+        self.routes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }
 
@@ -1174,6 +1357,95 @@ mod tests {
         add_relays(&direct, &relays, None).await.unwrap();
         let relay = direct.relay(&relays[0]).await.unwrap();
         assert_eq!(*relay.connection_mode(), ConnectionMode::Direct);
+    }
+
+    // A response goes to the bunker's own relays and the requester's own
+    // ones, never to relays another client picked.
+    #[test]
+    fn a_response_goes_only_to_its_requesters_relays() {
+        let own = vec![RelayUrl::parse("wss://own.example.com").unwrap()];
+        let theirs = RelayUrl::parse("wss://theirs.example.com").unwrap();
+        let picker = Keys::generate().public_key();
+        let other = Keys::generate().public_key();
+        let routes = ClientRoutes::default();
+        routes
+            .write()
+            .unwrap()
+            .insert(picker, vec![theirs.clone(), own[0].clone()]);
+
+        assert_eq!(response_relays(&own, &routes, &other), own);
+        assert_eq!(
+            response_relays(&own, &routes, &picker),
+            vec![own[0].clone(), theirs]
+        );
+    }
+
+    // A join reaches each relay once however it is spelled, keeps what it
+    // reached, and drops what it added and could not reach; abandoning it
+    // removes what it added and leaves what the pool held before.
+    #[tokio::test]
+    async fn a_join_leaves_the_pool_as_it_found_it_when_abandoned() {
+        let own = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let own_url = own.url().await.to_string();
+        let theirs = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let their_url = theirs.url().await.to_string();
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("ws://{}", listener.local_addr().unwrap())
+        };
+        let mut keyring = Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let server = Server::new(
+            Arc::new(Mutex::new(keyring)),
+            std::slice::from_ref(&own_url),
+            None,
+        )
+        .await
+        .unwrap();
+        let relays = server.relays();
+
+        let asked = [
+            own_url.clone(),
+            their_url.clone(),
+            their_url.replacen("ws://", "WS://", 1),
+            closed.clone(),
+        ];
+        let joined = relays
+            .join(&asked, None, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut reached = joined.reached();
+        reached.sort();
+        let mut expected = vec![own_url.clone(), their_url.clone()];
+        expected.sort();
+        assert_eq!(reached, expected);
+        assert!(relays.holds(&their_url).await);
+        assert!(
+            !relays.holds(&closed).await,
+            "an unreached relay is dropped"
+        );
+
+        relays.abandon(joined, None).await;
+        assert!(relays.holds(&own_url).await, "the bunker's own relay stays");
+        assert!(!relays.holds(&their_url).await);
+
+        let none = relays
+            .join(
+                std::slice::from_ref(&closed),
+                None,
+                std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(none.is_err());
+        assert!(!relays.holds(&closed).await);
     }
 
     // An explicitly-configured `expected_secret` must surface as the bunker

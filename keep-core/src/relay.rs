@@ -349,20 +349,25 @@ pub fn default_frost_relays() -> Vec<String> {
 /// Normalize a relay URL: trim whitespace, lowercase scheme+host, ensure trailing slash.
 pub fn normalize_relay_url(url: &str) -> String {
     let url = url.trim();
-    let result = if let Some(idx) = url.find("://") {
+    // A query or fragment is kept as it is, after the path rather than with
+    // a slash appended to it.
+    let (url, tail) = url.split_at(url.find(['?', '#']).unwrap_or(url.len()));
+    let (result, has_path) = if let Some(idx) = url.find("://") {
         let scheme = url[..idx].to_lowercase();
         let rest = &url[idx + 3..];
         let host_end = rest.find('/').unwrap_or(rest.len());
         let host = rest[..host_end].to_lowercase();
         let path = &rest[host_end..];
-        format!("{scheme}://{host}{path}")
+        (format!("{scheme}://{host}{path}"), !path.is_empty())
     } else {
-        url.to_string()
+        (url.to_string(), false)
     };
-    if result.ends_with('/') {
+    if tail.is_empty() && result.ends_with('/') {
         result
+    } else if tail.is_empty() || !has_path {
+        format!("{result}/{tail}")
     } else {
-        format!("{result}/")
+        format!("{result}{tail}")
     }
 }
 
@@ -831,6 +836,22 @@ mod tests {
         assert_eq!(
             normalize_relay_url("wss://Relay.Example.COM/"),
             normalize_relay_url("wss://relay.example.com/")
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_a_query_or_fragment_last() {
+        assert_eq!(
+            normalize_relay_url("wss://Relay.Example.com?auth=1"),
+            "wss://relay.example.com/?auth=1"
+        );
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com/inbox?auth=1"),
+            "wss://relay.example.com/inbox?auth=1"
+        );
+        assert_eq!(
+            normalize_relay_url("wss://relay.example.com#frag"),
+            "wss://relay.example.com/#frag"
         );
     }
 
