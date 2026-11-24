@@ -458,6 +458,15 @@ impl HiddenStorage {
     /// Unlock whichever volume the password matches.
     /// Returns the type that was unlocked.
     pub fn unlock(&mut self, password: &str) -> Result<VolumeType> {
+        // An unlocked volume would pass any password below, so each call
+        // would test the other volume's password and clear the counter.
+        if let Some(volume) = self.active_volume {
+            if volume == VolumeType::Outer {
+                self.attach_outer_audit(&rate_limit::derive_hmac_key(&self.outer_header.salt))?;
+            }
+            return Ok(volume);
+        }
+
         let hmac_key = rate_limit::derive_hmac_key(&self.outer_header.salt);
         let attempt = rate_limit::count_attempt(&self.path, &hmac_key)?;
 
@@ -1052,6 +1061,47 @@ mod tests {
             let volume = storage.unlock("hidden").unwrap();
             assert_eq!(volume, VolumeType::Hidden);
         }
+    }
+
+    // With one volume unlocked, `unlock` tests no password against the other,
+    // so it cannot be used to guess it.
+    #[test]
+    fn an_unlocked_volume_does_not_test_the_others_password() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test-hidden-guess");
+        let mut created = HiddenStorage::create(
+            &path,
+            "outer",
+            Some("hidden"),
+            10 * 1024 * 1024,
+            0.2,
+            Argon2Params::TESTING,
+        )
+        .unwrap();
+        assert_eq!(created.unlock("outer").unwrap(), VolumeType::Outer);
+        assert!(
+            created.audit_read_all().is_ok(),
+            "the outer audit log is attached"
+        );
+        drop(created);
+
+        let hmac_key =
+            rate_limit::derive_hmac_key(&HiddenStorage::open(&path).unwrap().outer_header.salt);
+
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_outer("outer").unwrap();
+        rate_limit::set_attempts_for_tests(&path, &hmac_key, 4);
+        assert_eq!(storage.unlock("hidden").unwrap(), VolumeType::Outer);
+        assert!(!storage.is_hidden_unlocked());
+        assert_eq!(rate_limit::live_attempts_for_tests(&path, &hmac_key), 4);
+
+        rate_limit::reset_for_tests(&path, &hmac_key);
+        let mut storage = HiddenStorage::open(&path).unwrap();
+        storage.unlock_hidden("hidden").unwrap();
+        rate_limit::set_attempts_for_tests(&path, &hmac_key, 4);
+        assert_eq!(storage.unlock("outer").unwrap(), VolumeType::Hidden);
+        assert!(storage.outer_key.is_none());
+        assert_eq!(rate_limit::live_attempts_for_tests(&path, &hmac_key), 4);
     }
 
     #[test]
