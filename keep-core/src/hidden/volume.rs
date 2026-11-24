@@ -461,6 +461,9 @@ impl HiddenStorage {
         // An unlocked volume would pass any password below, so each call
         // would test the other volume's password and clear the counter.
         if let Some(volume) = self.active_volume {
+            if volume == VolumeType::Outer {
+                self.attach_outer_audit(&rate_limit::derive_hmac_key(&self.outer_header.salt))?;
+            }
             return Ok(volume);
         }
 
@@ -1066,7 +1069,7 @@ mod tests {
     fn an_unlocked_volume_does_not_test_the_others_password() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test-hidden-guess");
-        HiddenStorage::create(
+        let mut created = HiddenStorage::create(
             &path,
             "outer",
             Some("hidden"),
@@ -1075,6 +1078,12 @@ mod tests {
             Argon2Params::TESTING,
         )
         .unwrap();
+        assert_eq!(created.unlock("outer").unwrap(), VolumeType::Outer);
+        assert!(
+            created.audit_read_all().is_ok(),
+            "the outer audit log is attached"
+        );
+        drop(created);
 
         let hmac_key =
             rate_limit::derive_hmac_key(&HiddenStorage::open(&path).unwrap().outer_header.salt);
