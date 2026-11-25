@@ -1538,6 +1538,28 @@ mod tests {
         assert!(app.bunker_pending_approval.is_none());
     }
 
+    // A secret too short to serve as the bunker's connect secret is refused
+    // before any bunker starts with it.
+    #[test]
+    fn a_nostrconnect_request_with_a_short_secret_is_refused() {
+        let mut app = bunker_app();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=0123456789abcde",
+            nostr_sdk::Keys::generate().public_key().to_hex()
+        );
+        let _ = app.process_pending_nostrconnect(keep_nip46::parse_nostrconnect_uri(&uri).unwrap());
+        let _ = app.handle_nostrconnect_approve();
+        assert!(app.bunker_pending_setup.is_none(), "a bunker was started");
+        let Screen::Bunker(s) = &app.screen else {
+            panic!("the bunker screen is not shown");
+        };
+        assert!(s
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("secret is too short")));
+        assert!(!s.starting);
+    }
+
     // Showing a bunker request takes the card from a pending nostrconnect
     // request, so an answer to the new card cannot reach the old one.
     #[test]

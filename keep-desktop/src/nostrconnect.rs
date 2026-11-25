@@ -15,6 +15,8 @@ use crate::message::Message;
 use crate::screen::bunker::PendingApprovalDisplay;
 use crate::screen::Screen;
 
+pub(crate) const MIN_NOSTRCONNECT_SECRET_LEN: usize = 16;
+
 impl App {
     pub(crate) fn process_pending_nostrconnect(
         &mut self,
@@ -54,6 +56,18 @@ impl App {
                 "Bunker already running; stop it first".into(),
                 ToastKind::Error,
             );
+            return Task::none();
+        }
+
+        // The secret becomes the bunker's connect secret here, so a short one
+        // could be guessed by another key to take the app slot.
+        if request.secret.chars().count() < MIN_NOSTRCONNECT_SECRET_LEN {
+            if let Screen::Bunker(s) = &mut self.screen {
+                s.starting = false;
+                s.error = Some(format!(
+                    "The app's connection secret is too short; it needs at least {MIN_NOSTRCONNECT_SECRET_LEN} characters"
+                ));
+            }
             return Task::none();
         }
 
@@ -131,7 +145,7 @@ impl App {
                 let pinning = keep_frost_net::TlsPinning::new(cert_pins, require_pinned);
                 let config = keep_nip46::ServerConfig {
                     rate_limit: Some(keep_nip46::RateLimitConfig::conservative()),
-                    expected_secret: Some(request.secret.clone()),
+                    expected_secret: Some(request.secret.to_string()),
                     tls_pinning: Some(pinning),
                     ..Default::default()
                 };
@@ -230,7 +244,7 @@ async fn send_nostrconnect_response(
 
     let response = serde_json::json!({
         "id": hex::encode(response_id),
-        "result": request.secret,
+        "result": request.secret.as_str(),
     });
     let response_json =
         serde_json::to_string(&response).map_err(|e| format!("serialization: {e}"))?;

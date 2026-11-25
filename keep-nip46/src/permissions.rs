@@ -167,6 +167,12 @@ pub struct AppPermission {
     /// persisted row on restore.
     #[serde(default)]
     pub explicitly_remembered: bool,
+    /// Set once the user paired this app by approving its `nostrconnect://`
+    /// request. It never held the connect secret, so it could not connect
+    /// again after a restart: it is persisted and restored on that approval
+    /// alone.
+    #[serde(default)]
+    pub paired: bool,
 }
 
 fn default_duration() -> PermissionDuration {
@@ -187,6 +193,7 @@ impl AppPermission {
             request_count: 0,
             duration: PermissionDuration::Forever,
             explicitly_remembered: false,
+            paired: false,
         }
     }
 
@@ -229,10 +236,10 @@ impl AppPermission {
                 .any(|(k, expiry)| *k != NIP98_HTTP_AUTH && now < *expiry)
     }
 
-    /// Whether this app should be persisted / restored: the user explicitly
-    /// remembered it AND it still holds a live remember-grant.
+    /// Whether this app should be persisted / restored: the user paired it,
+    /// or explicitly remembered it AND it still holds a live remember-grant.
     pub fn is_persistable_remember(&self) -> bool {
-        self.explicitly_remembered && self.has_live_remember_grant()
+        self.paired || (self.explicitly_remembered && self.has_live_remember_grant())
     }
 
     fn prune_expired_kind_grants(&mut self) {
@@ -649,6 +656,15 @@ impl PermissionManager {
         false
     }
 
+    /// Marks the connected app at `pubkey` paired (see
+    /// [`AppPermission::paired`]). Returns whether the app is connected.
+    pub fn pair(&mut self, pubkey: &PublicKey) -> bool {
+        self.apps
+            .get_mut(pubkey)
+            .map(|app| app.paired = true)
+            .is_some()
+    }
+
     pub fn record_usage(&mut self, pubkey: &PublicKey) {
         if let Some(app) = self.apps.get_mut(pubkey) {
             app.last_used = Timestamp::now();
@@ -708,6 +724,7 @@ impl PermissionManager {
                     .collect(),
                 explicitly_remembered: Some(app.explicitly_remembered),
                 kinds_vetted: true,
+                paired: app.paired,
             })
             .collect()
     }
@@ -749,6 +766,7 @@ impl PermissionManager {
         connected_at: Timestamp,
         timed_kind_grants: HashMap<Kind, u64>,
         explicitly_remembered: Option<bool>,
+        paired: bool,
     ) -> bool {
         match duration {
             PermissionDuration::Session => return false,
@@ -784,10 +802,12 @@ impl PermissionManager {
         // scope (persisted as `Some(false)`) is not resurrected.
         app.explicitly_remembered =
             explicitly_remembered.unwrap_or_else(|| app.has_live_remember_grant());
-        // Only restore apps the user explicitly chose to remember AND that still
-        // hold a live grant, so a merely-connected client must re-present the
-        // connect secret via a fresh `connect` rather than being silently
-        // re-authorized. Also migrates away pre-existing over-broad rows.
+        app.paired = paired;
+        // Only restore apps the user paired, or explicitly chose to remember
+        // AND that still hold a live grant, so a merely-connected client must
+        // re-present the connect secret via a fresh `connect` rather than
+        // being silently re-authorized. Also migrates away pre-existing
+        // over-broad rows.
         if !app.is_persistable_remember() {
             return false;
         }
@@ -1125,6 +1145,7 @@ mod tests {
             Timestamp::now(),
             grants,
             None,
+            false,
         );
         assert!(restored);
 
@@ -1280,6 +1301,7 @@ mod tests {
             Timestamp::now(),
             grants,
             None,
+            false,
         );
         assert!(restored);
 
@@ -1320,6 +1342,7 @@ mod tests {
             Timestamp::now(),
             persisted,
             None,
+            false,
         );
 
         assert!(
@@ -1381,6 +1404,7 @@ mod tests {
             Timestamp::from_secs(stored.connected_at),
             timed,
             stored.explicitly_remembered,
+            false,
         );
 
         assert!(
@@ -1414,6 +1438,57 @@ mod tests {
             pm.stored_snapshot().is_empty(),
             "a connected app with no remember-grant is not persisted"
         );
+    }
+
+    // A paired app has no connect secret to present again, so it is
+    // persisted and restored with its grant and nothing remembered.
+    #[test]
+    fn a_paired_app_round_trips_without_a_remember_grant() {
+        let mut pm = PermissionManager::new();
+        let pubkey = Keys::generate().public_key();
+        let perms = Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT;
+        pm.connect_with_permissions(pubkey, "App".into(), perms, HashSet::new());
+        assert!(pm.pair(&pubkey));
+        assert!(!pm.pair(&Keys::generate().public_key()));
+        let snapshot = pm.stored_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].paired);
+
+        let stored = &snapshot[0];
+        let mut restored = PermissionManager::new();
+        assert!(restored.restore_persisted(
+            pubkey,
+            stored.name.clone(),
+            Permission::from_bits_truncate(stored.permissions),
+            stored
+                .auto_approve_kinds
+                .iter()
+                .copied()
+                .map(Kind::from)
+                .collect(),
+            PermissionDuration::Forever,
+            Timestamp::from_secs(stored.connected_at),
+            HashMap::new(),
+            stored.explicitly_remembered,
+            stored.paired,
+        ));
+        let app = restored.get_app(&pubkey).unwrap();
+        assert_eq!(app.permissions, perms);
+        assert!(app.paired);
+        assert_eq!(restored.stored_snapshot().len(), 1);
+
+        let mut unpaired = PermissionManager::new();
+        assert!(!unpaired.restore_persisted(
+            pubkey,
+            stored.name.clone(),
+            perms,
+            HashSet::new(),
+            PermissionDuration::Forever,
+            Timestamp::now(),
+            HashMap::new(),
+            stored.explicitly_remembered,
+            false,
+        ));
     }
 
     #[test]
@@ -1466,6 +1541,7 @@ mod tests {
             Timestamp::now(),
             HashMap::new(),
             None,
+            false,
         );
         assert!(!restored, "a bare legacy row is not restored");
         assert!(pm.get_app(&pubkey).is_none());
@@ -1488,6 +1564,7 @@ mod tests {
             Timestamp::now(),
             grants,
             None,
+            false,
         );
         assert!(
             !restored,
@@ -1513,6 +1590,7 @@ mod tests {
             Timestamp::now(),
             grants,
             None,
+            false,
         );
         assert!(!restored, "a NIP-98-only legacy row is dropped on restore");
         assert!(pm.get_app(&pubkey).is_none());
@@ -1560,6 +1638,7 @@ mod tests {
             Timestamp::now(),
             HashMap::new(),
             Some(false),
+            false,
         );
         assert!(!restored, "a row marked not-remembered is not restored");
         assert!(pm.get_app(&pubkey).is_none());

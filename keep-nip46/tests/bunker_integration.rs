@@ -940,6 +940,7 @@ async fn test_e2e_unvetted_restored_kinds_are_not_signed_unprompted() {
             timed_kind_grants: Vec::new(),
             explicitly_remembered: Some(true),
             kinds_vetted: vetted,
+            paired: false,
         };
         let prompts = Arc::new(RecordingRefuser(std::sync::Mutex::new(Vec::new())));
         let mut server = Server::new_with_config(

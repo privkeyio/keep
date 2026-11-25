@@ -5,6 +5,7 @@ use keep_core::relay::{
     ALLOW_INTERNAL_HOSTS, MAX_RELAYS,
 };
 use nostr_sdk::prelude::*;
+use zeroize::Zeroizing;
 
 pub fn generate_bunker_url(
     pubkey: &PublicKey,
@@ -35,7 +36,7 @@ pub fn generate_bunker_url(
 pub struct NostrConnectRequest {
     pub client_pubkey: PublicKey,
     pub relays: Vec<String>,
-    pub secret: String,
+    pub secret: Zeroizing<String>,
     pub name: Option<String>,
     pub url: Option<String>,
     pub image: Option<String>,
@@ -61,12 +62,31 @@ const MAX_DISPLAY_NAME_LEN: usize = 50;
 const MAX_PERMS_LEN: usize = 512;
 const MAX_SECRET_LEN: usize = 64;
 
-fn validate_metadata_url(value: &str) -> Result<String, String> {
-    let parsed = ::url::Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
-    match parsed.scheme() {
-        "https" => Ok(parsed.to_string()),
-        _ => Err("only https:// URLs are allowed".into()),
+const MAX_METADATA_URL_LEN: usize = 512;
+
+/// A client's `url` or `image`: https only, without userinfo, and on a host a
+/// relay could be on, so the app is never pointed at an internal one.
+fn validate_metadata_url(
+    value: &str,
+    validate: fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    if value.len() > MAX_METADATA_URL_LEN {
+        return Err("URL too long".into());
     }
+    let parsed = ::url::Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("only https:// URLs are allowed".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("userinfo not allowed".into());
+    }
+    let host = parsed.host_str().ok_or("missing host")?;
+    validate(&format!("wss://{host}"))?;
+    let cleaned = parsed.to_string();
+    if cleaned.len() > MAX_METADATA_URL_LEN {
+        return Err("URL too long".into());
+    }
+    Ok(cleaned)
 }
 
 /// A `nostrconnect://` relay as it is dialed, or `None` when it is unusable.
@@ -85,12 +105,24 @@ fn nostrconnect_relay(value: &str, validate: fn(&str) -> Result<(), String>) -> 
         .filter(|relay| validate(relay).is_ok())
 }
 
+/// `value` without control, zero-width, bidi or line and paragraph
+/// separator characters, which could spoof or break the approval prompt.
+fn strip_invisible(value: &str) -> impl Iterator<Item = char> + '_ {
+    value.chars().filter(|c| {
+        !c.is_control()
+            && !matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{061C}'
+                    | '\u{FEFF}'
+            )
+    })
+}
+
 fn sanitize_display_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
-        .filter(|c| !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'))
-        .take(MAX_DISPLAY_NAME_LEN)
-        .collect()
+    strip_invisible(name).take(MAX_DISPLAY_NAME_LEN).collect()
 }
 
 pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequest, String> {
@@ -131,13 +163,13 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
                     }
                 }
             }
-            "secret" => secret = Some(value.to_string()),
+            "secret" => secret = Some(Zeroizing::new(value.into_owned())),
             "name" => name = Some(sanitize_display_name(&value)),
-            "url" => url_param = validate_metadata_url(&value).ok(),
-            "image" => image = validate_metadata_url(&value).ok(),
+            "url" => url_param = validate_metadata_url(&value, validate).ok(),
+            "image" => image = validate_metadata_url(&value, validate).ok(),
             "perms" => {
                 if value.len() <= MAX_PERMS_LEN {
-                    perms = Some(value.to_string());
+                    perms = Some(strip_invisible(&value).collect());
                 } else {
                     return Err("perms parameter too long".into());
                 }
@@ -282,7 +314,7 @@ mod tests {
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.client_pubkey, pubkey);
         assert_eq!(req.relays, vec!["wss://relay.damus.io/"]);
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
         assert_eq!(req.name.as_deref(), Some("My Client"));
     }
 
@@ -297,7 +329,7 @@ mod tests {
 
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.relays.len(), 2);
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
     }
 
     #[test]
@@ -397,7 +429,7 @@ mod tests {
             secret
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, secret);
+        assert_eq!(req.secret.as_str(), secret);
     }
 
     #[test]
@@ -424,7 +456,7 @@ mod tests {
             secret
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, secret);
+        assert_eq!(req.secret.as_str(), secret);
     }
 
     #[test]
@@ -561,7 +593,7 @@ mod tests {
             pubkey.to_hex()
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
     }
 
     #[test]
@@ -682,22 +714,59 @@ mod tests {
 
     #[test]
     fn test_validate_metadata_url_javascript() {
-        assert!(validate_metadata_url("javascript:alert(1)").is_err());
+        assert!(validate_metadata_url("javascript:alert(1)", validate_relay_url).is_err());
     }
 
     #[test]
     fn test_validate_metadata_url_data() {
-        assert!(validate_metadata_url("data:text/html,<h1>X</h1>").is_err());
+        assert!(validate_metadata_url("data:text/html,<h1>X</h1>", validate_relay_url).is_err());
     }
 
     #[test]
     fn test_validate_metadata_url_ftp() {
-        assert!(validate_metadata_url("ftp://example.com/file").is_err());
+        assert!(validate_metadata_url("ftp://example.com/file", validate_relay_url).is_err());
+    }
+
+    #[test]
+    fn test_validate_metadata_url_refuses_userinfo_internal_hosts_and_long_urls() {
+        for refused in [
+            "https://user@example.com/",
+            "https://user:pass@example.com/",
+            "https://localhost/icon.png",
+            "https://127.0.0.1/icon.png",
+            "https://10.0.0.5/icon.png",
+            "https://192.168.1.1/icon.png",
+            "https://[::1]/icon.png",
+            "https://printer.local/icon.png",
+            "https://intranet/icon.png",
+        ] {
+            assert!(
+                validate_metadata_url(refused, validate_relay_url).is_err(),
+                "{refused}"
+            );
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_METADATA_URL_LEN));
+        assert!(validate_metadata_url(&long, validate_relay_url).is_err());
+        let fits = format!("https://example.com/{}", "a".repeat(400));
+        assert!(validate_metadata_url(&fits, validate_relay_url).is_ok());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_strips_invisible_characters() {
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com&secret=abcdef0123456789&name={}&perms={}",
+            Keys::generate().public_key().to_hex(),
+            urlencoding::encode("Ad\u{2028}m\u{2029}i\u{061C}n\u{202E}"),
+            urlencoding::encode("sign_event\u{200B},nip44_\u{202E}encrypt\u{0007}\u{2029}")
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.name.as_deref(), Some("Admin"));
+        assert_eq!(req.perms.as_deref(), Some("sign_event,nip44_encrypt"));
     }
 
     #[test]
     fn test_validate_metadata_url_valid_https() {
-        let result = validate_metadata_url("https://example.com/image.png");
+        let result = validate_metadata_url("https://example.com/image.png", validate_relay_url);
         assert!(result.is_ok());
     }
 }

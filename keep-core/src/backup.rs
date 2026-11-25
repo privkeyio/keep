@@ -1195,6 +1195,7 @@ mod tests {
             timed_kind_grants: Vec::new(),
             explicitly_remembered: None,
             kinds_vetted: false,
+            paired: false,
         });
         relay_cfg.auto_approve_kinds = vec![22242];
         keep.store_relay_config(&relay_cfg).unwrap();

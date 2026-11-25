@@ -73,6 +73,8 @@ pub struct PreGrantedApp {
     /// `None` for a legacy row predating the flag; the restore path then falls
     /// back to inspecting the row's grants.
     pub explicitly_remembered: Option<bool>,
+    /// Paired through a `nostrconnect://` approval, so restored on that alone.
+    pub paired: bool,
 }
 
 impl PreGrantedApp {
@@ -136,6 +138,7 @@ impl PreGrantedApp {
             connected_at: Timestamp::from_secs(stored.connected_at),
             timed_kind_grants,
             explicitly_remembered: stored.explicitly_remembered,
+            paired: stored.paired,
         })
     }
 }
@@ -252,6 +255,7 @@ async fn apply_pre_grants(
             app.connected_at,
             app.timed_kind_grants.clone(),
             app.explicitly_remembered,
+            app.paired,
         );
     }
 }
@@ -1150,7 +1154,21 @@ pub struct JoinedRelays {
     added: Vec<RelayUrl>,
     /// The client [`ServerRelays::route`] routed through these relays.
     routed: Option<PublicKey>,
-    _one_at_a_time: tokio::sync::OwnedMutexGuard<()>,
+    _one_at_a_time: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+/// The relays a [`ServerRelays::rejoin`] reached for each client, not yet
+/// routed.
+pub struct Rejoined {
+    joined: JoinedRelays,
+    clients: Vec<(PublicKey, Vec<RelayUrl>)>,
+}
+
+impl Rejoined {
+    /// The clients at least one of whose relays was reached.
+    pub fn clients(&self) -> Vec<PublicKey> {
+        self.clients.iter().map(|(client, _)| *client).collect()
+    }
 }
 
 impl JoinedRelays {
@@ -1170,9 +1188,11 @@ impl ServerRelays {
     /// given `timeout`, keeping those reached. Equivalent spellings of one
     /// relay are joined once. A relay added here that cannot be reached is
     /// removed again, as is every one added when the call fails; one the pool
-    /// already held is left as it was. Fails when none is reached, and times
-    /// out when the relays cannot be added within `timeout`, in which case
-    /// those added are removed once the pool lets them be.
+    /// already held is left as it was. A removal the pool holds up past
+    /// `timeout` finishes after the call returns, and no other join starts
+    /// before it does. Fails when none is reached, and times out when the
+    /// relays cannot be added within `timeout`, in which case those added are
+    /// removed once the pool lets them be.
     pub async fn join(
         &self,
         relay_urls: &[String],
@@ -1180,10 +1200,102 @@ impl ServerRelays {
         timeout: std::time::Duration,
     ) -> Result<JoinedRelays> {
         debug_assert!(relay_urls.len() <= keep_core::relay::MAX_RELAYS);
+        self.join_all(relay_urls, proxy, timeout).await
+    }
+
+    /// Joins the relays of each of `clients` again, on a server started
+    /// after they were accepted, as [`ServerRelays::join`] joins them: all
+    /// at once within `timeout`, those not reached removed again. No client
+    /// is routed yet: [`ServerRelays::route_rejoined`] does that once the
+    /// caller has seen the clients may still be served, and
+    /// [`ServerRelays::release_rejoined`] then drops the relays no route
+    /// uses. Joins are taken one at a time until then.
+    pub async fn rejoin(
+        &self,
+        clients: &[(PublicKey, Vec<String>)],
+        proxy: Option<SocketAddr>,
+        timeout: std::time::Duration,
+    ) -> Result<Rejoined> {
+        let mut all: Vec<String> = Vec::new();
+        for relay in clients.iter().flat_map(|(_, relays)| relays) {
+            if !all.contains(relay) {
+                all.push(relay.clone());
+            }
+        }
+        if all.is_empty() {
+            return Err(NetworkError::relay("no nostrconnect relay to join").into());
+        }
+        let joined = self.join_all(&all, proxy, timeout).await?;
+        let clients = clients
+            .iter()
+            .filter_map(|(client, relays)| {
+                let reached: Vec<RelayUrl> = distinct_relay_urls(relays)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|url| joined.reached.contains(url))
+                    .collect();
+                (!reached.is_empty()).then_some((*client, reached))
+            })
+            .collect();
+        Ok(Rejoined { joined, clients })
+    }
+
+    /// Sends the responses of each client `rejoined` reached that `keep`
+    /// accepts to those of its relays reached, as [`ServerRelays::route`]
+    /// does for one. Returns the clients routed.
+    pub fn route_rejoined(
+        &self,
+        rejoined: &Rejoined,
+        keep: impl Fn(&PublicKey) -> bool,
+    ) -> Vec<PublicKey> {
+        let mut routes = self.routes.write().unwrap_or_else(|e| e.into_inner());
+        let mut routed = Vec::new();
+        for (client, reached) in rejoined.clients.iter().filter(|(c, _)| keep(c)) {
+            routes.insert(*client, reached.clone());
+            routed.push(*client);
+        }
+        routed
+    }
+
+    /// Ends a [`ServerRelays::rejoin`]: the relays it added that no route
+    /// uses are removed, and the next join may start.
+    pub async fn release_rejoined(&self, rejoined: Rejoined) {
+        let unused: Vec<RelayUrl> = {
+            let routes = self.routes.read().unwrap_or_else(|e| e.into_inner());
+            rejoined
+                .joined
+                .added
+                .iter()
+                .filter(|url| !routes.values().flatten().any(|used| used == *url))
+                .cloned()
+                .collect()
+        };
+        self.remove_relays(&unused).await;
+    }
+
+    /// The relays `client`'s responses are routed to beyond the bunker's own.
+    pub fn routed_relays(&self, client: &PublicKey) -> Vec<String> {
+        self.routes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(client)
+            .into_iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    async fn join_all(
+        &self,
+        relay_urls: &[String],
+        proxy: Option<SocketAddr>,
+        timeout: std::time::Duration,
+    ) -> Result<JoinedRelays> {
         let urls = distinct_relay_urls(relay_urls)?;
         // Waiting on another join counts against `timeout`, so the call as a
         // whole never runs past it.
         let started = tokio::time::Instant::now();
+        let budget = timeout;
         let one_at_a_time = tokio::time::timeout(timeout, Arc::clone(&self.joining).lock_owned())
             .await
             .map_err(|_| NetworkError::timeout("waiting on another nostrconnect join"))?;
@@ -1191,7 +1303,7 @@ impl ServerRelays {
             reached: Vec::new(),
             added: Vec::new(),
             routed: None,
-            _one_at_a_time: one_at_a_time,
+            _one_at_a_time: Arc::new(one_at_a_time),
         };
         let opts = relay_options(proxy);
         // An add waits for the pool's write lock, which a send in flight
@@ -1237,7 +1349,19 @@ impl ServerRelays {
             }
         }
         joined.added.retain(|url| !unreached.contains(url));
-        self.remove_relays(&unreached).await;
+        // A removal waits for the pool's write lock too. One that cannot
+        // take it in time finishes in a task of its own, which holds this
+        // join's turn until it does.
+        let left = budget.saturating_sub(started.elapsed());
+        let lingering = self.remove_relays_within(&unreached, left).await;
+        if !lingering.is_empty() {
+            let relays = self.clone();
+            let turn = Arc::clone(&joined._one_at_a_time);
+            tokio::spawn(async move {
+                relays.remove_relays(&lingering).await;
+                drop(turn);
+            });
+        }
         if joined.reached.is_empty() {
             self.abandon(joined).await;
             return Err(NetworkError::relay("none of the client's relays could be reached").into());
@@ -1289,6 +1413,27 @@ impl ServerRelays {
         }
     }
 
+    /// [`ServerRelays::remove_relays`] for at most `timeout`, returning the
+    /// relays it did not get to. A removal cut short has removed nothing,
+    /// since its only wait is for the pool's write lock.
+    async fn remove_relays_within(
+        &self,
+        urls: &[RelayUrl],
+        timeout: std::time::Duration,
+    ) -> Vec<RelayUrl> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        for (i, url) in urls.iter().enumerate() {
+            match tokio::time::timeout_at(deadline, self.client.force_remove_relay(url)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    warn!(relay = %url, error = %e, "could not remove a nostrconnect relay")
+                }
+                Err(_) => return urls[i..].to_vec(),
+            }
+        }
+        Vec::new()
+    }
+
     /// Answers a `nostrconnect://` request on the relays `joined` reached: a
     /// kind 24133 event signed with the transport key and NIP-44 encrypted to
     /// the client, whose `result` is the client's own secret. Succeeds as soon
@@ -1303,7 +1448,7 @@ impl ServerRelays {
         let response_id = keep_core::crypto::try_random_bytes::<16>()?;
         let response = serde_json::json!({
             "id": hex::encode(response_id),
-            "result": request.secret,
+            "result": request.secret.as_str(),
         });
         let response_json = Zeroizing::new(
             serde_json::to_string(&response)
@@ -1655,6 +1800,110 @@ mod tests {
         assert!(!relays.holds(&their_url).await);
     }
 
+    // A send that takes the pool while a join dials holds up the removal of
+    // the relay the join could not reach. The join still returns within its
+    // timeout, and the relay is removed once the send lets the pool go,
+    // before another join starts.
+    #[tokio::test]
+    async fn a_join_does_not_wait_past_its_timeout_to_drop_an_unreached_relay() {
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holding = nostr_relay_builder::LocalRelay::new(
+            nostr_relay_builder::RelayBuilder::default()
+                .write_policy(HoldsEveryOk(Arc::clone(&held))),
+        );
+        holding.run().await.unwrap();
+        let holding_url = holding.url().await.to_string();
+        let theirs = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let their_url = theirs.url().await.to_string();
+        let hanging = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            std::thread::spawn(move || {
+                let mut held = Vec::new();
+                for stream in listener.incoming() {
+                    held.push(stream);
+                }
+            });
+            url
+        };
+        let mut keyring = Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let server = Server::new(
+            Arc::new(Mutex::new(keyring)),
+            std::slice::from_ref(&holding_url),
+            None,
+        )
+        .await
+        .unwrap();
+        let relays = server.relays();
+        relays
+            .client
+            .try_connect_relay(&holding_url, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let timeout = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let joining = {
+            let relays = relays.clone();
+            let asked = [their_url.clone(), hanging.clone()];
+            tokio::spawn(async move { relays.join(&asked, None, timeout).await })
+        };
+        while !relays.holds(&hanging).await {
+            assert!(
+                started.elapsed() < timeout,
+                "the join never added the relay"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let event = EventBuilder::text_note("held")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let sending = {
+            let client = relays.client.clone();
+            tokio::spawn(async move { client.send_event_to([holding_url], &event).await })
+        };
+        while held.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                started.elapsed() < timeout,
+                "the send never reached the holding relay"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let joined = joining.await.unwrap().unwrap();
+        assert!(
+            started.elapsed() < timeout + std::time::Duration::from_millis(500),
+            "the join ran past its timeout"
+        );
+        assert_eq!(joined.reached(), vec![their_url.clone()]);
+        assert!(!sending.is_finished(), "the send let the pool go");
+
+        drop(joined);
+        assert!(
+            relays.joining.try_lock().is_err(),
+            "another join could start before the removal"
+        );
+        sending.abort();
+        let removed = std::time::Instant::now();
+        while relays.joining.try_lock().is_err() {
+            assert!(
+                removed.elapsed() < std::time::Duration::from_secs(5),
+                "the removal never finished"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!relays.holds(&hanging).await, "the unreached relay stayed");
+    }
+
     // An explicitly-configured `expected_secret` must surface as the bunker
     // secret, which `bunker_url()` embeds; otherwise clients get a secret-less
     // URL and reject the connect.
@@ -1741,6 +1990,7 @@ mod tests {
             timed_kind_grants: Vec::new(),
             explicitly_remembered: None,
             kinds_vetted: true,
+            paired: false,
         }
     }
 

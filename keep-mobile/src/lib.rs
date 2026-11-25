@@ -235,7 +235,7 @@ use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use network::{convert_peer_status, parse_loopback_proxy, validate_hex_pubkey};
 use policy::{PolicyBundle, PolicyEvaluator, POLICY_PUBKEY_LEN};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -740,6 +740,13 @@ pub struct ProxyConfigInfo {
 pub struct BunkerConfigInfo {
     pub enabled: bool,
     pub authorized_clients: Vec<String>,
+    /// The revision of `authorized_clients` this was read at. A save that
+    /// carries one is refused once the list has changed since, as a
+    /// `nostrconnect://` accept, its rollback or a revoke changes it, so a
+    /// save from an older read neither drops nor brings back a client. A
+    /// save without one replaces the list as given.
+    #[uniffi(default = None)]
+    pub revision: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1099,11 +1106,6 @@ pub struct KeepMobile {
     /// to its rollback.
     pub(crate) nostrconnect_listings:
         std::sync::Mutex<HashMap<nostr_sdk::PublicKey, nip46::NostrconnectListing>>,
-    /// The clients a `nostrconnect://` accept listed in `authorized_clients`
-    /// in this process, which a `save_bunker_config` made from an older read
-    /// of the config keeps. Added under `bunker_config_lock`; a revoke or
-    /// rollback that unlists the client drops it.
-    pub(crate) nostrconnect_clients: std::sync::Mutex<HashSet<nostr_sdk::PublicKey>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -1547,7 +1549,6 @@ impl KeepMobile {
             bunker_start_lock: std::sync::Mutex::new(()),
             live_bunker: std::sync::Mutex::new(None),
             nostrconnect_listings: std::sync::Mutex::new(HashMap::new()),
-            nostrconnect_clients: std::sync::Mutex::new(HashSet::new()),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             proxy_config_lock: std::sync::Mutex::new(()),
@@ -4219,6 +4220,7 @@ impl KeepMobile {
         Ok(BunkerConfigInfo {
             enabled: config.enabled,
             authorized_clients: config.authorized_clients,
+            revision: Some(config.client_list_revision),
         })
     }
 
@@ -4244,39 +4246,35 @@ impl KeepMobile {
             })?;
         let existing = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?
             .unwrap_or_default();
-        // A client a `nostrconnect://` accept listed may postdate the caller's
-        // read, so a save never drops one; a revoke removes it.
-        let mut authorized_clients = config.authorized_clients;
+        if config
+            .revision
+            .is_some_and(|read| read != existing.client_list_revision)
         {
-            let accepted = self
-                .nostrconnect_clients
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            for client in &existing.authorized_clients {
-                let Ok(pk) = nostr_sdk::PublicKey::parse(client) else {
-                    continue;
-                };
-                let kept = authorized_clients
-                    .iter()
-                    .any(|c| nostr_sdk::PublicKey::parse(c).ok() == Some(pk));
-                if accepted.contains(&pk) && !kept {
-                    authorized_clients.push(client.clone());
-                }
-            }
-        }
-        if authorized_clients.len() > keep_nip46::PermissionManager::MAX_CONNECTED_APPS {
-            return Err(KeepMobileError::TooManyAuthorizedClients {
-                max: keep_nip46::PermissionManager::MAX_CONNECTED_APPS as u32,
+            return Err(KeepMobileError::InvalidInput {
+                msg:
+                    "The authorized client list changed since it was read; read it again and retry"
+                        .into(),
             });
         }
+        let listed: std::collections::HashSet<nostr_sdk::PublicKey> = config
+            .authorized_clients
+            .iter()
+            .filter_map(|c| nostr_sdk::PublicKey::parse(c).ok())
+            .collect();
+        let mut nostrconnect_relays = existing.nostrconnect_relays;
+        nostrconnect_relays.retain(|client, _| {
+            nostr_sdk::PublicKey::from_hex(client).is_ok_and(|pk| listed.contains(&pk))
+        });
         let stored = persistence::StoredBunkerConfig {
             enabled: config.enabled,
-            authorized_clients,
+            authorized_clients: config.authorized_clients,
+            client_list_revision: existing.client_list_revision.wrapping_add(1),
             transport_secret: existing.transport_secret,
             connect_secret: existing.connect_secret,
             pending_revokes: existing.pending_revokes,
             pending_revoke_all: existing.pending_revoke_all,
             unsettled_nostrconnect: existing.unsettled_nostrconnect,
+            nostrconnect_relays,
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }

@@ -90,6 +90,12 @@ pub struct StoredBunkerPermission {
     /// apart from the user's, a row without it restores with none.
     #[serde(default)]
     pub kinds_vetted: bool,
+    /// Whether the user paired this client by approving its
+    /// `nostrconnect://` request. Such a client never holds the connect
+    /// secret, so it cannot present it again after a restart: its grant is
+    /// persisted and restored whether or not it remembered anything.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paired: bool,
 }
 
 /// Per-peer send/receive policy entry, stored alongside relay configuration.
@@ -278,6 +284,7 @@ impl RelayConfig {
                 timed_kind_grants: bp.timed_kind_grants,
                 explicitly_remembered: bp.explicitly_remembered,
                 kinds_vetted: bp.kinds_vetted,
+                paired: bp.paired,
             });
         }
 

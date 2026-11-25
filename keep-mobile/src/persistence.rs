@@ -1260,6 +1260,10 @@ pub(crate) struct StoredBunkerConfig {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) authorized_clients: Vec<String>,
+    /// Moved on by every write that changes `authorized_clients`, so a
+    /// config save can tell its read is out of date.
+    #[serde(default)]
+    pub(crate) client_list_revision: u64,
     /// Hex-encoded 32-byte transport secret key. The bunker:// pubkey is derived
     /// from this key, so persisting it keeps the bunker URL stable across service
     /// restarts. Stored in the same SQLCipher-backed SecureStorage as the FROST
@@ -1281,12 +1285,18 @@ pub(crate) struct StoredBunkerConfig {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) pending_revoke_all: bool,
     /// Clients a `nostrconnect://` accept listed and has not settled. Written
-    /// with the listing and cleared only once the accept succeeds, so one
+    /// with the listing and cleared only once the accept settles, or once its
+    /// rollback has both dropped the client's grants and unlisted it, so one
     /// whose rollback could not finish is still marked after a restart. A
     /// start neither restores such a client's grants nor keeps it listed.
     /// Hex pubkeys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) unsettled_nostrconnect: Vec<String>,
+    /// The relays each client a `nostrconnect://` accept listed picked, as
+    /// the accept checked and joined them, which a start joins again. Keyed
+    /// by hex pubkey, written with the listing and dropped with it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) nostrconnect_relays: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub(crate) fn load_bunker_config(
