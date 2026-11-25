@@ -1483,12 +1483,16 @@ mod tests {
     async fn a_join_stays_within_its_timeout() {
         let own = nostr_relay_builder::MockRelay::run().await.unwrap();
         let own_url = own.url().await.to_string();
+        let (dialed_tx, dialed) = std::sync::mpsc::channel();
         let hanging = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             std::thread::spawn(move || {
-                let held: Vec<_> = listener.incoming().collect();
-                drop(held);
+                let mut held = Vec::new();
+                for stream in listener.incoming() {
+                    held.push(stream);
+                    let _ = dialed_tx.send(());
+                }
             });
             url
         };
@@ -1520,14 +1524,29 @@ mod tests {
             .unwrap();
 
         let timeout = std::time::Duration::from_secs(2);
+        // Each handle on the lock is a count: the clone moved into the task
+        // and the one the join takes to wait for the lock.
+        let waiting = Arc::strong_count(&relays.joining) + 2;
         let started = std::time::Instant::now();
         let second = {
             let relays = relays.clone();
             tokio::spawn(async move { relays.join(&[hanging], None, timeout).await })
         };
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        while Arc::strong_count(&relays.joining) < waiting {
+            assert!(
+                started.elapsed() < timeout,
+                "the second join never waited on the lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(!second.is_finished(), "the second join did not wait");
         relays.abandon(first).await;
         assert!(second.await.unwrap().is_err());
+        assert!(
+            dialed.try_recv().is_ok(),
+            "the second join never dialed the hanging relay"
+        );
         assert!(
             started.elapsed() < timeout + std::time::Duration::from_millis(500),
             "the join ran past its timeout"

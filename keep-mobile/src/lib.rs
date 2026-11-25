@@ -235,7 +235,7 @@ use keep_frost_net::{KfpNode, KfpNodeEvent, SessionInfo, SigningHooks};
 use network::{convert_peer_status, parse_loopback_proxy, validate_hex_pubkey};
 use policy::{PolicyBundle, PolicyEvaluator, POLICY_PUBKEY_LEN};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
@@ -1096,7 +1096,13 @@ pub struct KeepMobile {
     /// `authorized_clients` and may still roll that listing back, so a
     /// rollback never removes a listing a later accept made. Written under
     /// `bunker_start_lock`.
-    pub(crate) nostrconnect_listings: std::sync::Mutex<HashMap<nostr_sdk::PublicKey, u64>>,
+    pub(crate) nostrconnect_listings:
+        std::sync::Mutex<HashMap<nostr_sdk::PublicKey, nip46::NostrconnectListing>>,
+    /// The clients a `nostrconnect://` accept listed in `authorized_clients`
+    /// in this process, which a `save_bunker_config` made from an older read
+    /// of the config keeps. Added under `bunker_config_lock`; a revoke or
+    /// rollback that unlists the client drops it.
+    pub(crate) nostrconnect_clients: std::sync::Mutex<HashSet<nostr_sdk::PublicKey>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -1540,6 +1546,7 @@ impl KeepMobile {
             bunker_start_lock: std::sync::Mutex::new(()),
             live_bunker: std::sync::Mutex::new(None),
             nostrconnect_listings: std::sync::Mutex::new(HashMap::new()),
+            nostrconnect_clients: std::sync::Mutex::new(HashSet::new()),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             proxy_config_lock: std::sync::Mutex::new(()),
@@ -4236,9 +4243,34 @@ impl KeepMobile {
             })?;
         let existing = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?
             .unwrap_or_default();
+        // A client a `nostrconnect://` accept listed may postdate the caller's
+        // read, so a save never drops one; a revoke removes it.
+        let mut authorized_clients = config.authorized_clients;
+        {
+            let accepted = self
+                .nostrconnect_clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for client in &existing.authorized_clients {
+                let Ok(pk) = nostr_sdk::PublicKey::parse(client) else {
+                    continue;
+                };
+                let kept = authorized_clients
+                    .iter()
+                    .any(|c| nostr_sdk::PublicKey::parse(c).ok() == Some(pk));
+                if accepted.contains(&pk) && !kept {
+                    authorized_clients.push(client.clone());
+                }
+            }
+        }
+        if authorized_clients.len() > keep_nip46::PermissionManager::MAX_CONNECTED_APPS {
+            return Err(KeepMobileError::TooManyAuthorizedClients {
+                max: keep_nip46::PermissionManager::MAX_CONNECTED_APPS as u32,
+            });
+        }
         let stored = persistence::StoredBunkerConfig {
             enabled: config.enabled,
-            authorized_clients: config.authorized_clients,
+            authorized_clients,
             transport_secret: existing.transport_secret,
             connect_secret: existing.connect_secret,
             pending_revokes: existing.pending_revokes,

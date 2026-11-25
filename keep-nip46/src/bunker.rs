@@ -59,7 +59,7 @@ impl std::fmt::Debug for NostrConnectRequest {
 const MAX_NOSTRCONNECT_RELAYS: usize = 10;
 const MAX_DISPLAY_NAME_LEN: usize = 50;
 const MAX_PERMS_LEN: usize = 512;
-const MIN_SECRET_LEN: usize = 16;
+const MAX_SECRET_LEN: usize = 64;
 
 fn validate_metadata_url(value: &str) -> Result<String, String> {
     let parsed = ::url::Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
@@ -151,9 +151,8 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     }
 
     let secret = secret.ok_or("secret is required")?;
-    let secret_len = secret.chars().count();
-    if !(MIN_SECRET_LEN..=64).contains(&secret_len) {
-        return Err(format!("secret must be {MIN_SECRET_LEN}-64 characters"));
+    if secret.is_empty() || secret.chars().count() > MAX_SECRET_LEN {
+        return Err(format!("secret must be 1-{MAX_SECRET_LEN} characters"));
     }
 
     Ok(NostrConnectRequest {
@@ -340,18 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nostrconnect_short_secret() {
-        let keys = Keys::generate();
-        let pubkey = keys.public_key();
-        let uri = format!(
-            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=short",
-            pubkey.to_hex()
-        );
-
-        assert!(parse_nostrconnect_uri(&uri).is_err());
-    }
-
-    #[test]
     fn test_parse_nostrconnect_missing_relay() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
@@ -400,10 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nostrconnect_secret_exact_min_length() {
+    fn test_parse_nostrconnect_accepts_the_nip46_example_secret() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "a".repeat(MIN_SECRET_LEN);
+        let secret = "0s8j2djs";
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
@@ -414,10 +401,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nostrconnect_secret_one_below_min() {
+    fn test_parse_nostrconnect_rejects_an_empty_secret() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "a".repeat(MIN_SECRET_LEN - 1);
+        let secret = "";
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
@@ -430,7 +417,7 @@ mod tests {
     fn test_parse_nostrconnect_secret_exact_max_length() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "b".repeat(64);
+        let secret = "b".repeat(MAX_SECRET_LEN);
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
@@ -444,7 +431,7 @@ mod tests {
     fn test_parse_nostrconnect_secret_over_max() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "c".repeat(65);
+        let secret = "c".repeat(MAX_SECRET_LEN + 1);
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
