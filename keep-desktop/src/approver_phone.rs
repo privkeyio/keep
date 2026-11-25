@@ -91,15 +91,21 @@ pub fn run(uri: &str) -> ! {
         let mut words = line.split_whitespace();
         let outcome = match (words.next(), words.next()) {
             (Some(verdict @ ("approve" | "deny")), None) => {
-                let Some(id) = printer.requests().pop_front() else {
+                let Some(id) = printer.requests().front().cloned() else {
                     say("no-request");
                     continue;
                 };
-                if verdict == "approve" {
+                let sent = if verdict == "approve" {
                     approver.approve(&id)
                 } else {
                     approver.deny(&id)
+                };
+                // A send that failed leaves the request waiting, to decide
+                // again. One that is no longer waiting is dropped.
+                if sent.is_ok() || !approver.is_waiting(&id) {
+                    printer.requests().retain(|r| *r != id);
                 }
+                sent
             }
             (Some("freeze"), Some("all")) => approver.freeze_all(),
             (Some("unfreeze"), Some("all")) => approver.unfreeze_all(),

@@ -282,6 +282,13 @@ impl TestApprover {
         self.handler.forget().map_err(err)
     }
 
+    pub fn is_waiting(&self, request_id: &str) -> bool {
+        self.handler
+            .waiting_requests()
+            .iter()
+            .any(|r| r.request_id == request_id)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             status: self.handler.status(),

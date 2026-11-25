@@ -133,11 +133,14 @@ chmod 0500 "$CREDS"
 
 PORT=$(python3 -I -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')
 RELAY_URL=ws://127.0.0.1:$PORT
-as "$RELAY_USER" "$WORK/approval_peer" relay "$PORT" >"$WORK/relay.log" 2>&1 &
+# The relay, gateway and relay helper run in sessions of their own, so a
+# Ctrl-C at the prompt reaches none of them.
+setsid setpriv --reuid="$RELAY_USER" --regid="$(id -g "$RELAY_USER")" --init-groups \
+    env -i PATH=/usr/bin:/bin HOME="$WORK" "$WORK/approval_peer" relay "$PORT" >"$WORK/relay.log" 2>&1 &
 RELAY_PID=$!
 wait_for "$WORK/relay.log" "^relay "
 
-setpriv --reuid="$GW" --regid="$(id -g "$GW")" --init-groups \
+setsid setpriv --reuid="$GW" --regid="$(id -g "$GW")" --init-groups \
     env -i PATH=/usr/bin:/bin HOME="$WORK" CREDENTIALS_DIRECTORY="$CREDS" RUST_LOG=info \
     "$KEEP" --path "$VAULT" gateway serve \
     --agent-socket "$AGENT_SOCK" --admin-socket "$ADMIN_SOCK" \
@@ -151,7 +154,8 @@ for _ in $(seq 100); do
     kill -0 "$GW_PID" 2>/dev/null || fail "the gateway exited at start: $(tail -5 "$WORK/gateway.log")"
     sleep 0.1
 done
-as "$RELAY_USER" env RUST_LOG=info "$KEEP" gateway relay --relay-socket "$RELAY_SOCK" --gateway-user "$GW" \
+setsid setpriv --reuid="$RELAY_USER" --regid="$(id -g "$RELAY_USER")" --init-groups \
+    env -i PATH=/usr/bin:/bin HOME="$WORK" RUST_LOG=info "$KEEP" gateway relay --relay-socket "$RELAY_SOCK" --gateway-user "$GW" \
     >>"$WORK/helper.log" 2>&1 &
 HELPER_PID=$!
 wait_for "$WORK/gateway.log" "relay helper connected"
