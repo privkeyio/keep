@@ -4275,6 +4275,7 @@ impl KeepMobile {
             connect_secret: existing.connect_secret,
             pending_revokes: existing.pending_revokes,
             pending_revoke_all: existing.pending_revoke_all,
+            unsettled_nostrconnect: existing.unsettled_nostrconnect,
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }

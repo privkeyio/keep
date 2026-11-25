@@ -1280,6 +1280,13 @@ pub(crate) struct StoredBunkerConfig {
     /// As `pending_revokes`, for a revoke of every client.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) pending_revoke_all: bool,
+    /// Clients a `nostrconnect://` accept listed and has not settled. Written
+    /// with the listing and cleared only once the accept succeeds, so one
+    /// whose rollback could not finish is still marked after a restart. A
+    /// start neither restores such a client's grants nor keeps it listed.
+    /// Hex pubkeys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) unsettled_nostrconnect: Vec<String>,
 }
 
 pub(crate) fn load_bunker_config(
