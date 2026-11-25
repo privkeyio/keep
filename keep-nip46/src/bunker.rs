@@ -71,7 +71,9 @@ fn validate_metadata_url(value: &str) -> Result<String, String> {
 
 /// A `nostrconnect://` relay as it is dialed, or `None` when it is unusable.
 /// One carrying a control character is refused rather than cleaned, and the
-/// default port is dropped, so spellings of one relay compare equal.
+/// default port is dropped, so spellings of one relay compare equal. The
+/// normalized form is validated too, since normalizing can lengthen it past
+/// the limit the relays are checked against downstream.
 fn nostrconnect_relay(value: &str, validate: fn(&str) -> Result<(), String>) -> Option<String> {
     if value.chars().any(char::is_control) || validate(value).is_err() {
         return None;
@@ -80,6 +82,7 @@ fn nostrconnect_relay(value: &str, validate: fn(&str) -> Result<(), String>) -> 
     ::url::Url::parse(&normalized)
         .ok()
         .map(|url| url.to_string())
+        .filter(|relay| validate(relay).is_ok())
 }
 
 fn sanitize_display_name(name: &str) -> String {
@@ -497,6 +500,22 @@ mod tests {
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.relays, vec!["wss://r.example.com/?auth=1"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_drops_a_relay_normalizing_lengthens_past_the_limit() {
+        let pubkey = Keys::generate().public_key();
+        let long = format!("wss://r.example.com?x={}", "a".repeat(234));
+        assert_eq!(long.len(), keep_core::relay::MAX_RELAY_URL_LENGTH);
+        assert!(validate_relay_url(&long).is_ok());
+        let uri = format!(
+            "nostrconnect://{}?relay={}&relay=wss%3A%2F%2Fok.example.com&secret=abcdef0123456789",
+            pubkey.to_hex(),
+            urlencoding::encode(&long)
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://ok.example.com/"]);
+        assert!(req.relays.iter().all(|r| validate_relay_url(r).is_ok()));
     }
 
     #[test]

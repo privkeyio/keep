@@ -1049,6 +1049,35 @@ type ClientRoutes = Arc<std::sync::RwLock<std::collections::HashMap<PublicKey, V
 /// pool's lock held while a relay is awaited, so a relay slow to answer holds
 /// up only the send that went to it. Returns how many relays accepted it.
 async fn send_to_relays(client: &Client, urls: &[RelayUrl], event: &Event) -> usize {
+    let mut sends = spawn_sends(client, urls, event).await;
+    let mut accepted = 0;
+    while let Some(sent) = sends.join_next().await {
+        if matches!(sent, Ok(true)) {
+            accepted += 1;
+        }
+    }
+    accepted
+}
+
+/// Sends `event` to every relay of `urls` at once, and returns once one has
+/// accepted it, leaving the others to finish on their own, or once all have
+/// refused it.
+async fn send_until_one_accepts(client: &Client, urls: &[RelayUrl], event: &Event) -> bool {
+    let mut sends = spawn_sends(client, urls, event).await;
+    while let Some(sent) = sends.join_next().await {
+        if matches!(sent, Ok(true)) {
+            sends.detach_all();
+            return true;
+        }
+    }
+    false
+}
+
+async fn spawn_sends(
+    client: &Client,
+    urls: &[RelayUrl],
+    event: &Event,
+) -> tokio::task::JoinSet<bool> {
     let mut sends = tokio::task::JoinSet::new();
     for url in urls {
         match client.relay(url).await {
@@ -1059,13 +1088,7 @@ async fn send_to_relays(client: &Client, urls: &[RelayUrl], event: &Event) -> us
             Err(e) => debug!(relay = %url, error = %e, "relay left the pool before a send"),
         }
     }
-    let mut accepted = 0;
-    while let Some(sent) = sends.join_next().await {
-        if matches!(sent, Ok(true)) {
-            accepted += 1;
-        }
-    }
-    accepted
+    sends
 }
 
 /// The relays a response to `app` goes to: the bunker's own and, for a
@@ -1125,6 +1148,8 @@ pub struct ServerRelays {
 pub struct JoinedRelays {
     reached: Vec<RelayUrl>,
     added: Vec<RelayUrl>,
+    /// The client [`ServerRelays::route`] routed through these relays.
+    routed: Option<PublicKey>,
     _one_at_a_time: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -1160,10 +1185,10 @@ impl ServerRelays {
         let one_at_a_time = tokio::time::timeout(timeout, Arc::clone(&self.joining).lock_owned())
             .await
             .map_err(|_| NetworkError::timeout("waiting on another nostrconnect join"))?;
-        let timeout = timeout.saturating_sub(started.elapsed());
         let mut joined = JoinedRelays {
             reached: Vec::new(),
             added: Vec::new(),
+            routed: None,
             _one_at_a_time: one_at_a_time,
         };
         let opts = relay_options(proxy);
@@ -1177,6 +1202,7 @@ impl ServerRelays {
                 }
             }
         }
+        let timeout = timeout.saturating_sub(started.elapsed());
         let mut attempts = tokio::task::JoinSet::new();
         for url in urls {
             let client = self.client.clone();
@@ -1201,7 +1227,7 @@ impl ServerRelays {
         joined.added.retain(|url| !unreached.contains(url));
         self.remove_relays(&unreached).await;
         if joined.reached.is_empty() {
-            self.abandon(joined, None).await;
+            self.abandon(joined).await;
             return Err(NetworkError::relay("none of the client's relays could be reached").into());
         }
         Ok(joined)
@@ -1209,18 +1235,20 @@ impl ServerRelays {
 
     /// Sends `client`'s responses to the relays `joined` reached as well as
     /// the bunker's own, from now until the server stops or
-    /// [`ServerRelays::abandon`] is called for it.
-    pub fn route(&self, joined: &JoinedRelays, client: PublicKey) {
+    /// [`ServerRelays::abandon`] is called for `joined`.
+    pub fn route(&self, joined: &mut JoinedRelays, client: PublicKey) {
         self.routes
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(client, joined.reached.clone());
+        joined.routed = Some(client);
     }
 
-    /// Undoes a join: `client`'s route is dropped and the relays the join
-    /// added are removed from the pool.
-    pub async fn abandon(&self, joined: JoinedRelays, client: Option<PublicKey>) {
-        if let Some(client) = client {
+    /// Undoes a join: the route it installed, if any, is dropped, and the
+    /// relays it added are removed from the pool. A route another join
+    /// installed for the same client is left alone.
+    pub async fn abandon(&self, joined: JoinedRelays) {
+        if let Some(client) = joined.routed {
             self.routes
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1244,8 +1272,9 @@ impl ServerRelays {
 
     /// Answers a `nostrconnect://` request on the relays `joined` reached: a
     /// kind 24133 event signed with the transport key and NIP-44 encrypted to
-    /// the client, whose `result` is the client's own secret. Succeeds only
-    /// when at least one relay accepted it.
+    /// the client, whose `result` is the client's own secret. Succeeds as soon
+    /// as one relay accepts it, without waiting on the others, and fails only
+    /// when every relay refused it.
     pub async fn send_nostrconnect_response(
         &self,
         request: &crate::bunker::NostrConnectRequest,
@@ -1274,7 +1303,7 @@ impl ServerRelays {
             .sign_with_keys(&self.keys)
             .map_err(|e| CryptoError::invalid_signature(format!("sign response: {e}")))?;
 
-        if send_to_relays(&self.client, &joined.reached, &event).await == 0 {
+        if !send_until_one_accepts(&self.client, &joined.reached, &event).await {
             return Err(NetworkError::relay("no relay accepted the connect response").into());
         }
         Ok(())
@@ -1433,7 +1462,7 @@ mod tests {
             "an unreached relay is dropped"
         );
 
-        relays.abandon(joined, None).await;
+        relays.abandon(joined).await;
         assert!(relays.holds(&own_url).await, "the bunker's own relay stays");
         assert!(!relays.holds(&their_url).await);
 
@@ -1446,6 +1475,63 @@ mod tests {
             .await;
         assert!(none.is_err());
         assert!(!relays.holds(&closed).await);
+    }
+
+    // A join that waits on another and then dials a relay that never
+    // answers still returns within its timeout as a whole.
+    #[tokio::test]
+    async fn a_join_stays_within_its_timeout() {
+        let own = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let own_url = own.url().await.to_string();
+        let hanging = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            std::thread::spawn(move || {
+                let held: Vec<_> = listener.incoming().collect();
+                drop(held);
+            });
+            url
+        };
+        let mut keyring = Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let server = Server::new(
+            Arc::new(Mutex::new(keyring)),
+            std::slice::from_ref(&own_url),
+            None,
+        )
+        .await
+        .unwrap();
+        let relays = server.relays();
+        let first = relays
+            .join(
+                std::slice::from_ref(&own_url),
+                None,
+                std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+
+        let timeout = std::time::Duration::from_secs(2);
+        let started = std::time::Instant::now();
+        let second = {
+            let relays = relays.clone();
+            tokio::spawn(async move { relays.join(&[hanging], None, timeout).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        relays.abandon(first).await;
+        assert!(second.await.unwrap().is_err());
+        assert!(
+            started.elapsed() < timeout + std::time::Duration::from_millis(500),
+            "the join ran past its timeout"
+        );
     }
 
     // An explicitly-configured `expected_secret` must surface as the bunker

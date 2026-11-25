@@ -1092,6 +1092,11 @@ pub struct KeepMobile {
     /// a revoke reaches it whichever instance the revoke is made through. Weak,
     /// so it dies with the server.
     pub(crate) live_bunker: std::sync::Mutex<Option<std::sync::Weak<keep_nip46::SignerHandler>>>,
+    /// The `nostrconnect://` accept that listed each client in
+    /// `authorized_clients` and may still roll that listing back, so a
+    /// rollback never removes a listing a later accept made. Written under
+    /// `bunker_start_lock`.
+    pub(crate) nostrconnect_listings: std::sync::Mutex<HashMap<nostr_sdk::PublicKey, u64>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -1534,6 +1539,7 @@ impl KeepMobile {
             live_generation: tokio::sync::watch::Sender::new(0),
             bunker_start_lock: std::sync::Mutex::new(()),
             live_bunker: std::sync::Mutex::new(None),
+            nostrconnect_listings: std::sync::Mutex::new(HashMap::new()),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             proxy_config_lock: std::sync::Mutex::new(()),
