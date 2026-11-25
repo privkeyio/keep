@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
+#[cfg(feature = "test-approver")]
+mod approver;
 mod audit;
 mod backup;
 mod config;
@@ -182,6 +184,14 @@ pub struct App {
     cached_nsec_count: usize,
     /// What the vault says about its audit logs, shown until acknowledged.
     audit_warnings: Vec<String>,
+    #[cfg(feature = "test-approver")]
+    pub(crate) approver: Arc<std::sync::OnceLock<crate::approver_service::TestApprover>>,
+    #[cfg(feature = "test-approver")]
+    pub(crate) approver_log: VecDeque<String>,
+    #[cfg(feature = "test-approver")]
+    pub(crate) approver_busy: bool,
+    #[cfg(feature = "test-approver")]
+    pub(crate) approver_outcome: Option<Result<String, String>>,
 }
 
 impl App {
@@ -269,6 +279,14 @@ impl App {
             cached_share_count: 0,
             cached_nsec_count: 0,
             audit_warnings: Vec::new(),
+            #[cfg(feature = "test-approver")]
+            approver: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "test-approver")]
+            approver_log: VecDeque::new(),
+            #[cfg(feature = "test-approver")]
+            approver_busy: false,
+            #[cfg(feature = "test-approver")]
+            approver_outcome: None,
             settings,
             kill_switch,
             tray,
@@ -361,6 +379,8 @@ impl App {
                 message,
                 Message::LocalSignerStartResult(..) | Message::LocalSignerRevokeResult(..)
             );
+        #[cfg(feature = "test-approver")]
+        let is_background = is_background || matches!(message, Message::ApproverResult(..));
         if !is_background {
             self.last_activity = Instant::now();
         }
@@ -469,6 +489,13 @@ impl App {
             | Message::AuditPageLoaded(..)
             | Message::AuditChainVerified(..) => self.handle_audit_message(message),
 
+            #[cfg(feature = "test-approver")]
+            Message::NavigateApprover => self.handle_navigate_approver(),
+            #[cfg(feature = "test-approver")]
+            Message::Approver(msg) => self.handle_approver_message(msg),
+            #[cfg(feature = "test-approver")]
+            Message::ApproverResult(result) => self.handle_approver_result(result),
+
             Message::ToggleIdentitySwitcher
             | Message::SwitchIdentity(..)
             | Message::RequestDeleteIdentity(..)
@@ -547,6 +574,8 @@ impl App {
         let bunker_task = self.poll_bunker_events();
         #[cfg(unix)]
         self.poll_local_signer_events();
+        #[cfg(feature = "test-approver")]
+        self.refresh_approver();
         self.sync_tray_status();
         let tray_events = self.poll_tray_events();
         let mut tasks: Vec<_> = tray_events
@@ -891,6 +920,14 @@ impl App {
             cached_share_count: 0,
             cached_nsec_count: 0,
             audit_warnings: Vec::new(),
+            #[cfg(feature = "test-approver")]
+            approver: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "test-approver")]
+            approver_log: VecDeque::new(),
+            #[cfg(feature = "test-approver")]
+            approver_busy: false,
+            #[cfg(feature = "test-approver")]
+            approver_outcome: None,
             settings,
             kill_switch,
             tray: None,

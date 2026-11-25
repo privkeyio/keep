@@ -5,6 +5,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+#[cfg(feature = "test-approver")]
+mod approver_phone;
+#[cfg(feature = "test-approver")]
+mod approver_service;
 mod bunker_service;
 mod frost;
 #[cfg(unix)]
@@ -22,6 +26,20 @@ fn main() -> iced::Result {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install rustls crypto provider");
+
+    #[cfg(feature = "test-approver")]
+    if std::env::args().nth(1).as_deref() == Some("phone") {
+        let Some(uri) = std::env::args().nth(2) else {
+            eprintln!("usage: keep-desktop phone <uri>");
+            std::process::exit(2)
+        };
+        // Warnings only, on stderr: stdout carries the reports.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_max_level(tracing::Level::WARN)
+            .init();
+        approver_phone::run(&uri);
+    }
 
     tracing_subscriber::fmt::init();
 
