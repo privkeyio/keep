@@ -1170,7 +1170,9 @@ impl ServerRelays {
     /// given `timeout`, keeping those reached. Equivalent spellings of one
     /// relay are joined once. A relay added here that cannot be reached is
     /// removed again, as is every one added when the call fails; one the pool
-    /// already held is left as it was. Fails when none is reached.
+    /// already held is left as it was. Fails when none is reached, and times
+    /// out when the relays cannot be added within `timeout`, in which case
+    /// those added are removed once the pool lets them be.
     pub async fn join(
         &self,
         relay_urls: &[String],
@@ -1192,13 +1194,23 @@ impl ServerRelays {
             _one_at_a_time: one_at_a_time,
         };
         let opts = relay_options(proxy);
+        // An add waits for the pool's write lock, which a send in flight
+        // holds shared while it waits on relays' replies.
         for url in &urls {
-            match self.client.pool().add_relay(url, opts.clone()).await {
-                Ok(true) => joined.added.push(url.clone()),
-                Ok(false) => {}
-                Err(e) => {
-                    self.remove_relays(&joined.added).await;
+            let left = timeout.saturating_sub(started.elapsed());
+            let added = tokio::time::timeout(left, self.client.pool().add_relay(url, opts.clone()))
+                .await
+                .map_err(|_| NetworkError::timeout("waiting to add a nostrconnect relay"));
+            match added {
+                Ok(Ok(true)) => joined.added.push(url.clone()),
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    self.abandon_later(joined);
                     return Err(NetworkError::relay(e.to_string()).into());
+                }
+                Err(e) => {
+                    self.abandon_later(joined);
+                    return Err(e.into());
                 }
             }
         }
@@ -1255,6 +1267,13 @@ impl ServerRelays {
                 .remove(&client);
         }
         self.remove_relays(&joined.added).await;
+    }
+
+    /// [`ServerRelays::abandon`] in a task of its own, so a caller bounded by
+    /// a deadline need not wait on the pool's write lock.
+    fn abandon_later(&self, joined: JoinedRelays) {
+        let relays = self.clone();
+        tokio::spawn(async move { relays.abandon(joined).await });
     }
 
     /// Whether the pool holds `url`.
@@ -1551,6 +1570,89 @@ mod tests {
             started.elapsed() < timeout + std::time::Duration::from_millis(500),
             "the join ran past its timeout"
         );
+    }
+
+    /// A relay write policy that never answers, counting the events it holds.
+    #[derive(Debug)]
+    struct HoldsEveryOk(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl nostr_relay_builder::prelude::WritePolicy for HoldsEveryOk {
+        fn admit_event<'a>(
+            &'a self,
+            _event: &'a Event,
+            _addr: &'a SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
+        {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    // A join that cannot add its relays while a send in flight holds the
+    // pool waits for it only until its timeout, and leaves none of them in
+    // the pool.
+    #[tokio::test]
+    async fn a_join_waits_on_a_send_in_flight_only_until_its_timeout() {
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let holding = nostr_relay_builder::LocalRelay::new(
+            nostr_relay_builder::RelayBuilder::default()
+                .write_policy(HoldsEveryOk(Arc::clone(&held))),
+        );
+        holding.run().await.unwrap();
+        let holding_url = holding.url().await.to_string();
+        let theirs = nostr_relay_builder::MockRelay::run().await.unwrap();
+        let their_url = theirs.url().await.to_string();
+        let mut keyring = Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let server = Server::new(
+            Arc::new(Mutex::new(keyring)),
+            std::slice::from_ref(&holding_url),
+            None,
+        )
+        .await
+        .unwrap();
+        let relays = server.relays();
+        relays
+            .client
+            .try_connect_relay(&holding_url, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let event = EventBuilder::text_note("held")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let sending = {
+            let client = relays.client.clone();
+            tokio::spawn(async move { client.send_event_to([holding_url], &event).await })
+        };
+        let started = std::time::Instant::now();
+        while held.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "the send never reached the holding relay"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let timeout = std::time::Duration::from_secs(1);
+        let started = std::time::Instant::now();
+        let joined = relays
+            .join(std::slice::from_ref(&their_url), None, timeout)
+            .await;
+        assert!(
+            started.elapsed() < timeout + std::time::Duration::from_millis(500),
+            "the join ran past its timeout"
+        );
+        assert!(joined.is_err());
+        assert!(!sending.is_finished(), "the send let the pool go");
+        assert!(!relays.holds(&their_url).await);
     }
 
     // An explicitly-configured `expected_secret` must surface as the bunker

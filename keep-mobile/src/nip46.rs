@@ -207,6 +207,16 @@ const NOSTRCONNECT_RELAY_TIMEOUT: Duration = if cfg!(test) {
 /// dials and the response.
 const NOSTRCONNECT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long past an accept's deadline the rollback of a failed accept may
+/// wait for the relays it joined to be dropped and for the start lock. A
+/// rollback that cannot take the lock by then is finished by a thread of its
+/// own, so the accept still returns.
+const NOSTRCONNECT_ROLLBACK_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(2)
+};
+
 /// What is left of `deadline`, or `Timeout` once it has passed.
 fn time_left(deadline: std::time::Instant) -> Result<Duration, KeepMobileError> {
     deadline
@@ -238,12 +248,24 @@ static NEXT_NOSTRCONNECT_LISTING: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// The `nostrconnect://` accept that listed a client and may still roll the
-/// listing back, and whether its rollback revoked the client but could not
-/// yet finish, which leaves the client marked unsettled on disk.
+/// listing back, and how far that has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NostrconnectListing {
     id: u64,
-    unlisting: bool,
+    state: ListingState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListingState {
+    /// The accept is still in flight.
+    Accepting,
+    /// The accept failed and revoked the client, and its rollback is waiting
+    /// for the start lock to finish. Nothing else rolls it back meanwhile, so
+    /// the rollback still revokes the client on a server started since.
+    RollingBack,
+    /// The rollback could not finish, which leaves the client marked
+    /// unsettled on disk for a start or the next accept to finish.
+    Unfinished,
 }
 
 /// The name a `nostrconnect://` client is registered under.
@@ -1029,7 +1051,7 @@ impl BunkerHandler {
             *client,
             NostrconnectListing {
                 id,
-                unlisting: false,
+                state: ListingState::Accepting,
             },
         );
         Ok(id)
@@ -1075,7 +1097,7 @@ impl BunkerHandler {
         self.still_live(live)?;
         let owned = NostrconnectListing {
             id: listing,
-            unlisting: false,
+            state: ListingState::Accepting,
         };
         if self.nostrconnect_listings().get(client) != Some(&owned) {
             return Err(KeepMobileError::BunkerNotRunning);
@@ -1108,51 +1130,28 @@ impl BunkerHandler {
     /// Whether an accept of `client` in this process is still in flight,
     /// rather than rolling back.
     fn accepting(&self, client: &PublicKey) -> bool {
-        self.nostrconnect_listings()
-            .get(client)
-            .is_some_and(|l| !l.unlisting)
+        self.listing_state(client) == Some(ListingState::Accepting)
     }
 
-    /// Rolls back an unsettled listing of `client`: drops its stored grants
-    /// and unlists it, and clears its mark and lets go of its listing only
-    /// once both are written. The unlist is written even if the grants could
-    /// not be dropped. Callers hold the start lock and own the listing.
-    fn roll_back_listing(&self, client: &PublicKey) -> Result<(), KeepMobileError> {
-        let forgot = self.mobile.forget_bunker_permissions(Some(client));
-        self.with_bunker_config(|stored| {
-            stored
-                .authorized_clients
-                .retain(|c| PublicKey::parse(c).ok() != Some(*client));
-            if forgot.is_ok() {
-                stored
-                    .unsettled_nostrconnect
-                    .retain(|c| PublicKey::from_hex(c).ok() != Some(*client));
-            }
-            crate::persistence::persist_bunker_config(
-                &self.mobile.storage,
-                crate::BUNKER_CONFIG_STORAGE_KEY,
-                stored,
-            )?;
-            self.nostrconnect_clients().remove(client);
-            Ok(())
-        })?;
-        forgot?;
-        self.nostrconnect_listings().remove(client);
-        Ok(())
+    fn listing_state(&self, client: &PublicKey) -> Option<ListingState> {
+        self.nostrconnect_listings().get(client).map(|l| l.state)
     }
 
     /// Finishes the rollback of every unsettled accept, or only `only`'s,
-    /// whose accept is not still in flight here: one a rollback could not
-    /// finish, or one a previous process left. An accept in flight owns its
-    /// listing, so a later listing of a client is never removed. Callers hold
-    /// the start lock.
+    /// that neither an accept in flight here nor its rollback still owns: one
+    /// a rollback could not finish, or one a previous process left. An accept
+    /// in flight owns its listing, so a later listing of a client is never
+    /// removed. Callers hold the start lock.
     fn finish_unsettled(&self, only: Option<&PublicKey>) -> Result<(), KeepMobileError> {
         let mut result = Ok(());
         for client in self.unsettled_clients()? {
-            if only.is_some_and(|only| *only != client) || self.accepting(&client) {
+            let owned = self
+                .listing_state(&client)
+                .is_some_and(|state| state != ListingState::Unfinished);
+            if only.is_some_and(|only| *only != client) || owned {
                 continue;
             }
-            if let Err(e) = self.roll_back_listing(&client) {
+            if let Err(e) = roll_back_listing(&self.mobile, &client) {
                 result = Err(e);
             }
         }
@@ -1162,31 +1161,66 @@ impl BunkerHandler {
     /// Undoes `authorize_nostrconnect` for a client it registered. Only while
     /// the listing is still `listing`: once a revoke took it out and a later
     /// accept listed the client again, that newer listing stays. The client
-    /// is revoked on the server it was accepted on and on any server started
-    /// since, which restored the grants its listing let it be given, and
-    /// those grants are dropped from storage. The client stays marked
-    /// unsettled on disk until both writes land, so a start never restores
-    /// it, and a start or the next accept of the client finishes them.
-    fn unauthorize(&self, handler: &SignerHandler, client: &PublicKey, listing: u64) {
-        let _start_guard = self.start_guard();
+    /// is revoked on the server it was accepted on at once, without the
+    /// start lock, and the relays `abandon` drops are dropped before the lock
+    /// is waited for, each wait bounded by `by`. The rest needs the start
+    /// lock: the client is revoked on any server started since, which
+    /// restored the grants its listing let it be given, those grants are
+    /// dropped from storage and the client is unlisted. When the lock cannot
+    /// be taken by `by` a thread of its own does that once it can, so this
+    /// returns by `by`. No start from here on restores the client, so only a
+    /// start already holding the lock can serve it meanwhile, until it lets
+    /// the lock go. The client stays marked unsettled on disk until both
+    /// writes land, so a start never restores it, and a start or the next
+    /// accept of the client finishes them.
+    fn unauthorize(
+        &self,
+        handler: &Arc<SignerHandler>,
+        client: &PublicKey,
+        listing: u64,
+        abandon: impl std::future::Future<Output = ()> + Send + 'static,
+        by: std::time::Instant,
+    ) {
         self.mobile.runtime.block_on(handler.revoke_client(client));
-        {
+        let owned = {
             let mut listings = self.nostrconnect_listings();
             match listings.get_mut(client) {
-                Some(owned) if owned.id == listing => owned.unlisting = true,
-                _ => return,
+                Some(owned) if owned.id == listing => {
+                    owned.state = ListingState::RollingBack;
+                    true
+                }
+                _ => false,
             }
-        }
-        if let Some(replacement) = self
-            .live_handler()
-            .filter(|live| !std::ptr::eq(live.as_ref(), handler))
-        {
-            self.mobile
+        };
+        let abandoning = self.mobile.runtime.spawn(abandon);
+        if let Ok(left) = time_left(by) {
+            let _ = self
+                .mobile
                 .runtime
-                .block_on(replacement.revoke_client(client));
+                .block_on(async { tokio::time::timeout(left, abandoning).await });
         }
-        if let Err(e) = self.roll_back_listing(client) {
-            tracing::warn!(error = %e, "the rollback of a failed nostrconnect accept is unfinished; its client is not restored");
+        if !owned {
+            return;
+        }
+        if let Ok(_start_guard) = lock_by(&self.mobile.bunker_start_lock, by) {
+            finish_rollback(&self.mobile, handler, client, listing);
+            return;
+        }
+        let (mobile, accepted_on, rolled_back) =
+            (Arc::clone(&self.mobile), Arc::clone(handler), *client);
+        let handed_off = std::thread::Builder::new()
+            .name("nostrconnect-rollback".into())
+            .spawn(move || {
+                let _start_guard = mobile
+                    .bunker_start_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                finish_rollback(&mobile, &accepted_on, &rolled_back, listing);
+            });
+        if let Err(e) = handed_off {
+            tracing::warn!(error = %e, "could not hand off a nostrconnect rollback; finishing it here");
+            let _start_guard = self.start_guard();
+            finish_rollback(&self.mobile, handler, client, listing);
         }
     }
 
@@ -1246,8 +1280,15 @@ impl BunkerHandler {
             .and_then(|()| self.settle_accept(&live, &client, listing, deadline))
             .map_err(|e| self.still_live(&live).err().unwrap_or(e));
         if let Err(e) = settled {
-            self.unauthorize(&handler, &client, listing);
-            self.mobile.runtime.block_on(live.relays.abandon(joined));
+            let relays = live.relays.clone();
+            let by = deadline.max(std::time::Instant::now()) + NOSTRCONNECT_ROLLBACK_GRACE;
+            self.unauthorize(
+                &handler,
+                &client,
+                listing,
+                async move { relays.abandon(joined).await },
+                by,
+            );
             return Err(e);
         }
         Ok(())
@@ -1583,6 +1624,84 @@ fn listed_clients(mobile: &KeepMobile) -> Result<HashSet<PublicKey>, KeepMobileE
             .filter_map(|c| PublicKey::parse(c).ok())
             .collect())
     })
+}
+
+/// Rolls back an unsettled listing of `client`: drops its stored grants and
+/// unlists it, and clears its mark and lets go of its listing only once both
+/// are written. The unlist is written even if the grants could not be
+/// dropped. Callers hold the start lock and own the listing.
+fn roll_back_listing(mobile: &KeepMobile, client: &PublicKey) -> Result<(), KeepMobileError> {
+    let forgot = mobile.forget_bunker_permissions(Some(client));
+    with_bunker_config(mobile, |stored| {
+        stored
+            .authorized_clients
+            .retain(|c| PublicKey::parse(c).ok() != Some(*client));
+        if forgot.is_ok() {
+            stored
+                .unsettled_nostrconnect
+                .retain(|c| PublicKey::from_hex(c).ok() != Some(*client));
+        }
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )?;
+        mobile
+            .nostrconnect_clients
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(client);
+        Ok(())
+    })?;
+    forgot?;
+    mobile
+        .nostrconnect_listings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(client);
+    Ok(())
+}
+
+/// The part of `BunkerHandler::unauthorize` that needs the start lock, which
+/// callers hold: while `listing` is still the client's and rolling back, the
+/// client is revoked on any server started since it was accepted on
+/// `accepted_on`, and its listing rolled back. A rollback that cannot finish
+/// is left for a start or the next accept of the client.
+fn finish_rollback(
+    mobile: &KeepMobile,
+    accepted_on: &SignerHandler,
+    client: &PublicKey,
+    listing: u64,
+) {
+    let rolling_back = NostrconnectListing {
+        id: listing,
+        state: ListingState::RollingBack,
+    };
+    let listings = || {
+        mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    };
+    if listings().get(client) != Some(&rolling_back) {
+        return;
+    }
+    let replacement = mobile
+        .live_bunker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|live| !std::ptr::eq(live.as_ref(), accepted_on));
+    if let Some(replacement) = replacement {
+        mobile.runtime.block_on(replacement.revoke_client(client));
+    }
+    if let Err(e) = roll_back_listing(mobile, client) {
+        if let Some(owned) = listings().get_mut(client).filter(|l| l.id == listing) {
+            owned.state = ListingState::Unfinished;
+        }
+        tracing::warn!(error = %e, "the rollback of a failed nostrconnect accept is unfinished; its client is not restored");
+    }
 }
 
 /// Runs `f` on the stored bunker config under its lock.
@@ -3649,6 +3768,17 @@ mod tests {
         assert_ne!(*mobile.live_generation.borrow(), before, "stopped");
     }
 
+    /// Rolls back `listing` with no relays to drop and a lock nobody holds.
+    fn unauthorize_now(
+        handler: &BunkerHandler,
+        engine: &Arc<SignerHandler>,
+        client: &PublicKey,
+        listing: u64,
+    ) {
+        let by = std::time::Instant::now() + Duration::from_secs(5);
+        handler.unauthorize(engine, client, listing, async {}, by);
+    }
+
     fn stored_config(storage: &Arc<dyn SecureStorage>) -> StoredBunkerConfig {
         load_bunker_config(storage, BUNKER_CONFIG_STORAGE_KEY)
             .unwrap()
@@ -4865,13 +4995,13 @@ mod tests {
         handler.revoke_client(client.to_hex()).unwrap();
         assert!(!is_listed(&storage, &client));
         let second = handler.list_client(&client).unwrap();
-        handler.unauthorize(&engine, &client, first);
+        unauthorize_now(&handler, &engine, &client, first);
         assert!(
             is_listed(&storage, &client),
             "the earlier accept's rollback removed the later listing"
         );
 
-        handler.unauthorize(&engine, &client, second);
+        unauthorize_now(&handler, &engine, &client, second);
         assert!(
             !is_listed(&storage, &client),
             "a rollback with no replacement removes its own listing"
@@ -5083,6 +5213,91 @@ mod tests {
         starter.stop_bunker();
     }
 
+    // A failed accept whose rollback cannot take the start lock returns
+    // within its deadline and the rollback's grace, the original error
+    // reported, with the client revoked and its relays dropped meanwhile.
+    // Once the lock is let go the rollback finishes: the client is unlisted
+    // and unmarked, and its grant is dropped.
+    #[test]
+    fn a_rollback_held_up_by_the_start_lock_finishes_after_the_accept_returns() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let client = nostr_sdk::Keys::generate().public_key();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(Some(released));
+        let locking = Arc::downgrade(&mobile);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, move |_| {
+            let released = released.lock().unwrap().take();
+            if let (Some(mobile), Some(released)) = (locking.upgrade(), released) {
+                persist_grants(&mobile, &[client]);
+                let (locked_tx, locked) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _held = mobile.bunker_start_lock.lock().unwrap();
+                    let _ = locked_tx.send(());
+                    let _ = released.recv();
+                });
+                locked.recv().unwrap();
+            }
+            Some(false)
+        });
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+
+        let timeout = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let accepting = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&client, &[&refusing_url], "");
+            std::thread::spawn(move || {
+                let result =
+                    starter.accept_nostrconnect_by(uri, None, std::time::Instant::now() + timeout);
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let finished = done.recv_timeout(Duration::from_secs(10)).is_ok();
+        let elapsed = started.elapsed();
+        let live = starter.relays.lock().unwrap().clone().unwrap();
+        let relays_kept = mobile.runtime.block_on(live.relays.holds(&refusing_url));
+        let served = engine_lists(&starter, &client);
+        let unlisted = !is_listed(&storage, &client);
+        drop(release);
+        assert!(
+            finished,
+            "the rollback waited on the start lock past the accept's deadline"
+        );
+        assert!(elapsed < timeout + NOSTRCONNECT_ROLLBACK_GRACE + Duration::from_millis(500));
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(KeepMobileError::NetworkError { ref msg })
+                if msg.contains("no relay accepted the connect response")
+        ));
+        assert!(!served, "the client could sign while its rollback waited");
+        assert!(
+            !relays_kept,
+            "the joined relay was held while the rollback waited"
+        );
+        assert!(!unlisted, "the unlist was written without the start lock");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_listed(&storage, &client) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_listed(&storage, &client), "the rollback never finished");
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        assert!(!engine_lists(&starter, &client));
+        assert!(!mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap()
+            .contains_key(&client));
+        starter.stop_bunker();
+    }
+
     // A rollback that revoked the client but could not write the unlist
     // keeps the listing its own, so once storage recovers an accept of the
     // client again finishes the unlist rather than being refused as a
@@ -5172,7 +5387,7 @@ mod tests {
             "the replacement restored the grant"
         );
 
-        handler.unauthorize(&accepted_on, &client, listing);
+        unauthorize_now(&handler, &accepted_on, &client, listing);
         assert!(
             !engine_lists(&replacement, &client),
             "the replacement still serves the client"

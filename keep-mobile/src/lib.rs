@@ -1095,7 +1095,8 @@ pub struct KeepMobile {
     /// The `nostrconnect://` accept that listed each client in
     /// `authorized_clients` and may still roll that listing back, so a
     /// rollback never removes a listing a later accept made. Written under
-    /// `bunker_start_lock`.
+    /// `bunker_start_lock`, but for a failed accept handing its own listing
+    /// to its rollback.
     pub(crate) nostrconnect_listings:
         std::sync::Mutex<HashMap<nostr_sdk::PublicKey, nip46::NostrconnectListing>>,
     /// The clients a `nostrconnect://` accept listed in `authorized_clients`
