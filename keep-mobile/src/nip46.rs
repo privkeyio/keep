@@ -960,10 +960,9 @@ impl BunkerHandler {
             let verified = self.mobile.runtime.block_on(async {
                 tokio::time::timeout(
                     time_left(deadline)?,
-                    // A proxied socket is not pinned by the transport, so
-                    // through a proxy a relay is admitted only after a probe
-                    // saw its pin. The live socket and its reconnects still
-                    // get CA-only validation unless strict pinning is on.
+                    // Through a proxy a relay is admitted only after a probe
+                    // saw its pin. The live socket and its reconnects enforce
+                    // the pin in their own handshake either way.
                     async {
                         if live.proxy.is_some() {
                             self.mobile
@@ -1528,10 +1527,10 @@ impl BunkerHandler {
     /// one whose certificate `probe` finds does not match its pin is not
     /// dialed. One the probe cannot reach by `deadline` is dialed directly,
     /// as at the accept, since its handshake is checked against the stored
-    /// pin. Through a `proxy` it is not: the pinned transport cannot pin a
-    /// proxied socket and gives it CA-only validation, so it is dialed only
-    /// after a probe saw its pin. That admits the relay but does not pin the
-    /// live socket or its reconnects.
+    /// pin. Through a `proxy` it is not: it is dialed only after a probe saw
+    /// its pin. The live socket and its reconnects enforce the stored pin in
+    /// their own handshake, proxied or not, and requiring the probe as well
+    /// is kept as a conservative policy pending a separate decision.
     async fn a_start_may_dial<P, F>(
         relay: &str,
         pins: &keep_frost_net::CertificatePinSet,
@@ -1697,9 +1696,9 @@ impl BunkerHandler {
     /// is enforced on the handshake of the socket the bunker then opens to
     /// the relay. They are dialed through the proxy the bunker was started
     /// with, all at once, and the whole accept is bounded by one deadline.
-    /// Through a proxy that socket cannot be pinned, so a pinned relay is
-    /// joined only once a probe saw its pin. The socket itself, and its
-    /// reconnects, still get CA-only validation unless strict pinning is on.
+    /// Through a proxy a pinned relay is joined only once a probe saw its
+    /// pin, and the proxied socket and its reconnects enforce that pin in
+    /// their handshake as a direct one does.
     ///
     /// The client's secret is only echoed back. It never becomes a secret the
     /// bunker accepts on `connect`. A client already authorized is refused,
@@ -5475,9 +5474,8 @@ mod tests {
             &crate::persistence::StoredStrictPinConfig { enabled: false },
         )
         .unwrap();
-        // The probe through the proxy cannot confirm the pin, and the
-        // proxied socket would not enforce it, so the relay is refused
-        // rather than joined.
+        // The probe through the proxy cannot confirm the pin, so the relay
+        // is refused rather than joined.
         let pinned = nostrconnect_uri(&client, &["wss://pinned.example.com"], "");
         assert!(no_relay_passed(starter.accept_nostrconnect(pinned, None)));
         dialed
@@ -6535,8 +6533,8 @@ mod tests {
         )));
         assert!(!probed.load(Ordering::Acquire));
 
-        // A proxied socket is not pinned by the transport, so through a
-        // proxy only a probe that confirmed the pin lets a relay be dialed.
+        // Through a proxy only a probe that confirmed the pin lets a relay
+        // be dialed.
         let proxy = Some("127.0.0.1:9050".parse().unwrap());
         assert!(may_dial_through(proxy, || Ok(())));
         assert!(!may_dial_through(proxy, || Err(

@@ -5609,9 +5609,9 @@ impl KeepMobile {
         }
     }
 
-    /// The stored proxy, refused under strict pinning: the pinned transport
-    /// cannot pin a socket the proxy opens and refuses every one, so a start
-    /// would wait out its relay timeout and carry nothing.
+    /// The stored proxy, refused under strict pinning. The pinned transport
+    /// pins a socket the SOCKS proxy opens, and this refusal is kept as a
+    /// conservative policy pending a separate decision.
     pub(crate) fn pinnable_proxy(&self) -> Result<Option<std::net::SocketAddr>, KeepMobileError> {
         let proxy = self.configured_proxy()?;
         if proxy.is_some() {
@@ -5725,7 +5725,7 @@ impl KeepMobile {
     fn refuse_strict_pinning_behind_proxy(&self) -> Result<(), KeepMobileError> {
         if self.get_strict_cert_pinning()? {
             return Err(KeepMobileError::InvalidInput {
-                msg: "Strict certificate pinning cannot pin relays reached through the proxy; turn one of them off".into(),
+                msg: "Strict certificate pinning cannot be used together with the proxy; turn one of them off".into(),
             });
         }
         Ok(())

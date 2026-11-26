@@ -12,7 +12,6 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
-use tokio_socks::tcp::Socks5Stream;
 use x509_cert::der::{Decode, Encode};
 use x509_cert::Certificate;
 
@@ -259,7 +258,11 @@ pub async fn verify_relay_certificate(
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name = ServerName::try_from(hostname.as_str())
+    let bare_host = hostname
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(&hostname);
+    let server_name = ServerName::try_from(bare_host)
         .map_err(|_| FrostNetError::Transport(format!("Invalid server name: {hostname}")))?
         .to_owned();
 
@@ -275,18 +278,18 @@ pub async fn verify_relay_certificate(
         // Hand the relay name to the proxy rather than resolving it here: a
         // local lookup would leak the relay being contacted even though the
         // connection itself is proxied, which is the whole point of routing
-        // through Tor. That also means `is_internal_ip` cannot run, since no
-        // address is resolved on this side; the target is whatever the proxy
-        // reaches, exactly as for the live relay sockets, which build their
-        // proxied streams the same way.
+        // through Tor. That also means `is_internal_ip` can only screen an IP
+        // literal, since no name is resolved on this side; a hostname reaches
+        // whatever the proxy reaches. The dial is the one the live relay
+        // sockets use, so both send and screen a host the same way. The
+        // literal is always screened, as the direct probe below screens
+        // every address it resolves.
         Some(socks) => tokio::time::timeout(
             connect_timeout,
-            Socks5Stream::connect(socks, (hostname.as_str(), port)),
+            crate::pinned_transport::socks_dial(socks, &hostname, port, true),
         )
         .await
-        .map_err(|_| FrostNetError::Timeout(format!("SOCKS connect to {addr} via {socks}")))?
-        .map_err(|e| FrostNetError::Transport(format!("SOCKS connect to {addr} via {socks}: {e}")))?
-        .into_inner(),
+        .map_err(|_| FrostNetError::Timeout(format!("SOCKS connect to {addr} via {socks}")))??,
         None => {
             let resolve_addr = addr.clone();
             let addrs: Vec<SocketAddr> = tokio::time::timeout(

@@ -1957,8 +1957,8 @@ fn a_callback_can_save_the_proxy_from_the_stop_alert() {
     assert!(!phone.handler.status().running);
 }
 
-// Strict pinning cannot pin a socket the proxy opens, so the approver refuses
-// the pair outright rather than report running and carry nothing.
+// Strict pinning together with the proxy is refused outright, so the approver
+// does not start with the pair.
 #[test]
 fn strict_pinning_with_the_proxy_is_refused() {
     let phone = paired();
