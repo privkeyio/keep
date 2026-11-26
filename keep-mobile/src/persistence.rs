@@ -1260,8 +1260,8 @@ pub(crate) struct StoredBunkerConfig {
     pub(crate) enabled: bool,
     #[serde(default)]
     pub(crate) authorized_clients: Vec<String>,
-    /// Moved on by every write that changes `authorized_clients`, so a
-    /// config save can tell its read is out of date.
+    /// Moved on by every write to the client list or settings, so a config
+    /// save from an older read is refused.
     #[serde(default)]
     pub(crate) client_list_revision: u64,
     /// Hex-encoded 32-byte transport secret key. The bunker:// pubkey is derived
