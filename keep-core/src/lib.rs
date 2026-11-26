@@ -289,7 +289,14 @@ impl Keep {
     /// Returns [`KeepError::RateLimited`] after too many failed attempts.
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.storage.unlock(password)?;
+        let opened = self.finish_unlock();
+        if opened.is_err() {
+            self.clear_unlocked_state();
+        }
+        opened
+    }
 
+    fn finish_unlock(&mut self) -> Result<()> {
         let data_key = self.get_data_key()?;
         self.audit = Some(AuditLog::open(self.storage.path(), &data_key)?);
         self.signing_audit = Some(SigningAuditLog::open(self.storage.path(), &data_key)?);
@@ -346,6 +353,10 @@ impl Keep {
     /// Lock and clear all keys from memory.
     pub fn lock(&mut self) {
         self.audit_event(AuditEventType::VaultLock, |e| e);
+        self.clear_unlocked_state();
+    }
+
+    fn clear_unlocked_state(&mut self) {
         self.keyring.clear();
         self.audit = None;
         self.signing_audit = None;
@@ -4274,6 +4285,48 @@ mod tests {
 
         assert_eq!(session.commitments_needed(), 1);
         assert!(!session.is_complete());
+    }
+
+    #[test]
+    fn an_unlock_that_cannot_open_the_audit_log_leaves_the_vault_locked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        {
+            let mut keep = test_keep(&path);
+            keep.generate_key("held").unwrap();
+        }
+        let log = path.join("audit.log");
+        std::fs::remove_file(&log).unwrap();
+        std::fs::create_dir(&log).unwrap();
+
+        let mut keep = Keep::open(&path).unwrap();
+        assert!(keep.unlock("testpass").is_err());
+        assert!(!keep.is_unlocked());
+        assert!(keep.audit.is_none());
+        assert!(keep.signing_audit.is_none());
+        assert!(keep.keyring().get_by_name("held").is_none());
+    }
+
+    #[test]
+    fn an_unlock_that_fails_loading_keys_clears_the_ones_it_loaded() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        {
+            let mut keep = test_keep(&path);
+            keep.generate_key("held").unwrap();
+            let held = keep.list_keys().unwrap().remove(0);
+            let mut twin = held.clone();
+            twin.id = [7u8; 32];
+            twin.name = "twin".into();
+            keep.storage.store_key(&twin).unwrap();
+        }
+
+        let mut keep = Keep::open(&path).unwrap();
+        assert!(keep.unlock("testpass").is_err());
+        assert!(!keep.is_unlocked());
+        assert!(keep.audit.is_none());
+        assert!(keep.keyring().get_by_name("held").is_none());
+        assert!(keep.keyring().get_by_name("twin").is_none());
     }
 
     #[test]
