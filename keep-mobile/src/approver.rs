@@ -705,6 +705,9 @@ impl ApproverHandler {
     /// asks the owner to start it is moot.
     fn clear_setting_stop_alerts(&self) {
         let mut inner = self.lock();
+        // With the alerts, under the same lock, so no status shows one
+        // without the other.
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Some(stored) = inner.stored.as_mut() {
             let before = stored.alerts.len();
             stored.alerts.retain(|a| {
@@ -1452,12 +1455,14 @@ impl ApproverHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
+        // Read under the state lock: a stop sets `last_error` before it
+        // raises its alert there, so a status showing the alert shows why.
+        let inner = self.lock();
         let last_error = self
             .last_error
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let inner = self.lock();
         let Some(stored) = inner.stored.as_ref() else {
             return ApproverStatus {
                 paired: false,

@@ -225,6 +225,14 @@ pub enum Message {
     AuditPageLoaded(Result<AuditLoadResult, String>),
     AuditChainVerified(Result<(bool, usize), String>),
 
+    // Test approver
+    #[cfg(feature = "test-approver")]
+    NavigateApprover,
+    #[cfg(feature = "test-approver")]
+    Approver(crate::screen::approver::Message),
+    #[cfg(feature = "test-approver")]
+    ApproverResult(Result<String, String>),
+
     // Identity
     ToggleIdentitySwitcher,
     SwitchIdentity(String),
@@ -609,6 +617,12 @@ impl fmt::Debug for Message {
                 .field(&r.as_ref().map(|(v, c)| (*v, *c)).map_err(|e| e.as_str()))
                 .finish(),
             Self::SigningAudit(msg) => f.debug_tuple("SigningAudit").field(msg).finish(),
+            #[cfg(feature = "test-approver")]
+            Self::NavigateApprover => f.write_str("NavigateApprover"),
+            #[cfg(feature = "test-approver")]
+            Self::Approver(msg) => f.debug_tuple("Approver").field(msg).finish(),
+            #[cfg(feature = "test-approver")]
+            Self::ApproverResult(r) => f.debug_tuple("ApproverResult").field(r).finish(),
             Self::KillSwitchDeactivateResult(r) => f
                 .debug_tuple("KillSwitchDeactivateResult")
                 .field(&r.as_ref().map(|_| ()).map_err(|e| e.as_str()))

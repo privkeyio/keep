@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: © 2026 PrivKey LLC
 // SPDX-License-Identifier: MIT
 
+#[cfg(feature = "test-approver")]
+pub mod approver;
 pub mod bunker;
 pub mod create;
 pub mod distribute;
@@ -66,6 +68,8 @@ pub enum Screen {
     SigningAudit(signing_audit::SigningAuditScreen),
     Settings(settings::SettingsScreen),
     Recovery(recovery::State),
+    #[cfg(feature = "test-approver")]
+    Approver(approver::State),
 }
 
 impl Screen {
@@ -97,6 +101,8 @@ impl Screen {
             Screen::SigningAudit(s) => (NavItem::Audit, s.view().map(Message::SigningAudit)),
             Screen::Settings(s) => (NavItem::Settings, s.view().map(Message::Settings)),
             Screen::Recovery(s) => (NavItem::Shares, s.view().map(Message::Recovery)),
+            #[cfg(feature = "test-approver")]
+            Screen::Approver(s) => (NavItem::Approver, s.view().map(Message::Approver)),
         };
         layout::with_sidebar(
             nav,
@@ -148,6 +154,8 @@ impl Screen {
             | Screen::Relay(_)
             | Screen::SigningAudit(_)
             | Screen::Settings(_) => {}
+            #[cfg(feature = "test-approver")]
+            Screen::Approver(_) => {}
         }
     }
 }

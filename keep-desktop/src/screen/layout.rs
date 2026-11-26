@@ -40,6 +40,8 @@ pub enum NavItem {
     #[cfg(unix)]
     LocalSigner,
     Audit,
+    #[cfg(feature = "test-approver")]
+    Approver,
     Settings,
 }
 
@@ -122,6 +124,13 @@ pub fn with_sidebar<'a>(
             "Audit",
             Message::NavigateAudit,
             NavItem::Audit,
+            NavBadge::None,
+        ),
+        #[cfg(feature = "test-approver")]
+        (
+            "Test Approver",
+            Message::NavigateApprover,
+            NavItem::Approver,
             NavBadge::None,
         ),
         (

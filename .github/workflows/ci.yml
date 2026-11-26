@@ -58,7 +58,7 @@ jobs:
       # --all-targets so test code is linted too, and the features named
       # explicitly rather than arriving through workspace feature unification,
       # which silently decided whether the ed25519 module was linted at all.
-      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519 -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features keep-frost-net/testing,keep-core/ed25519,keep-desktop/test-approver -- -D warnings
       # The reproducible and Debian builds run only on pushes and tags, so a
       # workspace member missing from their Dockerfiles is caught here instead.
       - run: scripts/check-dockerfile-members.sh
@@ -116,6 +116,7 @@ jobs:
       # tests were type-checked by clippy and never run. That is the ciphersuite
       # whose 64-byte scalar fill the draw criteria are written around.
       - run: cargo test -p keep-core --features ed25519 --lib
+      - run: cargo test -p keep-desktop --features test-approver --bins
       - run: cargo test -p keep-core --features testing --test integration_tests
       - run: cargo test -p keep-frost-net --features testing --test multinode_test
       - run: cargo test -p keep-frost-net --features testing --test taproot_key_spend_memory_test
@@ -148,6 +149,9 @@ jobs:
         run: cargo build --release -p keep-agent --features mcp --example approval_peer
       - if: matrix.os == 'ubuntu-latest'
         run: cargo build --release -p keep-mobile --example mobile_approver
+      # keep-desktop's test approver, which `keep-desktop phone` runs without a window.
+      - if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release -p keep-desktop --features test-approver
       # Adversarial PSBTs and a seeded mutation loop against the single-key signer.
       - run: cargo test -p keep-bitcoin --release --test psbt_stress
       # End-to-end CLI tests drive the release `keep` binary built above as a
@@ -200,6 +204,10 @@ jobs:
       - if: matrix.os == 'ubuntu-latest'
         timeout-minutes: 15
         run: sudo KEEP_GATEWAY_E2E=1 KEEP_E2E_PHONE=target/release/examples/mobile_approver scripts/gateway-approvals-e2e.sh target/e2e-roots/release/keep target/release/examples/approval_peer
+      # And with keep-desktop's test approver as the phone.
+      - if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: sudo KEEP_GATEWAY_E2E=1 KEEP_E2E_PHONE=target/release/keep-desktop scripts/gateway-approvals-e2e.sh target/e2e-roots/release/keep target/release/examples/approval_peer
       # A network key-path spend between two `keep` processes over an in-process
       # relay. The binary is rebuilt with `local-relay-tests` so it accepts a
       # loopback ws:// relay; this stays the last step so no later step runs it.

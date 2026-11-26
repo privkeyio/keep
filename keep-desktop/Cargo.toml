@@ -35,6 +35,21 @@ nokhwa = { version = "0.10", features = ["input-native"] }
 rxing = "0.9"
 image = "0.25"
 rfd = "0.17"
+keep-mobile = { path = "../keep-mobile", optional = true }
+keep-approval = { path = "../keep-approval", optional = true }
+p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "pkcs8"], optional = true }
+
+[features]
+# A stand-in phone for gateway end-to-end tests: trusts only a test
+# attestation root and allows loopback ws:// relays. Never for real use.
+test-approver = [
+    "dep:keep-mobile",
+    "dep:keep-approval",
+    "keep-approval/test-attestation",
+    "dep:p256",
+    "keep-core/allow-ws",
+    "keep-core/allow-internal",
+]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
