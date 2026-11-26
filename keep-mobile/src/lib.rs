@@ -3960,11 +3960,7 @@ impl KeepMobile {
         // No saved config yet: pre-populate the reliable default relay so it
         // shows in the UI and is used immediately, rather than an empty list the
         // user has to fill in. An explicitly-saved empty list is left as-is.
-        let config = stored.unwrap_or_else(|| persistence::StoredRelayConfig {
-            frost_relays: keep_core::relay::default_frost_relays(),
-            bunker_relays: keep_core::relay::default_frost_relays(),
-            ..Default::default()
-        });
+        let config = stored.unwrap_or_else(unsaved_relay_config);
         Ok(RelayConfigInfo {
             frost_relays: config.frost_relays,
             profile_relays: config.profile_relays,
@@ -5123,6 +5119,16 @@ fn wss_relay_lacks_pin(relay: &str, pins: &keep_frost_net::CertificatePinSet) ->
     }
 }
 
+/// The relay config a key with no saved config is shown and run with, so a
+/// write that creates the config keeps those relays.
+fn unsaved_relay_config() -> persistence::StoredRelayConfig {
+    persistence::StoredRelayConfig {
+        frost_relays: keep_core::relay::default_frost_relays(),
+        bunker_relays: keep_core::relay::default_frost_relays(),
+        ..Default::default()
+    }
+}
+
 fn relay_config_key(group_pubkey: Option<&str>) -> String {
     match group_pubkey {
         Some(pk) => {
@@ -5518,7 +5524,7 @@ impl KeepMobile {
         }
         let mut stored = match persistence::load_relay_config(&self.storage, &key) {
             Ok(Some(c)) => c,
-            Ok(None) => persistence::StoredRelayConfig::default(),
+            Ok(None) => unsaved_relay_config(),
             Err(e) => {
                 return Err(KeepMobileError::StorageError {
                     msg: format!("failed to load existing relay config: {e}"),
@@ -8492,6 +8498,42 @@ mod cert_pin_ffi_tests {
     fn keep() -> KeepMobile {
         let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
         KeepMobile::new(storage).unwrap()
+    }
+
+    #[test]
+    fn the_first_persisted_grant_keeps_the_relays_an_unsaved_config_shows() {
+        let keep = keep();
+        let shown = keep.get_relay_config(None).unwrap();
+        assert!(!shown.bunker_relays.is_empty());
+        assert!(!shown.frost_relays.is_empty());
+
+        keep.persist_bunker_permissions(Vec::new(), "scope", || true)
+            .unwrap();
+
+        let after = keep.get_relay_config(None).unwrap();
+        assert_eq!(after.bunker_relays, shown.bunker_relays);
+        assert_eq!(after.frost_relays, shown.frost_relays);
+    }
+
+    #[test]
+    fn a_persisted_grant_keeps_relay_lists_the_user_emptied() {
+        let keep = keep();
+        keep.save_relay_config(
+            None,
+            RelayConfigInfo {
+                frost_relays: Vec::new(),
+                profile_relays: Vec::new(),
+                bunker_relays: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        keep.persist_bunker_permissions(Vec::new(), "scope", || true)
+            .unwrap();
+
+        let after = keep.get_relay_config(None).unwrap();
+        assert!(after.bunker_relays.is_empty());
+        assert!(after.frost_relays.is_empty());
     }
 
     fn pins_for(keep: &KeepMobile, host: &str) -> usize {
