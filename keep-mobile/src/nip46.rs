@@ -960,8 +960,21 @@ impl BunkerHandler {
             let verified = self.mobile.runtime.block_on(async {
                 tokio::time::timeout(
                     time_left(deadline)?,
-                    self.mobile
-                        .verify_and_pin_relays(&request.relays, live.proxy),
+                    // A proxied socket is not pinned by the transport, so
+                    // through a proxy a relay is admitted only after a probe
+                    // saw its pin. The live socket and its reconnects still
+                    // get CA-only validation unless strict pinning is on.
+                    async {
+                        if live.proxy.is_some() {
+                            self.mobile
+                                .verify_and_confirm_pins(&request.relays, live.proxy)
+                                .await
+                        } else {
+                            self.mobile
+                                .verify_and_pin_relays(&request.relays, live.proxy)
+                                .await
+                        }
+                    },
                 )
                 .await
                 .map_err(|_| KeepMobileError::Timeout)?
@@ -1103,8 +1116,9 @@ impl BunkerHandler {
     /// the accept that made `listing` and lets go of the listing, once
     /// `live` is seen to still serve there. Under the start lock, so a revoke
     /// or start either comes first, and this refuses, or after. A grant that
-    /// is not stored or a mark that cannot be cleared fails the accept, which
-    /// then rolls back, since a start would otherwise drop the client.
+    /// is not stored, a client a config save unlisted meanwhile, or a mark
+    /// that cannot be cleared fails the accept, which then rolls back, since
+    /// a start would otherwise drop the client.
     fn settle_accept(
         &self,
         live: &LiveRelays,
@@ -1138,6 +1152,19 @@ impl BunkerHandler {
             });
         }
         self.with_bunker_config(|stored| {
+            // A config save does not take the start lock, so one since the
+            // listing may have unlisted the client, which a start would then
+            // not restore.
+            if !stored
+                .authorized_clients
+                .iter()
+                .any(|c| PublicKey::parse(c).ok() == Some(*client))
+            {
+                return Err(KeepMobileError::InvalidInput {
+                    msg: "The client was taken off the authorized list while it was accepted"
+                        .into(),
+                });
+            }
             stored
                 .unsettled_nostrconnect
                 .retain(|c| PublicKey::from_hex(c).ok() != Some(*client));
@@ -1499,8 +1526,12 @@ impl BunkerHandler {
     /// checks its accept ran, with only the stored `pins`. A relay that is
     /// invalid or internal, a `wss://` one whose host has no stored pin, or
     /// one whose certificate `probe` finds does not match its pin is not
-    /// dialed. One the probe cannot reach by `deadline` is, as at the
-    /// accept, since its handshake is checked against the stored pin.
+    /// dialed. One the probe cannot reach by `deadline` is dialed directly,
+    /// as at the accept, since its handshake is checked against the stored
+    /// pin. Through a `proxy` it is not: the pinned transport cannot pin a
+    /// proxied socket and gives it CA-only validation, so it is dialed only
+    /// after a probe saw its pin. That admits the relay but does not pin the
+    /// live socket or its reconnects.
     async fn a_start_may_dial<P, F>(
         relay: &str,
         pins: &keep_frost_net::CertificatePinSet,
@@ -1536,6 +1567,14 @@ impl BunkerHandler {
                 | keep_frost_net::FrostNetError::CertificatePinMissing { .. }),
             )) => {
                 tracing::error!(relay = %relay, error = %e, "not joining a nostrconnect relay whose certificate does not match its pin");
+                false
+            }
+            Ok(Err(e)) if proxy.is_some() => {
+                tracing::warn!(relay = %relay, error = %e, "not joining a proxied nostrconnect relay whose pin the probe could not confirm");
+                false
+            }
+            Err(_) if proxy.is_some() => {
+                tracing::warn!(relay = %relay, "not joining a proxied nostrconnect relay whose probe ran out of time");
                 false
             }
             Ok(Err(e)) => {
@@ -1658,6 +1697,9 @@ impl BunkerHandler {
     /// is enforced on the handshake of the socket the bunker then opens to
     /// the relay. They are dialed through the proxy the bunker was started
     /// with, all at once, and the whole accept is bounded by one deadline.
+    /// Through a proxy that socket cannot be pinned, so a pinned relay is
+    /// joined only once a probe saw its pin. The socket itself, and its
+    /// reconnects, still get CA-only validation unless strict pinning is on.
     ///
     /// The client's secret is only echoed back. It never becomes a secret the
     /// bunker accepts on `connect`. A client already authorized is refused,
@@ -5067,16 +5109,64 @@ mod tests {
         (relay, url, held)
     }
 
-    /// A loopback relay URL whose host accepts the connection and never
-    /// answers the handshake.
-    fn hanging_relay() -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        std::thread::spawn(move || {
-            let held: Vec<_> = listener.incoming().collect();
-            drop(held);
-        });
-        url
+    /// A loopback listener taking every connection, holding each open or
+    /// closing it at once, and calling `on_accept` for each. Dropping it
+    /// stops its thread and closes the connections it held.
+    struct TestListener {
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestListener {
+        fn spawn(hold: bool, on_accept: impl Fn() + Send + 'static) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let mut held = Vec::new();
+                while !stopping.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            on_accept();
+                            if hold {
+                                held.push(stream);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("ws://{}", self.addr)
+        }
+    }
+
+    impl Drop for TestListener {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A loopback relay whose host accepts the connection and never answers
+    /// the handshake, until the fixture is dropped.
+    fn hanging_relay() -> TestListener {
+        TestListener::spawn(true, || {})
     }
 
     // A client's relays carry only its own responses: one that holds every
@@ -5180,8 +5270,13 @@ mod tests {
         reachable: &str,
     ) -> std::thread::JoinHandle<Result<(), KeepMobileError>> {
         let starter = Arc::clone(starter);
-        let uri = nostrconnect_uri(&client, &[&hanging_relay(), reachable], "");
-        let accepting = std::thread::spawn(move || starter.accept_nostrconnect(uri, None));
+        let hanging = hanging_relay();
+        let uri = nostrconnect_uri(&client, &[&hanging.url(), reachable], "");
+        let accepting = std::thread::spawn(move || {
+            let accepted = starter.accept_nostrconnect(uri, None);
+            drop(hanging);
+            accepted
+        });
         std::thread::sleep(Duration::from_millis(500));
         assert!(!accepting.is_finished(), "the accept is still dialing");
         accepting
@@ -5345,15 +5440,11 @@ mod tests {
         let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
         let prompts = Arc::new(AtomicUsize::new(0));
         let (_bunker_relay, bunker_url) = mock_relay(&mobile);
-        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let proxy_addr = proxy.local_addr().unwrap();
         let (dialed_tx, dialed) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for stream in proxy.incoming() {
-                let _ = dialed_tx.send(());
-                drop(stream);
-            }
+        let proxy = TestListener::spawn(false, move || {
+            let _ = dialed_tx.send(());
         });
+        let proxy_addr = proxy.addr;
         mobile
             .stage_certificate_pin("pinned.example.com".into(), hex::encode([1u8; 32]))
             .unwrap();
@@ -5384,15 +5475,18 @@ mod tests {
             &crate::persistence::StoredStrictPinConfig { enabled: false },
         )
         .unwrap();
+        // The probe through the proxy cannot confirm the pin, and the
+        // proxied socket would not enforce it, so the relay is refused
+        // rather than joined.
         let pinned = nostrconnect_uri(&client, &["wss://pinned.example.com"], "");
-        assert!(matches!(
-            starter.accept_nostrconnect(pinned, None),
-            Err(KeepMobileError::NetworkError { ref msg })
-                if msg.contains("none of the client's relays could be reached")
-        ));
+        assert!(no_relay_passed(starter.accept_nostrconnect(pinned, None)));
         dialed
             .recv_timeout(Duration::from_secs(10))
             .expect("the pinned relay is checked through the bunker's proxy");
+        assert!(
+            dialed.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the relay whose pin was not confirmed was joined through the proxy"
+        );
 
         assert!(!is_listed(&storage, &client));
         assert!(!engine_lists(&starter, &client));
@@ -6393,16 +6487,18 @@ mod tests {
         pins.add_pin("pinned.example.com".into(), [1u8; 32]);
         let relay = "wss://pinned.example.com/";
         let deadline = || tokio::time::Instant::now() + Duration::from_millis(200);
-        let may_dial = |verdict: fn() -> Result<(), keep_frost_net::FrostNetError>| {
-            runtime.block_on(BunkerHandler::a_start_may_dial(
-                relay,
-                &pins,
-                false,
-                None,
-                deadline(),
-                &|_, _, _, _| std::future::ready(verdict()),
-            ))
-        };
+        let may_dial_through =
+            |proxy, verdict: fn() -> Result<(), keep_frost_net::FrostNetError>| {
+                runtime.block_on(BunkerHandler::a_start_may_dial(
+                    relay,
+                    &pins,
+                    false,
+                    proxy,
+                    deadline(),
+                    &|_, _, _, _| std::future::ready(verdict()),
+                ))
+            };
+        let may_dial = |verdict| may_dial_through(None, verdict);
         assert!(may_dial(|| Err(keep_frost_net::FrostNetError::Transport(
             "unreachable".into()
         ))));
@@ -6438,5 +6534,70 @@ mod tests {
             },
         )));
         assert!(!probed.load(Ordering::Acquire));
+
+        // A proxied socket is not pinned by the transport, so through a
+        // proxy only a probe that confirmed the pin lets a relay be dialed.
+        let proxy = Some("127.0.0.1:9050".parse().unwrap());
+        assert!(may_dial_through(proxy, || Ok(())));
+        assert!(!may_dial_through(proxy, || Err(
+            keep_frost_net::FrostNetError::Transport("unreachable".into())
+        )));
+        assert!(!may_dial_through(proxy, || Err(
+            keep_frost_net::FrostNetError::Timeout("slow".into())
+        )));
+        assert!(!runtime.block_on(BunkerHandler::a_start_may_dial(
+            relay,
+            &pins,
+            false,
+            proxy,
+            deadline(),
+            &|_, _, _, _| std::future::pending(),
+        )));
+    }
+
+    // A config save that unlists the client while its accept is sending the
+    // response fails the accept, which rolls back, rather than report a
+    // client that a start would not restore.
+    #[test]
+    fn a_save_that_unlists_an_accepting_client_fails_the_accept() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let saving = Arc::downgrade(&mobile);
+        let saved = Arc::new(AtomicBool::new(false));
+        let saved_once = Arc::clone(&saved);
+        let (_client_relay, client_url, _) = policy_relay(&mobile, move |_| {
+            if let Some(mobile) = saving.upgrade() {
+                if !saved_once.swap(true, Ordering::AcqRel) {
+                    mobile
+                        .save_bunker_config(crate::BunkerConfigInfo {
+                            enabled: true,
+                            authorized_clients: Vec::new(),
+                            revision: None,
+                        })
+                        .unwrap();
+                }
+            }
+            Some(true)
+        });
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        let result =
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None);
+        assert!(saved.load(Ordering::Acquire), "the save never ran");
+        assert!(
+            matches!(result, Err(KeepMobileError::InvalidInput { ref msg }) if msg.contains("taken off")),
+            "{result:?}"
+        );
+        assert!(!is_listed(&storage, &client));
+        let stored = stored_config(&storage);
+        assert!(stored.unsettled_nostrconnect.is_empty());
+        assert!(!stored.nostrconnect_relays.contains_key(&client.to_hex()));
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        assert!(!engine_lists(&starter, &client));
+        stop_and_wait(&starter, &running);
     }
 }

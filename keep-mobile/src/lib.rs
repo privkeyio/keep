@@ -5782,6 +5782,28 @@ impl KeepMobile {
         relays: &[String],
         proxy: Option<std::net::SocketAddr>,
     ) -> Result<Vec<String>, KeepMobileError> {
+        self.verify_relay_pins(relays, proxy, false).await
+    }
+
+    /// `verify_and_pin_relays`, but a pinned `wss://` relay is kept only when
+    /// its probe confirmed the pin, rather than also when the probe could not
+    /// reach it. For sockets that will not enforce the pin themselves: the
+    /// pinned transport cannot pin one a proxy opens, and gives it CA-only
+    /// validation. This only decides admission. It does not pin the socket.
+    pub(crate) async fn verify_and_confirm_pins(
+        &self,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<Vec<String>, KeepMobileError> {
+        self.verify_relay_pins(relays, proxy, true).await
+    }
+
+    async fn verify_relay_pins(
+        &self,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+        confirmed_only: bool,
+    ) -> Result<Vec<String>, KeepMobileError> {
         // Every relay is checked before any is dialed: the probe connects and
         // saves a pin, so a URL refused later would already have reached the
         // host it names.
@@ -5807,6 +5829,7 @@ impl KeepMobile {
         } = persistence::load_pin_store(&self.storage)?;
         let mut pins_changed = false;
         let mut learned = Vec::new();
+        let mut confirmed = std::collections::HashSet::new();
         for relay in relays {
             // The user removed this host's pin: whatever key it shows now is
             // not learned, nor dialed, until they stage one or release it.
@@ -5835,6 +5858,7 @@ impl KeepMobile {
                 .await
             {
                 Ok((_hash, new_pin)) => {
+                    confirmed.insert(relay.as_str());
                     if let Some((hostname, hash)) = new_pin {
                         if !pins.is_pinned(&hostname) {
                             holds.hosts.remove(&hostname);
@@ -5877,6 +5901,7 @@ impl KeepMobile {
                     return true;
                 }
                 url.host_str().map(|h| pins.is_pinned(h)).unwrap_or(false)
+                    && (!confirmed_only || confirmed.contains(r.as_str()))
             })
             .cloned()
             .collect();
