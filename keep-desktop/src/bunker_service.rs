@@ -948,6 +948,7 @@ pub(crate) fn remembered_clients_to_stored(
                 .collect(),
             explicitly_remembered: Some(c.explicitly_remembered),
             kinds_vetted: true,
+            paired: false,
         })
         .collect()
 }

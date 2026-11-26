@@ -740,6 +740,13 @@ pub struct ProxyConfigInfo {
 pub struct BunkerConfigInfo {
     pub enabled: bool,
     pub authorized_clients: Vec<String>,
+    /// The revision of `authorized_clients` this was read at. A save that
+    /// carries one is refused once the list has changed since, as a
+    /// `nostrconnect://` accept, its rollback or a revoke changes it, so a
+    /// save from an older read neither drops nor brings back a client. A
+    /// save without one replaces the list as given.
+    #[uniffi(default = None)]
+    pub revision: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1092,6 +1099,13 @@ pub struct KeepMobile {
     /// a revoke reaches it whichever instance the revoke is made through. Weak,
     /// so it dies with the server.
     pub(crate) live_bunker: std::sync::Mutex<Option<std::sync::Weak<keep_nip46::SignerHandler>>>,
+    /// The `nostrconnect://` accept that listed each client in
+    /// `authorized_clients` and may still roll that listing back, so a
+    /// rollback never removes a listing a later accept made. Written under
+    /// `bunker_start_lock`, but for a failed accept handing its own listing
+    /// to its rollback.
+    pub(crate) nostrconnect_listings:
+        std::sync::Mutex<HashMap<nostr_sdk::PublicKey, nip46::NostrconnectListing>>,
     pub(crate) bunker_config_lock: Arc<std::sync::Mutex<()>>,
     /// Serializes load-modify-store of the relay config (relays + bunker
     /// permission grants) so a relay edit and an engine grant/revoke write do
@@ -1534,6 +1548,7 @@ impl KeepMobile {
             live_generation: tokio::sync::watch::Sender::new(0),
             bunker_start_lock: std::sync::Mutex::new(()),
             live_bunker: std::sync::Mutex::new(None),
+            nostrconnect_listings: std::sync::Mutex::new(HashMap::new()),
             bunker_config_lock: Arc::new(std::sync::Mutex::new(())),
             relay_config_lock: Arc::new(std::sync::Mutex::new(())),
             proxy_config_lock: std::sync::Mutex::new(()),
@@ -4205,6 +4220,7 @@ impl KeepMobile {
         Ok(BunkerConfigInfo {
             enabled: config.enabled,
             authorized_clients: config.authorized_clients,
+            revision: Some(config.client_list_revision),
         })
     }
 
@@ -4230,13 +4246,35 @@ impl KeepMobile {
             })?;
         let existing = persistence::load_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY)?
             .unwrap_or_default();
+        if config
+            .revision
+            .is_some_and(|read| read != existing.client_list_revision)
+        {
+            return Err(KeepMobileError::InvalidInput {
+                msg:
+                    "The authorized client list changed since it was read; read it again and retry"
+                        .into(),
+            });
+        }
+        let listed: std::collections::HashSet<nostr_sdk::PublicKey> = config
+            .authorized_clients
+            .iter()
+            .filter_map(|c| nostr_sdk::PublicKey::parse(c).ok())
+            .collect();
+        let mut nostrconnect_relays = existing.nostrconnect_relays;
+        nostrconnect_relays.retain(|client, _| {
+            nostr_sdk::PublicKey::from_hex(client).is_ok_and(|pk| listed.contains(&pk))
+        });
         let stored = persistence::StoredBunkerConfig {
             enabled: config.enabled,
             authorized_clients: config.authorized_clients,
+            client_list_revision: existing.client_list_revision.wrapping_add(1),
             transport_secret: existing.transport_secret,
             connect_secret: existing.connect_secret,
             pending_revokes: existing.pending_revokes,
             pending_revoke_all: existing.pending_revoke_all,
+            unsettled_nostrconnect: existing.unsettled_nostrconnect,
+            nostrconnect_relays,
         };
         persistence::persist_bunker_config(&self.storage, BUNKER_CONFIG_STORAGE_KEY, &stored)
     }
@@ -5744,6 +5782,28 @@ impl KeepMobile {
         relays: &[String],
         proxy: Option<std::net::SocketAddr>,
     ) -> Result<Vec<String>, KeepMobileError> {
+        self.verify_relay_pins(relays, proxy, false).await
+    }
+
+    /// `verify_and_pin_relays`, but a pinned `wss://` relay is kept only when
+    /// its probe confirmed the pin, rather than also when the probe could not
+    /// reach it. For sockets that will not enforce the pin themselves: the
+    /// pinned transport cannot pin one a proxy opens, and gives it CA-only
+    /// validation. This only decides admission. It does not pin the socket.
+    pub(crate) async fn verify_and_confirm_pins(
+        &self,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+    ) -> Result<Vec<String>, KeepMobileError> {
+        self.verify_relay_pins(relays, proxy, true).await
+    }
+
+    async fn verify_relay_pins(
+        &self,
+        relays: &[String],
+        proxy: Option<std::net::SocketAddr>,
+        confirmed_only: bool,
+    ) -> Result<Vec<String>, KeepMobileError> {
         // Every relay is checked before any is dialed: the probe connects and
         // saves a pin, so a URL refused later would already have reached the
         // host it names.
@@ -5769,6 +5829,7 @@ impl KeepMobile {
         } = persistence::load_pin_store(&self.storage)?;
         let mut pins_changed = false;
         let mut learned = Vec::new();
+        let mut confirmed = std::collections::HashSet::new();
         for relay in relays {
             // The user removed this host's pin: whatever key it shows now is
             // not learned, nor dialed, until they stage one or release it.
@@ -5797,6 +5858,7 @@ impl KeepMobile {
                 .await
             {
                 Ok((_hash, new_pin)) => {
+                    confirmed.insert(relay.as_str());
                     if let Some((hostname, hash)) = new_pin {
                         if !pins.is_pinned(&hostname) {
                             holds.hosts.remove(&hostname);
@@ -5839,6 +5901,7 @@ impl KeepMobile {
                     return true;
                 }
                 url.host_str().map(|h| pins.is_pinned(h)).unwrap_or(false)
+                    && (!confirmed_only || confirmed.contains(r.as_str()))
             })
             .cloned()
             .collect();

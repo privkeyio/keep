@@ -105,6 +105,10 @@ pub enum KeepMobileError {
     /// A bunker config listed more authorized clients than the signer holds.
     #[error("At most {max} clients can be authorized")]
     TooManyAuthorizedClients { max: u32 },
+
+    /// A call that needs the running bunker found it stopped.
+    #[error("The bunker is not running; start it first")]
+    BunkerNotRunning,
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
@@ -162,6 +166,10 @@ mod tests {
         assert_eq!(
             KeepMobileError::TooManyAuthorizedClients { max: 100 }.to_string(),
             "At most 100 clients can be authorized"
+        );
+        assert_eq!(
+            KeepMobileError::BunkerNotRunning.to_string(),
+            "The bunker is not running; start it first"
         );
     }
 }

@@ -113,6 +113,12 @@ impl TlsPinning {
     pub fn require_pinned(&self) -> bool {
         self.require_pinned
     }
+
+    /// The pin set handshakes are checked against. A pin added to it holds
+    /// for every later handshake through a transport built from this.
+    pub fn pins(&self) -> Arc<Mutex<CertificatePinSet>> {
+        Arc::clone(&self.pins)
+    }
 }
 
 /// Build the relay client, installing the SPKI-pinning transport when

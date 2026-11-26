@@ -7,11 +7,11 @@ use keep_nip46::types::{
     ApprovalRequest, ApprovalResult, ClientListing, LogEvent, RememberDuration, ServerCallbacks,
 };
 use keep_nip46::{
-    FrostSigner, NetworkFrostSigner, Permission, PreGrantedApp, RateLimitConfig, Server,
-    ServerConfig, SignerHandler,
+    FrostSigner, NetworkFrostSigner, NostrConnectRequest, Permission, PreGrantedApp,
+    RateLimitConfig, Server, ServerConfig, ServerRelays, SignerHandler,
 };
 use nostr_sdk::{Kind, PublicKey};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,6 +167,139 @@ pub struct ParsedBunkerUrl {
     pub pubkey: String,
     pub relays: Vec<String>,
     pub secret: Option<String>,
+}
+
+/// What a `nostrconnect://` request asks for, for the approval prompt. The
+/// client's secret is left out on purpose: it never reaches the app. Every
+/// field is remote-derived; render them as inert text.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct NostrConnectInfo {
+    pub client_pubkey: String,
+    pub name: Option<String>,
+    pub url: Option<String>,
+    pub image: Option<String>,
+    pub relays: Vec<String>,
+    pub requested_permissions: Option<String>,
+}
+
+impl From<&NostrConnectRequest> for NostrConnectInfo {
+    fn from(request: &NostrConnectRequest) -> Self {
+        Self {
+            client_pubkey: request.client_pubkey.to_hex(),
+            name: request.name.clone(),
+            url: request.url.clone(),
+            image: request.image.clone(),
+            relays: request.relays.clone(),
+            requested_permissions: request.perms.clone(),
+        }
+    }
+}
+
+/// How long accepting a `nostrconnect://` request waits on the client's
+/// relays, which it dials all at once.
+const NOSTRCONNECT_RELAY_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(10)
+};
+
+/// How long a whole `nostrconnect://` accept may take: the pin checks, the
+/// dials and the response.
+const NOSTRCONNECT_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long past an accept's deadline the rollback of a failed accept may
+/// wait for the relays it joined to be dropped and for the start lock. A
+/// rollback that cannot take the lock by then is finished by a thread of its
+/// own, so the accept still returns.
+const NOSTRCONNECT_ROLLBACK_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(2)
+};
+
+/// What is left of `deadline`, or `Timeout` once it has passed.
+fn time_left(deadline: std::time::Instant) -> Result<Duration, KeepMobileError> {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or(KeepMobileError::Timeout)
+}
+
+/// Takes `lock` by `deadline`, or `Timeout`. Polled, as a std mutex has no
+/// timed lock, so it may be taken up to one poll late; a lock that is
+/// constantly retaken could starve it until the deadline.
+fn lock_by(
+    lock: &std::sync::Mutex<()>,
+    deadline: std::time::Instant,
+) -> Result<std::sync::MutexGuard<'_, ()>, KeepMobileError> {
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::thread::sleep(time_left(deadline)?.min(Duration::from_millis(10)));
+            }
+        }
+    }
+}
+
+/// Tells apart the `nostrconnect://` accepts that list a client.
+static NEXT_NOSTRCONNECT_LISTING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The `nostrconnect://` accept that listed a client and may still roll the
+/// listing back, and how far that has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NostrconnectListing {
+    id: u64,
+    state: ListingState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListingState {
+    /// The accept is still in flight.
+    Accepting,
+    /// The accept failed and revoked the client, and its rollback is waiting
+    /// for the start lock to finish. Nothing else rolls it back meanwhile, so
+    /// the rollback still revokes the client on a server started since.
+    RollingBack,
+    /// The rollback could not finish, which leaves the client marked
+    /// unsettled on disk for a start or the next accept to finish.
+    Unfinished,
+}
+
+/// The name a `nostrconnect://` client is registered under.
+fn nostrconnect_name(request: &NostrConnectRequest) -> String {
+    request
+        .name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| format!("App {}", &request.client_pubkey.to_hex()[..8]))
+}
+
+/// The server a `nostrconnect://` accept joins a client to, and what tells
+/// that it still serves.
+#[derive(Clone)]
+struct LiveRelays {
+    relays: ServerRelays,
+    handler: std::sync::Weak<SignerHandler>,
+    proxy: Option<std::net::SocketAddr>,
+    /// Whether `proxy` was read from storage when the server started.
+    stored_proxy: bool,
+    /// The `live_generation` the server started under; a revoke, rotation
+    /// or teardown from any handler moves it.
+    generation: u64,
+    serving: Arc<AtomicBool>,
+    /// What the server's persisted grants are tagged with.
+    grant_scope: String,
+}
+
+/// Where a handler keeps its live server's [`LiveRelays`], which the task
+/// running that server clears when it ends.
+type LiveRelaysSlot = Arc<std::sync::Mutex<Option<LiveRelays>>>;
+
+fn parse_nostrconnect_request(uri: &str) -> Result<NostrConnectRequest, KeepMobileError> {
+    keep_nip46::parse_nostrconnect_uri(uri).map_err(|msg| KeepMobileError::InvalidInput { msg })
 }
 
 #[uniffi::export]
@@ -467,6 +600,9 @@ pub struct BunkerHandler {
     /// The `serving` flag of the server last started, which `stop_bunker`
     /// clears.
     serving: std::sync::Mutex<Arc<AtomicBool>>,
+    /// The relay pool of the server last started and what an accept checks
+    /// it is still live by, while that server runs.
+    relays: LiveRelaysSlot,
 }
 
 impl Drop for BunkerHandler {
@@ -570,8 +706,9 @@ impl BunkerHandler {
     }
 
     /// The persisted grants a start restores, less those of any client a
-    /// revoke left pending or `authorized_clients` does not list. Those
-    /// revokes are finished first where they can be. Where they cannot, the
+    /// revoke left pending, `authorized_clients` does not list, or an accept
+    /// not in flight here left unsettled. Those revokes and rollbacks are
+    /// finished first where they can be. Where a revoke cannot be, the
     /// grants stay on disk but are not served, and the engine's next persist
     /// replaces them and clears the marks. The grants of unlisted clients are
     /// dropped from disk too, so listing such a client again does not bring
@@ -581,9 +718,17 @@ impl BunkerHandler {
         if let Err(e) = self.finish_pending_revokes() {
             tracing::warn!(error = %e, "revoked clients' grants are still stored; not restoring them");
         }
+        if let Err(e) = self.finish_unsettled(None) {
+            tracing::warn!(error = %e, "failed nostrconnect accepts are not rolled back yet; not restoring their clients");
+        }
         if all {
             return Ok(Vec::new());
         }
+        let unsettled: HashSet<PublicKey> = self
+            .unsettled_clients()?
+            .into_iter()
+            .filter(|c| !self.accepting(c))
+            .collect();
         let listed = listed_clients(&self.mobile)?;
         if let Err(e) = self
             .mobile
@@ -600,8 +745,9 @@ impl BunkerHandler {
             .load_bunker_permissions(scope)
             .iter()
             .filter(|grant| {
-                PublicKey::from_hex(&grant.pubkey_hex)
-                    .is_ok_and(|pk| listed.contains(&pk) && !revoked.contains(&pk))
+                PublicKey::from_hex(&grant.pubkey_hex).is_ok_and(|pk| {
+                    listed.contains(&pk) && !revoked.contains(&pk) && !unsettled.contains(&pk)
+                })
             })
             .filter_map(PreGrantedApp::from_stored)
             .collect())
@@ -683,7 +829,38 @@ impl BunkerHandler {
             invalidated,
             Arc::clone(&self.status),
             serving,
+            Arc::clone(&self.relays),
         ))
+    }
+
+    /// Makes a published server the one a `nostrconnect://` accept joins
+    /// clients to, until it stops.
+    fn publish_relays(
+        &self,
+        server: &Server,
+        proxy: Option<std::net::SocketAddr>,
+        stored_proxy: bool,
+        generation: u64,
+        serving: &Arc<AtomicBool>,
+        grant_scope: &str,
+    ) {
+        *self.relays.lock().unwrap_or_else(|e| e.into_inner()) = Some(LiveRelays {
+            relays: server.relays(),
+            handler: Arc::downgrade(&server.handler()),
+            proxy,
+            stored_proxy,
+            generation,
+            serving: Arc::clone(serving),
+            grant_scope: grant_scope.to_owned(),
+        });
+    }
+
+    /// The server last published here, whether or not it still serves.
+    fn published_relays(&self) -> Option<LiveRelays> {
+        self.relays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn live_handler(&self) -> Option<Arc<SignerHandler>> {
@@ -694,6 +871,744 @@ impl BunkerHandler {
             .as_ref()
             .and_then(std::sync::Weak::upgrade)
     }
+
+    /// The server last started, while it is still the one serving.
+    fn live_relays(&self) -> Result<LiveRelays, KeepMobileError> {
+        let live = self
+            .relays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .ok_or(KeepMobileError::BunkerNotRunning)?;
+        self.still_live(&live)?;
+        Ok(live)
+    }
+
+    /// Whether `live` still serves: still published here, not stopped, not
+    /// replaced by a revoke, rotation or teardown from any handler, and, when
+    /// it read the proxy from storage, with the stored proxy still the one it
+    /// dials through.
+    fn still_live(&self, live: &LiveRelays) -> Result<(), KeepMobileError> {
+        let published = self
+            .relays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.serving, &live.serving));
+        let serving = published
+            && live.serving.load(Ordering::Acquire)
+            && *self.mobile.live_generation.borrow() == live.generation
+            && self.load_status() == STATUS_RUNNING;
+        let proxy_current =
+            !live.stored_proxy || self.mobile.configured_proxy().ok() == Some(live.proxy);
+        if serving && proxy_current {
+            Ok(())
+        } else {
+            Err(KeepMobileError::BunkerNotRunning)
+        }
+    }
+
+    /// Refuses a client that cannot be registered now: signing is disabled,
+    /// it is already authorized, or the authorized list is full.
+    fn refuse_to_register(
+        &self,
+        handler: &SignerHandler,
+        client: &PublicKey,
+    ) -> Result<(), KeepMobileError> {
+        if self.mobile.get_kill_switch().unwrap_or(true) {
+            return Err(KeepMobileError::PolicyViolation {
+                reason: "signing is disabled".into(),
+            });
+        }
+        let listed = listed_clients(&self.mobile)?;
+        let registered = self
+            .mobile
+            .runtime
+            .block_on(handler.list_clients())
+            .iter()
+            .any(|app| app.pubkey == *client);
+        if listed.contains(client) || registered {
+            return Err(KeepMobileError::InvalidInput {
+                msg: "This client is already connected; revoke it to connect it again".into(),
+            });
+        }
+        let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
+        if listed.len() >= max {
+            return Err(KeepMobileError::TooManyAuthorizedClients {
+                max: u32::try_from(max).unwrap_or(u32::MAX),
+            });
+        }
+        Ok(())
+    }
+
+    /// Checks the client's relays' pins and joins those that pass, without
+    /// the start lock, so a revoke is not held up by the dials. The probes run
+    /// under `cert_pin_lock`, as a start's do, so a start that begins meanwhile
+    /// waits for them while holding the start lock. Waiting for that lock
+    /// counts against `deadline`, as the probes do.
+    fn join_client_relays(
+        &self,
+        live: &LiveRelays,
+        request: &NostrConnectRequest,
+        deadline: std::time::Instant,
+    ) -> Result<keep_nip46::JoinedRelays, KeepMobileError> {
+        self.still_live(live)?;
+        let verified = {
+            // As a start holds it, so a pin learned here cannot race a
+            // cert-pin call.
+            let _cert_pins = lock_by(&self.mobile.cert_pin_lock, deadline)?;
+            let verified = self.mobile.runtime.block_on(async {
+                tokio::time::timeout(
+                    time_left(deadline)?,
+                    // A proxied socket is not pinned by the transport, so
+                    // through a proxy a relay is admitted only after a probe
+                    // saw its pin. The live socket and its reconnects still
+                    // get CA-only validation unless strict pinning is on.
+                    async {
+                        if live.proxy.is_some() {
+                            self.mobile
+                                .verify_and_confirm_pins(&request.relays, live.proxy)
+                                .await
+                        } else {
+                            self.mobile
+                                .verify_and_pin_relays(&request.relays, live.proxy)
+                                .await
+                        }
+                    },
+                )
+                .await
+                .map_err(|_| KeepMobileError::Timeout)?
+            })?;
+            self.trust_learned_pins(live, &verified)?;
+            verified
+        };
+        self.still_live(live)?;
+        let timeout = time_left(deadline)?.min(NOSTRCONNECT_RELAY_TIMEOUT);
+        self.mobile
+            .runtime
+            .block_on(live.relays.join(&verified, live.proxy, timeout))
+            .map_err(|e| {
+                // A server stopped meanwhile shut its pool down under the join.
+                self.still_live(live)
+                    .err()
+                    .unwrap_or(KeepMobileError::NetworkError { msg: e.to_string() })
+            })
+    }
+
+    /// Adds the stored pins of `relays`' hosts to the set the bunker's live
+    /// handshakes are checked against, which holds only the pins stored when
+    /// it started. Without this a host first pinned by this accept would get
+    /// standard certificate validation alone. Callers hold `cert_pin_lock`.
+    fn trust_learned_pins(
+        &self,
+        live: &LiveRelays,
+        relays: &[String],
+    ) -> Result<(), KeepMobileError> {
+        let Some(pinning) = live.relays.tls_pinning() else {
+            return Ok(());
+        };
+        let stored = crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
+        let pins = pinning.pins();
+        let mut pins = pins.lock().unwrap_or_else(|e| e.into_inner());
+        for host in relays.iter().filter_map(|relay| crate::relay_host(relay)) {
+            if !pins.is_pinned(&host) {
+                for hash in stored.get_pins(&host) {
+                    pins.add_pin(host.clone(), *hash);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Registers and lists the client under the start lock, once `live` is
+    /// seen to still serve there: a revoke either comes first, and this
+    /// refuses, or after, and finds the client listed. Waiting for the lock
+    /// counts against `deadline`. Returns the listing `unauthorize` rolls
+    /// back.
+    fn authorize_nostrconnect(
+        &self,
+        live: &LiveRelays,
+        handler: &SignerHandler,
+        request: &NostrConnectRequest,
+        approved_perms: Option<&str>,
+        joined: &mut keep_nip46::JoinedRelays,
+        deadline: std::time::Instant,
+    ) -> Result<u64, KeepMobileError> {
+        let client = request.client_pubkey;
+        let _start_guard = lock_by(&self.mobile.bunker_start_lock, deadline)?;
+        self.still_live(live)?;
+        self.finish_unsettled(Some(&client))?;
+        self.refuse_to_register(handler, &client)?;
+        self.mobile
+            .runtime
+            .block_on(handler.register_nostrconnect_client(
+                client,
+                nostrconnect_name(request),
+                request.perms.as_deref(),
+                approved_perms,
+            ))?;
+        live.relays.route(joined, client);
+        match self.list_client(&client, joined.reached()) {
+            Ok(listing) => Ok(listing),
+            Err(e) => {
+                self.mobile.runtime.block_on(handler.revoke_client(&client));
+                Err(e)
+            }
+        }
+    }
+
+    /// Lists `client` with the `relays` a start joins it on again, marked
+    /// unsettled in the same write, and records the listing as this
+    /// accept's. Callers hold the start lock. The list is checked for room
+    /// again under the config lock, since a config save does not take the
+    /// start lock.
+    fn list_client(&self, client: &PublicKey, relays: Vec<String>) -> Result<u64, KeepMobileError> {
+        self.with_bunker_config(|stored| {
+            let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
+            if stored.authorized_clients.len() >= max {
+                return Err(KeepMobileError::TooManyAuthorizedClients {
+                    max: u32::try_from(max).unwrap_or(u32::MAX),
+                });
+            }
+            let hex = client.to_hex();
+            if !stored.unsettled_nostrconnect.contains(&hex) {
+                stored.unsettled_nostrconnect.push(hex.clone());
+            }
+            stored.nostrconnect_relays.insert(hex.clone(), relays);
+            stored.authorized_clients.push(hex);
+            stored.client_list_revision = stored.client_list_revision.wrapping_add(1);
+            crate::persistence::persist_bunker_config(
+                &self.mobile.storage,
+                crate::BUNKER_CONFIG_STORAGE_KEY,
+                stored,
+            )
+        })?;
+        let id = NEXT_NOSTRCONNECT_LISTING.fetch_add(1, Ordering::Relaxed);
+        self.nostrconnect_listings().insert(
+            *client,
+            NostrconnectListing {
+                id,
+                state: ListingState::Accepting,
+            },
+        );
+        Ok(id)
+    }
+
+    fn nostrconnect_listings(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<PublicKey, NostrconnectListing>> {
+        self.mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lets go of `listing` once its accept can no longer roll it back.
+    fn settle_listing(&self, client: &PublicKey, listing: u64) {
+        let mut listings = self.nostrconnect_listings();
+        if listings.get(client).map(|l| l.id) == Some(listing) {
+            listings.remove(client);
+        }
+    }
+
+    /// Persists the client's grant, marked paired so a start restores it as
+    /// it restores a remembered client's, then clears the unsettled mark of
+    /// the accept that made `listing` and lets go of the listing, once
+    /// `live` is seen to still serve there. Under the start lock, so a revoke
+    /// or start either comes first, and this refuses, or after. A grant that
+    /// is not stored, a client a config save unlisted meanwhile, or a mark
+    /// that cannot be cleared fails the accept, which then rolls back, since
+    /// a start would otherwise drop the client.
+    fn settle_accept(
+        &self,
+        live: &LiveRelays,
+        handler: &SignerHandler,
+        client: &PublicKey,
+        listing: u64,
+        deadline: std::time::Instant,
+    ) -> Result<(), KeepMobileError> {
+        let _start_guard = lock_by(&self.mobile.bunker_start_lock, deadline)?;
+        self.still_live(live)?;
+        let owned = NostrconnectListing {
+            id: listing,
+            state: ListingState::Accepting,
+        };
+        if self.nostrconnect_listings().get(client) != Some(&owned) {
+            return Err(KeepMobileError::BunkerNotRunning);
+        }
+        if !self.mobile.runtime.block_on(handler.pair_client(client)) {
+            return Err(KeepMobileError::BunkerNotRunning);
+        }
+        let hex = client.to_hex();
+        let stored = self
+            .mobile
+            .load_bunker_permissions(&live.grant_scope)
+            .iter()
+            .any(|grant| grant.pubkey_hex == hex && grant.paired);
+        if !stored {
+            self.still_live(live)?;
+            return Err(KeepMobileError::StorageError {
+                msg: "The client's grant could not be stored".into(),
+            });
+        }
+        self.with_bunker_config(|stored| {
+            // A config save does not take the start lock, so one since the
+            // listing may have unlisted the client, which a start would then
+            // not restore.
+            if !stored
+                .authorized_clients
+                .iter()
+                .any(|c| PublicKey::parse(c).ok() == Some(*client))
+            {
+                return Err(KeepMobileError::InvalidInput {
+                    msg: "The client was taken off the authorized list while it was accepted"
+                        .into(),
+                });
+            }
+            stored
+                .unsettled_nostrconnect
+                .retain(|c| PublicKey::from_hex(c).ok() != Some(*client));
+            crate::persistence::persist_bunker_config(
+                &self.mobile.storage,
+                crate::BUNKER_CONFIG_STORAGE_KEY,
+                stored,
+            )
+        })?;
+        self.settle_listing(client, listing);
+        Ok(())
+    }
+
+    /// The clients marked unsettled on disk.
+    fn unsettled_clients(&self) -> Result<HashSet<PublicKey>, KeepMobileError> {
+        self.with_bunker_config(|stored| {
+            Ok(stored
+                .unsettled_nostrconnect
+                .iter()
+                .filter_map(|c| PublicKey::from_hex(c).ok())
+                .collect())
+        })
+    }
+
+    /// Whether an accept of `client` in this process is still in flight,
+    /// rather than rolling back.
+    fn accepting(&self, client: &PublicKey) -> bool {
+        self.listing_state(client) == Some(ListingState::Accepting)
+    }
+
+    fn listing_state(&self, client: &PublicKey) -> Option<ListingState> {
+        self.nostrconnect_listings().get(client).map(|l| l.state)
+    }
+
+    /// Finishes the rollback of every unsettled accept, or only `only`'s,
+    /// that neither an accept in flight here nor its rollback still owns: one
+    /// a rollback could not finish, or one a previous process left. An accept
+    /// in flight owns its listing, so a later listing of a client is never
+    /// removed. Callers hold the start lock.
+    fn finish_unsettled(&self, only: Option<&PublicKey>) -> Result<(), KeepMobileError> {
+        let mut result = Ok(());
+        for client in self.unsettled_clients()? {
+            let owned = self
+                .listing_state(&client)
+                .is_some_and(|state| state != ListingState::Unfinished);
+            if only.is_some_and(|only| *only != client) || owned {
+                continue;
+            }
+            if let Err(e) = roll_back_listing(&self.mobile, &client) {
+                result = Err(e);
+            }
+        }
+        result
+    }
+
+    /// Undoes `authorize_nostrconnect` for a client it registered. Only while
+    /// the listing is still `listing`: once a revoke took it out and a later
+    /// accept listed the client again, that newer listing stays. The client
+    /// is revoked on the server it was accepted on at once, without the
+    /// start lock, and the relays `abandon` drops are dropped before the lock
+    /// is waited for, each wait bounded by `by`. The rest needs the start
+    /// lock: the client is revoked on any server started since, which
+    /// restored the grants its listing let it be given, those grants are
+    /// dropped from storage and the client is unlisted. When the lock cannot
+    /// be taken by `by` a thread of its own does that once it can, so this
+    /// returns by `by`. No start from here on restores the client, so only a
+    /// start already holding the lock can serve it meanwhile, until it lets
+    /// the lock go. The client stays marked unsettled on disk until both
+    /// writes land, so a start never restores it, and a start or the next
+    /// accept of the client finishes them.
+    fn unauthorize(
+        &self,
+        handler: &Arc<SignerHandler>,
+        client: &PublicKey,
+        listing: u64,
+        abandon: impl std::future::Future<Output = ()> + Send + 'static,
+        by: std::time::Instant,
+    ) {
+        self.mobile.runtime.block_on(handler.revoke_client(client));
+        let owned = {
+            let mut listings = self.nostrconnect_listings();
+            match listings.get_mut(client) {
+                Some(owned) if owned.id == listing => {
+                    owned.state = ListingState::RollingBack;
+                    true
+                }
+                _ => false,
+            }
+        };
+        let abandoning = self.mobile.runtime.spawn(abandon);
+        if let Ok(left) = time_left(by) {
+            let _ = self
+                .mobile
+                .runtime
+                .block_on(async { tokio::time::timeout(left, abandoning).await });
+        }
+        if !owned {
+            return;
+        }
+        if let Ok(_start_guard) = lock_by(&self.mobile.bunker_start_lock, by) {
+            finish_rollback(&self.mobile, handler, client, listing);
+            return;
+        }
+        let (mobile, accepted_on, rolled_back) =
+            (Arc::clone(&self.mobile), Arc::clone(handler), *client);
+        let handed_off = std::thread::Builder::new()
+            .name("nostrconnect-rollback".into())
+            .spawn(move || {
+                let _start_guard = mobile
+                    .bunker_start_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                finish_rollback(&mobile, &accepted_on, &rolled_back, listing);
+            });
+        if let Err(e) = handed_off {
+            tracing::warn!(error = %e, "could not hand off a nostrconnect rollback; finishing it here");
+            let _start_guard = self.start_guard();
+            finish_rollback(&self.mobile, handler, client, listing);
+        }
+    }
+
+    /// `accept_nostrconnect`, bounded by `deadline`.
+    fn accept_nostrconnect_by(
+        &self,
+        uri: String,
+        approved_perms: Option<String>,
+        deadline: std::time::Instant,
+    ) -> Result<(), KeepMobileError> {
+        let request = parse_nostrconnect_request(&uri)?;
+        let client = request.client_pubkey;
+        let live = self.live_relays()?;
+        let handler = live
+            .handler
+            .upgrade()
+            .ok_or(KeepMobileError::BunkerNotRunning)?;
+        if self.unsettled_clients()?.contains(&client) {
+            let _start_guard = lock_by(&self.mobile.bunker_start_lock, deadline)?;
+            self.finish_unsettled(Some(&client))?;
+        }
+        self.refuse_to_register(&handler, &client)?;
+
+        let mut joined = self.join_client_relays(&live, &request, deadline)?;
+        let listing = match self.authorize_nostrconnect(
+            &live,
+            &handler,
+            &request,
+            approved_perms.as_deref(),
+            &mut joined,
+            deadline,
+        ) {
+            Ok(listing) => listing,
+            Err(e) => {
+                // Drops the route only if this attempt installed it, never one
+                // an earlier accept of the same client did. Waited for only
+                // as long as a rollback's, since it waits on the pool.
+                let relays = live.relays.clone();
+                let abandoning = self
+                    .mobile
+                    .runtime
+                    .spawn(async move { relays.abandon(joined).await });
+                let by = deadline.max(std::time::Instant::now()) + NOSTRCONNECT_ROLLBACK_GRACE;
+                if let Ok(left) = time_left(by) {
+                    let _ = self
+                        .mobile
+                        .runtime
+                        .block_on(async { tokio::time::timeout(left, abandoning).await });
+                }
+                return Err(e);
+            }
+        };
+        // Returns once one relay accepted the response, so a slow relay
+        // cannot run it past the deadline after the client has it.
+        let sent = self.mobile.runtime.block_on(async {
+            tokio::time::timeout(
+                time_left(deadline)?,
+                live.relays.send_nostrconnect_response(&request, &joined),
+            )
+            .await
+            .map_err(|_| KeepMobileError::Timeout)?
+            .map_err(|e| KeepMobileError::NetworkError { msg: e.to_string() })
+        });
+        // A teardown bumps the generation without the start lock, so it can
+        // land after the check in `authorize_nostrconnect`. One that lands
+        // while the send fails is reported over the send's error, so the app
+        // can offer a start.
+        let settled = sent
+            .and_then(|()| self.settle_accept(&live, &handler, &client, listing, deadline))
+            .map_err(|e| self.still_live(&live).err().unwrap_or(e));
+        if let Err(e) = settled {
+            let relays = live.relays.clone();
+            let by = deadline.max(std::time::Instant::now()) + NOSTRCONNECT_ROLLBACK_GRACE;
+            self.unauthorize(
+                &handler,
+                &client,
+                listing,
+                async move { relays.abandon(joined).await },
+                by,
+            );
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// What a start reads, under the start lock and `cert_pin_lock`, to join
+    /// the relays of the `nostrconnect://` clients `live`'s engine restored
+    /// again once it lets them go: the clients and their stored relays, and
+    /// the stored pins and strict pinning setting, which the server's own
+    /// handshakes were set up from. `None` when there is nothing to join.
+    async fn plan_rejoin(&self, live: LiveRelays) -> Option<NostrconnectRejoin> {
+        let engine = live.handler.upgrade()?;
+        let read = (|| {
+            let stored =
+                self.with_bunker_config(|stored| Ok(stored.nostrconnect_relays.clone()))?;
+            let pins =
+                crate::persistence::load_cert_pins(&self.mobile.storage)?.unwrap_or_default();
+            Ok::<_, KeepMobileError>((stored, pins, self.mobile.get_strict_cert_pinning()?))
+        })();
+        let (stored, pins, strict) = match read {
+            Ok(read) => read,
+            Err(e) => {
+                tracing::warn!(error = %e, "nostrconnect clients' relays not joined: their config cannot be read");
+                return None;
+            }
+        };
+        if stored.is_empty() {
+            return None;
+        }
+        let restored: HashSet<PublicKey> = engine
+            .list_clients()
+            .await
+            .into_iter()
+            .map(|app| app.pubkey)
+            .collect();
+        let clients: Vec<(PublicKey, Vec<String>)> = stored
+            .into_iter()
+            .filter_map(|(client, relays)| {
+                PublicKey::from_hex(&client)
+                    .ok()
+                    .filter(|c| restored.contains(c))
+                    .map(|c| (c, relays))
+            })
+            .collect();
+        (!clients.is_empty()).then_some(NostrconnectRejoin {
+            live,
+            engine,
+            clients,
+            pins,
+            strict,
+        })
+    }
+
+    /// Joins the relays of the clients `plan` holds again, so each reaches
+    /// a server started after its accept. Runs without the start lock or
+    /// `cert_pin_lock`, so a revoke, an accept or a teardown is not held up
+    /// by the probes and dials. Each relay goes through the checks the
+    /// accept ran, with only the pins `plan` read (see
+    /// [`Self::a_start_may_dial`]), and those that pass are dialed through
+    /// the proxy the server was started with. The clients are routed only
+    /// under the start lock, once the server is seen to still serve and
+    /// each client to still be listed and registered there, so a revoke made
+    /// meanwhile, which stops the server, leaves its client unrouted. A
+    /// client none of whose relays passes or is reached stays listed with
+    /// its grant, but unreachable until a later start joins one. Nothing
+    /// here fails the start.
+    fn rejoin_nostrconnect_clients<P, F>(&self, plan: NostrconnectRejoin, probe: P)
+    where
+        P: Fn(String, keep_frost_net::CertificatePinSet, bool, Option<std::net::SocketAddr>) -> F,
+        F: std::future::Future<Output = Result<(), keep_frost_net::FrostNetError>>,
+    {
+        let NostrconnectRejoin {
+            live,
+            engine,
+            clients,
+            pins,
+            strict,
+        } = plan;
+        let proxy = live.proxy;
+        let rejoined = self.mobile.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + NOSTRCONNECT_ACCEPT_TIMEOUT;
+            let mut dialable: HashMap<String, bool> = HashMap::new();
+            let mut passing = Vec::new();
+            for (client, client_relays) in clients {
+                let mut passed = Vec::new();
+                for relay in client_relays {
+                    let ok = match dialable.get(&relay) {
+                        Some(ok) => *ok,
+                        None => {
+                            let ok = Self::a_start_may_dial(
+                                &relay, &pins, strict, proxy, deadline, &probe,
+                            )
+                            .await;
+                            dialable.insert(relay.clone(), ok);
+                            ok
+                        }
+                    };
+                    if ok {
+                        passed.push(relay);
+                    }
+                }
+                if passed.is_empty() {
+                    tracing::warn!(client = %&client.to_hex()[..8], "no relay of a nostrconnect client passed its checks; it cannot be reached");
+                } else {
+                    passing.push((client, passed));
+                }
+            }
+            if passing.is_empty() || self.still_live(&live).is_err() {
+                return None;
+            }
+            match live
+                .relays
+                .rejoin(&passing, proxy, NOSTRCONNECT_RELAY_TIMEOUT)
+                .await
+            {
+                Ok(rejoined) => Some((rejoined, passing)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "nostrconnect clients' relays could not be joined");
+                    None
+                }
+            }
+        });
+        let Some((rejoined, passing)) = rejoined else {
+            return;
+        };
+        let routed = match lock_by(
+            &self.mobile.bunker_start_lock,
+            std::time::Instant::now() + NOSTRCONNECT_RELAY_TIMEOUT,
+        ) {
+            Ok(_start_guard) if self.still_live(&live).is_ok() => {
+                match listed_clients(&self.mobile) {
+                    Ok(listed) => {
+                        let registered: HashSet<PublicKey> = self
+                            .mobile
+                            .runtime
+                            .block_on(engine.list_clients())
+                            .into_iter()
+                            .map(|app| app.pubkey)
+                            .collect();
+                        live.relays.route_rejoined(&rejoined, |client| {
+                            listed.contains(client) && registered.contains(client)
+                        })
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "nostrconnect clients not routed: the authorized client list cannot be read");
+                        Vec::new()
+                    }
+                }
+            }
+            _ => Vec::new(),
+        };
+        for (client, _) in passing.iter().filter(|(c, _)| !routed.contains(c)) {
+            tracing::warn!(client = %&client.to_hex()[..8], "a nostrconnect client was not rejoined; it cannot be reached");
+        }
+        self.mobile
+            .runtime
+            .block_on(live.relays.release_rejoined(rejoined));
+    }
+
+    /// Whether a start may dial `relay` for a `nostrconnect://` client: the
+    /// checks its accept ran, with only the stored `pins`. A relay that is
+    /// invalid or internal, a `wss://` one whose host has no stored pin, or
+    /// one whose certificate `probe` finds does not match its pin is not
+    /// dialed. One the probe cannot reach by `deadline` is dialed directly,
+    /// as at the accept, since its handshake is checked against the stored
+    /// pin. Through a `proxy` it is not: the pinned transport cannot pin a
+    /// proxied socket and gives it CA-only validation, so it is dialed only
+    /// after a probe saw its pin. That admits the relay but does not pin the
+    /// live socket or its reconnects.
+    async fn a_start_may_dial<P, F>(
+        relay: &str,
+        pins: &keep_frost_net::CertificatePinSet,
+        strict: bool,
+        proxy: Option<std::net::SocketAddr>,
+        deadline: tokio::time::Instant,
+        probe: &P,
+    ) -> bool
+    where
+        P: Fn(String, keep_frost_net::CertificatePinSet, bool, Option<std::net::SocketAddr>) -> F,
+        F: std::future::Future<Output = Result<(), keep_frost_net::FrostNetError>>,
+    {
+        if let Err(e) = crate::network::validate_relay_urls(&[relay.to_owned()]) {
+            tracing::warn!(relay = %relay, error = %e, "not joining a nostrconnect relay that is not allowed");
+            return false;
+        }
+        if crate::wss_relay_lacks_pin(relay, pins) {
+            tracing::warn!(relay = %relay, "not joining a nostrconnect relay with no stored pin; a start learns none");
+            return false;
+        }
+        if !relay.starts_with("wss://") {
+            return true;
+        }
+        match tokio::time::timeout_at(
+            deadline,
+            probe(relay.to_owned(), pins.clone(), strict, proxy),
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(
+                e @ (keep_frost_net::FrostNetError::CertificatePinMismatch { .. }
+                | keep_frost_net::FrostNetError::CertificatePinMissing { .. }),
+            )) => {
+                tracing::error!(relay = %relay, error = %e, "not joining a nostrconnect relay whose certificate does not match its pin");
+                false
+            }
+            Ok(Err(e)) if proxy.is_some() => {
+                tracing::warn!(relay = %relay, error = %e, "not joining a proxied nostrconnect relay whose pin the probe could not confirm");
+                false
+            }
+            Err(_) if proxy.is_some() => {
+                tracing::warn!(relay = %relay, "not joining a proxied nostrconnect relay whose probe ran out of time");
+                false
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(relay = %relay, error = %e, "nostrconnect relay not probed; its handshake is checked against its pin");
+                true
+            }
+            Err(_) => {
+                tracing::warn!(relay = %relay, "nostrconnect relay probe ran out of time; its handshake is checked against its pin");
+                true
+            }
+        }
+    }
+}
+
+/// What [`BunkerHandler::plan_rejoin`] read for a rejoin.
+struct NostrconnectRejoin {
+    live: LiveRelays,
+    engine: Arc<SignerHandler>,
+    clients: Vec<(PublicKey, Vec<String>)>,
+    pins: keep_frost_net::CertificatePinSet,
+    strict: bool,
+}
+
+/// The certificate check a start runs on a `nostrconnect://` client's
+/// pinned relay.
+async fn probe_pinned_relay(
+    relay: String,
+    pins: keep_frost_net::CertificatePinSet,
+    strict: bool,
+    proxy: Option<std::net::SocketAddr>,
+) -> Result<(), keep_frost_net::FrostNetError> {
+    keep_frost_net::verify_relay_certificate(&relay, &pins, strict, proxy)
+        .await
+        .map(|_| ())
 }
 
 #[uniffi::export]
@@ -706,6 +1621,7 @@ impl BunkerHandler {
             bunker_url: std::sync::Mutex::new(None),
             lifecycle: std::sync::Mutex::new(Lifecycle::default()),
             serving: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
+            relays: LiveRelaysSlot::default(),
         }
     }
 
@@ -732,20 +1648,82 @@ impl BunkerHandler {
     }
 
     pub fn stop_bunker(&self) {
-        {
-            let mut lifecycle = self.lifecycle();
-            if let Some(tx) = lifecycle.shutdown_tx.take() {
-                let _ = tx.send(());
-            }
-            if lifecycle.starting {
-                lifecycle.stop_requested = true;
-            }
+        // Held throughout, so no start publishes between the signal and the
+        // clears below, and the URL cleared is the stopped server's, since a
+        // start publishes it with `serving` under this lock.
+        let mut lifecycle = self.lifecycle();
+        if let Some(tx) = lifecycle.shutdown_tx.take() {
+            let _ = tx.send(());
         }
-        self.serving
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .store(false, Ordering::Release);
+        if lifecycle.starting {
+            lifecycle.stop_requested = true;
+        }
+        let serving = Arc::clone(&self.serving.lock().unwrap_or_else(|e| e.into_inner()));
+        serving.store(false, Ordering::Release);
         *self.bunker_url.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Only the stopped server's pool, as `run_server` does.
+        let mut relays = self.relays.lock().unwrap_or_else(|e| e.into_inner());
+        if relays
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(&live.serving, &serving))
+        {
+            *relays = None;
+        }
+        drop(lifecycle);
+    }
+
+    /// Reads a `nostrconnect://` URI for the approval prompt, with no side
+    /// effects. The relays it lists are already filtered: invalid or internal
+    /// ones, ones carrying control characters, repeats of one listed earlier
+    /// however spelled, and any past the tenth are dropped, and a URI left
+    /// with none is refused.
+    pub fn parse_nostrconnect(&self, uri: String) -> Result<NostrConnectInfo, KeepMobileError> {
+        parse_nostrconnect_request(&uri).map(|request| NostrConnectInfo::from(&request))
+    }
+
+    /// Accepts a `nostrconnect://` request the user approved: the running
+    /// bunker joins the client's relays, the client is registered with
+    /// `approved_perms` narrowed to what the request asked for (just what it
+    /// asked for when `None`, and the bunker's connect grant when it asked
+    /// for nothing), and the connect response carrying the client's secret
+    /// is sent to it. The client is then listed in `authorized_clients` with
+    /// its grant and relays persisted, and `revoke_client` and
+    /// `revoke_all_clients` cover it as they do one that sent `connect`. Its
+    /// relays carry only its own responses, never another client's.
+    ///
+    /// The client's relays are checked as the bunker's own are: certificate
+    /// pins are learned or enforced and strict pinning applies, and a
+    /// mismatch or a set with no usable relay is an error. A pin learned here
+    /// is enforced on the handshake of the socket the bunker then opens to
+    /// the relay. They are dialed through the proxy the bunker was started
+    /// with, all at once, and the whole accept is bounded by one deadline.
+    /// Through a proxy that socket cannot be pinned, so a pinned relay is
+    /// joined only once a probe saw its pin. The socket itself, and its
+    /// reconnects, still get CA-only validation unless strict pinning is on.
+    ///
+    /// The client's secret is only echoed back. It never becomes a secret the
+    /// bunker accepts on `connect`. A client already authorized is refused,
+    /// with its grant left as it was: revoke it first to accept it again.
+    ///
+    /// Fails with `BunkerNotRunning` when the bunker is stopped, or is
+    /// stopped, revoked, rotated or torn down while this runs. A revoke does
+    /// not wait on the client's relays being dialed or answered; it can wait
+    /// behind a start that is itself waiting for this accept's certificate
+    /// probes, which the deadline bounds. On any error the client is left
+    /// unauthorized and the relays this call joined are dropped.
+    ///
+    /// Every later start restores the client's grant and joins its relays
+    /// again, through the checks above with only the pins already stored: a
+    /// start learns no pin. A relay that fails them is skipped, and a client
+    /// with none left stays listed with its grant but cannot be reached
+    /// until a start can join one; the start does not fail for it.
+    pub fn accept_nostrconnect(
+        &self,
+        uri: String,
+        approved_perms: Option<String>,
+    ) -> Result<(), KeepMobileError> {
+        let deadline = std::time::Instant::now() + NOSTRCONNECT_ACCEPT_TIMEOUT;
+        self.accept_nostrconnect_by(uri, approved_perms, deadline)
     }
 
     /// Revokes a single client: drops its grants in the running engine, so any
@@ -787,13 +1765,25 @@ impl BunkerHandler {
                 stored
                     .authorized_clients
                     .retain(|c| PublicKey::parse(c).ok() != Some(pubkey));
+                stored.client_list_revision = stored.client_list_revision.wrapping_add(1);
+                // The pending mark covers its grants from here, and with the
+                // listing dropped below no rollback would clear this one.
+                stored
+                    .unsettled_nostrconnect
+                    .retain(|c| PublicKey::from_hex(c).ok() != Some(pubkey));
+                stored
+                    .nostrconnect_relays
+                    .retain(|c, _| PublicKey::from_hex(c).ok() != Some(pubkey));
                 let hex = pubkey.to_hex();
                 if !stored.pending_revokes.contains(&hex) {
                     stored.pending_revokes.push(hex);
                 }
             },
             Some(&pubkey),
-        )
+        )?;
+        // Unlisted now, so an accept rolling back has no listing of its own.
+        self.nostrconnect_listings().remove(&pubkey);
+        Ok(())
     }
 
     /// Revokes every client: in the running engine, in the persisted grants
@@ -810,10 +1800,15 @@ impl BunkerHandler {
         self.record_revoke(
             |stored| {
                 stored.authorized_clients.clear();
+                stored.client_list_revision = stored.client_list_revision.wrapping_add(1);
+                stored.unsettled_nostrconnect.clear();
+                stored.nostrconnect_relays.clear();
                 stored.pending_revoke_all = true;
             },
             None,
-        )
+        )?;
+        self.nostrconnect_listings().clear();
+        Ok(())
     }
 
     /// Rotate the bunker credentials: generate a fresh transport secret (new
@@ -964,6 +1959,88 @@ fn listed_clients(mobile: &KeepMobile) -> Result<HashSet<PublicKey>, KeepMobileE
             .filter_map(|c| PublicKey::parse(c).ok())
             .collect())
     })
+}
+
+/// Rolls back an unsettled listing of `client`: drops its stored grants and
+/// unlists it, and clears its mark and lets go of its listing only once both
+/// are written. The unlist is written even if the grants could not be
+/// dropped. Callers hold the start lock and own the listing.
+fn roll_back_listing(mobile: &KeepMobile, client: &PublicKey) -> Result<(), KeepMobileError> {
+    let forgot = mobile.forget_bunker_permissions(Some(client));
+    with_bunker_config(mobile, |stored| {
+        let (listed, relays) = (
+            stored.authorized_clients.len(),
+            stored.nostrconnect_relays.len(),
+        );
+        stored
+            .authorized_clients
+            .retain(|c| PublicKey::parse(c).ok() != Some(*client));
+        stored
+            .nostrconnect_relays
+            .retain(|c, _| PublicKey::from_hex(c).ok() != Some(*client));
+        if stored.authorized_clients.len() != listed || stored.nostrconnect_relays.len() != relays {
+            stored.client_list_revision = stored.client_list_revision.wrapping_add(1);
+        }
+        if forgot.is_ok() {
+            stored
+                .unsettled_nostrconnect
+                .retain(|c| PublicKey::from_hex(c).ok() != Some(*client));
+        }
+        crate::persistence::persist_bunker_config(
+            &mobile.storage,
+            crate::BUNKER_CONFIG_STORAGE_KEY,
+            stored,
+        )
+    })?;
+    forgot?;
+    mobile
+        .nostrconnect_listings
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(client);
+    Ok(())
+}
+
+/// The part of `BunkerHandler::unauthorize` that needs the start lock, which
+/// callers hold: while `listing` is still the client's and rolling back, the
+/// client is revoked on any server started since it was accepted on
+/// `accepted_on`, and its listing rolled back. A rollback that cannot finish
+/// is left for a start or the next accept of the client.
+fn finish_rollback(
+    mobile: &KeepMobile,
+    accepted_on: &SignerHandler,
+    client: &PublicKey,
+    listing: u64,
+) {
+    let rolling_back = NostrconnectListing {
+        id: listing,
+        state: ListingState::RollingBack,
+    };
+    let listings = || {
+        mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    };
+    if listings().get(client) != Some(&rolling_back) {
+        return;
+    }
+    let replacement = mobile
+        .live_bunker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .filter(|live| !std::ptr::eq(live.as_ref(), accepted_on));
+    if let Some(replacement) = replacement {
+        mobile.runtime.block_on(replacement.revoke_client(client));
+    }
+    if let Err(e) = roll_back_listing(mobile, client) {
+        if let Some(owned) = listings().get_mut(client).filter(|l| l.id == listing) {
+            owned.state = ListingState::Unfinished;
+        }
+        tracing::warn!(error = %e, "the rollback of a failed nostrconnect accept is unfinished; its client is not restored");
+    }
 }
 
 /// Runs `f` on the stored bunker config under its lock.
@@ -1152,6 +2229,7 @@ impl BunkerHandler {
         // server even if the node it read is the one torn down.
         let mut invalidated = self.mobile.live_generation.subscribe();
         let generation = *invalidated.borrow_and_update();
+        let stored_proxy = matches!(proxy, crate::ProxyChoice::Stored);
         let result = self.mobile.runtime.block_on(async {
             // Read after the generation above, which a proxy change bumps, so
             // this start either sees the change or is stopped by it.
@@ -1203,7 +2281,7 @@ impl BunkerHandler {
                 outstanding: Arc::new(AtomicUsize::new(0)),
                 callbacks,
                 mobile: Arc::clone(&self.mobile),
-                grant_scope,
+                grant_scope: grant_scope.clone(),
                 serving: Arc::clone(&serving),
             }) as Arc<dyn ServerCallbacks>);
 
@@ -1259,19 +2337,42 @@ impl BunkerHandler {
                     msg: "The bunker was stopped while it was starting".into(),
                 });
             }
-
+            self.publish_relays(
+                &server,
+                proxy,
+                stored_proxy,
+                generation,
+                &serving,
+                &grant_scope,
+            );
             self.serve(server, shutdown_rx, invalidated, serving);
+            let plan = match self.published_relays() {
+                Some(live) => self.plan_rejoin(live).await,
+                None => None,
+            };
 
-            Ok::<(), KeepMobileError>(())
+            Ok::<_, KeepMobileError>(plan)
         });
+        // The node, the pins and the start lock are let go before the
+        // clients' relays are probed and dialed.
+        drop(_cert_pins);
+        drop(_start_guard);
 
-        if result.is_err() {
-            let mut lifecycle = self.lifecycle();
-            lifecycle.starting = false;
-            lifecycle.stop_requested = false;
-            self.set_status(STATUS_STOPPED);
+        match result {
+            Ok(plan) => {
+                if let Some(plan) = plan {
+                    self.rejoin_nostrconnect_clients(plan, probe_pinned_relay);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let mut lifecycle = self.lifecycle();
+                lifecycle.starting = false;
+                lifecycle.stop_requested = false;
+                self.set_status(STATUS_STOPPED);
+                Err(e)
+            }
         }
-        result
     }
 }
 
@@ -1281,6 +2382,7 @@ async fn run_server(
     mut invalidated: tokio::sync::watch::Receiver<u64>,
     status: Arc<AtomicU8>,
     serving: Arc<AtomicBool>,
+    relays: LiveRelaysSlot,
 ) {
     // Biased so a teardown is seen before more requests are drained, since
     // those that need no prompt would otherwise sign with the old share.
@@ -1309,6 +2411,14 @@ async fn run_server(
     }
     // However it stopped, including a handler dropped without `stop_bunker`.
     serving.store(false, Ordering::Release);
+    // Its pool and transport key go with it, unless a later start replaced it.
+    let mut relays = relays.lock().unwrap_or_else(|e| e.into_inner());
+    if relays
+        .as_ref()
+        .is_some_and(|live| Arc::ptr_eq(&live.serving, &serving))
+    {
+        *relays = None;
+    }
 }
 
 #[cfg(test)]
@@ -1327,6 +2437,8 @@ mod tests {
         data: Mutex<HashMap<String, Vec<u8>>>,
         /// A key whose writes fail, as a platform write can.
         fail_writes_to: Mutex<Option<String>>,
+        /// Fails every write, whatever its key.
+        fail_every_write: AtomicBool,
         /// Run at the start of every write, to observe state mid-write.
         on_write: Mutex<Option<Box<dyn Fn() + Send>>>,
     }
@@ -1361,7 +2473,9 @@ mod tests {
             if let Some(on_write) = self.on_write.lock().unwrap().as_ref() {
                 on_write();
             }
-            if self.fail_writes_to.lock().unwrap().as_deref() == Some(key.as_str()) {
+            if self.fail_every_write.load(Ordering::Acquire)
+                || self.fail_writes_to.lock().unwrap().as_deref() == Some(key.as_str())
+            {
                 return Err(KeepMobileError::StorageError {
                     msg: "write failed".into(),
                 });
@@ -1416,6 +2530,7 @@ mod tests {
         assert!(config.connect_secret.is_none());
         assert!(config.pending_revokes.is_empty());
         assert!(!config.pending_revoke_all);
+        assert!(config.unsettled_nostrconnect.is_empty());
     }
 
     // (c) A fresh storage generates and persists new transport key + secret.
@@ -1807,6 +2922,7 @@ mod tests {
             timed_kind_grants: Vec::new(),
             explicitly_remembered: Some(true),
             kinds_vetted: true,
+            paired: false,
         }
     }
 
@@ -3014,6 +4130,17 @@ mod tests {
         assert_ne!(*mobile.live_generation.borrow(), before, "stopped");
     }
 
+    /// Rolls back `listing` with no relays to drop and a lock nobody holds.
+    fn unauthorize_now(
+        handler: &BunkerHandler,
+        engine: &Arc<SignerHandler>,
+        client: &PublicKey,
+        listing: u64,
+    ) {
+        let by = std::time::Instant::now() + Duration::from_secs(5);
+        handler.unauthorize(engine, client, listing, async {}, by);
+    }
+
     fn stored_config(storage: &Arc<dyn SecureStorage>) -> StoredBunkerConfig {
         load_bunker_config(storage, BUNKER_CONFIG_STORAGE_KEY)
             .unwrap()
@@ -3227,6 +4354,7 @@ mod tests {
             .save_bunker_config(crate::BunkerConfigInfo {
                 enabled: false,
                 authorized_clients: vec!["c".into()],
+                revision: None,
             })
             .unwrap();
 
@@ -3257,6 +4385,7 @@ mod tests {
             mobile.save_bunker_config(crate::BunkerConfigInfo {
                 enabled: true,
                 authorized_clients: (0..n).map(|i| format!("{i:064x}")).collect(),
+                revision: None,
             })
         };
         save(max).unwrap();
@@ -3336,6 +4465,7 @@ mod tests {
             invalidated,
             Arc::clone(&status),
             Arc::clone(&persisting),
+            LiveRelaysSlot::default(),
         ));
         assert!(
             mobile.runtime.block_on(pings_back(&url, bunker)),
@@ -3454,5 +4584,2020 @@ mod tests {
         };
         let result = ServerCallbacks::request_approval(&bridge, an_approval());
         assert!(!result.approved, "the share changed while it was asked");
+    }
+
+    struct ApprovesAndCounts(Arc<AtomicUsize>);
+    impl BunkerCallbacks for ApprovesAndCounts {
+        fn on_log(&self, _event: BunkerLogEvent) {}
+        fn request_approval(&self, _request: BunkerApprovalRequest) -> BunkerApprovalResult {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            BunkerApprovalResult {
+                approved: true,
+                remember: BunkerRememberDuration::JustThisTime,
+            }
+        }
+        fn on_connect(&self, _pubkey: String, _name: String, _a: ConnectAuthorization) {}
+    }
+
+    const CLIENT_SECRET: &str = "nostrconnect-client-secret";
+
+    fn nostrconnect_uri(client: &PublicKey, relays: &[&str], perms: &str) -> String {
+        let encode =
+            |v: &str| url::form_urlencoded::byte_serialize(v.as_bytes()).collect::<String>();
+        let relays: String = relays
+            .iter()
+            .map(|r| format!("relay={}&", encode(r)))
+            .collect();
+        format!(
+            "nostrconnect://{}?{relays}secret={CLIENT_SECRET}&name=Scanned+App&perms={}",
+            client.to_hex(),
+            encode(perms)
+        )
+    }
+
+    /// A bunker on `url` built as a start builds one: under the production
+    /// config, with the stored transport key and connect secret, serving the
+    /// grants a start restores. Not yet published or run.
+    fn nostrconnect_server(
+        mobile: &Arc<KeepMobile>,
+        starter: &BunkerHandler,
+        url: &str,
+        prompts: &Arc<AtomicUsize>,
+        serving: &Arc<AtomicBool>,
+    ) -> Server {
+        let (transport, secret) = load_or_create_bunker_keys(mobile).unwrap();
+        let mut keyring = keep_core::keyring::Keyring::new();
+        let keypair = keep_core::keys::NostrKeypair::generate().unwrap();
+        keyring
+            .load_key(
+                *keypair.public_bytes(),
+                *keypair.secret_bytes(),
+                keep_core::keys::KeyType::Nostr,
+                "test".into(),
+            )
+            .unwrap();
+        let scope = grant_scope(&transport, &GROUP).unwrap();
+        let bridge = CallbackBridge {
+            callbacks: Arc::new(ApprovesAndCounts(Arc::clone(prompts))),
+            mobile: Arc::clone(mobile),
+            approval_timeout: Duration::from_secs(5),
+            generation: *mobile.live_generation.borrow(),
+            outstanding: Arc::new(AtomicUsize::new(0)),
+            grant_scope: scope.clone(),
+            serving: Arc::clone(serving),
+        };
+        let pre_grants = starter.grants_to_restore(&scope).unwrap();
+        let config = bunker_server_config(mobile, secret.as_str(), pre_grants).unwrap();
+        mobile.runtime.block_on(async {
+            Server::new_with_config(
+                Arc::new(tokio::sync::Mutex::new(keyring)),
+                None,
+                Some(*transport),
+                &[url.to_owned()],
+                Some(Arc::new(bridge) as Arc<dyn ServerCallbacks>),
+                config,
+            )
+            .await
+            .unwrap()
+        })
+    }
+
+    /// A [`nostrconnect_server`] published through `starter` with its relay
+    /// pool, as a start publishes one, dialing client relays through `proxy`,
+    /// and run, with the relays of the clients it restored joined again as a
+    /// start joins them.
+    fn serve_for_nostrconnect(
+        mobile: &Arc<KeepMobile>,
+        starter: &BunkerHandler,
+        url: &str,
+        proxy: Option<std::net::SocketAddr>,
+        prompts: &Arc<AtomicUsize>,
+    ) -> (PublicKey, tokio::task::JoinHandle<()>) {
+        serve_probing(mobile, starter, url, proxy, prompts, probe_pinned_relay)
+    }
+
+    /// [`serve_for_nostrconnect`], with the clients' pinned relays checked
+    /// by `probe`.
+    fn serve_probing<P, F>(
+        mobile: &Arc<KeepMobile>,
+        starter: &BunkerHandler,
+        url: &str,
+        proxy: Option<std::net::SocketAddr>,
+        prompts: &Arc<AtomicUsize>,
+        probe: P,
+    ) -> (PublicKey, tokio::task::JoinHandle<()>)
+    where
+        P: Fn(String, keep_frost_net::CertificatePinSet, bool, Option<std::net::SocketAddr>) -> F,
+        F: std::future::Future<Output = Result<(), keep_frost_net::FrostNetError>>,
+    {
+        let serving = Arc::new(AtomicBool::new(true));
+        let generation = *mobile.live_generation.borrow();
+        let invalidated = mobile.live_generation.subscribe();
+        let server = nostrconnect_server(mobile, starter, url, prompts, &serving);
+        let bunker = server.pubkey();
+        starter.set_status(STATUS_STARTING);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(starter.publish_server(String::new(), &server.handler(), Arc::clone(&serving), tx));
+        starter.publish_relays(
+            &server,
+            proxy,
+            false,
+            generation,
+            &serving,
+            &test_scope(mobile),
+        );
+        let running = starter.serve(server, rx, invalidated, serving);
+        let plan = {
+            let _start_guard = starter.start_guard();
+            let _cert_pins = mobile.cert_pin_lock.lock().unwrap();
+            let live = starter.published_relays().unwrap();
+            mobile.runtime.block_on(starter.plan_rejoin(live))
+        };
+        if let Some(plan) = plan {
+            starter.rejoin_nostrconnect_clients(plan, probe);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        (bunker, running)
+    }
+
+    fn test_scope(mobile: &KeepMobile) -> String {
+        let (transport, _) = load_or_create_bunker_keys(mobile).unwrap();
+        grant_scope(&transport, &GROUP).unwrap()
+    }
+
+    fn mock_relay(mobile: &KeepMobile) -> (nostr_relay_builder::MockRelay, String) {
+        let relay = mobile
+            .runtime
+            .block_on(nostr_relay_builder::MockRelay::run())
+            .unwrap();
+        let url = mobile.runtime.block_on(relay.url()).to_string();
+        (relay, url)
+    }
+
+    fn engine_lists(handler: &BunkerHandler, client: &PublicKey) -> bool {
+        handler.live_handler().is_some_and(|engine| {
+            handler
+                .mobile
+                .runtime
+                .block_on(engine.list_clients())
+                .iter()
+                .any(|app| app.pubkey == *client)
+        })
+    }
+
+    fn is_listed(storage: &Arc<dyn SecureStorage>, client: &PublicKey) -> bool {
+        load_bunker_config(storage, BUNKER_CONFIG_STORAGE_KEY)
+            .unwrap()
+            .is_some_and(|stored| stored.authorized_clients.contains(&client.to_hex()))
+    }
+
+    /// The first response from `bunker` that `notifications` carry within
+    /// five seconds, decrypted by `app`.
+    fn connect_response(
+        mobile: &KeepMobile,
+        notifications: &mut tokio::sync::broadcast::Receiver<nostr_sdk::RelayPoolNotification>,
+        app: &nostr_sdk::Keys,
+        bunker: PublicKey,
+    ) -> Option<serde_json::Value> {
+        use tokio::sync::broadcast::error::RecvError;
+        mobile.runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let notification = match notifications.recv().await {
+                        Ok(notification) => notification,
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break None,
+                    };
+                    let nostr_sdk::RelayPoolNotification::Event { event, .. } = notification else {
+                        continue;
+                    };
+                    if event.kind == Kind::NostrConnect && event.pubkey == bunker {
+                        let plain = nostr_sdk::nips::nip44::decrypt(
+                            app.secret_key(),
+                            &bunker,
+                            event.content.as_str(),
+                        )
+                        .ok()?;
+                        break serde_json::from_str::<serde_json::Value>(&plain).ok();
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
+        })
+    }
+
+    // End to end over two relays, the bunker on its own and the client on
+    // one it picked. The parsed request carries no secret; the accepted
+    // client hears its own secret back on its relay, signs what it was
+    // approved for there and nothing else, cannot use its secret as the
+    // bunker's, and once revoked is refused.
+    #[test]
+    fn a_nostrconnect_client_signs_with_its_approved_perms_until_revoked() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+
+        let app = nostr_sdk::Keys::generate();
+        let uri = nostrconnect_uri(
+            &app.public_key(),
+            &[&client_url],
+            "sign_event:1,nip44_encrypt",
+        );
+        let info = starter.parse_nostrconnect(uri.clone()).unwrap();
+        assert_eq!(info.client_pubkey, app.public_key().to_hex());
+        assert_eq!(info.name.as_deref(), Some("Scanned App"));
+        assert_eq!(info.relays.len(), 1);
+        assert_eq!(
+            info.requested_permissions.as_deref(),
+            Some("sign_event:1,nip44_encrypt")
+        );
+        assert!(!format!("{info:?}").contains(CLIENT_SECRET));
+        assert!(
+            !is_listed(&storage, &app.public_key()),
+            "parsing registers nothing"
+        );
+
+        let client = listening(&mobile, &client_url, &app, bunker);
+        let mut notifications = client.notifications();
+        starter
+            .accept_nostrconnect(uri, Some("sign_event:1".into()))
+            .unwrap();
+        let answer = connect_response(&mobile, &mut notifications, &app, bunker)
+            .expect("the connect response reaches the client's relay");
+        assert_eq!(
+            answer.get("result").and_then(|v| v.as_str()),
+            Some(CLIENT_SECRET),
+            "the response carries the client's own secret"
+        );
+        assert!(is_listed(&storage, &app.public_key()));
+        assert!(engine_lists(&starter, &app.public_key()));
+
+        let signed = mobile
+            .runtime
+            .block_on(sign_over_relay(&client, &app, bunker, "approved"))
+            .expect("an approved kind is signed on the client's relay");
+        signed.verify().unwrap();
+        let ask = |client: &nostr_sdk::Client, keys, id, method, params| {
+            mobile
+                .runtime
+                .block_on(ask_over_relay(client, keys, bunker, id, method, params))
+        };
+        let encrypt = serde_json::json!([nostr_sdk::Keys::generate().public_key().to_hex(), "x"]);
+        assert_eq!(
+            error_of(ask(
+                &client,
+                &app,
+                "encrypt",
+                "nip44_encrypt",
+                encrypt.clone()
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "a permission it asked for but was not approved is refused"
+        );
+
+        let stranger = nostr_sdk::Keys::generate();
+        let stranger_client = listening(&mobile, &bunker_url, &stranger, bunker);
+        assert_eq!(
+            error_of(ask(
+                &stranger_client,
+                &stranger,
+                "stolen-secret",
+                "connect",
+                serde_json::json!([bunker.to_hex(), CLIENT_SECRET]),
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "the client's secret is not a connect secret"
+        );
+
+        let wait_for = |running: &tokio::task::JoinHandle<()>| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !running.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            running.is_finished()
+        };
+        starter.stop_bunker();
+        assert!(wait_for(&running));
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (restored, running) =
+            serve_for_nostrconnect(&mobile, &restarter, &bunker_url, None, &prompts);
+        assert_eq!(restored, bunker, "a restart keeps the transport key");
+        assert!(
+            mobile
+                .runtime
+                .block_on(sign_over_relay(&client, &app, bunker, "restored"))
+                .is_some(),
+            "a restart restores the client's grant and rejoins its relay"
+        );
+        assert_eq!(
+            error_of(ask(
+                &client,
+                &app,
+                "encrypt-again",
+                "nip44_encrypt",
+                encrypt.clone()
+            ))
+            .as_deref(),
+            Some("Permission denied"),
+            "a restart restores only what was approved"
+        );
+        let on_bunker_relay = listening(&mobile, &bunker_url, &app, bunker);
+
+        BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_client(app.public_key().to_hex())
+            .unwrap();
+        assert!(wait_for(&running), "the revoke stops the bunker");
+        assert!(!is_listed(&storage, &app.public_key()));
+        assert!(stored_config(&storage).nostrconnect_relays.is_empty());
+        assert!(!restored_clients(&mobile).contains(&app.public_key().to_hex()));
+
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (again, _) = serve_for_nostrconnect(&mobile, &restarter, &bunker_url, None, &prompts);
+        assert_eq!(again, bunker);
+        let unsigned = serde_json::json!({
+            "kind": 1,
+            "content": "revoked",
+            "tags": [],
+            "created_at": nostr_sdk::Timestamp::now().as_secs(),
+        });
+        assert_eq!(
+            error_of(mobile.runtime.block_on(ask_over_relay(
+                &on_bunker_relay,
+                &app,
+                again,
+                "revoked",
+                "sign_event",
+                serde_json::json!([serde_json::to_string(&unsigned).unwrap()]),
+            )))
+            .as_deref(),
+            Some("Permission denied"),
+            "the revoked client cannot sign"
+        );
+        restarter.stop_bunker();
+        for c in [client, stranger_client, on_bunker_relay] {
+            mobile.runtime.block_on(c.disconnect());
+        }
+    }
+
+    // An accept grants what the request asked for, narrowed by the approval
+    // but never widened by it. A request that asks for nothing asks for the
+    // bunker's connect grant, as a `connect` that names nothing does.
+    #[test]
+    fn an_accept_grants_no_more_than_the_request_asked_for() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let granted = |client: &PublicKey| {
+            let engine = starter.live_handler().unwrap();
+            mobile
+                .runtime
+                .block_on(engine.list_clients())
+                .into_iter()
+                .find(|app| app.pubkey == *client)
+                .map(|app| app.permissions)
+        };
+
+        let cases = [
+            (
+                "",
+                None,
+                Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT,
+            ),
+            ("", Some("get_public_key"), Permission::GET_PUBLIC_KEY),
+            (
+                "nip44_encrypt",
+                None,
+                Permission::GET_PUBLIC_KEY | Permission::NIP44_ENCRYPT,
+            ),
+            (
+                "nip44_encrypt",
+                Some("sign_event,nip44_encrypt"),
+                Permission::GET_PUBLIC_KEY | Permission::NIP44_ENCRYPT,
+            ),
+        ];
+        for (requested, approved, expected) in cases {
+            let client = nostr_sdk::Keys::generate().public_key();
+            starter
+                .accept_nostrconnect(
+                    nostrconnect_uri(&client, &[&client_url], requested),
+                    approved.map(str::to_owned),
+                )
+                .unwrap();
+            assert_eq!(
+                granted(&client),
+                Some(expected),
+                "{requested:?} {approved:?}"
+            );
+        }
+        starter.stop_bunker();
+    }
+
+    // A revoke-all and an accept, in either order or at once, leave the
+    // client unauthorized; one that comes first leaves nothing to accept on.
+    #[test]
+    fn a_revoke_all_alongside_an_accept_leaves_the_client_unauthorized() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let first = nostr_sdk::Keys::generate().public_key();
+        starter.revoke_all_clients().unwrap();
+        assert!(matches!(
+            starter.accept_nostrconnect(nostrconnect_uri(&first, &[&client_url], ""), None),
+            Err(KeepMobileError::BunkerNotRunning)
+        ));
+        assert!(!is_listed(&storage, &first));
+
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let second = nostr_sdk::Keys::generate().public_key();
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&second, &[&client_url], ""), None)
+            .unwrap();
+        assert!(is_listed(&storage, &second));
+        starter.revoke_all_clients().unwrap();
+        assert!(!is_listed(&storage, &second));
+        assert!(!engine_lists(&starter, &second));
+
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let third = nostr_sdk::Keys::generate().public_key();
+        let accepting = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&third, &[&client_url], "");
+            std::thread::spawn(move || starter.accept_nostrconnect(uri, None))
+        };
+        let revoking = {
+            let starter = Arc::clone(&starter);
+            std::thread::spawn(move || starter.revoke_all_clients())
+        };
+        revoking.join().unwrap().unwrap();
+        let _ = accepting.join().unwrap();
+        assert!(!is_listed(&storage, &third), "the race left it authorized");
+        assert!(!engine_lists(&starter, &third));
+    }
+
+    /// Whether a test relay accepts an event, refuses it, or (`None`) holds
+    /// its OK forever.
+    type Admit = Box<dyn Fn(&nostr_sdk::Event) -> Option<bool> + Send + Sync>;
+
+    /// A relay write policy that answers `admit` for each event it is sent,
+    /// counting those it holds.
+    struct Admits {
+        admit: Admit,
+        held: Arc<AtomicUsize>,
+    }
+
+    impl nostr_relay_builder::prelude::WritePolicy for Admits {
+        fn admit_event<'a>(
+            &'a self,
+            event: &'a nostr_sdk::Event,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult>
+        {
+            use nostr_relay_builder::prelude::PolicyResult;
+            let decision = (self.admit)(event);
+            Box::pin(async move {
+                match decision {
+                    Some(true) => PolicyResult::Accept,
+                    Some(false) => PolicyResult::Reject("refused".into()),
+                    None => {
+                        self.held.fetch_add(1, Ordering::AcqRel);
+                        std::future::pending().await
+                    }
+                }
+            })
+        }
+    }
+
+    impl std::fmt::Debug for Admits {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Admits").finish_non_exhaustive()
+        }
+    }
+
+    fn policy_relay(
+        mobile: &KeepMobile,
+        admit: impl Fn(&nostr_sdk::Event) -> Option<bool> + Send + Sync + 'static,
+    ) -> (nostr_relay_builder::LocalRelay, String, Arc<AtomicUsize>) {
+        let held = Arc::new(AtomicUsize::new(0));
+        let relay = nostr_relay_builder::LocalRelay::new(
+            nostr_relay_builder::RelayBuilder::default().write_policy(Admits {
+                admit: Box::new(admit),
+                held: Arc::clone(&held),
+            }),
+        );
+        mobile.runtime.block_on(relay.run()).unwrap();
+        let url = mobile.runtime.block_on(relay.url()).to_string();
+        (relay, url, held)
+    }
+
+    /// A loopback listener taking every connection, holding each open or
+    /// closing it at once, and calling `on_accept` for each. Dropping it
+    /// stops its thread and closes the connections it held.
+    struct TestListener {
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestListener {
+        fn spawn(hold: bool, on_accept: impl Fn() + Send + 'static) -> Self {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let addr = listener.local_addr().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                let mut held = Vec::new();
+                while !stopping.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            on_accept();
+                            if hold {
+                                held.push(stream);
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("ws://{}", self.addr)
+        }
+    }
+
+    impl Drop for TestListener {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// A loopback relay whose host accepts the connection and never answers
+    /// the handshake, until the fixture is dropped.
+    fn hanging_relay() -> TestListener {
+        TestListener::spawn(true, || {})
+    }
+
+    // A client's relays carry only its own responses: one that holds every
+    // OK after the connect response sees no response to another client, and
+    // does not slow that client's requests.
+    #[test]
+    fn a_stalling_client_relay_does_not_hold_up_another_clients_responses() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, _running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+
+        let staller = nostr_sdk::Keys::generate();
+        let staller_pk = staller.public_key();
+        let (_stalling, stalling_url, held) = policy_relay(&mobile, move |event| {
+            event
+                .tags
+                .public_keys()
+                .any(|pk| *pk == staller_pk)
+                .then_some(true)
+        });
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&staller_pk, &[&stalling_url], ""), None)
+            .unwrap();
+
+        let other = nostr_sdk::Keys::generate();
+        let (_other_relay, other_url) = mock_relay(&mobile);
+        let other_client = listening(&mobile, &other_url, &other, bunker);
+        starter
+            .accept_nostrconnect(
+                nostrconnect_uri(&other.public_key(), &[&other_url], ""),
+                None,
+            )
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        for id in ["first", "second", "third"] {
+            let answer = mobile.runtime.block_on(ask_over_relay(
+                &other_client,
+                &other,
+                bunker,
+                id,
+                "get_public_key",
+                serde_json::json!([]),
+            ));
+            assert!(
+                answer.is_some_and(|a| a.get("result").is_some()),
+                "request {id} was answered"
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the other client waited on the stalling relay"
+        );
+        assert_eq!(
+            held.load(Ordering::Acquire),
+            0,
+            "another client's response reached the stalling relay"
+        );
+        starter.stop_bunker();
+        mobile.runtime.block_on(other_client.disconnect());
+    }
+
+    // An accept whose response no relay takes leaves the client unauthorized
+    // and drops the relay it joined from the bunker's pool.
+    #[test]
+    fn a_failed_accept_drops_the_relays_it_joined() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, |_| Some(false));
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        assert!(matches!(
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&refusing_url], ""), None),
+            Err(KeepMobileError::NetworkError { ref msg })
+                if msg.contains("no relay accepted the connect response")
+        ));
+        assert!(!is_listed(&storage, &client));
+        assert!(!engine_lists(&starter, &client));
+        let live = starter.relays.lock().unwrap().clone().unwrap();
+        assert!(!mobile.runtime.block_on(live.relays.holds(&refusing_url)));
+        assert!(
+            mobile.runtime.block_on(live.relays.holds(&bunker_url)),
+            "the bunker's own relay stays"
+        );
+        starter.stop_bunker();
+    }
+
+    /// Accepts on `starter` from another thread with one relay that answers
+    /// and one whose handshake hangs, so the accept is dialing for a while.
+    fn accept_while_dialing(
+        starter: &Arc<BunkerHandler>,
+        client: PublicKey,
+        reachable: &str,
+    ) -> std::thread::JoinHandle<Result<(), KeepMobileError>> {
+        let starter = Arc::clone(starter);
+        let hanging = hanging_relay();
+        let uri = nostrconnect_uri(&client, &[&hanging.url(), reachable], "");
+        let accepting = std::thread::spawn(move || {
+            let accepted = starter.accept_nostrconnect(uri, None);
+            drop(hanging);
+            accepted
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!accepting.is_finished(), "the accept is still dialing");
+        accepting
+    }
+
+    // A revoke does not wait for an accept dialing the client's relays, and
+    // the accept, finding the bunker it would register with revoked, or
+    // stopped, refuses. The task that ran the server lets go of its pool.
+    #[test]
+    fn a_revoke_or_stop_during_an_accept_is_not_held_up_and_refuses_it() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+        let accepting = accept_while_dialing(&starter, client, &client_url);
+        let revoking = std::time::Instant::now();
+        BunkerHandler::new(Arc::clone(&mobile))
+            .revoke_all_clients()
+            .unwrap();
+        assert!(
+            revoking.elapsed() < Duration::from_secs(2),
+            "the revoke waited on the accept"
+        );
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(KeepMobileError::BunkerNotRunning)
+        ));
+        assert!(!is_listed(&storage, &client));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !running.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.is_finished());
+        assert!(starter.relays.lock().unwrap().is_none());
+
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let accepting = accept_while_dialing(&starter, client, &client_url);
+        starter.stop_bunker();
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(KeepMobileError::BunkerNotRunning)
+        ));
+        assert!(!is_listed(&storage, &client));
+        assert!(!engine_lists(&starter, &client));
+    }
+
+    // Accepting a client already authorized is refused, and leaves its grant
+    // as it was rather than replacing or revoking it.
+    #[test]
+    fn accepting_an_authorized_client_again_is_refused_and_keeps_its_grant() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, _running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let app = nostr_sdk::Keys::generate();
+        let client = listening(&mobile, &client_url, &app, bunker);
+        let uri = nostrconnect_uri(&app.public_key(), &[&client_url], "sign_event:1");
+        starter
+            .accept_nostrconnect(uri.clone(), Some("sign_event:1".into()))
+            .unwrap();
+
+        assert!(matches!(
+            starter.accept_nostrconnect(uri, Some("nip44_encrypt".into())),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(is_listed(&storage, &app.public_key()));
+        assert!(engine_lists(&starter, &app.public_key()));
+        assert!(
+            mobile
+                .runtime
+                .block_on(sign_over_relay(&client, &app, bunker, "still-granted"))
+                .is_some(),
+            "the grant it had still signs"
+        );
+        let encrypt = serde_json::json!([nostr_sdk::Keys::generate().public_key().to_hex(), "x"]);
+        assert_eq!(
+            error_of(mobile.runtime.block_on(ask_over_relay(
+                &client,
+                &app,
+                bunker,
+                "encrypt",
+                "nip44_encrypt",
+                encrypt
+            )))
+            .as_deref(),
+            Some("Permission denied"),
+            "the refused accept did not widen the grant"
+        );
+        starter.stop_bunker();
+        mobile.runtime.block_on(client.disconnect());
+    }
+
+    // Invalid relays and any past the tenth are dropped from a request, and
+    // one left with none is refused before anything is registered.
+    #[test]
+    fn a_nostrconnect_request_keeps_only_usable_relays() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        let many: Vec<String> = (0..15)
+            .map(|i| format!("wss://relay{i}.example.com"))
+            .collect();
+        let mut relays: Vec<&str> = vec!["https://relay.example.com", "not a url", "wss://"];
+        relays.extend(many.iter().map(String::as_str));
+        let info = handler
+            .parse_nostrconnect(nostrconnect_uri(&client, &relays, ""))
+            .unwrap();
+        assert_eq!(info.relays.len(), 10);
+        assert!(info.relays.iter().all(|r| r.starts_with("wss://relay")));
+
+        let unusable = nostrconnect_uri(&client, &["https://relay.example.com", "not a url"], "");
+        assert!(matches!(
+            handler.parse_nostrconnect(unusable.clone()),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            handler.accept_nostrconnect(unusable, None),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(!is_listed(&storage, &client));
+    }
+
+    // Accepting with the bunker stopped is a typed refusal the app can turn
+    // into a prompt to start it.
+    #[test]
+    fn accepting_with_the_bunker_stopped_asks_for_a_start() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let client = nostr_sdk::Keys::generate().public_key();
+        let uri = nostrconnect_uri(&client, &["wss://relay.example.com"], "");
+        assert!(matches!(
+            BunkerHandler::new(Arc::clone(&mobile)).accept_nostrconnect(uri, None),
+            Err(KeepMobileError::BunkerNotRunning)
+        ));
+        assert!(!is_listed(&storage, &client));
+    }
+
+    // The client's relays are held to the bunker's pinning: under strict
+    // pinning an unpinned one is refused without being dialed, and a pinned
+    // one whose check cannot complete is probed and dialed only through the
+    // bunker's proxy, and refused when unreached. Neither registers the
+    // client. A pinned relay presenting another key would need a TLS relay
+    // to test against, which these tests have none of; `verify_and_pin_relays`
+    // refuses that mismatch for the bunker's own relays and this path calls
+    // it unchanged.
+    #[test]
+    fn a_client_relay_that_fails_its_pin_check_is_refused() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (dialed_tx, dialed) = std::sync::mpsc::channel();
+        let proxy = TestListener::spawn(false, move || {
+            let _ = dialed_tx.send(());
+        });
+        let proxy_addr = proxy.addr;
+        mobile
+            .stage_certificate_pin("pinned.example.com".into(), hex::encode([1u8; 32]))
+            .unwrap();
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, Some(proxy_addr), &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        crate::persistence::persist_strict_pin_config(
+            &storage,
+            crate::STRICT_PIN_CONFIG_STORAGE_KEY,
+            &crate::persistence::StoredStrictPinConfig { enabled: true },
+        )
+        .unwrap();
+        let no_relay_passed = |result: Result<(), KeepMobileError>| {
+            matches!(
+                result,
+                Err(KeepMobileError::NetworkError { ref msg })
+                    if msg.contains("No relays passed TLS certificate verification")
+            )
+        };
+        let unpinned = nostrconnect_uri(&client, &["wss://unpinned.example.com"], "");
+        assert!(no_relay_passed(starter.accept_nostrconnect(unpinned, None)));
+        assert!(dialed.try_recv().is_err(), "an unpinned relay was dialed");
+
+        crate::persistence::persist_strict_pin_config(
+            &storage,
+            crate::STRICT_PIN_CONFIG_STORAGE_KEY,
+            &crate::persistence::StoredStrictPinConfig { enabled: false },
+        )
+        .unwrap();
+        // The probe through the proxy cannot confirm the pin, and the
+        // proxied socket would not enforce it, so the relay is refused
+        // rather than joined.
+        let pinned = nostrconnect_uri(&client, &["wss://pinned.example.com"], "");
+        assert!(no_relay_passed(starter.accept_nostrconnect(pinned, None)));
+        dialed
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the pinned relay is checked through the bunker's proxy");
+        assert!(
+            dialed.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the relay whose pin was not confirmed was joined through the proxy"
+        );
+
+        assert!(!is_listed(&storage, &client));
+        assert!(!engine_lists(&starter, &client));
+        starter.stop_bunker();
+    }
+
+    // Waiting on `cert_pin_lock` counts against an accept's deadline, so a
+    // start holding it cannot keep an accept past it.
+    #[test]
+    fn the_cert_pin_lock_is_waited_for_only_until_the_deadline() {
+        let lock = std::sync::Mutex::new(());
+        let held = lock.lock().unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            lock_by(&lock, started + Duration::from_millis(100)),
+            Err(KeepMobileError::Timeout)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(held);
+        assert!(lock_by(
+            &lock,
+            std::time::Instant::now() + Duration::from_millis(100)
+        )
+        .is_ok());
+    }
+
+    // An accept rolling back removes its own listing, but not one a later
+    // accept made after a revoke took its own out.
+    #[test]
+    fn an_accept_rolling_back_keeps_a_later_accepts_listing() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let client = nostr_sdk::Keys::generate().public_key();
+        let (engine, _) = engine_knowing(&client);
+
+        let first = handler.list_client(&client, Vec::new()).unwrap();
+        handler.revoke_client(client.to_hex()).unwrap();
+        assert!(!is_listed(&storage, &client));
+        let second = handler.list_client(&client, Vec::new()).unwrap();
+        unauthorize_now(&handler, &engine, &client, first);
+        assert!(
+            is_listed(&storage, &client),
+            "the earlier accept's rollback removed the later listing"
+        );
+
+        unauthorize_now(&handler, &engine, &client, second);
+        assert!(
+            !is_listed(&storage, &client),
+            "a rollback with no replacement removes its own listing"
+        );
+    }
+
+    // A stop clears the relay pool slot only when it holds the server being
+    // stopped, and leaves another server's publication in place.
+    #[test]
+    fn a_stop_leaves_another_servers_relays_published() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        // Never run, so no server task can clear the slot under test.
+        let replacement = Arc::new(AtomicBool::new(true));
+        let mut server =
+            nostrconnect_server(&mobile, &starter, &bunker_url, &prompts, &replacement);
+        let generation = *mobile.live_generation.borrow();
+        starter.publish_relays(
+            &server,
+            None,
+            false,
+            generation,
+            &replacement,
+            &test_scope(&mobile),
+        );
+
+        let older = Arc::new(AtomicBool::new(true));
+        *starter.serving.lock().unwrap() = Arc::clone(&older);
+        starter.stop_bunker();
+        assert!(!older.load(Ordering::Acquire));
+        assert!(
+            starter.relays.lock().unwrap().is_some(),
+            "the stop cleared another server's relays"
+        );
+
+        *starter.serving.lock().unwrap() = replacement;
+        starter.stop_bunker();
+        assert!(starter.relays.lock().unwrap().is_none());
+        mobile.runtime.block_on(server.stop());
+    }
+
+    // A duplicate accept that passed the unlocked check before the first
+    // registered is refused under the start lock, and leaves the route the
+    // first one installed: the client still hears its responses on its own
+    // relay.
+    #[test]
+    fn a_refused_duplicate_accept_keeps_the_first_accepts_route() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let slow_relay = mobile
+            .runtime
+            .block_on(nostr_relay_builder::MockRelay::run_with_opts(
+                nostr_relay_builder::prelude::RelayTestOptions {
+                    unresponsive_connection: Some(Duration::from_secs(1)),
+                    send_random_events: false,
+                },
+            ))
+            .unwrap();
+        let slow_url = mobile.runtime.block_on(slow_relay.url()).to_string();
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        let (bunker, _running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let app = nostr_sdk::Keys::generate();
+        let client = listening(&mobile, &client_url, &app, bunker);
+
+        let first = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&app.public_key(), &[&slow_url, &client_url], "");
+            std::thread::spawn(move || starter.accept_nostrconnect(uri, None))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!first.is_finished(), "the first accept is still dialing");
+        let duplicate = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&app.public_key(), &[&client_url], "");
+            std::thread::spawn(move || starter.accept_nostrconnect(uri, None))
+        };
+        first.join().unwrap().unwrap();
+        assert!(matches!(
+            duplicate.join().unwrap(),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(is_listed(&storage, &app.public_key()));
+
+        let answer = mobile.runtime.block_on(ask_over_relay(
+            &client,
+            &app,
+            bunker,
+            "after-duplicate",
+            "get_public_key",
+            serde_json::json!([]),
+        ));
+        assert!(
+            answer.is_some_and(|a| a.get("result").is_some()),
+            "the refused duplicate dropped the first accept's route"
+        );
+        starter.stop_bunker();
+        mobile.runtime.block_on(client.disconnect());
+    }
+
+    // An accept succeeds as soon as one relay takes the connect response,
+    // and does not wait on another that holds its OK, so it cannot be rolled
+    // back for that relay once the client has the response.
+    #[test]
+    fn an_accept_does_not_wait_on_a_relay_holding_its_ok() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let (_holding, holding_url, held) = policy_relay(&mobile, |_| None);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        let started = std::time::Instant::now();
+        starter
+            .accept_nostrconnect(
+                nostrconnect_uri(&client, &[&holding_url, &client_url], ""),
+                None,
+            )
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the accept waited on the relay holding its OK"
+        );
+        assert!(is_listed(&storage, &client));
+        assert!(engine_lists(&starter, &client));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while held.load(Ordering::Acquire) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            held.load(Ordering::Acquire) > 0,
+            "the response was sent to the holding relay too"
+        );
+        starter.stop_bunker();
+    }
+
+    // The eight-character secret NIP-46 gives as its example is read for the
+    // prompt and echoed back to the client unchanged.
+    #[test]
+    fn a_short_nostrconnect_secret_is_accepted_and_echoed() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, _running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let app = nostr_sdk::Keys::generate();
+        let uri = nostrconnect_uri(&app.public_key(), &[&client_url], "")
+            .replace(CLIENT_SECRET, "0s8j2djs");
+        starter.parse_nostrconnect(uri.clone()).unwrap();
+
+        let client = listening(&mobile, &client_url, &app, bunker);
+        let mut notifications = client.notifications();
+        starter.accept_nostrconnect(uri, None).unwrap();
+        let answer = connect_response(&mobile, &mut notifications, &app, bunker)
+            .expect("the connect response reaches the client's relay");
+        assert_eq!(
+            answer.get("result").and_then(|v| v.as_str()),
+            Some("0s8j2djs")
+        );
+        starter.stop_bunker();
+        mobile.runtime.block_on(client.disconnect());
+    }
+
+    // Waiting on the start lock counts against an accept's deadline: one
+    // that cannot take it in time times out, registers nothing and drops the
+    // relays it joined.
+    #[test]
+    fn an_accept_waits_for_the_start_lock_only_until_its_deadline() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        let held = mobile.bunker_start_lock.lock().unwrap();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let accepting = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&client, &[&client_url], "");
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + Duration::from_secs(3);
+                let result = starter.accept_nostrconnect_by(uri, None, deadline);
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let finished = done.recv_timeout(Duration::from_secs(10)).is_ok();
+        drop(held);
+        assert!(
+            finished,
+            "the accept waited on the start lock past its deadline"
+        );
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(KeepMobileError::Timeout)
+        ));
+        assert!(!is_listed(&storage, &client));
+        assert!(!engine_lists(&starter, &client));
+        let live = starter.relays.lock().unwrap().clone().unwrap();
+        assert!(!mobile.runtime.block_on(live.relays.holds(&client_url)));
+        starter.stop_bunker();
+    }
+
+    // A failed accept whose rollback cannot take the start lock returns
+    // within its deadline and the rollback's grace, the original error
+    // reported, with the client revoked and its relays dropped meanwhile.
+    // Once the lock is let go the rollback finishes: the client is unlisted
+    // and unmarked, and its grant is dropped.
+    #[test]
+    fn a_rollback_held_up_by_the_start_lock_finishes_after_the_accept_returns() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let client = nostr_sdk::Keys::generate().public_key();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(Some(released));
+        let locking = Arc::downgrade(&mobile);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, move |_| {
+            let released = released.lock().unwrap().take();
+            if let (Some(mobile), Some(released)) = (locking.upgrade(), released) {
+                persist_grants(&mobile, &[client]);
+                let (locked_tx, locked) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _held = mobile.bunker_start_lock.lock().unwrap();
+                    let _ = locked_tx.send(());
+                    let _ = released.recv();
+                });
+                locked.recv().unwrap();
+            }
+            Some(false)
+        });
+        let starter = Arc::new(BunkerHandler::new(Arc::clone(&mobile)));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+
+        let timeout = Duration::from_secs(3);
+        let started = std::time::Instant::now();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let accepting = {
+            let starter = Arc::clone(&starter);
+            let uri = nostrconnect_uri(&client, &[&refusing_url], "");
+            std::thread::spawn(move || {
+                let result =
+                    starter.accept_nostrconnect_by(uri, None, std::time::Instant::now() + timeout);
+                let _ = done_tx.send(());
+                result
+            })
+        };
+        let finished = done.recv_timeout(Duration::from_secs(10)).is_ok();
+        let elapsed = started.elapsed();
+        let live = starter.relays.lock().unwrap().clone().unwrap();
+        let relays_kept = mobile.runtime.block_on(live.relays.holds(&refusing_url));
+        let served = engine_lists(&starter, &client);
+        let unlisted = !is_listed(&storage, &client);
+        drop(release);
+        assert!(
+            finished,
+            "the rollback waited on the start lock past the accept's deadline"
+        );
+        assert!(elapsed < timeout + NOSTRCONNECT_ROLLBACK_GRACE + Duration::from_millis(500));
+        assert!(matches!(
+            accepting.join().unwrap(),
+            Err(KeepMobileError::NetworkError { ref msg })
+                if msg.contains("no relay accepted the connect response")
+        ));
+        assert!(!served, "the client could sign while its rollback waited");
+        assert!(
+            !relays_kept,
+            "the joined relay was held while the rollback waited"
+        );
+        assert!(!unlisted, "the unlist was written without the start lock");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_listed(&storage, &client) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!is_listed(&storage, &client), "the rollback never finished");
+        drop(mobile.bunker_start_lock.lock().unwrap());
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        assert!(!engine_lists(&starter, &client));
+        assert!(!mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap()
+            .contains_key(&client));
+        starter.stop_bunker();
+    }
+
+    // A rollback that revoked the client but could not write the unlist
+    // keeps the listing its own, so once storage recovers an accept of the
+    // client again finishes the unlist rather than being refused as a
+    // duplicate.
+    #[test]
+    fn a_retried_accept_finishes_an_unlist_its_rollback_could_not_write() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let failing = Arc::clone(&mem);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, move |_| {
+            *failing.fail_writes_to.lock().unwrap() = Some(BUNKER_CONFIG_STORAGE_KEY.into());
+            Some(false)
+        });
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        assert!(matches!(
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&refusing_url], ""), None),
+            Err(KeepMobileError::NetworkError { .. })
+        ));
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(is_listed(&storage, &client), "the unlist write failed");
+        assert!(!engine_lists(&starter, &client));
+
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
+            .expect("the retry finishes the unlist and accepts");
+        assert!(is_listed(&storage, &client));
+        assert!(engine_lists(&starter, &client));
+        starter.stop_bunker();
+    }
+
+    // A bunker torn down while its response is refused is reported as not
+    // running, which the app can offer a start for, rather than as the
+    // send's error, and the client is left unauthorized.
+    #[test]
+    fn a_failed_send_on_a_stopped_bunker_asks_for_a_start() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let tearing = Arc::downgrade(&mobile);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, move |_| {
+            if let Some(mobile) = tearing.upgrade() {
+                mobile
+                    .live_generation
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            Some(false)
+        });
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        assert!(matches!(
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&refusing_url], ""), None),
+            Err(KeepMobileError::BunkerNotRunning)
+        ));
+        assert!(!is_listed(&storage, &client));
+    }
+
+    // A server started while an accept was pending restores the grant the
+    // client was given meanwhile, since the client is listed. The accept's
+    // rollback revokes it there too and drops the stored grant, so the
+    // client is left unauthorized on every server.
+    #[test]
+    fn a_rolled_back_accept_leaves_no_grant_on_a_replacement_server() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let client = nostr_sdk::Keys::generate().public_key();
+        let (accepted_on, _) = engine_knowing(&client);
+        let listing = handler.list_client(&client, Vec::new()).unwrap();
+        persist_grants(&mobile, &[client]);
+
+        let replacement = BunkerHandler::new(Arc::clone(&mobile));
+        serve_for_nostrconnect(&mobile, &replacement, &bunker_url, None, &prompts);
+        assert!(
+            engine_lists(&replacement, &client),
+            "the replacement restored the grant"
+        );
+
+        unauthorize_now(&handler, &accepted_on, &client, listing);
+        assert!(
+            !engine_lists(&replacement, &client),
+            "the replacement still serves the client"
+        );
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        assert!(!is_listed(&storage, &client));
+        replacement.stop_bunker();
+    }
+
+    // A config save made from a read older than an accept, or than its
+    // rollback, is refused, so it neither drops the accepted client nor
+    // lists again one the rollback unlisted. One from a fresh read saves.
+    #[test]
+    fn a_config_save_from_an_older_read_is_refused() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let ordinary = nostr_sdk::Keys::generate().public_key().to_hex();
+        set_listed(&mobile, vec![ordinary.clone()]);
+        let before_accept = mobile.get_bunker_config().unwrap();
+
+        let client = nostr_sdk::Keys::generate().public_key();
+        let listing = handler.list_client(&client, Vec::new()).unwrap();
+        let during_accept = mobile.get_bunker_config().unwrap();
+        let stale = crate::BunkerConfigInfo {
+            enabled: !before_accept.enabled,
+            authorized_clients: before_accept.authorized_clients.clone(),
+            revision: before_accept.revision,
+        };
+        assert!(matches!(
+            mobile.save_bunker_config(stale),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert_eq!(
+            stored_config(&storage).authorized_clients,
+            vec![ordinary.clone(), client.to_hex()],
+            "the save dropped the accepted client"
+        );
+
+        unauthorize_now(&handler, &engine_knowing(&client).0, &client, listing);
+        assert!(!is_listed(&storage, &client));
+        assert!(matches!(
+            mobile.save_bunker_config(crate::BunkerConfigInfo {
+                enabled: true,
+                authorized_clients: during_accept.authorized_clients.clone(),
+                revision: during_accept.revision,
+            }),
+            Err(KeepMobileError::InvalidInput { .. })
+        ));
+        assert!(
+            !is_listed(&storage, &client),
+            "the save listed the rolled back client again"
+        );
+
+        let fresh = mobile.get_bunker_config().unwrap();
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: !fresh.enabled,
+                authorized_clients: fresh.authorized_clients.clone(),
+                revision: fresh.revision,
+            })
+            .unwrap();
+        assert_eq!(stored_config(&storage).enabled, !fresh.enabled);
+        assert_eq!(stored_config(&storage).authorized_clients, vec![ordinary]);
+    }
+
+    // A save that drops every client, as an account reset makes, drops one
+    // an accept listed too, and the next start restores none of them.
+    #[test]
+    fn a_config_save_can_drop_an_accepted_client() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
+            .unwrap();
+        assert!(restored_clients(&mobile).contains(&client.to_hex()));
+
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: false,
+                authorized_clients: Vec::new(),
+                revision: None,
+            })
+            .unwrap();
+        assert!(!is_listed(&storage, &client));
+        assert!(stored_config(&storage).nostrconnect_relays.is_empty());
+        stop_and_wait(&starter, &running);
+
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &restarter, &bunker_url, None, &prompts);
+        assert!(
+            !engine_lists(&restarter, &client),
+            "a start restored the dropped client"
+        );
+        assert!(!is_listed(&storage, &client));
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        stop_and_wait(&restarter, &running);
+    }
+
+    // A revoke that lands while an accept of the client is still pending
+    // clears its unsettled mark, so a later pairing of the same key through
+    // the bunker URL stays listed across a start.
+    #[test]
+    fn a_revoke_during_an_accept_clears_its_unsettled_mark() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let client = nostr_sdk::Keys::generate().public_key();
+        handler.list_client(&client, Vec::new()).unwrap();
+        assert!(handler.accepting(&client));
+
+        handler.revoke_client(client.to_hex()).unwrap();
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+
+        set_listed(&mobile, vec![client.to_hex()]);
+        {
+            let _start_guard = mobile.bunker_start_lock.lock().unwrap();
+            handler.finish_unsettled(None).unwrap();
+        }
+        assert!(
+            is_listed(&storage, &client),
+            "a start unlisted the paired client"
+        );
+    }
+
+    // A config save that filled the list after an accept's first check
+    // leaves that accept no room: listing refuses rather than overfilling.
+    #[test]
+    fn listing_an_accepted_client_rechecks_the_list_for_room() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
+        let full: Vec<String> = (0..max)
+            .map(|_| nostr_sdk::Keys::generate().public_key().to_hex())
+            .collect();
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: true,
+                authorized_clients: full.clone(),
+                revision: None,
+            })
+            .unwrap();
+
+        let client = nostr_sdk::Keys::generate().public_key();
+        assert!(matches!(
+            handler.list_client(&client, Vec::new()),
+            Err(KeepMobileError::TooManyAuthorizedClients { max: m }) if m as usize == max
+        ));
+        let stored = stored_config(&storage);
+        assert_eq!(stored.authorized_clients, full);
+        assert!(stored.unsettled_nostrconnect.is_empty());
+        assert!(!mobile
+            .nostrconnect_listings
+            .lock()
+            .unwrap()
+            .contains_key(&client));
+    }
+
+    /// Stops the server `running` serves and waits for its task to end.
+    fn stop_and_wait(handler: &BunkerHandler, running: &tokio::task::JoinHandle<()>) {
+        handler.stop_bunker();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !running.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(running.is_finished());
+    }
+
+    // An accept whose rollback could write neither the grant drop nor the
+    // unlist leaves its client marked unsettled on disk. Once storage
+    // recovers, a start in a fresh process does not restore the grant the
+    // client was given meanwhile, and finishes the rollback.
+    #[test]
+    fn a_rollback_that_wrote_nothing_is_finished_by_a_start_after_a_restart() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let client = nostr_sdk::Keys::generate().public_key();
+        let failing = Arc::clone(&mem);
+        let granting = Arc::downgrade(&mobile);
+        let (_refusing, refusing_url, _) = policy_relay(&mobile, move |_| {
+            if let Some(mobile) = granting.upgrade() {
+                persist_grants(&mobile, &[client]);
+            }
+            failing.fail_every_write.store(true, Ordering::Release);
+            Some(false)
+        });
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+
+        assert!(matches!(
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&refusing_url], ""), None),
+            Err(KeepMobileError::NetworkError { .. })
+        ));
+        mem.fail_every_write.store(false, Ordering::Release);
+        assert!(is_listed(&storage, &client), "the unlist write failed");
+        assert!(
+            restored_clients(&mobile).contains(&client.to_hex()),
+            "the grant drop failed"
+        );
+        stop_and_wait(&starter, &running);
+        drop(starter);
+
+        let restarted = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let restarter = BunkerHandler::new(Arc::clone(&restarted));
+        let (_, running) =
+            serve_for_nostrconnect(&restarted, &restarter, &bunker_url, None, &prompts);
+        assert!(
+            !engine_lists(&restarter, &client),
+            "a start restored the grant of an accept that failed"
+        );
+        assert!(!is_listed(&storage, &client));
+        assert!(!restored_clients(&restarted).contains(&client.to_hex()));
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+        stop_and_wait(&restarter, &running);
+    }
+
+    // A client whose accept succeeded keeps its grant across a restart.
+    #[test]
+    fn a_settled_accepts_grant_is_restored_after_a_restart() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
+            .unwrap();
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+        stop_and_wait(&starter, &running);
+        drop(starter);
+
+        let restarted = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let restarter = BunkerHandler::new(Arc::clone(&restarted));
+        let (_, running) =
+            serve_for_nostrconnect(&restarted, &restarter, &bunker_url, None, &prompts);
+        assert!(
+            engine_lists(&restarter, &client),
+            "the grant was not restored"
+        );
+        assert!(is_listed(&storage, &client));
+        stop_and_wait(&restarter, &running);
+    }
+
+    /// Whether the relay pool of the server `handler` last started holds
+    /// `url`.
+    fn pool_holds(handler: &BunkerHandler, url: &str) -> bool {
+        let live = handler.relays.lock().unwrap().clone().unwrap();
+        handler.mobile.runtime.block_on(live.relays.holds(url))
+    }
+
+    fn set_nostrconnect_relays(mobile: &KeepMobile, client: &PublicKey, relays: &[&str]) {
+        with_bunker_config(mobile, |stored| {
+            stored.nostrconnect_relays.insert(
+                client.to_hex(),
+                relays.iter().map(|r| (*r).to_owned()).collect(),
+            );
+            persist_bunker_config(&mobile.storage, BUNKER_CONFIG_STORAGE_KEY, stored)
+        })
+        .unwrap();
+    }
+
+    // A start checks a client's relays with the pins already stored and
+    // learns none: a relay whose certificate no longer matches its pin, and
+    // one whose host has no pin, are not joined, while the client's other
+    // relay still carries it. A client none of whose relays passes stays
+    // listed with its grant, unreachable, and the start still succeeds.
+    #[test]
+    fn a_start_skips_a_client_relay_whose_pin_no_longer_matches() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (bunker, running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let app = nostr_sdk::Keys::generate();
+        let client = listening(&mobile, &client_url, &app, bunker);
+        starter
+            .accept_nostrconnect(
+                nostrconnect_uri(&app.public_key(), &[&client_url], ""),
+                None,
+            )
+            .unwrap();
+        stop_and_wait(&starter, &running);
+
+        mobile
+            .stage_certificate_pin("changed.example.com".into(), hex::encode([1u8; 32]))
+            .unwrap();
+        let (changed, unpinned) = ("wss://changed.example.com/", "wss://unpinned.example.com/");
+        set_nostrconnect_relays(
+            &mobile,
+            &app.public_key(),
+            &[&client_url, changed, unpinned],
+        );
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let mismatching = |probed: Arc<Mutex<Vec<String>>>| {
+            move |relay: String, _pins, _strict, _proxy| {
+                probed.lock().unwrap().push(relay.clone());
+                std::future::ready(Err(keep_frost_net::FrostNetError::CertificatePinMismatch {
+                    hostname: relay,
+                    expected: "***".into(),
+                    actual: hex::encode([2u8; 32]),
+                }))
+            }
+        };
+
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_probing(
+            &mobile,
+            &restarter,
+            &bunker_url,
+            None,
+            &prompts,
+            mismatching(Arc::clone(&probed)),
+        );
+        assert_eq!(restarter.get_bunker_status(), BunkerStatus::Running);
+        assert_eq!(*probed.lock().unwrap(), vec![changed.to_owned()]);
+        assert!(!pool_holds(&restarter, changed));
+        assert!(!pool_holds(&restarter, unpinned));
+        assert!(pool_holds(&restarter, &client_url));
+        assert!(
+            mobile
+                .runtime
+                .block_on(sign_over_relay(&client, &app, bunker, "passed"))
+                .is_some(),
+            "the client's relay that passed is joined"
+        );
+        stop_and_wait(&restarter, &running);
+
+        set_nostrconnect_relays(&mobile, &app.public_key(), &[changed, unpinned]);
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_probing(
+            &mobile,
+            &restarter,
+            &bunker_url,
+            None,
+            &prompts,
+            mismatching(Arc::clone(&probed)),
+        );
+        assert_eq!(restarter.get_bunker_status(), BunkerStatus::Running);
+        assert!(!pool_holds(&restarter, changed));
+        assert!(!pool_holds(&restarter, &client_url));
+        assert!(
+            engine_lists(&restarter, &app.public_key()),
+            "the grant was dropped"
+        );
+        assert!(is_listed(&storage, &app.public_key()));
+        stop_and_wait(&restarter, &running);
+        mobile.runtime.block_on(client.disconnect());
+    }
+
+    // A revoke of every client after a restart drops the clients' relays
+    // and grants with their listing, so the next start restores none of
+    // them and joins none of their relays.
+    #[test]
+    fn a_revoke_all_after_a_restart_leaves_nothing_to_restore() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
+            .unwrap();
+        stop_and_wait(&starter, &running);
+
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &restarter, &bunker_url, None, &prompts);
+        assert!(engine_lists(&restarter, &client));
+        assert!(pool_holds(&restarter, &client_url));
+        restarter.revoke_all_clients().unwrap();
+        stop_and_wait(&restarter, &running);
+        let stored = stored_config(&storage);
+        assert!(stored.authorized_clients.is_empty());
+        assert!(stored.nostrconnect_relays.is_empty());
+        assert!(restored_clients(&mobile).is_empty());
+
+        let again = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &again, &bunker_url, None, &prompts);
+        assert!(!engine_lists(&again, &client));
+        assert!(!pool_holds(&again, &client_url));
+        stop_and_wait(&again, &running);
+    }
+
+    // A revoke made while a start's rejoin is stuck probing a client's
+    // relay does not wait for the probe, and the revoked client is not
+    // routed once the probe returns.
+    #[test]
+    fn a_revoke_during_a_stalled_rejoin_is_not_held_up_and_wins() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+        starter
+            .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
+            .unwrap();
+        stop_and_wait(&starter, &running);
+        mobile
+            .stage_certificate_pin("stall.example.com".into(), hex::encode([1u8; 32]))
+            .unwrap();
+        set_nostrconnect_relays(&mobile, &client, &["wss://stall.example.com/", &client_url]);
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (probing_tx, probing) = std::sync::mpsc::channel();
+        let probe = {
+            let gate = Arc::clone(&gate);
+            let probing_tx = std::sync::Mutex::new(probing_tx);
+            move |_relay: String, _pins, _strict, _proxy| {
+                let gate = Arc::clone(&gate);
+                let _ = probing_tx.lock().unwrap().send(());
+                async move {
+                    let _ = gate.acquire().await;
+                    Ok(())
+                }
+            }
+        };
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (relays, running) = std::thread::scope(|scope| {
+            let starting = scope
+                .spawn(|| serve_probing(&mobile, &restarter, &bunker_url, None, &prompts, probe));
+            probing
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the rejoin probes the pinned relay");
+            let relays = restarter.published_relays().unwrap().relays;
+            let (revoked_tx, revoked) = std::sync::mpsc::channel();
+            let revoking = Arc::clone(&mobile);
+            let revoker = scope.spawn(move || {
+                let started = std::time::Instant::now();
+                let result = BunkerHandler::new(revoking).revoke_client(client.to_hex());
+                let _ = revoked_tx.send(started.elapsed());
+                result
+            });
+            let took = revoked.recv_timeout(Duration::from_secs(3));
+            gate.add_permits(1);
+            let took = took.expect("the revoke waited on the stalled rejoin");
+            assert!(took < Duration::from_secs(3), "the revoke took {took:?}");
+            revoker.join().unwrap().unwrap();
+            let (_, running) = starting.join().unwrap();
+            (relays, running)
+        });
+        assert!(
+            relays.routed_relays(&client).is_empty(),
+            "the revoked client was routed after the revoke"
+        );
+        assert!(!is_listed(&storage, &client));
+        assert!(stored_config(&storage).nostrconnect_relays.is_empty());
+        stop_and_wait(&restarter, &running);
+    }
+
+    // A start finishing an unsettled mark whose client is no longer listed
+    // changes no listing, so a client list read before it stays current.
+    // One that unlists its client moves the revision on.
+    #[test]
+    fn a_rollback_that_unlists_nothing_keeps_the_client_list_revision() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let client = nostr_sdk::Keys::generate().public_key();
+        with_bunker_config(&mobile, |stored| {
+            stored.unsettled_nostrconnect.push(client.to_hex());
+            persist_bunker_config(&mobile.storage, BUNKER_CONFIG_STORAGE_KEY, stored)
+        })
+        .unwrap();
+        let read = mobile.get_bunker_config().unwrap();
+        {
+            let _start_guard = mobile.bunker_start_lock.lock().unwrap();
+            handler.finish_unsettled(None).unwrap();
+        }
+        assert!(stored_config(&storage).unsettled_nostrconnect.is_empty());
+        assert_eq!(mobile.get_bunker_config().unwrap().revision, read.revision);
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: !read.enabled,
+                authorized_clients: read.authorized_clients,
+                revision: read.revision,
+            })
+            .unwrap();
+
+        let listed = nostr_sdk::Keys::generate().public_key();
+        handler.list_client(&listed, Vec::new()).unwrap();
+        mobile.nostrconnect_listings.lock().unwrap().clear();
+        let before = mobile.get_bunker_config().unwrap().revision;
+        {
+            let _start_guard = mobile.bunker_start_lock.lock().unwrap();
+            handler.finish_unsettled(None).unwrap();
+        }
+        assert!(!is_listed(&storage, &listed));
+        assert_ne!(mobile.get_bunker_config().unwrap().revision, before);
+    }
+
+    // An accept whose paired grant does not reach storage fails rather than
+    // leave a client that would lose its grant at the next start, and is
+    // rolled back: unlisted, with no relays, no mark and nothing restored.
+    #[test]
+    fn an_accept_whose_grant_cannot_be_stored_is_refused_and_rolled_back() {
+        let mem = Arc::new(MemStorage::default());
+        let storage: Arc<dyn SecureStorage> = mem.clone();
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        *mem.fail_writes_to.lock().unwrap() = Some(crate::relay_config_key(None));
+        let result =
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None);
+        *mem.fail_writes_to.lock().unwrap() = None;
+        assert!(
+            matches!(result, Err(KeepMobileError::StorageError { ref msg }) if msg.contains("could not be stored")),
+            "{result:?}"
+        );
+        assert!(!is_listed(&storage, &client));
+        let stored = stored_config(&storage);
+        assert!(!stored.nostrconnect_relays.contains_key(&client.to_hex()));
+        assert!(stored.unsettled_nostrconnect.is_empty());
+        assert!(!engine_lists(&starter, &client));
+        stop_and_wait(&starter, &running);
+
+        let restarter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &restarter, &bunker_url, None, &prompts);
+        assert!(!engine_lists(&restarter, &client));
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        stop_and_wait(&restarter, &running);
+    }
+
+    // A pinned relay whose probe cannot reach it, or runs out of time, is
+    // still dialed, its handshake checked against the pin. One that shows
+    // another key is not, nor is an unpinned one, which is never probed.
+    #[test]
+    fn a_start_dials_a_pinned_relay_its_probe_could_not_reach() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut pins = keep_frost_net::CertificatePinSet::new();
+        pins.add_pin("pinned.example.com".into(), [1u8; 32]);
+        let relay = "wss://pinned.example.com/";
+        let deadline = || tokio::time::Instant::now() + Duration::from_millis(200);
+        let may_dial_through =
+            |proxy, verdict: fn() -> Result<(), keep_frost_net::FrostNetError>| {
+                runtime.block_on(BunkerHandler::a_start_may_dial(
+                    relay,
+                    &pins,
+                    false,
+                    proxy,
+                    deadline(),
+                    &|_, _, _, _| std::future::ready(verdict()),
+                ))
+            };
+        let may_dial = |verdict| may_dial_through(None, verdict);
+        assert!(may_dial(|| Err(keep_frost_net::FrostNetError::Transport(
+            "unreachable".into()
+        ))));
+        assert!(may_dial(|| Err(keep_frost_net::FrostNetError::Timeout(
+            "slow".into()
+        ))));
+        assert!(may_dial(|| Ok(())));
+        assert!(!may_dial(|| Err(
+            keep_frost_net::FrostNetError::CertificatePinMismatch {
+                hostname: "pinned.example.com".into(),
+                expected: "***".into(),
+                actual: hex::encode([2u8; 32]),
+            }
+        )));
+        assert!(runtime.block_on(BunkerHandler::a_start_may_dial(
+            relay,
+            &pins,
+            false,
+            None,
+            deadline(),
+            &|_, _, _, _| std::future::pending(),
+        )));
+        let probed = AtomicBool::new(false);
+        assert!(!runtime.block_on(BunkerHandler::a_start_may_dial(
+            "wss://unpinned.example.com/",
+            &pins,
+            false,
+            None,
+            deadline(),
+            &|_, _, _, _| {
+                probed.store(true, Ordering::Release);
+                std::future::ready(Ok(()))
+            },
+        )));
+        assert!(!probed.load(Ordering::Acquire));
+
+        // A proxied socket is not pinned by the transport, so through a
+        // proxy only a probe that confirmed the pin lets a relay be dialed.
+        let proxy = Some("127.0.0.1:9050".parse().unwrap());
+        assert!(may_dial_through(proxy, || Ok(())));
+        assert!(!may_dial_through(proxy, || Err(
+            keep_frost_net::FrostNetError::Transport("unreachable".into())
+        )));
+        assert!(!may_dial_through(proxy, || Err(
+            keep_frost_net::FrostNetError::Timeout("slow".into())
+        )));
+        assert!(!runtime.block_on(BunkerHandler::a_start_may_dial(
+            relay,
+            &pins,
+            false,
+            proxy,
+            deadline(),
+            &|_, _, _, _| std::future::pending(),
+        )));
+    }
+
+    // A config save that unlists the client while its accept is sending the
+    // response fails the accept, which rolls back, rather than report a
+    // client that a start would not restore.
+    #[test]
+    fn a_save_that_unlists_an_accepting_client_fails_the_accept() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let saving = Arc::downgrade(&mobile);
+        let saved = Arc::new(AtomicBool::new(false));
+        let saved_once = Arc::clone(&saved);
+        let (_client_relay, client_url, _) = policy_relay(&mobile, move |_| {
+            if let Some(mobile) = saving.upgrade() {
+                if !saved_once.swap(true, Ordering::AcqRel) {
+                    mobile
+                        .save_bunker_config(crate::BunkerConfigInfo {
+                            enabled: true,
+                            authorized_clients: Vec::new(),
+                            revision: None,
+                        })
+                        .unwrap();
+                }
+            }
+            Some(true)
+        });
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_, running) = serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+
+        let result =
+            starter.accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None);
+        assert!(saved.load(Ordering::Acquire), "the save never ran");
+        assert!(
+            matches!(result, Err(KeepMobileError::InvalidInput { ref msg }) if msg.contains("taken off")),
+            "{result:?}"
+        );
+        assert!(!is_listed(&storage, &client));
+        let stored = stored_config(&storage);
+        assert!(stored.unsettled_nostrconnect.is_empty());
+        assert!(!stored.nostrconnect_relays.contains_key(&client.to_hex()));
+        assert!(!restored_clients(&mobile).contains(&client.to_hex()));
+        assert!(!engine_lists(&starter, &client));
+        stop_and_wait(&starter, &running);
     }
 }

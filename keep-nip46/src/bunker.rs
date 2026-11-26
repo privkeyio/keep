@@ -5,6 +5,7 @@ use keep_core::relay::{
     ALLOW_INTERNAL_HOSTS, MAX_RELAYS,
 };
 use nostr_sdk::prelude::*;
+use zeroize::Zeroizing;
 
 pub fn generate_bunker_url(
     pubkey: &PublicKey,
@@ -31,36 +32,97 @@ pub fn generate_bunker_url(
     url
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NostrConnectRequest {
     pub client_pubkey: PublicKey,
     pub relays: Vec<String>,
-    pub secret: String,
+    pub secret: Zeroizing<String>,
     pub name: Option<String>,
     pub url: Option<String>,
     pub image: Option<String>,
     pub perms: Option<String>,
 }
 
-const MAX_NOSTRCONNECT_RELAYS: usize = 10;
-const MAX_DISPLAY_NAME_LEN: usize = 50;
-const MAX_PERMS_LEN: usize = 512;
-const MIN_SECRET_LEN: usize = 16;
-
-fn validate_metadata_url(value: &str) -> Result<String, String> {
-    let parsed = ::url::Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
-    match parsed.scheme() {
-        "https" => Ok(parsed.to_string()),
-        _ => Err("only https:// URLs are allowed".into()),
+impl std::fmt::Debug for NostrConnectRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NostrConnectRequest")
+            .field("client_pubkey", &self.client_pubkey)
+            .field("relays", &self.relays)
+            .field("secret", &"<redacted>")
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("image", &self.image)
+            .field("perms", &self.perms)
+            .finish()
     }
 }
 
+const MAX_NOSTRCONNECT_RELAYS: usize = 10;
+const MAX_DISPLAY_NAME_LEN: usize = 50;
+const MAX_PERMS_LEN: usize = 512;
+const MAX_SECRET_LEN: usize = 64;
+
+const MAX_METADATA_URL_LEN: usize = 512;
+
+/// A client's `url` or `image`: https only, without userinfo, and on a host a
+/// relay could be on, so the app is never pointed at an internal one.
+fn validate_metadata_url(
+    value: &str,
+    validate: fn(&str) -> Result<(), String>,
+) -> Result<String, String> {
+    if value.len() > MAX_METADATA_URL_LEN {
+        return Err("URL too long".into());
+    }
+    let parsed = ::url::Url::parse(value).map_err(|e| format!("invalid URL: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("only https:// URLs are allowed".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("userinfo not allowed".into());
+    }
+    let host = parsed.host_str().ok_or("missing host")?;
+    validate(&format!("wss://{host}"))?;
+    let cleaned = parsed.to_string();
+    if cleaned.len() > MAX_METADATA_URL_LEN {
+        return Err("URL too long".into());
+    }
+    Ok(cleaned)
+}
+
+/// A `nostrconnect://` relay as it is dialed, or `None` when it is unusable.
+/// One carrying a control character is refused rather than cleaned, and the
+/// default port is dropped, so spellings of one relay compare equal. The
+/// normalized form is validated too, since normalizing can lengthen it past
+/// the limit the relays are checked against downstream.
+fn nostrconnect_relay(value: &str, validate: fn(&str) -> Result<(), String>) -> Option<String> {
+    if value.chars().any(char::is_control) || validate(value).is_err() {
+        return None;
+    }
+    let normalized = normalize_relay_url(value);
+    ::url::Url::parse(&normalized)
+        .ok()
+        .map(|url| url.to_string())
+        .filter(|relay| validate(relay).is_ok())
+}
+
+/// `value` without control, zero-width, bidi or line and paragraph
+/// separator characters, which could spoof or break the approval prompt.
+fn strip_invisible(value: &str) -> impl Iterator<Item = char> + '_ {
+    value.chars().filter(|c| {
+        !c.is_control()
+            && !matches!(
+                c,
+                '\u{200B}'..='\u{200F}'
+                    | '\u{2028}'..='\u{202E}'
+                    | '\u{2060}'..='\u{206F}'
+                    | '\u{061C}'
+                    | '\u{FEFF}'
+            )
+    })
+}
+
 fn sanitize_display_name(name: &str) -> String {
-    name.chars()
-        .filter(|c| !c.is_control())
-        .filter(|c| !matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'))
-        .take(MAX_DISPLAY_NAME_LEN)
-        .collect()
+    strip_invisible(name).take(MAX_DISPLAY_NAME_LEN).collect()
 }
 
 pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequest, String> {
@@ -93,17 +155,21 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     for (key, value) in parsed.query_pairs() {
         match key.as_ref() {
             "relay" => {
-                if relays.len() < MAX_NOSTRCONNECT_RELAYS && validate(&value).is_ok() {
-                    relays.push(normalize_relay_url(&value));
+                if relays.len() < MAX_NOSTRCONNECT_RELAYS {
+                    if let Some(relay) = nostrconnect_relay(&value, validate) {
+                        if !relays.contains(&relay) {
+                            relays.push(relay);
+                        }
+                    }
                 }
             }
-            "secret" => secret = Some(value.to_string()),
+            "secret" => secret = Some(Zeroizing::new(value.into_owned())),
             "name" => name = Some(sanitize_display_name(&value)),
-            "url" => url_param = validate_metadata_url(&value).ok(),
-            "image" => image = validate_metadata_url(&value).ok(),
+            "url" => url_param = validate_metadata_url(&value, validate).ok(),
+            "image" => image = validate_metadata_url(&value, validate).ok(),
             "perms" => {
                 if value.len() <= MAX_PERMS_LEN {
-                    perms = Some(value.to_string());
+                    perms = Some(strip_invisible(&value).collect());
                 } else {
                     return Err("perms parameter too long".into());
                 }
@@ -117,9 +183,8 @@ pub fn parse_nostrconnect_uri(uri: &str) -> std::result::Result<NostrConnectRequ
     }
 
     let secret = secret.ok_or("secret is required")?;
-    let secret_len = secret.chars().count();
-    if !(MIN_SECRET_LEN..=64).contains(&secret_len) {
-        return Err(format!("secret must be {MIN_SECRET_LEN}-64 characters"));
+    if secret.is_empty() || secret.chars().count() > MAX_SECRET_LEN {
+        return Err(format!("secret must be 1-{MAX_SECRET_LEN} characters"));
     }
 
     Ok(NostrConnectRequest {
@@ -249,7 +314,7 @@ mod tests {
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.client_pubkey, pubkey);
         assert_eq!(req.relays, vec!["wss://relay.damus.io/"]);
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
         assert_eq!(req.name.as_deref(), Some("My Client"));
     }
 
@@ -264,7 +329,7 @@ mod tests {
 
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.relays.len(), 2);
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
     }
 
     #[test]
@@ -299,18 +364,6 @@ mod tests {
         let pubkey = keys.public_key();
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com",
-            pubkey.to_hex()
-        );
-
-        assert!(parse_nostrconnect_uri(&uri).is_err());
-    }
-
-    #[test]
-    fn test_parse_nostrconnect_short_secret() {
-        let keys = Keys::generate();
-        let pubkey = keys.public_key();
-        let uri = format!(
-            "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret=short",
             pubkey.to_hex()
         );
 
@@ -366,24 +419,24 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_nostrconnect_secret_exact_min_length() {
+    fn test_parse_nostrconnect_accepts_the_nip46_example_secret() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "a".repeat(MIN_SECRET_LEN);
+        let secret = "0s8j2djs";
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
             secret
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, secret);
+        assert_eq!(req.secret.as_str(), secret);
     }
 
     #[test]
-    fn test_parse_nostrconnect_secret_one_below_min() {
+    fn test_parse_nostrconnect_rejects_an_empty_secret() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "a".repeat(MIN_SECRET_LEN - 1);
+        let secret = "";
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
@@ -396,21 +449,21 @@ mod tests {
     fn test_parse_nostrconnect_secret_exact_max_length() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "b".repeat(64);
+        let secret = "b".repeat(MAX_SECRET_LEN);
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
             secret
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, secret);
+        assert_eq!(req.secret.as_str(), secret);
     }
 
     #[test]
     fn test_parse_nostrconnect_secret_over_max() {
         let keys = Keys::generate();
         let pubkey = keys.public_key();
-        let secret = "c".repeat(65);
+        let secret = "c".repeat(MAX_SECRET_LEN + 1);
         let uri = format!(
             "nostrconnect://{}?relay=wss%3A%2F%2Frelay.example.com&secret={}",
             pubkey.to_hex(),
@@ -433,6 +486,66 @@ mod tests {
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
         assert_eq!(req.relays.len(), MAX_NOSTRCONNECT_RELAYS);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_joins_one_relay_once() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2FR.EXAMPLE.COM&relay=wss%3A%2F%2Fr.example.com%2F&relay=wss%3A%2F%2Fr.example.com%3A443%2F&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://r.example.com/"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_drops_a_relay_with_control_chars() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com%2F%00x&relay=wss%3A%2F%2Fr.example.com%2Fa%0Ab&relay=wss%3A%2F%2Fok.example.com&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://ok.example.com/"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_keeps_a_relay_query_last() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com%3Fauth%3D1&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://r.example.com/?auth=1"]);
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_drops_a_relay_normalizing_lengthens_past_the_limit() {
+        let pubkey = Keys::generate().public_key();
+        let long = format!("wss://r.example.com?x={}", "a".repeat(234));
+        assert_eq!(long.len(), keep_core::relay::MAX_RELAY_URL_LENGTH);
+        assert!(validate_relay_url(&long).is_ok());
+        let uri = format!(
+            "nostrconnect://{}?relay={}&relay=wss%3A%2F%2Fok.example.com&secret=abcdef0123456789",
+            pubkey.to_hex(),
+            urlencoding::encode(&long)
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.relays, vec!["wss://ok.example.com/"]);
+        assert!(req.relays.iter().all(|r| validate_relay_url(r).is_ok()));
+    }
+
+    #[test]
+    fn test_nostrconnect_request_debug_hides_the_secret() {
+        let pubkey = Keys::generate().public_key();
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com&secret=abcdef0123456789",
+            pubkey.to_hex()
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert!(!format!("{req:?}").contains("abcdef0123456789"));
     }
 
     #[test]
@@ -480,7 +593,7 @@ mod tests {
             pubkey.to_hex()
         );
         let req = parse_nostrconnect_uri(&uri).unwrap();
-        assert_eq!(req.secret, "abcdef0123456789");
+        assert_eq!(req.secret.as_str(), "abcdef0123456789");
     }
 
     #[test]
@@ -601,22 +714,59 @@ mod tests {
 
     #[test]
     fn test_validate_metadata_url_javascript() {
-        assert!(validate_metadata_url("javascript:alert(1)").is_err());
+        assert!(validate_metadata_url("javascript:alert(1)", validate_relay_url).is_err());
     }
 
     #[test]
     fn test_validate_metadata_url_data() {
-        assert!(validate_metadata_url("data:text/html,<h1>X</h1>").is_err());
+        assert!(validate_metadata_url("data:text/html,<h1>X</h1>", validate_relay_url).is_err());
     }
 
     #[test]
     fn test_validate_metadata_url_ftp() {
-        assert!(validate_metadata_url("ftp://example.com/file").is_err());
+        assert!(validate_metadata_url("ftp://example.com/file", validate_relay_url).is_err());
+    }
+
+    #[test]
+    fn test_validate_metadata_url_refuses_userinfo_internal_hosts_and_long_urls() {
+        for refused in [
+            "https://user@example.com/",
+            "https://user:pass@example.com/",
+            "https://localhost/icon.png",
+            "https://127.0.0.1/icon.png",
+            "https://10.0.0.5/icon.png",
+            "https://192.168.1.1/icon.png",
+            "https://[::1]/icon.png",
+            "https://printer.local/icon.png",
+            "https://intranet/icon.png",
+        ] {
+            assert!(
+                validate_metadata_url(refused, validate_relay_url).is_err(),
+                "{refused}"
+            );
+        }
+        let long = format!("https://example.com/{}", "a".repeat(MAX_METADATA_URL_LEN));
+        assert!(validate_metadata_url(&long, validate_relay_url).is_err());
+        let fits = format!("https://example.com/{}", "a".repeat(400));
+        assert!(validate_metadata_url(&fits, validate_relay_url).is_ok());
+    }
+
+    #[test]
+    fn test_parse_nostrconnect_strips_invisible_characters() {
+        let uri = format!(
+            "nostrconnect://{}?relay=wss%3A%2F%2Fr.example.com&secret=abcdef0123456789&name={}&perms={}",
+            Keys::generate().public_key().to_hex(),
+            urlencoding::encode("Ad\u{2028}m\u{2029}i\u{061C}n\u{202E}"),
+            urlencoding::encode("sign_event\u{200B},nip44_\u{202E}encrypt\u{0007}\u{2029}")
+        );
+        let req = parse_nostrconnect_uri(&uri).unwrap();
+        assert_eq!(req.name.as_deref(), Some("Admin"));
+        assert_eq!(req.perms.as_deref(), Some("sign_event,nip44_encrypt"));
     }
 
     #[test]
     fn test_validate_metadata_url_valid_https() {
-        let result = validate_metadata_url("https://example.com/image.png");
+        let result = validate_metadata_url("https://example.com/image.png", validate_relay_url);
         assert!(result.is_ok());
     }
 }

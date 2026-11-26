@@ -1169,9 +1169,36 @@ impl SignerHandler {
         name: String,
         permissions_str: Option<&str>,
     ) -> Result<()> {
+        let perms = permissions_str.map_or(self.connect_grant, parse_permission_string);
+        self.register_with(app_pubkey, name, perms).await
+    }
+
+    /// Registers a `nostrconnect://` client with what the user approved,
+    /// never more than the request asked for. A request that names no
+    /// permission asks for the connect grant, as a `connect` that names none
+    /// does, and an approval of `None` is the request as asked.
+    pub async fn register_nostrconnect_client(
+        &self,
+        app_pubkey: PublicKey,
+        name: String,
+        requested: Option<&str>,
+        approved: Option<&str>,
+    ) -> Result<()> {
+        let requested = requested
+            .filter(|perms| perms.split(',').any(|perm| !perm.trim().is_empty()))
+            .map_or(self.connect_grant, parse_permission_string);
+        let perms = approved.map_or(requested, |a| parse_permission_string(a) & requested);
+        self.register_with(app_pubkey, name, perms).await
+    }
+
+    async fn register_with(
+        &self,
+        app_pubkey: PublicKey,
+        name: String,
+        requested_perms: Permission,
+    ) -> Result<()> {
         self.check_rate_limit(&app_pubkey).await?;
 
-        let requested_perms = permissions_str.map_or(self.connect_grant, parse_permission_string);
         let auto_kinds = self.connect_auto_approve_kinds.clone();
 
         let mut pm = self.permissions.lock().await;
@@ -1213,7 +1240,19 @@ impl SignerHandler {
             connected_at,
             timed_kind_grants,
             explicitly_remembered,
+            false,
         );
+    }
+
+    /// Marks a registered `nostrconnect://` client paired, so its grant is
+    /// persisted and restored as a remembered client's is, and persists the
+    /// grants. Returns whether the client is registered.
+    pub async fn pair_client(&self, pubkey: &PublicKey) -> bool {
+        let paired = self.permissions.lock().await.pair(pubkey);
+        if paired {
+            self.persist_permissions().await;
+        }
+        paired
     }
 
     pub async fn update_client_permissions(&self, pubkey: &PublicKey, permissions: Permission) {
@@ -1523,6 +1562,63 @@ mod tests {
         // The legitimate text survives, only the spoofing code points are stripped.
         assert_eq!(app, "EvilApp");
         assert_eq!(method, "sign_event");
+    }
+
+    // A `nostrconnect://` client gets no more than it asked for, whatever
+    // the approval names. One that names no permission asks for the connect
+    // grant, as a `connect` that names none gets.
+    #[tokio::test]
+    async fn a_nostrconnect_grant_never_exceeds_the_request() {
+        let connect_grant = Permission::GET_PUBLIC_KEY | Permission::SIGN_EVENT;
+        let handler = SignerHandler::new(
+            setup_keyring(),
+            Arc::new(Mutex::new(PermissionManager::new())),
+            Arc::new(Mutex::new(AuditLog::new(100))),
+            None,
+        )
+        .with_connect_grant(connect_grant);
+        let granted = |app: PublicKey| {
+            let handler = &handler;
+            async move {
+                handler
+                    .list_clients()
+                    .await
+                    .into_iter()
+                    .find(|a| a.pubkey == app)
+                    .unwrap()
+                    .permissions
+            }
+        };
+        let cases: [(Option<&str>, Option<&str>, Permission); 8] = [
+            (None, None, connect_grant),
+            (Some(""), None, connect_grant),
+            (Some(" , "), None, connect_grant),
+            (None, Some("sign_event,nip44_encrypt"), connect_grant),
+            (None, Some("nip44_encrypt"), Permission::DEFAULT),
+            (
+                Some("sign_event"),
+                None,
+                Permission::DEFAULT | Permission::SIGN_EVENT,
+            ),
+            (
+                Some("sign_event"),
+                Some("sign_event,nip44_encrypt"),
+                Permission::DEFAULT | Permission::SIGN_EVENT,
+            ),
+            (
+                Some("sign_event,nip44_encrypt"),
+                Some("nip44_encrypt"),
+                Permission::DEFAULT | Permission::NIP44_ENCRYPT,
+            ),
+        ];
+        for (requested, approved, expected) in cases {
+            let app = Keys::generate().public_key();
+            handler
+                .register_nostrconnect_client(app, "app".into(), requested, approved)
+                .await
+                .unwrap();
+            assert_eq!(granted(app).await, expected, "{requested:?} {approved:?}");
+        }
     }
 
     // Reproduces the readstr / nostr-tools failure: a client that connects
