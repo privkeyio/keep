@@ -328,9 +328,10 @@ impl Keep {
             ),
             None => audit_record::RECORD_NOTE.to_string(),
         };
-        self.audit_event(AuditEventType::VaultUnlock, |e| e.with_reason(&reason));
         debug!("loading keys to keyring");
-        self.load_keys_to_keyring()
+        self.load_keys_to_keyring()?;
+        self.audit_event(AuditEventType::VaultUnlock, |e| e.with_reason(&reason));
+        Ok(())
     }
 
     /// Verify a password without changing the unlock state.
@@ -4327,6 +4328,39 @@ mod tests {
         assert!(keep.audit.is_none());
         assert!(keep.keyring().get_by_name("held").is_none());
         assert!(keep.keyring().get_by_name("twin").is_none());
+    }
+
+    #[test]
+    fn an_unlock_that_fails_loading_keys_records_no_unlock() {
+        let unlocks = |keep: &Keep| {
+            keep.read_audit_entries()
+                .unwrap()
+                .iter()
+                .filter(|e| e.event_type == AuditEventType::VaultUnlock)
+                .count()
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("keep");
+        let before = {
+            let mut keep = test_keep(&path);
+            keep.generate_key("held").unwrap();
+            let mut twin = keep.list_keys().unwrap().remove(0);
+            twin.id = [7u8; 32];
+            twin.name = "twin".into();
+            keep.storage.store_key(&twin).unwrap();
+            unlocks(&keep)
+        };
+
+        let mut keep = Keep::open(&path).unwrap();
+        assert!(keep.unlock("testpass").is_err());
+        keep.storage.unlock("testpass").unwrap();
+        keep.storage.delete_key(&[7u8; 32]).unwrap();
+        keep.storage.lock();
+        drop(keep);
+
+        let mut keep = Keep::open(&path).unwrap();
+        keep.unlock("testpass").unwrap();
+        assert_eq!(unlocks(&keep), before + 1);
     }
 
     #[test]
