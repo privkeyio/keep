@@ -361,7 +361,11 @@ fn split_stream(
 /// URL-level check, so this is what actually stops a rebind onto a loopback or
 /// link-local address.
 async fn direct_connect(host: &str, port: u16, screen_internal: bool) -> Result<TcpStream> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((bare, port))
         .await
         .map_err(|e| FrostNetError::Transport(format!("DNS resolve {host}:{port}: {e}")))?
         .filter(|a| !screen_internal || !is_internal_ip(&a.ip()))
@@ -590,6 +594,15 @@ mod tests {
     use super::*;
 
     use std::sync::Once;
+
+    #[tokio::test]
+    async fn a_direct_dial_resolves_an_ipv6_literal() {
+        let err = direct_connect("[::1]", 4443, true)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no connectable addresses"), "{err}");
+    }
 
     static SETUP: Once = Once::new();
 

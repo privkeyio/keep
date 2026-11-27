@@ -244,11 +244,7 @@ pub async fn verify_relay_certificate(
         .to_string();
 
     let port = url.port_or_known_default().unwrap_or(443);
-    let addr = if hostname.contains(':') {
-        format!("[{hostname}]:{port}")
-    } else {
-        format!("{hostname}:{port}")
-    };
+    let addr = format!("{hostname}:{port}");
 
     let mut root_store = RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -410,6 +406,25 @@ pub(crate) fn extract_spki_from_der(cert_der: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_direct_probe_dials_an_ipv6_literal() {
+        crate::install_default_crypto_provider();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(verify_relay_certificate(
+                "wss://[::1]:4443",
+                &CertificatePinSet::new(),
+                false,
+                None,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("internal addresses only"), "{err}");
+    }
 
     // --- keep-y8v: opt-in strict mode closes the first-use TOFU MitM window ---
 
