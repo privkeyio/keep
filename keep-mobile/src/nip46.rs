@@ -1211,6 +1211,13 @@ impl BunkerHandler {
         self.nostrconnect_listings().get(client).map(|l| l.state)
     }
 
+    /// Whether an accept or rollback here still owns `client`'s listing, so
+    /// `finish_unsettled` leaves it alone.
+    fn owns_listing(&self, client: &PublicKey) -> bool {
+        self.listing_state(client)
+            .is_some_and(|state| state != ListingState::Unfinished)
+    }
+
     /// Finishes the rollback of every unsettled accept, or only `only`'s,
     /// that neither an accept in flight here nor its rollback still owns: one
     /// a rollback could not finish, or one a previous process left. An accept
@@ -1219,10 +1226,7 @@ impl BunkerHandler {
     fn finish_unsettled(&self, only: Option<&PublicKey>) -> Result<(), KeepMobileError> {
         let mut result = Ok(());
         for client in self.unsettled_clients()? {
-            let owned = self
-                .listing_state(&client)
-                .is_some_and(|state| state != ListingState::Unfinished);
-            if only.is_some_and(|only| *only != client) || owned {
+            if only.is_some_and(|only| *only != client) || self.owns_listing(&client) {
                 continue;
             }
             if let Err(e) = roll_back_listing(&self.mobile, &client) {
@@ -1690,10 +1694,15 @@ impl BunkerHandler {
     /// however spelled, and any past the tenth are dropped, and a URI left
     /// with none is refused.
     /// `already_connected` is set for a client `accept_nostrconnect` would
-    /// refuse as already authorized.
+    /// refuse as already authorized. An unsettled listing no accept here owns
+    /// does not count, since the accept rolls it back before that check.
     pub fn parse_nostrconnect(&self, uri: String) -> Result<NostrConnectInfo, KeepMobileError> {
         let request = parse_nostrconnect_request(&uri)?;
-        let listed = listed_clients(&self.mobile)?;
+        let mut listed = listed_clients(&self.mobile)?;
+        let client = request.client_pubkey;
+        if !self.owns_listing(&client) && self.unsettled_clients()?.contains(&client) {
+            listed.remove(&client);
+        }
         let handler = self.live_handler();
         let already_connected =
             self.is_authorized(&listed, handler.as_deref(), &request.client_pubkey);
@@ -5896,6 +5905,13 @@ mod tests {
         *mem.fail_writes_to.lock().unwrap() = None;
         assert!(is_listed(&storage, &client), "the unlist write failed");
         assert!(!engine_lists(&starter, &client));
+        assert!(
+            !starter
+                .parse_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""))
+                .unwrap()
+                .already_connected,
+            "a retry can finish the unlist, so the client is not reported connected"
+        );
 
         starter
             .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
