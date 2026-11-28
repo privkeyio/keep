@@ -109,6 +109,15 @@ pub enum KeepMobileError {
     /// A call that needs the running bunker found it stopped.
     #[error("The bunker is not running; start it first")]
     BunkerNotRunning,
+
+    /// A bunker config save read the authorized client list before it last
+    /// changed.
+    #[error("The authorized client list changed since it was read; read it again and retry")]
+    BunkerConfigChanged,
+
+    /// A client asked to be authorized is already listed or registered.
+    #[error("This client is already connected; revoke it to connect it again")]
+    AlreadyAuthorized,
 }
 
 impl From<keep_frost_net::FrostNetError> for KeepMobileError {
@@ -170,6 +179,14 @@ mod tests {
         assert_eq!(
             KeepMobileError::BunkerNotRunning.to_string(),
             "The bunker is not running; start it first"
+        );
+        assert_eq!(
+            KeepMobileError::BunkerConfigChanged.to_string(),
+            "The authorized client list changed since it was read; read it again and retry"
+        );
+        assert_eq!(
+            KeepMobileError::AlreadyAuthorized.to_string(),
+            "This client is already connected; revoke it to connect it again"
         );
     }
 }

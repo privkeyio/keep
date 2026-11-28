@@ -40,6 +40,8 @@ interface KeepMobileError {
     GroupShareAlreadyStored();
     TooManyAuthorizedClients(u32 max);
     BunkerNotRunning();
+    BunkerConfigChanged();
+    AlreadyAuthorized();
 };
 
 dictionary ShareMetadataInfo {

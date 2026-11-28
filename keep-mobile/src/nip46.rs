@@ -180,10 +180,13 @@ pub struct NostrConnectInfo {
     pub image: Option<String>,
     pub relays: Vec<String>,
     pub requested_permissions: Option<String>,
+    /// The client is already listed or registered, so an accept is refused
+    /// until it is revoked.
+    pub already_connected: bool,
 }
 
-impl From<&NostrConnectRequest> for NostrConnectInfo {
-    fn from(request: &NostrConnectRequest) -> Self {
+impl NostrConnectInfo {
+    fn new(request: &NostrConnectRequest, already_connected: bool) -> Self {
         Self {
             client_pubkey: request.client_pubkey.to_hex(),
             name: request.name.clone(),
@@ -191,6 +194,7 @@ impl From<&NostrConnectRequest> for NostrConnectInfo {
             image: request.image.clone(),
             relays: request.relays.clone(),
             requested_permissions: request.perms.clone(),
+            already_connected,
         }
     }
 }
@@ -921,16 +925,8 @@ impl BunkerHandler {
             });
         }
         let listed = listed_clients(&self.mobile)?;
-        let registered = self
-            .mobile
-            .runtime
-            .block_on(handler.list_clients())
-            .iter()
-            .any(|app| app.pubkey == *client);
-        if listed.contains(client) || registered {
-            return Err(KeepMobileError::InvalidInput {
-                msg: "This client is already connected; revoke it to connect it again".into(),
-            });
+        if self.is_authorized(&listed, Some(handler), client) {
+            return Err(KeepMobileError::AlreadyAuthorized);
         }
         let max = keep_nip46::PermissionManager::MAX_CONNECTED_APPS;
         if listed.len() >= max {
@@ -939,6 +935,23 @@ impl BunkerHandler {
             });
         }
         Ok(())
+    }
+
+    /// Whether `client` is in `listed` or registered with `handler`.
+    fn is_authorized(
+        &self,
+        listed: &HashSet<PublicKey>,
+        handler: Option<&SignerHandler>,
+        client: &PublicKey,
+    ) -> bool {
+        listed.contains(client)
+            || handler.is_some_and(|handler| {
+                self.mobile
+                    .runtime
+                    .block_on(handler.list_clients())
+                    .iter()
+                    .any(|app| app.pubkey == *client)
+            })
     }
 
     /// Checks the client's relays' pins and joins those that pass, without
@@ -1198,6 +1211,13 @@ impl BunkerHandler {
         self.nostrconnect_listings().get(client).map(|l| l.state)
     }
 
+    /// Whether an accept or rollback here still owns `client`'s listing, so
+    /// `finish_unsettled` leaves it alone.
+    fn owns_listing(&self, client: &PublicKey) -> bool {
+        self.listing_state(client)
+            .is_some_and(|state| state != ListingState::Unfinished)
+    }
+
     /// Finishes the rollback of every unsettled accept, or only `only`'s,
     /// that neither an accept in flight here nor its rollback still owns: one
     /// a rollback could not finish, or one a previous process left. An accept
@@ -1206,10 +1226,7 @@ impl BunkerHandler {
     fn finish_unsettled(&self, only: Option<&PublicKey>) -> Result<(), KeepMobileError> {
         let mut result = Ok(());
         for client in self.unsettled_clients()? {
-            let owned = self
-                .listing_state(&client)
-                .is_some_and(|state| state != ListingState::Unfinished);
-            if only.is_some_and(|only| *only != client) || owned {
+            if only.is_some_and(|only| *only != client) || self.owns_listing(&client) {
                 continue;
             }
             if let Err(e) = roll_back_listing(&self.mobile, &client) {
@@ -1676,8 +1693,20 @@ impl BunkerHandler {
     /// ones, ones carrying control characters, repeats of one listed earlier
     /// however spelled, and any past the tenth are dropped, and a URI left
     /// with none is refused.
+    /// `already_connected` is set for a client `accept_nostrconnect` would
+    /// refuse as already authorized. An unsettled listing no accept here owns
+    /// does not count, since the accept rolls it back before that check.
     pub fn parse_nostrconnect(&self, uri: String) -> Result<NostrConnectInfo, KeepMobileError> {
-        parse_nostrconnect_request(&uri).map(|request| NostrConnectInfo::from(&request))
+        let request = parse_nostrconnect_request(&uri)?;
+        let mut listed = listed_clients(&self.mobile)?;
+        let client = request.client_pubkey;
+        if !self.owns_listing(&client) && self.unsettled_clients()?.contains(&client) {
+            listed.remove(&client);
+        }
+        let handler = self.live_handler();
+        let already_connected =
+            self.is_authorized(&listed, handler.as_deref(), &request.client_pubkey);
+        Ok(NostrConnectInfo::new(&request, already_connected))
     }
 
     /// Accepts a `nostrconnect://` request the user approved: the running
@@ -5343,13 +5372,25 @@ mod tests {
         let app = nostr_sdk::Keys::generate();
         let client = listening(&mobile, &client_url, &app, bunker);
         let uri = nostrconnect_uri(&app.public_key(), &[&client_url], "sign_event:1");
+        assert!(
+            !starter
+                .parse_nostrconnect(uri.clone())
+                .unwrap()
+                .already_connected
+        );
         starter
             .accept_nostrconnect(uri.clone(), Some("sign_event:1".into()))
             .unwrap();
 
+        assert!(
+            starter
+                .parse_nostrconnect(uri.clone())
+                .unwrap()
+                .already_connected
+        );
         assert!(matches!(
             starter.accept_nostrconnect(uri, Some("nip44_encrypt".into())),
-            Err(KeepMobileError::InvalidInput { .. })
+            Err(KeepMobileError::AlreadyAuthorized)
         ));
         assert!(is_listed(&storage, &app.public_key()));
         assert!(engine_lists(&starter, &app.public_key()));
@@ -5618,7 +5659,7 @@ mod tests {
         first.join().unwrap().unwrap();
         assert!(matches!(
             duplicate.join().unwrap(),
-            Err(KeepMobileError::InvalidInput { .. })
+            Err(KeepMobileError::AlreadyAuthorized)
         ));
         assert!(is_listed(&storage, &app.public_key()));
 
@@ -5864,6 +5905,13 @@ mod tests {
         *mem.fail_writes_to.lock().unwrap() = None;
         assert!(is_listed(&storage, &client), "the unlist write failed");
         assert!(!engine_lists(&starter, &client));
+        assert!(
+            !starter
+                .parse_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""))
+                .unwrap()
+                .already_connected,
+            "a retry can finish the unlist, so the client is not reported connected"
+        );
 
         starter
             .accept_nostrconnect(nostrconnect_uri(&client, &[&client_url], ""), None)
@@ -5957,7 +6005,7 @@ mod tests {
         };
         assert!(matches!(
             mobile.save_bunker_config(stale),
-            Err(KeepMobileError::InvalidInput { .. })
+            Err(KeepMobileError::BunkerConfigChanged)
         ));
         assert_eq!(
             stored_config(&storage).authorized_clients,
@@ -5973,7 +6021,7 @@ mod tests {
                 authorized_clients: during_accept.authorized_clients.clone(),
                 revision: during_accept.revision,
             }),
-            Err(KeepMobileError::InvalidInput { .. })
+            Err(KeepMobileError::BunkerConfigChanged)
         ));
         assert!(
             !is_listed(&storage, &client),
@@ -5990,6 +6038,110 @@ mod tests {
             .unwrap();
         assert_eq!(stored_config(&storage).enabled, !fresh.enabled);
         assert_eq!(stored_config(&storage).authorized_clients, vec![ordinary]);
+    }
+
+    // A save that only toggles the bunker moves the revision too, so a save
+    // from a read before it cannot undo the toggle.
+    #[test]
+    fn a_toggle_only_save_refuses_a_save_from_an_older_read() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        set_listed(
+            &mobile,
+            vec![nostr_sdk::Keys::generate().public_key().to_hex()],
+        );
+        let read = mobile.get_bunker_config().unwrap();
+
+        mobile
+            .save_bunker_config(crate::BunkerConfigInfo {
+                enabled: !read.enabled,
+                authorized_clients: read.authorized_clients.clone(),
+                revision: read.revision,
+            })
+            .unwrap();
+        assert_ne!(
+            stored_config(&storage).client_list_revision,
+            read.revision.unwrap()
+        );
+        assert!(matches!(
+            mobile.save_bunker_config(crate::BunkerConfigInfo {
+                enabled: read.enabled,
+                authorized_clients: read.authorized_clients.clone(),
+                revision: read.revision,
+            }),
+            Err(KeepMobileError::BunkerConfigChanged)
+        ));
+        assert_eq!(stored_config(&storage).enabled, !read.enabled);
+    }
+
+    // A client the running engine has registered but the list does not hold
+    // reads as connected, and an accept of it is refused without listing it.
+    #[test]
+    fn a_client_registered_but_unlisted_is_already_authorized() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let (_bunker_relay, bunker_url) = mock_relay(&mobile);
+        let (_client_relay, client_url) = mock_relay(&mobile);
+        let starter = BunkerHandler::new(Arc::clone(&mobile));
+        let (_bunker, _running) =
+            serve_for_nostrconnect(&mobile, &starter, &bunker_url, None, &prompts);
+        let client = nostr_sdk::Keys::generate().public_key();
+        let engine = starter.live_handler().expect("bunker running");
+        mobile
+            .runtime
+            .block_on(engine.register_nostrconnect_client(client, "app".into(), None, None))
+            .unwrap();
+        assert!(engine_lists(&starter, &client));
+        assert!(!is_listed(&storage, &client));
+
+        let uri = nostrconnect_uri(&client, &[&client_url], "");
+        assert!(
+            starter
+                .parse_nostrconnect(uri.clone())
+                .unwrap()
+                .already_connected
+        );
+        assert!(matches!(
+            starter.accept_nostrconnect(uri, None),
+            Err(KeepMobileError::AlreadyAuthorized)
+        ));
+        assert!(!is_listed(&storage, &client));
+        starter.stop_bunker();
+    }
+
+    // A client already listed reads as connected before the user is asked,
+    // with the bunker stopped too, and the read writes nothing.
+    #[test]
+    fn parsing_a_request_from_a_listed_client_says_it_is_connected() {
+        let storage: Arc<dyn SecureStorage> = Arc::new(MemStorage::default());
+        let mobile = Arc::new(KeepMobile::new(Arc::clone(&storage)).unwrap());
+        let handler = BunkerHandler::new(Arc::clone(&mobile));
+        let listed = nostr_sdk::Keys::generate().public_key();
+        let other = nostr_sdk::Keys::generate().public_key();
+        set_listed(
+            &mobile,
+            vec![nostr_sdk::ToBech32::to_bech32(&listed).unwrap()],
+        );
+        let before = serde_json::to_string(&stored_config(&storage)).unwrap();
+
+        let relays = ["wss://relay.example.com"];
+        assert!(
+            handler
+                .parse_nostrconnect(nostrconnect_uri(&listed, &relays, ""))
+                .unwrap()
+                .already_connected
+        );
+        assert!(
+            !handler
+                .parse_nostrconnect(nostrconnect_uri(&other, &relays, ""))
+                .unwrap()
+                .already_connected
+        );
+        assert_eq!(
+            serde_json::to_string(&stored_config(&storage)).unwrap(),
+            before
+        );
     }
 
     // A save that drops every client, as an account reset makes, drops one

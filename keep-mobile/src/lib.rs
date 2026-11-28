@@ -740,11 +740,13 @@ pub struct ProxyConfigInfo {
 pub struct BunkerConfigInfo {
     pub enabled: bool,
     pub authorized_clients: Vec<String>,
-    /// The revision of `authorized_clients` this was read at. A save that
-    /// carries one is refused once the list has changed since, as a
-    /// `nostrconnect://` accept, its rollback or a revoke changes it, so a
-    /// save from an older read neither drops nor brings back a client. A
-    /// save without one replaces the list as given.
+    /// The revision of the bunker config this was read at. It moves on every
+    /// write to the config's client list or settings, as a config save, a
+    /// `nostrconnect://` accept, its rollback or a revoke makes, so a save
+    /// that carries one is refused with `BunkerConfigChanged` once anything
+    /// was written since. A save from an older read therefore neither drops
+    /// nor brings back a client, nor undoes a newer `enabled`. A save without
+    /// one replaces the config as given.
     #[uniffi(default = None)]
     pub revision: Option<u64>,
 }
@@ -4246,11 +4248,7 @@ impl KeepMobile {
             .revision
             .is_some_and(|read| read != existing.client_list_revision)
         {
-            return Err(KeepMobileError::InvalidInput {
-                msg:
-                    "The authorized client list changed since it was read; read it again and retry"
-                        .into(),
-            });
+            return Err(KeepMobileError::BunkerConfigChanged);
         }
         let listed: std::collections::HashSet<nostr_sdk::PublicKey> = config
             .authorized_clients
